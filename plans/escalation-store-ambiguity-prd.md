@@ -509,6 +509,15 @@ No waivers required.
    the description block and the server instructions' "(empty when no orchestrator
    is attached)". The merge/halt pair needs nothing further. Pinned by
    `fused-memory/tests/reconciliation/test_recon_stage_escalation_read_boundary.py::test_recon_stage_cannot_obtain_the_task_runtime_snapshot`.
+
+   S3 δ (`plans/review-all-s3-escalation-server-and-queue-boundary-prd.md`) moves
+   `get_task_runtime_state` off `create_server`, so the reconciliation server stops
+   serving it and this denial is superseded. δ retires
+   `DISALLOW_ESCALATION_RUNTIME_READS` (its folds into `STAGE1/2/3_DISALLOWED` and
+   its entry in `test_every_escalation_server_tool_is_classified`'s bucket map),
+   the `ESCALATION_BOUNDARY_NOTE` runtime-snapshot sentences, and the pinning test
+   above. It does not touch `_REVIEWED_STAGE_SAFE` for this tool, which that set
+   no longer holds: ten of δ's eleven moved names leave it, not eleven.
 4. **Does `--disallowed-tools` reject a denied MCP tool on call, or omit it from
    the listing?** **RESOLVED during α (task 3163): OMISSION.** A denied tool is
    simply absent from the agent's visible tool set; there is no rejection event

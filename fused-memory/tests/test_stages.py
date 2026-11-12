@@ -224,9 +224,8 @@ class TestMockTypesConstant:
 #     unrelated to the escalation-record question.
 #
 # This is the reviewed-safe half of the classification asserted by
-# test_every_escalation_server_tool_is_classified; the denied half is
-# DISALLOW_ESCALATION_READS plus DISALLOW_ESCALATION_RUNTIME_READS plus
-# DISALLOW_ESCALATION_WRITES. Adding a name here is a decision that the tool
+# test_every_escalation_server_tool_is_classified; the denied half is every
+# DISALLOW_ESCALATION_* bucket in that test's map. Adding a name here is a decision that the tool
 # cannot mislead a stage about the reconciliation queue — not a formality.
 _REVIEWED_STAGE_SAFE = {
     # amend_escalation (task 4886) acts on a record the caller already holds
@@ -546,9 +545,10 @@ class TestDisallowedToolLists:
                 '(cli_stage_runner.py) if a stage must not call it — the default for '
                 'anything that READS per-task escalation state, since a stage is wired '
                 'to the reconciliation queue and would read a categorical [] as proof '
-                'of absence — or to DISALLOW_ESCALATION_RUNTIME_READS if it READS '
-                'orchestrator runtime state, which the harness-less reconciliation '
-                'server can only answer with an empty-but-live snapshot — or to '
+                'of absence — or to DISALLOW_ESCALATION_RUNTIME_READS if, with no '
+                'orchestrator harness attached, it answers a silent empty-but-live '
+                'result instead of an error (a runtime read that fails loudly '
+                'standalone, like get_merge_queue, is reviewed-safe) — or to '
                 'DISALLOW_ESCALATION_WRITES if it FILES an '
                 'escalation (denied in Stage 1/3, kept by Stage 2 for FIX D), or to '
                 '_REVIEWED_STAGE_SAFE here once you have confirmed it is harmless '

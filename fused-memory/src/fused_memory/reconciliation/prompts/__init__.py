@@ -459,14 +459,14 @@ only — never a project's escalation queue. A question of the form "was an \
 escalation ever filed for task X?" CANNOT be answered from this stage: the \
 escalation READ tools are not available to you here, and any empty or missing \
 escalation result you encounter is NOT evidence that no escalation exists. It \
-means only that you are looking in the wrong store. The orchestrator's live \
+means only that you are looking in the wrong store. Never report, infer, or \
+flag "no escalation was filed for task X" on the strength of this connection; \
+if a finding depends on that question, record what you actually observed and \
+hand the question on rather than asserting an absence. The orchestrator's live \
 task-runtime snapshot (`get_task_runtime_state`) is withheld from this stage too: \
 no orchestrator is attached to this connection, so that snapshot could only ever \
-claim "online, nothing running", whatever is actually in flight. A task's live \
-status comes from `mcp__fused-memory__get_task`, a read you do hold. Never report, \
-infer, or flag "no escalation was filed for task X" on the strength of this connection; \
-if a finding depends on that question, record what you actually observed and \
-hand the question on rather than asserting an absence.\
+claim "online, nothing running", whatever is actually in flight. A task's current \
+status comes from the task record (`mcp__fused-memory__get_task`), a read you do hold.\
 """
 
 # Per-stage sanctioned-action clauses appended to ESCALATION_BOUNDARY_NOTE.
