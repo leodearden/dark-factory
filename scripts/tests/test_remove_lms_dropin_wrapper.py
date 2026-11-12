@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from uuid import uuid4
@@ -1242,14 +1243,22 @@ def _remove_template_residue(template: str) -> None:
         pass
 
 
-_HOST_BUS_TRANSPORT_ERRNOS = (errno.ENOTCONN, errno.ECONNRESET, errno.ECONNREFUSED)
+_HOST_BUS_TRANSPORT_ERRNOS = (errno.ENOTCONN,)
 _HOST_BUS_TRANSPORT_SUFFIXES = {e: f": {os.strerror(e)}" for e in _HOST_BUS_TRANSPORT_ERRNOS}
 
 
-def _host_bus_transport_errno(result: subprocess.CompletedProcess[str]) -> int | None:
-    """Parse systemctl's `%m` error lines, at the boundary, into a typed errno.
+class HostBusDroppedWarning(UserWarning):
+    """A selftest run skipped because the user-manager bus dropped; -q prints this, not a skip reason."""
 
-    Only the connection-lost/refused class sd-bus reports when the user-manager bus drops.
+
+def _host_bus_transport_errno(result: subprocess.CompletedProcess[str]) -> int | None:
+    """Parse one .sh run's output, at the boundary, into the transport errno it reports.
+
+    Scans EVERY line of the combined output, whatever printed it, for one ending in
+    systemctl's `%m` text of an errno with an observed sample: ENOTCONN (task 7803,
+    2026-10-29).  Add an errno only on a newly observed sample, the
+    orchestrator/src/orchestrator/verify_classify.py::_SCOPE_SPAWN_FAILURE_RE discipline:
+    ECONNREFUSED would also be what a script regression that disrupts the manager prints.
     """
     lines = f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
     for line, (err, suffix) in itertools.product(lines, _HOST_BUS_TRANSPORT_SUFFIXES.items()):
@@ -1269,16 +1278,22 @@ def _selftest_detail(result: subprocess.CompletedProcess[str], template: str) ->
 
 
 def _skip_if_host_bus_dropped(result: subprocess.CompletedProcess[str], template: str) -> None:
-    """Skip a FAILED run whose output shows the user-manager bus dropping a systemctl call."""
+    """Skip a FAILED run whose output shows the user-manager bus dropping a systemctl call.
+
+    Not tied to the failing step: a transport line from ANY call skips the whole run.
+    The skip's reason never reaches a `-q` verify log, so it also warns, which does.
+    """
     __tracebackhide__ = True  # report the skip against the TEST, not this helper
     err = _host_bus_transport_errno(result)
     if result.returncode != 0 and err is not None:
-        pytest.skip(
+        reason = (
             f"the systemd --user manager's bus dropped a systemctl call mid-run "
             f"({errno.errorcode[err]}: {os.strerror(err)}).  Environment fact, like this "
             "module's other skips, not a regression in remove-lms-arm-worktree-dropin.sh"
             + _selftest_detail(result, template)
         )
+        warnings.warn(reason, HostBusDroppedWarning, stacklevel=2)
+        pytest.skip(reason)
 
 
 def _assert_selftest_passed(result: subprocess.CompletedProcess[str], template: str) -> None:
@@ -1538,14 +1553,14 @@ def _completed(
         pytest.param(
             "",
             f"Failed to get properties: {os.strerror(errno.ECONNRESET)}\n",
-            errno.ECONNRESET,
-            id="show-ECONNRESET",
+            None,
+            id="unobserved-ECONNRESET",
         ),
         pytest.param(
             "",
             f"Failed to connect to bus: {os.strerror(errno.ECONNREFUSED)}\n",
-            errno.ECONNREFUSED,
-            id="connect-ECONNREFUSED",
+            None,
+            id="unobserved-ECONNREFUSED",
         ),
         pytest.param(
             "",
@@ -1579,7 +1594,7 @@ def _completed(
 def test_host_bus_transport_errno_reads_only_line_ending_transport_errors(
     stdout: str, stderr: str, expected: int | None
 ) -> None:
-    """Only a line ENDING in ': <strerror>' of a transport-class errno is a lost bus."""
+    """Only a line ENDING in ': <strerror>' of an observed transport errno is a lost bus."""
     assert _host_bus_transport_errno(_completed(stdout=stdout, stderr=stderr)) == expected
 
 
@@ -1591,11 +1606,12 @@ def test_failed_run_that_lost_the_host_bus_is_a_named_skip() -> None:
         stdout=f"    | Failed to reload daemon: {os.strerror(errno.ENOTCONN)}\n",
         stderr="  FAIL: exit code is 0 on re-run -- expected '0', got '1'\n",
     )
+    names_errno_and_template = rf"(?s){errno.errorcode[errno.ENOTCONN]}.*{re.escape(template)}"
 
-    with pytest.raises(
-        pytest.skip.Exception,
-        match=rf"(?s){errno.errorcode[errno.ENOTCONN]}.*{re.escape(template)}",
-    ) as excinfo:
+    with (
+        pytest.warns(HostBusDroppedWarning, match=names_errno_and_template),
+        pytest.raises(pytest.skip.Exception, match=names_errno_and_template) as excinfo,
+    ):
         _skip_if_host_bus_dropped(result, template)
 
     assert _selftest_detail(result, template) in str(excinfo.value)
@@ -1632,5 +1648,8 @@ def test_lost_host_bus_inside_the_script_reaches_the_gate_as_a_skip(tmp_path: Pa
         tmp_path, template, os.strerror(errno.ENOTCONN)
     )
 
-    with pytest.raises(pytest.skip.Exception, match=errno.errorcode[errno.ENOTCONN]):
+    with (
+        pytest.warns(HostBusDroppedWarning),
+        pytest.raises(pytest.skip.Exception, match=errno.errorcode[errno.ENOTCONN]),
+    ):
         _skip_if_host_bus_dropped(result, template)
