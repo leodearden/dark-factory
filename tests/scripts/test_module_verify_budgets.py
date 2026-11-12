@@ -114,6 +114,7 @@ from collections.abc import Callable
 import pytest
 import verify_budget_census_records as census_records
 import yaml
+from git_listing import listed_files
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
     FAMILY_READER_PATH,
@@ -122,6 +123,7 @@ from module_budget_family import (
     published_pairs,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_plan import FileKind, classify_file
 from shared.whole_tree_guard_family import (
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
     is_whole_tree_guard_module,
@@ -1873,16 +1875,23 @@ class TestCensusBudgetFloor:
         assert family.HELPER_NAME == 'min_budget'
 
 
-
 FAMILY_RUNNING_LEGS_FLOOR = frozenset(
     {'orchestrator', 'fused-memory', 'shared', 'scripts', 'tests/scripts'},
 )
 
 
-def _leg_runs_the_family(prefix: str) -> bool:
+def _source_or_none(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _leg_tree_holds_a_member(prefix: str) -> bool:
     return any(
-        is_whole_tree_guard_module(path.read_text(encoding='utf-8'))
-        for path in (REPO_ROOT / prefix).rglob('test_*.py')
+        classify_file(path.as_posix(), None) is FileKind.COLLECTABLE_TEST
+        and is_whole_tree_guard_module(_source_or_none(path))
+        for path in listed_files(REPO_ROOT, f'{prefix}/*.py')
     )
 
 
@@ -1891,10 +1900,12 @@ def test_every_leg_running_the_family_outlasts_its_ceiling(
 ) -> None:
     """A whole-tree guard member's per-test ceiling must be able to fire before verify kills its leg.
 
-    A leg whose tree holds a member must budget at least ``min_leg_budget_for_family(W)``,
-    W being its recorded worst green run: a hang starting as late as W must still reach
-    WHOLE_TREE_SCAN_TEST_TIMEOUT, or it surfaces as a retried, unattributed infra_timeout
-    (task 8402). It lives here because this file alone holds every leg's budget and W.
+    A leg whose tracked tree holds a collectable member must budget at least
+    ``min_leg_budget_for_family(W)``, whichever run collects the member (task-role family
+    or merge-gate suite), W being its recorded worst green run: a hang starting as late
+    as W must still reach WHOLE_TREE_SCAN_TEST_TIMEOUT, or it surfaces as a retried,
+    unattributed infra_timeout (task 8402). It lives here because this file alone holds
+    every leg's budget and W.
     Scope: registered module legs only; the repo-root fallback chain and
     merge_gate_history_test_command are not checked (task 9396).
     """
@@ -1902,7 +1913,7 @@ def test_every_leg_running_the_family_outlasts_its_ceiling(
     family_running: set[str] = set()
     failures: list[str] = []
     for prefix, module_config in sorted(discover_module_configs().items()):
-        if not _leg_runs_the_family(prefix):
+        if not _leg_tree_holds_a_member(prefix):
             continue
         family_running.add(prefix)
         budget = module_config.verify_command_timeout_secs
