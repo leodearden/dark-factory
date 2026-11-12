@@ -215,6 +215,7 @@ from fused_memory.server.write_triage import (
     declares_attach_keys,
     declares_supersession,
     emit_triage_fail_open_storm_escalation,
+    is_orchestrator_completion_write,
     resolve_write_triage_enabled,
     triage_write,
 )
@@ -3917,9 +3918,11 @@ def create_mcp_server(
         # the attach below OVERWRITES, so a caller that set either force-stores
         # exactly like allow_near_duplicate. See write_triage.declares_attach_keys
         # for why ANY `kind` counts (not just the child kinds) and what that
-        # costs in coverage.
+        # costs in coverage. An orchestrator completion record force-stores even
+        # without its kind; see write_triage.is_orchestrator_completion_write.
         caller_owns_attach_keys = declares_attach_keys(metadata)
         caller_declares_supersession = declares_supersession(metadata)
+        caller_is_completion_record = is_orchestrator_completion_write(metadata)
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3958,6 +3961,7 @@ def create_mcp_server(
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
                 caller_declares_supersession=caller_declares_supersession,
+                caller_is_completion_record=caller_is_completion_record,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
