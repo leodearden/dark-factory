@@ -1338,25 +1338,25 @@ class TestBlockedRedispatchReleasesItsVetoStreak:
 _REMEDIABLE = 'stranded_blocked'
 
 
+async def _drive_blocked_sweep(tmp_path: Path, rows: list) -> Scheduler:
+    scheduler = _emitting_scheduler(tmp_path)
+    scheduler.escalation_queue = _FakeEscalationQueue({'T1': list(rows)})  # type: ignore[assignment]
+    await scheduler._phase_redispatch_stranded_blocked(
+        _ctx_with_done_dep(_blocked_task('T1')),
+    )
+    return scheduler
+
+
+def _sweep_flipped(scheduler: Scheduler) -> bool:
+    return any(
+        c.args[:2] == ('T1', 'pending')
+        for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+    )
+
+
 @pytest.mark.asyncio
 class TestBlockedRedispatchConsumesTheSharedPredicate:
     """Every pin class and the category relaxation, at this site."""
-
-    @staticmethod
-    async def _drive(tmp_path: Path, rows: list) -> Scheduler:
-        scheduler = _emitting_scheduler(tmp_path)
-        scheduler.escalation_queue = _FakeEscalationQueue({'T1': list(rows)})  # type: ignore[assignment]
-        await scheduler._phase_redispatch_stranded_blocked(
-            _ctx_with_done_dep(_blocked_task('T1')),
-        )
-        return scheduler
-
-    @staticmethod
-    def _flipped(scheduler: Scheduler) -> bool:
-        return any(
-            c.args[:2] == ('T1', 'pending')
-            for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
-        )
 
     async def test_a_lone_stranded_blocked_l1_no_longer_vetoes(self, tmp_path: Path):
         """THE relaxation this sweep was missing.
@@ -1366,19 +1366,19 @@ class TestBlockedRedispatchConsumesTheSharedPredicate:
         request veto its own remediation is the anti-synergy PRD leaf δ already
         closed on the harness side.
         """
-        scheduler = await self._drive(
+        scheduler = await _drive_blocked_sweep(
             tmp_path, [_esc('esc-1', category=_REMEDIABLE)],
         )
 
-        assert self._flipped(scheduler)
+        assert _sweep_flipped(scheduler)
 
     async def test_a_task_failure_l1_still_vetoes(self, tmp_path: Path):
         """A human-concern class names a problem re-pending does not fix."""
-        scheduler = await self._drive(
+        scheduler = await _drive_blocked_sweep(
             tmp_path, [_esc('esc-1', category='task_failure')],
         )
 
-        assert not self._flipped(scheduler)
+        assert not _sweep_flipped(scheduler)
         from orchestrator.recovery_emission import render_shape
 
         rows = _recovery_rows(scheduler)
@@ -1389,12 +1389,12 @@ class TestBlockedRedispatchConsumesTheSharedPredicate:
 
     async def test_a_mixed_record_set_still_vetoes(self, tmp_path: Path):
         """`only_merge_remediable` is an `all(...)`, and that is load-bearing."""
-        scheduler = await self._drive(tmp_path, [
+        scheduler = await _drive_blocked_sweep(tmp_path, [
             _esc('esc-1', category=_REMEDIABLE),
             _esc('esc-2', category='task_failure'),
         ])
 
-        assert not self._flipped(scheduler)
+        assert not _sweep_flipped(scheduler)
 
     async def test_a_blocking_l0_no_longer_vetoes(self, tmp_path: Path):
         """`live_claimant=False` is EXACT here, not assumed.
@@ -1404,19 +1404,19 @@ class TestBlockedRedispatchConsumesTheSharedPredicate:
         its identity-independent branch: the filer is necessarily dead, and a
         handoff with no consumer left must not pin.
         """
-        scheduler = await self._drive(
+        scheduler = await _drive_blocked_sweep(
             tmp_path, [_esc('esc-1', level=0, category='task_failure')],
         )
 
-        assert self._flipped(scheduler)
+        assert _sweep_flipped(scheduler)
 
     async def test_an_l2_still_vetoes(self, tmp_path: Path):
         """Level != 0 is a supervised, queue-backed handoff at any severity."""
-        scheduler = await self._drive(
+        scheduler = await _drive_blocked_sweep(
             tmp_path, [_esc('esc-1', level=2, category='task_failure')],
         )
 
-        assert not self._flipped(scheduler)
+        assert not _sweep_flipped(scheduler)
 
     async def test_a_parked_stranded_blocked_l2_still_vetoes(self, tmp_path: Path):
         """The relaxation stops once a human holds the record (task 6145).
@@ -1426,11 +1426,11 @@ class TestBlockedRedispatchConsumesTheSharedPredicate:
         record, so before this fix the sweep re-pended the task every tick
         and the re-dispatch blocked it again.
         """
-        scheduler = await self._drive(
+        scheduler = await _drive_blocked_sweep(
             tmp_path, [_esc('esc-1', level=2, category=_REMEDIABLE)],
         )
 
-        assert not self._flipped(scheduler)
+        assert not _sweep_flipped(scheduler)
 
     async def test_an_unreadable_store_still_skips_and_still_describes(
         self, tmp_path: Path,
@@ -1448,7 +1448,7 @@ class TestBlockedRedispatchConsumesTheSharedPredicate:
             _ctx_with_done_dep(_blocked_task('T1')),
         )
 
-        assert not self._flipped(scheduler)
+        assert not _sweep_flipped(scheduler)
         rows = _recovery_rows(scheduler)
         assert rows[0]['data']['reason'] == 'escalation_store_unavailable'
 
@@ -1570,18 +1570,10 @@ class TestBlockedRedispatchFlipLogNamesUnpinnedRecords:
 
     @staticmethod
     async def _flip_message(tmp_path: Path, caplog, rows: list) -> str:
-        scheduler = _emitting_scheduler(tmp_path)
-        scheduler.escalation_queue = _FakeEscalationQueue({'T1': list(rows)})  # type: ignore[assignment]
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
-            await scheduler._phase_redispatch_stranded_blocked(
-                _ctx_with_done_dep(_blocked_task('T1')),
-            )
+            scheduler = await _drive_blocked_sweep(tmp_path, rows)
 
-        assert any(
-            c.args[:2] == ('T1', 'pending')
-            for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
-        ), 'the sweep must flip for its flip line to be under test'
+        assert _sweep_flipped(scheduler), 'the sweep must flip for its flip line to be under test'
         [message] = [
             r.getMessage() for r in caplog.records
             if 'crash-stranded-blocked-redispatch' in r.getMessage() and 'T1' in r.getMessage()
