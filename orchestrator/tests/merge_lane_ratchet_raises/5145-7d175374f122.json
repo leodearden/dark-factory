@@ -1,0 +1,18 @@
+{
+  "task_id": "5145",
+  "reason": "Merging main into task/5145 combines two independent +1s on orchestrator/tests/conftest.py reexport_names: main's own noqa-F401 binding (6 on both parents over base 5) and this task's binding of the shared df_pytest_isolation._df_no_mock_derived_stray_dirs guard, which REPLACES the local MagicMock-only fixture (SPOT for orchestrator and fused-memory). The merge's 3-way bound held the value at 6; the merged tree measures 7.",
+  "measures": [
+    {
+      "measure": "reexport_names",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 6,
+      "current": 7
+    },
+    {
+      "measure": "total:reexport_names",
+      "key": "<cluster>",
+      "baseline": 7,
+      "current": 8
+    }
+  ]
+}
