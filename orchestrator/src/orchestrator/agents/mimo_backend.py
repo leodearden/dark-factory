@@ -5,9 +5,10 @@ The measured evidence behind every shape here is plans/mimo-code-harness-probe-2
 
 from __future__ import annotations
 
+import json
 import logging
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ _MCP_TOOL = re.compile(r'mcp__(?P<server>[A-Za-z0-9_-]+?)__(?P<tool>[A-Za-z0-9_-
 _BASH_PATTERN = re.compile(r'Bash\((?P<pattern>.+)\)')
 
 CostOf = Callable[[int, int, int], float]
+SessionSpawn = Callable[[list[str]], Awaitable[_SubprocessResult]]
 
 
 class MimoEndpointMissing(ValueError):
@@ -176,6 +178,42 @@ def mimo_session_list_argv() -> list[str]:
 
 def mimo_export_argv(session_id: str) -> list[str]:
     return ['mimo', 'export', session_id]
+
+
+async def read_mimo_sessions(spawn: SessionSpawn) -> list[dict[str, Any]]:
+    """Every session the run home's store holds, as ``mimo export`` documents, in list order."""
+    listing = await spawn(mimo_session_list_argv())
+    sessions = _decoded(listing)
+    if not isinstance(sessions, list):
+        logger.warning(
+            'mimo backend: the session list is unusable (rc=%d), so no usage is read: %.200r',
+            listing.returncode, listing.stdout,
+        )
+        return []
+    exports: list[dict[str, Any]] = []
+    for session in sessions:
+        session_id = session.get('id') if isinstance(session, dict) else None
+        if not session_id:
+            continue
+        exported = await spawn(mimo_export_argv(str(session_id)))
+        document = _decoded(exported)
+        if isinstance(document, dict):
+            exports.append(document)
+        else:
+            logger.warning(
+                'mimo backend: skipped session %s, whose export is unusable (rc=%d)',
+                session_id, exported.returncode,
+            )
+    return exports
+
+
+def _decoded(result: _SubprocessResult) -> Any:
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
 
 
 @dataclass(frozen=True)

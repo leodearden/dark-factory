@@ -347,6 +347,7 @@ class _FakeSessionStore:
         return self.exports.get(sid) or _subprocess_result(stdout=json.dumps(measured_export(sid)))
 
 
+@pytest.mark.asyncio
 class TestReadMimoSessions:
 
     async def test_lists_then_exports_every_session_in_order(self):
