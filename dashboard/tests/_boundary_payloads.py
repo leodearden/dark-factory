@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import httpx
-from _canned_mcp import CannedMCP, _raw_row
+from _canned_mcp import CannedMCP, _raw_row, is_metadata_projection
 from _dt_helpers import fixed_clock, installed_clock
 from _prd_lanes_tree import (
     CARRIER,
@@ -778,8 +778,8 @@ def _furnish_lanes(
     return furnish
 
 
-def _projected_read(call: dict) -> bool:
-    return call['tool'] == 'get_tasks' and call['args'].get('fields') is not None
+def _lineage_read(call: dict) -> bool:
+    return call['tool'] == 'get_tasks' and is_metadata_projection(call['args'])
 
 
 CONTENDED_IDS = (950, 951, 952)
@@ -847,7 +847,7 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         ) -> None:
             substrate = lanes_substrate(tree)
             if lineage_fails:
-                substrate.fail_when = _projected_read
+                substrate.fail_when = _lineage_read
             if contended:
                 _contend(substrate)
             substrates = {LANES_ROOT: substrate, QUEUELESS_ROOT: _substrate(REIFY_COUNTS)}
