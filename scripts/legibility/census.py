@@ -7,16 +7,13 @@ The LEAF that consumes every prior legibility module: beta's (β)
 inventory/sampling, alpha's (α) digest, delta's (δ) trickle coder, gamma's
 (γ) codebook merger, zeta's (ζ) census trigger/state.
 
-Flow (§5.7): usage-headroom preflight -> stratified-random saturation
-mining (Sonnet miners) until >=dup_rate duplicates for consecutive_batches
--> Sonnet verification of novel clusters vs current main -> Fable
-synthesis into a dated ``plans/confusion-census-<date>.md`` report with
-the origin x manifestation matrix -> curator-path ``submit_task``
-remediation filing -> codebook update (promote/reject candidates, retire
-fixed, never delete) -> advance ``docs/legibility/census-state.json`` ->
-the project's landing gate over those outputs -> one scoped commit of all
-of it (a gate refusal, or a commit that does not land, is rolled back to
-HEAD and quarantined; see ``run_census``).
+Flow (§5.7): ``run_census`` runs a usage-headroom preflight, then the
+stages ``mine`` (Sonnet miners, to saturation), ``merge``, ``adjudicate``
+(Sonnet verification against current main), ``place_verdicts``,
+``synthesize`` (Fable; the origin x manifestation matrix of a dated
+``plans/confusion-census-<date>.md`` report), ``plan_filing`` and
+``persist`` (curator-path filing, the report, the codebook, the census
+state, the project's landing gate and one scoped commit, or a rollback).
 ``--force`` for operator-initiated runs.
 
 Every LLM / MCP / git / disk side effect of a run is a field of
@@ -557,7 +554,7 @@ class CensusHeadroomExhausted(Exception):
 
     Not an error in the census -- an external condition that makes the
     stage's output untrustworthy. It exists so an infra failure can never
-    be laundered into a verdict: ``run_census`` catches it and defers
+    be laundered into a verdict: ``adjudicate`` catches it and defers
     before any persistence, instead of the cap-poisoned clusters landing
     in the codebook as ordinary rejections.
 
@@ -852,7 +849,7 @@ class DryRunFiling:
 
     ``payload_count`` is how many payloads the file holds. Reused by both
     ``render_report`` (which must not let a run that filed nothing read as a
-    normal run that had nothing to file) and ``CensusOutcome`` (so
+    normal run that had nothing to file) and ``Done``/``Unlanded`` (so
     ``main``'s summary line can name the review file instead of printing a
     misleading ``filed_tickets=0``). ``None`` in place of this record means
     the run filed normally."""
@@ -1368,8 +1365,8 @@ def render_report(record: Mapping[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# run_census — full orchestration: preflight -> mine -> verify -> synthesize
-# -> matrix -> codebook update -> file tasks -> report -> advance state
+# run_census — preflight, then mine -> merge -> adjudicate -> place_verdicts
+# -> synthesize -> plan_filing -> persist
 # ---------------------------------------------------------------------------
 
 CANDIDATE_KEY = "candidate_id"
@@ -2054,15 +2051,13 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
 
     A ``--dry-run-filing`` payload file is a human-review deliverable AND
     the only remaining handle on that run's remediation work -- the run
-    already advanced the codebook and census-state, so nothing can
-    regenerate it (see the dry-run WARNING in ``run_census``). A second
-    dry run on the same date must therefore never overwrite the first.
+    advances the codebook and census-state, so nothing can regenerate it
+    (see the dry-run WARNING in ``_write_dry_run_payloads``). A second dry
+    run on the same date must therefore never overwrite the first.
 
     The probe is bounded by *limit*; exhausting it raises ``RuntimeError``
-    naming the directory. Raising here is safe precisely because this
-    write precedes ``codebook.dump``/``census_state.advance`` -- the
-    module's ordering invariant means an abort at this point leaves
-    nothing persisted, so a re-run starts clean.
+    naming the directory. Raising here leaves nothing persisted, because
+    ``persist`` writes the payloads before any other output.
     """
     if not path.exists():
         return path
@@ -2119,7 +2114,7 @@ def _write_dry_run_payloads(
             withheld_offered,
         )
     # Every downstream consumer -- the report's Filed Tasks section, the
-    # commit paths and CensusOutcome -- reads the path off this one object,
+    # commit paths and the outcome -- reads the path off this one object,
     # so they all name the file actually written.
     return DryRunFiling(path=str(resolved_path), payload_count=len(payloads))
 
@@ -2233,9 +2228,7 @@ def _defer(
     ONE owner of the deferral shape, so the preflight gate, the
     stage-boundary gate and the in-verify abort cannot drift into three
     slightly different alarms/outcomes (design-invariants:
-    one mechanism, one spelling). Every caller must ``return`` this
-    directly -- a defer that keeps going and persists something is the
-    exact failure this whole guard exists to prevent.
+    one mechanism, one spelling).
     """
     reason = reason or f"headroom gate failed at the {stage} stage"
     verified, rejected, unverified = counts.verified, counts.rejected, counts.unverified
@@ -2569,14 +2562,6 @@ def adjudicate(run: CensusRun, effects: CensusEffects, mined: Mined, merged: Mer
     """Verify the capped novel clusters and the queue behind a headroom gate,
     or defer at the verify stage."""
     probes = 0
-    # Stage-boundary gate. Mining is long and expensive, so a cap that was
-    # absent at preflight can easily have arrived by now -- and the stage it
-    # guards is the one where an unnoticed cap goes SILENT rather than loud:
-    # the default verifier fails closed per cluster, so every cap-poisoned
-    # verify call would land as an ordinary rejection and the run would exit 0
-    # looking unremarkable. It guards the queue's verify call as much as the
-    # novel clusters', so a run with neither spends no probe on a stage it is
-    # about to skip.
     if merged.to_verify or merged.offered:
         probes += 1
         stage_headroom = _stage_headroom_gate(effects.invoke, model=run.config.models.trickle, stage="verify")
@@ -3216,213 +3201,15 @@ def run_census(
     dry_run_payloads_path: str | Path | None = None,
     harness_project: filing_policy.ProjectRef | None = None,
 ) -> CensusOutcome:
-    """Run one periodic legibility census end to end.
+    """Run one periodic legibility census end to end: preflight, then
+    ``mine``, ``merge``, ``adjudicate``, ``place_verdicts``, ``synthesize``,
+    ``plan_filing`` and ``persist``.
 
-    Every LLM / MCP / git side effect is one of the seam parameters above
-    -- this function performs no I/O and calls no model except through
-    them. ``escalate_fn(*, summary, detail, level) -> bool`` raises one
-    alarm, journaled at *level*, and never raises. *config* is a
-    ``config.LegibilityConfig`` (``config.census.
-    saturation`` drives the mining stop condition; ``config.models.*``
-    drives the ratified static model routing).
-
-    *selection_of* is called once, as soon as mining has drained
-    *batch_source*, and reports which sessions that source selected
-    (``census_window.WindowBatchSource.selection``): the Method evidence, the
-    census-state ``session_watermark`` and the ledger the coded sessions are
-    written to all come from it. A source with no mining window declares so
-    by returning ``None``; the run then ledgers nothing and records null
-    evidence and a null watermark.
-
-    Order: ``preflight_headroom`` first (PRD decision 5 -- one tiny probe,
-    Haiku-tier per ``config.models.trickle``). A failed probe DEFERS the
-    whole census: files one INFO escalation via *escalate_fn* naming the
-    deferral, logs loudly, and returns immediately -- no batch is pulled
-    from *batch_source*, no ``submit_fn``/``codebook.dump``/
-    ``census_state.advance`` call happens.
-
-    There is a SECOND headroom gate, after mining and before ``verify_fn``
-    (``_stage_headroom_gate``, skipped when there is nothing to verify).
-    Mining is long and expensive, so a cap absent at preflight can easily
-    have arrived by the time verification starts -- and verification is
-    where an unnoticed cap goes SILENT rather than loud, because the
-    default verifier fails closed per cluster and would record every
-    cap-poisoned call as an ordinary rejection. A mid-run cap detected
-    INSIDE verification surfaces as ``CensusHeadroomExhausted`` and lands
-    on this same path. Both defer through ``_defer``, so all three aborts
-    emit an identical log/escalation/outcome shape, and all three return
-    BEFORE any persistence -- nothing is ledgered, so every session is
-    re-mined by the next run. The ``Deferred`` outcome's ``stage``/``counts`` tell the two
-    apart. Otherwise falls through to the
-    happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
-    the pre-screen (``prescreen.screen``: a title or session already
-    catalogued is not verified) -> merge the routed batch via
-    ``codebook.apply_coding_records``, purely, and group the payloads left to
-    verify by the candidate id each resolved to -> ``verify_fn``
-    (Sonnet, ``census_verify``, asserts observations vs current main, never
-    diagnoses -- lesson guards-assert-unverified-diagnoses) -> apply
-    ``codebook_lifecycle.promote_candidate``/``reject_candidate`` to the
-    candidate each reply names by ``CANDIDATE_KEY`` (a
-    promoted entry takes the cluster Verdict's severity and severity_reason,
-    and a verified cluster *verify_fn* returned without a Verdict gets the
-    verdict parser's defaults) and ``retire_entry`` for any entry ids
-    *verify_fn* reports fixed; contract finding keys are stamped at promotion
-    and at a verdict-bearing rejection (``census_findings``, areas from
-    ``finding_area.load_area_map``) -- ``prescreen.place`` decides where each
-    verified cluster goes: a verdict at a live keyed entry's location attaches
-    to that entry (``prescreen.attach_by_key``), one at only a fixed entry's
-    is promoted afresh and surfaced, and a promotion at a finding another
-    instrument's newest record keys adopts that key
-    (``prescreen.load_instrument_findings``) -- and every entry sighted this run has the
-    run appended to its ``last_seen_runs``; the similarity stage that screens,
-    attaches and queues by embedding is plans/census-incremental-prd.md L7
-    (``similarity.build_view``) -> synthesis over this run's findings
-    (plans/census-incremental-prd.md L10): ``synthesis.Brief`` holds the keyed
-    entries this run created or re-observed, ``synthesize_fn`` (Fable,
-    ``census_synthesis``, tool-less) is called only when it is not empty, and
-    ``synthesis.parse`` validates its reply whole -- an invalid one is
-    "synthesis unavailable", one info escalation, and the run goes on -- then
-    its phase refinements reach the verified clusters and this run's new
-    entries -> ``compute_matrix``/``render_matrix`` over the refined verified
-    sightings -> ``codebook.validate`` (raises and aborts BEFORE
-    anything is written, on an invalid merge) -> the route gate
-    (``disposition.files``, contract §6: a structural verdict stays promoted
-    and is listed under ## Structural, never filed) -> the singleton filing
-    gate over the mechanical rest (``_filing_gate``: a verified cluster
-    files only with an in-tree remediation or a recurrence, counted in the
-    merged codebook at the title of the entry it lands on, after a key
-    attach; a withheld one stays promoted, is marked withheld on a new
-    entry and is listed in the report unless its entry files this run, while
-    one whose verdict was dropped is neither filed nor listed)
-    -> ``disposition.backfill``, which links every historical
-    ``source=legibility_census`` task to the entry its title was filed under,
-    in the first run it can reach the store -> the outcome feedback of
-    plans/census-incremental-prd.md L5 (D8), over ONE *status_fetcher* read
-    and a second *verify_fn* call inside what *max_verify_clusters* leaves ->
-    ``_filing_queue``, which pairs
-    each fileable cluster with the entry it was promoted to and adds every
-    earlier-withheld entry that has since recurred, carrying the re-filings
-    onto it -> ``build_task_payloads``
-    over that queue -> ``disposition.dispose``, contract §8 over
-    *task_store*: a finding whose key a live, accepted or done task already
-    carries, that a live task matches semantically, or whose key an earlier
-    finding of this run was routed under, is linked to that work and never
-    refiled; the rest go to *submit_fn*, best-effort; and if any key lookup
-    cannot run, NOTHING is filed (work routed for a withheld entry marks it
-    filed, so it is never filed twice; a raised exception, or a result
-    carrying no ticket id, is logged and reported, never counted in
-    ``filed_ticket_ids``) -> each routed decision's C1 back-link onto its
-    entry and the run's ``disposition.with_follow_ups``, then
-    ``disposition.resolve_tickets`` within its D7 budget -> the synthesis
-    corrections, one coding record through ``codebook.apply_coding_records`` ->
-    ``codebook.validate`` again (raises and aborts before any artifact is
-    written) -> write the JSON record beside *report_path*
-    (``build_census_record``) and the
-    report rendered from it -> ``codebook.dump`` -> ``census_state.advance``
-    (watermark from the mining window) -> *gate*, the project's landing gate
-    (``landing_gate.run_gate``) over the checkout now holding those outputs,
-    at a HEAD that held still while it ran (it re-runs a bounded number of
-    times while the merge worker moves HEAD, then refuses):
-    a verdict that does not pass is rolled back exactly as a commit that did
-    not land, and *commit* is never called ->
-    *commit* of report + record + codebook + state -> ledger every merged
-    coding's session (``session_ledger``, only once the commit has landed; a
-    failed write is ``CensusOutcome.ledger_write_error``, never a crash). A
-    *commit* whose ``unlanded.CommitResult`` is not ok after
-    ``unlanded.commit_only``'s bounded lock retries (e.g. refused by the
-    target repo's pre-commit hook) hands every one of those paths to
-    *roll_back*, which quarantines them and
-    restores them to HEAD -- census-state included, so ``last_census_at``
-    is not advanced by a census that did not land -- and the run returns
-    ``Unlanded`` (see ``_unlanded``).
-
-    A cluster whose fix surface belongs to *harness_project*
-    (``filing_policy.resolve_target``) files into that project's task tree:
-    the dedup lookups, the curator and ``resolve_ticket`` all run against
-    that project_root, which the report and
-    ``CensusOutcome.cross_project_tickets`` name.
-
-    The report write, ``codebook.dump``, and ``census_state.advance`` run
-    in that fixed order, with nothing else in between the latter two, to
-    keep as small as possible the window in which a mid-pipeline failure
-    could leave on-disk state inconsistent: a failure before
-    ``codebook.dump`` leaves at most the report written (harmless -- a
-    plain re-run regenerates it); a failure inside ``census_state.advance``
-    itself (the one residual risk -- e.g. a disk-full atomic-write failure)
-    leaves the codebook advanced ahead of census-state.json on disk.
-    Recovery for that residual case is a plain re-run:
-    ``codebook.apply_coding_records`` dedups merged sightings/candidates by
-    session, and a promoted/rejected candidate is no longer ``"pending"``,
-    so re-mining the same window is idempotent rather than double-counted.
-    A storm batch encountered during mining (see ``mine_to_saturation``) is
-    logged loudly and called out in the report's cost note rather than
-    silently folded into a clean-looking result.
-
-    OPERATOR COST CONTROL. *max_batches* bounds mining to that many
-    batches (``--max-batches``). It is the reusable spend brake for a run
-    that cannot rely on saturation to bound itself -- most sharply a FIRST
-    census against an empty codebook, where every batch's ``dup_rate``
-    only measures "the miner found nothing to match" and mining therefore
-    runs to source exhaustion. It defaults to ``None`` = today's
-    behavior: unbounded, no extra rendering. A capped run is deliberately
-    PARTIAL coverage and never pretends otherwise: the report states the
-    cap and says so in as many words, and ``CensusOutcome.stop_reason``
-    is ``"capped"`` -- distinct from the ``"exhausted"`` a source that
-    genuinely ran dry produces. Only coded sessions are ledgered, so the
-    capped-away ones are RESUMED by the next run while they remain inside
-    its retention window, and the report says so. A cap below 1 raises
-    ``ValueError``
-    (see ``mine_to_saturation``) rather than degrading into a half-applied
-    cap.
-
-    *max_verify_clusters* bounds the per-cluster verification spend
-    (``--max-verify-clusters``) to the first N novel clusters the pre-screen
-    leaves, in mining order; the similarity queue and then the re-verifies
-    take only what the novel clusters leave of it. Selection is a plain
-    ``[:N]`` slice in first-payload order -- deterministic given the run,
-    with no invented "most important first" heuristic (any such ranking
-    would need a signal the census does not have pre-verification). The
-    deferred remainder is NOT dropped: the merge already holds each deferred
-    cluster's candidate as ``pending``. A later pickup is
-    CONDITIONAL (see ``VerifyCoverage``): its sessions are ledgered as coded,
-    so a deferred cluster is re-adjudicated only if the same confusion
-    RECURS. What a deferred cluster
-    unconditionally forgoes is this run's adjudication: the matrix and the
-    synthesis necessarily cover only the VERIFIED subset, and the report's
-    ``## Verification`` section states that split rather than letting a
-    bounded run read as a complete one. A cap below 1 raises ``ValueError``
-    up front -- a negative cap would slice from the END of the cluster list
-    rather than bounding it, which is precisely the silently mis-honored cap
-    this flag exists to make impossible.
-
-    *dry_run_payloads_path* switches filing to review mode
-    (``--dry-run-filing``): the dedup protocol stops before the curator, every
-    payload it would have handed *submit_fn* is written there as JSON for a
-    human to read, *submit_fn* is never called, and ``filed_ticket_ids`` stays
-    empty. ONLY the external filing
-    is stubbed -- mining, verification, synthesis, the matrix, the
-    codebook merge and promotions, the report write, ``codebook.dump``
-    and ``census_state.advance`` all proceed exactly as on a normal run,
-    so the payload file is a faithful preview of what a real run would
-    file rather than the output of a half-executed census. The write sits
-    at the same point in the sequence the filing loop occupies (after
-    ``build_task_payloads``, before ``codebook.dump``), preserving the
-    ordering invariant above, and the file is appended to the *commit*
-    paths -- a dry run's deliverable IS the payload file, so it is
-    versioned alongside the report and codebook it came from (and rolled
-    back with them if the commit does not land).
-
-    A dry run is consequently NOT resumable by re-running: the mining, the
-    codebook merge, the promotions, ``codebook.dump`` and
-    ``census_state.advance`` all really happened and its sessions are
-    ledgered as coded, so a later census neither re-mines them nor files
-    these confusions (they now code as ``matches``). The payload file is
-    the sole remaining handle on
-    the remediation work, which is why it is never overwritten: a
-    colliding path is left untouched and the payloads go to a numbered
-    sibling instead (see ``_free_payloads_path``), so ``dry_run.path`` --
-    not the requested path -- is what the report, the commit paths and
-    ``CensusOutcome`` name.
+    Only ``persist`` writes, so a ``Deferred`` -- at preflight or at the
+    verify gate -- persists nothing and a re-run loses nothing. What the
+    operator caps (*max_batches*, *max_verify_clusters*) and
+    *dry_run_payloads_path* cost and leave behind is stated in ``main``'s
+    flag help and in ``VerifyCoverage``.
     """
     run = CensusRun(
         standing=codebook_dict,
@@ -3451,47 +3238,8 @@ def run_census(
             counts=DeferralCounts(),
         )
 
-    # Every output parent, created ONCE, here -- not at each of the four
-    # write sites below. Three reasons, in order of how much they cost when
-    # ignored:
-    #
-    # (1) FAIL-FAST. On 2026-08-03 a census of /home/leo/src/reify mined to
-    #     saturation (~12.5h, ~$100) and only THEN died on its first output
-    #     write: `[Errno 2] No such file or directory:
-    #     '/home/leo/src/reify/plans/confusion-census-2026-08-02-payloads.json'`
-    #     -- reify simply has no plans/ directory. Creating (or failing to
-    #     create) the parents before mining means an un-creatable output path
-    #     costs nothing instead of a whole mining run.
-    # (2) ONE PLACE. report_path, the dry-run payloads, codebook_path and
-    #     census_state_path are four writers of the SAME run's outputs; a
-    #     mkdir at each is lockstep duplication (INV-5) that drifts the moment
-    #     a fifth output is added. Note this covers codebook.dump too, not
-    #     just the two write_text calls: it writes atomically via
-    #     `tempfile.mkstemp(dir=os.path.dirname(path))`, which raises the same
-    #     FileNotFoundError on a missing directory as write_text does.
-    #     census_state.advance creates its own parent, so only the fail-fast
-    #     half applies to it. reify tripped only the plans/ pair because main()
-    #     loads its config from <root>/docs/legibility/legibility.yaml, so
-    #     that directory necessarily existed; a target reached via --config
-    #     pointing elsewhere trips the codebook/state pair identically.
-    #     dark-factory's own plans/ + docs/legibility/ are the ONLY reason
-    #     none of this was ever hit before.
-    #     This "one place" argument is honest only for run_census's OWN four
-    #     paths, so it is not the whole guard: census_state.advance also
-    #     creates its parent writer-side (state_docs.write_state), which
-    #     covers every OTHER caller too. codebook.dump has no such
-    #     writer-side guard yet -- codebook.py sits outside this task's lock
-    #     scope -- so nightly.py's codebook.dump call remains exposed to the
-    #     same FileNotFoundError. Follow-up, not fixed here.
-    # (3) AFTER THE GATE. Sitting below the headroom-defer return rather than
-    #     at the top of run_census keeps the DEFER branch side-effect-free --
-    #     a deferred census creates no empty directories in the target
-    #     project.
-    #
-    # Creating an empty directory is not persisted census state, so the
-    # documented report -> codebook.dump -> census_state.advance ordering
-    # invariant (see this function's docstring and the comments at those
-    # three sites) is untouched by this call.
+    # Before mining, so an uncreatable output path fails fast; after
+    # preflight, so a defer creates nothing.
     _ensure_output_parents(
         report_path, codebook_path, census_state_path, dry_run_payloads_path,
     )
@@ -3789,7 +3537,7 @@ def _build_default_verify_fn(
     wrapper below rather than restated at the three call sites:
 
     * **It is counted.** The result dict carries ``headroom_probes`` -- how
-      many probes this verifier actually spent -- which ``run_census`` folds
+      many probes this verifier actually spent -- which ``adjudicate`` folds
       into the report's cost note. Reported through the return value rather
       than a counter passed in, because the seam is wired by ``main()`` and a
       counter would need a second wiring site nothing forces anyone to
@@ -3805,7 +3553,7 @@ def _build_default_verify_fn(
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
         # Every probe THIS verifier spends, reported back in the result dict
-        # so run_census's cost note can state the run's real probe spend.
+        # so the report's cost note can state the run's real probe spend.
         # It rides the return value rather than a mutable counter passed in
         # because the probe seam is wired by main(), not by run_census: a
         # counter would need a second wiring site that nothing forces anyone
@@ -3819,7 +3567,7 @@ def _build_default_verify_fn(
             *headroom_probe* is an injected seam with no exception contract.
             Production wires ``preflight_headroom``, which folds any failure
             into ``HeadroomResult(ok=False)`` -- but a seam that RAISES here
-            would escape ``_verify_fn``, sail past ``run_census``'s
+            would escape ``_verify_fn``, sail past ``adjudicate``'s
             ``except CensusHeadroomExhausted`` and land in ``main()``'s
             hard-failure path: exit 1 plus a traceback escalation, after the
             whole mining spend, on a path that has ALREADY failed once.
@@ -4142,7 +3890,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     measures "the miner found nothing to match". Both numeric caps take
     ``type=_positive_int``, so a nonsense value (0 or negative) exits 2 at
     the CLI boundary instead of being half-applied. None of the three lets
-    a bounded run masquerade as a complete one -- see ``run_census`` and
+    a bounded run masquerade as a complete one -- see
     ``census_report_sections``.
 
     Each run gets a fresh ``census_identity.RunIdentity``
