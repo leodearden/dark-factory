@@ -29,6 +29,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -3355,6 +3356,104 @@ def test_run_census_runs_its_gate_over_the_written_outputs_then_commits(tmp_path
     assert seen["codebook"] == codebook.load(kwargs["codebook_path"])
     assert seen["codebook"] != kwargs["codebook_dict"]
     assert seen["state"]["last_census_at"] == "2026-07-14"
+
+
+# ---------------------------------------------------------------------------
+# PRD boundary row 16: the effect order a run is observed to take equals the
+# persist order.
+# ---------------------------------------------------------------------------
+
+def _write_labels(kwargs) -> dict[Path, str]:
+    """The journal label of each file a run writes, by path."""
+    report_path = Path(kwargs["report_path"])
+    labels = {report_path.with_suffix(".json"): "write record", report_path: "write report"}
+    if kwargs.get("dry_run_payloads_path") is not None:
+        labels[Path(kwargs["dry_run_payloads_path"])] = "write payloads"
+    return labels
+
+
+def _journaled(effects, journal: list[str], *, labels: dict[Path, str]):
+    """*effects* with every persisting seam appending its label to *journal*
+    before it delegates, so the real writes still happen."""
+    def logged(label, seam):
+        def call(*args, **kwargs):
+            journal.append(label)
+            return seam(*args, **kwargs)
+
+        return call
+
+    def write_text(path, text):
+        journal.append(labels[Path(path)])
+        return effects.write_text(path, text)
+
+    return dataclasses.replace(
+        effects,
+        submit_fn=logged("file tickets", effects.submit_fn),
+        write_text=write_text,
+        dump_codebook=logged("dump codebook", effects.dump_codebook),
+        advance_state=logged("advance state", effects.advance_state),
+        gate=logged("gate", effects.gate),
+        commit=logged("commit", effects.commit),
+        roll_back=logged("roll back", effects.roll_back),
+        record_codings=logged("ledger", effects.record_codings),
+    )
+
+
+def test_row16_a_commit_that_does_not_land_after_filing_rolls_back_last(tmp_path):
+    rollback = unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",))
+    kwargs = _unlanded_kwargs(tmp_path, roll_back=_make_fake_roll_back(rollback))
+    journal: list[str] = []
+    kwargs["effects"] = _journaled(kwargs["effects"], journal, labels=_write_labels(kwargs))
+
+    outcome = _unlanded(mod.run_census(**kwargs))
+
+    assert outcome.rollback is rollback
+    assert outcome.filed_ticket_ids == ("tkt_1",)
+    assert journal == [
+        "file tickets", "write record", "write report", "dump codebook", "advance state",
+        "gate", "commit", "roll back",
+    ]
+
+
+def test_row16_a_dry_run_its_gate_refuses_writes_its_payloads_first_and_never_commits(tmp_path):
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    kwargs = _mined_run_kwargs(
+        tmp_path,
+        dry_run_payloads_path=payloads_path,
+        gate=_make_fake_gate(_refusing_gate_verdict(landing_gate.GateStatus.FAILED)),
+        commit=_poison("commit"),
+        roll_back=_make_fake_roll_back(
+            unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",)),
+        ),
+    )
+    submit_fn = kwargs["effects"].submit_fn
+    journal: list[str] = []
+    kwargs["effects"] = _journaled(kwargs["effects"], journal, labels=_write_labels(kwargs))
+
+    _unlanded(mod.run_census(**kwargs))
+
+    assert submit_fn.calls == []
+    assert journal == [
+        "write payloads", "write record", "write report", "dump codebook", "advance state",
+        "gate", "roll back",
+    ]
+
+
+def test_row16_a_submit_that_raises_is_reported_and_the_run_still_lands(tmp_path):
+    def raising_submit(**payload):
+        raise RuntimeError("the curator is down")
+
+    kwargs = _mined_run_kwargs(tmp_path, submit_fn=raising_submit, commit=_make_fake_commit())
+    journal: list[str] = []
+    kwargs["effects"] = _journaled(kwargs["effects"], journal, labels=_write_labels(kwargs))
+
+    outcome = _done(mod.run_census(**kwargs))
+
+    assert outcome.filed_ticket_ids == ()
+    assert journal == [
+        "file tickets", "write record", "write report", "dump codebook", "advance state",
+        "gate", "commit",
+    ]
 
 
 # ---------------------------------------------------------------------------
