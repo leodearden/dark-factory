@@ -2009,6 +2009,59 @@ def test_dependency_free_module_loads_before_its_consumers(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: classic modules that destructure other classic modules'
+# globals at module scope are served, versioned, and load after every module
+# they read and before every consumer that reads them (task 8461)
+#
+# One row per module: (the modules whose globals it reads, its consumers).
+# Each edge is its own case, because each blanks a different surface.
+# ---------------------------------------------------------------------------
+
+_READING_MODULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    'quality_view.js': (('chart_marks.js',), ()),
+}
+_READING_MODULE_EDGES = [
+    edge
+    for module, (reads, consumers) in _READING_MODULES.items()
+    for edge in [*((read, module) for read in reads),
+                 *((module, consumer) for consumer in consumers)]
+]
+
+
+@pytest.mark.parametrize('module', list(_READING_MODULES))
+def test_reading_module_is_served(client, module: str) -> None:
+    """The module is reachable at runtime, not merely tagged in index.html."""
+    resp = client.get(f'/static/redux/{module}')
+    assert resp.status_code == 200, f'expected 200 for /static/redux/{module}, got {resp.status_code}'
+
+
+@pytest.mark.parametrize('module', list(_READING_MODULES))
+def test_reading_module_has_cache_buster(index_html_body: str, module: str) -> None:
+    """The module is present among the VERSIONED redux assets."""
+    assert re.search(rf'/static/redux/{re.escape(module)}\?v=\d+', index_html_body), (
+        f'{module} is not among the versioned /static/redux/* assets in index.html. '
+        'Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+@pytest.mark.parametrize(
+    'before, after',
+    _READING_MODULE_EDGES,
+    ids=[f'{before}-before-{after}' for before, after in _READING_MODULE_EDGES],
+)
+def test_reading_module_load_order(index_html_body: str, before: str, after: str) -> None:
+    """Each read global is defined before the module that destructures it runs."""
+    assert_script_loads_before(
+        index_html_body,
+        f'/static/redux/{before}',
+        f'/static/redux/{after}',
+        before_label=before,
+        after_label=after,
+        consumer_note=f'{after} ' + _READS_AT_MODULE_SCOPE.format(before=before),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 

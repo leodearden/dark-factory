@@ -410,8 +410,8 @@ function qualityHeadline(kind, points, form) {
 // One QUALITY.metrics[id] entry with one point per landing. A null
 // `measuredSince` is the no-producer state (INV-13): its rule names no start
 // and its headline is unknown, saying so. The rolling band is unmeasured
-// (null) at every point, and there is no control chart unless `ewma`,
-// `alarms` or `baseline` are given.
+// (null) at every point unless `rolling` is given, and there is no control
+// chart unless `ewma`, `alarms` or `baseline` are given.
 export function qualityMetric({
   kind = 'rate',
   points,
@@ -419,6 +419,7 @@ export function qualityMetric({
   measuredSince = WIRE_AS_OF,
   source = 'rejections',
   unit = kind === 'rate' ? 'share' : kind === 'cost' ? 'usd' : 'per landing',
+  rolling = null,
   ewma = null,
   alarms = [],
   baseline = NO_BASELINE,
@@ -436,7 +437,7 @@ export function qualityMetric({
     },
     unit,
     points,
-    rolling: { center: unmeasured, lo: unmeasured, hi: unmeasured, n: points.map(() => 0) },
+    rolling: rolling ?? { center: unmeasured, lo: unmeasured, hi: unmeasured, n: points.map(() => 0) },
     ewma,
     alarms,
     baseline,
@@ -458,5 +459,43 @@ export function qualityPayload({ axis, metrics, gitCheck = NO_GIT_DISAGREEMENT }
     modules: [],
     before_after: [],
     git_check: gitCheck,
+  };
+}
+
+// One QUALITY_MARKERS.value.markers entry, as
+// dashboard/src/dashboard/data/quality_markers.py::Marker.to_wire serves it
+// (that method owns the shape): a derived reviewer effort change in
+// dark_factory placed at landing `ordinal`, applying to every series unless
+// `series` names some. A range (an artefact) also names its `untilOrdinal`.
+export function qualityMarker({
+  id,
+  ordinal,
+  kind = 'effort',
+  label = `marker ${id}`,
+  series = null,
+  untilOrdinal = null,
+  until = null,
+  ref = null,
+  at = WIRE_AS_OF,
+  scope = 'dark_factory',
+  source = { type: 'routing', role: 'reviewer_comprehensive' },
+  tasks = [],
+}) {
+  return { id, at, ordinal, until_ordinal: untilOrdinal, kind, scope, series, until, label, source, ref, tasks };
+}
+
+// The QUALITY_MARKERS Datum's value, as quality_markers.py::MarkerStream.to_wire
+// serves it: `markers` as given, no availability flag, prompt coverage not yet
+// written, and nothing skipped or unparsed.
+export function qualityMarkers(markers) {
+  return {
+    markers,
+    availability: [],
+    prompt_coverage: {
+      state: 'not_yet_written', since: null, roles_py_landings: null, counted_since: null,
+      reason: 'no routing decision is folded yet',
+    },
+    curated_parse_failures: 0,
+    skipped_records: 0,
   };
 }
