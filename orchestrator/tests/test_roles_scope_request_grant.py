@@ -13,6 +13,7 @@ import pytest
 
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, SIMPLE_TASK
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import plan_tools
 
 _TOOL = 'report_missing_plan_file'
 _GRANT = f'mcp__plan-tools__{_TOOL}'
@@ -30,8 +31,6 @@ def test_roles_without_a_boundary_do_not(role):
 
 @pytest.mark.asyncio
 async def test_granted_name_resolves_to_a_registered_tool(tmp_path: Path):
-    from orchestrator.mcp import plan_tools  # noqa: PLC0415
-
     artifacts = TaskArtifacts(tmp_path)
     artifacts.init('42', 'X', 'desc', base_commit='base')
     server = plan_tools.create_server(artifacts)

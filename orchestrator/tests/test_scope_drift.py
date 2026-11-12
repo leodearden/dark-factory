@@ -54,10 +54,11 @@ class TestScopeRequest:
         assert excinfo.value.field == 'reason'
         assert repr(reason) in str(excinfo.value)
 
-    def test_is_frozen(self):
+    @pytest.mark.parametrize('field_name', [f.name for f in dataclasses.fields(ScopeRequest)])
+    def test_is_frozen(self, field_name):
         request = ScopeRequest('pkg/a.py', 'plan omitted it')
         with pytest.raises(dataclasses.FrozenInstanceError):
-            request.path = 'pkg/b.py'  # type: ignore[misc]
+            setattr(request, field_name, 'other')
 
     def test_mapping_round_trip(self):
         request = ScopeRequest('pkg/a.py', 'plan omitted it')
@@ -162,8 +163,11 @@ class TestBuildScopeDriftReport:
             'contested': {'pkg/b.py': '777'},
         }
 
-    def test_report_is_frozen(self):
+    @pytest.mark.parametrize(
+        'field_name', [f.name for f in dataclasses.fields(ScopeDriftReport)]
+    )
+    def test_report_is_frozen(self, field_name):
         report = _report(['pkg/a.py'])
         assert isinstance(report, ScopeDriftReport)
         with pytest.raises(dataclasses.FrozenInstanceError):
-            report.reason = 'other'  # type: ignore[misc]
+            setattr(report, field_name, 'other')

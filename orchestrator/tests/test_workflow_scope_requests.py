@@ -11,20 +11,20 @@ and no outcome re-pends or escalates.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
-from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import FakeScheduler
 from shared.testing import make_gate_mock
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import PlanState, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.scope_drift import (
     IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT,
     IMPLEMENT_SCOPE_EXPANDED,
@@ -40,7 +40,18 @@ _REQUESTED = 'pkg/b.py'
 _HOLDER = '777'
 
 
-def _make_workflow(tmp_path: Path) -> tuple[TaskWorkflow, FakeScheduler, _RecordingEventStore]:
+@dataclass(frozen=True)
+class _Rig:
+    wf: TaskWorkflow
+    scheduler: FakeScheduler
+    events: EventStore
+    cfg: MagicMock
+    implementer_prompt: AsyncMock
+    debugger_prompt: AsyncMock
+    amender_prompt: AsyncMock
+
+
+def _make_workflow(tmp_path: Path) -> _Rig:
     assignment = MagicMock()
     assignment.task_id = _TASK_ID
     assignment.task = {
@@ -73,12 +84,16 @@ def _make_workflow(tmp_path: Path) -> tuple[TaskWorkflow, FakeScheduler, _Record
     git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     git_ops.get_commit_subjects = AsyncMock(return_value=[])
 
+    implementer_prompt = AsyncMock(return_value='Implement the plan')
+    debugger_prompt = AsyncMock(return_value='Fix the failure')
+    amender_prompt = AsyncMock(return_value='Amend')
     briefing = MagicMock()
-    briefing.build_implementer_prompt = AsyncMock(return_value='Implement the plan')
-    briefing.build_debugger_prompt = AsyncMock(return_value='Fix the failure')
+    briefing.build_implementer_prompt = implementer_prompt
+    briefing.build_debugger_prompt = debugger_prompt
+    briefing.build_amender_prompt = amender_prompt
 
     scheduler = FakeScheduler()
-    events = _RecordingEventStore()
+    events = EventStore(tmp_path / 'runs.db', 'run-1')
     wf = TaskWorkflow(
         assignment=assignment,
         config=cfg,
@@ -86,7 +101,7 @@ def _make_workflow(tmp_path: Path) -> tuple[TaskWorkflow, FakeScheduler, _Record
         scheduler=scheduler,
         briefing=briefing,
         mcp=MagicMock(),
-        event_store=events,  # type: ignore[arg-type]
+        event_store=events,
     )
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
@@ -94,7 +109,15 @@ def _make_workflow(tmp_path: Path) -> tuple[TaskWorkflow, FakeScheduler, _Record
     wf.artifacts = TaskArtifacts(worktree)
     wf.merge_queue = MagicMock()
     wf._module_configs = []
-    return wf, scheduler, events
+    return _Rig(
+        wf=wf,
+        scheduler=scheduler,
+        events=events,
+        cfg=cfg,
+        implementer_prompt=implementer_prompt,
+        debugger_prompt=debugger_prompt,
+        amender_prompt=amender_prompt,
+    )
 
 
 def _write_dispatched_plan(wf: TaskWorkflow, *, steps: int) -> str | None:
@@ -121,16 +144,25 @@ def _write_dispatched_plan(wf: TaskWorkflow, *, steps: int) -> str | None:
     return stamped.lifecycle.confirmed_at
 
 
-def _stub_loop_collaborators(wf: TaskWorkflow, *, escalations: Callable[[], list] | None = None) -> None:
+def _stub_loop_collaborators(
+    wf: TaskWorkflow,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    escalations: Callable[[], list] | None = None,
+    stub_owner_check: bool = True,
+) -> None:
     assert wf.artifacts is not None
-    wf.artifacts.validate_plan_owner = MagicMock(return_value=True)  # type: ignore[method-assign]
-    wf.artifacts.stamp_plan_provenance = MagicMock()  # type: ignore[method-assign]
-    wf._check_escalations = (  # type: ignore[method-assign]
-        MagicMock(side_effect=escalations) if escalations else MagicMock(return_value=[])
+    if stub_owner_check:
+        monkeypatch.setattr(wf.artifacts, 'validate_plan_owner', MagicMock(return_value=True))
+    monkeypatch.setattr(wf.artifacts, 'stamp_plan_provenance', MagicMock())
+    monkeypatch.setattr(
+        wf,
+        '_check_escalations',
+        MagicMock(side_effect=escalations) if escalations else MagicMock(return_value=[]),
     )
-    wf._get_head_commit = AsyncMock(return_value='head0000')  # type: ignore[method-assign]
-    wf._build_agent_env = MagicMock(return_value=None)  # type: ignore[method-assign]
-    wf._reconcile_done_step_commits = AsyncMock()  # type: ignore[method-assign]
+    monkeypatch.setattr(wf, '_get_head_commit', AsyncMock(return_value='head0000'))
+    monkeypatch.setattr(wf, '_build_agent_env', MagicMock(return_value=None))
+    monkeypatch.setattr(wf, '_reconcile_done_step_commits', AsyncMock())
     wf.usage_gate = make_gate_mock(
         account_count=2,
         detect_cap_hit=MagicMock(return_value=False),
@@ -170,8 +202,8 @@ async def _run_execute_loop(wf: TaskWorkflow) -> WorkflowOutcome:
         return await wf._execute_iterations()
 
 
-def _scope_drift_events(events: _RecordingEventStore) -> list[dict]:
-    return [entry['data'] for (etype, entry) in events.events if etype == EventType.scope_drift]
+def _scope_drift_events(store: EventStore) -> list[dict]:
+    return [row['data'] for row in store.fetch_events_by_type(EventType.scope_drift)]
 
 
 def _scope_drift_kwargs(builder: AsyncMock) -> list[ScopeDriftReport | None]:
@@ -198,10 +230,13 @@ def _assert_never_repended(scheduler: FakeScheduler) -> None:
 
 @pytest.mark.asyncio
 class TestImplementerScopeRequest:
-    async def test_a_free_path_is_locked_and_declared_without_unconfirming_the_plan(self, tmp_path):
-        wf, scheduler, events = _make_workflow(tmp_path)
+    async def test_a_free_path_is_locked_and_declared_without_unconfirming_the_plan(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler, events = rig.wf, rig.scheduler, rig.events
         confirmed_at = _write_dispatched_plan(wf, steps=2)
-        _stub_loop_collaborators(wf)
+        _stub_loop_collaborators(wf, monkeypatch)
 
         outcome = await _run_execute_loop(wf)
 
@@ -221,7 +256,7 @@ class TestImplementerScopeRequest:
             'acquired': [_REQUESTED],
             'contested': {},
         }]
-        second_brief = _scope_drift_kwargs(wf.briefing.build_implementer_prompt)[1]  # type: ignore[attr-defined]
+        second_brief = _scope_drift_kwargs(rig.implementer_prompt)[1]
         assert second_brief is not None
         assert second_brief.acquired == (_REQUESTED,)
         assert wf.artifacts is not None
@@ -231,11 +266,14 @@ class TestImplementerScopeRequest:
         assert widened.lifecycle.confirmed_at == confirmed_at
         assert widened.state is PlanState.STAMPED
 
-    async def test_a_contested_path_advances_nothing_and_is_briefed_with_its_holder(self, tmp_path):
-        wf, scheduler, events = _make_workflow(tmp_path)
+    async def test_a_contested_path_advances_nothing_and_is_briefed_with_its_holder(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler, events = rig.wf, rig.scheduler, rig.events
         scheduler.contested_modules = {_REQUESTED: _HOLDER}
         _write_dispatched_plan(wf, steps=2)
-        _stub_loop_collaborators(wf)
+        _stub_loop_collaborators(wf, monkeypatch)
 
         outcome = await _run_execute_loop(wf)
 
@@ -248,30 +286,31 @@ class TestImplementerScopeRequest:
         assert drift['reason'] == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
         assert drift['acquired'] == []
         assert drift['contested'] == {_REQUESTED: _HOLDER}
-        second_brief = _scope_drift_kwargs(wf.briefing.build_implementer_prompt)[1]  # type: ignore[attr-defined]
+        second_brief = _scope_drift_kwargs(rig.implementer_prompt)[1]
         assert second_brief is not None
         assert second_brief.contested == ((_REQUESTED, _HOLDER),)
 
-    async def test_an_iteration_without_a_request_briefs_no_drift(self, tmp_path):
-        wf, scheduler, events = _make_workflow(tmp_path)
+    async def test_an_iteration_without_a_request_briefs_no_drift(self, tmp_path, monkeypatch):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler, events = rig.wf, rig.scheduler, rig.events
         _write_dispatched_plan(wf, steps=3)
-        _stub_loop_collaborators(wf)
+        _stub_loop_collaborators(wf, monkeypatch)
 
         outcome = await _run_execute_loop(wf)
 
         assert outcome == WorkflowOutcome.DONE
-        briefs = _scope_drift_kwargs(wf.briefing.build_implementer_prompt)  # type: ignore[attr-defined]
+        briefs = _scope_drift_kwargs(rig.implementer_prompt)
         assert len(briefs) == 3
         assert briefs[1] is not None
         assert briefs[2] is None
         assert len(scheduler.acquire_uncontested_calls) == 1
         assert len(_scope_drift_events(events)) == 1
 
-    async def test_requests_are_applied_before_the_escalation_gate(self, tmp_path):
-        wf, _scheduler, _events = _make_workflow(tmp_path)
+    async def test_requests_are_applied_before_the_escalation_gate(self, tmp_path, monkeypatch):
+        wf = _make_workflow(tmp_path).wf
         _write_dispatched_plan(wf, steps=2)
         blocker = SimpleNamespace(severity='blocking', level=0)
-        _stub_loop_collaborators(wf, escalations=lambda: [blocker])
+        _stub_loop_collaborators(wf, monkeypatch, escalations=lambda: [blocker])
 
         outcome = await _run_execute_loop(wf)
 
@@ -307,19 +346,22 @@ def _debugger_reporting_on_first_dispatch(wf: TaskWorkflow):
 
 @pytest.mark.asyncio
 class TestDebuggerScopeRequest:
-    async def test_the_next_debugger_is_briefed_with_the_widened_scope(self, tmp_path):
-        wf, _scheduler, events = _make_workflow(tmp_path)
+    async def test_the_next_debugger_is_briefed_with_the_widened_scope(self, tmp_path, monkeypatch):
+        rig = _make_workflow(tmp_path)
+        wf, events = rig.wf, rig.events
         _write_dispatched_plan(wf, steps=1)
-        _stub_loop_collaborators(wf)
-        wf.config.rebase_before_verify = False
-        wf.config.escalate_preexisting_main_break = False
-        wf.config.max_opaque_timeout_attempts = 3
-        wf.config.max_failure_signature_repeat = 5
-        wf.config.max_verify_attempts = 5
-        wf._run_scoped_verification_with_infra_retry = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[_failing_verify(), _failing_verify(), _passing_verify()],
+        _stub_loop_collaborators(wf, monkeypatch)
+        rig.cfg.rebase_before_verify = False
+        rig.cfg.escalate_preexisting_main_break = False
+        rig.cfg.max_opaque_timeout_attempts = 3
+        rig.cfg.max_failure_signature_repeat = 5
+        rig.cfg.max_verify_attempts = 5
+        monkeypatch.setattr(
+            wf,
+            '_run_scoped_verification_with_infra_retry',
+            AsyncMock(side_effect=[_failing_verify(), _failing_verify(), _passing_verify()]),
         )
-        wf._maybe_file_chronic_flakes = AsyncMock()  # type: ignore[method-assign]
+        monkeypatch.setattr(wf, '_maybe_file_chronic_flakes', AsyncMock())
 
         with (
             patch(
@@ -335,7 +377,7 @@ class TestDebuggerScopeRequest:
         assert drift['role'] == 'debugger'
         assert drift['iteration'] == 1
         assert _plan_files(wf) == [_DECLARED, _REQUESTED]
-        briefs = _scope_drift_kwargs(wf.briefing.build_debugger_prompt)  # type: ignore[attr-defined]
+        briefs = _scope_drift_kwargs(rig.debugger_prompt)
         assert len(briefs) == 2
         assert briefs[0] is None
         assert briefs[1] is not None
