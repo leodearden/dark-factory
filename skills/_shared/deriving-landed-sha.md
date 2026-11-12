@@ -488,9 +488,8 @@ prints nothing. That is the same rule as [`merge-queue/SKILL.md`](../merge-queue
 (`orchestrator/tests/test_rebased_solo_landing_ladder.py` pins each premise against real git.)
 `merge_status`'s patch-id arm
 (`orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed`) applies check
-(c)'s empty-output rule: it classifies containment through the same `git cherry` call
-(`orchestrator/src/orchestrator/merge_lane/landing_evidence.py::_classify_patch_containment`) and
-refuses empty output from a tip that is not an ancestor of main as `not_landed`.
+(c)'s empty-output rule: it classifies containment through the same `git cherry` call and refuses
+empty output from a tip that is not an ancestor of main as `not_landed`.
 
 - **All three pass** → landed. Stamp `{"kind": "merged", "commit": "<M>", "note": "rebased solo
   landing: request <request_id>'s recorded merge_sha; every branch commit patch-equivalent on

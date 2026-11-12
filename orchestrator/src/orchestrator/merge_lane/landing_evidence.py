@@ -1153,10 +1153,9 @@ async def _patch_id_equivalent_on_main(
 async def _unresolvable_endpoints(git_ops: GitOps, *refs: str) -> list[str]:
     """Which of *refs* do NOT resolve to a commit in this repo right now.
 
-    The health re-probe behind the fail-open disambiguation in
-    :func:`branch_work_landed`, whose containment arm treats "the work is
-    genuinely not there" and "``git cherry`` failed" alike, so the way it
-    tells them apart is to ask git a question whose failure is unambiguous.
+    The health re-probe behind :func:`branch_work_landed`'s ``not_contained``
+    arm: before a ``+`` line is believed as "this task never landed", git is
+    asked a question whose failure is unambiguous.
 
     Implemented as ``is_ancestor(ref, ref)``: ``git merge-base --is-ancestor
     X X`` succeeds for every commit (a commit is its own ancestor) and fails
@@ -1392,10 +1391,13 @@ async def _containment_rejection(
         return None
     if containment is PatchContainment.vacuous:
         return await _vacuous_containment_rejection(git_ops, head, upstream, probe)
-    # THE FAIL-OPEN DISAMBIGUATION.  A non-contained answer here would mean
-    # "this task never landed", so it is re-probed rather than believed: both
-    # endpoints were resolved before the call, so if either fails to
-    # re-resolve NOW the answer came from a broken repo and not from the task.
+    if containment is PatchContainment.unreadable:
+        probe['git_error_stage'] = 'patch_id_containment'
+        return LandingReason.git_error
+    # A not_contained answer means "this task never landed", the verdict that
+    # re-dispatches, so it is re-probed before it is believed: both endpoints
+    # were resolved before the call, so if either fails to re-resolve NOW the
+    # repo changed under the call and the answer is not about the task.
     unresolvable = await _unresolvable_endpoints(git_ops, head, upstream)
     probe['containment_unresolvable'] = unresolvable
     probe['containment_recheck'] = 'unhealthy' if unresolvable else 'healthy'
@@ -1429,7 +1431,7 @@ async def branch_work_landed(
     *,
     branch_tip_sha: str | None,
     metadata: dict[str, Any] | None = None,
-    pattern_template: str | None = None,
+    pattern_template: str | None,
     escalation_queue: EscalationQueue | None = None,
     recovery_emission: RecoveryEmissionConfig | None = None,
 ) -> LandingVerdict:
@@ -1558,19 +1560,22 @@ async def branch_work_landed(
       shape", which is recorded as ``no_op_baseline == 'unavailable'`` and is
       not an error).
     - ``net_diff_is_empty`` — the tri-state primitive returned ``None``.
-    - ``patch_id_containment`` — the fail-open disambiguation below.
+    - ``patch_id_containment`` — ``git cherry`` itself failed
+      (``probe['patch_id_containment'] == 'unreadable'``), the re-probe below
+      found an endpoint unresolvable, or the ancestry answer on empty cherry
+      output was unreadable (``probe['containment_by_ancestry'] is None``).
     - ``unexpected_exception`` — with ``probe['exception']`` carrying the
       repr and a traceback logged at WARNING.
 
-    **The fail-open disambiguation.** A ``not_contained`` or ``unreadable``
-    classification would mean "this task never landed", so it is re-probed
-    instead of believed: both endpoints were resolved before the call, so if
-    either fails to re-resolve afterwards the answer came from a broken repo.
-    Which branch was taken is recorded in ``probe['containment_recheck']``
-    (``'healthy'`` / ``'unhealthy'``) and ``probe['containment_unresolvable']``,
-    so a reader can see a genuine negative distinguished from an unreadable
-    repo without re-running git.  The classification itself is recorded in
-    ``probe['patch_id_containment']``.
+    **The not-contained re-probe.** The containment classification is
+    recorded in ``probe['patch_id_containment']``.  A ``not_contained`` one
+    would mean "this task never landed", so it is re-probed instead of
+    believed: both endpoints were resolved before the call, so if either fails
+    to re-resolve afterwards the repo changed under the call.  Which branch was
+    taken is recorded in ``probe['containment_recheck']`` (``'healthy'`` /
+    ``'unhealthy'``) and ``probe['containment_unresolvable']``, so a reader can
+    see a genuine negative distinguished from an unreadable repo without
+    re-running git.
 
     Two legs remain fail-soft rather than fail-closed, recorded here so the
     residue is known rather than discovered: :func:`branch_is_degenerate`
@@ -1589,10 +1594,10 @@ async def branch_work_landed(
     state.  The caller owns the action.
 
     Args:
-        git_ops: A ``GitOps`` instance, or a duck-typed stand-in exposing
-            ``resolve_branch_sha`` / ``find_task_citation_commit`` /
-            ``merge_base_with_main`` / ``find_equivalent_commit`` and a
-            ``project_root``.
+        git_ops: A ``GitOps`` instance, or a stand-in exposing every
+            ``GitOps`` method this function and its helpers call.  A missing
+            one does not raise: it surfaces as ``git_error`` at stage
+            ``unexpected_exception``.
         task_id: Bare task id (no ``task/`` prefix).
         branch: The task's branch name (e.g. ``f'task/{task_id}'``).
         branch_tip_sha: An already-resolved tip for *branch*, or ``None`` to
@@ -1611,7 +1616,9 @@ async def branch_work_landed(
             ``DEFAULT_COMMIT_CITATION_PATTERN``; ``''`` is the project's
             opt-out, so the citation tier answers None and attribution falls
             to the patch-id twin.  A consumer holding an OrchestratorConfig
-            passes ``config.git.commit_citation_pattern``.
+            passes ``config.git.commit_citation_pattern``.  REQUIRED-BY-KEYWORD
+            for the same reason as *branch_tip_sha*: a default would silently
+            apply the default pattern for a caller that forgot the project's.
         escalation_queue: The queue the ``git_error`` storm-escape L1 is filed
             on (see :func:`file_landing_git_error_storm_escalation`).
             ``None`` means "no queue available", which is a SUPPORTED shape
