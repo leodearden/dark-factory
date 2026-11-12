@@ -1,15 +1,20 @@
 """A real quality project for the dashboard tests: a git repo on ``main`` plus its runs.db.
 
 The builders hold no expectations; tests do. ``INVOCATIONS_DDL`` is the ``invocations`` table
-of shared/src/shared/cost_store.py::_SCHEMA and ``FLAKE_OCCURRENCE_DDL`` the
-``flake_occurrence`` table of orchestrator/src/orchestrator/flake_ledger.py::_SCHEMA, copied
-because shared/src/shared/quality_series/rows.py::rows_for reads both and the dashboard does
-not depend on the orchestrator. Event payloads follow
-shared/src/shared/quality_series/landings.py::_DONE_SQL and ::_COALESCED_TRAIN_SQL.
+of shared/src/shared/cost_store.py::_SCHEMA, ``FLAKE_OCCURRENCE_DDL`` the
+``flake_occurrence`` table of orchestrator/src/orchestrator/flake_ledger.py::_SCHEMA and
+``RUNS_DDL`` the ``runs`` table of orchestrator/src/orchestrator/run_store.py::_SCHEMA, copied
+because shared/src/shared/quality_series/rows.py::rows_for and the quality marker derivation
+read them and the dashboard does not depend on the orchestrator. Event payloads follow
+shared/src/shared/quality_series/landings.py::_DONE_SQL and ::_COALESCED_TRAIN_SQL; the
+``routing_decision`` and ``config_reload`` payloads follow
+orchestrator/src/orchestrator/workflow.py::_record_routing_decision and the ``config_reload``
+entry of orchestrator/src/orchestrator/event_store.py::EventType.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -18,6 +23,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from _runs_db_fixture import EventRow, TaskResultRow, write_runs_db
 
@@ -59,6 +65,114 @@ CREATE TABLE IF NOT EXISTS flake_occurrence (
     detail          TEXT    DEFAULT '{}'
 );
 """
+
+
+RUNS_DDL = """\
+CREATE TABLE IF NOT EXISTS runs (
+    run_id         TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL,
+    prd_path       TEXT,
+    started_at     TEXT NOT NULL,
+    completed_at   TEXT,
+    total_tasks    INTEGER DEFAULT 0,
+    completed      INTEGER DEFAULT 0,
+    blocked        INTEGER DEFAULT 0,
+    escalated      INTEGER DEFAULT 0,
+    total_cost_usd REAL DEFAULT 0.0,
+    paused_for_cap INTEGER DEFAULT 0,
+    cap_pause_secs REAL DEFAULT 0.0,
+    code_sha       TEXT
+);
+"""
+
+
+def routing_decision(
+    ts: datetime | str,
+    role: str,
+    *,
+    model: str,
+    effort: str,
+    budget_usd: float,
+    max_turns: int,
+    source_layer: str = 'config',
+    rule_id: str | None = None,
+    prompt_digest: str | None = None,
+) -> EventRow:
+    """One ``routing_decision`` event; the role rides in the payload (write_runs_db sets no role column)."""
+    data: dict[str, Any] = {
+        'role': role, 'model': model, 'effort': effort, 'budget_usd': budget_usd,
+        'max_turns': max_turns, 'source_layer': source_layer, 'rule_id': rule_id,
+        'rejected': [], 'inputs_digest': 'fixture',
+    }
+    if prompt_digest is not None:
+        data['prompt_digest'] = prompt_digest
+    return (ts, None, 'routing_decision', data)
+
+
+def config_reload(
+    ts: datetime | str,
+    *,
+    applied: Mapping[str, object] | None = None,
+    restart_required: Mapping[str, object] | None = None,
+) -> EventRow:
+    """One ``config_reload`` report; each change maps a config path to ``{old, new}`` (or, to
+    write a malformed report, to anything else)."""
+    return (ts, None, 'config_reload', {
+        'reloaded': True,
+        'applied': dict(applied or {}),
+        'restart_required': dict(restart_required or {}),
+        'unchanged': 0,
+        'error': None,
+    })
+
+
+def write_runs_rows(
+    store: Path, rows: Iterable[tuple[str, datetime | str, str | None]],
+) -> None:
+    """Add a ``runs`` table to *store* holding each (run_id, started_at, code_sha)."""
+    with closing(sqlite3.connect(store)) as conn:
+        conn.executescript(RUNS_DDL)
+        conn.executemany(
+            "INSERT INTO runs (run_id, project_id, started_at, code_sha) VALUES (?, 'fixture', ?, ?)",
+            [(run_id, _iso(started_at), code_sha) for run_id, started_at, code_sha in rows],
+        )
+        conn.commit()
+
+
+def write_invocations(
+    store: Path, rows: Iterable[tuple[str, str | None, datetime | str]],
+) -> None:
+    """Add an ``invocations`` table to *store* holding each (model, model_id, started_at)."""
+    with closing(sqlite3.connect(store)) as conn:
+        conn.executescript(INVOCATIONS_DDL)
+        conn.executemany(
+            'INSERT INTO invocations (run_id, project_id, account_name, model, role, '
+            'started_at, completed_at, model_id) '
+            "VALUES ('run-fixture', 'fixture', 'fixture', ?, 'implementer', ?, ?, ?)",
+            [
+                (model, _iso(started_at), _iso(started_at), model_id)
+                for model, model_id, started_at in rows
+            ],
+        )
+        conn.commit()
+
+
+def append_events(store: Path, events: Iterable[EventRow]) -> None:
+    """Append *events* to an existing runs.db, after every row already in it."""
+    with closing(sqlite3.connect(store)) as conn:
+        conn.executemany(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, data) VALUES (?, ?, ?, ?, ?)',
+            [
+                (_iso(timestamp), f'run-{task_id}', task_id, event_type,
+                 data if isinstance(data, str) else json.dumps(dict(data)))
+                for timestamp, task_id, event_type, data in events
+            ],
+        )
+        conn.commit()
+
+
+def _iso(instant: datetime | str) -> str:
+    return instant.isoformat() if isinstance(instant, datetime) else instant
 
 
 def write_quality_runs_db(
