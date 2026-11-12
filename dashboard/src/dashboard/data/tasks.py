@@ -767,7 +767,7 @@ async def fetch_statuses(
 
 @dataclass(frozen=True, slots=True)
 class TaskProse:
-    """One task's description and details, as the Task Detail pane renders them."""
+    """One task's description and details, read on demand because task rows omit both."""
 
     description: str
     details: str
@@ -844,7 +844,7 @@ async def _read_task(
 
 
 def _prose_of(result: dict) -> TaskProse:
-    """Missing prose normalises to ``''``, as :func:`_shape_task` does for ``description``."""
+    """Missing prose normalises to ``''``."""
     return TaskProse(result.get('description') or '', result.get('details') or '')
 
 
@@ -864,16 +864,17 @@ async def fetch_task_prose(
     *,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> TaskProseRead:
-    """Read ONE task's description/details for the Tasks tab's Task Detail pane.
+    """Read ONE task's description/details on demand.
 
-    The task rows (``TASKS_SNAPSHOT[p].rows``) omit both fields; the pane
-    fetches them here for the selected task only. Each outcome is its own type
+    The task rows (``TASKS_SNAPSHOT[p].rows``) omit both fields; the Task
+    Detail pane fetches them here for the selected task, and the Escalations
+    drawer for the linked one. Each outcome is its own type
     because the route answers each with a different status:
     :class:`TaskProse`, :class:`TaskNotFound` or :class:`TaskReadOffline`,
     classified by :func:`_read_task`.
 
     *timeout* is per HTTP request; the caller bounds the whole read.
-    Uncached, deliberately: a primary-key lookup fetched only on selection.
+    Uncached, deliberately: a primary-key lookup fetched only when a task is opened.
     """
     return await _read_task(
         client, config, project_root, task_id,
