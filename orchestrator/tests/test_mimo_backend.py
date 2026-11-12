@@ -6,6 +6,7 @@ Fixtures follow the shapes measured in plans/mimo-code-harness-probe-2026-11.md.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 
 import pytest
@@ -24,6 +25,7 @@ from orchestrator.agents.mimo_backend import (
     mimo_session_list_argv,
     mimo_variant,
     parse_mimo_sessions,
+    read_mimo_sessions,
 )
 
 TOKEN = 'tp-secret-value'
@@ -324,3 +326,67 @@ class TestParseMimoSessions:
         )
         assert result.success is False
         assert result.stderr == 'boom'
+
+
+class _FakeSessionStore:
+    """An injected spawn answering the session-list and export argvs, recording each argv."""
+
+    def __init__(self, ids=('ses_a', 'ses_b'), *, listing=None, exports=None):
+        self.calls: list[list[str]] = []
+        self.listing = listing if listing is not None else _subprocess_result(
+            stdout=json.dumps([{'id': sid} for sid in ids]),
+        )
+        self.exports = exports or {}
+
+    async def __call__(self, argv: list[str]) -> _SubprocessResult:
+        self.calls.append(argv)
+        if argv[1:3] == ['session', 'list']:
+            return self.listing
+        assert argv[1] == 'export'
+        sid = argv[2]
+        return self.exports.get(sid) or _subprocess_result(stdout=json.dumps(measured_export(sid)))
+
+
+class TestReadMimoSessions:
+
+    async def test_lists_then_exports_every_session_in_order(self):
+        spawn = _FakeSessionStore()
+        exports = await read_mimo_sessions(spawn)
+        assert exports == [measured_export('ses_a'), measured_export('ses_b')]
+        assert spawn.calls == [
+            mimo_session_list_argv(), mimo_export_argv('ses_a'), mimo_export_argv('ses_b'),
+        ]
+
+    @pytest.mark.parametrize('bad_export', [
+        _subprocess_result(stdout=json.dumps(measured_export('ses_a')), returncode=1),
+        _subprocess_result(stdout='not json'),
+        _subprocess_result(stdout='[1, 2]'),
+    ])
+    async def test_an_unusable_export_is_skipped_with_a_warning(self, bad_export, caplog):
+        spawn = _FakeSessionStore(exports={'ses_a': bad_export})
+        with caplog.at_level(logging.WARNING, logger='orchestrator.agents.mimo_backend'):
+            exports = await read_mimo_sessions(spawn)
+        assert exports == [measured_export('ses_b')]
+        assert 'ses_a' in caplog.text
+
+    @pytest.mark.parametrize('listing', [
+        _subprocess_result(stdout='[{"id": "ses_a"}]', returncode=1),
+        _subprocess_result(stdout=''),
+        _subprocess_result(stdout='{not json'),
+        _subprocess_result(stdout='{"id": "ses_a"}'),
+    ])
+    async def test_an_unusable_listing_reads_nothing_with_a_warning(self, listing, caplog):
+        spawn = _FakeSessionStore(listing=listing)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.agents.mimo_backend'):
+            exports = await read_mimo_sessions(spawn)
+        assert exports == []
+        assert spawn.calls == [mimo_session_list_argv()]
+        assert caplog.records
+
+    async def test_an_entry_without_an_id_is_skipped(self):
+        spawn = _FakeSessionStore(listing=_subprocess_result(
+            stdout=json.dumps([{'title': 'no id'}, {'id': 'ses_b'}]),
+        ))
+        exports = await read_mimo_sessions(spawn)
+        assert exports == [measured_export('ses_b')]
+        assert spawn.calls == [mimo_session_list_argv(), mimo_export_argv('ses_b')]
