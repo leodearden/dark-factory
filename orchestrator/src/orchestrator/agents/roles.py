@@ -407,6 +407,12 @@ _PLAN_DEVIATION_TOOLS = [
     'mcp__plan-tools__' + _RECORD_STEP_DEVIATION,
 ]
 
+# Only the writers whose sessions end at a scope-request boundary
+# (workflow.py::TaskWorkflow._apply_scope_requests) hold this.
+_SCOPE_REQUEST_TOOLS = [
+    'mcp__plan-tools__report_missing_plan_file',
+]
+
 # The writer-facing metadata vocabulary spliced onto the tail of
 # _MEMORY_INSTRUCTIONS (task 3202, PRD docs/prds/memory-metadata-vocabulary.md
 # leaf iota).  Before it, the word `metadata` did not appear anywhere in the
@@ -758,8 +764,11 @@ The server runs the same checks as a backstop, in this order:
 # The Scope Boundary section shared (in substance) by IMPLEMENTER, DEBUGGER,
 # and SIMPLE_TASK (task 4370): the sandbox enforces WORKTREE containment, not
 # per-file plan scope, so every file inside the worktree is writable and
-# staying within the plan's assigned files is the agent's own responsibility,
-# self-reported via `escalate_blocker(category='scope_violation')`.
+# staying within the plan's assigned files is the agent's own responsibility.
+# IMPLEMENTER/DEBUGGER report a merely incomplete file list with
+# report_missing_plan_file, which workflow.py::TaskWorkflow._apply_scope_requests
+# locks and declares at the session boundary; a design-level scope question
+# is still `escalate_blocker(category='scope_violation')`.
 #
 # Split into a shared factual paragraph (_SCOPE_BOUNDARY_FACTS) plus a
 # role-specific recourse paragraph (task 4370 review, suggestion 3), so the
@@ -802,13 +811,24 @@ not the sandbox's.
 """
 
 
-# IMPLEMENTER/DEBUGGER's recourse: escalate and keep working in this same
-# session. Concatenated onto _SCOPE_BOUNDARY_FACTS below -- never used alone.
+# IMPLEMENTER/DEBUGGER's recourse: report an incomplete file list and keep
+# working, or escalate a design-level scope question. Concatenated onto
+# _SCOPE_BOUNDARY_FACTS below -- never used alone.
 _SCOPE_BOUNDARY_RECOURSE = """
-If you genuinely need to modify files outside your assigned scope, that is
-the ONLY mechanism to request it: call `escalate_blocker` with
-`category='scope_violation'` BEFORE making the edit, rather than widening
-scope on your own.
+When you need to EDIT an existing file the plan's `files` list omits, decide
+which of two cases it is BEFORE making the edit:
+
+1. The list was merely incomplete: the edit belongs to this task. Call
+   `report_missing_plan_file(path, reason)`, then make the edit and carry on —
+   there is no need to stop. When your session ends the orchestrator takes
+   that file's lock and adds it to the plan's `files`. Your next briefing says
+   whether it was granted or is held by another task. If it is held, revert
+   your edits to it, or escalate as in case 2 naming the holding task.
+2. The file is out of scope for a DESIGN reason — it belongs to another
+   owner's module or another PRD. Call `escalate_blocker` with
+   `category='scope_violation'` and the design reason, before editing it.
+
+CREATING a new file needs no report.
 """
 
 
@@ -1007,7 +1027,7 @@ The workflow for each step is:
 - Run tests frequently to verify your work.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
@@ -1050,7 +1070,7 @@ git add -- .
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,

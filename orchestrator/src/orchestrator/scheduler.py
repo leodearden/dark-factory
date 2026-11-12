@@ -89,7 +89,7 @@ from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.hold_history import HoldHistory
 from orchestrator.id_tie_break import id_tie_break
-from orchestrator.lock_table import ModuleLockTable
+from orchestrator.lock_table import ModuleLockTable, UncontestedAcquisition
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
@@ -1013,6 +1013,9 @@ class SchedulerFacade(Protocol):
         *,
         persist_files: list[str] | None = ...,
     ) -> BlastRadiusResult: ...
+    async def acquire_uncontested(
+        self, task_id: str, modules: list[str], /, *, reason: str,
+    ) -> UncontestedAcquisition: ...
     async def get_status(self, task_id: str, /) -> str | None: ...
     async def get_task(self, task_id: str, /) -> dict | None: ...
     async def update_task(
@@ -8073,6 +8076,33 @@ class Scheduler:
                 task_id,
             )
         return updated
+
+    async def acquire_uncontested(
+        self, task_id: str, modules: list[str], *, reason: str,
+    ) -> UncontestedAcquisition:
+        """The live-slot widen: take every free key of *modules*, name the rest.
+
+        For a task whose workflow is running. Unlike
+        :meth:`handle_blast_radius_expansion`, which re-pends the row and
+        releases every lock on a conflict and so must never be used mid-EXECUTE
+        (task 3090 ruling), this never re-pends, never releases and never
+        writes status. A contested key comes back as a Blocker naming its
+        holder. Acquired keys emit ``lock_acquired`` with *reason* through the
+        single lock-event writer and refresh the module cache through its
+        single writer.
+        """
+        result = self.lock_table.acquire_uncontested(task_id, modules)
+        if result.acquired:
+            self._emit_lock_event(
+                EventType.lock_acquired,
+                task_id=task_id,
+                modules=list(result.acquired),
+                reason=reason,
+            )
+            self._write_module_cache(
+                task_id, sorted(self.lock_table.held_modules(task_id))
+            )
+        return result
 
     async def handle_blast_radius_expansion(
         self,
