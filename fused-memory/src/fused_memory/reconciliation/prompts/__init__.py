@@ -436,10 +436,13 @@ value.\
 # exists for. So the note is RENDERED via render_escalation_boundary_note()
 # rather than pasted: only Stage 2 holds the FIX D escalate_blocker path.
 #
-# The companion mechanism is DISALLOW_ESCALATION_READS in cli_stage_runner.py,
-# which denies the escalation READ tools in every stage, with its write-side
-# counterpart DISALLOW_ESCALATION_WRITES denying the filing tools to Stage 1 and
-# Stage 3 (the stages handed the no-action clause below). This paragraph is not
+# The companion mechanisms are DISALLOW_ESCALATION_READS in cli_stage_runner.py,
+# which denies the escalation READ tools in every stage, and
+# DISALLOW_ESCALATION_RUNTIME_READS, which denies every stage the orchestrator
+# runtime snapshot the harness-less recon server can only answer as "online,
+# nothing running" (task 6553); the write-side counterpart
+# DISALLOW_ESCALATION_WRITES denies the filing tools to Stage 1 and Stage 3 (the
+# stages handed the no-action clause below). This paragraph is not
 # decorative: `--disallowed-tools` OMITS a denied tool from the agent's listing
 # rather than rejecting the call, so without it the agent gets no explanation
 # for the missing tool and can conclude the escalation surface does not exist.
@@ -456,8 +459,12 @@ only — never a project's escalation queue. A question of the form "was an \
 escalation ever filed for task X?" CANNOT be answered from this stage: the \
 escalation READ tools are not available to you here, and any empty or missing \
 escalation result you encounter is NOT evidence that no escalation exists. It \
-means only that you are looking in the wrong store. Never report, infer, or \
-flag "no escalation was filed for task X" on the strength of this connection; \
+means only that you are looking in the wrong store. The orchestrator's live \
+task-runtime snapshot (`get_task_runtime_state`) is withheld from this stage too: \
+no orchestrator is attached to this connection, so that snapshot could only ever \
+claim "online, nothing running", whatever is actually in flight. A task's live \
+status comes from `mcp__fused-memory__get_task`, a read you do hold. Never report, \
+infer, or flag "no escalation was filed for task X" on the strength of this connection; \
 if a finding depends on that question, record what you actually observed and \
 hand the question on rather than asserting an absence.\
 """
