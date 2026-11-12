@@ -1987,7 +1987,7 @@ class TestExemptionSeparatorVariants:
 # sanctioned rise where every added violation was newly SEEN, not new debt:
 #   * task 5269: 650 violations across 47 files in four packages (task 4246 shipped
 #     618 across 20, every one under orchestrator/tests/);
-#   * task 7800: 309 across 90 files in five packages after Rule C learned
+#   * task 7800: 311 across 91 files in five packages after Rule C learned
 #     asyncio.timeout blocks and clock-deadline polls — every added violation newly
 #     SEEN, not new debt (220 across 39 before it), sites rebased in from main
 #     admitted at their measured counts per esc-7800-5 and esc-7800-7.
@@ -2058,6 +2058,7 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'dashboard/tests/test_memory_exchange_isolation.py',
     'dashboard/tests/test_merge_queue_data.py',
     'dashboard/tests/test_quality_sampler.py',
+    'dashboard/tests/test_quality_marker_sampler.py',
     'dashboard/tests/test_escalation_corpus.py',
     'fused-memory/tests/test_harness.py',
     'fused-memory/tests/test_drain_signal_handler.py',
@@ -2140,7 +2141,7 @@ class TestWallClockDeadlineDebtBaseline:
 
     Pre-existing violations — 618 across 20 files when task 4246 shipped the rule,
     650 across 47 files in four packages once task 5269 widened its detection, and
-    309 across 90 files in five packages once task 7800 taught it asyncio.timeout
+    311 across 91 files in five packages once task 7800 taught it asyncio.timeout
     blocks and clock-deadline polls (220 across 39 before; every added one newly
     SEEN, not new debt) — mean a hot default-on rule would turn those packages' lint_commands red
     immediately and stall the merge lane repo-wide — the identical situation Rule B
