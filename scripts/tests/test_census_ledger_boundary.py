@@ -380,6 +380,51 @@ def test_an_unlanded_commit_rolls_back_the_record_and_ledgers_nothing(census):
     assert census.ledger_rows() == []
 
 
+def _journaled(effects, journal: list[str], *, labels: dict[Path, str]):
+    """*effects* with every persisting seam appending its label to *journal*
+    before it delegates, so the real writes still happen."""
+    def logged(label, seam):
+        def call(*args, **kwargs):
+            journal.append(label)
+            return seam(*args, **kwargs)
+
+        return call
+
+    def write_text(path, text):
+        journal.append(labels[Path(path)])
+        return effects.write_text(path, text)
+
+    return dataclasses.replace(
+        effects,
+        submit_fn=logged("file tickets", effects.submit_fn),
+        write_text=write_text,
+        dump_codebook=logged("dump codebook", effects.dump_codebook),
+        advance_state=logged("advance state", effects.advance_state),
+        gate=logged("gate", effects.gate),
+        commit=logged("commit", effects.commit),
+        roll_back=logged("roll back", effects.roll_back),
+        record_codings=logged("ledger", effects.record_codings),
+    )
+
+
+def test_row16_a_landed_run_ledgers_its_sessions_last(census):
+    census.session("S-tango")
+    kwargs = census.kwargs()
+    report_path = kwargs["report_path"]
+    journal: list[str] = []
+    kwargs["effects"] = _journaled(
+        kwargs["effects"], journal,
+        labels={report_path.with_suffix(".json"): "write record", report_path: "write report"},
+    )
+
+    outcome = _done(mod.run_census(**kwargs))
+
+    assert outcome.ledger_rows_written == 1
+    assert journal == [
+        "write record", "write report", "dump codebook", "advance state", "gate", "commit", "ledger",
+    ]
+
+
 def test_row3_a_deletion_shaped_coding_is_skipped_and_never_ledgered(census):
     """A skipped coding was never merged, so its session is not marked coded:
     the next census mines it again. The rest of the run lands and ledgers."""

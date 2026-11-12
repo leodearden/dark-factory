@@ -3443,9 +3443,11 @@ def test_row16_a_submit_that_raises_is_reported_and_the_run_still_lands(tmp_path
     def raising_submit(**payload):
         raise RuntimeError("the curator is down")
 
-    kwargs = _mined_run_kwargs(tmp_path, submit_fn=raising_submit, commit=_make_fake_commit())
+    kwargs = _mined_run_kwargs(tmp_path, commit=_make_fake_commit())
     journal: list[str] = []
-    kwargs["effects"] = _journaled(kwargs["effects"], journal, labels=_write_labels(kwargs))
+    kwargs["effects"] = _journaled(
+        dataclasses.replace(kwargs["effects"], submit_fn=raising_submit), journal, labels=_write_labels(kwargs),
+    )
 
     outcome = _done(mod.run_census(**kwargs))
 
