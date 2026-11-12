@@ -8,6 +8,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import stat
+from pathlib import Path
 
 import pytest
 from _mimo_fixture import measured_export, plan_tools_mcp
@@ -18,11 +20,14 @@ from orchestrator.agents import mimo_backend
 from orchestrator.agents.mimo_backend import (
     MimoEndpoint,
     MimoEndpointMissing,
+    MimoRunHome,
     mimo_config_document,
     mimo_export_argv,
     mimo_permission_rules,
     mimo_run_argv,
+    mimo_run_home,
     mimo_session_list_argv,
+    mimo_spawn_env,
     mimo_variant,
     parse_mimo_sessions,
     read_mimo_sessions,
@@ -391,3 +396,87 @@ class TestReadMimoSessions:
         exports = await read_mimo_sessions(spawn)
         assert exports == [measured_export('ses_b')]
         assert spawn.calls == [mimo_session_list_argv(), mimo_export_argv('ses_b')]
+
+
+OPERATOR_HOME = Path('/home/operator')
+CONFIG_DOCUMENT = {'model': f'mimo-token-plan/{MODEL}', 'provider': {'k': TOKEN}}
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _run_home(system_prompt: str = 'SYS PROMPT'):
+    return mimo_run_home(
+        system_prompt=system_prompt, config_document=CONFIG_DOCUMENT, operator_home=OPERATOR_HOME,
+    )
+
+
+class TestMimoRunHome:
+
+    def test_the_home_holds_the_config_and_instruction_files(self):
+        with _run_home() as home:
+            assert home.root.name.startswith('mimo-home-')
+            assert _mode(home.root) == 0o700
+            assert home.config_path == home.root / 'config' / 'mimocode.json'
+            assert json.loads(home.config_path.read_text()) == CONFIG_DOCUMENT
+            assert _mode(home.config_path) == 0o600
+            assert (home.root / 'config' / 'AGENTS.md').read_text() == 'SYS PROMPT'
+            assert (home.root / 'tmp').is_dir()
+            assert home.operator_home == OPERATOR_HOME
+
+    def test_the_home_value_is_frozen(self):
+        with _run_home() as home:
+            for field in dataclasses.fields(MimoRunHome):
+                with pytest.raises(dataclasses.FrozenInstanceError):
+                    setattr(home, field.name, Path('/elsewhere'))
+
+    def test_the_home_is_removed_after_the_block(self):
+        with _run_home() as home:
+            root = home.root
+        assert not root.exists()
+
+    def test_the_home_is_removed_when_the_block_raises(self):
+        with pytest.raises(RuntimeError, match='body failed'), _run_home() as home:
+            root = home.root
+            raise RuntimeError('body failed')
+        assert not root.exists()
+
+
+class TestMimoSpawnEnv:
+
+    def test_the_child_env_points_mimo_at_the_run_home_and_drops_every_secret(self):
+        base_env = {
+            'PATH': '/usr/local/bin:/usr/bin',
+            'HOME': '/home/operator',
+            'MIMO_API_KEY': 'mimo-secret',
+            'ANTHROPIC_AUTH_TOKEN': TOKEN,
+            'ANTHROPIC_BASE_URL': AMS_ANTHROPIC,
+            'SOME_TOKEN': 'some-secret',
+            'CLAUDE_CODE_OAUTH_TOKEN': 'claude-secret',
+        }
+        with _run_home() as home:
+            env = mimo_spawn_env(base_env, home)
+            assert env['HOME'] == str(home.root)
+            assert env['MIMOCODE_HOME'] == str(home.root)
+            assert env['TMPDIR'] == str(home.root / 'tmp')
+        assert env['PATH'] == '/usr/local/bin:/usr/bin'
+        for name in ('MIMO_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'SOME_TOKEN',
+                     'CLAUDE_CODE_OAUTH_TOKEN'):
+            assert name not in env
+        assert TOKEN not in env.values()
+
+    def test_mimo_is_told_to_stay_offline_and_ignore_claude_code_mcp(self):
+        with _run_home() as home:
+            env = mimo_spawn_env({'HOME': '/home/operator'}, home)
+        assert env['MIMOCODE_ENABLE_ANALYSIS'] == 'false'
+        for flag in ('MIMOCODE_DISABLE_CLAUDE_CODE_MCP', 'MIMOCODE_DISABLE_MODELS_FETCH',
+                     'MIMOCODE_DISABLE_AUTOUPDATE', 'MIMOCODE_DISABLE_CRON',
+                     'MIMOCODE_DISABLE_SHARE'):
+            assert env[flag] == '1'
+
+    def test_the_operator_tool_homes_are_kept(self):
+        with _run_home() as home:
+            env = mimo_spawn_env({'HOME': '/home/operator'}, home)
+        assert env['XDG_CACHE_HOME'] == str(OPERATOR_HOME / '.cache')
+        assert env['CARGO_HOME'] == str(OPERATOR_HOME / '.cargo')
