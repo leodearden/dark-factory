@@ -12,6 +12,7 @@ contract tests stub with.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Mapping
 
 import httpx
@@ -36,6 +37,12 @@ class CannedMCP:
       holding only the requested keys PRESENT on the row. Requesting
       ``metadata`` itself keeps the whole dict. Mirrored, not imported:
       dashboard tests may not depend on fused-memory.
+    * ``fields`` is validated first, as ``fused_memory/server/tools.py::_validate_fields``
+      does through ``task_projection.py::parse_task_projection``: an entry
+      that is neither a row key nor ``metadata.<key>`` with ``<key>``
+      matching ``[A-Za-z_][A-Za-z0-9_]*`` fails the WHOLE read with the
+      server's ``ValidationError`` payload, which the dashboard reads as that
+      URL failing.
     * With :attr:`audit_projection` set, a ``get_tasks`` carrying ``fields``
       serves its rows UNPROJECTED instead, and every ``get`` / ``[]`` / ``in``
       of a key the projection would have dropped lands in
@@ -153,6 +160,10 @@ class CannedMCP:
         }
 
     def _tasks(self, args: dict) -> dict:
+        fields = args.get('fields')
+        refusal = _projection_refusal(fields)
+        if refusal is not None:
+            return refusal
         statuses = args.get('statuses')
         selected = [
             row for row in self.rows
@@ -163,7 +174,6 @@ class CannedMCP:
         if page_size is not None:
             start = args.get('offset') or 0
             selected = selected[start:start + page_size]
-        fields = args.get('fields')
         if fields is not None and self.audit_projection:
             selected = [_audited(row, fields, self.unprojected_reads) for row in selected]
         elif fields is not None:
@@ -188,6 +198,47 @@ class CannedMCP:
 
 
 _METADATA_FIELD_PREFIX = 'metadata.'
+_TASK_ROW_KEYS: tuple[str, ...] = (
+    'id', 'title', 'description', 'details', 'testStrategy', 'status', 'dependencies',
+    'priority', 'subtasks', 'updatedAt', 'metadata', 'claimant_run_id', 'heartbeat_at',
+    'candidate_key',
+)
+"""``task_projection.py::TASK_ROW_KEYS``: the top-level keys a projection may name."""
+_METADATA_KEY_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+_ALLOWED_FIELDS: tuple[str, ...] = (*_TASK_ROW_KEYS, f'{_METADATA_FIELD_PREFIX}<key>')
+
+
+def _projectable(entry: object) -> bool:
+    """Whether ``parse_task_projection`` accepts *entry* as one ``fields`` entry."""
+    if not isinstance(entry, str):
+        return False
+    if entry in _TASK_ROW_KEYS:
+        return True
+    return entry.startswith(_METADATA_FIELD_PREFIX) and bool(
+        _METADATA_KEY_PATTERN.fullmatch(entry.removeprefix(_METADATA_FIELD_PREFIX)),
+    )
+
+
+def _projection_refusal(fields: object) -> dict | None:
+    """The server's answer to a ``get_tasks`` whose *fields* it refuses, else ``None``."""
+    if fields is None:
+        return None
+    if isinstance(fields, (list, tuple)):
+        unprojectable = [entry for entry in fields if not _projectable(entry)]
+        if not unprojectable:
+            return None
+        refused = unprojectable[0]
+    else:
+        refused = fields
+    return {
+        'error': (
+            f'cannot project {refused!r}: fields must be a list of entries drawn from '
+            f'{list(_ALLOWED_FIELDS)}, where <key> matches {_METADATA_KEY_PATTERN.pattern}'
+        ),
+        'error_type': 'ValidationError',
+        'field': refused,
+        'allowed': list(_ALLOWED_FIELDS),
+    }
 
 
 def is_metadata_projection(args: Mapping) -> bool:

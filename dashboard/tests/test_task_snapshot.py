@@ -173,6 +173,41 @@ class TestCannedMCP:
         assert row == {'id': '1', 'metadata': {'files': ['a.py']}}
         assert type(row) is dict
 
+    @pytest.mark.parametrize('audit', [False, True])
+    @pytest.mark.parametrize('refused', [
+        'complexity', 'metadata.delivered-checks', 'metadata.', 'metadata.a.b', 7,
+    ])
+    async def test_a_field_the_server_refuses_fails_the_whole_read(self, refused, audit):
+        canned = CannedMCP(rows=[_raw_row(1, 'pending')])
+        canned.audit_projection = audit
+
+        answer = await canned(None, 'u', 'get_tasks',
+                              {'project_root': '/p', 'fields': ['id', 'title', refused]})
+
+        assert 'tasks' not in answer
+        assert answer['error_type'] == 'ValidationError'
+        assert answer['field'] == refused
+        assert 'metadata.<key>' in answer['allowed']
+
+    async def test_fields_that_are_not_a_list_are_refused_whole(self):
+        canned = CannedMCP(rows=[_raw_row(1, 'pending')])
+
+        answer = await canned(None, 'u', 'get_tasks', {'project_root': '/p', 'fields': 'title'})
+
+        assert answer['error_type'] == 'ValidationError'
+        assert answer['field'] == 'title'
+
+    async def test_every_row_key_and_a_well_formed_metadata_key_are_accepted(self):
+        canned = CannedMCP(rows=[_raw_row(1, 'pending')])
+        row_keys = ['id', 'title', 'description', 'details', 'testStrategy', 'status',
+                    'dependencies', 'priority', 'subtasks', 'updatedAt', 'metadata',
+                    'claimant_run_id', 'heartbeat_at', 'candidate_key']
+
+        answer = await canned(None, 'u', 'get_tasks',
+                              {'project_root': '/p', 'fields': [*row_keys, 'metadata.x_Key_2']})
+
+        assert [row['id'] for row in answer['tasks']] == ['1']
+
 
 # ---------------------------------------------------------------------------
 # TestAcquireSnapshotHappyPath — one unit, two halves, one TTL (step-3)
