@@ -934,11 +934,13 @@ _MIN_SUBSTANTIVE_REASON_LENGTH = 40
 #: any WIDENING of PREFLIGHT_EXEMPT_SCRIPTS requires a deliberate edit in
 #: BOTH this file and fused_memory/utils/store_mutation_preflight.py. The
 #: list is expected to SHRINK as scripts are migrated onto the guard
-#: directly, never to grow -- a newly-written mutating script should call
-#: assert_store_mutation_allowed, not earn an entry here.
+#: directly -- a newly-written mutating script should call
+#: assert_store_mutation_allowed, unless, like these three, it never
+#: touches mem0 or Qdrant and is bounded to scratch substrate.
 EXPECTED_EXEMPT_SCRIPTS = frozenset({
     'bake_off_storage_shape.py',
     'cleanup_test_collections.py',
+    'seed_scratch_reference_graph.py',
 })
 
 
