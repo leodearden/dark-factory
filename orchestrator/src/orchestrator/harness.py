@@ -214,6 +214,11 @@ from orchestrator.slot_lease import (
     suspended_slot_tasks,
     wedged_slot_escalation,
 )
+from orchestrator.stale_l0_strand_identity import (
+    STALE_L0_STRAND_ROLE,
+    STALE_L0_STRAND_ROOT_CAUSE,
+    STALE_L0_STRAND_SENTINEL,
+)
 from orchestrator.startup_steps import (
     EntryFailures,
     StartupJournal,
@@ -13652,9 +13657,6 @@ class Harness:
     # the strand threshold, not by a guard: each sweep dismisses every pending
     # L0, so a strand at the next sweep was filed after this one and has aged
     # past orphan_l0_timeout_secs since (task 4988).
-    _STALE_L0_STRAND_SENTINEL: str = '__stale_l0_strand_sweep__'
-    _STALE_L0_STRAND_ROOT_CAUSE: str = 'stale_l0_strand_sweep'
-    _STALE_L0_STRAND_ROLE: str = 'harness-stale-l0-strand-sweep'
 
     @staticmethod
     def _open_stale_l0_strand_records(
@@ -13673,7 +13675,7 @@ class Harness:
             (
                 (e.id, clustered_by.get(e.id))
                 for e in pending
-                if e.level == 1 and e.root_cause == Harness._STALE_L0_STRAND_ROOT_CAUSE
+                if e.level == 1 and e.root_cause == STALE_L0_STRAND_ROOT_CAUSE
             ),
             key=lambda record: record[0],
         )
@@ -13762,13 +13764,13 @@ class Harness:
                 'listed ids before closing this record.'
             )
             esc = Escalation(
-                id=queue.make_id(self._STALE_L0_STRAND_SENTINEL),
-                task_id=self._STALE_L0_STRAND_SENTINEL,
-                agent_role=self._STALE_L0_STRAND_ROLE,
+                id=queue.make_id(STALE_L0_STRAND_SENTINEL),
+                task_id=STALE_L0_STRAND_SENTINEL,
+                agent_role=STALE_L0_STRAND_ROLE,
                 severity='blocking',
                 category='risk_identified',
                 level=1,
-                root_cause=self._STALE_L0_STRAND_ROOT_CAUSE,
+                root_cause=STALE_L0_STRAND_ROOT_CAUSE,
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_stranded_escalation',
