@@ -2116,10 +2116,13 @@ comes from `cd "$DARK_FACTORY_ROOT" && .venv/bin/python scripts/check_run_comple
 - **Never resolve it when you spawn.** The spawned run resolves it once, in its supersede step
   (C5 step 5), with `resume` and `ran as <run_id>`; resolving it here too would double-resolve it.
   Leave it pending until the spawn reports back, and never re-spawn for it after. A run that
-  handed off still owns it (`/review-all` hands off after phases 0–5 and resolves it only as
-  Phase 6's last act): record the successor session as its owner in the handover's In flight
-  section. A run that filed no tasks files no chain (snippet §0), so nothing else resolves it:
-  resolve it once yourself, `resume` with `ran as <run_id>`.
+  handed off still owns it (`/review-all` hands off after phases 0–5 and resolves it in Phase 6,
+  when the program files its chain): record the successor session as its owner in the handover's
+  In flight section. Only a run whose report's `## Method` block carries "no trigger chain: the
+  run filed no tasks" under `extra` (snippet §0) leaves it to you: resolve it once, `resume` with
+  `ran as <run_id>` from that report. A run that stopped at its own scope/cost go-gate, or ended
+  `abandoned`, `blocked` or `in-progress` without that line, never ran: take it to Leo under
+  Decline, never `resume`.
 - **Decline (C5 step 6).** "Not now": leave it pending, a standing brief item that re-files
   nothing. "End the cadence": `resolve_issue(action='abandon')` on the human gate.
 - **Interim gate.** A `milestone_gate` whose task carries `metadata.trigger_chain.role='human_gate'`
