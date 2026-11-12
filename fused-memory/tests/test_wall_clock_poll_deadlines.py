@@ -512,6 +512,35 @@ class TestNestedDeadlineSpellings:
         assert len(violations) == 1, violations
         assert violations[0].lineno == _line_of(source, 'asyncio.timeout(t)')
 
+    def test_a_per_attempt_block_that_flags_nothing_leaves_the_clock_poll_flagged(self):
+        source = """
+            async def test_x():
+                while loop.time() < deadline:
+                    async with asyncio.timeout(1):
+                        if await probe():
+                            break
+        """
+
+        violations = _rule_c(source)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(source, 'while loop.time()')
+
+    def test_a_per_attempt_block_that_flags_nothing_leaves_the_outer_block_flagged(self):
+        source = """
+            async def test_x():
+                async with asyncio.timeout(t):
+                    while True:
+                        async with asyncio.timeout(1):
+                            if await probe():
+                                break
+        """
+
+        violations = _rule_c(source)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(source, 'asyncio.timeout(t)')
+
 
 class TestResponsiveHelperRegistry:
     """The responsive helpers Rule C recognises and cites exist where it says they do."""

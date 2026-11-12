@@ -1431,17 +1431,21 @@ def _block_deadline(block: ast.AsyncWith) -> tuple[ast.expr, _DeadlineContext] |
 
 
 def _owns_its_waits(node: ast.AST) -> bool:
-    """Return True if *node* opens a scope or is a deadline spelling of its own.
+    """Return True if *node* opens a scope or is a deadline spelling that reports its waits.
 
     Either owns the waits inside it.  A scope's code is its own, and a nested
-    ``asyncio`` deadline block or clock-deadline ``while`` is the innermost deadline
-    on what it contains, so Rule C attributes those waits to it alone and counts one
-    wait once.
+    ``asyncio`` deadline block or clock-deadline ``while`` that Rule C flags is the
+    innermost deadline on what it contains, so its waits are attributed to it alone
+    and one wait is counted once.  A nested spelling that flags nothing — a
+    per-attempt ``asyncio.timeout`` around a non-load-bearing await — owns nothing,
+    so the enclosing deadline still sees the waits inside it.
     """
     if isinstance(node, ast.AsyncWith):
-        return _block_deadline(node) is not None
+        return _block_deadline(node) is not None and _timeout_block_target(node) is not None
     if isinstance(node, ast.While):
-        return _clock_deadline_read(node) is not None
+        return _clock_deadline_read(node) is not None and _awaits(
+            node.body, prune=_owns_its_waits
+        )
     return _opens_scope(node)
 
 
