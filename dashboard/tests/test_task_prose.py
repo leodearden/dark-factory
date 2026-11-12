@@ -282,7 +282,6 @@ class TestFetchTask:
         assert row == {
             'id': 19,
             'title': 'merge attempts as one datum',
-            'description': 'd',
             'status': 'done',
             'priority': 'high',
             'dependencies': [3, 4],
