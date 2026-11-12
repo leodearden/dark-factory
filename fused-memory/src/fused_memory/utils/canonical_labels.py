@@ -69,7 +69,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -650,7 +650,7 @@ def scan_content(
     content: str,
     *,
     group_id: str,
-    known_project_ids: Collection[str] | None = None,
+    known_project_ids: Iterable[str] | None = None,
 ) -> LabelScan:
     """Scan *content* for every task referent it mentions.
 
@@ -710,7 +710,7 @@ def scan_content(
             before the comparison, so case and hyphen/underscore spelling
             differences still count as local.
         known_project_ids: Optional registry of known project ids (any
-            collection; a ``{project_id: project_root}`` mapping works, since
+            iterable, consumed once; a ``{project_id: project_root}`` mapping works, since
             iterating it yields its keys). When non-empty, FOREIGN referents
             naming a project outside it are dropped — own-project referents
             are never dropped by it. When None, empty, or made up entirely of
