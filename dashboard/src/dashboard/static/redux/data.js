@@ -45,6 +45,13 @@ const {
 const PLAIN = Object.freeze({ kind: 'plain' });
 const DATUM = Object.freeze({ kind: 'datum' });
 
+// A keySpec whose value is read from the response body under `bodyKey` rather
+// than under its own DF_DATA key: an on-demand row whose body keys are fixed
+// but whose value depends on the request's param (ON_DEMAND_KEYS.quality).
+function fromBody(bodyKey, spec) {
+  return Object.freeze({ ...spec, bodyKey });
+}
+
 // Endpoint → {DF_DATA key: spec} map, parameterised on the active window chip.
 // Only the four windowed endpoints append ?window=; the rest stay static.
 //
@@ -91,24 +98,31 @@ const NARROWED_POLL_URLS = Object.freeze({
 });
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
-// by the one value its caller already holds. Two declared rows today:
+// by the one value its caller already holds. Three declared rows today:
 // `terminal`, through which tab_tasks.jsx and, via
 // task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
-// `?terminal=<project>`, and `taskProse`, a task's description/details
+// `?terminal=<project>`; `taskProse`, a task's description/details
 // addressed by its row's own uid (`<project>/T-<id>`), which the Task Detail
 // pane reads for the selected task and the Escalations drawer for the linked
-// one.
+// one; and `quality`, the Quality tab's one read, addressed by the canonical
+// query qualityQuery builds.
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
 // the url/key pair is constructed in exactly one place and cannot drift.
 //
-// `key(param)` names BOTH what the response body calls the value and what
-// DF_DATA calls it. That is the same rule endpointsFor's rows already follow,
-// where a row's key name is simultaneously the body key and the DF_DATA key;
-// the only difference here is that the name is BUILT from a parameter instead
-// of written as a literal, which is why these keys cannot be seeded in the
-// DF_DATA block above and why datumFor exists.
+// For a row without `fields`, `key(param)` names BOTH what the response body
+// calls the value and what DF_DATA calls it. That is the same rule
+// endpointsFor's rows already follow, where a row's key name is simultaneously
+// the body key and the DF_DATA key; the only difference here is that the name
+// is BUILT from a parameter instead of written as a literal, which is why
+// these keys cannot be seeded in the DF_DATA block above and why datumFor
+// exists.
+//
+// A row WITH `fields` is answered by a body whose keys are fixed while its
+// value depends on the param, so each field lands under `key(param, field)`,
+// read from the body under the field's own name (fromBody). `key(param)` is
+// the first field's key, which is what useOnDemand reads.
 //
 // Note which half is encoded: the url must survive HTTP parsing, and the key
 // must be the name a caller can look up with the parameter it already holds.
@@ -134,12 +148,29 @@ const ON_DEMAND_KEYS = {
     spec: PLAIN,
     retain: 8,
   },
+  // Not polled: one read costs about a second and its data moves on the
+  // sampler's 600 s tick, and a polled row could not carry ?project=.
+  quality: {
+    url: query => `/api/v2/dashboard/quality?${query}`,
+    key: (query, field = 'QUALITY') => `${field}:${query}`,
+    spec: DATUM,
+    fields: Object.freeze(['QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS']),
+    retain: 4,
+  },
 };
 
 // A task row's uid, `<project>/T-<id>`: the taskProse param. It restates
 // active_tasks.py::task_uid, which builds the uid every served row carries.
 function taskUid(project, id) {
   return `${project}/T-${id}`;
+}
+
+// The quality param: the route's query in one fixed key order, so equal
+// inputs give equal params. An opaque identity, never parsed back.
+function qualityQuery({ project, window: landingWindow, module: moduleName }) {
+  const parts = [['project', project], ['window', landingWindow]];
+  if (moduleName !== null && moduleName !== undefined && moduleName !== '') parts.push(['module', moduleName]);
+  return parts.map(([name, value]) => `${name}=${encodeURIComponent(value)}`).join('&');
 }
 
 // Keys whose array reference is captured at module-load by shell.jsx — mutate
@@ -668,12 +699,12 @@ const ON_DEMAND_HOLE_REASONS = Object.freeze({
 // receipt-stamped Datum once one has landed, else a hole naming what its own
 // request is doing — never datumFor's 'not yet fetched'. A PLAIN row has no
 // Datum to answer with, so asking for one is refused.
-function onDemandDatum(name, param, outcome) {
+function onDemandDatum(name, param, outcome, field) {
   const row = onDemandRow(name);
   if (row.spec !== DATUM) {
     throw new Error(`DF_DATA: on-demand key '${name}' is not datum-kinded, so it has no Datum to answer with`);
   }
-  const value = window.DF_DATA[row.key(param)];
+  const value = window.DF_DATA[row.key(param, field)];
   const view = onDemandView(value, outcome);
   return view === ON_DEMAND_VIEWS.ready ? value : unknownDatumPlaceholder(ON_DEMAND_HOLE_REASONS[view]);
 }
@@ -771,7 +802,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     const receivedAt = deps.now();
     const pacingHoldMs = slownessPacingHoldMs(deps, receivedAt - startedAt);
     const receipt = { servedAt: body.served_at ?? null, receivedAt, window: body.WINDOW ?? null, pacingHoldMs };
-    Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[k], spec, receipt));
+    Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[(spec && spec.bodyKey) || k], spec, receipt));
     recordSuccess(st, startedAt, receivedAt, pacingHoldMs);
     publishReceipt(stateKey, receipt);
     return REFRESH_OUTCOMES.applied;
@@ -1019,12 +1050,19 @@ function onDemandRow(name) {
   return row;
 }
 
+// The {DF_DATA key: spec} map one request for `param` lands.
+function onDemandKeySpecs(name, param) {
+  const row = ON_DEMAND_KEYS[name];
+  if (!row.fields) return { [row.key(param)]: row.spec };
+  return Object.fromEntries(row.fields.map(field => [row.key(param, field), fromBody(field, row.spec)]));
+}
+
 function startOnDemand(name, param, state, depsOverrides, ledger) {
   const row = ON_DEMAND_KEYS[name];
   const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0, pollIntervalMs: undefined };
   const request = refreshOne(
     row.url(param),
-    { [row.key(param)]: row.spec },
+    onDemandKeySpecs(name, param),
     state,
     deps,
     onDemandStateKey(name, param),
@@ -1036,6 +1074,13 @@ function startOnDemand(name, param, state, depsOverrides, ledger) {
 
 function onDemandStateKey(name, param) {
   return `${pollKey(ON_DEMAND_KEYS[name].url(param))}#${name}:${param}`;
+}
+
+// The receipt of the latest landed request for `param` (its served/received
+// instants and WINDOW echo), or null before one lands.
+function onDemandReceipt(name, param) {
+  onDemandRow(name);
+  return window.DF_DATA.__receipt[onDemandStateKey(name, param)] ?? null;
 }
 
 // Per poll state, per row: every param requestOnDemand has asked for and not
@@ -1069,11 +1114,12 @@ function trimOnDemand(name, ledger, limit, state) {
 // entry and its __stale/__receipt records. The __loaded marker goes too, so it
 // never claims a value that is no longer there.
 function forgetOnDemand(name, param, state) {
-  const key = ON_DEMAND_KEYS[name].key(param);
   const stateKey = onDemandStateKey(name, param);
   state.delete(stateKey);
-  delete window.DF_DATA[key];
-  delete window.DF_DATA.__loaded[key];
+  for (const key of Object.keys(onDemandKeySpecs(name, param))) {
+    delete window.DF_DATA[key];
+    delete window.DF_DATA.__loaded[key];
+  }
   delete window.DF_DATA.__stale[stateKey];
   delete window.DF_DATA.__receipt[stateKey];
 }
@@ -1130,7 +1176,9 @@ const DF_DATA_LOADER_API = {
   datumFor,
   ON_DEMAND_KEYS,
   taskUid,
+  qualityQuery,
   requestOnDemand,
+  onDemandReceipt,
   REFRESH_OUTCOMES,
   ON_DEMAND_VIEWS,
   onDemandView,

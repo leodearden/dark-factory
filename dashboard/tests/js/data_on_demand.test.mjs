@@ -764,7 +764,7 @@ const QUALITY_FIELDS = ['QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS'];
 const QUALITY_WINDOW_ECHO = Object.freeze({ requested: '100', served: '100', landings: 100 });
 
 function qualityDatum(value) {
-  return { value, as_of: '2026-11-12T09:00:00+00:00', state: 'exact', reason: null, freshness_bound_seconds: 1200 };
+  return { value, as_of: '2026-11-12T09:00:00+00:00', state: 'fresh', reason: null, freshness_bound_seconds: 1200 };
 }
 
 function qualityBody(overrides = {}) {
