@@ -10,7 +10,8 @@ repo-wide test module that is not a member.
 
 PROVENANCE.  The signature is the "sig09" one from the test-selection seat M2
 of plans/portfolio-review-2026-11-01 (§2.1), adapted from a text regex to the
-AST, so a mention in a docstring or a comment does not count.
+AST, so a mention in prose does not count: a comment, a docstring, an assert
+message, or the value of a :data:`PROSE_KEYWORDS` keyword.
 
 THE DETECTOR IS A FLOOR.  It sees only what a module spells itself: a tree read
 behind a helper imported from elsewhere is not seen.
@@ -40,6 +41,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TIMEOUT_NAME, is_whol
 __all__ = [
     'COMMITTED_CONFIG_NAMES',
     'COMMITTED_DOC_NAMES',
+    'PROSE_KEYWORDS',
     'RepoWideFloors',
     'RepoWideModule',
     'RepoWideSignal',
@@ -71,6 +73,9 @@ COMMITTED_CONFIG_NAMES = (
     'capability-manifest', '.service', 'systemd',
 )
 
+#: Keywords whose value is a message to a reader, like ``pytest.raises(match=...)``.
+PROSE_KEYWORDS = ('match', 'msg', 'reason')
+
 _REPO_ANCHOR_NAME = re.compile(r'_*(PROJECT_ROOT|REPO_ROOT)')
 
 
@@ -89,18 +94,28 @@ _COMMITTED_CONFIG_NAME = _vocabulary_pattern(COMMITTED_CONFIG_NAMES)
 _GIT_LS_FILES = 'ls-files'
 
 
-def _docstring_nodes(tree: ast.Module) -> set[int]:
-    owners = [tree] + [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
-    ]
-    return {
-        id(owner.body[0].value) for owner in owners
-        if owner.body
-        and isinstance(owner.body[0], ast.Expr)
-        and isinstance(owner.body[0].value, ast.Constant)
-        and isinstance(owner.body[0].value.value, str)
-    }
+def _docstring(owner: ast.AST) -> ast.Constant | None:
+    if not isinstance(owner, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+        return None
+    first = owner.body[0] if owner.body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+        return first.value if isinstance(first.value.value, str) else None
+    return None
+
+
+def _prose_roots(tree: ast.Module) -> Iterator[ast.AST]:
+    for node in ast.walk(tree):
+        docstring = _docstring(node)
+        if docstring is not None:
+            yield docstring
+        if isinstance(node, ast.Assert) and node.msg is not None:
+            yield node.msg
+        if isinstance(node, ast.keyword) and node.arg in PROSE_KEYWORDS:
+            yield node.value
+
+
+def _prose_nodes(tree: ast.Module) -> set[int]:
+    return {id(node) for root in _prose_roots(tree) for node in ast.walk(root)}
 
 
 def _is_str_constant(node: ast.AST, value: str) -> bool:
@@ -165,12 +180,12 @@ def _node_signals(node: ast.AST) -> Iterator[RepoWideSignal]:
 
 
 def repo_wide_signals(tree: ast.Module) -> frozenset[RepoWideSignal]:
-    """Every :class:`RepoWideSignal` the module *tree* spells, docstrings excluded."""
-    docstrings = _docstring_nodes(tree)
+    """Every :class:`RepoWideSignal` the module *tree* spells, strings in prose excluded."""
+    prose = _prose_nodes(tree)
     signals: set[RepoWideSignal] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if id(node) not in docstrings:
+            if id(node) not in prose:
                 signals.update(_string_signals(node.value))
             continue
         signals.update(_node_signals(node))
@@ -272,9 +287,10 @@ def _offender_failure(root: Path, offenders: tuple[RepoWideModule, ...]) -> str 
     )
     return (
         f'{len(offenders)} repo-wide test module(s) under {root} are not members '
-        'of the whole-tree guard family. Each reads the repository beyond its '
-        'own imports, so task-role verify must run it on every production diff '
-        'in its leg, and it runs only the family. Add, at module level:\n\n'
+        'of the whole-tree guard family. Each spells a sign, bracketed below, of '
+        'reading the repository beyond its own imports, so task-role verify must '
+        'run it on every production diff in its leg, and it runs only the family. '
+        'Add, at module level:\n\n'
         f'    from {whole_tree_guard_family.__name__} import {WHOLE_TREE_SCAN_TIMEOUT_NAME}\n'
         f'    pytestmark = pytest.mark.timeout({WHOLE_TREE_SCAN_TIMEOUT_NAME})\n\n'
         'or append that timeout element to an existing pytestmark list. Spell it '

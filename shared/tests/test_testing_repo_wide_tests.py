@@ -150,6 +150,34 @@ def test_a_comment_only_mention_yields_no_signals() -> None:
     assert _signals(f'# {_EVERY_WORD}\nvalue = 1\n') == frozenset()
 
 
+@pytest.mark.parametrize('source', [
+    pytest.param(f'assert ok, {_EVERY_WORD!r}\n', id='assert-message'),
+    pytest.param("assert ok, f'see CLAUDE.md about {why}'\n", id='assert-f-string-message'),
+    pytest.param("assert ok, 'see ' + 'OPERATIONS.md'\n", id='assert-concatenated-message'),
+    pytest.param(
+        "with pytest.raises(ValueError, match='orchestrator.yaml'):\n    pass\n", id='match-keyword',
+    ),
+    pytest.param("check(ok, msg='the README says so')\n", id='msg-keyword'),
+    pytest.param("pytest.skip(reason='needs x.service')\n", id='reason-keyword'),
+])
+def test_prose_naming_a_committed_file_yields_no_signals(source: str) -> None:
+    assert _signals(source) == frozenset()
+
+
+@pytest.mark.parametrize(('source', 'signal'), [
+    pytest.param(
+        "assert (root / 'CLAUDE.md').exists(), 'missing'\n",
+        RepoWideSignal.COMMITTED_DOC_NAME,
+        id='asserted-expression',
+    ),
+    pytest.param(
+        "load(path='orchestrator.yaml')\n", RepoWideSignal.COMMITTED_CONFIG_NAME, id='other-keyword',
+    ),
+])
+def test_a_committed_name_outside_prose_still_counts(source: str, signal: RepoWideSignal) -> None:
+    assert _signals(source) == {signal}
+
+
 def test_an_f_string_piece_counts() -> None:
     assert _signals("path = f'{root}/CLAUDE.md'\n") == {RepoWideSignal.COMMITTED_DOC_NAME}
 
