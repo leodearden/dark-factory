@@ -70,7 +70,7 @@ from orchestrator.merge_lane.worker import (
     MergeRequest,
 )
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
-from orchestrator.workflow import _evaluate_merge_thrash
+from orchestrator.workflow import evaluate_merge_thrash
 
 _STOP_TIMEOUT = 30.0
 
@@ -372,7 +372,7 @@ def _fold_through_thrash_ladder(
     ledger = RetryLedger()
     escalations: list[bool] = []
     for outcome in outcomes:
-        verdict = _evaluate_merge_thrash(
+        verdict = evaluate_merge_thrash(
             ledger, ledger.last_merge_outcome_signature, _signature(outcome), threshold,
         )
         ledger = verdict.ledger
@@ -874,7 +874,7 @@ class TestBounceEscalationsNeverFeedTheThrashLadder:
     ``consecutive_merge_thrash`` reaches its threshold of 2 -- a false L1 for
     what is a fresh collision each time.
 
-    Every outcome here is folded through the SHIPPED ``_evaluate_merge_thrash``
+    Every outcome here is folded through the SHIPPED ``evaluate_merge_thrash``
     at the SHIPPED ``max_consecutive_merge_thrash``; the control proves that
     fold escalates on genuinely identical input.
     """
