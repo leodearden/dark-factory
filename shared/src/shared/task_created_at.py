@@ -9,9 +9,12 @@ Two writers fill the pair, and each emits only its own members:
 - ``SqliteTaskBackend.add_task``, the only INSERT into ``tasks``, emits
   :attr:`CreatedAtSource.STAMPED`: the instant the row was created.
 - ``scripts/backfill_task_created_at.py`` fills rows created before the
-  column existed, and emits the other three members, in its preference
-  order: the task's earliest runs.db event, else its un-back-filled
-  ``metadata.pending_since``, else its ``updated_at``.
+  column existed, and emits the other three members. Each names a proxy
+  that is an upper bound on the filing time, and the script keeps the
+  earliest usable one: the task's earliest runs.db event, its un-back-filled
+  ``metadata.pending_since``, or its ``updated_at``, an exact tie going in
+  that order. :attr:`CreatedAtSource.UPDATED_AT` also labels the v4 -> v5
+  migration's copy of ``updated_at`` held in a back-filled ``pending_since``.
 """
 
 from __future__ import annotations

@@ -3,18 +3,23 @@
 
 PRD ``plans/instruments-honesty-prd.md`` decision 3. ``SqliteTaskBackend.add_task``
 stamps every row it creates with ``created_at_source = 'stamped'``. This script
-fills only the rows whose ``created_at`` is still NULL, and records which
-proxy each value came from, in this order:
+fills only the rows whose ``created_at`` is still NULL. Each of the three
+proxies below is an upper bound on when the task was filed, because a task
+exists before any event, pending landing or update touches it. So the script
+stores the earliest usable one and records its source; the list order only
+breaks an exact tie:
 
 1. ``first_event``: the earliest runs.db event for the task id. Events carry
-   no tag, so only tag ``master`` rows are matched to them.
-2. ``pending_since``: ``metadata.pending_since``, unless
-   ``pending_since_backfilled`` marks it as the v4 -> v5 migration's copy of
-   ``updated_at``.
+   no tag, so only tag ``master`` rows are matched to them. A long-waiting
+   task's earliest event is often the starvation watchdog's alarm, not its
+   filing, which is why the event cannot simply win.
+2. ``pending_since``: ``metadata.pending_since``. One marked
+   ``pending_since_backfilled`` is the v4 -> v5 migration's copy of
+   ``updated_at``, so it counts as an ``updated_at`` reading.
 3. ``updated_at``.
 
-A blank or unparseable value falls through to the next source. A row with no
-usable source stays NULL and is counted. Every value is normalised by
+A blank or unparseable value is not usable. A row with no usable source
+stays NULL and is counted. Every value is normalised by
 ``shared.task_timestamp.format_task_timestamp``.
 
 All rows are filled in one ``BEGIN IMMEDIATE`` transaction, and every UPDATE
@@ -96,23 +101,39 @@ def _instant(raw: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _candidates(
+    row: Mapping[str, object], first_event: datetime | None
+) -> tuple[tuple[CreatedAtSource, datetime | None], ...]:
+    """*row*'s filing-time proxies in rank order; None marks an unusable one."""
+    metadata = coerce_task_metadata(row['metadata']) or {}
+    pending_source = (
+        CreatedAtSource.UPDATED_AT
+        if 'pending_since_backfilled' in metadata
+        else CreatedAtSource.PENDING_SINCE
+    )
+    return (
+        (CreatedAtSource.FIRST_EVENT, first_event),
+        (pending_source, _instant(metadata.get('pending_since'))),
+        (CreatedAtSource.UPDATED_AT, _instant(row['updated_at'])),
+    )
+
+
 def choose_created_at(
     row: Mapping[str, object], first_event: datetime | None
 ) -> tuple[CreatedAtSource, str] | None:
-    """The best-ranked usable source for *row*'s filing time, formatted; None if none is usable."""
-    metadata = coerce_task_metadata(row['metadata']) or {}
-    pending_since = (
-        None if 'pending_since_backfilled' in metadata else _instant(metadata.get('pending_since'))
-    )
-    candidates = (
-        (CreatedAtSource.FIRST_EVENT, first_event),
-        (CreatedAtSource.PENDING_SINCE, pending_since),
-        (CreatedAtSource.UPDATED_AT, _instant(row['updated_at'])),
-    )
-    for source, instant in candidates:
-        if instant is not None:
-            return source, format_task_timestamp(instant)
-    return None
+    """The earliest usable candidate for *row*'s filing time, formatted; None if none is usable.
+
+    Every proxy is an upper bound on the filing time; ties go to rank order.
+    """
+    usable = [
+        (source, instant)
+        for source, instant in _candidates(row, first_event)
+        if instant is not None
+    ]
+    if not usable:
+        return None
+    source, instant = min(usable, key=lambda candidate: candidate[1])
+    return source, format_task_timestamp(instant)
 
 
 def earliest_events(conn: sqlite3.Connection) -> FirstEvents:
