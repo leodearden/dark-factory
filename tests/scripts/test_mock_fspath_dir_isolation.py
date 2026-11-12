@@ -30,9 +30,11 @@ from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     MOCK_FSPATH_ROOT_NAMES,
+    STDLIB_MOCK_CLASSES,
     fixture_marker,
     mock_derived_stray_dir_reason,
     mock_derived_stray_dirs,
+    mock_fspath_root_names,
 )
 
 # Reached through the module, never imported: importing a fixture into a test
@@ -70,6 +72,31 @@ class TestMockFspathRootNames:
     def test_it_is_a_sorted_tuple(self) -> None:
         assert isinstance(MOCK_FSPATH_ROOT_NAMES, tuple)
         assert list(MOCK_FSPATH_ROOT_NAMES) == sorted(MOCK_FSPATH_ROOT_NAMES)
+
+    def test_every_name_is_one_plain_path_component(self) -> None:
+        """The guard rmtree's ``cwd / name``, so a name must never reach past the CWD."""
+        assert all(name.isidentifier() for name in MOCK_FSPATH_ROOT_NAMES), MOCK_FSPATH_ROOT_NAMES
+
+
+def _pathlike_class(fspath: str) -> type:
+    return type('Escaping', (), {'__fspath__': lambda self: fspath})
+
+
+class TestMockFspathRootNamesDerivation:
+    """``mock_fspath_root_names`` refuses a name the guard could not safely rmtree."""
+
+    def test_a_class_name_component_is_kept(self) -> None:
+        assert mock_fspath_root_names([_pathlike_class('Plain/mock/1')]) == ('Plain',)
+
+    def test_a_non_pathlike_class_contributes_nothing(self) -> None:
+        assert mock_fspath_root_names([object]) == ()
+
+    @pytest.mark.parametrize('fspath', ['../escape/1', '/abs/1', '', '.'])
+    def test_a_component_that_is_not_a_class_name_is_refused(self, fspath: str) -> None:
+        with pytest.raises(ValueError, match='Escaping') as refused:
+            mock_fspath_root_names([_pathlike_class(fspath)])
+
+        assert repr(fspath) in str(refused.value)
 
 
 class TestMockDerivedStrayDirs:
@@ -151,30 +178,40 @@ def _is_ignored(relpath: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+_SUBPROJECT_PREFIXES = ['', 'fused-memory/', 'orchestrator/']
+
+
 class TestEveryMockDerivedShapeIsGitIgnored:
-    """``.gitignore`` follows ``MOCK_FSPATH_ROOT_NAMES``; a name it lags on goes red here.
+    """``.gitignore`` follows the derived class sets; a name it lags on goes red here.
 
     The subproject prefixes matter because verify runs ``cd <subproject> &&
     pytest``, so a leaked tree lands under the subproject, not the repo root.
     """
 
-    @pytest.mark.parametrize('prefix', ['', 'fused-memory/', 'orchestrator/'])
+    @pytest.mark.parametrize('prefix', _SUBPROJECT_PREFIXES)
     @pytest.mark.parametrize('name', MOCK_FSPATH_ROOT_NAMES)
-    def test_both_shapes_are_ignored(self, name: str, prefix: str) -> None:
-        shapes = {
-            'fspath DIRECTORY': f'{prefix}{name}/mock.data_dir/1/probe',
-            'str()/repr FILE': f"{prefix}<{name} name='mock.x' id='1'>",
-        }
-        uncovered = {
-            shape: (relpath, probed.returncode, probed.stderr)
-            for shape, relpath in shapes.items()
-            if (probed := _is_ignored(relpath)).returncode != 0
-        }
+    def test_the_fspath_directory_shape_is_ignored(self, name: str, prefix: str) -> None:
+        relpath = f'{prefix}{name}/mock.data_dir/1/probe'
+        probed = _is_ignored(relpath)
 
-        assert not uncovered, (
-            f'mock-derived paths a `git add -- .` would stage: {uncovered!r} '
-            '(shape: (path, git check-ignore exit code, stderr)). Add '
-            f'`{name}/` and `<{name}*` to the .gitignore block "Test SQLite '
+        assert probed.returncode == 0, (
+            f'`git add -- .` would stage the mock-derived tree {relpath!r} '
+            f'(git check-ignore exit {probed.returncode}, stderr={probed.stderr!r}). '
+            f'Add `{name}/` to the .gitignore block "Test SQLite artifacts — '
+            'MagicMock path side-effects".'
+        )
+
+    @pytest.mark.parametrize('prefix', _SUBPROJECT_PREFIXES)
+    @pytest.mark.parametrize('mock_class', STDLIB_MOCK_CLASSES, ids=lambda cls: cls.__name__)
+    def test_the_repr_file_shape_is_ignored(self, mock_class: type, prefix: str) -> None:
+        """Every stdlib mock, PathLike or not: ``str(Mock().x)`` is a file name too."""
+        relpath = f'{prefix}{mock_class()}'
+        probed = _is_ignored(relpath)
+
+        assert probed.returncode == 0, (
+            f'`git add -- .` would stage the mock-derived file {relpath!r} '
+            f'(git check-ignore exit {probed.returncode}, stderr={probed.stderr!r}). '
+            f'Add `<{mock_class.__name__}*` to the .gitignore block "Test SQLite '
             'artifacts — MagicMock path side-effects".'
         )
 
@@ -188,12 +225,24 @@ class TestEveryMockDerivedShapeIsGitIgnored:
         )
 
 
-def _nested_run(root: Path, body: str, *, imports: str = ''):
+def _nested_run(
+    root: Path, body: str, *, imports: str = '', extra_files: dict[str, str] | None = None,
+):
     source = f'import os\nfrom pathlib import Path\n{imports}\n\ndef test_leaks():\n{body}\n'
     return run_nested_pytest(root, {
         'conftest.py': binding_conftest(_GUARD_NAME),
         'test_x.py': source,
+        **(extra_files or {}),
     })
+
+
+def _leak_body(mock_class: str) -> str:
+    return f'    Path(os.fspath({mock_class}().data_dir)).mkdir(parents=True)'
+
+
+def _guard_message_for(tree: Path) -> str:
+    """Text only the guard prints: pytest's own report already names the test and file."""
+    return f'left mock-derived directories: {tree}'
 
 
 class TestTheGuardFailsTheRun:
@@ -205,9 +254,7 @@ class TestTheGuardFailsTheRun:
     ) -> None:
         root = tmp_path / mock_class.lower()
         result = _nested_run(
-            root,
-            f'    Path(os.fspath({mock_class}().data_dir)).mkdir(parents=True)',
-            imports=f'from unittest.mock import {mock_class}',
+            root, _leak_body(mock_class), imports=f'from unittest.mock import {mock_class}',
         )
         combined = result.stdout + result.stderr
 
@@ -219,11 +266,7 @@ class TestTheGuardFailsTheRun:
             'the nested TEST must still pass on its own, or this proves nothing '
             f'about the guard. stdout={result.stdout!r} stderr={result.stderr!r}'
         )
-        assert 'test_leaks' in combined, (
-            f'the failure does not name the leaking test. '
-            f'stdout={result.stdout!r} stderr={result.stderr!r}'
-        )
-        assert mock_class in combined, (
+        assert _guard_message_for(root.resolve() / mock_class) in combined, (
             f'the failure does not name the stray tree. '
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
@@ -260,3 +303,38 @@ class TestTheGuardFailsTheRun:
         assert (root / 'data').is_dir(), (
             f'the guard deleted data/. stdout={result.stdout!r} stderr={result.stderr!r}'
         )
+
+    def test_a_tree_present_before_the_test_is_not_blamed(self, tmp_path: Path) -> None:
+        """A stale tree is not this test's leak, and is not the guard's to delete."""
+        root = tmp_path / 'stale'
+        result = _nested_run(root, '    pass', extra_files={'AsyncMock/mock.x/1/probe': ''})
+
+        assert result.returncode == 0, (
+            f'a tree that predates the test failed it. '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert (root / 'AsyncMock' / 'mock.x' / '1' / 'probe').is_file(), (
+            f'the guard deleted a tree it did not see appear. '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+
+    def test_only_the_tree_that_appeared_is_blamed(self, tmp_path: Path) -> None:
+        root = tmp_path / 'stale-and-new'
+        result = _nested_run(
+            root,
+            _leak_body('MagicMock'),
+            imports='from unittest.mock import MagicMock',
+            extra_files={'AsyncMock/mock.x/1/probe': ''},
+        )
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            f'the new MagicMock/ tree did not fail the run. '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert _guard_message_for(root.resolve() / 'MagicMock') in combined, (
+            f'the guard did not report exactly the new tree. '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert not (root / 'MagicMock').exists(), f'{root / "MagicMock"} was left behind'
+        assert (root / 'AsyncMock').is_dir(), 'the guard deleted the pre-existing AsyncMock/ tree'

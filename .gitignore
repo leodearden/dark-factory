@@ -64,20 +64,23 @@ mutants/
 /orchestrator/df_pytest_isolation.py
 
 # ── Test SQLite artifacts — MagicMock path side-effects ──────────────
-# A mock passed where code wants a path leaves one of two shapes: the
-# str(mock)/repr FILE "<ClassName name=... id=...>" (e.g. OverrideStore's
-# SQLite DB) or, via os.fspath(), the DIRECTORY tree "<ClassName>/...".
-# Both lead with the mock's OWN CLASS NAME, not always "MagicMock": every
-# MagicMixin-based stdlib mock does this. AsyncMock is not a MagicMock
-# subclass but shares MagicMixin; it reached a commit in task 4592 because
-# only MagicMock was listed. The names below must cover
-# df_pytest_isolation.py::MOCK_FSPATH_ROOT_NAMES, and
-# tests/scripts/test_mock_fspath_dir_isolation.py fails if they do not.
+# A mock passed where code wants a path leaves one of two shapes, each led
+# by the mock's OWN CLASS NAME, not always "MagicMock". The str(mock)/repr
+# FILE "<ClassName name=... id=...>" (e.g. OverrideStore's SQLite DB) comes
+# from every stdlib mock, df_pytest_isolation.py::STDLIB_MOCK_CLASSES. The
+# os.fspath() DIRECTORY tree "<ClassName>/..." comes only from the
+# MagicMixin-based, PathLike ones, df_pytest_isolation.py::MOCK_FSPATH_ROOT_NAMES.
+# AsyncMock is not a MagicMock subclass but shares MagicMixin; it reached a
+# commit in task 4592 because only MagicMock was listed.
+# tests/scripts/test_mock_fspath_dir_isolation.py fails if a name is missing.
 # Both are containment only: the real fence is the autouse guard
 # df_pytest_isolation.py::_df_no_mock_derived_stray_dirs.
-<MagicMock*
 <AsyncMock*
+<MagicMock*
+<Mock*
 <NonCallableMagicMock*
+<NonCallableMock*
+<PropertyMock*
 <ThreadingMock*
 MagicMock/
 AsyncMock/

@@ -3024,16 +3024,40 @@ def _df_claude_binary_unset(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _mock_fspath_root_names() -> tuple[str, ...]:
+def _public_mock_classes() -> tuple[type, ...]:
+    public = (getattr(unittest.mock, name) for name in unittest.mock.__all__)
+    return tuple(sorted(
+        (c for c in public if isinstance(c, type) and issubclass(c, unittest.mock.NonCallableMock)),
+        key=lambda cls: cls.__name__,
+    ))
+
+
+# Every one's repr, and so str(), is '<ClassName ...>': the FILE shape a mock
+# passed to sqlite3.connect(str(...)) leaves, PathLike or not.
+STDLIB_MOCK_CLASSES = _public_mock_classes()
+
+
+def mock_fspath_root_names(classes: Iterable[type]) -> tuple[str, ...]:
+    """The sorted leading ``os.fspath()`` components of the PathLike mocks in *classes*.
+
+    A class whose instances are not PathLike contributes nothing.  Raises
+    ValueError for a component that is not a plain class name, because the
+    guard rmtree's ``cwd / name`` and a ``..`` or ``/`` would reach past the CWD.
+    """
     names = set()
-    for public in unittest.mock.__all__:
-        candidate = getattr(unittest.mock, public)
-        if not (isinstance(candidate, type) and issubclass(candidate, unittest.mock.NonCallableMock)):
-            continue
+    for cls in classes:
         try:
-            names.add(Path(os.fspath(candidate())).parts[0])
+            fspath = os.fspath(cls())
         except TypeError:
             continue
+        name = next(iter(Path(fspath).parts), '')
+        if not name.isidentifier():
+            raise ValueError(
+                f'os.fspath({cls.__qualname__}()) is {fspath!r}, whose leading '
+                f'component {name!r} is not a class name; the stray-dir guard '
+                'would rmtree outside the CWD with it.'
+            )
+        names.add(name)
     return tuple(sorted(names))
 
 
@@ -3042,7 +3066,7 @@ def _mock_fspath_root_names() -> tuple[str, ...]:
 # adds one is covered with no edit; on 3.13 that is AsyncMock, MagicMock,
 # NonCallableMagicMock and ThreadingMock. AsyncMock is NOT a MagicMock subclass:
 # it shares MagicMixin, which is why a MagicMock-only list missed it.
-MOCK_FSPATH_ROOT_NAMES = _mock_fspath_root_names()
+MOCK_FSPATH_ROOT_NAMES = mock_fspath_root_names(STDLIB_MOCK_CLASSES)
 
 
 def mock_derived_stray_dirs(cwd: Path) -> list[Path]:
@@ -3076,18 +3100,23 @@ def _df_no_mock_derived_stray_dirs(request):
     materialises its repr-derived fspath for real; tasks 3223 (``MagicMock/``)
     and 4592 (``AsyncMock/``) each landed such a tree in a commit.
 
-    FUNCTION scope, like ``_df_git_env_hermetic``, so the failure names the test
-    that leaked.  The CWD is captured at SETUP, so a test that chdir's without
-    restoring cannot hide its tree.  It REMOVES as well as fails, so one
-    polluter does not cascade through the xdist worker's shared CWD.
+    FUNCTION scope, like ``_df_git_env_hermetic``.  The CWD and the trees already
+    in it are captured at SETUP: a test that chdir's without restoring cannot
+    hide its tree, and only a tree that APPEARED during the test is blamed and
+    removed.  So a tree left before the session is never pinned on a test (nor
+    seen until removed by hand; ``.gitignore`` contains it).  Every xdist worker
+    shares one CWD, so the named test is the one whose teardown first saw the
+    tree: usually, not always, the leaker.  Removing it keeps one polluter from
+    failing every later test.
 
-    Deliberately NOT matched: the ``<MagicMock ...>`` repr FILE shape.  It is
+    Deliberately NOT matched: the ``<ClassName ...>`` repr FILE shape.  It is
     contained by ``.gitignore`` and tracked separately by ticket
     ``tkt_0RRXS67RDHVVRVM811KFCAPSX8``.
     """
     cwd = Path.cwd()
+    present_at_setup = set(mock_derived_stray_dirs(cwd))
     yield
-    strays = mock_derived_stray_dirs(cwd)
+    strays = [d for d in mock_derived_stray_dirs(cwd) if d not in present_at_setup]
     for stray in strays:
         shutil.rmtree(stray, ignore_errors=True)
     reason = mock_derived_stray_dir_reason(request.node.nodeid, strays)
