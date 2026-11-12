@@ -117,6 +117,7 @@ from legibility import (  # noqa: E402
     unlanded,
 )
 from legibility import verdict as verdict_mod  # noqa: E402
+from legibility.config import LegibilityConfig  # noqa: E402
 from legibility.task_store import TaskStore  # noqa: E402
 from orchestrator.agents import code_quality  # noqa: E402
 
@@ -645,9 +646,7 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     return HeadroomResult(ok=True, reason=None)
 
 
-def _stage_headroom_gate(
-    invoke, *, model: str, stage: str, probe_count: list | None = None,
-) -> HeadroomResult:
+def _stage_headroom_gate(invoke, *, model: str, stage: str) -> HeadroomResult:
     """Re-probe headroom at a stage boundary, logging which stage asked.
 
     Deliberately NOT a second probe implementation -- it is a thin wrapper
@@ -655,10 +654,6 @@ def _stage_headroom_gate(
     nothing else, so the "one tiny call, no usage API assumed" decision
     (PRD decision 5) and its fail-safe exception handling hold identically
     at every gate.
-
-    *probe_count* is a one-element mutable counter incremented for every
-    probe this gate spends, so the report's cost note can state what the
-    run ACTUALLY paid rather than a hardcoded literal.
 
     Gates exist only where an unnoticed cap CORRUPTS output, not at every
     stage transition. Today that means the preflight and this one, before
@@ -670,8 +665,6 @@ def _stage_headroom_gate(
     genuinely paid for. Mining is the same: a storm batch is already
     detected and reported. Do not "complete the pattern" by adding them.
     """
-    if probe_count is not None:
-        probe_count[0] += 1
     result = preflight_headroom(invoke, model=model)
     if not result.ok:
         logger.warning(
@@ -1630,6 +1623,14 @@ def _read_statuses(status_fetcher) -> tuple[Mapping[str, Any] | None, str | None
         return None, str(exc)
 
 
+@dataclass(frozen=True)
+class _Reverified:
+    """The re-verify call's reverifications, and the headroom probes it reported."""
+
+    reverifications: dict[str, disposition.Reverification]
+    probes: int = 0
+
+
 def _reverify(
     due: Sequence[disposition.Reverify],
     *,
@@ -1637,8 +1638,7 @@ def _reverify(
     verify_fn,
     model: str,
     remaining: int | None,
-    probe_count: list[int],
-) -> dict[str, disposition.Reverification]:
+) -> _Reverified:
     """Re-verify each *due* entry at as_of_sha (D8) in ONE *verify_fn* call,
     the first *remaining* of them when the verify cap sets that, the rest
     deferred. A cap hit inside the call leaves the offered ones inconclusive
@@ -1652,7 +1652,7 @@ def _reverify(
             len(deferred), len(due),
         )
     if not offered:
-        return disposition.reverifications({}, offered=(), deferred=deferred)
+        return _Reverified(disposition.reverifications({}, offered=(), deferred=deferred))
     entries = {entry["id"]: entry for entry in cb.get("entries") or []}
     clusters = [
         {
@@ -1665,18 +1665,19 @@ def _reverify(
         result = verify_fn(clusters, model=model) or {}
     except CensusHeadroomExhausted as exc:
         logger.warning("census: headroom exhausted during re-verification, so it is inconclusive: %s", exc.reason)
-        return disposition.reverifications(
+        return _Reverified(disposition.reverifications(
             {}, offered=offered, deferred=deferred, error=f"headroom exhausted: {exc.reason}",
-        )
-    _count_reported_probes(result, probe_count)
-    return disposition.reverifications(result, offered=offered, deferred=deferred)
+        ))
+    return _Reverified(
+        disposition.reverifications(result, offered=offered, deferred=deferred), _reported_probes(result),
+    )
 
 
-def _count_reported_probes(result, probe_count: list[int]) -> None:
-    """Add the headroom probes a *verify_fn* result reports spending; a result
-    without an int count adds none."""
+def _reported_probes(result) -> int:
+    """The headroom probes a *verify_fn* result reports spending; 0 for a
+    result without an int count."""
     reported = result.get("headroom_probes") if isinstance(result, Mapping) else None
-    probe_count[0] += reported if isinstance(reported, int) else 0
+    return reported if isinstance(reported, int) else 0
 
 
 def _pending_cluster(cb: dict, queued: similarity.QueuedCluster) -> dict:
@@ -1757,14 +1758,16 @@ def _accepted(result: synthesis.Synthesis | synthesis.Unavailable | None) -> syn
 
 
 @dataclass(frozen=True)
-class _Synthesized:
+class Synthesized:
     """A run's synthesis before its corrections: the brief, the document
-    accepted or why none was (None when no call was made), and the run's
-    codebook and verified clusters with its phase refinements applied."""
+    accepted or why none was (None when no call was made), the run's
+    codebook and verified clusters with its phase refinements applied, and
+    the origin x manifestation matrix of those clusters."""
 
     brief: synthesis.Brief
     result: synthesis.Synthesis | synthesis.Unavailable | None
     refined: synthesis.Refined
+    matrix_md: str
 
 
 def _synthesis_stage(
@@ -1777,11 +1780,11 @@ def _synthesis_stage(
     model: str,
     project_id: str,
     escalate_fn,
-) -> _Synthesized:
+) -> Synthesized:
     """Synthesize *brief*, then refine the phases of the run's placed
     *clusters* and of every entry of *cb* that is not in *standing*, the
-    codebook before the run. A refused reply is one info escalation and
-    refines nothing."""
+    codebook before the run, and render the matrix of the refined clusters.
+    A refused reply is one info escalation and refines nothing."""
     result = _synthesize(brief, synthesize_fn=synthesize_fn, model=model)
     if isinstance(result, synthesis.Unavailable):
         _escalate_unavailable_synthesis(result.reason, project_id=project_id, escalate_fn=escalate_fn)
@@ -1792,12 +1795,15 @@ def _synthesis_stage(
         clusters=clusters,
         created=[entry["id"] for entry in cb.get("entries") or [] if entry["id"] not in stood],
     )
-    return _Synthesized(brief, result, refined)
+    matrix_md = render_matrix(compute_matrix(
+        [sighting for cluster in refined.clusters for sighting in cluster.get("sightings") or []],
+    ))
+    return Synthesized(brief, result, refined, matrix_md)
 
 
 def _apply_synthesis_corrections(
     cb: dict,
-    synthesized: _Synthesized,
+    synthesized: Synthesized,
     *,
     standing: Mapping[str, Any],
     run_id: str,
@@ -1862,6 +1868,7 @@ class QueueOutcome:
     verified: tuple[dict, ...] = ()
     rejected: tuple[dict, ...] = ()
     inconclusive: str | None = None
+    probes: int = 0
 
 
 def _adjudicate_queue(
@@ -1871,7 +1878,6 @@ def _adjudicate_queue(
     verify_fn,
     model: str,
     project_root: str,
-    probe_count: list[int],
 ) -> QueueOutcome:
     """Verify each *offered* queue cluster's representative in ONE
     *verify_fn* call. A cap hit inside it leaves every offered candidate
@@ -1884,11 +1890,11 @@ def _adjudicate_queue(
     except CensusHeadroomExhausted as exc:
         logger.warning("census: headroom exhausted during queue adjudication, so it is inconclusive: %s", exc.reason)
         return QueueOutcome(inconclusive=f"headroom exhausted: {exc.reason}")
-    _count_reported_probes(result, probe_count)
     verified = _offered_replies(result.get("verified") or [], clusters, verdict="verified")
     return QueueOutcome(
         verified=tuple(_verified_with_verdicts(verified, project_root=project_root)),
         rejected=tuple(_offered_replies(result.get("rejected") or [], clusters, verdict="rejected")),
+        probes=_reported_probes(result),
     )
 
 
@@ -2364,6 +2370,580 @@ class CensusEffects:
     roll_back: Callable[..., unlanded.Rollback]
 
 
+@dataclass(frozen=True)
+class CensusRun:
+    """One census run: its identity, the codebook it starts from, its caps and
+    its output paths."""
+
+    standing: dict
+    config: LegibilityConfig
+    project_root: str
+    project_id: str
+    codebook_path: Path | str
+    census_state_path: Path | str
+    report_path: Path | str
+    date: str
+    run_id: str
+    as_of_sha: str
+    since: str | None
+    force: bool = False
+    max_batches: int | None = None
+    max_verify_clusters: int | None = None
+    dry_run_payloads_path: Path | str | None = None
+    harness_project: filing_policy.ProjectRef | None = None
+    started: float = field(default_factory=time.monotonic)
+    report_relpath: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.max_batches is not None and self.max_batches < 1:
+            raise ValueError(
+                f"max_batches must be >= 1 when set, got {self.max_batches!r} -- omit it "
+                "entirely for unbounded mining"
+            )
+        if self.max_verify_clusters is not None and self.max_verify_clusters < 1:
+            raise ValueError(
+                f"max_verify_clusters must be >= 1 when set, got {self.max_verify_clusters!r} "
+                "-- a negative cap would slice novel_clusters[:N] from the END rather "
+                "than bounding it; omit it entirely to verify every novel cluster"
+            )
+        object.__setattr__(self, "report_relpath", _repo_relative(self.report_path, self.project_root))
+
+
+@dataclass(frozen=True)
+class Mined:
+    """What mining coded, which sessions its source selected, and the project
+    inputs read beside it."""
+
+    result: MiningResult
+    selection: census_window.SessionSelection | None
+    invariant_slugs: tuple[str, ...]
+    area_map: finding_area.AreaMap
+    instrument_findings: prescreen.InstrumentFindings
+
+    @property
+    def sessions(self) -> frozenset[str]:
+        return frozenset(record["session"] for record in self.result.records if record.get("session"))
+
+
+def mine(run: CensusRun, effects: CensusEffects) -> Mined:
+    """Mine to saturation, then read which sessions the source selected."""
+    invariant_slugs = invariants.read_slugs(run.project_root)
+    area_map = finding_area.load_area_map(run.project_root)
+    for note in area_map.notes:
+        logger.warning("census: finding area map: %s", note)
+    instrument_findings = prescreen.load_instrument_findings(run.project_root, run.project_id)
+    result = mine_to_saturation(
+        effects.batch_source,
+        run.standing,
+        project=run.project_id,
+        model=run.config.models.census_miner,
+        config=run.config.census.saturation,
+        invariant_slugs=invariant_slugs,
+        invoke=effects.invoke,
+        max_batches=run.max_batches,
+    )
+    return Mined(result, effects.selection_of(), invariant_slugs, area_map, instrument_findings)
+
+
+@dataclass(frozen=True)
+class Merged:
+    """The mined batch screened and merged purely into the standing codebook,
+    and what of it this run verifies: the novel clusters the cap admits, the
+    similarity queue it leaves room for, and the budget left to re-verify."""
+
+    screen: prescreen.Screen
+    merge: codebook.MergeResult
+    view: similarity.View
+    novel: tuple[dict, ...]
+    to_verify: tuple[dict, ...]
+    coverage: VerifyCoverage | None
+    offered: tuple[similarity.QueuedCluster, ...]
+    reverify_budget: int | None
+    session_screened: int
+
+
+def merge(run: CensusRun, effects: CensusEffects, mined: Mined) -> Merged:
+    """Screen and merge the mined batch, screen it by similarity, and cap
+    what is verified."""
+    # The pre-screen (plans/census-incremental-prd.md L6): a cluster already
+    # catalogued by title, or from a session already sighted, costs no verify
+    # call, and the merge attaches each title-screened sighting through its
+    # existing routing. The cap, the stage gate and verify see what is left;
+    # a surfaced cluster is verified, never similarity-screened
+    # (prescreen.py::Screen.uncatalogued).
+    screen = prescreen.screen(mined.result.records, prescreen.Catalogue.of(run.standing), run_id=run.run_id)
+    merged = codebook.apply_coding_records(run.standing, screen.records, invariant_slugs=mined.invariant_slugs)
+    logger.info("census: merge: %s", merged.summary())
+    if merged.skipped_deletions:
+        logger.warning(
+            "census: %d mined coding record(s) carried a deletion directive and "
+            "were skipped: %s",
+            len(merged.skipped_deletions),
+            "; ".join(skipped.describe() for skipped in merged.skipped_deletions),
+        )
+    codebook.warn_unknown_invariant_slugs(merged.invariant_slugs, mined.invariant_slugs, run=run.run_id)
+    resolved = _resolved_clusters(screen, merged)
+    if resolved.unmerged:
+        logger.warning(
+            "census: %d to-verify payload(s) belong to mined record(s) the merge skipped, so they are not verified",
+            resolved.unmerged,
+        )
+    view = similarity.build_view(
+        run.standing,
+        {candidate_id: resolved.clusters[candidate_id] for candidate_id in resolved.uncatalogued},
+        embedder=effects.embedder,
+        settings=run.config.census.adjudication,
+    )
+    if view.skipped is not None:
+        _escalate_skipped_similarity(view.skipped, project_id=run.project_id, escalate_fn=effects.escalate_fn)
+    novel = tuple(cluster for candidate_id, cluster in resolved.clusters.items() if not view.screens(candidate_id))
+    to_verify, coverage = _verify_cap(novel, run.max_verify_clusters)
+    # The pending queue's representatives are verified inside what the verify
+    # cap leaves after the novel clusters, and their verdicts take the novel
+    # clusters' one path from here on.
+    view = view.without({cluster[CANDIDATE_KEY] for cluster in to_verify})
+    cap = run.max_verify_clusters
+    remaining = None if cap is None else max(0, cap - len(to_verify))
+    queue_cap = run.config.census.adjudication.max_clusters_per_run
+    offered = view.select(queue_cap if remaining is None else min(queue_cap, remaining))
+    return Merged(
+        screen=screen,
+        merge=merged,
+        view=view,
+        novel=novel,
+        to_verify=to_verify,
+        coverage=coverage,
+        offered=offered,
+        reverify_budget=None if remaining is None else remaining - len(offered),
+        session_screened=sum(1 for item in screen.screened if item.rule is prescreen.Rule.SESSION),
+    )
+
+
+def _verify_cap(novel: tuple[dict, ...], cap: int | None) -> tuple[tuple[dict, ...], VerifyCoverage | None]:
+    """The first *cap* of the *novel* clusters, and that cap's coverage; a
+    deferred remainder is logged."""
+    if cap is None:
+        return novel, None
+    to_verify = novel[:cap]
+    deferred_count = len(novel) - len(to_verify)
+    if deferred_count:
+        logger.warning(
+            "census: operator verify cap (--max-verify-clusters=%d) reached -- "
+            "%d of %d novel cluster(s) DEFERRED, not verified this run; they still "
+            "merge into the codebook as pending candidates (deferred, never "
+            "dropped), but their sessions are ledgered as coded, so a later "
+            "census re-adjudicates them only if the same confusion RECURS",
+            cap, deferred_count, len(novel),
+        )
+    return to_verify, VerifyCoverage(novel=len(novel), offered=len(to_verify), cap=cap)
+
+
+@dataclass(frozen=True)
+class Verdicts:
+    """What verification decided for the novel clusters and the queue, the
+    alarms it raised, and the headroom probes it spent."""
+
+    verified: tuple[dict, ...]
+    rejected: tuple[dict, ...]
+    fixed_entry_ids: tuple[str, ...]
+    queue: QueueOutcome
+    mass_rejection: MassRejection | None
+    queue_mass_rejection: MassRejection | None
+    normalisations: dict[str, int]
+    probes: int
+
+
+def adjudicate(run: CensusRun, effects: CensusEffects, mined: Mined, merged: Merged) -> Verdicts | Deferred:
+    """Verify the capped novel clusters and the queue behind a headroom gate,
+    or defer at the verify stage."""
+    probes = 0
+    # Stage-boundary gate. Mining is long and expensive, so a cap that was
+    # absent at preflight can easily have arrived by now -- and the stage it
+    # guards is the one where an unnoticed cap goes SILENT rather than loud:
+    # the default verifier fails closed per cluster, so every cap-poisoned
+    # verify call would land as an ordinary rejection and the run would exit 0
+    # looking unremarkable. It guards the queue's verify call as much as the
+    # novel clusters', so a run with neither spends no probe on a stage it is
+    # about to skip.
+    if merged.to_verify or merged.offered:
+        probes += 1
+        stage_headroom = _stage_headroom_gate(effects.invoke, model=run.config.models.trickle, stage="verify")
+        if not stage_headroom.ok:
+            return _defer(
+                CensusStage.VERIFY,
+                "headroom gate failed at the verify stage boundary: "
+                f"{stage_headroom.reason or 'no headroom'}",
+                escalate_fn=effects.escalate_fn,
+                counts=DeferralCounts(unverified=len(merged.to_verify)),
+            )
+    try:
+        verify_result = effects.verify_fn(list(merged.to_verify), model=run.config.models.census_verify) or {}
+    except CensusHeadroomExhausted as exc:
+        return _defer(
+            CensusStage.VERIFY,
+            f"headroom exhausted during verification: {exc.reason}",
+            escalate_fn=effects.escalate_fn,
+            counts=exc.counts,
+        )
+    probes += _reported_probes(verify_result)
+
+    verified = _verified_with_verdicts(
+        _offered_replies(verify_result.get("verified") or [], merged.to_verify, verdict="verified"),
+        project_root=run.project_root,
+    )
+    rejected = _offered_replies(verify_result.get("rejected") or [], merged.to_verify, verdict="rejected")
+    mass_rejection = _detect_mass_rejection(
+        len(merged.to_verify), len(verified), clusters="verified-candidate", escalate_fn=effects.escalate_fn,
+    )
+    queue = _adjudicate_queue(
+        merged.offered,
+        cb=run.standing,
+        verify_fn=effects.verify_fn,
+        model=run.config.models.census_verify,
+        project_root=run.project_root,
+    )
+    queue_mass_rejection = None if queue.inconclusive is not None else _detect_mass_rejection(
+        len(merged.offered), len(queue.verified), clusters="pending-queue", escalate_fn=effects.escalate_fn,
+    )
+    verified = [*verified, *queue.verified]
+    rejected = [*rejected, *queue.rejected]
+    return Verdicts(
+        verified=tuple(_with_finding(cluster, mined.area_map) for cluster in verified),
+        rejected=tuple(_with_finding(cluster, mined.area_map) for cluster in rejected),
+        fixed_entry_ids=tuple(verify_result.get("fixed") or []),
+        queue=queue,
+        mass_rejection=mass_rejection,
+        queue_mass_rejection=queue_mass_rejection,
+        normalisations=verdict_mod.count_normalisations(
+            cluster["verdict"]
+            for cluster in (*verified, *rejected)
+            if isinstance(cluster.get("verdict"), verdict_mod.Verdict)
+        ),
+        probes=probes + queue.probes,
+    )
+
+
+@dataclass(frozen=True)
+class _VerifiedPlacements:
+    """Where each verified cluster landed, and what landing it decided."""
+
+    placed: tuple[tuple[dict, str | None], ...]
+    fileable: tuple[tuple[dict, str | None], ...]
+    held_back: tuple[tuple[filing_policy.WithheldCluster, str], ...]
+    promoted: tuple[census_findings.Adjudication, ...]
+    dropped: tuple[DroppedVerdict, ...]
+    key_attaches: tuple[prescreen.KeyAttach, ...]
+    surfaced: tuple[prescreen.Surfaced, ...]
+    re_observed: tuple[prescreen.ReObserved, ...]
+
+
+def _place_verified(
+    cb: dict, clusters: Sequence[dict], *, run_id: str, instrument_findings: prescreen.InstrumentFindings,
+) -> tuple[dict, _VerifiedPlacements]:
+    """Promote, key-attach or drop each verified cluster, gating its filing at
+    the distinct sessions of the record it lands on."""
+    # Each verified cluster's filing is gated at the distinct sessions of the
+    # record it lands on: its candidate, counted BEFORE promotion so a withheld
+    # entry is marked as it is created; its entry, after a key attach; or the
+    # standing record a dropped verdict met. A structural cluster (contract
+    # §6, D6) is promoted but never filed.
+    placed: list[tuple[dict, str | None]] = []
+    fileable: list[tuple[dict, str | None]] = []
+    held_back: list[tuple[filing_policy.WithheldCluster, str]] = []
+    promoted: list[census_findings.Adjudication] = []
+    dropped: list[DroppedVerdict] = []
+    key_attaches: list[prescreen.KeyAttach] = []
+    surfaced: list[prescreen.Surfaced] = []
+    re_observed: list[prescreen.ReObserved] = []
+    for cluster in clusters:
+        cand_id = cluster[CANDIDATE_KEY]
+        candidate = codebook.record_by_id(cb["candidates"], cand_id, kind="verified candidate")
+        if candidate["disposition"] != "pending":
+            placed.append((cluster, None))
+            dropped.append(_dropped_verdict(
+                verdict="verified", cluster=cluster, standing=candidate, contradicting_disposition="rejected",
+            ))
+            standing_entry_id = _promoted_entry_id(cb, candidate)
+            holder = (
+                candidate if standing_entry_id is None
+                else codebook.record_by_id(cb["entries"], standing_entry_id, kind="standing entry")
+            )
+            files, _ = _filing_gate(cluster, _distinct_sessions(holder))
+            if files:
+                fileable.append((cluster, standing_entry_id))
+            continue
+        found = cluster["verdict"]
+        # The key and cross-instrument rules (plans/census-incremental-prd.md
+        # L6): a verdict at a live entry's (area, anchor), this run's
+        # promotions included, joins that entry, which keeps its key; any
+        # other is promoted, under the key of another instrument's finding
+        # at its location when there is one.
+        placement = prescreen.place(cb, cluster["title"], cluster["finding"], instrument_findings)
+        if placement.surfaced is not None:
+            surfaced.append(placement.surfaced)
+        if placement.standing_entry_id is not None:
+            cb, key_attach = prescreen.attach_by_key(
+                cb, cand_id, placement.standing_entry_id, found, run_id=run_id,
+            )
+            key_attaches.append(key_attach)
+            entry_id = key_attach.entry_id
+            attached_entry = codebook.record_by_id(cb["entries"], entry_id, kind="key-attached entry")
+            files, held = _filing_gate(cluster, _distinct_sessions(attached_entry))
+            if entry_id not in {adjudication.record_id for adjudication in promoted}:
+                promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
+        else:
+            entry_id = f"entry-{cand_id}"
+            files, held = _filing_gate(cluster, _distinct_sessions(candidate))
+            if placement.adoption is not None:
+                re_observed.append(prescreen.ReObserved(cluster["title"], entry_id, placement.adoption))
+            entry_fields = {
+                "id": entry_id,
+                "title": cluster.get("title"),
+                "severity": found.severity,
+                "severity_reason": found.severity_reason,
+                "status": "open",
+                "origin_phase": cluster.get("origin_phase") or "unknown",
+                "manifested_phase": cluster.get("manifested_phase") or "unknown",
+                **census_findings.first_sighting_fields(run_id),
+                "first_seen_run": placement.first_seen_run(run_id),
+            }
+            cb = codebook_lifecycle.promote_candidate(
+                cb, cand_id, entry_fields, finding=placement.identity,
+                supersedes=placement.supersedes, withheld=held is not None,
+            )
+            promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
+        placed.append((cluster, entry_id))
+        if held is not None:
+            held_back.append((held, entry_id))
+        if files:
+            fileable.append(({**cluster, "finding": placement.identity}, entry_id))
+    return cb, _VerifiedPlacements(
+        placed=tuple(placed),
+        fileable=tuple(fileable),
+        held_back=tuple(held_back),
+        promoted=tuple(promoted),
+        dropped=tuple(dropped),
+        key_attaches=tuple(key_attaches),
+        surfaced=tuple(surfaced),
+        re_observed=tuple(re_observed),
+    )
+
+
+@dataclass(frozen=True)
+class Placed:
+    """The codebook with every verdict placed, and what filing, synthesis and
+    the record read of that placement."""
+
+    codebook: dict
+    placed: tuple[tuple[dict, str | None], ...]
+    fileable: tuple[tuple[dict, str | None], ...]
+    withheld: tuple[filing_policy.WithheldCluster, ...]
+    structural: tuple[disposition.StructuralFinding, ...]
+    promoted: tuple[census_findings.Adjudication, ...]
+    refuted: tuple[census_findings.Adjudication, ...]
+    re_observed: tuple[prescreen.ReObserved, ...]
+    dropped_verdicts: tuple[DroppedVerdict, ...]
+    sighted: tuple[str, ...]
+    attached: tuple[similarity.AppliedAttach, ...]
+    adjudicated: tuple[similarity.Adjudicated, ...]
+    screen_report: prescreen.ScreenReport
+    adjudication_report: similarity.AdjudicationReport
+
+
+def place_verdicts(run: CensusRun, mined: Mined, merged: Merged, verdicts: Verdicts) -> Placed:
+    """Apply every verdict to the merged codebook: similarity attaches,
+    promotions and rejections, queue members, retirements and this run's
+    sightings."""
+    cb, attached = similarity.attach(merged.merge.codebook, merged.view, run_id=run.run_id)
+    cb, verified = _place_verified(
+        cb, verdicts.verified, run_id=run.run_id, instrument_findings=mined.instrument_findings,
+    )
+    # A held cluster whose entry files this run anyway, through a cluster
+    # that joined it, is not withheld.
+    filed_entry_ids = {entry_id for _, entry_id in verified.fileable}
+    withheld = tuple(held for held, entry_id in verified.held_back if entry_id not in filed_entry_ids)
+    structural = disposition.structural_findings(
+        cb, [adjudication.record_id for adjudication in verified.promoted if not disposition.files(adjudication.found)],
+    )
+    if withheld:
+        logger.info(
+            "census: %d verified cluster(s) recorded but not filed (no in-tree "
+            "remediation, fewer than %d sightings): %s",
+            len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
+            [cluster.title for cluster in withheld],
+        )
+
+    dropped_verdicts = list(verified.dropped)
+    refuted: list[census_findings.Adjudication] = []
+    for cluster in verdicts.rejected:
+        cand_id = cluster[CANDIDATE_KEY]
+        candidate = codebook.record_by_id(cb["candidates"], cand_id, kind="rejected candidate")
+        if candidate["disposition"] != "pending":
+            dropped_verdicts.append(_dropped_verdict(
+                verdict="rejected", cluster=cluster, standing=candidate, contradicting_disposition="promoted",
+            ))
+            continue
+        cb = codebook_lifecycle.reject_candidate(cb, cand_id, finding=cluster.get("finding"))
+        if cluster.get("finding") is not None:
+            refuted.append(census_findings.Adjudication(cand_id, cluster["verdict"], cluster.get("cause")))
+
+    cb, adjudicated = similarity.adjudicate_members(cb, merged.offered)
+
+    for entry_id in dict.fromkeys(verdicts.fixed_entry_ids):
+        if codebook.record_by_id(cb["entries"], entry_id, kind="fixed entry").get("status") == "retired":
+            logger.warning("census: the verifier reported entry %r fixed, but it is already retired", entry_id)
+            continue
+        cb = codebook_lifecycle.retire_entry(cb, entry_id)
+
+    cb, sighted = census_findings.mark_seen(cb, run_id=run.run_id, sessions=mined.sessions)
+
+    _report_dropped_verdicts(
+        dropped_verdicts,
+        disposition_conflicts=merged.merge.counts.candidate_disposition_conflicts,
+    )
+    return Placed(
+        codebook=cb,
+        placed=verified.placed,
+        fileable=verified.fileable,
+        withheld=withheld,
+        structural=structural,
+        promoted=verified.promoted,
+        refuted=tuple(refuted),
+        re_observed=verified.re_observed,
+        dropped_verdicts=tuple(dropped_verdicts),
+        sighted=sighted,
+        attached=attached,
+        adjudicated=adjudicated,
+        screen_report=prescreen.ScreenReport(
+            merged.screen, verified.surfaced, verified.key_attaches, verified.re_observed,
+            mined.instrument_findings,
+        ),
+        adjudication_report=similarity.AdjudicationReport(
+            merged.view, attached, merged.offered, adjudicated, verdicts.queue.inconclusive,
+            verdicts.queue_mass_rejection is not None,
+        ),
+    )
+
+
+def synthesize(
+    run: CensusRun, effects: CensusEffects, mined: Mined, verdicts: Verdicts, placed: Placed,
+) -> Synthesized:
+    """Synthesize this run's findings, refine its phases, render its matrix,
+    and hold the refined codebook to the schema."""
+    # Synthesis (plans/census-incremental-prd.md L10, C6) runs after the key
+    # rule, the attaches and adjudication, so the brief's keys and its new /
+    # re-observed split are exact. Its phase refinements reach this run's
+    # verified clusters, which the matrix is rendered from, and the entries
+    # this run created, before the codebook is validated, filed from or
+    # written.
+    brief = synthesis.Brief.of(
+        run_id=run.run_id,
+        before=run.standing,
+        after=placed.codebook,
+        verdicts=placed.promoted,
+        adopted={item.entry_id: item.adoption.external.run_id for item in placed.re_observed},
+        run_sessions=mined.sessions,
+        counts={
+            "mined": len(mined.result.records),
+            "confirmed": len(verdicts.verified),
+            "refuted": len(verdicts.rejected),
+            **{f"screened_{rule}": count for rule, count in placed.screen_report.counts().items()},
+            **placed.adjudication_report.counts(),
+        },
+    )
+    synthesized = _synthesis_stage(
+        brief, placed.codebook, standing=run.standing, clusters=placed.placed, synthesize_fn=effects.synthesize_fn,
+        model=run.config.models.census_synthesis, project_id=run.project_id, escalate_fn=effects.escalate_fn,
+    )
+    _require_valid(synthesized.refined.codebook, "merge")
+    return synthesized
+
+
+@dataclass(frozen=True)
+class FilingPlan:
+    """Everything persist files and writes: the run's stage values, the
+    codebook before filing, the filings to dispose, and the outcome feedback
+    that shaped them."""
+
+    run: CensusRun
+    mined: Mined
+    merged: Merged
+    verdicts: Verdicts
+    placed: Placed
+    synthesized: Synthesized
+    codebook: dict
+    filings: tuple[disposition.Filing, ...]
+    withheld_entry_ids: frozenset[str]
+    outcomes: disposition.Outcomes
+    reverified: Mapping[str, disposition.Reverification]
+    status_changes: tuple[disposition.StatusChange, ...]
+    refiled: tuple[disposition.Refiling, ...]
+    backfilled: disposition.Backfill
+    reverify_probes: int
+
+
+def plan_filing(
+    run: CensusRun,
+    effects: CensusEffects,
+    mined: Mined,
+    merged: Merged,
+    verdicts: Verdicts,
+    placed: Placed,
+    synthesized: Synthesized,
+) -> FilingPlan:
+    """Link historical tasks, read and re-verify the outcomes of earlier
+    filings, and queue this run's filings with their payloads."""
+    # Historical census tasks link to their entries before this run files
+    # anything (plans/census-incremental-prd.md L4), in dry runs too: it is a
+    # read plus a codebook update. disposition.backfill never raises and logs
+    # its own failure.
+    cb, backfilled = disposition.backfill(
+        synthesized.refined.codebook, store=effects.task_store, project_root=run.project_root, run_id=run.run_id,
+    )
+    # Outcome feedback (plans/census-incremental-prd.md L5, D8), after the
+    # backfill so the tasks it linked are read this run. Re-verifies take
+    # only what the verify cap leaves after the novel clusters.
+    statuses, statuses_error = _read_statuses(effects.status_fetcher)
+    outcomes = disposition.read_outcomes(
+        cb, statuses=statuses, statuses_error=statuses_error,
+        observed_root=run.project_root, store=effects.task_store,
+    )
+    reverified = _reverify(
+        outcomes.due,
+        cb=cb,
+        verify_fn=effects.verify_fn,
+        model=run.config.models.census_verify,
+        remaining=merged.reverify_budget,
+    )
+    cb, status_changes = disposition.project(cb, outcomes, reverified.reverifications, as_of_sha=run.as_of_sha)
+    refiled = disposition.refilings(outcomes, reverified.reverifications, sighted=placed.sighted)
+    queue = _with_refilings(_filing_queue(list(placed.fileable), cb), refiled, cb)
+    payloads = build_task_payloads(
+        [pending.cluster for pending in queue],
+        project_root=run.project_root, project_id=run.project_id, run_id=run.run_id,
+        harness=run.harness_project,
+    )
+    return FilingPlan(
+        run=run,
+        mined=mined,
+        merged=merged,
+        verdicts=verdicts,
+        placed=placed,
+        synthesized=synthesized,
+        codebook=cb,
+        filings=tuple(pending.filing(payload) for pending, payload in zip(queue, payloads, strict=True)),
+        withheld_entry_ids=frozenset(
+            pending.withheld_entry_id for pending in queue if pending.withheld_entry_id is not None
+        ),
+        outcomes=outcomes,
+        reverified=reverified.reverifications,
+        status_changes=status_changes,
+        refiled=refiled,
+        backfilled=backfilled,
+        reverify_probes=reverified.probes,
+    )
+
+
 def run_census(
     *,
     effects: CensusEffects,
@@ -2592,32 +3172,24 @@ def run_census(
     not the requested path -- is what the report, the commit paths and
     ``CensusOutcome`` name.
     """
-    started = time.monotonic()
-    # Validated BEFORE the headroom probe spends anything: a nonsense cap on a
-    # flag whose entire purpose is to be an explicit, legible bound must be
-    # rejected outright, never half-applied. Left unchecked,
-    # max_verify_clusters=-1 would slice novel_clusters[:-1] -- silently
-    # verifying all but the LAST cluster and reporting cap=-1 as if honored.
-    if max_batches is not None and max_batches < 1:
-        raise ValueError(
-            f"max_batches must be >= 1 when set, got {max_batches!r} -- omit it "
-            "entirely for unbounded mining"
-        )
-    if max_verify_clusters is not None and max_verify_clusters < 1:
-        raise ValueError(
-            f"max_verify_clusters must be >= 1 when set, got {max_verify_clusters!r} "
-            "-- a negative cap would slice novel_clusters[:N] from the END rather "
-            "than bounding it; omit it entirely to verify every novel cluster"
-        )
-    report_relpath = _repo_relative(report_path, project_root)
-
-    # Real probe accounting for the report's cost note. A legibility tool
-    # that under-reports its own spend -- in the very artifact an operator
-    # reads to check --max-verify-clusters -- is the same defect class this
-    # pipeline exists to find. Counts THIS function's probes (the preflight
-    # below and the stage gate); the verifier's own in-verify probes are
-    # added from its reported count at the verify site.
-    probe_count = [1]
+    run = CensusRun(
+        standing=codebook_dict,
+        config=config,
+        project_root=project_root,
+        project_id=project_id,
+        codebook_path=codebook_path,
+        census_state_path=census_state_path,
+        report_path=report_path,
+        date=date,
+        run_id=run_id,
+        as_of_sha=as_of_sha,
+        since=since,
+        force=force,
+        max_batches=max_batches,
+        max_verify_clusters=max_verify_clusters,
+        dry_run_payloads_path=dry_run_payloads_path,
+        harness_project=harness_project,
+    )
     headroom = preflight_headroom(effects.invoke, model=config.models.trickle)
     if not headroom.ok:
         return _defer(
@@ -2672,372 +3244,32 @@ def run_census(
         report_path, codebook_path, census_state_path, dry_run_payloads_path,
     )
 
-    invariant_slugs = invariants.read_slugs(project_root)
-    area_map = finding_area.load_area_map(project_root)
-    for note in area_map.notes:
-        logger.warning("census: finding area map: %s", note)
-    instrument_findings = prescreen.load_instrument_findings(project_root, project_id)
-    mining_result = mine_to_saturation(
-        effects.batch_source,
-        codebook_dict,
-        project=project_id,
-        model=config.models.census_miner,
-        config=config.census.saturation,
-        invariant_slugs=invariant_slugs,
-        invoke=effects.invoke,
-        max_batches=max_batches,
-    )
-    selection = effects.selection_of()
+    mined = mine(run, effects)
+    merged = merge(run, effects, mined)
+    verdicts = adjudicate(run, effects, mined, merged)
+    if isinstance(verdicts, Deferred):
+        return verdicts
+    placed = place_verdicts(run, mined, merged, verdicts)
+    synthesized = synthesize(run, effects, mined, verdicts, placed)
+    plan = plan_filing(run, effects, mined, merged, verdicts, placed, synthesized)
 
-    # The pre-screen (plans/census-incremental-prd.md L6): a cluster already
-    # catalogued by title, or from a session already sighted, costs no verify
-    # call, and the merge attaches each title-screened sighting through its
-    # existing routing. The cap, the stage gate and verify see what is left;
-    # a surfaced cluster is verified, never similarity-screened
-    # (prescreen.py::Screen.uncatalogued).
-    catalogue = prescreen.Catalogue.of(codebook_dict)
-    screen = prescreen.screen(mining_result.records, catalogue, run_id=run_id)
-    # The merge is pure, so merging first persists nothing on a defer below,
-    # and every cluster offered to verify names the candidate the merge gave it.
-    merge = codebook.apply_coding_records(
-        codebook_dict, screen.records, invariant_slugs=invariant_slugs,
-    )
-    logger.info("census: merge: %s", merge.summary())
-    if merge.skipped_deletions:
-        logger.warning(
-            "census: %d mined coding record(s) carried a deletion directive and "
-            "were skipped: %s",
-            len(merge.skipped_deletions),
-            "; ".join(skipped.describe() for skipped in merge.skipped_deletions),
-        )
-    codebook.warn_unknown_invariant_slugs(merge.invariant_slugs, invariant_slugs, run=run_id)
-    resolved = _resolved_clusters(screen, merge)
-    if resolved.unmerged:
-        logger.warning(
-            "census: %d to-verify payload(s) belong to mined record(s) the merge skipped, so they are not verified",
-            resolved.unmerged,
-        )
-    session_screened = sum(1 for item in screen.screened if item.rule is prescreen.Rule.SESSION)
-    view = similarity.build_view(
-        codebook_dict,
-        {candidate_id: resolved.clusters[candidate_id] for candidate_id in resolved.uncatalogued},
-        embedder=effects.embedder,
-        settings=config.census.adjudication,
-    )
-    if view.skipped is not None:
-        _escalate_skipped_similarity(view.skipped, project_id=project_id, escalate_fn=effects.escalate_fn)
-    novel_clusters = [
-        cluster for candidate_id, cluster in resolved.clusters.items() if not view.screens(candidate_id)
-    ]
-    if max_verify_clusters is None:
-        clusters_to_verify = novel_clusters
-        verify_coverage = None
-    else:
-        clusters_to_verify = novel_clusters[:max_verify_clusters]
-        verify_coverage = VerifyCoverage(
-            novel=len(novel_clusters),
-            offered=len(clusters_to_verify),
-            cap=max_verify_clusters,
-        )
-        deferred_count = len(novel_clusters) - len(clusters_to_verify)
-        if deferred_count:
-            logger.warning(
-                "census: operator verify cap (--max-verify-clusters=%d) reached -- "
-                "%d of %d novel cluster(s) DEFERRED, not verified this run; they still "
-                "merge into the codebook as pending candidates (deferred, never "
-                "dropped), but their sessions are ledgered as coded, so a later "
-                "census re-adjudicates them only if the same confusion RECURS",
-                max_verify_clusters, deferred_count, len(novel_clusters),
-            )
-
-    # The pending queue's representatives are verified inside what the verify
-    # cap leaves after the novel clusters, and their verdicts take the novel
-    # clusters' one path from here on.
-    view = view.without({cluster[CANDIDATE_KEY] for cluster in clusters_to_verify})
-    remaining = None if max_verify_clusters is None else max(0, max_verify_clusters - len(clusters_to_verify))
-    queue_cap = config.census.adjudication.max_clusters_per_run
-    offered = view.select(queue_cap if remaining is None else min(queue_cap, remaining))
-
-    # Stage-boundary gate. Mining is long and expensive, so a cap that was
-    # absent at preflight can easily have arrived by now -- and the stage it
-    # guards is the one where an unnoticed cap goes SILENT rather than loud:
-    # the default verifier fails closed per cluster, so every cap-poisoned
-    # verify call would land as an ordinary rejection and the run would exit 0
-    # looking unremarkable. It guards the queue's verify call as much as the
-    # novel clusters', so a run with neither spends no probe on a stage it is
-    # about to skip.
-    if clusters_to_verify or offered:
-        stage_headroom = _stage_headroom_gate(
-            effects.invoke, model=config.models.trickle, stage="verify", probe_count=probe_count,
-        )
-        if not stage_headroom.ok:
-            # The reason NAMES the stage. The preflight's reason is left
-            # byte-identical to what it has always been (nothing downstream
-            # that reads it changes), so the stage name is added here, where
-            # it is new information, rather than in _defer where it would
-            # rewrite both.
-            return _defer(
-                CensusStage.VERIFY,
-                "headroom gate failed at the verify stage boundary: "
-                f"{stage_headroom.reason or 'no headroom'}",
-                escalate_fn=effects.escalate_fn,
-                counts=DeferralCounts(unverified=len(clusters_to_verify)),
-            )
-
-    # A cap detected INSIDE verification lands here. The except must sit so
-    # the abort returns BEFORE the mass-rejection detector, synthesize_fn,
-    # compute_matrix and every write (the codebook merge has already run, but
-    # it is pure) -- the whole point is that nothing is persisted, so no
-    # cap-poisoned cluster is ever recorded as a verdict and last_census_at
-    # never advances past a window that was not actually adjudicated.
-    try:
-        verify_result = effects.verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
-    except CensusHeadroomExhausted as exc:
-        return _defer(
-            CensusStage.VERIFY,
-            f"headroom exhausted during verification: {exc.reason}",
-            escalate_fn=effects.escalate_fn,
-            counts=exc.counts,
-        )
-    # The default verifier probes internally (detectors (a)/(b)/(c)) and
-    # reports how many probes it spent, so the cost note below counts those
-    # too rather than only run_census's own two. A verify_fn that omits the
-    # key -- every fake in the tests, any custom verifier -- contributes 0,
-    # and a non-int is ignored rather than crashing a finished census over a
-    # cosmetic count.
-    _count_reported_probes(verify_result, probe_count)
-
-    verified = _verified_with_verdicts(
-        _offered_replies(verify_result.get("verified") or [], clusters_to_verify, verdict="verified"),
-        project_root=project_root,
-    )
-    rejected = _offered_replies(verify_result.get("rejected") or [], clusters_to_verify, verdict="rejected")
-    fixed_entry_ids = verify_result.get("fixed") or []
-
-    mass_rejection = _detect_mass_rejection(
-        len(clusters_to_verify), len(verified), clusters="verified-candidate", escalate_fn=effects.escalate_fn,
-    )
-
-    queue = _adjudicate_queue(
-        offered,
-        cb=codebook_dict,
-        verify_fn=effects.verify_fn,
-        model=config.models.census_verify,
-        project_root=project_root,
-        probe_count=probe_count,
-    )
-    queue_mass_rejection = None if queue.inconclusive is not None else _detect_mass_rejection(
-        len(offered), len(queue.verified), clusters="pending-queue", escalate_fn=effects.escalate_fn,
-    )
-    verified = [*verified, *queue.verified]
-    rejected = [*rejected, *queue.rejected]
-    verify_normalisations = verdict_mod.count_normalisations(
-        cluster["verdict"]
-        for cluster in (*verified, *rejected)
-        if isinstance(cluster.get("verdict"), verdict_mod.Verdict)
-    )
-
-    verified = [_with_finding(cluster, area_map) for cluster in verified]
-    rejected = [_with_finding(cluster, area_map) for cluster in rejected]
-
-    updated_codebook, attached = similarity.attach(merge.codebook, view, run_id=run_id)
-
-    # ONE list for every verdict this run paid for and dropped, shared by both
-    # adjudication loops below -- a per-loop name would fork the tally
-    # permanently. Records, not a bare count, so the run summary, the persisted
-    # report and the tests all read one structure.
-    dropped_verdicts: list[DroppedVerdict] = []
-
-    # Each verified cluster's filing is gated at the distinct sessions of the
-    # record it lands on: its candidate, counted BEFORE promotion so a withheld
-    # entry is marked as it is created; its entry, after a key attach; or the
-    # standing record a dropped verdict met. A structural cluster (contract
-    # §6, D6) is promoted but never filed.
-    fileable: list[tuple[dict, str | None]] = []
-    held_back: list[tuple[filing_policy.WithheldCluster, str]] = []
-    promoted: list[census_findings.Adjudication] = []
-    refuted: list[census_findings.Adjudication] = []
-    key_attaches: list[prescreen.KeyAttach] = []
-    surfaced_by_key: list[prescreen.Surfaced] = []
-    re_observed: list[prescreen.ReObserved] = []
-    placed: list[tuple[dict, str | None]] = []
-
-    for cluster in verified:
-        cand_id = cluster[CANDIDATE_KEY]
-        candidate = codebook.record_by_id(updated_codebook["candidates"], cand_id, kind="verified candidate")
-        if candidate["disposition"] != "pending":
-            placed.append((cluster, None))
-            dropped_verdicts.append(_dropped_verdict(
-                verdict="verified", cluster=cluster, standing=candidate, contradicting_disposition="rejected",
-            ))
-            standing_entry_id = _promoted_entry_id(updated_codebook, candidate)
-            holder = (
-                candidate if standing_entry_id is None
-                else codebook.record_by_id(updated_codebook["entries"], standing_entry_id, kind="standing entry")
-            )
-            files, _ = _filing_gate(cluster, _distinct_sessions(holder))
-            if files:
-                fileable.append((cluster, standing_entry_id))
-            continue
-        found = cluster["verdict"]
-        # The key and cross-instrument rules (plans/census-incremental-prd.md
-        # L6): a verdict at a live entry's (area, anchor), this run's
-        # promotions included, joins that entry, which keeps its key; any
-        # other is promoted, under the key of another instrument's finding
-        # at its location when there is one.
-        placement = prescreen.place(updated_codebook, cluster["title"], cluster["finding"], instrument_findings)
-        if placement.surfaced is not None:
-            surfaced_by_key.append(placement.surfaced)
-        if placement.standing_entry_id is not None:
-            updated_codebook, key_attach = prescreen.attach_by_key(
-                updated_codebook, cand_id, placement.standing_entry_id, found, run_id=run_id,
-            )
-            key_attaches.append(key_attach)
-            entry_id = key_attach.entry_id
-            attached_entry = codebook.record_by_id(updated_codebook["entries"], entry_id, kind="key-attached entry")
-            files, held = _filing_gate(cluster, _distinct_sessions(attached_entry))
-            if entry_id not in {adjudication.record_id for adjudication in promoted}:
-                promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
-        else:
-            entry_id = f"entry-{cand_id}"
-            files, held = _filing_gate(cluster, _distinct_sessions(candidate))
-            if placement.adoption is not None:
-                re_observed.append(prescreen.ReObserved(cluster["title"], entry_id, placement.adoption))
-            entry_fields = {
-                "id": entry_id,
-                "title": cluster.get("title"),
-                "severity": found.severity,
-                "severity_reason": found.severity_reason,
-                "status": "open",
-                "origin_phase": cluster.get("origin_phase") or "unknown",
-                "manifested_phase": cluster.get("manifested_phase") or "unknown",
-                **census_findings.first_sighting_fields(run_id),
-                "first_seen_run": placement.first_seen_run(run_id),
-            }
-            updated_codebook = codebook_lifecycle.promote_candidate(
-                updated_codebook, cand_id, entry_fields, finding=placement.identity,
-                supersedes=placement.supersedes, withheld=held is not None,
-            )
-            promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
-        placed.append((cluster, entry_id))
-        if held is not None:
-            held_back.append((held, entry_id))
-        if files:
-            fileable.append(({**cluster, "finding": placement.identity}, entry_id))
-
-    # A held cluster whose entry files this run anyway, through a cluster
-    # that joined it, is not withheld.
-    filed_entry_ids = {entry_id for _, entry_id in fileable}
-    withheld = tuple(held for held, entry_id in held_back if entry_id not in filed_entry_ids)
-    structural = disposition.structural_findings(
-        updated_codebook,
-        [adjudication.record_id for adjudication in promoted if not disposition.files(adjudication.found)],
-    )
-    if withheld:
-        logger.info(
-            "census: %d verified cluster(s) recorded but not filed (no in-tree "
-            "remediation, fewer than %d sightings): %s",
-            len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
-            [cluster.title for cluster in withheld],
-        )
-
-    for cluster in rejected:
-        cand_id = cluster[CANDIDATE_KEY]
-        candidate = codebook.record_by_id(updated_codebook["candidates"], cand_id, kind="rejected candidate")
-        if candidate["disposition"] != "pending":
-            dropped_verdicts.append(_dropped_verdict(
-                verdict="rejected", cluster=cluster, standing=candidate, contradicting_disposition="promoted",
-            ))
-            continue
-        updated_codebook = codebook_lifecycle.reject_candidate(
-            updated_codebook, cand_id, finding=cluster.get("finding"),
-        )
-        if cluster.get("finding") is not None:
-            refuted.append(census_findings.Adjudication(cand_id, cluster["verdict"], cluster.get("cause")))
-
-    updated_codebook, adjudicated = similarity.adjudicate_members(updated_codebook, offered)
-
-    for entry_id in dict.fromkeys(fixed_entry_ids):
-        if codebook.record_by_id(updated_codebook["entries"], entry_id, kind="fixed entry").get("status") == "retired":
-            logger.warning("census: the verifier reported entry %r fixed, but it is already retired", entry_id)
-            continue
-        updated_codebook = codebook_lifecycle.retire_entry(updated_codebook, entry_id)
-
-    mined_sessions = {record["session"] for record in mining_result.records if record.get("session")}
-    updated_codebook, sighted = census_findings.mark_seen(updated_codebook, run_id=run_id, sessions=mined_sessions)
-
-    _report_dropped_verdicts(
-        dropped_verdicts,
-        disposition_conflicts=merge.counts.candidate_disposition_conflicts,
-    )
-
-    screen_report = prescreen.ScreenReport(
-        screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
-    )
-    adjudication_report = similarity.AdjudicationReport(
-        view, attached, offered, adjudicated, queue.inconclusive, queue_mass_rejection is not None,
-    )
-
-    # Synthesis (plans/census-incremental-prd.md L10, C6) runs here, after the
-    # key rule, the attaches and adjudication, so the brief's keys and its new
-    # / re-observed split are exact. Its phase refinements reach this run's
-    # verified clusters, which the matrix is rendered from, and the entries
-    # this run created, before the codebook is validated, filed from or
-    # written.
-    brief = synthesis.Brief.of(
-        run_id=run_id,
-        before=codebook_dict,
-        after=updated_codebook,
-        verdicts=promoted,
-        adopted={item.entry_id: item.adoption.external.run_id for item in re_observed},
-        run_sessions=mined_sessions,
-        counts={
-            "mined": len(mining_result.records),
-            "confirmed": len(verified),
-            "refuted": len(rejected),
-            **{f"screened_{rule}": count for rule, count in screen_report.counts().items()},
-            **adjudication_report.counts(),
-        },
-    )
-    synthesized = _synthesis_stage(
-        brief, updated_codebook, standing=codebook_dict, clusters=placed, synthesize_fn=effects.synthesize_fn,
-        model=config.models.census_synthesis, project_id=project_id, escalate_fn=effects.escalate_fn,
-    )
-    updated_codebook = synthesized.refined.codebook
-    matrix_md = render_matrix(compute_matrix(
-        [sighting for cluster in synthesized.refined.clusters for sighting in cluster.get("sightings") or []],
-    ))
-
-    _require_valid(updated_codebook, "merge")
-
-    # Historical census tasks link to their entries before this run files
-    # anything (plans/census-incremental-prd.md L4), in dry runs too: it is a
-    # read plus a codebook update. disposition.backfill never raises and logs
-    # its own failure.
-    updated_codebook, backfilled = disposition.backfill(
-        updated_codebook, store=effects.task_store, project_root=project_root, run_id=run_id,
-    )
-
-    # Outcome feedback (plans/census-incremental-prd.md L5, D8), after the
-    # backfill so the tasks it linked are read this run. Re-verifies take
-    # only what the verify cap leaves after the novel clusters.
-    statuses, statuses_error = _read_statuses(effects.status_fetcher)
-    outcomes = disposition.read_outcomes(
-        updated_codebook, statuses=statuses, statuses_error=statuses_error,
-        observed_root=project_root, store=effects.task_store,
-    )
-    reverified = _reverify(
-        outcomes.due,
-        cb=updated_codebook,
-        verify_fn=effects.verify_fn,
-        model=config.models.census_verify,
-        remaining=None if remaining is None else remaining - len(offered),
-        probe_count=probe_count,
-    )
-    updated_codebook, status_changes = disposition.project(
-        updated_codebook, outcomes, reverified, as_of_sha=as_of_sha,
-    )
-    refiled = disposition.refilings(outcomes, reverified, sighted=sighted)
+    updated_codebook = plan.codebook
+    mining_result, selection = mined.result, mined.selection
+    invariant_slugs, area_map = mined.invariant_slugs, mined.area_map
+    merge_result, view, offered = merged.merge, merged.view, merged.offered
+    clusters_to_verify, novel_clusters = merged.to_verify, merged.novel
+    session_screened, verify_coverage = merged.session_screened, merged.coverage
+    verified, rejected = verdicts.verified, verdicts.rejected
+    mass_rejection, verify_normalisations = verdicts.mass_rejection, verdicts.normalisations
+    withheld, structural = placed.withheld, placed.structural
+    promoted, refuted, sighted = placed.promoted, placed.refuted, placed.sighted
+    dropped_verdicts = placed.dropped_verdicts
+    screen_report, adjudication_report = placed.screen_report, placed.adjudication_report
+    matrix_md = synthesized.matrix_md
+    outcomes, reverified, refiled = plan.outcomes, plan.reverified, plan.refiled
+    status_changes, backfilled = plan.status_changes, plan.backfilled
+    probe_count = 1 + verdicts.probes + plan.reverify_probes
+    report_relpath, started = run.report_relpath, run.started
 
     # Positioned BEFORE codebook.dump()/census_state.advance() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
@@ -3045,21 +3277,13 @@ def run_census(
     # already-advanced codebook. Filing itself is best-effort per finding
     # (disposition.dispose): a failed submit is logged and reported, never
     # counted as filed and never fatal.
-    filing_queue = _with_refilings(_filing_queue(fileable, updated_codebook), refiled, updated_codebook)
-    task_payloads = build_task_payloads(
-        [pending.cluster for pending in filing_queue],
-        project_root=project_root, project_id=project_id, run_id=run_id,
-        harness=harness_project,
-    )
     disposal = disposition.dispose(
-        [pending.filing(payload) for pending, payload in zip(filing_queue, task_payloads, strict=True)],
+        list(plan.filings),
         store=effects.task_store,
         submit=None if dry_run_payloads_path is not None else effects.submit_fn,
         awaiting=outcomes.awaiting,
     )
-    withheld_entry_ids = {
-        pending.withheld_entry_id for pending in filing_queue if pending.withheld_entry_id is not None
-    }
+    withheld_entry_ids = plan.withheld_entry_ids
     dry_run_filing = None
     if dry_run_payloads_path is not None:
         dry_run_filing = _write_dry_run_payloads(
@@ -3137,7 +3361,7 @@ def run_census(
         f"{sum(s.total for s in mining_result.batch_stats)}, "
         f"{config.models.census_verify} verify={verify_calls}, "
         f"{config.models.census_synthesis} synthesis={synthesis_report.calls}, "
-        f"{config.models.trickle} headroom-probe={probe_count[0]}"
+        f"{config.models.trickle} headroom-probe={probe_count}"
     )
     if storm_batch_indices:
         cost_note += (
@@ -3157,7 +3381,7 @@ def run_census(
         miner_calls=sum(s.total for s in mining_result.batch_stats),
         verify_calls=verify_calls,
         synthesis_calls=synthesis_report.calls,
-        probe_calls=probe_count[0],
+        probe_calls=probe_count,
         wall_clock_secs=round(time.monotonic() - started, 3),
         verify_normalisations=verify_normalisations,
         reverify=dispositions_record["reverify"],
@@ -3166,7 +3390,7 @@ def run_census(
         inputs_consumed_note=screen_report.inputs.note,
         embedding_calls=view.requests,
         adjudication=adjudication_report.counts(),
-        slug_tally=merge.invariant_slugs,
+        slug_tally=merge_result.invariant_slugs,
     )
     record = build_census_record(
         method=method,
@@ -3240,7 +3464,7 @@ def run_census(
         withheld=withheld,
         cross_project_tickets=cross_project_tickets,
         released_entry_ids=released_entry_ids,
-        skipped_deletions=merge.skipped_deletions,
+        skipped_deletions=merge_result.skipped_deletions,
         filing=filing_report,
         gate=verdict,
     )
@@ -3261,7 +3485,7 @@ def run_census(
     if selection is None:
         return landed
     return _ledger_census_codings(
-        landed, list(merge.merged_records), run_id=run_id, ledger=selection.ledger,
+        landed, list(merge_result.merged_records), run_id=run_id, ledger=selection.ledger,
     )
 
 
