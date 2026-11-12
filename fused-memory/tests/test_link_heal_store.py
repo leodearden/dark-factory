@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -17,6 +18,7 @@ from _fm_qdrant_live import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
 
 from fused_memory.maintenance.link_heal_store import (
     CensusFailed,
+    CreatedWindow,
     LinkHealStore,
     LiveRecord,
     MetadataChange,
@@ -88,6 +90,101 @@ class TestMetadataChange:
     def test_a_none_patch_value_is_rejected(self):
         with pytest.raises(ValueError, match='None'):
             MetadataChange.patch_only({'kind': 'amendment', 'parent_id': None})
+
+
+SINCE = datetime(2026, 11, 11, tzinfo=UTC)
+UNTIL = datetime(2026, 11, 12, tzinfo=UTC)
+
+
+class TestCreatedWindow:
+    def test_a_naive_bound_is_refused_naming_both_values(self):
+        naive = datetime(2026, 11, 11)
+
+        with pytest.raises(ValueError) as excinfo:
+            CreatedWindow(since=naive, until=UNTIL)
+
+        assert naive.isoformat() in str(excinfo.value)
+        assert UNTIL.isoformat() in str(excinfo.value)
+
+    def test_a_naive_until_is_refused(self):
+        with pytest.raises(ValueError):
+            CreatedWindow(since=SINCE, until=datetime(2026, 11, 12))
+
+    @pytest.mark.parametrize('until', [SINCE, SINCE - timedelta(seconds=1)], ids=['equal', 'before'])
+    def test_since_must_precede_until(self, until):
+        with pytest.raises(ValueError) as excinfo:
+            CreatedWindow(since=SINCE, until=until)
+
+        assert SINCE.isoformat() in str(excinfo.value)
+        assert until.isoformat() in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        'created_at',
+        [
+            '2026-11-11T00:00:00+00:00',
+            '2026-11-11T12:30:00.123456+00:00',
+            '2026-11-11T20:00:00-07:00',
+            '2026-11-11T23:59:59.999999Z',
+        ],
+        ids=['at-since', 'inside', 'other-offset-inside', 'just-before-until'],
+    )
+    def test_admits_a_payload_created_inside_the_window(self, created_at):
+        window = CreatedWindow(since=SINCE, until=UNTIL)
+
+        assert window.admits({'created_at': created_at}) is True
+
+    @pytest.mark.parametrize(
+        'created_at',
+        [
+            '2026-11-10T23:59:59.999999+00:00',
+            '2026-11-12T00:00:00+00:00',
+            '2026-11-11T18:00:00-07:00',
+            '2026-11-12T08:00:00+09:00',
+        ],
+        ids=['before-since', 'at-until', 'other-offset-after', 'other-offset-at-until'],
+    )
+    def test_refuses_a_payload_created_outside_the_window(self, created_at):
+        window = CreatedWindow(since=SINCE, until=UNTIL)
+
+        assert window.admits({'created_at': created_at}) is False
+
+    @pytest.mark.parametrize(
+        'payload',
+        [{}, {'created_at': None}, {'created_at': 'yesterday'}, {'created_at': 1731283200},
+         {'created_at': '2026-11-11T12:00:00'}],
+        ids=['missing', 'null', 'unparseable', 'not-a-string', 'naive'],
+    )
+    def test_an_unknown_creation_time_is_admitted(self, payload):
+        window = CreatedWindow(since=SINCE, until=UNTIL)
+
+        assert window.admits(payload) is True
+
+
+class TestLiveRecordTimes:
+    def test_created_and_updated_parse_into_aware_datetimes(self):
+        record = LiveRecord(
+            memory_id=CHILD,
+            text='t',
+            metadata={
+                'created_at': '2026-11-11T20:00:00-07:00',
+                'updated_at': '2026-11-12T03:00:00.5+00:00',
+            },
+        )
+
+        assert record.created_at == datetime(2026, 11, 12, 3, tzinfo=UTC)
+        assert record.created_at.utcoffset() == timedelta(hours=-7)
+        assert record.updated_at == datetime(2026, 11, 12, 3, 0, 0, 500000, tzinfo=UTC)
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [{}, {'created_at': None, 'updated_at': None}, {'created_at': 'soon', 'updated_at': 7}],
+        ids=['absent', 'null', 'unparseable'],
+    )
+    def test_absent_or_unparseable_times_are_none(self, metadata):
+        record = LiveRecord(memory_id=CHILD, text='t', metadata=metadata)
+
+        assert record.created_at is None
+        assert record.updated_at is None
 
 
 class TestRead:
@@ -265,8 +362,9 @@ class TestProbe:
 
 
 class _Point:
-    def __init__(self, point_id: Any) -> None:
+    def __init__(self, point_id: Any, payload: dict[str, Any] | None = None) -> None:
         self.id = point_id
+        self.payload = payload
 
 
 class _FakeScrollBackend:
@@ -317,6 +415,34 @@ class TestQdrantLinkCensus:
         assert excinfo.value.project_id == PROJECT
         assert excinfo.value.error_type == 'ConnectionError'
         assert 'mid-scroll' in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_a_window_keeps_only_the_admitted_ids(self):
+        inside, outside, unknown = (str(uuid.UUID(int=n)) for n in (1, 2, 3))
+        backend = _FakeScrollBackend([
+            _Point(inside, {'parent_id': 'p', 'created_at': '2026-11-11T20:00:00-07:00'}),
+            _Point(outside, {'parent_id': 'p', 'created_at': '2026-11-10T00:00:00+00:00'}),
+            _Point(unknown, {'parent_id': 'p'}),
+        ])
+        census = QdrantLinkCensus(cast('Mem0Backend', backend), 'fused')
+
+        ids = await census.linked_ids(
+            PROJECT, created_in=CreatedWindow(since=SINCE, until=UNTIL),
+        )
+
+        assert ids == [inside, unknown]
+
+    @pytest.mark.asyncio
+    async def test_no_window_keeps_every_id(self):
+        ids = [str(uuid.UUID(int=n)) for n in (1, 2)]
+        backend = _FakeScrollBackend([
+            _Point(ids[0], {'parent_id': 'p', 'created_at': '2026-11-11T20:00:00-07:00'}),
+            _Point(ids[1], {'parent_id': 'p', 'created_at': '2020-01-01T00:00:00+00:00'}),
+        ])
+
+        found = await QdrantLinkCensus(cast('Mem0Backend', backend), 'fused').linked_ids(PROJECT)
+
+        assert found == ids
 
 
 @qdrant_skipif()
