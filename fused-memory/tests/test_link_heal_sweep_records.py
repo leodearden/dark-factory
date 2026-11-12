@@ -6,11 +6,16 @@ text. At the executor seam a sweep is an adjudicator plan of its own source:
 only the links whose child was created inside the run window are examined,
 only the heals the sweep is enabled for are staged, and a writing sweep files
 the adjudicator storm escape rather than only forecasting it.
+
+End to end, :func:`run_sweep` resolves its window from the ledger, gates its
+writes on the adjudicator's calibration, and leaves one report on disk and one
+info escalation naming it, whether or not it wrote.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,6 +23,8 @@ import pytest_asyncio
 from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     DF,
+    FAKE_ADJUDICATOR_MODEL,
+    FAKE_PROMPT_SHA256,
     PROJECTS,
     Answer,
     FakeAdjudicator,
@@ -26,16 +33,28 @@ from _link_heal_harness import (
     build_harness,
 )
 
-from fused_memory.maintenance.link_heal import HealAction, Report, Verdict
+from fused_memory.config.schema import LinkHealConfig
+from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
+from fused_memory.maintenance.link_heal import HealAction, LinkImage, Report, Verdict
 from fused_memory.maintenance.link_heal_executor import (
     ADJUDICATOR_ANCHOR,
+    MISFILE_SHARE_ANCHOR,
+    RUN_REPORT_ANCHOR,
     EscapeFiler,
     RunLimits,
     RunReport,
     run_adjudicator_plan,
+    run_undo,
 )
-from fused_memory.maintenance.link_heal_ledger import Disposition, LinkHealLedger, RunSource
+from fused_memory.maintenance.link_heal_ledger import (
+    NO_ACTION_TAKEN,
+    Disposition,
+    LinkHealLedger,
+    RunSource,
+)
+from fused_memory.maintenance.link_heal_report import WritesWithheld
 from fused_memory.maintenance.link_heal_store import CreatedWindow
+from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
 from fused_memory.server.grouped_read import AMENDMENT_KIND, CONTESTED_METADATA_KEY, SIGHTING_KIND
 
 LIMITS = RunLimits(
@@ -250,3 +269,424 @@ class TestTheSweepFilesItsStorm:
 
         assert ADJUDICATOR_ANCHOR in report.counts.would_escape
         assert report.counts.escaped == ()
+
+
+NOW = datetime(2026, 11, 2, tzinfo=UTC)
+DAY = timedelta(hours=24)
+
+
+def _settings(*, writes: bool = False, dry_run: bool = False) -> SweepSettings:
+    return SweepSettings(
+        projects=PROJECTS, writes=writes, dry_run=dry_run, actions=SWEEP_ACTIONS, window_hours=24,
+    )
+
+
+def _calibrate(ledger: LinkHealLedger, *, passed: bool, prompt_sha256: str = FAKE_PROMPT_SHA256) -> str:
+    run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
+    ledger.add_calibration(
+        run_id, model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=prompt_sha256,
+        population_sha256='0' * 64, passed=passed, report={'passed': passed},
+    )
+    return run_id
+
+
+async def _sweep(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    tmp_path: Path,
+    *,
+    settings: SweepSettings,
+    filer: RecordingFiler,
+    adjudicate: FakeAdjudicator | None = None,
+    now: datetime = NOW,
+    since: datetime | None = None,
+    limits: RunLimits = LIMITS,
+) -> SweepReport:
+    return await run_sweep(
+        adjudicate=adjudicate or _answering(),
+        store=harness.store(),
+        census=harness.mem0,
+        ledger=ledger,
+        limits=limits,
+        settings=settings,
+        filer=filer,
+        reports_dir=tmp_path / 'reports',
+        now=now,
+        since=since,
+    )
+
+
+def _sweep_runs(ledger: LinkHealLedger, *, writes: bool) -> list[str]:
+    return [
+        run.run_id for run in ledger.recent_runs(50)
+        if run.source is RunSource.SWEEP and run.writes is writes
+    ]
+
+
+def _report_json(report: SweepReport) -> dict:
+    return json.loads(report.json_path.read_text())
+
+
+class TestADryRunSweep:
+    @pytest.mark.asyncio
+    async def test_it_plans_once_and_never_applies(self, harness, ledger, tmp_path):
+        _seed(harness)
+
+        report = await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+
+        assert _sweep_runs(ledger, writes=False) == [report.plan_run_id]
+        assert _sweep_runs(ledger, writes=True) == []
+        assert report.apply_run_id is None
+        assert harness.mem0.write_count == 0
+
+    @pytest.mark.asyncio
+    async def test_every_record_took_no_action_and_kept_its_before_state(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+
+        report = await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+
+        records = ledger.run_records(report.plan_run_id)
+        assert len(records) == 6
+        for record in records:
+            assert record.action_taken == NO_ACTION_TAKEN
+            assert record.after_child == record.before_child
+
+    @pytest.mark.asyncio
+    async def test_it_leaves_a_report_and_one_info_escalation_naming_it(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        filer = RecordingFiler()
+
+        report = await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=filer)
+
+        assert report.json_path.parent == tmp_path / 'reports'
+        assert report.json_path.is_file()
+        assert report.report_path.suffix == '.md'
+        assert report.report_path.is_file()
+        run_reports = [escape for escape in filer.escapes if escape.anchor == RUN_REPORT_ANCHOR]
+        assert len(run_reports) == 1
+        assert str(report.report_path) in run_reports[0].summary
+        assert report.escalation_id == f'esc-recorded-{len(filer.escapes)}'
+
+    @pytest.mark.asyncio
+    async def test_the_report_says_dry_run_and_names_no_undo(self, harness, ledger, tmp_path):
+        _seed(harness)
+
+        report = await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+
+        document = _report_json(report)
+        assert document['writes'] == {'mode': 'dry_run', 'withheld': WritesWithheld.WRITES_OFF.value}
+        assert document['undo_run_id'] is None
+        assert document['plan_run_id'] == report.plan_run_id
+        assert '- Writes: dry-run' in report.report_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_forecasts_the_storm_rather_than_filing_it(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        filer = RecordingFiler()
+
+        await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=filer,
+            adjudicate=FakeAdjudicator(ANSWERS.__getitem__, storm=STORM),
+        )
+
+        assert ADJUDICATOR_ANCHOR not in [escape.anchor for escape in filer.escapes]
+
+
+class TestWithheldWrites:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('calibration', 'reason'),
+        [
+            (None, WritesWithheld.UNCALIBRATED),
+            ('failed', WritesWithheld.CALIBRATION_FAILED),
+            ('another prompt', WritesWithheld.UNCALIBRATED),
+        ],
+    )
+    async def test_writes_wait_for_a_passing_calibration_of_this_adjudicator(
+        self, harness, ledger, tmp_path, calibration, reason,
+    ):
+        _seed(harness)
+        if calibration == 'failed':
+            _calibrate(ledger, passed=False)
+        elif calibration == 'another prompt':
+            _calibrate(ledger, passed=True, prompt_sha256='f' * 64)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+
+        assert report.apply_run_id is None
+        assert _sweep_runs(ledger, writes=True) == []
+        assert harness.mem0.write_count == 0
+        document = _report_json(report)
+        assert document['writes'] == {'mode': 'withheld', 'withheld': reason.value}
+        assert f'- Writes: withheld ({reason.value})' in report.report_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_the_dry_run_override_withholds_a_calibrated_writing_sweep(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        _calibrate(ledger, passed=True)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True, dry_run=True),
+            filer=RecordingFiler(),
+        )
+
+        assert report.apply_run_id is None
+        assert _sweep_runs(ledger, writes=True) == []
+        assert harness.mem0.write_count == 0
+        assert _report_json(report)['writes'] == {
+            'mode': 'dry_run', 'withheld': WritesWithheld.DRY_RUN.value,
+        }
+
+
+class TestAllowedWrites:
+    @pytest.mark.asyncio
+    async def test_one_apply_run_applies_the_staged_heals(self, harness, ledger, tmp_path):
+        _seed(harness)
+        calibration_run = _calibrate(ledger, passed=True)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+
+        assert _sweep_runs(ledger, writes=True) == [report.apply_run_id]
+        applied = {
+            (row.planned.child_id, row.planned.action)
+            for row in ledger.applied_actions(report.apply_run_id)
+        }
+        assert applied == {
+            (MISFILED, HealAction.DETACH),
+            (EXTENDS, HealAction.RELABEL),
+            (TRIAGE_CONTESTED, HealAction.DETACH),
+        }
+        document = _report_json(report)
+        assert document['undo_run_id'] == report.apply_run_id
+        assert document['calibration']['calibration_run_id'] == calibration_run
+        assert f'link_heal.py undo --run {report.apply_run_id}' in report.report_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_the_records_show_each_heal_and_its_after_state(self, harness, ledger, tmp_path):
+        _seed(harness)
+        _calibrate(ledger, passed=True)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+
+        post_images = {
+            row.action_id: row.planned.post_image
+            for row in ledger.applied_actions(report.apply_run_id)
+        }
+        records = {record.child_id: record for record in ledger.run_records(report.plan_run_id)}
+        for child, action in (
+            (MISFILED, 'detach'), (EXTENDS, 'relabel'), (TRIAGE_CONTESTED, 'detach'),
+        ):
+            record = records[child]
+            assert record.action_taken == action
+            assert record.after_child is not None
+            assert record.after_child.link_image() == post_images[record.action_id]
+        assert records[AMENDMENT_CORRECTS].action_taken == NO_ACTION_TAKEN
+
+    @pytest.mark.asyncio
+    async def test_undoing_the_apply_run_restores_every_before_state(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        _calibrate(ledger, passed=True)
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+        assert report.apply_run_id is not None
+
+        await run_undo(
+            ledger.undo_target(ledger.resolve_run(report.apply_run_id)),
+            store=harness.store(), ledger=ledger, limits=LIMITS,
+        )
+
+        for record in ledger.run_records(report.plan_run_id):
+            restored = LinkImage.from_metadata(harness.mem0.payload(DF, record.child_id))
+            assert restored == record.before_child.link_image()
+
+    @pytest.mark.asyncio
+    async def test_a_writing_sweep_files_its_storm(self, harness, ledger, tmp_path):
+        _seed(harness)
+        _calibrate(ledger, passed=True)
+        filer = RecordingFiler()
+
+        await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=filer,
+            adjudicate=FakeAdjudicator(ANSWERS.__getitem__, storm=STORM),
+        )
+
+        assert [escape.anchor for escape in filer.escapes] == [
+            ADJUDICATOR_ANCHOR, RUN_REPORT_ANCHOR,
+        ]
+
+
+def _seed_misfile_heavy(harness: LinkHealHarness) -> None:
+    """Twenty in-window sighting links, eight of them misfiled: a 0.40 misfile share."""
+    for n in range(20):
+        text = f'misfiled sighting {n}' if n < 8 else f'belonging sighting {n}'
+        harness.seed_link(
+            kind=SIGHTING_KIND, child=_id('cccccccc', n), parent=_id('dddddddd', n),
+            child_text=text, parent_text=f'the parent of {text}', meta={'created_at': INSIDE},
+        )
+
+
+class TestTheShareEscape:
+    @pytest.mark.asyncio
+    async def test_a_misfile_heavy_sweep_files_the_share_escape_and_writes_nothing(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed_misfile_heavy(harness)
+        _calibrate(ledger, passed=True)
+        filer = RecordingFiler()
+        adjudicate = FakeAdjudicator(
+            lambda text: Verdict.RELATED if text.startswith('misfiled') else Verdict.SAME,
+        )
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=filer,
+            adjudicate=adjudicate,
+        )
+
+        assert MISFILE_SHARE_ANCHOR in [escape.anchor for escape in filer.escapes]
+        assert harness.mem0.write_count == 0
+        assert report.apply_run_id is not None
+        records = ledger.run_records(report.plan_run_id)
+        assert {record.action_taken for record in records} == {NO_ACTION_TAKEN}
+        assert _report_json(report)['undo_run_id'] is None
+
+
+def _seed_one(harness: LinkHealHarness, n: int, text: str, created_at: str) -> str:
+    child = _id('eeeeeeee', n)
+    harness.seed_link(
+        kind=SIGHTING_KIND, child=child, parent=_id('ffffffff', n),
+        child_text=text, parent_text=f'the parent of {text}', meta={'created_at': created_at},
+    )
+    return child
+
+
+def _window(report: SweepReport) -> tuple[datetime, datetime]:
+    document = _report_json(report)
+    return (
+        datetime.fromisoformat(document['window']['since']),
+        datetime.fromisoformat(document['window']['until']),
+    )
+
+
+class TestTheWindow:
+    @pytest.mark.asyncio
+    async def test_the_first_sweep_looks_back_its_window_hours(self, harness, ledger, tmp_path):
+        report = await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+
+        assert _window(report) == (NOW - DAY, NOW)
+
+    @pytest.mark.asyncio
+    async def test_the_next_sweep_starts_where_the_last_one_ended(self, harness, ledger, tmp_path):
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        later = NOW + timedelta(hours=6)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(), now=later,
+        )
+
+        assert _window(report) == (NOW, later)
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_since_overrides_the_watermark(self, harness, ledger, tmp_path):
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        backlog = datetime(2026, 1, 1, tzinfo=UTC)
+        later = NOW + DAY
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            now=later, since=backlog,
+        )
+
+        assert _window(report) == (backlog, later)
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_since_reaches_children_the_window_would_miss(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            since=datetime(2026, 9, 1, tzinfo=UTC),
+        )
+
+        assert OLD in {record.child_id for record in ledger.run_records(report.plan_run_id)}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('failure', ['adjudication', 'read'])
+    async def test_an_incomplete_sweep_does_not_advance_the_watermark(
+        self, harness, ledger, tmp_path, failure,
+    ):
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        second = NOW + DAY
+        child = _seed_one(harness, 1, 'an unjudgeable sighting', '2026-11-02T12:00:00+00:00')
+        if failure == 'read':
+            harness.mem0.read_failures.add(child)
+        failing = FakeAdjudicator(lambda _text: AdjudicationFailure.CLI_FAILED)
+
+        incomplete = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            adjudicate=failing, now=second,
+        )
+        assert not incomplete.complete
+        third = second + DAY
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            adjudicate=FakeAdjudicator(lambda _text: Verdict.SAME), now=third,
+        )
+
+        assert _window(report) == (NOW, third)
+
+    @pytest.mark.asyncio
+    async def test_a_complete_sweep_says_so(self, harness, ledger, tmp_path):
+        _seed(harness)
+
+        report = await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+
+        assert report.complete
+
+
+class TestSweepSettings:
+    def test_it_reads_the_config_leaves(self):
+        config = LinkHealConfig(projects=[DF], writes=True, sweep_window_hours=6)
+
+        settings = SweepSettings.from_config(config, dry_run=True)
+
+        assert settings == SweepSettings(
+            projects=(DF,), writes=True, dry_run=True, actions=SWEEP_ACTIONS, window_hours=6,
+        )
+
+    def test_a_projects_override_replaces_the_configured_projects(self):
+        config = LinkHealConfig(projects=[DF])
+
+        assert SweepSettings.from_config(config, projects=['reify']).projects == ('reify',)
+
+    def test_a_sweep_over_no_project_is_refused(self):
+        with pytest.raises(ValueError, match='projects'):
+            SweepSettings.from_config(LinkHealConfig())
+
+    def test_an_unknown_sweep_action_is_refused_by_name(self):
+        config = LinkHealConfig(projects=[DF], sweep_actions=['detach', 'explode'])
+
+        with pytest.raises(ValueError, match='explode') as raised:
+            SweepSettings.from_config(config)
+
+        for action in HealAction:
+            assert action.value in str(raised.value)
