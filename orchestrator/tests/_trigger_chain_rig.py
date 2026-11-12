@@ -12,7 +12,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import socket
+import subprocess
+import sys
 import threading
 from collections.abc import AsyncIterator, Coroutine
 from dataclasses import dataclass
@@ -55,6 +58,8 @@ INTERIM_DELAY_SECS = 259200
 _READY_TIMEOUT_S = 60.0
 _READY_POLL_S = 0.05
 _TOOL_TIMEOUT_S = 30.0
+_SCRIPT_TIMEOUT_S = 120.0
+CHECK_SCRIPT_RELPATH = Path('scripts/check_run_completion.py')
 
 _T = TypeVar('_T')
 
@@ -212,6 +217,13 @@ class FakeClock:
 
     def timestamp(self) -> float:
         return self.now.timestamp()
+
+
+@dataclass(frozen=True)
+class ScriptRun:
+    rc: int
+    lines: tuple[str, ...]
+    stderr: str
 
 
 class StatusWriteFailing:
@@ -407,6 +419,25 @@ class TriggerChainRig:
     def _one_pending(self, task_id: str) -> Escalation:
         (escalation,) = self.own_escalations(task_id, status='pending')
         return escalation
+
+    def pending_report(self, *extra_args: str) -> ScriptRun:
+        """The factory script's ``--pending`` report on this project, read from the live server."""
+        done = subprocess.run(
+            [
+                sys.executable,
+                '-s',
+                str(self.factory_root / CHECK_SCRIPT_RELPATH),
+                '--pending',
+                '--project-root',
+                str(self.root),
+                *extra_args,
+            ],
+            env={**os.environ, 'FUSED_MEMORY_MCP_URL': self.url},
+            capture_output=True,
+            text=True,
+            timeout=_SCRIPT_TIMEOUT_S,
+        )
+        return ScriptRun(done.returncode, tuple(done.stdout.splitlines()), done.stderr)
 
     def status_write_failing(self, status: str) -> StatusWriteFailing:
         """This rig's Scheduler, except that its writes of *status* are lost."""
