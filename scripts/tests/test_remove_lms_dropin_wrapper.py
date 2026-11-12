@@ -1258,6 +1258,29 @@ def _host_bus_transport_errno(result: subprocess.CompletedProcess[str]) -> int |
     return None
 
 
+def _selftest_detail(result: subprocess.CompletedProcess[str], template: str) -> str:
+    """The full record of one .sh run, as every red or skip of it reports it."""
+    return (
+        f"\n--- template: {template}\n"
+        f"--- exit code: {result.returncode}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+
+
+def _skip_if_host_bus_dropped(result: subprocess.CompletedProcess[str], template: str) -> None:
+    """Skip a FAILED run whose output shows the user-manager bus dropping a systemctl call."""
+    __tracebackhide__ = True  # report the skip against the TEST, not this helper
+    err = _host_bus_transport_errno(result)
+    if result.returncode != 0 and err is not None:
+        pytest.skip(
+            f"the systemd --user manager's bus dropped a systemctl call mid-run "
+            f"({errno.errorcode[err]}: {os.strerror(err)}).  Environment fact, like this "
+            "module's other skips, not a regression in remove-lms-arm-worktree-dropin.sh"
+            + _selftest_detail(result, template)
+        )
+
+
 def _assert_selftest_passed(result: subprocess.CompletedProcess[str], template: str) -> None:
     """Assert one run is green, surfacing its full output on failure.
 
@@ -1266,12 +1289,7 @@ def _assert_selftest_passed(result: subprocess.CompletedProcess[str], template: 
     in hand when it goes red.  The .sh prints a PASS/FAIL line per check, so
     embedding stdout names the exact check that broke.
     """
-    detail = (
-        f"\n--- template: {template}\n"
-        f"--- exit code: {result.returncode}\n"
-        f"--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
+    detail = _selftest_detail(result, template)
     assert result.returncode == 0, f"{SELFTEST_SH.name} exited non-zero.{detail}"
     assert "ALL CHECKS PASSED" in result.stdout, (
         f"{SELFTEST_SH.name} did not report ALL CHECKS PASSED.{detail}"
@@ -1375,12 +1393,7 @@ def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
         timeout=60,
     )
 
-    detail = (
-        f"\n--- template: {template}\n"
-        f"--- exit code: {result.returncode}\n"
-        f"--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
+    detail = _selftest_detail(result, template)
     assert template in result.stderr, (
         f"{SELFTEST_SH.name} never named the template it was handed, so "
         "LMS_SELFTEST_TEMPLATE did not reach its UNIT/DROPIN_DIR paths.  The .sh "
@@ -1437,7 +1450,9 @@ def test_shell_selftest_passes() -> None:
     with _serialized_selftest_slot():
         template = _unique_template()
         try:
-            _assert_selftest_passed(_run_selftest(template), template)
+            result = _run_selftest(template)
+            _skip_if_host_bus_dropped(result, template)
+            _assert_selftest_passed(result, template)
         finally:
             _remove_template_residue(template)
 
@@ -1489,12 +1504,7 @@ def test_selftest_surfaces_script_under_test_output(tmp_path: Path) -> None:
 
     result = _run_selftest_with_failing_script_reload(tmp_path, template, transport_error)
 
-    detail = (
-        f"\n--- template: {template}\n"
-        f"--- exit code: {result.returncode}\n"
-        f"--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
+    detail = _selftest_detail(result, template)
     assert transport_error in result.stdout + result.stderr, (
         f"{SELFTEST_SH.name} discarded the script under test's output, so its "
         f"systemctl error {transport_error!r} never reached the run's output." + detail
