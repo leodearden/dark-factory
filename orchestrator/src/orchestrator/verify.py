@@ -92,6 +92,7 @@ from orchestrator.verify_classify import (
     is_interpreter_missing_workspace_packages,
     is_partially_provisioned_venv_type_failure,
     is_shell_reported_external_kill,
+    shows_no_lint_type_finding,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
@@ -1106,6 +1107,18 @@ def _pytest_session_aborted_without_verdict(rc: int, output: str) -> bool:
     ):
         return False
     return is_shell_reported_external_kill(rc) or bool(_XDIST_CHANNEL_COLLAPSE_RE.search(output))
+
+
+def _leg_aborted_without_verdict(tool: ToolKind, rc: int, output: str) -> bool:
+    """Return True when a leg was torn down before reaching any verdict.
+
+    A pytest leg answers through ``_pytest_session_aborted_without_verdict``.
+    Any other leg needs a shell-reported kill and output holding no finding
+    (``verify_classify.py::shows_no_lint_type_finding``).
+    """
+    if tool is ToolKind.PYTEST:
+        return _pytest_session_aborted_without_verdict(rc, output)
+    return is_shell_reported_external_kill(rc) and shows_no_lint_type_finding(tool, output)
 
 
 # Pytest node-id extraction for the main-tip-sweep isolated-rerun confirm gate
@@ -2755,7 +2768,7 @@ def classify_leg(
     category = classify_failure(tool, rc, output, timed_out, event_channel=event_channel)
     if category != FailureCategory.UNKNOWN_TEST_FAILURE:
         return category
-    if tool is ToolKind.PYTEST and _pytest_session_aborted_without_verdict(rc, output):
+    if _leg_aborted_without_verdict(tool, rc, output):
         return FailureCategory.INFRA_ABORT
     return _red_gate_category(slot)
 

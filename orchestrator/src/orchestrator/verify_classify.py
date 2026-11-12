@@ -1515,6 +1515,44 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
 
 
 # ---------------------------------------------------------------------------
+# ToolKind.RUFF / ToolKind.PYRIGHT — the no-finding witness of a killed leg
+# (task 6461): the lines each tool prints without having found anything.
+# ---------------------------------------------------------------------------
+
+# bash's report that its child died of SIGTERM or SIGHUP. The bare word
+# 'Terminated' was measured 2026-11-12; the job-report long form was measured
+# on bash 5.2.21 by task 4843.
+_SHELL_KILL_REPORT = r'(?:\S+: line \d+: +\d+ +)?(?:Terminated|Hangup)(?: .*)?'
+
+_NO_FINDING_LINE_BY_TOOL: dict[ToolKind, re.Pattern[str]] = {
+    # ruff's `warning:` lines are its own notices, printed during the run;
+    # no ruff finding starts that way, in any output format.
+    ToolKind.RUFF: re.compile(rf'(?:All checks passed!|warning: .+|{_SHELL_KILL_REPORT})'),
+}
+
+
+def shows_no_lint_type_finding(tool: ToolKind, output: str) -> bool:
+    """Return True when *output* holds no finding of *tool*, a lint or type
+    checker with a known no-finding vocabulary.
+
+    Every non-blank line must be one *tool* prints without having found
+    anything, or bash's report of its kill. An unrecognised line counts as a
+    finding, so any real diagnostic wins. Empty output qualifies, because
+    these tools print a summary only on completion. A tool with no known
+    vocabulary never qualifies.
+
+    Output only: whether the leg was killed is the caller's to decode
+    (``is_shell_reported_external_kill``). Pure and total.
+    """
+    pattern = _NO_FINDING_LINE_BY_TOOL.get(tool)
+    if pattern is None:
+        return False
+    return all(
+        pattern.fullmatch(line.rstrip()) for line in output.splitlines() if line.strip()
+    )
+
+
+# ---------------------------------------------------------------------------
 # ToolKind.OPAQUE — the full legacy generic ladder, moved verbatim from
 # verify.py's _CLASSIFY_PATTERNS (with its grounding comments, now hoisted
 # above as shared primitives). The ONLY surviving dispatch target for the
