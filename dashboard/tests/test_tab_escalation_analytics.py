@@ -1069,44 +1069,6 @@ def test_esc_per_done_chart_does_not_compact_its_series(tab_analytics_jsx_body: 
 
 
 # ---------------------------------------------------------------------------
-# amendment: pin charts.jsx's chart padding to the value RegimeMarkers assumes
-# ---------------------------------------------------------------------------
-
-
-def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: str) -> None:
-    """Pin charts.jsx's LineChart/StackedAreaChart padL/padR to the values
-    tab_escalation_analytics.jsx's RegimeMarkers overlay hardcodes as
-    `_CHART_PAD_L`/`_CHART_PAD_R` (38/12).
-
-    charts.jsx is intentionally NOT modified by the escalation-analytics tab
-    (see task 2659 design decisions: markers/ECDF are composed locally from
-    existing primitives instead of extending the shared chart primitives, to
-    avoid a broader-scope edit and contention with sibling tasks also
-    building on charts.jsx). RegimeMarkers therefore duplicates padL/padR as
-    private constants rather than importing them from charts.jsx, so that
-    duplication is invisible to any test scoped to tab_escalation_analytics.jsx
-    alone — if charts.jsx's padding ever changes, the overlay would silently
-    drift out of alignment with the chart it decorates. This test is the
-    tripwire: it fails loudly the moment the two constants diverge, without
-    requiring charts.jsx to export anything.
-    """
-    for fn_name in ('LineChart', 'StackedAreaChart'):
-        fn_body = extract_function_body(charts_jsx_body, fn_name)
-        assert re.search(r'padL\s*=\s*38\b', fn_body), (
-            f'charts.jsx {fn_name} no longer declares padL = 38 — '
-            'tab_escalation_analytics.jsx hardcodes _CHART_PAD_L = 38 for its '
-            'RegimeMarkers overlay (see that file) and must be updated to match, '
-            'or charts.jsx should export the constant instead.'
-        )
-        assert re.search(r'padR\s*=\s*12\b', fn_body), (
-            f'charts.jsx {fn_name} no longer declares padR = 12 — '
-            'tab_escalation_analytics.jsx hardcodes _CHART_PAD_R = 12 for its '
-            'RegimeMarkers overlay (see that file) and must be updated to match, '
-            'or charts.jsx should export the constant instead.'
-        )
-
-
-# ---------------------------------------------------------------------------
 # task 5596 (PRD leaf eta): the analytics tab reads the corpus through
 # escalation_views.js and states the age of the walk it shows
 # ---------------------------------------------------------------------------

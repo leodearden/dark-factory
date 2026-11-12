@@ -12,6 +12,9 @@ import assert from 'node:assert/strict';
 
 import { openWindow } from './_render_helpers.mjs';
 
+// Arrays built inside the window belong to its realm, so a helper's result is
+// spread into a node array before a deepStrictEqual against the DOM.
+
 // charts.jsx's LineChart before its ResizeObserver reports a width.
 const CHART_WIDTH = 600;
 const CHART_HEIGHT = 220;
@@ -65,7 +68,7 @@ test('charts.jsx::LineChart draws bandPaths(lo, hi, geom) as filled paths beneat
   });
 
   const geom = plotGeom(window, 4, axisRange(window, [...CENTRE, ...HI]));
-  const expected = window.DF_SPARK_PATH.bandPaths(LO, HI, geom);
+  const expected = [...window.DF_SPARK_PATH.bandPaths(LO, HI, geom)];
   assert.equal(expected.length, 1);
   assert.deepEqual(bandDs(container), expected);
 
@@ -88,7 +91,7 @@ test('charts.jsx::LineChart splits the band at a hole in hi', t => {
   });
 
   const geom = plotGeom(window, 4, axisRange(window, [...CENTRE, ...hi]));
-  const expected = window.DF_SPARK_PATH.bandPaths(LO, hi, geom);
+  const expected = [...window.DF_SPARK_PATH.bandPaths(LO, hi, geom)];
   assert.equal(expected.length, 2);
   assert.deepEqual(bandDs(container), expected);
 });
@@ -273,7 +276,7 @@ test('charts.jsx::Markers draws a legend only when asked, one entry per style pr
   assert.ok(legend, 'legend: true draws the legend');
   assert.deepEqual(
     [...legend.querySelectorAll('.chart-mark-legend-entry')].map(e => e.textContent),
-    legendEntries(marks).map(e => e.label),
+    [...legendEntries(marks)].map(e => e.label),
   );
 });
 
