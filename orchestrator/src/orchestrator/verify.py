@@ -598,6 +598,14 @@ _PYTEST_STATS_LINE_RE = re.compile(
     rf'{_PYTEST_TALLY_DECORATION}(?:\d+ {_PYTEST_OUTCOME_WORD}|no tests ran){_PYTEST_TALLY_TAIL}',
 )
 _PYTEST_SESSION_START_RE = re.compile(r'^=+ test session starts =+$')
+# `_pytest/terminal.py::TerminalReporter._report_keyboardinterrupt`'s banner, written
+# only when the run loop ended by an exception: xdist.dsession.Interrupted (-x or
+# --maxfail under xdist) or KeyboardInterrupt. Not `stopping after N failures`:
+# a genuine xdist bailout under -x prints that one too.
+_PYTEST_INTERRUPTED_BANNER_RE = re.compile(
+    r'^!+ (?:[\w.]+\.)?(?:KeyboardInterrupt|Interrupted)(?:: .+)? !+$',
+    re.MULTILINE,
+)
 _SEGMENT_BLOCK_HEADER_LEAD = '===== segment '
 _SEGMENT_BLOCK_HEADER_RE = re.compile(rf'^{re.escape(_SEGMENT_BLOCK_HEADER_LEAD)}\d+/\d+ ')
 _PYTEST_BARRED_HEADER = r'=+ .+ =+'
@@ -707,14 +715,16 @@ def _pytest_session_own_streams(output: str) -> list[str]:
     Report-section bodies (FAILURES, ERRORS, captured output, warnings) carry
     test-controlled text: a nested run's progress, a quoted crash notice. A
     body opens at a ``=``-barred header and closes at the session's stats
-    line. A session starts at pytest's ``test session starts`` header or at a
-    ``_run_segmented`` block header, because each segment is its own pytest
-    process. Header-less text, such as the ``-q`` per-module join in
-    ``_aggregate_results``, stays ONE stream, where a stats line closing a
-    body keeps last-module semantics.
+    line or at pytest's interrupted-run banner, both written by pytest's
+    terminal reporter after its report sections. A session starts at pytest's
+    ``test session starts`` header or at a ``_run_segmented`` block header,
+    because each segment is its own pytest process. Header-less text, such as
+    the ``-q`` per-module join in ``_aggregate_results``, stays ONE stream,
+    where a stats line closing a body keeps last-module semantics.
 
-    Known limitations: a nested run's own stats line inside a body closes it
-    early, and a nested default-verbosity session header starts a new session.
+    Known limitations: a nested run's own stats line or interrupted-run banner
+    inside a body closes it early, and a nested default-verbosity session
+    header starts a new session.
     In a header-less join, a body that never reaches a stats line (a module
     killed mid-summary, or a non-pytest ``=``-barred banner) hides the run
     stream of every chunk after it, so a truncated module there goes
@@ -726,7 +736,7 @@ def _pytest_session_own_streams(output: str) -> list[str]:
         if _PYTEST_SESSION_START_RE.match(line) or _SEGMENT_BLOCK_HEADER_RE.match(line):
             streams.append([])
             in_body = False
-        elif _PYTEST_STATS_LINE_RE.match(line):
+        elif _PYTEST_STATS_LINE_RE.match(line) or _PYTEST_INTERRUPTED_BANNER_RE.match(line):
             in_body = False
         elif in_body:
             continue
@@ -766,7 +776,7 @@ def _reported_every_collected_test(stream: str) -> bool:
 def _crashed_session_stop_percent(stream: str) -> int | None:
     """Return the percentage of collected tests a crashed session stopped at.
 
-    The ``-q``-robust truncation witness. All three facts must hold, each
+    The ``-q``-robust truncation witness. All four facts must hold, each
     read from *stream*, one session's own stream
     (``_pytest_session_own_streams``):
 
@@ -778,18 +788,16 @@ def _crashed_session_stop_percent(stream: str) -> int | None:
       ``_pytest/terminal.py::TerminalReporter._get_progress_information_message``
       floors ``reported*100//collected``, so only an abandoned queue stays
       short; a recovering run reaches ``[100%]``.
-    * A pytest failure tally AFTER that line: pytest ended its own run loop and
-      printed its summary, rather than being killed mid-run.
+    * A pytest failure tally AFTER that line: pytest printed its summary,
+      rather than being killed mid-run.
+    * No interrupted-run banner (``_PYTEST_INTERRUPTED_BANNER_RE``) after that
+      line. An ``-x``/``--maxfail`` stop or a KeyboardInterrupt after xdist
+      replaced a crashed worker prints one, while xdist's
+      ``triggershutdown()`` bailout ends the loop without one.
 
     Returns ``None`` when any fact is missing, including when *stream* has no
     percentage progress line at all (``-v``, or the ``count``/``times``
     console styles): the bailout literal is then the only witness.
-
-    Known limitation: a run whose crashed worker xdist REPLACED
-    (``--max-worker-restart > 0``) and that ``-x``/``--maxfail`` then stopped
-    also satisfies all three facts. Its tally is genuinely partial; only the
-    named cause is imprecise (``VerifyResult.failure_report`` says the cap
-    was exceeded).
     """
     if not _XDIST_WORKER_CRASH_RE.search(stream):
         return None
@@ -797,10 +805,16 @@ def _crashed_session_stop_percent(stream: str) -> int | None:
     if final_line is None:
         return None
     stop_percent = int(final_line.group(1))
-    pytest_ended_its_own_loop = (
-        _PYTEST_FAILURE_SUMMARY_RE.search(stream, final_line.end()) is not None
+    after_final_line = final_line.end()
+    pytest_printed_its_tally = (
+        _PYTEST_FAILURE_SUMMARY_RE.search(stream, after_final_line) is not None
     )
-    return stop_percent if stop_percent < 100 and pytest_ended_its_own_loop else None
+    pytest_interrupted_its_loop = (
+        _PYTEST_INTERRUPTED_BANNER_RE.search(stream, after_final_line) is not None
+    )
+    if stop_percent < 100 and pytest_printed_its_tally and not pytest_interrupted_its_loop:
+        return stop_percent
+    return None
 
 
 def _worker_death_truncation_evidence(output: str) -> str | None:
