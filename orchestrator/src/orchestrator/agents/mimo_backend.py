@@ -293,9 +293,12 @@ class _Usage:
 
 
 def parse_mimo_sessions(
-    exports: Sequence[Mapping[str, Any]], run: _SubprocessResult, *, cost_of: CostOf,
+    exports: Sequence[Mapping[str, Any]], run: _SubprocessResult, *, max_turns: int, cost_of: CostOf,
 ) -> AgentResult:
-    """Every ``mimo export`` document of one run home; *cost_of* prices (uncached input, output, cached input) tokens in dollars."""
+    """Every ``mimo export`` document of one run home; *cost_of* prices (uncached input, output, cached input) tokens in dollars.
+
+    The root session is the one the run's stdout names or, when stdout names none, the one session without a parent.
+    """
     if not exports:
         return AgentResult(
             success=False,
@@ -308,24 +311,24 @@ def parse_mimo_sessions(
         )
     steps = [message['info'] for export in exports for message in _assistant_messages(export)]
     usage = sum((_Usage.of_step(step) for step in steps), _Usage())
-    root = next((export for export in exports if not _session_info(export).get('parentID')), exports[0])
-    terminal = next(reversed(_assistant_messages(root)), None)
-    terminal_info = terminal['info'] if terminal else {}
+    named_id = _stdout_session_id(run.stdout)
+    root = _root_session(exports, named_id)
+    root_steps = _assistant_messages(root) if root is not None else []
+    terminal = root_steps[-1] if root_steps else {}
+    terminal_info = terminal.get('info') or {}
     error = terminal_info.get('error')
-    text = _text_of(terminal) if terminal else ''
-    success = (
-        run.returncode == 0 and not run.timed_out
-        and error is None and terminal_info.get('finish') == 'stop'
-    )
+    text = _text_of(terminal)
+    subtype = _subtype(run, root, len(root_steps), terminal_info, max_turns)
+    success = subtype == 'success'
     return AgentResult(
         success=success,
-        output=text if success else (_error_message(error) or text or _unfinished(run, terminal_info)),
+        output=text if success else _failure_output(run, subtype, text, terminal_info, max_turns),
         cost_usd=cost_of(usage.input + usage.cache_write, usage.output, usage.cache_read),
         cost_basis=ProcessCostBasis.USAGE_ESTIMATE,
         duration_ms=run.duration_ms,
         turns=len(steps),
-        session_id=str(_session_info(root).get('id') or ''),
-        subtype='success' if success else 'error',
+        session_id=named_id or str(_session_info(root or {}).get('id') or ''),
+        subtype=subtype,
         stderr=run.stderr,
         timed_out=run.timed_out,
         api_error_status=_api_error_status(error),
@@ -334,6 +337,66 @@ def parse_mimo_sessions(
         cache_read_tokens=usage.cache_read,
         cache_create_tokens=usage.cache_write,
     )
+
+
+def _stdout_session_id(stdout: str) -> str | None:
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        session_id = event.get('sessionID') if isinstance(event, dict) else None
+        if isinstance(session_id, str) and session_id:
+            return session_id
+    return None
+
+
+def _root_session(
+    exports: Sequence[Mapping[str, Any]], named_id: str | None,
+) -> Mapping[str, Any] | None:
+    if named_id:
+        matches = [export for export in exports if _session_info(export).get('id') == named_id]
+        rule = f'the id {named_id!r} its stdout names'
+    else:
+        matches = [export for export in exports if not _session_info(export).get('parentID')]
+        rule = 'having no parent (its stdout names no session)'
+    if len(matches) == 1:
+        return matches[0]
+    logger.warning(
+        'mimo backend: %d of the stored sessions [%s] match %s; the run needs exactly one '
+        'root session, so it fails',
+        len(matches), ', '.join(repr(_session_info(export).get('id')) for export in exports), rule,
+    )
+    return None
+
+
+def _subtype(
+    run: _SubprocessResult,
+    root: Mapping[str, Any] | None,
+    root_step_count: int,
+    terminal_info: Mapping[str, Any],
+    max_turns: int,
+) -> str:
+    if root is None:
+        return 'error_no_root_session'
+    if root_step_count >= max_turns:
+        return 'error_max_turns'
+    finished = terminal_info.get('error') is None and terminal_info.get('finish') == 'stop'
+    return 'success' if run.returncode == 0 and not run.timed_out and finished else 'error'
+
+
+def _failure_output(
+    run: _SubprocessResult,
+    subtype: str,
+    text: str,
+    terminal_info: Mapping[str, Any],
+    max_turns: int,
+) -> str:
+    if subtype == 'error_no_root_session':
+        return f"{_exit_line(run)} and its store holds no session identifiable as the run's root"
+    if subtype == 'error_max_turns':
+        return f'{_exit_line(run)} at its {max_turns}-step cap' + (f': {text}' if text else '')
+    return _error_message(terminal_info.get('error')) or text or _unfinished(run, terminal_info)
 
 
 def _session_info(export: Mapping[str, Any]) -> Mapping[str, Any]:

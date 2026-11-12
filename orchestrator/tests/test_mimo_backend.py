@@ -258,11 +258,34 @@ class TestMimoVariantAndArgv:
         assert mimo_export_argv('ses_a') == ['mimo', 'export', 'ses_a']
 
 
+MAX_TURNS = 7
+
+
+def _jsonl(*session_ids: str) -> str:
+    """``mimo run --format json`` stdout: one event per id, each carrying its sessionID."""
+    return ''.join(
+        json.dumps({'type': 'step_finish', 'timestamp': 1, 'sessionID': sid}) + '\n'
+        for sid in session_ids
+    )
+
+
+def _parse(exports, run: _SubprocessResult | None = None, *, max_turns: int = MAX_TURNS):
+    return parse_mimo_sessions(
+        exports, run or _subprocess_result(), max_turns=max_turns, cost_of=_cost_of,
+    )
+
+
+def _with_text(export, text: str):
+    export['messages'][-1]['parts'] = [{'type': 'text', 'text': text}]
+    return export
+
+
 class TestParseMimoSessions:
 
     def test_one_completed_session(self):
-        result = parse_mimo_sessions([measured_export()], _subprocess_result(), cost_of=_cost_of)
+        result = _parse([measured_export()])
         assert result.success is True
+        assert result.subtype == 'success'
         assert result.output == 'probe complete'
         assert result.session_id == 'ses_x'
         assert result.turns == 2
@@ -276,11 +299,8 @@ class TestParseMimoSessions:
         assert result.duration_ms == 1234
 
     def test_sessions_sum_and_the_root_session_is_terminal(self):
-        child = measured_export('ses_child', parent_id='ses_x')
-        child['messages'][-1]['parts'] = [{'type': 'text', 'text': 'child text'}]
-        result = parse_mimo_sessions(
-            [child, measured_export()], _subprocess_result(), cost_of=_cost_of,
-        )
+        child = _with_text(measured_export('ses_child', parent_id='ses_x'), 'child text')
+        result = _parse([child, measured_export()])
         assert result.success is True
         assert result.output == 'probe complete'
         assert result.session_id == 'ses_x'
@@ -289,32 +309,81 @@ class TestParseMimoSessions:
         assert result.output_tokens == 200
         assert result.cache_read_tokens == 1200
 
+    def test_the_root_is_the_session_the_stdout_names(self):
+        exports = [measured_export('ses_a'), _with_text(measured_export('ses_b'), 'b text')]
+        result = _parse(exports, _subprocess_result(stdout='not json\n' + _jsonl('ses_b')))
+        assert result.success is True
+        assert result.output == 'b text'
+        assert result.session_id == 'ses_b'
+        assert result.turns == 4
+
+    def test_a_named_root_whose_export_is_missing_is_a_failure_with_a_warning(self, caplog):
+        child = measured_export('ses_child', parent_id='ses_x')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.agents.mimo_backend'):
+            result = _parse([child], _subprocess_result(stdout=_jsonl('ses_x')))
+        assert result.success is False
+        assert result.subtype == 'error_no_root_session'
+        assert result.session_id == 'ses_x'
+        assert result.input_tokens == 1400
+        assert 'ses_child' in caplog.text
+
+    def test_without_stdout_a_store_of_child_sessions_is_a_failure_with_a_warning(self, caplog):
+        child = measured_export('ses_child', parent_id='ses_x')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.agents.mimo_backend'):
+            result = _parse([child])
+        assert result.success is False
+        assert result.subtype == 'error_no_root_session'
+        assert result.input_tokens == 1400
+        assert 'ses_child' in caplog.text
+
+    def test_without_stdout_two_parentless_sessions_are_a_failure_with_a_warning(self, caplog):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.agents.mimo_backend'):
+            result = _parse([measured_export('ses_a'), measured_export('ses_b')])
+        assert result.success is False
+        assert result.subtype == 'error_no_root_session'
+        assert result.input_tokens == 2800
+        assert 'ses_a' in caplog.text
+        assert 'ses_b' in caplog.text
+
+    def test_a_root_that_reached_the_step_cap_is_error_max_turns(self):
+        result = _parse([measured_export()], max_turns=2)
+        assert result.success is False
+        assert result.subtype == 'error_max_turns'
+        assert result.turns == 2
+        assert result.input_tokens == 1400
+        assert 'probe complete' in result.output
+
+    def test_the_step_cap_counts_only_the_root_sessions_steps(self):
+        child = measured_export('ses_child', parent_id='ses_x')
+        result = _parse([child, measured_export()], max_turns=3)
+        assert result.success is True
+        assert result.turns == 4
+
     def test_an_api_error_is_a_failure_carrying_its_status(self):
         export = measured_export(
             error={'name': 'APIError', 'data': {'statusCode': 401, 'message': 'm'}}, finish=None,
         )
-        result = parse_mimo_sessions([export], _subprocess_result(), cost_of=_cost_of)
+        result = _parse([export])
         assert result.success is False
+        assert result.subtype == 'error'
         assert result.api_error_status == 401
         assert 'm' in result.output
 
     @pytest.mark.parametrize('finish', ['tool-calls', None])
     def test_an_unfinished_terminal_step_is_a_failure(self, finish):
-        result = parse_mimo_sessions(
-            [measured_export(finish=finish)], _subprocess_result(), cost_of=_cost_of,
-        )
+        result = _parse([measured_export(finish=finish)])
         assert result.success is False
 
     def test_an_export_without_session_info_still_counts_its_steps(self):
         export = measured_export()
         del export['info']
-        result = parse_mimo_sessions([export], _subprocess_result(), cost_of=_cost_of)
+        result = _parse([export])
         assert result.success is True
         assert result.session_id == ''
         assert result.input_tokens == 1400
 
     def test_no_session_is_a_failure_with_no_tokens(self):
-        result = parse_mimo_sessions([], _subprocess_result(), cost_of=_cost_of)
+        result = _parse([])
         assert result.success is False
         assert result.subtype == 'error_no_session'
         assert result.input_tokens is None
@@ -323,20 +392,14 @@ class TestParseMimoSessions:
         assert result.cache_create_tokens is None
 
     def test_a_timed_out_run_still_reports_its_tokens(self):
-        result = parse_mimo_sessions(
-            [measured_export()], _subprocess_result(timed_out=True, returncode=-9),
-            cost_of=_cost_of,
-        )
+        result = _parse([measured_export()], _subprocess_result(timed_out=True, returncode=-9))
         assert result.success is False
         assert result.timed_out is True
         assert result.input_tokens == 1400
         assert result.cost_usd == _cost_of(1400, 100, 600)
 
     def test_a_nonzero_exit_is_a_failure(self):
-        result = parse_mimo_sessions(
-            [measured_export()], _subprocess_result(returncode=1, stderr='boom'),
-            cost_of=_cost_of,
-        )
+        result = _parse([measured_export()], _subprocess_result(returncode=1, stderr='boom'))
         assert result.success is False
         assert result.stderr == 'boom'
 

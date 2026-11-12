@@ -1469,7 +1469,7 @@ async def _invoke_mimo(
         run = await spawn(mimo_run_argv(model, cwd, effort), timeout_seconds, prompt.encode())
         exports = await read_mimo_sessions(spawn)
     return parse_mimo_sessions(
-        exports, run,
+        exports, run, max_turns=max_turns,
         cost_of=lambda uncached, output, cached: _estimate_cost(
             model, uncached + cached, output, prices, cached_input_tokens=cached,
         ),

@@ -235,6 +235,13 @@ class TestInvokeMimo:
         assert result.input_tokens == 1400
         assert not Path(fake_mimo.run_record()['mimocode_home']).exists()
 
+    async def test_a_run_that_reached_its_step_cap_is_error_max_turns(self, fake_mimo, worktree):
+        result = await _invoke(worktree, max_turns=2)
+        assert json.loads(fake_mimo.run_record()['config']['text'])['agent']['build']['steps'] == 2
+        assert result.success is False
+        assert result.subtype == 'error_max_turns'
+        assert result.input_tokens == 1400
+
     async def test_an_api_error_is_a_failure_with_its_status(
         self, fake_mimo, worktree, monkeypatch,
     ):

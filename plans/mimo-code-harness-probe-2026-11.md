@@ -50,6 +50,15 @@ Detection: the exit code is insufficient. The arm reads
 run's usage, the 401 as `info.error`, and 33 completed steps after a
 wall-clock kill.
 
+Usage is summed over every exported session. The run's outcome and output
+come from its root session's last assistant step. The root is the session
+named by the first stdout event that carries a `sessionID`. When stdout names
+none (the #2727 shape, or a wall-clock kill), the root is the one exported
+session without a `parentID`. If the named session has no export, or no
+parentless session or more than one exists, the arm logs a WARNING and fails
+the run with subtype `error_no_root_session`. It still reports the summed
+usage.
+
 Also:
 
 - A non-TTY stdin is read to EOF before the run starts. An inherited open
@@ -81,6 +90,13 @@ reached the server in every valid run. The marker line:
 endpoint honouring `tool_choice: 'none'`. No cost or budget flag exists, and
 429/404 retry forever. The arm therefore sets `steps = max_turns` AND refuses
 an invocation without a wall-clock timeout.
+
+The cap turn offers no tools, so it can finish `stop`, and a capped run would
+then read as a success. The arm treats a root session with `max_turns` or more assistant
+steps as capped. It reports that as `success=False` with subtype
+`error_max_turns`, as the Claude arm does, so `classify_agent_failure` routes
+it to `MAX_TURNS`. Subagent sessions run their own loops and do not count
+towards the cap.
 
 That timeout bounds `mimo run` only. The store read that follows, one
 `session list` plus one `export` per session, is bounded separately: each
@@ -184,7 +200,13 @@ multiply cache misses.
 - The quota-exhaustion response.
 - `mimo export` size on a long run.
 - Checkpoint-writer sessions under large contexts. They would be counted,
-  because the arm sums every session in the run home.
+  because the arm sums every session in the run home. If one has no
+  `parentID` and stdout is lost, the arm sees two roots and fails the run.
+- Whether every stdout event's `sessionID` names the root session rather
+  than a subagent's. The arm takes the first one as the root.
+- Whether, against a live endpoint, the cap's forced turn is the root
+  session's `max_turns`-th assistant message. The mock run ended after N
+  requests, and the arm reads N root steps as the cap.
 
 All are left to operator task 8955, which installs `mimo` on the orchestrator
 host and runs the paired `-mimocode` / `-endpoint` eval cells. Until task 8955
