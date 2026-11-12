@@ -90,6 +90,10 @@ Payload kind outside          :class:`CorpusBuildError` naming the kinds
 (build only)                  never a corpus silently re-stratified.
 Non-``GRAPH.RO_QUERY``        :class:`CorpusBuildError` from the reader's
 command attempted             client-side guard.
+Population read not provably  :class:`CorpusBuildError` naming the cause
+whole (a short read, no       and both counts — never a corpus drawn over
+census, the page cap, or a    a partial census.
+write mid-read)
 ============================  ============================================
 
 Verification (``--verify``) instead reports a status and exits on its code.
@@ -118,7 +122,9 @@ Status                Exit  Meaning and remedy
 ====================  ====  ==================================================
 
 Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
-complete at all — the store was unreachable, the requested corpus is
+complete at all — the store was unreachable, the population read could not be
+proven whole (a short read, no census, the page cap, or a write mid-read; under
+``--verify`` no verdict was reached), the requested corpus is
 unsatisfiable, a build's population carries a payload kind outside
 :data:`KNOWN_PAYLOAD_KINDS`, stdout could not be written (a downstream reader closed the
 pipe, as in ``--verify | head``; a full disk on ``> report.txt``), the manifest
@@ -161,7 +167,12 @@ from shared.cli_boundary import (
     run_cli,
 )
 
-from fused_memory.backends.falkor_read_only import NonReadOnlyCommandError, ReadOnlyGraphReader
+from fused_memory.backends.falkor_read_only import (
+    NonReadOnlyCommandError,
+    PagedQuery,
+    ReadOnlyGraphReader,
+)
+from fused_memory.backends.paged_read import PagedRead
 from fused_memory.config.falkordb_endpoints import FalkorEndpoint
 from fused_memory.config.schema import FusedMemoryConfig
 
@@ -760,26 +771,67 @@ def select(population: list[EpisodeRecord], n: int, *, seed: str) -> SelectionRe
 DEFAULT_GRAPH = 'dark_factory'
 """The graph this corpus is drawn from."""
 
-POPULATION_CYPHER = 'MATCH (e:Episodic) RETURN ' + ', '.join(
-    f'e.{field}' for field in PROJECTED_FIELDS
+POPULATION_READ = PagedQuery(
+    match='MATCH (e:Episodic)',
+    row='e',
+    returns=tuple(f'e.{field}' for field in PROJECTED_FIELDS),
 )
-"""The single query this builder issues. Built from :data:`PROJECTED_FIELDS`.
+"""The population read this builder issues. Built from :data:`PROJECTED_FIELDS`.
 
-Note what is deliberately absent:
+Note what is deliberately absent, and what is deliberately present:
 
 * **No ``entity_edges``** and no other incumbent-success signal — the binding
   hazard. The projection is derived from one constant that a test pins, so the
   query and the manifest's claim about the query cannot drift apart.
 * **No ``WHERE``** — no filter of any kind. The population IS the population.
-* **No ``LIMIT``** — the full population is required or the stratum
+* **Read whole** — the full population is required or the stratum
   denominators are wrong, and every proportional share computed from them
-  would be wrong with it.
+  would be wrong with it. FalkorDB truncates every answer silently at its
+  result-set cap (``fused_memory/backends/paged_read.py::RESULTSET_SIZE``), so
+  the population is read in pages ordered on ``e.uuid`` and checked against a
+  ``count(e)`` census. On 2026-11-12 the unpaged read of ``dark_factory``
+  returned exactly 10000 rows: the cap, not the population.
 
 Why not the product ``get_episodes`` read path: ``MemoryService.get_episodes``
 projects six fields that do **not** include ``source_description`` — which is
 the payload-kind stratification dimension here — and the MCP tool clamps
-``last_n`` to 1000, well below the ~2770-row population.
+``last_n`` to 1000, below the size of the population.
 """
+
+
+def _whole_population_rows(read: PagedRead, graph_name: str) -> list[list]:
+    """The rows of *read*, refused unless the read is complete and its row count equals the census.
+
+    Branches only on the typed fields; ``read.reason`` is diagnostic prose,
+    carried into the message and never parsed.
+
+    Exact equality is stricter than ``read.complete``, which accepts more rows
+    than the census as growth. The census is taken before the first page, so
+    any SINGLE write while the pages are read moves the row count off it: a
+    row inserted below the cursor shifts a page boundary and the next page
+    re-returns a row the store holds once. Refused here, that is reported as
+    the write it was rather than as a duplicate episode in the store.
+
+    What this checks is the COUNT, not the identity of the rows. SKIP/LIMIT
+    pages are not a snapshot, so two writes that offset each other (one
+    delete and one insert, on opposite sides of the cursor) leave the count
+    equal and pass, over a row set that omits a live episode or repeats one.
+    """
+    if not read.complete:
+        raise CorpusBuildError(
+            f'graph {graph_name!r}: the Episodic population read is not whole '
+            f'(incomplete_kind={read.incomplete_kind}, rows_seen={read.rows_seen}, '
+            f'expected_rows={read.expected_rows}); refusing to stratify a partial '
+            f'census. Diagnostics: {read.reason}'
+        )
+    if read.rows_seen != read.expected_rows:
+        raise CorpusBuildError(
+            f'graph {graph_name!r} was written to while its Episodic population was '
+            f'being paged: the census counted {read.expected_rows} but the pages '
+            f'returned {read.rows_seen}. A row written mid-read can shift a page '
+            f'boundary and be returned twice, so re-run.'
+        )
+    return read.rows
 
 
 class EpisodeReader:
@@ -816,7 +868,13 @@ class EpisodeReader:
     async def fetch_population(self) -> list[EpisodeRecord]:
         """Return every ``Episodic`` node, projected to :class:`EpisodeRecord`.
 
-        One query, no filter, no limit. A row whose ``created_at`` or
+        Paged, census-checked, no filter. A read that is not complete, or
+        whose row count differs from the census, is refused as a
+        :class:`CorpusBuildError` before any row is examined — so a read
+        defect is reported as one, never as a row or duplicate-uuid defect.
+        :func:`_whole_population_rows` states what that count check cannot see.
+
+        A row whose ``created_at`` or
         ``source_description`` cannot be parsed aborts the build via
         :class:`CorpusBuildError` rather than being dropped — a silently
         dropped row would shrink a stratum's denominator and skew every
@@ -837,9 +895,10 @@ class EpisodeReader:
         forwards.
         """
         try:
-            rows = await self._reader.read_unpaged(POPULATION_CYPHER)
+            read = await self._reader.read_paged(POPULATION_READ)
         except NonReadOnlyCommandError as exc:
             raise CorpusBuildError(f'build_corpus is strictly read-only: {exc}') from exc
+        rows = _whole_population_rows(read, self.graph_name)
         population: list[EpisodeRecord] = []
         for index, row in enumerate(rows):
             if len(row) != len(PROJECTED_FIELDS):
@@ -919,9 +978,11 @@ never invalidates an existing artifact.
 NO_OUTCOME_FILTER_STATEMENT = (
     'Corpus membership is NEVER conditioned on the incumbent extraction '
     "pipeline's outcome. The population query projects only the six fields "
-    'listed in projected_fields and applies no WHERE clause, no LIMIT and no '
-    'ranking of any kind; e.entity_edges — the per-episode record of what the '
-    'incumbent produced — is never read, never filtered on, and never used as a '
+    'listed in projected_fields and applies no WHERE clause and no ranking of '
+    'any kind; the population is read whole, in pages ordered on e.uuid and '
+    'checked against a count(e) census. e.entity_edges — the per-episode '
+    'record of what the incumbent produced — is never read, never filtered on, '
+    'and never used as a '
     'stratification dimension. Within each stratum the draw is an unconditioned '
     'seeded permutation, not a score-ranked take. An episode the incumbent '
     'extracted zero edges from is exactly as eligible as any other.'
@@ -1031,7 +1092,7 @@ def build_manifest(
             'entity_edges_queried': False,
             'entity_edges_used_as_filter': False,
             'entity_edges_used_as_stratum': False,
-            'population_query': POPULATION_CYPHER,
+            'population_query': POPULATION_READ.page_template,
             'projected_fields': list(PROJECTED_FIELDS),
             # Reflected off EpisodeRecord, NOT copied from PROJECTED_FIELDS
             # above: two independent derivations of the same claim, so the
@@ -1563,9 +1624,10 @@ def _build_parser() -> argparse.ArgumentParser:
         # first line plus the two guarantees is what an operator needs here.
         description=(
             f'{(__doc__ or "LME replay corpus builder").splitlines()[0]}\n\n'
-            'Strictly read-only: one GRAPH.RO_QUERY against the graph, one\n'
-            'committed manifest written beside this script. Corpus membership\n'
-            "is never conditioned on the incumbent pipeline's outcome."
+            'Strictly read-only: GRAPH.RO_QUERY reads of the graph (a count\n'
+            'census plus uuid-ordered pages), one committed manifest written\n'
+            'beside this script. Corpus membership is never conditioned on\n'
+            "the incumbent pipeline's outcome."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
