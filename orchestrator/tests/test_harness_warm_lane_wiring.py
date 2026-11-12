@@ -14,15 +14,27 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _lane_test_helpers import (
+    acquire_lane,
+    add_warm_lane_scripts,
+    build_harness,
+    get_head,
+    make_orch_config,
+    make_plan,
+    make_warm_lane_repo,
+    wire_recovery_scheduler,
+)
 from _workflow_helpers import _build_harness, _init_git_repo
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.quarantine_provenance import NOT_RELOCATED
@@ -1366,6 +1378,79 @@ class TestRecoveryTerminalTaskLaneRelease:
         record = git_ops._lane_lifecycle.read(lane_entry)
         assert record is not None
         assert record.state == DurableLaneState.QUARANTINED
+
+
+@pytest.mark.asyncio
+class TestRecordDrivenQuarantineProvenance:
+    """Task 4845: each record-driven quarantine in recovery parks a resolvable
+    branch and leaves its payload and a back-pointer in the live task plan.
+
+    Real git, real GitOps: the writer (acquire_warm_lane) feeds the reader
+    (_recover_crashed_tasks) across a simulated restart, as
+    test_lane_lifecycle_integration.py's B2 suite does.
+    """
+
+    async def _recover_a_divergent_lane(
+        self, tmp_path: Path, *, live_title: str | None, drop_admin_entry: bool,
+    ) -> tuple[Harness, TaskArtifacts, MagicMock]:
+        repo = make_warm_lane_repo(tmp_path)
+        await add_warm_lane_scripts(repo)
+        harness = build_harness(make_orch_config(repo))
+        wire_recovery_scheduler(harness)
+        if live_title is not None:
+            harness.scheduler.get_task = AsyncMock(return_value={'title': live_title})
+        lane = await acquire_lane(harness.git_ops, '42', await get_head(repo), expected_title='Stored title')
+        artifacts = TaskArtifacts.for_task(lane, '42')
+        artifacts.init('42', 'Stored title', 'd')
+        artifacts.write_plan(make_plan(1, 2, '42'))
+        artifacts.ensure_lane_symlinks()
+        (lane / 'work.py').write_text('x = 1\n')
+        await harness.git_ops.commit(lane, 'lane work')
+        old_pool = harness.git_ops.warm_lane_pool
+        assert old_pool is not None
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base, size=old_pool.size,
+        )
+        if drop_admin_entry:
+            shutil.rmtree(repo / '.git' / 'worktrees' / lane.name)
+        events = MagicMock()
+        harness.event_store = events
+
+        await harness._recover_crashed_tasks()
+
+        return harness, artifacts, events
+
+    async def _assert_provenance(
+        self, harness: Harness, artifacts: TaskArtifacts, events: MagicMock, reason: str,
+    ) -> None:
+        (emit,) = [
+            call.kwargs for call in events.emit.call_args_list
+            if call.args[0] == EventType.worktree_quarantined
+        ]
+        data = emit['data']
+        assert data['reason'] == reason
+        assert data['branch'] is not None
+        assert data['tip_sha'] is not None
+        assert data['unique_commit_count'] == 1
+        assert artifacts.read_plan()['_quarantined_from'][-1]['branch'] == data['branch']
+        assert await harness.git_ops.resolve_branch_sha(data['branch']) == data['tip_sha']
+        parked_plan = Path(data['dest']) / '.task' / 'plan.json'
+        assert parked_plan.is_file()
+        assert not parked_plan.is_symlink()
+
+    async def test_identity_mismatch_site_records_provenance(self, tmp_path: Path):
+        harness, artifacts, events = await self._recover_a_divergent_lane(
+            tmp_path, live_title='A different live task', drop_admin_entry=False,
+        )
+
+        await self._assert_provenance(harness, artifacts, events, 'recovery-identity-mismatch')
+
+    async def test_record_divergence_site_records_provenance(self, tmp_path: Path):
+        harness, artifacts, events = await self._recover_a_divergent_lane(
+            tmp_path, live_title=None, drop_admin_entry=True,
+        )
+
+        await self._assert_provenance(harness, artifacts, events, 'recovery-record-divergence')
 
 
 # ===========================================================================

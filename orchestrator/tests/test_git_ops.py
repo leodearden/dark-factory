@@ -7493,6 +7493,49 @@ class TestOrphanWorktreeHelpers:
         assert outcome.dest.is_dir()
         assert outcome.branch is None
 
+    async def test_quarantine_snapshots_and_stamps_provenance(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-prov')
+        ta = TaskArtifacts.for_task(info.path, 'q-prov')
+        ta.init('q-prov', 'Provenance', 'd')
+        ta.write_plan({
+            'task_id': 'q-prov',
+            'title': 'Provenance',
+            'steps': [
+                {'id': 'step-1', 'description': 'red', 'status': 'done', 'commit': 'abc'},
+                {'id': 'step-2', 'description': 'green', 'status': 'pending'},
+            ],
+        })
+        ta.ensure_lane_symlinks()
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        plan_before = ta.read_plan()
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-prov', 'unit-test')
+
+        assert outcome.dest is not None
+        parked_plan = outcome.dest / '.task' / 'plan.json'
+        assert parked_plan.is_file()
+        assert not parked_plan.is_symlink()
+        assert json.loads(parked_plan.read_text()) == plan_before
+        parked_metadata = outcome.dest / '.task' / 'metadata.json'
+        assert parked_metadata.is_file()
+        assert not parked_metadata.is_symlink()
+        stamp = TaskArtifacts.for_task(info.path, 'q-prov').read_plan()['_quarantined_from'][-1]
+        assert stamp['branch'] == outcome.branch
+        assert stamp['tip_sha'] == outcome.tip_sha
+        assert stamp['unique_commit_count'] == 1
+        assert stamp['parking'] == str(outcome.dest)
+
+    async def test_quarantine_without_a_plan_writes_no_plan(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-noplan')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-noplan', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not TaskArtifacts.for_task(info.path, 'q-noplan').artifact_path('plan.json').exists()
+
     async def test_unsaved_work_false_when_clean_no_commits(self, git_ops: GitOps):
         info = await git_ops.create_worktree('clean-wt')
         assert await git_ops.worktree_has_unsaved_work(info.path, 'clean-wt') is False
