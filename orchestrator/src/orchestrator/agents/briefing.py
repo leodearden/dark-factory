@@ -1621,6 +1621,8 @@ where the previous agent left off.
 
         ``workflow.py::TaskWorkflow._brief_contested_scope_drift`` runs it when
         the session that filed the request was the last writer session due.
+        That can be the judge's early exit with steps still pending, so the
+        prompt claims nothing about the plan's progress.
         """
         scope = _plan_scope(plan, task_id)
         context = await self._get_memory_context(scope, 'implementer')
@@ -1632,8 +1634,9 @@ where the previous agent left off.
 
 # Scope Request Follow-up
 
-Every plan step is done, but a file reported with `report_missing_plan_file`
-is locked by another task. This session exists only to settle it.
+A file reported with `report_missing_plan_file` is locked by another task,
+and no other writer session is due to hear about it. This session exists only
+to settle it.
 
 {_format_scope_drift(scope_drift)}
 ## Action
