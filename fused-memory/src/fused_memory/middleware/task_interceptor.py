@@ -1864,6 +1864,7 @@ class TaskInterceptor:
                     agent_id,
                     is_recon_stage_write,
                     self._reject_stale_done_evidence_mode(),
+                    git_runner=self._git_runner,
                 )
                 if _reopen_freshness_err is not None:
                     return _reopen_freshness_err
@@ -6939,54 +6940,20 @@ async def _resolve_commit_sha(
 # (task 2649 stamps this atomically on every terminal-exit reopen).
 
 
-async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | None:
+async def _resolve_commit_committed_at(
+    project_root: str, sha: str, *, git_runner: GitProbeRunner,
+) -> str | None:
     """Resolve a commit's committer date via ``git show -s --format=%cI``.
 
     Returns the stripped ``%cI`` (strict ISO-8601, offset-aware) string on
     success, or None on any failure (git binary missing, non-zero exit,
-    timeout, empty output). Modeled directly on :func:`_resolve_commit_sha`'s
-    subprocess/timeout/error-handling shape for consistent semantics.
+    timeout, empty output). Runs through :func:`_git_probe`, like the other
+    done-provenance probes, so it shares their timeout and error handling.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'show',
-            '-s',
-            '--format=%cI',
-            sha,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            # Reap the killed child promptly rather than leaving it as a
-            # transient zombie until GC finalizes the Process object.
-            await proc.wait()
-            return None
-    except FileNotFoundError:
+    result = await _git_probe(git_runner, project_root, 'show', '-s', '--format=%cI', sha)
+    if isinstance(result, _ProbeUnavailable) or not result.ok:
         return None
-    except Exception:
-        # Loud fail-safe (silent-fallthrough gate, sig-b): an unexpected error
-        # in this best-effort committer-date probe must surface in the log
-        # rather than vanish. Behaviour is unchanged (still returns None); the
-        # WARN just makes the swallow observable, matching the "loud over
-        # silent" directive the gate enforces.
-        logger.warning(
-            '_resolve_commit_committed_at: unexpected error resolving committer '
-            'date for %s; returning None',
-            sha,
-            exc_info=True,
-        )
-        return None
-
-    if proc.returncode != 0:
-        return None
-    committed_at = stdout.decode('utf-8', errors='replace').strip()
-    return committed_at or None
+    return result.stdout or None
 
 
 def _extract_reopen_at(before: Any) -> str | None:
@@ -7099,6 +7066,8 @@ async def _check_reopen_freshness(
     agent_id: str | None,
     is_recon_stage: bool,
     mode: str,
+    *,
+    git_runner: GitProbeRunner,
 ) -> dict | None:
     """Reject (enforce) or no-op (warn) a done-write citing PRE-reopen evidence.
 
@@ -7173,7 +7142,9 @@ async def _check_reopen_freshness(
     if not reopen_at:
         return None
 
-    evidence_committed_at = await _resolve_commit_committed_at(project_root, evidence_commit)
+    evidence_committed_at = await _resolve_commit_committed_at(
+        project_root, evidence_commit, git_runner=git_runner,
+    )
     if evidence_committed_at is None:
         # Distinguishable from a genuine date-based staleness verdict: this
         # fires whenever `git show` itself failed (binary missing, timeout,
