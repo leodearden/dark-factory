@@ -439,9 +439,11 @@ def test_a_quality_db_that_is_not_a_database_is_served_unknown_naming_the_error(
     with _seeded(client, tmp_path) as seeded:
         seeded.app.state.config.quality_db.write_bytes(b'not a sqlite database' * 64)
         with caplog.at_level(logging.WARNING, logger='dashboard.api.quality'):
-            quality = _get(seeded, 'project=dark_factory&window=100')['QUALITY']
+            body = _get(seeded, 'project=dark_factory&window=100')
 
-    assert (quality['state'], quality['value']) == ('unknown', None)
-    assert quality['reason'].startswith('quality.db unreadable: DatabaseError')
-    [record] = [r for r in caplog.records if r.name == 'dashboard.api.quality']
-    assert record.exc_info is not None
+    for key in ('QUALITY', 'QUALITY_MARKERS'):
+        assert (body[key]['state'], body[key]['value']) == ('unknown', None)
+        assert body[key]['reason'].startswith('quality.db unreadable: DatabaseError')
+    records = [r for r in caplog.records if r.name == 'dashboard.api.quality']
+    assert len(records) == 2, 'one WARNING per datum that read quality.db'
+    assert all(record.exc_info is not None for record in records)
