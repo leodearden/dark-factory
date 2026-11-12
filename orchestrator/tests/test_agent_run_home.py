@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from _operator_home_fixture import OPERATOR_EMAIL, OPERATOR_IGNORED_FILE, write_operator_home
+
 from orchestrator.agents.agent_run_home import (
     operator_home,
     private_run_home,
