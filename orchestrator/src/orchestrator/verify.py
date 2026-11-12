@@ -1003,7 +1003,7 @@ def _carries_pytest_failure_verdict(output: str) -> bool:
     The surfaces are one flat veto set: a ``^FAILED `` line, an ``^E   ``
     traceback line, a failure summary, an ``INTERNALERROR>`` line, or either
     ``ERROR`` short-summary form (node-id or bare-file). It is the single
-    veto set of every verdictless-exit recogniser
+    veto set of every pytest verdictless-exit recogniser
     (``_is_bare_xdist_worker_crash``, ``_pytest_session_aborted_without_verdict``).
 
     The set is flat on purpose. It used to be two branches keyed on whether

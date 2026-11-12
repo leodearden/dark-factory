@@ -1528,6 +1528,11 @@ _NO_FINDING_LINE_BY_TOOL: dict[ToolKind, re.Pattern[str]] = {
     # ruff's `warning:` lines are its own notices, printed during the run;
     # no ruff finding starts that way, in any output format.
     ToolKind.RUFF: re.compile(rf'(?:All checks passed!|warning: .+|{_SHELL_KILL_REPORT})'),
+    # The zero-error summary only: a diagnostic line of ANY severity is a
+    # finding, so none is admitted.
+    ToolKind.PYRIGHT: re.compile(
+        rf'(?:0 errors, \d+ warnings?, \d+ informations?|{_SHELL_KILL_REPORT})',
+    ),
 }
 
 
