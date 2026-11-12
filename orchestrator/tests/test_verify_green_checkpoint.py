@@ -126,6 +126,34 @@ def _stub_verify_and_review(
     return verify_mock, review_mock
 
 
+def _rev_parse_head(repo: Path) -> str:
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _dispatch(tmp_path: Path, run_id: str, db_path: Path, worktree: Path) -> tuple[TaskWorkflow, EventStore]:
+    """One dispatch of the task: a fresh workflow and a new run on the shared *db_path*, at *worktree*."""
+    run_dir = tmp_path / run_id
+    run_dir.mkdir()
+    store = EventStore(db_path, run_id=run_id)
+    wf = _make_e2e_workflow(run_dir, store)
+    wf.worktree = worktree
+    return wf, store
+
+
+def _workflow_verify_rows(store: EventStore) -> list[dict[str, Any]]:
+    return [row['data'] for row in store.fetch_events_by_type(EventType.workflow_verify)]
+
+
+def _verify_skips(store: EventStore) -> list[dict[str, Any]]:
+    return [row['data'] for row in store.fetch_events_by_type(EventType.phase_skipped) if row['phase'] == 'verify']
+
+
+def _tip_fields(data: dict[str, Any]) -> tuple[object, ...]:
+    return (data['passed'], data['tip_sha'], data['tip_sha_unresolved'], data['tip_sha_unresolved_reason'])
+
+
 class TestVerifyGreenCheckpointSkipsVerify:
     @pytest.mark.asyncio
     async def test_durable_green_at_tip_skips_verify_and_suppresses_reemit(
@@ -219,10 +247,7 @@ class TestVerifyCheckpointTipFetchFailSafe:
         store_now = EventStore(tmp_path / 'runs.db', run_id='run-now')
         wf = _make_e2e_workflow(tmp_path, store_now)
         repo = seed_repo(tmp_path / 'repo')
-        head_before_verify = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'], cwd=repo,
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
+        head_before_verify = _rev_parse_head(repo)
         wf.worktree = repo
 
         async def remove_repo() -> None:
@@ -256,34 +281,6 @@ class TestVerifyCheckpointTipFetchFailSafe:
         assert outcome == WorkflowOutcome.DONE
         verify.assert_awaited_once()
         review.assert_awaited()
-
-
-def _rev_parse_head(repo: Path) -> str:
-    return subprocess.run(
-        ['git', 'rev-parse', 'HEAD'], cwd=repo, check=True, capture_output=True, text=True,
-    ).stdout.strip()
-
-
-def _dispatch(tmp_path: Path, run_id: str, db_path: Path, worktree: Path) -> tuple[TaskWorkflow, EventStore]:
-    """One dispatch of the task: a fresh workflow and a new run on the shared *db_path*, at *worktree*."""
-    run_dir = tmp_path / run_id
-    run_dir.mkdir()
-    store = EventStore(db_path, run_id=run_id)
-    wf = _make_e2e_workflow(run_dir, store)
-    wf.worktree = worktree
-    return wf, store
-
-
-def _workflow_verify_rows(store: EventStore) -> list[dict[str, Any]]:
-    return [row['data'] for row in store.fetch_events_by_type(EventType.workflow_verify)]
-
-
-def _verify_skips(store: EventStore) -> list[dict[str, Any]]:
-    return [row['data'] for row in store.fetch_events_by_type(EventType.phase_skipped) if row['phase'] == 'verify']
-
-
-def _tip_fields(data: dict[str, Any]) -> tuple[object, ...]:
-    return (data['passed'], data['tip_sha'], data['tip_sha_unresolved'], data['tip_sha_unresolved_reason'])
 
 
 class TestRedispatchBoundary:
