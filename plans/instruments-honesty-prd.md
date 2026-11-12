@@ -139,7 +139,7 @@ against the live stores together:
    `metadata.pending_since` (`pending_since`), and its `updated_at` or the v4→v5 back-filled `pending_since`
    copy of it (`updated_at`); ties go in that order. Each proxy is an upper bound on the filing time, and a
    long-waiting task's first event is often the starvation watchdog's alarm, so the event cannot simply win.
-   Blank `updated_at` rows are skipped and counted. Timestamps are normalised to the task store's `Z`
+   Rows with no usable proxy are skipped and counted. Timestamps are normalised to the task store's `Z`
    millisecond form.
 4. **The watchdog's clock is not changed.** `eligible_since` measures time as a dispatch candidate, which is
    what a dispatch-fairness alarm should measure (task 3821's decision). Age since filing is a different
@@ -293,11 +293,11 @@ calls `flush_state_snapshot()` after every pause, resume, restore and before shu
 tasks.created_at TEXT NULL            -- task-store 'Z' millisecond form, stamped in add_task
 tasks.created_at_source TEXT NULL     -- 'stamped' | 'first_event' | 'pending_since' | 'updated_at'
 _SCHEMA_VERSION = 6; _migrate_v5_to_v6 adds both columns (add_column_if_missing)
-scripts/backfill_task_created_at.py --project-root R [--dry-run] -> counts per source, rows skipped (blank updated_at)
+scripts/backfill_task_created_at.py --project-root R [--dry-run] -> counts per source, rows skipped (no usable proxy)
 ```
 Invariants: every row inserted after the migration has `created_at` and `created_at_source='stamped'`;
 backfill never overwrites a `stamped` row; `get_task`/`get_tasks` carry both keys (`task_projection.py::TASK_ROW_KEYS`)
-and omit them on an unmigrated store rather than failing; the dashboard task view shows "Filed <date> (<source>)".
+and omit them on a connection whose v6 ALTER never landed rather than failing; the dashboard task view shows "Filed <date> (<source>)".
 
 ### Merge-halt events (`orchestrator/src/orchestrator/event_store.py`, `merge_lane/halt.py`)
 
@@ -343,7 +343,7 @@ previous end, never at a fixed 24 h lookback, except on a store with no row.
 | 5 | restore path (fixture) | restart with a persisted pause row | snapshot rewritten at restore; shutdown rewrites once more |
 | 6 | new task | `submit_task` on a migrated store | `get_task` carries `created_at` (= `pending_since`) and `created_at_source='stamped'` |
 | 7 | backfill | a store with rows having an event, a non-backfilled `pending_since`, only `updated_at`, blank `updated_at`, a row whose first event is later than its `updated_at` | sources counted per rule; each row takes its earliest usable proxy; no `created_at` later than its row's `updated_at`; `stamped` rows untouched; second run changes nothing |
-| 8 | unmigrated read | read-only `get_tasks` on a v5 store | rows served without the two keys, no error |
+| 8 | unmigrated read | `get_tasks` on a connection whose v6 ALTER never landed (the store reports v6 without the two columns). A v5 store read through fused-memory is not this case: `_get_read_access` awaits `_get_write_access`, so that read migrates it (amended by task 8558 review, 2026-11-12) | rows served without the two keys, no error; a migrated row the backfill has not reached serves both keys as None |
 | 9 | review rounds | a task blocked twice then passed | `task_results.review_cycles=2`; `review_completed` max cycle agrees |
 | 10 | cap pause | a run whose gate recorded `total_pause_secs > 0` and finished cleanly | `runs.paused_for_cap=1`, `cap_pause_secs>0` on the row |
 | 11 | verify duration rule | the `event_store.py` comment and `docs/data-map.md` | both say verify durations live in `data.duration_ms` and the column is NULL by convention; a reader coalescing to 0 is named as the error |
