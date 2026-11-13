@@ -16642,11 +16642,10 @@ class GitOps:
         pool = self.warm_lane_pool
         assigned = pool.assignment_for(branch_name) if pool is not None else None
         quarantined = await self._quarantine_cold_incarnation(branch_name, reason)
-        quarantined_dest = quarantined.dest if quarantined is not None else None
         parked_name = (
-            quarantined_dest.name if quarantined_dest is not None else f'{branch_name}-{_utc_stamp()}'
+            quarantined.dest.name if quarantined.dest is not None else f'{branch_name}-{_utc_stamp()}'
         )
-        parked_branch = quarantined.branch if quarantined is not None else None
+        parked_branch = quarantined.branch
         if had_branch and parked_branch is None:
             await self._rename_branch_aside(branch_name, parked_name)
             parked_branch = f'{prefix}{parked_name}'
@@ -16658,7 +16657,7 @@ class GitOps:
         parked = ParkedIncarnation(
             parked_branch=parked_branch,
             parked_tip=await self.resolve_branch_sha(parked_branch) if parked_branch else None,
-            quarantined_worktree=str(quarantined_dest) if quarantined_dest is not None else None,
+            quarantined_worktree=str(quarantined.dest) if quarantined.dest is not None else None,
             relocated_meta_roots=tuple(relocated),
         )
         logger.warning(
@@ -16669,11 +16668,11 @@ class GitOps:
 
     async def _quarantine_cold_incarnation(
         self, branch_name: str, reason: str,
-    ) -> QuarantineOutcome | None:
-        """Quarantine the registered cold worktree for *branch_name*, if any; the outcome always has a ``dest``."""
+    ) -> QuarantineOutcome:
+        """Quarantine the registered cold worktree for *branch_name*; its ``dest`` is None only when none is registered."""
         cold = self.worktree_base / branch_name
         if not await self._is_registered_worktree(cold):
-            return None
+            return QuarantineOutcome(dest=None)
         outcome = await self.quarantine_worktree(cold, branch_name, reason)
         if outcome.dest is None:
             raise RuntimeError(f'park_prior_incarnation: could not quarantine {cold}')
