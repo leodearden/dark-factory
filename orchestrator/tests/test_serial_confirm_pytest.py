@@ -24,6 +24,7 @@ from _serial_recovery_helpers import (
 from orchestrator.verify import _serial_confirm_pytest_str, _serial_pytest_str
 from orchestrator.verify_cmd import (
     ToolKind,
+    applied_worker_count,
     apply_pytest_numprocesses,
     parse_config_command,
     render,
@@ -160,6 +161,24 @@ class TestTheWorkerCountDecoder:
     )
     def test_what_names_no_count(self, tokens):
         assert worker_count_values(tokens) == []
+
+    @pytest.mark.parametrize(
+        ('tokens', 'expected'),
+        [
+            (['-n', 'auto', '--dist', 'loadgroup', '-n0'], '0'),
+            (['-n', '8', '-n', 'auto'], 'auto'),
+            (['-n', '4', '-k', '-n0'], '4'),
+            (['--tb=short', 'tests/'], None),
+        ],
+        ids=[
+            'a-later-count-outvotes-an-earlier-one',
+            'position-not-value-decides',
+            'another-flags-value-is-not-a-count',
+            'no-count-named',
+        ],
+    )
+    def test_the_applied_count_is_the_last_one_named(self, tokens, expected):
+        assert applied_worker_count(tokens) == expected
 
 
 _SERIAL_STR_WRAPPERS = pytest.mark.parametrize(
