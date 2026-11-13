@@ -563,7 +563,7 @@ class ScopeRootsMissingError(RuntimeError):
             f"sub-directory. Every SCOPE_ROOTS entry is required, because a "
             f"skipped root is a green gate over less code; if a root was "
             f"renamed or removed, update SCOPE_ROOTS in "
-            f"shared/tests/silent_fallthrough_scan.py (see CONTRIBUTING.md §2, "
+            f"tests/repo_guards/silent_fallthrough_scan.py (see CONTRIBUTING.md §2, "
             f"'Where repo-wide gates live')."
         )
 

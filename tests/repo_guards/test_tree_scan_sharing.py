@@ -34,14 +34,13 @@ from pathlib import Path
 import pytest
 import silent_fallthrough_scan as sfs
 import test_config_dir_archival_gate as archival_gate
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from silent_fallthrough_scan import (
     SCOPE_ROOTS,
     ParsedFile,
     ScopeRootsMissingError,
     iter_first_party_files,
 )
-
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -903,7 +902,7 @@ def _offends(source: str, filename: str = '<synthetic>') -> bool:
 
 
 class TestNoRegrownWholeTreeParse:
-    """No shared/tests module may grow a SECOND private whole-tree parse.
+    """No tests/repo_guards module may grow a SECOND private whole-tree parse.
 
     Written in this directory's established ratchet idiom (the
     silent-fallthrough gate, the archival gate): AST scan, name the offender,
@@ -912,8 +911,8 @@ class TestNoRegrownWholeTreeParse:
     yourself (``rglob``, ``os.walk``, a recursive glob) and parsing (rule 2).
     ``test_safe_io``'s
     cross-tree sweep left shared/tests in task 3388 (now
-    ``tests/scripts/test_atomic_write_regrowth.py``), and ``test_auth_failed``
-    now walks the shared tree.
+    ``tests/scripts/test_atomic_write_regrowth.py``), and
+    ``test_auth_failed_parser_ownership`` walks the shared tree.
     """
 
     def test_no_module_enumerates_and_parses_the_tree_itself(self):
@@ -926,12 +925,12 @@ class TestNoRegrownWholeTreeParse:
             source = module_path.read_text(encoding='utf-8')
             if _offends(source, filename=str(module_path)):
                 offenders.append(module_path.name)
-        assert scanned >= 50, (
+        assert scanned >= 15, (
             f'only {scanned} modules scanned — is the tests dir correct? '
             f'({_TESTS_DIR})'
         )
         assert not offenders, (
-            'These shared/tests modules name iter_first_party_files, or walk '
+            'These tests/repo_guards modules name iter_first_party_files, or walk '
             'a directory tree (rglob, os.walk, a recursive glob) AND call '
             'ast.parse:\n'
             + '\n'.join(f'  {name}' for name in offenders)

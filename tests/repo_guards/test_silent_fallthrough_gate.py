@@ -26,6 +26,7 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from silent_fallthrough_scan import (
     KNOWN_VALUE_ERROR_RESOLVERS,
     ParsedFile,
@@ -33,8 +34,6 @@ from silent_fallthrough_scan import (
     find_violations,
     find_violations_in_tree,
 )
-
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

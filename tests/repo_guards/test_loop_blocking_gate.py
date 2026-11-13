@@ -66,12 +66,11 @@ from loop_blocking_scan import (
     find_loop_blocking_sites_in_trees,
     site_key,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from silent_fallthrough_scan import (
     ParsedFile,
     reconcile_against_allowlist,
 )
-
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

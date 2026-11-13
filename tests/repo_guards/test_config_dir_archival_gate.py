@@ -33,9 +33,8 @@ from pathlib import Path
 
 import pytest
 from config_dir_archival_allowlist import ARCHIVED, AUDITED_SITES, DISPOSITIONS
-from silent_fallthrough_scan import ParsedFile, _build_parent_map, _compute_qualname
-
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from silent_fallthrough_scan import ParsedFile, _build_parent_map, _compute_qualname
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

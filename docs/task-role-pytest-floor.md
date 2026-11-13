@@ -43,6 +43,17 @@ Task 8503 owns the fix;
 `tests/scripts/test_task_role_floor_narrows_every_leg.py::test_the_scripts_floor_runs_the_tests_scripts_guards`
 is a strict xfail that turns red when it lands.
 
+Known gap: task 5654 moved the whole-tree gates out of shared/tests, scripts/tests
+and tests/scripts into tests/repo_guards. While they lived in shared/tests they
+were shared family members, so a shared-only production diff ran them at task
+role. Now they belong to no member's family, and a task-role leg runs only the
+touched tests plus its own family, so no production diff runs them at task role.
+They still run at every merge gate: tests/repo_guards declares
+`verify_cache: never`, and `merge_verify_breadth: full` runs every module. This
+is distinct from task 8503's gap, which concerns enumerating a family across
+directories. The follow-up to plan the tests/repo_guards leg on task-role
+production diffs was filed by task 5654.
+
 Merge role is unchanged. Under `merge_verify_breadth: full` the merge gate still
 runs the full suite.
 
@@ -55,8 +66,8 @@ runs the full suite.
 - **Scanners ⊆ family is enforced**, by two mechanisms. For orchestrator,
   `orchestrator/tests/test_whole_tree_scan_timeout_guard.py` turns red on any
   detected `rglob`/`glob('*.py')` scanner that `is_whole_tree_guard_module`
-  does not admit. For fused-memory, shared, scripts/tests and tests/scripts,
-  each tree's `test_repo_wide_guard_family.py` instance of
+  does not admit. For fused-memory, shared, scripts/tests, tests/scripts and
+  tests/repo_guards, each tree's `test_repo_wide_guard_family.py` instance of
   `shared/src/shared/testing_repo_wide_tests.py::judge_repo_wide_family` turns
   red on any repo-wide test module outside the family. Without these checks a
   new scanner would silently drop out of task-role verify.

@@ -65,6 +65,8 @@ CAPABILITY_TEST_COPIES = {
     for rel in (
         'tests/repo_guards/test_checked_in_capability_manifests.py',
         'tests/repo_guards/conftest.py',
+        'tests/repo_guards/session_prebuild.py',
+        'tests/repo_guards/silent_fallthrough_scan.py',
         'shared/tests/cross_suite_helpers/capability_manifest_corpus.py',
     )
 }

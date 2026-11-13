@@ -59,6 +59,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from silent_fallthrough_scan import ParsedFile
 from wildcard_mcp_scoping_scan import (
     EXEMPT_STRICT_MCP,
@@ -68,8 +69,6 @@ from wildcard_mcp_scoping_scan import (
     is_violation,
     records_worth_scanning,
 )
-
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
