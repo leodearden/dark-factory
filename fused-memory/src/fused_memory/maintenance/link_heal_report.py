@@ -19,8 +19,12 @@ from typing import Any
 
 from fused_memory.maintenance.link_heal import RunCounts
 from fused_memory.maintenance.link_heal_executor import undo_command
-from fused_memory.maintenance.link_heal_ledger import NO_ACTION_TAKEN, CandidateRecord
-from fused_memory.maintenance.link_heal_store import CreatedWindow
+from fused_memory.maintenance.link_heal_ledger import (
+    NO_ACTION_TAKEN,
+    ActionState,
+    CandidateRecord,
+)
+from fused_memory.maintenance.link_heal_store import CreatedWindow, parse_record_time
 
 SWEEP_REPORT_FORMAT = 'link-heal-sweep-report/1'
 
@@ -39,6 +43,8 @@ class WritesWithheld(StrEnum):
     UNCALIBRATED = 'uncalibrated'
     #: The latest calibration of the adjudicator's model and prompt version failed.
     CALIBRATION_FAILED = 'calibration_failed'
+    #: The sweep's own plan run stopped, so its examinations were not recorded.
+    PLAN_STOPPED = 'plan_stopped'
 
     @property
     def is_dry_run(self) -> bool:
@@ -84,8 +90,9 @@ class SweepRunView:
     """Everything one sweep run's report says: its plan run and records, its apply
     run or why it made none, its window and calibration, and the ledger.
 
-    *carried* are the records of the heals the apply run executed that an earlier
-    plan run staged, so the counts cover every heal the run wrote, not only those
+    *carried* are the records of the heals an earlier plan run staged that this
+    run's plan or apply run acted on (applied, failed, skipped, withheld or
+    superseded), so the counts cover every heal the run acted on, not only those
     of the links its own window examined.
     """
 
@@ -114,6 +121,20 @@ class SweepRunView:
     @property
     def runs(self) -> tuple[LedgerRun, ...]:
         return (self.plan,) if self.apply is None else (self.plan, self.apply)
+
+    def withheld_heals(self) -> dict[str, Any]:
+        """How many heals the run withheld as uncalibrated, and the earliest creation
+        time among their children: a ``sweep --since`` from it re-examines them all."""
+        withheld = [
+            record for record in (*self.records, *self.carried)
+            if record.action_state is ActionState.WITHHELD_UNCALIBRATED
+        ]
+        created = [parse_record_time(record.before_child.created_at) for record in withheld]
+        known = [time for time in created if time is not None]
+        return {
+            'count': sum(run.counts.withheld_uncalibrated for run in self.runs),
+            'oldest_child_created_at': min(known).isoformat() if known else None,
+        }
 
 
 def render_run_report(view: SweepRunView) -> tuple[str, str]:
@@ -152,6 +173,7 @@ def run_headline(view: SweepRunView) -> dict[str, Any]:
             'mode': _writes_mode(view),
             'withheld': None if view.withheld is None else view.withheld.value,
         },
+        'withheld_heals': view.withheld_heals(),
     }
 
 
@@ -237,8 +259,8 @@ def _markdown(view: SweepRunView, document: Mapping[str, Any]) -> str:
         f'- records: ledger `{view.ledger_path}`, plan run `{view.plan.run_id}`'
         + ('' if view.apply is None else f', apply run `{view.apply.run_id}`'),
         *([] if not view.carried else [
-            f'- carried: {len(view.carried)} heal(s) this run executed were staged by '
-            'earlier plan runs; the tables count them too',
+            f'- carried: {len(view.carried)} heal(s) staged by earlier plan runs that this '
+            'run applied, withheld or superseded; the tables count them too',
         ]),
         '',
         '## Escapes',
@@ -262,10 +284,14 @@ def _writes_line(view: SweepRunView) -> str:
     apply, withheld = view.apply, view.withheld
     if apply is not None:
         applied = f'applied: apply run `{apply.run_id}` applied {apply.counts.applied} heal(s)'
-        withheld_heals = sum(run.counts.withheld_uncalibrated for run in view.runs)
-        if not withheld_heals:
+        withheld_heals = view.withheld_heals()
+        if not withheld_heals['count']:
             return applied
-        return f'{applied}, withheld {withheld_heals} heal(s) whose adjudicator is uncalibrated'
+        oldest = withheld_heals['oldest_child_created_at']
+        return (
+            f'{applied}, withheld {withheld_heals["count"]} heal(s) whose adjudicator is '
+            f'uncalibrated' + ('' if oldest is None else f' (oldest child created {oldest})')
+        )
     if withheld is not None and withheld.is_dry_run:
         return f'dry-run ({withheld})'
     return f'withheld ({withheld})'

@@ -316,6 +316,7 @@ def sweep_document(report: SweepReport) -> dict[str, Any]:
         'report_path': str(report.report_path),
         'report_json': str(report.json_path),
         'escalation_id': report.escalation_id,
+        'report_unwritten': report.report_unwritten,
         'counts': {
             'plan': view.plan.counts.as_json(),
             'apply': None if view.apply is None else view.apply.counts.as_json(),
@@ -592,6 +593,8 @@ async def _sweep(args: argparse.Namespace, session: _Session) -> CommandOutcome:
             since=since,
         )
     code = max(_counts_exit_code(run.counts) for run in report.view.runs)
+    if report.report_unwritten is not None:
+        code = EXIT_FAILED
     return CommandOutcome(sweep_document(report), code)
 
 

@@ -3306,7 +3306,9 @@ check.
   `--dry-run` is given, and the latest calibration of the adjudicator's exact
   model and prompt version (the sha256 of the rendered system prompt) passed.
   Otherwise the report's Writes line says `dry-run` or
-  `withheld (uncalibrated)` / `withheld (calibration_failed)`. A writing run
+  `withheld (uncalibrated)` / `withheld (calibration_failed)`, or
+  `withheld (plan_stopped)` when the run's own plan document could not be
+  written: nothing is written after that, older pending heals included. A writing run
   keeps the per-run cap and the backlog, share-ceiling and write-failure
   escapes, and also files the adjudicator failure storm. A verdict is reused
   only by the same model and prompt version, so a model or brief change asks
@@ -3319,7 +3321,9 @@ check.
   stages its own heals, so a link its window re-examines under a newly
   calibrated adjudicator is staged afresh and written in the same run. A link
   outside the window is not re-examined: after a recalibration, run
-  `link_heal.py sweep --since <the oldest withheld child's created_at>`.
+  `link_heal.py sweep --since <the oldest withheld child's created_at>`. The
+  report's Writes line and its `withheld_heals.oldest_child_created_at` give
+  that time, and its tables count every heal the run withheld or superseded.
 - **Calibrate first, and again after any model or brief change.** From the
   main checkout (the soak data is gitignored there):
 
@@ -3357,7 +3361,8 @@ check.
     They give counts by project × decision × verdict × action, the escapes
     filed and would-escape, the window, the calibration status and the undo
     run.
-  - One info escalation per run naming the report: category
+  - One info escalation per run naming the report, or naming why the report
+    could not be written (the run then exits 1): category
     `link_heal_run_report`, anchor `link-heal-run-report`, never folded.
   - The records, in `<reconciliation.data_dir>/link_heal.db`. Each examined
     link has its child and parent exactly as read, the verdict with its
@@ -3366,7 +3371,8 @@ check.
     and after-state and names the undo run that took it back. The records are
     append-only and never pruned.
 - **Exit codes.** 0 when the run is complete, or partial only by the cap or
-  stale skips. 1 on a read, adjudication or write failure, or a stopped run.
+  stale skips. 1 on a read, adjudication or write failure, a stopped run, or a
+  report it could not write.
   2 when the run was refused before it started.
 
 ### Transcript secret sweep (02:30)

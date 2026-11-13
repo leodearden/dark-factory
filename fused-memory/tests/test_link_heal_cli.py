@@ -1174,6 +1174,20 @@ class TestSweep:
         assert report['counts']['plan']['examined'] == 1
 
     @pytest.mark.asyncio
+    async def test_a_report_it_cannot_write_exits_1_and_says_why(self, harness, workspace, capsys):
+        blocker = workspace.root / 'a-regular-file'
+        blocker.write_text('')
+        env = dataclasses.replace(
+            sweep_env_for(harness, workspace), reports_dir_for=lambda _config: blocker / 'reports',
+        )
+
+        code, report = await sweep(env, workspace, capsys, '--dry-run')
+
+        assert code == 1
+        assert report['report_unwritten']
+        assert report['escalation_id'] is not None
+
+    @pytest.mark.asyncio
     async def test_a_since_without_an_offset_is_refused_before_any_run(
         self, harness, workspace, capsys,
     ):

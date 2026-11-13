@@ -295,13 +295,23 @@ def adjudicator_storm_escape(
     )
 
 
-def run_report_escape(summary: Mapping[str, Any], report_path: Path) -> Escape:
+def run_report_escape(
+    summary: Mapping[str, Any], report_path: Path, *, unwritten: str | None = None,
+) -> Escape:
     """The info record that surfaces one sweep run's report; *summary* is the run's
-    headline facts, carried as the detail beside the report's path."""
+    headline facts, carried as the detail beside the report's path. *unwritten* is
+    why the report could not be written, when it could not: the run's facts then
+    reach the operator only through this record and the ledger."""
+    if unwritten is None:
+        return Escape(
+            anchor=RUN_REPORT_ANCHOR,
+            summary=f'link-heal sweep report: {report_path}',
+            detail={**summary, 'report': str(report_path)},
+        )
     return Escape(
         anchor=RUN_REPORT_ANCHOR,
-        summary=f'link-heal sweep report: {report_path}',
-        detail={**summary, 'report': str(report_path)},
+        summary=f'link-heal sweep report could not be written to {report_path}: {unwritten}',
+        detail={**summary, 'report': str(report_path), 'report_unwritten': unwritten},
     )
 
 

@@ -15,6 +15,7 @@ info escalation naming it, whether or not it wrote.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -313,6 +314,8 @@ async def _sweep(
     now: datetime = NOW,
     since: datetime | None = None,
     limits: RunLimits = LIMITS,
+    reports_dir: Path | None = None,
+    plan_path_for: Callable[[str], Path] | None = None,
 ) -> SweepReport:
     return await run_sweep(
         adjudicate=adjudicate or _answering(),
@@ -322,9 +325,10 @@ async def _sweep(
         limits=limits,
         settings=settings,
         filer=filer,
-        reports_dir=tmp_path / 'reports',
+        reports_dir=tmp_path / 'reports' if reports_dir is None else reports_dir,
         now=now,
         since=since,
+        plan_path_for=plan_path_for,
     )
 
 
@@ -939,6 +943,93 @@ class TestANewerRulingAtTheSameTexts:
         assert detach.state is ActionState.APPLIED
         assert detach.executed_run_id == second.apply_run_id
         assert second.view.plan.counts.superseded == 0
+
+
+class TestASweepWhosePlanStopped:
+    @pytest.mark.asyncio
+    async def test_writes_nothing_not_even_earlier_pending_heals_and_says_why(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        _calibrate(ledger, passed=True)
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        assert ledger.pending_actions(RunSource.SWEEP)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+            now=NOW + DAY, plan_path_for=lambda _run_id: tmp_path / 'missing' / 'plan.json',
+        )
+
+        assert report.view.plan.counts.stopped_by is not None
+        assert report.apply_run_id is None
+        assert _sweep_runs(ledger, writes=True) == []
+        assert harness.mem0.write_count == 0
+        assert report.view.withheld is WritesWithheld.PLAN_STOPPED
+        assert _report_json(report)['writes'] == {
+            'mode': 'withheld', 'withheld': WritesWithheld.PLAN_STOPPED.value,
+        }
+
+
+class TestASweepReportThatCannotBeWritten:
+    @pytest.mark.asyncio
+    async def test_is_still_escalated_naming_the_failure(self, harness, ledger, tmp_path):
+        _seed(harness)
+        blocker = tmp_path / 'a-regular-file'
+        blocker.write_text('')
+        filer = RecordingFiler()
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=filer,
+            reports_dir=blocker / 'reports',
+        )
+
+        assert report.report_unwritten
+        assert not report.report_path.exists()
+        (escape,) = [escape for escape in filer.escapes if escape.anchor == RUN_REPORT_ANCHOR]
+        assert escape.detail['report_unwritten'] == report.report_unwritten
+        assert 'could not be written' in escape.summary
+        assert report.escalation_id == f'esc-recorded-{len(filer.escapes)}'
+
+
+class TestTheReportNamesEveryHealTheRunActedOn:
+    @pytest.mark.asyncio
+    async def test_heals_withheld_at_plan_time_are_counted_with_their_oldest_child(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        _calibrate(ledger, passed=False)
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+            adjudicate=FakeAdjudicator(ANSWERS.__getitem__, prompt_sha256=SECOND_PROMPT_SHA256),
+            now=NOW + DAY,
+        )
+
+        document = _report_json(report)
+        assert document['counts']['examined'] == 0
+        assert document['counts']['by_action_state'] == {
+            ActionState.WITHHELD_UNCALIBRATED.value: len(STAGED_HEALS),
+        }
+        assert document['withheld_heals'] == {
+            'count': len(STAGED_HEALS), 'oldest_child_created_at': INSIDE,
+        }
+        assert f'oldest child created {INSIDE}' in report.report_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_that_supersedes_a_heal_counts_it(self, harness, ledger, tmp_path):
+        _seed(harness)
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            adjudicate=_second_prompt_answering(Verdict.SAME), now=NOW + DAY, since=WINDOW.since,
+        )
+
+        counts = _report_json(report)['counts']
+        assert counts['by_action_state'][ActionState.SUPERSEDED.value] == 1
+        assert counts['carried_from_earlier_plans'] == 1
 
 
 def _seed_misfile_heavy(harness: LinkHealHarness) -> None:
