@@ -2,7 +2,10 @@
 
 The fake records what a real ZCode process would see (argv, environ and the
 run-home files) and prints the result shape measured in
-plans/zcode-harness-probe-2026-11.md.
+plans/zcode-harness-probe-2026-11.md. Its environ includes the ``.env`` file
+upstream would load: zai-org/ZCode a9fe401eed
+packages/cli/src/env.ts::findDotenv and ::loadCliDotenv walk lexically up
+from ``--cwd`` to the first regular ``.env`` and merge it without override.
 """
 
 from __future__ import annotations
@@ -69,10 +72,36 @@ def git_probe():
     }
 
 
+def find_dotenv(start):
+    current = os.path.abspath(start)
+    while True:
+        candidate = os.path.join(current, '.env')
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def dotenv_loaded_environ(dotenv_path):
+    environ = dict(os.environ)
+    if dotenv_path is not None:
+        for line in Path(dotenv_path).read_text().splitlines():
+            key, sep, value = line.partition('=')
+            if sep and key.strip():
+                environ.setdefault(key.strip(), value.strip())
+    return environ
+
+
 home = os.environ.get('HOME', '')
+cwd_argument = sys.argv[sys.argv.index('--cwd') + 1]
+dotenv_path = find_dotenv(cwd_argument)
 capture = {
     'argv': sys.argv[1:],
-    'environ': dict(os.environ),
+    'environ': dotenv_loaded_environ(dotenv_path),
+    'dotenv_path': dotenv_path,
+    'cwd_realpath': os.path.realpath(cwd_argument),
     'home': home,
     'provider_config': snapshot(os.environ.get('ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', '')),
     'cli_config': snapshot(Path(home, '.zcode', 'cli', 'config.json')),
@@ -177,14 +206,28 @@ class TestInvokeZCode:
 
     async def test_the_argv_runs_one_headless_prompt_in_the_worktree(self, fake_zcode, worktree):
         await _invoke(worktree)
-        argv = fake_zcode.capture()['argv']
+        capture = fake_zcode.capture()
+        argv = capture['argv']
         assert _inline_value(argv, '--prompt') == 'do step-1'
-        assert _flag_value(argv, '--cwd') == str(worktree)
+        assert Path(_flag_value(argv, '--cwd')).parent == Path(capture['home'])
+        assert Path(capture['cwd_realpath']) == worktree.resolve()
         assert _flag_value(argv, '--mode') == 'yolo'
         assert _flag_value(argv, '--output-format') == 'json'
         disallowed = _flag_value(argv, '--disallowed-tools').split()
         assert 'Write' in disallowed
         assert 'Bash' not in disallowed
+
+    async def test_an_env_file_above_the_worktree_never_reaches_zcode(self, fake_zcode, tmp_path):
+        checkout = tmp_path / 'checkout'
+        checkout.mkdir()
+        (checkout / '.env').write_text('ZCODE_DOTENV_CANARY=from-the-checkout\n')
+        wt = checkout / '.worktrees' / 'wt'
+        wt.mkdir(parents=True)
+        (wt / 'README.md').write_text('fixture\n')
+        await _invoke(wt)
+        capture = fake_zcode.capture()
+        assert 'ZCODE_DOTENV_CANARY' not in capture['environ']
+        assert Path(capture['dotenv_path']) == Path(capture['home']) / '.env'
 
     async def test_the_run_home_carries_the_endpoint_mcp_and_system_prompt(
         self, fake_zcode, worktree,

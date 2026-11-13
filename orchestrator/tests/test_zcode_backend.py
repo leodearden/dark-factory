@@ -185,24 +185,37 @@ class TestZCodeCliConfig:
             zcode_cli_config({'mcpServers': {'broken-server': {'args': ['x']}}})
 
 
+def _home_at(path: Path) -> ZCodeRunHome:
+    return ZCodeRunHome(
+        root=path, provider_config_path=path / 'provider_config.json',
+        operator_home=OPERATOR_HOME, workspace=path / 'workspace',
+    )
+
+
 class TestZCodeArgv:
 
     def test_the_headless_argv_always_removes_the_interactive_tools(self, tmp_path):
-        argv = zcode_argv('do step-1', tmp_path, None)
+        argv = zcode_argv('do step-1', _home_at(tmp_path), None)
         assert argv == [
-            'zcode', '--prompt=do step-1', '--cwd', str(tmp_path), '--mode', 'yolo',
+            'zcode', '--prompt=do step-1', '--cwd', str(tmp_path / 'workspace'), '--mode', 'yolo',
             '--output-format', 'json', '--no-color', '--disallowed-tools', ALWAYS_DISALLOWED,
         ]
 
     @pytest.mark.parametrize('prompt', ['- do step-1', '---\ntitle: x\n---\n', '--cwd=/', ''])
     def test_a_prompt_that_looks_like_an_option_stays_inline_in_one_token(self, tmp_path, prompt):
-        argv = zcode_argv(prompt, tmp_path, None)
+        argv = zcode_argv(prompt, _home_at(tmp_path), None)
         assert argv[1] == f'--prompt={prompt}'
-        assert argv[2:4] == ['--cwd', str(tmp_path)]
+        assert argv[2:4] == ['--cwd', str(tmp_path / 'workspace')]
+
+    def test_zcode_runs_in_the_home_s_workspace(self, tmp_path):
+        home = _home_at(tmp_path)
+        argv = zcode_argv('p', home, None)
+        assert argv[argv.index('--cwd') + 1] == str(home.workspace)
 
     def test_plain_tool_names_are_appended_once(self, tmp_path):
-        argv = zcode_argv('p', tmp_path, ['Write', 'mcp__plan-tools__mark_step_done', 'Write',
-                                          'AskUserQuestion'])
+        argv = zcode_argv('p', _home_at(tmp_path), [
+            'Write', 'mcp__plan-tools__mark_step_done', 'Write', 'AskUserQuestion',
+        ])
         assert argv[-2:] == [
             '--disallowed-tools',
             f'{ALWAYS_DISALLOWED} Write mcp__plan-tools__mark_step_done',
@@ -213,7 +226,7 @@ class TestZCodeArgv:
         self, tmp_path, caplog, spec,
     ):
         with caplog.at_level(logging.WARNING, logger='orchestrator.agents.zcode_backend'):
-            argv = zcode_argv('p', tmp_path, [spec, 'Write'])
+            argv = zcode_argv('p', _home_at(tmp_path), [spec, 'Write'])
         names = argv[argv.index('--disallowed-tools') + 1]
         assert names == f'{ALWAYS_DISALLOWED} Write'
         assert spec not in ' '.join(argv)
@@ -223,7 +236,7 @@ class TestZCodeArgv:
 
     def test_the_largest_single_argument_linux_accepts_passes(self, tmp_path):
         prompt = 'x' * (131071 - PROMPT_PREFIX_BYTES)
-        assert zcode_argv(prompt, tmp_path, None)[1] == f'--prompt={prompt}'
+        assert zcode_argv(prompt, _home_at(tmp_path), None)[1] == f'--prompt={prompt}'
 
     @pytest.mark.parametrize('n_bytes', [
         131072 - PROMPT_PREFIX_BYTES, 131072, 131073, 200_000,
@@ -232,17 +245,17 @@ class TestZCodeArgv:
         self, tmp_path, n_bytes,
     ):
         with pytest.raises(ValueError, match=str(n_bytes)):
-            zcode_argv('x' * n_bytes, tmp_path, None)
+            zcode_argv('x' * n_bytes, _home_at(tmp_path), None)
 
     def test_the_refusal_counts_the_flag_prefix_in_the_argument_size(self, tmp_path):
         n_bytes = 131072 - PROMPT_PREFIX_BYTES
         with pytest.raises(ValueError, match='131072 bytes, but'):
-            zcode_argv('x' * n_bytes, tmp_path, None)
+            zcode_argv('x' * n_bytes, _home_at(tmp_path), None)
 
     def test_the_bound_counts_utf8_bytes_not_characters(self, tmp_path):
         prompt = 'é' * 70_000
         with pytest.raises(ValueError, match='140000'):
-            zcode_argv(prompt, tmp_path, None)
+            zcode_argv(prompt, _home_at(tmp_path), None)
 
 
 class TestParseZCodeOutput:
