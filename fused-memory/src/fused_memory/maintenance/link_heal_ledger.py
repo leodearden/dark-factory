@@ -890,12 +890,18 @@ class LinkHealLedger:
         parent_id: str,
         child_sha256: str,
         parent_sha256: str,
+        *,
+        model: str,
+        prompt_sha256: str,
     ) -> AdjudicationRow | None:
-        """The newest adjudication of this pair at exactly these text hashes."""
+        """The newest adjudication of this pair at these text hashes by exactly this
+        adjudicator: *model* asked under *prompt_sha256*. A legacy row with no prompt
+        version is never reused."""
         row = self._conn.execute(
             'SELECT * FROM adjudications WHERE project_id = ? AND child_id = ? AND parent_id = ? '
-            'AND child_sha256 = ? AND parent_sha256 = ? ORDER BY id DESC LIMIT 1',
-            (project_id, child_id, parent_id, child_sha256, parent_sha256),
+            'AND child_sha256 = ? AND parent_sha256 = ? AND model = ? AND prompt_sha256 = ? '
+            'ORDER BY id DESC LIMIT 1',
+            (project_id, child_id, parent_id, child_sha256, parent_sha256, model, prompt_sha256),
         ).fetchone()
         return None if row is None else _adjudication_row(row)
 

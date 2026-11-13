@@ -6,8 +6,10 @@ rendering of every pending heal, whose sha256 an operator can approve. It writes
 files nothing: every escape it would raise is recorded as ``would_escape``.
 Its verdicts come from the hand-link corpus (:func:`run_plan`) or from the
 link adjudicator (:func:`run_adjudicator_plan`), which is asked only about the
-links no deterministic row decides and that it has not judged at their
-current texts; its verdicts are ledgered as adjudications. A deterministic
+links no deterministic row decides and that this adjudicator (model and prompt
+version) has not judged at their current texts, so a model or brief change
+asks again and never inherits older verdicts; its verdicts are ledgered as
+adjudications. A deterministic
 plan is :func:`run_plan` with no verdicts at all: only the deterministic rows
 plan a heal, and every other link is reported unexamined.
 
@@ -618,10 +620,13 @@ class _Candidate:
     def pair(self) -> LinkPair:
         return LinkPair(key=self.key, child_text=self.state.child.text, parent_text=self.parent.text)
 
-    def judged(self, ledger: LinkHealLedger) -> AdjudicationRow | None:
+    def judged(
+        self, ledger: LinkHealLedger, adjudicate: LinkAdjudicator,
+    ) -> AdjudicationRow | None:
         return ledger.adjudication_at(
             self.state.project_id, self.child_id, self.parent.memory_id,
             self.state.child.text_sha256, self.parent.text_sha256,
+            model=adjudicate.model, prompt_sha256=adjudicate.prompt_sha256,
         )
 
     def record(self, verdict: LinkVerdict, prompt_sha256: str) -> AdjudicationRecord | None:
@@ -677,11 +682,11 @@ class _Adjudicated:
 async def _adjudicate(
     candidates: Sequence[_Candidate], ledger: LinkHealLedger, adjudicate: LinkAdjudicator,
 ) -> _Adjudicated:
-    """Reuse each candidate's ledgered verdict at its current texts; ask about the rest."""
+    """Reuse each candidate's verdict by *adjudicate* at its current texts; ask about the rest."""
     reused: list[AdjudicationRow] = []
     asked: list[_Candidate] = []
     for candidate in candidates:
-        row = candidate.judged(ledger)
+        row = candidate.judged(ledger, adjudicate)
         if row is None:
             asked.append(candidate)
         else:
@@ -723,7 +728,8 @@ async def run_adjudicator_plan(
 
     Only the links whose child *created_in* admits are read, when it is given.
     The adjudicator is asked only about the links the verdict rows decide and
-    that the ledger holds no adjudication of at their current texts. Every read
+    that this adjudicator (model and prompt version) has not judged at their
+    current texts, so a model or brief change asks again. Every read
     and every question is made before the run row exists. The run rests on the
     adjudications it makes and on those it reuses. A failed verdict is counted,
     never ledgered. Only heals in *enabled_actions* are staged (``None`` stages
