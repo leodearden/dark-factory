@@ -674,10 +674,12 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
 
 1. Read-only probes and log pulls.
 2. Installing an already-shipped timer or unit whose action is read-only or reporting.
-3. Filing a delayed follow-up for a gate that fired prematurely: a dependency plus a `delayed`
-   milestone. The milestone shape is in docs/task-authoring.md §"Milestone tasks (dated /
-   delayed)"; wire the dependency by CLAUDE.md's `planning_mode=True` → `add_dependency` →
-   `commit_planning` rule.
+3. Holding a gate that fired prematurely behind its real precondition: add the dependency, plus
+   a `delayed` milestone when the wait should outlast it (shape in docs/task-authoring.md
+   §"Milestone tasks (dated / delayed)"; wire the dependency by CLAUDE.md's `planning_mode=True`
+   → `add_dependency` → `commit_planning` rule), and only then `resume` the gate. The runner files
+   a fresh gate when the hold lands, because the task now waits on more than when it fired
+   (docs/task-authoring.md §5); never clear `gate_escalated_at` by hand.
 4. Recovering a preserved payload into the task the brief names.
 5. Appending a finding to an existing owner task, ONLY while that task is `pending`, because task
    text is never re-read after dispatch (see "Findings for another task's owner").

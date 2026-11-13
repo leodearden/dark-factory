@@ -973,7 +973,7 @@ action); task goes `blocked` until resolved.
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
 | present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
-| absent | `true` | escalate born-at-L2 immediately; `done` after `resume` | **pure gate** |
+| absent | `true` | escalate born-at-L2 immediately; `done` after `resume`; re-fires instead if resumed behind a new dependency or milestone | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
@@ -1000,7 +1000,8 @@ open (quiescence guard — no re-dispatch, no churn).
 
 **Runner stamps** (written by `DeterministicRunner`, never
 author-supplied): `before_done_ran_at`, `before_done_verified_at`,
-`gate_escalated_at`, and `done_provenance` (stamped for all four
+`gate_escalated_at`, `gate_escalated_preconditions` (pure gates only), and
+`done_provenance` (stamped for all four
 `deterministic-*` kinds — see the requirement table in §2 for
 per-kind semantics; `deterministic-milestone` is stamped on both the
 first-pass check and the post-escalation re-check described in §6).
@@ -1011,6 +1012,16 @@ does (§8, "The human-curator-gate contract") — both go through one rule in
 `orchestrator/src/orchestrator/deterministic_runner.py::_cite_gate_escalation_id`.
 The two closes keep distinct `note` text, which is what makes a genuine
 curator closure distinguishable from a generic one in the audit trail.
+
+**A gate that fired prematurely.** Hold it first, resume it second. Add the
+dependency (by CLAUDE.md's `planning_mode=True` → `add_dependency` →
+`commit_planning` rule) and/or a `milestone` (§6), then
+`resolve_issue(action='resume')`. When the hold lands, the runner files a
+fresh `milestone_gate` itself, because the task now waits on more than its
+`gate_escalated_preconditions` record (rationale:
+`docs/deterministic-runner.md` §3), so nobody clears `gate_escalated_at` by
+hand. Wiring the hold after the resume races: the task re-pends with
+nothing new to wait on and closes.
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
@@ -1225,6 +1236,13 @@ immediately. `mode='dated'` simply withholds while `now < at`. A malformed
 or unrecognized `metadata.milestone` value fails safe — withhold dispatch
 indefinitely, with a one-time WARNING log — rather than dispatch early or
 crash the tick.
+
+Moving or adding a pure gate's milestone after it fired re-arms it (§5, "A
+gate that fired prematurely"). One caveat: a new dependency does not
+restart a `delayed` milestone's frozen-once `milestone_deps_satisfied_at`
+anchor, so a gate that already carried that anchor re-fires as soon as the
+dependency lands rather than `after_secs` later. It asks early; it never
+skips the human.
 
 **Exemplar** (autonomous — no human involvement unless the check fails):
 "one week after task X lands, check merge flakiness is under 5%, else
@@ -1589,6 +1607,10 @@ Three of the entries belong to the completion-driven trigger chain
   predicate's trailing JSON-object payload, parsed; or
   `{"elided": true, "chars": N}` over the 400-char cap; or `null` when a
   declared `75` carried no JSON object (§6).
+
+`gate_escalated_preconditions` is runner-stamped, never author-supplied:
+`{dependencies, external_deps, milestone}`, what a pure gate waited on when
+it escalated, written beside `gate_escalated_at` (§5).
 
 `pure_gate_from` is machine-written at conversion, never author-supplied: the
 `submit_task` tool drops a caller-supplied value (metadata cloned from
