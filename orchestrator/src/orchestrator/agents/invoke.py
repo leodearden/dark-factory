@@ -1397,7 +1397,7 @@ async def _invoke_zcode(
     operator_home = require_operator_home(base_env, backend='zcode')
     with zcode_run_home(
         system_prompt=system_prompt, model=model, endpoint=endpoint, mcp_config=mcp_config,
-        operator_home=operator_home,
+        operator_home=operator_home, worktree=cwd,
     ) as home:
         cmd, env = _sandbox_spawn(
             zcode_argv(prompt, cwd, disallowed_tools),

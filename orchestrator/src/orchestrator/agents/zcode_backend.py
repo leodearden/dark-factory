@@ -113,6 +113,7 @@ class ZCodeRunHome:
     root: Path
     provider_config_path: Path
     operator_home: Path
+    workspace: Path
 
 
 @contextmanager
@@ -123,8 +124,9 @@ def zcode_run_home(
     endpoint: ZCodeEndpoint,
     mcp_config: Mapping[str, Any] | None,
     operator_home: Path,
+    worktree: Path,
 ) -> Iterator[ZCodeRunHome]:
-    """A private home for one invocation, holding the only copy of the endpoint key; removed on exit."""
+    """A private home for one invocation, holding the only copy of the endpoint key and the link to *worktree* ZCode runs in; removed on exit."""
     with private_run_home(backend='zcode', operator_home=operator_home) as root:
         zcode_dir = root / '.zcode'
         provider_config_path = zcode_dir / 'v2' / 'provider_config.json'
@@ -135,7 +137,16 @@ def zcode_run_home(
         (zcode_dir / 'AGENTS.md').write_text(system_prompt)
         yield ZCodeRunHome(
             root=root, provider_config_path=provider_config_path, operator_home=operator_home,
+            workspace=_fenced_workspace(root, worktree),
         )
+
+
+def _fenced_workspace(root: Path, worktree: Path) -> Path:
+    """See plans/zcode-harness-probe-2026-11.md §"Dotenv walk"."""
+    (root / '.env').touch(exist_ok=False)
+    workspace = root / 'workspace'
+    workspace.symlink_to(worktree.resolve(), target_is_directory=True)
+    return workspace
 
 
 def zcode_spawn_env(base_env: Mapping[str, str], home: ZCodeRunHome) -> dict[str, str]:
