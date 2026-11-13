@@ -7,8 +7,17 @@ from pathlib import Path
 import pytest
 import suite_census_evidence as ev
 import suite_census_outcomes as oc
+from orchestrator.flake_ledger import UNKNOWN_TEST_ID, FlakeCallSite
+from shared.project_layout import runs_db
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
-from suite_census_fixtures import git_tree, junit_xml, nextest_project, pytest_project, write_gz
+from suite_census_fixtures import (
+    flake_db,
+    git_tree,
+    junit_xml,
+    nextest_project,
+    pytest_project,
+    write_gz,
+)
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -325,3 +334,114 @@ class TestNextestEvidence:
         (ledger,) = [w for w in evidence.windows if w.source == 'flaky-ledger']
         assert (ledger.present, ledger.artefacts) == (False, 0)
         assert _observations(list(evidence.records()), 'flaky-ledger') == []
+
+
+LANE_FILE = 'orchestrator/tests/test_lane.py'
+LANE_TESTS = ('test_gate', 'test_reproduced', 'test_cleared', 'test_inconclusive', 'test_steady')
+LANE_PASS_AT = '2026-10-03T00:00:00+00:00'
+
+
+def _lane(name: str) -> oc.TestId:
+    return oc.TestId('orchestrator', f'{LANE_FILE}::{name}')
+
+
+def _lane_tree(root: Path) -> Path:
+    """Five tests costed by one junit run, and a merge-gate flake row for test_gate."""
+    git_tree(root, {
+        'orchestrator/orchestrator.yaml': '',
+        LANE_FILE: ''.join(f'def {name}():\n    pass\n\n\n' for name in LANE_TESTS),
+    })
+    write_gz(
+        root / 'data' / 'verify-logs' / 'T1'
+        / 'attempt-1.orchestrator.junit-20261001T000000_1Z.xml.gz',
+        junit_xml(
+            '2026-10-01T00:00:00+00:00',
+            [('tests.test_lane', name, 1.0, 'pass') for name in LANE_TESTS],
+        ),
+    )
+    flake_db(runs_db(root), [
+        ('2026-10-02T00:00:00+00:00', 'tests/test_lane.py::test_gate', 'fails_in_isolation'),
+    ])
+    return root
+
+
+def _add_lane_rows(root: Path) -> None:
+    """One offline-lane pass's suppressions: one test per verdict, and one naming no test."""
+    flake_db(runs_db(root), [
+        (LANE_PASS_AT, 'tests/test_lane.py::test_reproduced', 'fails_in_isolation'),
+        (LANE_PASS_AT, 'tests/test_lane.py::test_cleared', 'passes_in_isolation'),
+        (LANE_PASS_AT, 'tests/test_lane.py::test_inconclusive', 'unconfirmable'),
+        (LANE_PASS_AT, None, 'unconfirmable'),
+    ], call_site=FlakeCallSite.offline_lane)
+
+
+def _flake_tally(census: oc.OutcomeCensus) -> oc.SourceTally:
+    (tally,) = [tally for tally in census.sources if tally.source == 'flake_occurrence']
+    return tally
+
+
+def _flake_artefacts(census: oc.OutcomeCensus) -> int:
+    (window,) = [window for window in census.windows if window.source == 'flake_occurrence']
+    return window.artefacts
+
+
+class TestFlakeOccurrenceCallSites:
+    """Every flake_occurrence row fails the test it names, whatever its call site or verdict."""
+
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        return _lane_tree(tmp_path)
+
+    @staticmethod
+    def _census(root: Path) -> oc.OutcomeCensus:
+        return oc.census_outcomes(ev.pytest_evidence(root, root))
+
+    def test_offline_lane_rows_fail_the_tests_they_name(self, root):
+        before = self._census(root)
+        _add_lane_rows(root)
+        after = self._census(root)
+        assert before.failed_floor == {_lane('test_gate')}
+        assert after.failed_floor - before.failed_floor == {
+            _lane('test_reproduced'), _lane('test_cleared'), _lane('test_inconclusive'),
+        }
+        assert before.failed_floor <= after.failed_floor
+        assert [cost.test for cost in after.ranking] == [
+            cost.test for cost in before.ranking if cost.test not in after.failed_floor
+        ] == [_lane('test_steady')]
+
+    def test_offline_lane_rows_enter_the_flake_tally_and_window(self, root):
+        before = self._census(root)
+        _add_lane_rows(root)
+        after = self._census(root)
+        tallies = [
+            (tally.runs, tally.red_runs, tally.unresolved)
+            for tally in (_flake_tally(before), _flake_tally(after))
+        ]
+        assert tallies == [(1, 1, 0), (4, 4, 1)]
+        assert _flake_tally(after).unresolved_samples == (UNKNOWN_TEST_ID,)
+        assert (_flake_artefacts(before), _flake_artefacts(after)) == (1, 5)
+
+    def test_a_lane_observation_naming_no_test_credits_no_test(self, root):
+        _add_lane_rows(root)
+        records = list(ev.pytest_evidence(root, root).records())
+        assert _unresolved(records, 'flake_occurrence') == [UNKNOWN_TEST_ID]
+        assert not [
+            o for o in _observations(records, 'flake_occurrence')
+            if UNKNOWN_TEST_ID in o.test.name
+        ]
+
+    def test_nextest_counts_an_offline_lane_row_of_an_infra_script(self, tmp_path):
+        root = git_tree(tmp_path, {
+            'tests/infra/test_lane.sh': '#!/bin/sh\n',
+            'tests/infra/test_steady.sh': '#!/bin/sh\n',
+        })
+        flake_db(runs_db(root), [
+            (LANE_PASS_AT, 'test_lane.sh', 'fails_in_isolation'),
+            (LANE_PASS_AT, None, 'unconfirmable'),
+        ], call_site=FlakeCallSite.offline_lane)
+        census = oc.census_outcomes(ev.nextest_evidence(root, root))
+        assert census.failed_floor == {oc.TestId('tests/infra', 'tests/infra/test_lane.sh')}
+        assert census.never_failed_uncosted == (
+            oc.TestId('tests/infra', 'tests/infra/test_steady.sh'),
+        )
+        assert _flake_tally(census).unresolved_samples == (UNKNOWN_TEST_ID,)
