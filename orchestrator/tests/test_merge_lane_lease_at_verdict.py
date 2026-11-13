@@ -276,3 +276,63 @@ class TestRebasedHeadWaitsForAHostAtKHostsPlusOne:
             assert verifier.verified == ['wk-a', 'wk-a', 'wk-x'], verifier.verified
             assert _landings(store) == ['wk-a', 'wk-x']
             remote.run_merge_verify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
+class TestPersistentMergeLaneKeepsItsLease:
+    """A verdict in the persistent ``_merge-verify`` lane keeps its host to landing.
+
+    That lane is a singleton the entry's landing still runs in, and its held
+    local lease is what stops a second local dispatch from resetting it
+    (merge_lane/liveness.py::_acquire_warm_verify_worktree).
+    """
+
+    async def test_a_local_verdict_in_the_persistent_lane_holds_local_until_it_lands(
+        self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
+    ) -> None:
+        config = lane_scene_config(
+            git_repo,
+            git_config.model_copy(update={
+                'persistent_merge_worktree': True, 'merge_spec_warm_lane_pool': False,
+            }),
+            verify_host_policy='prefer_remote',
+        ).model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
+        assert config.git.persistent_merge_worktree is True
+        assert config.git.merge_spec_warm_lane_pool is False
+        assert config.merge_deep.chain_cap == 0
+        verifier = FakeVerifier()
+        laptop = _PerCallGatedRemote('laptop', calls=1)
+        store = _LateArrivalFakeEventStore()
+        persistent = git_ops.persistent_merge_worktree_path
+
+        async with _running_lane(
+            git_ops, verifier=verifier, event_store=store,
+            speculation_depth=3, remote_runners=[laptop.runner],
+        ) as (lane, queue):
+            lane.VERIFY_ABANDON_POLL_SECS = 0.02
+            try:
+                req_h = await _submitted(git_ops, config, 'pl-h')
+                req_a = await _submitted(git_ops, config, 'pl-a')
+                await queue.put(req_h)
+                await queue.put(req_a)
+                await wait_responsive(laptop.entered[0].wait(), label='H to enter the laptop')
+                await _until(
+                    lambda: _row(lane, 'pl-a') == ('local', 'finished'),
+                    what="A's local verdict, its lease held",
+                )
+                assert [c.task_id for c in verifier.verify_calls] == ['pl-a']
+                assert verifier.verify_calls[0].worktree.resolve() == persistent.resolve()
+                local = next(h for h in lane.snapshot()['hosts'] if h['name'] == 'local')
+                assert local['slot_state'] == 'busy', lane.snapshot()['hosts']
+                assert not req_h.result.done(), 'precondition: H still verifies'
+
+                laptop.release[0].set()
+                outcome_h = await wait_responsive(req_h.result, label='pl-h outcome')
+                outcome_a = await wait_responsive(req_a.result, label='pl-a outcome')
+            finally:
+                laptop.release_all()
+
+        assert (outcome_h.status, outcome_a.status) == ('done', 'done'), (outcome_h, outcome_a)
+        assert _landings(store) == ['pl-h', 'pl-a']
+        assert persistent.exists(), 'the persistent merge lane survives its landing'
