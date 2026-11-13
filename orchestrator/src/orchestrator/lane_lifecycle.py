@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
     from escalation.queue import EscalationQueue
 
+    from orchestrator.quarantine_provenance import QuarantineOutcome
+
 logger = logging.getLogger(__name__)
 
 # Escalation sentinel role for illegal-transition escalations. Matches the
@@ -250,7 +252,7 @@ class LaneLifecycle:
             unwired/bare-unit contexts green (no filing, no crash) — mirrors
             ``Harness._file_pool_storage_absent_escalation``.
         quarantine_worktree: Injected async ``(worktree, branch, reason) ->
-            Path | None`` callable (``GitOps.quarantine_worktree`` in
+            QuarantineOutcome`` callable (``GitOps.quarantine_worktree`` in
             production). Injected rather than importing ``GitOps`` directly
             to avoid the GitOps<->LaneLifecycle import cycle (gamma makes
             GitOps own a LaneLifecycle).
@@ -538,7 +540,7 @@ class LaneLifecycle:
             ),
         )
 
-    async def quarantine(self, lane: Path | str, branch: str, reason: str) -> Path | None:
+    async def quarantine(self, lane: Path | str, branch: str, reason: str) -> QuarantineOutcome:
         """Delegate the git-side relocation, then record the QUARANTINED edge.
 
         Requires an injected ``quarantine_worktree`` callable (raises
@@ -562,9 +564,9 @@ class LaneLifecycle:
             raise RuntimeError(
                 'LaneLifecycle.quarantine: no quarantine_worktree callable wired'
             )
-        dest = await self._quarantine_worktree(lane, branch, reason)
+        outcome = await self._quarantine_worktree(lane, branch, reason)
         self.transition(lane, LaneState.QUARANTINED)
-        return dest
+        return outcome
 
     def note_assigned(
         self,

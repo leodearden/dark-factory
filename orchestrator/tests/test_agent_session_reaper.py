@@ -30,6 +30,7 @@ from orchestrator.config import TranscriptArchiveConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 
 _DEAD_PID = 2**31 - 1
 _NOW = datetime(2026, 11, 11, 12, 0, 0, tzinfo=UTC)
@@ -288,7 +289,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
     h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
-    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
     h.git_ops._lane_lifecycle = LaneLifecycle(
         h.git_ops.worktree_base, quarantine_worktree=h.git_ops.quarantine_worktree,
     )
