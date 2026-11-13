@@ -10,8 +10,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _held_loop_clock import held_loop_clock
 from _script_survivor import SURVIVOR_SCRIPT, is_alive, kill_survivor, read_survivor_pid
 from shared.proc_group import SigkillDispatch
+from shared.process_identity import Liveness, capture, liveness
 
 from orchestrator.before_done_script import (
     REAP_GRACE_SECS,
@@ -94,6 +96,23 @@ def _fake_pgid() -> int:
     return candidate
 
 
+def _wait_for_recorded_pid(pidfile: Path, *, within: float = 30.0) -> int:
+    """Block until *pidfile* holds a complete pid line; runs off-loop because the loop clock may be held."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            text = pidfile.read_text()
+        except FileNotFoundError:
+            text = ''
+        if text.endswith('\n'):
+            return int(text)
+        time.sleep(0.01)
+    raise AssertionError(
+        f'{pidfile} never held a complete pid line within {within}s: '
+        f'the script never recorded its grandchild'
+    )
+
+
 @pytest.mark.asyncio
 class TestBeforeDoneSubprocessTimeoutHardening:
     """run_script — Layer A: kill the WHOLE process tree on timeout.
@@ -135,6 +154,10 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         (The exited-script case, where a surviving child holds the pipe open
         and a real exit code IS in hand, is pinned by
         ``test_deterministic_runner.py::TestDefaultRunnerInnerTimeoutDeployHonesty``.)
+
+        The 1s budget counts from the recorded, live grandchild, not from the
+        spawn: the loop clock is held until then (``_held_loop_clock``), so a
+        host stall before the record cannot expire it (task 9612).
         """
         script = tmp_path / 'hang.sh'
         pidfile = tmp_path / 'grandchild.pid'
@@ -146,20 +169,31 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         )
         script.chmod(0o755)
 
-        # Hang tripwire: if the fix regresses into a real hang, fail loudly
-        # instead of stalling the suite.
-        with pytest.raises(ScriptTimeout) as excinfo:
-            await asyncio.wait_for(
-                run_script(
-                    script,
-                    [str(pidfile)],
-                    cwd=tmp_path,
-                    env_overrides=None,
-                    timeout_secs=1,
-                    reap_grace_secs=REAP_GRACE_SECS,
+        with held_loop_clock() as release:
+            # Hang tripwire: if the fix regresses into a real hang, fail loudly
+            # instead of stalling the suite.
+            run = asyncio.ensure_future(
+                asyncio.wait_for(
+                    run_script(
+                        script,
+                        [str(pidfile)],
+                        cwd=tmp_path,
+                        env_overrides=None,
+                        timeout_secs=1,
+                        reap_grace_secs=REAP_GRACE_SECS,
+                    ),
+                    timeout=10,
                 ),
-                timeout=10,
             )
+            grandchild_pid = await asyncio.to_thread(_wait_for_recorded_pid, pidfile)
+            grandchild = capture(grandchild_pid)
+            assert grandchild is not None, (
+                f'the precondition is a live grandchild in the script\'s group '
+                f'when the budget starts, but pid {grandchild_pid} is not running'
+            )
+            release()
+            with pytest.raises(ScriptTimeout) as excinfo:
+                await run
 
         exc = excinfo.value
         assert exc.timeout_secs == 1, (
@@ -197,19 +231,15 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             f'the message must still name the budget it overran: {str(exc)!r}'
         )
 
-        grandchild_pid = int(pidfile.read_text().strip())
         deadline = time.monotonic() + 3.0
-        alive = True
-        while time.monotonic() < deadline:
-            try:
-                os.kill(grandchild_pid, 0)
-            except ProcessLookupError:
-                alive = False
-                break
+        state = liveness(grandchild)
+        while state is not Liveness.DEAD and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
-        assert not alive, (
+            state = liveness(grandchild)
+        assert state is Liveness.DEAD, (
             f'grandchild pid {grandchild_pid} must be dead after timeout — the '
-            f'WHOLE process group must be killed, not just the direct child'
+            f'WHOLE process group must be killed, not just the direct child: '
+            f'{grandchild} reads {state}'
         )
 
     async def test_timeout_of_already_exited_script_does_not_signal_the_group(
