@@ -36,7 +36,7 @@ from _link_heal_harness import (
 
 from fused_memory.config.schema import LinkHealConfig
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
-from fused_memory.maintenance.link_heal import HealAction, LinkImage, Report, Verdict
+from fused_memory.maintenance.link_heal import BasisSource, HealAction, LinkImage, Report, Verdict
 from fused_memory.maintenance.link_heal_executor import (
     ADJUDICATOR_ANCHOR,
     MISFILE_SHARE_ANCHOR,
@@ -44,11 +44,14 @@ from fused_memory.maintenance.link_heal_executor import (
     EscapeFiler,
     RunLimits,
     RunReport,
+    pending_plan_sha256,
     run_adjudicator_plan,
+    run_apply,
     run_undo,
 )
 from fused_memory.maintenance.link_heal_ledger import (
     NO_ACTION_TAKEN,
+    ActionState,
     Disposition,
     LinkHealLedger,
     RunSource,
@@ -567,6 +570,111 @@ class TestAllowedWrites:
         assert [escape.anchor for escape in filer.escapes] == [
             ADJUDICATOR_ANCHOR, RUN_REPORT_ANCHOR,
         ]
+
+
+SECOND_PROMPT_SHA256 = 'e' * 64
+DANGLING = _id('aaaaaaaa', 8)
+STAGED_HEALS = {
+    (MISFILED, HealAction.DETACH),
+    (EXTENDS, HealAction.RELABEL),
+    (TRIAGE_CONTESTED, HealAction.DETACH),
+}
+
+
+class TestTheWriteTimeCalibrationGate:
+    @pytest.mark.asyncio
+    async def test_heals_staged_under_a_failed_calibration_are_withheld_after_another_prompt_passes(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        failed = _calibrate(ledger, passed=False)
+        first = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+        assert first.apply_run_id is None
+        assert _report_json(first)['writes']['withheld'] == WritesWithheld.CALIBRATION_FAILED.value
+        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+
+        second = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+            adjudicate=FakeAdjudicator(ANSWERS.__getitem__, prompt_sha256=SECOND_PROMPT_SHA256),
+            now=NOW + DAY,
+        )
+
+        assert second.apply_run_id is not None
+        assert harness.mem0.write_count == 0
+        staged = ledger.run_actions(first.plan_run_id)
+        assert {(row.planned.child_id, row.planned.action) for row in staged} == STAGED_HEALS
+        for row in staged:
+            assert row.state is ActionState.WITHHELD_UNCALIBRATED
+            assert row.executed_run_id == second.apply_run_id
+            assert row.detail == {
+                'model': FAKE_ADJUDICATOR_MODEL,
+                'prompt_sha256': FAKE_PROMPT_SHA256,
+                'calibration': 'failed',
+                'calibration_run_id': failed,
+            }
+        assert ledger.pending_actions(RunSource.SWEEP) == []
+        assert second.view.apply is not None
+        assert second.view.apply.counts.withheld_uncalibrated == len(staged)
+        assert f'withheld {len(staged)} heal(s)' in second.report_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_staged_heals_apply_once_their_own_adjudicator_passes(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        first = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+        assert first.apply_run_id is None
+        assert _report_json(first)['writes']['withheld'] == WritesWithheld.UNCALIBRATED.value
+        _calibrate(ledger, passed=True)
+
+        second = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+            now=NOW + DAY,
+        )
+
+        assert second.apply_run_id is not None
+        applied = {
+            (row.planned.child_id, row.planned.action)
+            for row in ledger.applied_actions(second.apply_run_id)
+        }
+        assert applied == STAGED_HEALS
+        assert second.view.apply is not None
+        assert second.view.apply.counts.withheld_uncalibrated == 0
+
+    @pytest.mark.asyncio
+    async def test_an_attended_sweep_apply_withholds_uncalibrated_heals_but_not_deterministic_ones(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        harness.seed_link(
+            child=DANGLING, parent=_id('bbbbbbbb', 8), child_text='a dangling amendment',
+            parent_text=None, meta={'created_at': INSIDE},
+        )
+        planned = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(dry_run=True), filer=RecordingFiler(),
+        )
+
+        report = await run_apply(
+            store=harness.store(), ledger=ledger, limits=LIMITS, filer=RecordingFiler(),
+            source=RunSource.SWEEP,
+            approved_plan_sha256=pending_plan_sha256(ledger.pending_actions(RunSource.SWEEP)),
+        )
+
+        rows = ledger.run_actions(planned.plan_run_id)
+        adjudicated = [row for row in rows if row.planned.basis_source is BasisSource.ADJUDICATOR]
+        assert {(row.planned.child_id, row.planned.action) for row in adjudicated} == STAGED_HEALS
+        for row in adjudicated:
+            assert row.state is ActionState.WITHHELD_UNCALIBRATED
+            assert row.executed_run_id == report.run_id
+        (deterministic,) = [row for row in rows if row.planned.basis_source is not BasisSource.ADJUDICATOR]
+        assert (deterministic.planned.child_id, deterministic.state) == (DANGLING, ActionState.APPLIED)
+        assert harness.mem0.write_count == 1
+        assert report.counts.withheld_uncalibrated == len(adjudicated)
+        assert report.counts.applied == 1
 
 
 def _seed_misfile_heavy(harness: LinkHealHarness) -> None:

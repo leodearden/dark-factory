@@ -24,6 +24,7 @@ from fused_memory.maintenance.link_heal import (
 from fused_memory.maintenance.link_heal_ledger import (
     ActionState,
     AdjudicationRecord,
+    AdjudicatorCalibration,
     AmbiguousRun,
     Disposition,
     ExaminationRecord,
@@ -807,6 +808,79 @@ def _record(
         model=model,
         prompt_sha256=prompt_sha256,
     )
+
+
+class TestBasisCalibration:
+    @staticmethod
+    def _adjudicated_heal(ledger: LinkHealLedger, basis_key: str | None = None):
+        if basis_key is None:
+            judged = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+            (adjudication_id,) = ledger.add_adjudications(judged, [_record(1)])
+            basis_key = str(adjudication_id)
+        run_id = ledger.start_run(RunSource.SWEEP, writes=False)
+        planned = dataclasses.replace(_planned(source=BasisSource.ADJUDICATOR), basis_key=basis_key)
+        ledger.add_planned(run_id, [planned])
+        (row,) = ledger.run_actions(run_id)
+        return row
+
+    @staticmethod
+    def _calibrated(ledger: LinkHealLedger, *, passed: bool) -> str:
+        run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
+        ledger.add_calibration(
+            run_id, model=MODEL, prompt_sha256=PROMPT_SHA, population_sha256='0' * 64,
+            passed=passed, report={'passed': passed},
+        )
+        return run_id
+
+    def test_a_heal_not_resting_on_an_adjudication_has_none(self, ledger):
+        run_id = ledger.start_run(RunSource.SWEEP, writes=False)
+        ledger.add_planned(run_id, [_planned(source=BasisSource.DETERMINISTIC, parent_sha=None)])
+        (row,) = ledger.run_actions(run_id)
+
+        assert ledger.basis_calibration(row) is None
+
+    def test_an_uncalibrated_adjudicator_has_no_calibration_and_has_not_passed(self, ledger):
+        standing = ledger.basis_calibration(self._adjudicated_heal(ledger))
+
+        assert standing == AdjudicatorCalibration(model=MODEL, prompt_sha256=PROMPT_SHA, calibration=None)
+        assert standing.passed is False
+
+    def test_the_newest_calibration_failing_has_not_passed(self, ledger):
+        self._calibrated(ledger, passed=True)
+        failed = self._calibrated(ledger, passed=False)
+
+        standing = ledger.basis_calibration(self._adjudicated_heal(ledger))
+
+        assert standing is not None
+        assert standing.calibration is not None
+        assert standing.calibration.run_id == failed
+        assert standing.passed is False
+
+    def test_the_newest_calibration_passing_has_passed(self, ledger):
+        self._calibrated(ledger, passed=False)
+        passed = self._calibrated(ledger, passed=True)
+
+        standing = ledger.basis_calibration(self._adjudicated_heal(ledger))
+
+        assert standing is not None
+        assert standing.passed is True
+        assert standing.calibration is not None
+        assert standing.calibration.run_id == passed
+
+    def test_the_adjudicator_lookup_gives_the_same_standing(self, ledger):
+        self._calibrated(ledger, passed=True)
+
+        assert ledger.adjudicator_calibration(MODEL, PROMPT_SHA) == ledger.basis_calibration(
+            self._adjudicated_heal(ledger),
+        )
+
+    def test_a_basis_naming_no_adjudication_is_refused(self, ledger):
+        row = self._adjudicated_heal(ledger, basis_key='999999')
+
+        with pytest.raises(LookupError, match='999999') as raised:
+            ledger.basis_calibration(row)
+
+        assert str(row.action_id) in str(raised.value)
 
 
 class TestAdjudications:
