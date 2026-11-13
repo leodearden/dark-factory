@@ -517,6 +517,40 @@ class TestAllowedWrites:
             assert restored == record.before_child.link_image()
 
     @pytest.mark.asyncio
+    async def test_an_undone_heal_keeps_its_action_and_after_state_and_names_its_undo(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        _calibrate(ledger, passed=True)
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+        assert report.apply_run_id is not None
+
+        undo = await run_undo(
+            ledger.undo_target(ledger.resolve_run(report.apply_run_id)),
+            store=harness.store(), ledger=ledger, limits=LIMITS,
+        )
+
+        post_images = {
+            row.action_id: row.planned.post_image for row in ledger.run_actions(report.plan_run_id)
+        }
+        records = {record.child_id: record for record in ledger.run_records(report.plan_run_id)}
+        for child, action in (
+            (MISFILED, 'detach'), (EXTENDS, 'relabel'), (TRIAGE_CONTESTED, 'detach'),
+        ):
+            record = records[child]
+            assert record.action_taken == action
+            assert record.after_child is not None
+            assert record.after_child.link_image() == post_images[record.action_id]
+            assert record.undone_run_id == undo.run_id
+        assert records[AMENDMENT_CORRECTS].action_taken == NO_ACTION_TAKEN
+        assert records[AMENDMENT_CORRECTS].undone_run_id is None
+        for record in records.values():
+            restored = LinkImage.from_metadata(harness.mem0.payload(DF, record.child_id))
+            assert restored == record.before_child.link_image()
+
+    @pytest.mark.asyncio
     async def test_a_writing_sweep_files_its_storm(self, harness, ledger, tmp_path):
         _seed(harness)
         _calibrate(ledger, passed=True)
