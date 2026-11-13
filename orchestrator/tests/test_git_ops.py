@@ -7590,6 +7590,60 @@ class TestOrphanWorktreeHelpers:
         assert (outcome.dest / 'wip.py').exists()
         assert await git_ops.commits_beyond_main('task/q-foreign') == 0
 
+    async def test_quarantine_parks_the_branch_of_a_detached_worktree(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-detached')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-detached')
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=info.path)
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-detached', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not info.path.exists()
+        assert outcome.branch is not None
+        assert outcome.tip_sha == tip
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha('task/q-detached') is None
+
+    async def test_parking_a_detached_cold_incarnation_leaves_no_task_branch(
+        self, git_ops: GitOps,
+    ):
+        info = await git_ops.create_worktree('q-recut')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-recut')
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=info.path)
+        assert rc == 0, err
+
+        parked = await git_ops.park_prior_incarnation('q-recut', reason='recut')
+
+        assert parked is not None and parked.parked_branch is not None
+        assert await git_ops.resolve_branch_sha('task/q-recut') is None
+        assert await git_ops.resolve_branch_sha(parked.parked_branch) == tip
+        assert parked.parked_tip == tip
+        assert parked.quarantined_worktree is not None
+        assert not info.path.exists()
+
+    async def test_a_failed_unregistered_move_restores_branch_and_gitfile(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-rollback')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-rollback')
+        await _drop_admin_entry(git_ops, info.path)
+        gitfile_before = (info.path / '.git').read_bytes()
+        git_ops.quarantine_base.parent.mkdir(parents=True, exist_ok=True)
+        git_ops.quarantine_base.write_text('not a directory\n')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-rollback', 'unit-test')
+
+        assert outcome.dest is None
+        assert info.path.is_dir()
+        assert await git_ops.resolve_branch_sha('task/q-rollback') == tip
+        assert await _branches_matching(git_ops, 'task/q-rollback-*') == ''
+        assert (info.path / '.git').read_bytes() == gitfile_before
+
     async def test_quarantine_relocates_a_registered_worktree_without_the_branch(
         self, git_ops: GitOps,
     ):
