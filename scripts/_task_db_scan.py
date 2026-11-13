@@ -17,8 +17,10 @@ importable-by-sibling-scripts only. It hosts three tiers:
   FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525). The store
   paths and the known/default roots delegate to ``shared.project_layout``
   (task 6713). :func:`decode_metadata` is the exception to "adopted by all four": it is
-  used only by the two AUDIT scripts (task 4782), which are the only ones
-  that decode a ``metadata`` column at all. The tier's "…and OPEN it" half
+  adopted by the scripts that decode a ``metadata`` column, among them the
+  audit scripts ``audit_combine_gate_marker_loss.py`` and
+  ``audit_manifest_descriptor_drift.py`` (task 4782) and
+  ``audit_delivered_checks.py`` (task 6037). The tier's "…and OPEN it" half
   (task 5330) lives in ``shared/src/shared/tasks_db_readonly.py::connect_ro``
   (task 6268), and importers take it from there; this tier imports only the
   refusal class, to name it in :data:`UNREADABLE_STORE_ERRORS`. Both kinds of

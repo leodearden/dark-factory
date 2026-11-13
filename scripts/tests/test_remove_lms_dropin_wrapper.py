@@ -22,19 +22,23 @@ no session bus.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import functools
+import itertools
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import warnings
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The repo's session-isolated subprocess runner (task 3798, THIRD DEFENCE), a
 # documented drop-in for `subprocess.run(cmd, env=..., capture_output=True,
@@ -44,6 +48,8 @@ import pytest
 # Importable because conftest.py appends REPO_ROOT to sys.path for this
 # directory.
 from df_pytest_isolation import run_in_new_session
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SELFTEST_SH = Path(__file__).parent / "test_remove_lms_dropin.sh"
 
@@ -379,7 +385,7 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
     thing on a live systemd box and in a DBUS-less container.  That is what
     keeps this module from being a total no-op in a sandbox -- the guard
     itself is genuinely exercised everywhere, and only the two subprocess
-    tests skip.  Mirrors tests/scripts/test_dashboard_service_template.py::
+    tests skip.  Mirrors tests/scripts/test_dashboard_unit_restart_policy.py::
     test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir.
 
       (a) systemctl absent from PATH.
@@ -1240,6 +1246,59 @@ def _remove_template_residue(template: str) -> None:
         pass
 
 
+_HOST_BUS_TRANSPORT_ERRNOS = (errno.ENOTCONN,)
+_HOST_BUS_TRANSPORT_SUFFIXES = {e: f": {os.strerror(e)}" for e in _HOST_BUS_TRANSPORT_ERRNOS}
+
+
+class HostBusDroppedWarning(UserWarning):
+    """A selftest run skipped because the user-manager bus dropped; -q prints this, not a skip reason."""
+
+
+def _host_bus_transport_errno(result: subprocess.CompletedProcess[str]) -> int | None:
+    """Parse one .sh run's output, at the boundary, into the transport errno it reports.
+
+    Scans EVERY line of the combined output, whatever printed it, for one ending in
+    systemctl's `%m` text of an errno with an observed sample: ENOTCONN (task 7803,
+    2026-10-29).  Add an errno only on a newly observed sample, the
+    orchestrator/src/orchestrator/verify_classify.py::_SCOPE_SPAWN_FAILURE_RE discipline:
+    ECONNREFUSED would also be what a script regression that disrupts the manager prints.
+    """
+    lines = f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
+    for line, (err, suffix) in itertools.product(lines, _HOST_BUS_TRANSPORT_SUFFIXES.items()):
+        if line.rstrip().endswith(suffix):
+            return err
+    return None
+
+
+def _selftest_detail(result: subprocess.CompletedProcess[str], template: str) -> str:
+    """The full record of one .sh run, as every red or skip of it reports it."""
+    return (
+        f"\n--- template: {template}\n"
+        f"--- exit code: {result.returncode}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+
+
+def _skip_if_host_bus_dropped(result: subprocess.CompletedProcess[str], template: str) -> None:
+    """Skip a FAILED run whose output shows the user-manager bus dropping a systemctl call.
+
+    Not tied to the failing step: a transport line from ANY call skips the whole run.
+    The skip's reason never reaches a `-q` verify log, so it also warns, which does.
+    """
+    __tracebackhide__ = True  # report the skip against the TEST, not this helper
+    err = _host_bus_transport_errno(result)
+    if result.returncode != 0 and err is not None:
+        reason = (
+            f"the systemd --user manager's bus dropped a systemctl call mid-run "
+            f"({errno.errorcode[err]}: {os.strerror(err)}).  Environment fact, like this "
+            "module's other skips, not a regression in remove-lms-arm-worktree-dropin.sh"
+            + _selftest_detail(result, template)
+        )
+        warnings.warn(reason, HostBusDroppedWarning, stacklevel=2)
+        pytest.skip(reason)
+
+
 def _assert_selftest_passed(result: subprocess.CompletedProcess[str], template: str) -> None:
     """Assert one run is green, surfacing its full output on failure.
 
@@ -1248,12 +1307,7 @@ def _assert_selftest_passed(result: subprocess.CompletedProcess[str], template: 
     in hand when it goes red.  The .sh prints a PASS/FAIL line per check, so
     embedding stdout names the exact check that broke.
     """
-    detail = (
-        f"\n--- template: {template}\n"
-        f"--- exit code: {result.returncode}\n"
-        f"--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
+    detail = _selftest_detail(result, template)
     assert result.returncode == 0, f"{SELFTEST_SH.name} exited non-zero.{detail}"
     assert "ALL CHECKS PASSED" in result.stdout, (
         f"{SELFTEST_SH.name} did not report ALL CHECKS PASSED.{detail}"
@@ -1279,6 +1333,15 @@ def test_shell_selftest_is_executable() -> None:
         f"Expected {SELFTEST_SH} to be executable (os.X_OK); it is not. "
         f"Run: chmod +x {SELFTEST_SH}"
     )
+
+
+def _write_fake_systemctl(bin_dir: Path, body: str) -> Path:
+    """Write an executable POSIX-sh `systemctl` running *body* into *bin_dir*."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "systemctl"
+    shim.write_text(f"#!/bin/sh\n{body}")
+    shim.chmod(0o755)
+    return shim
 
 
 def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
@@ -1327,10 +1390,7 @@ def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
     scripts/tests/test_lms_ctl.py.
     """
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    shim = fake_bin / "systemctl"
-    shim.write_text("#!/bin/sh\nexit 0\n")
-    shim.chmod(0o755)
+    _write_fake_systemctl(fake_bin, "exit 0\n")
 
     unit_dir = tmp_path / "systemd" / "user"
     unit_dir.mkdir(parents=True)
@@ -1351,12 +1411,7 @@ def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
         timeout=60,
     )
 
-    detail = (
-        f"\n--- template: {template}\n"
-        f"--- exit code: {result.returncode}\n"
-        f"--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
+    detail = _selftest_detail(result, template)
     assert template in result.stderr, (
         f"{SELFTEST_SH.name} never named the template it was handed, so "
         "LMS_SELFTEST_TEMPLATE did not reach its UNIT/DROPIN_DIR paths.  The .sh "
@@ -1413,6 +1468,191 @@ def test_shell_selftest_passes() -> None:
     with _serialized_selftest_slot():
         template = _unique_template()
         try:
-            _assert_selftest_passed(_run_selftest(template), template)
+            result = _run_selftest(template)
+            _skip_if_host_bus_dropped(result, template)
+            _assert_selftest_passed(result, template)
         finally:
             _remove_template_residue(template)
+
+
+# ---------------------------------------------------------------------------
+# A lost user-manager bus: self-diagnosing, and a named skip rather than a red
+# ---------------------------------------------------------------------------
+
+# The .sh sets LMS_UNIT_TEMPLATE only as a prefix on its script invocations, so
+# this fails the SCRIPT UNDER TEST's daemon-reload and never the .sh's own.
+_FAKE_SYSTEMCTL_FAILING_SCRIPT_RELOAD = """\
+if [ -n "${LMS_UNIT_TEMPLATE:-}" ]; then
+    for arg in "$@"; do
+        if [ "$arg" = daemon-reload ]; then
+            echo "Failed to reload daemon: $FAKE_SYSTEMCTL_ERROR" >&2
+            exit 1
+        fi
+    done
+fi
+exit 0
+"""
+
+
+def _run_selftest_with_failing_script_reload(
+    tmp_path: Path, template: str, error_text: str
+) -> subprocess.CompletedProcess[str]:
+    """Drive the .sh with no systemd, failing only the script under test's reload."""
+    fake_bin = tmp_path / "bin"
+    _write_fake_systemctl(fake_bin, _FAKE_SYSTEMCTL_FAILING_SCRIPT_RELOAD)
+    return _run_selftest(
+        template,
+        extra_env={
+            "XDG_CONFIG_HOME": str(tmp_path),
+            "PATH": os.pathsep.join([str(fake_bin), os.environ.get("PATH", "")]),
+            "LMS_UNIT_TEMPLATE": "",  # only the .sh's own prefix may arm the fake
+            "FAKE_SYSTEMCTL_ERROR": error_text,
+        },
+        timeout=60,
+    )
+
+
+def test_selftest_surfaces_script_under_test_output(tmp_path: Path) -> None:
+    """A systemctl failure inside the script under test must reach the .sh's output.
+
+    Otherwise a red can say only that the script exited non-zero, never why.
+    """
+    transport_error = os.strerror(errno.ENOTCONN)
+    template = _unique_template()
+
+    result = _run_selftest_with_failing_script_reload(tmp_path, template, transport_error)
+
+    detail = _selftest_detail(result, template)
+    assert transport_error in result.stdout + result.stderr, (
+        f"{SELFTEST_SH.name} discarded the script under test's output, so its "
+        f"systemctl error {transport_error!r} never reached the run's output." + detail
+    )
+
+
+def _completed(
+    *, returncode: int = 1, stdout: str = "", stderr: str = ""
+) -> subprocess.CompletedProcess[str]:
+    """A hand-built .sh result, for the pure tests of the gate's helpers."""
+    return subprocess.CompletedProcess(
+        args=["bash", str(SELFTEST_SH)], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "expected"),
+    [
+        pytest.param(
+            "",
+            f"Failed to reload daemon: {os.strerror(errno.ENOTCONN)}\n",
+            errno.ENOTCONN,
+            id="reload-ENOTCONN-on-stderr",
+        ),
+        pytest.param(
+            f"    | Failed to reload daemon: {os.strerror(errno.ENOTCONN)}\n",
+            "",
+            errno.ENOTCONN,
+            id="reload-ENOTCONN-captured-by-the-sh",
+        ),
+        pytest.param(
+            "",
+            f"Failed to get properties: {os.strerror(errno.ECONNRESET)}\n",
+            None,
+            id="unobserved-ECONNRESET",
+        ),
+        pytest.param(
+            "",
+            f"Failed to connect to bus: {os.strerror(errno.ECONNREFUSED)}\n",
+            None,
+            id="unobserved-ECONNREFUSED",
+        ),
+        pytest.param(
+            "",
+            "  FAIL: WorkingDirectory now resolves to the repo root -- expected '/tmp/x', got ''\n",
+            None,
+            id="genuine-check-failure",
+        ),
+        pytest.param(
+            "",
+            "remove-lms-arm-worktree-dropin: ERROR: launcher absent at "
+            "/nonexistent/not-a-repo/scripts/local-model-serving/lms_serve.py -- task 3713 "
+            "has not landed on main. REFUSING to remove the drop-in: doing so now would "
+            "break every lms-arm@ instance.\n",
+            None,
+            id="script-refusal",
+        ),
+        pytest.param(
+            "",
+            f"Failed to reload daemon: {os.strerror(errno.ENOTCONN)} (while reloading)\n",
+            None,
+            id="transport-text-mid-line",
+        ),
+        pytest.param(
+            "",
+            f"Failed to reload daemon: {os.strerror(errno.ETIMEDOUT)}\n",
+            None,
+            id="out-of-set-ETIMEDOUT",
+        ),
+    ],
+)
+def test_host_bus_transport_errno_reads_only_line_ending_transport_errors(
+    stdout: str, stderr: str, expected: int | None
+) -> None:
+    """Only a line ENDING in ': <strerror>' of an observed transport errno is a lost bus."""
+    assert _host_bus_transport_errno(_completed(stdout=stdout, stderr=stderr)) == expected
+
+
+def test_failed_run_that_lost_the_host_bus_is_a_named_skip() -> None:
+    """A FAILED run carrying a transport errno skips, naming the errno and the full run."""
+    template = _unique_template()
+    result = _completed(
+        returncode=1,
+        stdout=f"    | Failed to reload daemon: {os.strerror(errno.ENOTCONN)}\n",
+        stderr="  FAIL: exit code is 0 on re-run -- expected '0', got '1'\n",
+    )
+    names_errno_and_template = rf"(?s){errno.errorcode[errno.ENOTCONN]}.*{re.escape(template)}"
+
+    with (
+        pytest.warns(HostBusDroppedWarning, match=names_errno_and_template),
+        pytest.raises(pytest.skip.Exception, match=names_errno_and_template) as excinfo,
+    ):
+        _skip_if_host_bus_dropped(result, template)
+
+    assert _selftest_detail(result, template) in str(excinfo.value)
+
+
+def test_failed_run_without_a_transport_errno_stays_red() -> None:
+    """A genuine check failure is not skipped, so _assert_selftest_passed still reports it."""
+    template = _unique_template()
+    result = _completed(
+        returncode=1,
+        stderr="  FAIL: WorkingDirectory now resolves to the repo root -- expected '/tmp/x', got ''\n",
+    )
+
+    assert _skip_if_host_bus_dropped(result, template) is None
+    with pytest.raises(AssertionError):
+        _assert_selftest_passed(result, template)
+
+
+def test_passing_run_is_never_turned_into_a_skip() -> None:
+    """A transport line on a run that still passed is noise, not a reason to skip."""
+    result = _completed(
+        returncode=0,
+        stdout="test_remove_lms_dropin: ALL CHECKS PASSED\n",
+        stderr=f"Failed to get properties: {os.strerror(errno.ENOTCONN)}\n",
+    )
+
+    assert _skip_if_host_bus_dropped(result, _unique_template()) is None
+
+
+def test_lost_host_bus_inside_the_script_reaches_the_gate_as_a_skip(tmp_path: Path) -> None:
+    """The transport line survives script -> .sh -> wrapper, the path the 11-11 red took."""
+    template = _unique_template()
+    result = _run_selftest_with_failing_script_reload(
+        tmp_path, template, os.strerror(errno.ENOTCONN)
+    )
+
+    with (
+        pytest.warns(HostBusDroppedWarning),
+        pytest.raises(pytest.skip.Exception, match=errno.errorcode[errno.ENOTCONN]),
+    ):
+        _skip_if_host_bus_dropped(result, template)

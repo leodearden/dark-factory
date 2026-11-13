@@ -1,0 +1,18 @@
+{
+  "task_id": "9334",
+  "reason": "bug fix: branch_work_landed refuses empty git-cherry containment off the ancestor arm via a structured PatchContainment classifier plus a tri-state ancestry check; branch_work_landed itself drops 17->13",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 159,
+      "current": 164
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5138,
+      "current": 5143
+    }
+  ]
+}

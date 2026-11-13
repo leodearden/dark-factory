@@ -35,6 +35,7 @@ from orchestrator.evals.measurement import (
     clip_reason,
     coerce_cost_usd,
     exception_reason,
+    format_invocation_errors,
     json_answer,
     measured_call,
 )
@@ -172,6 +173,18 @@ class TestReasonHelpers:
         assert exception_reason(RuntimeError('judge   exploded')) == (
             'RuntimeError: judge exploded'
         )
+
+
+class TestFormatInvocationErrors:
+    """A record list renders as one '; '-joined line, and no records as None."""
+
+    def test_format_invocation_errors_renders_records(self):
+        assert format_invocation_errors(None) is None
+        assert format_invocation_errors([]) is None
+        assert format_invocation_errors([
+            {'stage': 'architect', 'cause': 'timeout', 'reason': 'r1'},
+            {'stage': 'judge', 'cause': 'raised', 'reason': 'r2'},
+        ]) == 'architect:timeout: r1; judge:raised: r2'
 
 
 class TestCoerceCostUsd:

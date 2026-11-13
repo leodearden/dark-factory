@@ -14,6 +14,7 @@ unresolved incident and auto-resolving when the loop breaks.
 from __future__ import annotations
 
 import pytest
+from _null_task_escalation import submit_null_task_escalation
 from _packaged_defaults import load_packaged_defaults
 
 from orchestrator.workflow import WorkflowOutcome
@@ -887,6 +888,104 @@ class TestResolveZeroProgressWrappers:
         assert recovered['data'] == {'streak': 7, 'resolved': 1, 'wrappers': 1}
 
 
+def _inherit(pending, *, filed_at):
+    from orchestrator.zero_progress_requeue import inherit_zero_progress_alarms
+
+    return inherit_zero_progress_alarms(pending, filed_at=filed_at)
+
+
+class TestInheritZeroProgressAlarms:
+    """A restarted process inherits the alarms its predecessor left pending.
+
+    The tracker and the filed-at memo die with the process; the pending queue
+    does not.  Seeding the memo from it is what lets the resolver's cheap gate
+    open on the inherited task's next progress outcome.
+    """
+
+    def test_a_prior_process_alarm_seeds_the_memo_at_zero(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset({'3068'})
+        assert memo == {'3068': 0}
+
+    def test_the_inherited_alarm_resolves_on_the_first_progress_outcome(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+        _inherit(queue.get_pending(), filed_at=memo)
+
+        assert _resolve(
+            escalation_queue=queue, event_store=None, task_id='3068',
+            recovered_streak=0, threshold=5, filed_at=memo,
+        ) is True
+        assert _status(queue, alarm.id) == 'resolved'
+        assert '3068' not in memo
+
+    def test_without_inheritance_the_same_progress_strands_the_alarm(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '3068')
+
+        assert _resolve(
+            escalation_queue=queue, event_store=None, task_id='3068',
+            recovered_streak=0, threshold=5, filed_at={},
+        ) is False
+        assert _status(queue, alarm.id) == 'pending'
+
+    def test_a_sentinel_bound_wrapper_is_inherited(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '4000')
+        _submit(queue, 'esc-w', task_id=_sentinel('4000'), level=2, members=[alarm.id])
+        queue.resolve(alarm.id, 'looked at it', resolved_by='interactive')
+
+        assert '4000' in _inherit(queue.get_pending(), filed_at={})
+
+    def test_records_of_other_classes_are_ignored(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _submit(queue, 'esc-4001-1', task_id='4001', level=1, agent_role='implementer')
+        _submit(
+            queue, 'esc-streak-4001-1', task_id='__recovery_veto_streak__4001',
+            level=1, agent_role='orchestrator-recovery-veto-streak',
+        )
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset()
+        assert memo == {}
+
+    def test_a_null_task_id_record_beside_a_real_alarm_is_skipped(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        submit_null_task_escalation(queue)
+        _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset({'3068'})
+        assert memo == {'3068': 0}
+
+    def test_a_live_memo_entry_keeps_its_value(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue, '3068')
+        memo = {'3068': 7}
+
+        _inherit(queue.get_pending(), filed_at=memo)
+
+        assert memo == {'3068': 7}
+
+
 # ---------------------------------------------------------------------------
 # Part C.3 — the config section
 # ---------------------------------------------------------------------------
@@ -1232,8 +1331,7 @@ class TestHarnessZeroProgressWiring:
                 str(i), _report(WorkflowOutcome.DONE, task_id=str(i)), False,
             )
 
-        queue.get_by_task.assert_not_called()
-        queue.has_open_l1.assert_not_called()
+        assert queue.method_calls == []
 
     async def test_run_id_guard_still_short_circuits(self, wired_harness):
         """The _run_id=None no-op hook (relied on by other suites) is preserved."""
@@ -1278,3 +1376,68 @@ class TestHarnessZeroProgressWiring:
 
         assert await wired_harness._apply_retry_cap('3068', _report(), True) is True
         wired_harness.scheduler.record_requeue.assert_called_once()
+
+
+def _recovered_events(harness):
+    from orchestrator.event_store import EventType
+
+    return [
+        entry for (etype, entry) in harness.event_store.events
+        if etype == EventType.zero_progress_requeue_recovered
+    ]
+
+
+@pytest.mark.asyncio
+class TestHarnessZeroProgressAlarmSurvivesRestart:
+    """The fixture harness is the RESTARTED process: its tracker and memo are
+    empty, and the prior process's alarm exists only on the queue."""
+
+    @pytest.fixture
+    def restarted(self, wired_harness):
+        _file_alarm(wired_harness._escalation_queue, '3068')
+        wired_harness._inherit_pending_streak_alarms()
+        return wired_harness
+
+    async def test_the_first_done_resolves_the_inherited_alarm(self, restarted):
+        await restarted._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(restarted) == []
+        assert len(_recovered_events(restarted)) == 1
+
+        for _ in range(3):
+            await restarted._apply_retry_cap('3068', _report(), True)
+        assert len(_alerts(restarted)) == 1, 'the detector must re-arm'
+
+    async def test_a_requeue_that_invoked_an_agent_resolves_it(self, restarted):
+        await restarted._apply_retry_cap('3068', _report(agent_invocations=1), True)
+
+        assert _alerts(restarted) == []
+
+    async def test_a_task_still_looping_keeps_exactly_one_alarm(self, restarted):
+        for _ in range(5):
+            await restarted._apply_retry_cap('3068', _report(), True)
+
+        assert len(_alerts(restarted)) == 1
+
+    async def test_progress_after_a_below_threshold_loop_resolves_it(self, restarted):
+        """Two requeues are below the threshold of 3, so this process's own
+        streak cannot open the resolver's gate; only the inherited memo can."""
+        for _ in range(2):
+            await restarted._apply_retry_cap('3068', _report(), True)
+
+        await restarted._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(restarted) == []
+
+    async def test_a_null_task_id_record_does_not_stop_the_inheritance(
+        self, wired_harness,
+    ):
+        queue = wired_harness._escalation_queue
+        null_record = submit_null_task_escalation(queue)
+        _file_alarm(queue, '3068')
+        wired_harness._inherit_pending_streak_alarms()
+
+        await wired_harness._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(wired_harness) == []
+        assert _status(queue, null_record.id) == 'pending'

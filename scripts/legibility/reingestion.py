@@ -204,6 +204,7 @@ HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     TRICKLE_CODER_PROMPT_OPENER,
     'your previous run was interrupted by a usage limit',
     'you were interrupted by an orchestrator restart',
+    'your previous run was stopped at an orchestrator time limit',
     'handle this escalation, then call `resolve_issue` with a summary',
     'you are adjudicating whether each current review suggestion merely re-flags',
     'you are running as an autonomous escalation watcher',
@@ -212,10 +213,11 @@ HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
 """Harness-authored PROSE literals, matched as plain case-insensitive
 substrings (unlike the line-anchored heading markers above): the trickle
 coder's system prompt (scripts/legibility/coder.py:174 ``build_prompt``),
-the harness's two resume prompts --
-``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit) and
-``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator restart)
--- the steward's resume prompt for a new escalation,
+the harness's three resume prompts --
+``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit),
+``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator restart) and
+``shared.cli_invoke.PROGRESS_TIMEOUT_RESUME_PROMPT`` (watchdog kill
+mid-progress) -- the steward's resume prompt for a new escalation,
 ``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_steward_continuation_prompt``,
 the prior-round adjudicator,
 ``orchestrator/src/orchestrator/review_suggestions/prior_round.py::build_resettled_adjudicator_prompt``,
@@ -223,9 +225,9 @@ the escalation-watcher rotation prompt,
 ``orchestrator/src/orchestrator/harness.py::Harness._run_watcher_rotation``,
 and the pre-task-5356 replan prompt. Every one is one defect class --
 harness prose typed into the transcript as an ordinary user turn, most
-with no origin stamp -- even though cli_invoke deliberately keeps its two
-strings separate because their causes differ (a usage-cap interrupt vs. an
-orchestrator restart).
+with no origin stamp -- even though cli_invoke deliberately keeps its three
+strings separate because their causes differ (a usage-cap interrupt, an
+orchestrator restart, a watchdog kill).
 
 The replan marker is a RETIRED shape kept for the archived corpus and must
 not be pruned, for the reason HARNESS_BRIEFING_SUBHEADINGS keeps its
@@ -241,7 +243,7 @@ heading interpolates the task.
 
 Held in lockstep with the canonical sources by
 ``TestHarnessInjectedTurnFilter.test_resume_prompt_is_excluded_lockstep``
-(the two constants),
+(the three constants),
 ``TestHarnessInjectedTurnFilter.test_steward_continuation_prompt_is_excluded_lockstep``
 and ``test_prior_round_adjudicator_prompt_is_excluded_lockstep`` (prompts
 built by the real builders), all in

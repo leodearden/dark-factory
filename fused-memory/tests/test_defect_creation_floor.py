@@ -40,6 +40,7 @@ from shared.defects import (
     mint_explore_ref,
     mint_human_ref,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.defect_records import DefectCreationRefused
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -49,6 +50,8 @@ from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _REF = mint_human_ref(datetime(2026, 10, 18, 12, 34, 56, tzinfo=UTC), 'Some summary')
 _OTHER_REF = mint_explore_ref('run-1', 4)

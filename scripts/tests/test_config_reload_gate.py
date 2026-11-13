@@ -13,6 +13,9 @@ from config_reload_script_fakes import (
     FakeEscalationMcp,
     reload_report,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 COMMITTED_AS = "abc1234"
 CONFIG_PATH = "/x/dark-factory-orchestrator.yaml"
@@ -70,7 +73,8 @@ def test_a_tool_that_raised_is_reload_raised():
 
 
 def test_a_dead_socket_is_no_reload_report():
-    refusal = _refusal(ClosedPort().port)
+    with ClosedPort() as closed:
+        refusal = _refusal(closed.port)
 
     assert refusal.failure is ReloadFailure.NO_RELOAD_REPORT
     assert COMMITTED_AS in refusal.detail, refusal.detail
@@ -138,19 +142,6 @@ def test_the_callers_path_is_compared_by_realpath(tmp_path):
     with FakeEscalationMcp(report) as server:
         fetched = fetch_reload_report(
             str(server.port), committed_as=COMMITTED_AS, config_path=str(alias),
-        )
-
-    assert fetched == report
-
-
-def test_without_a_config_path_the_reread_is_not_checked():
-    """config_path=None asks only for the report: a caller that reads one
-    knob's own disposition gets it whichever file was re-read."""
-    report = reload_report(reloaded=False, config_path=None)
-
-    with FakeEscalationMcp(report) as server:
-        fetched = fetch_reload_report(
-            str(server.port), committed_as=COMMITTED_AS, config_path=None,
         )
 
     assert fetched == report

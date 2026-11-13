@@ -37,6 +37,7 @@ from unittest.mock import patch
 import pytest
 from _escalation_http import escalation_http_call
 from _escalation_seed import seed_escalation
+from _resolve_issue_call import call_resolve_issue
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition
 
@@ -54,14 +55,6 @@ from escalation.server import create_server
 # ---------------------------------------------------------------------------
 # In-process (header-less) drive harness — B5, B3-server, D1.
 # ---------------------------------------------------------------------------
-
-
-async def _resolve_issue(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the resolve_issue MCP tool directly (sync tool; mirrors
-    test_server.py:1364-1368). ``get_http_headers()`` resolves ``{}`` here —
-    this is the header-less / full-authority path (esc-2087-2)."""
-    tool = await server.get_tool('resolve_issue')
-    return tool.fn(**kwargs)
 
 
 def _seed(
@@ -159,7 +152,7 @@ class TestB5BogusActionRejected:
         server = create_server(queue)
         esc = _seed(queue, level=1, task_id='t-b5')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='n/a', action='bogus',
         )
 
@@ -194,7 +187,7 @@ class TestB3ServerParkKeepsL2Open:
         server = create_server(queue)
         esc = _seed(queue, level=1, task_id='t-b3-server')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='parked pending human', action='park',
         )
 
@@ -548,10 +541,21 @@ class TestAuthorityTablesMatchDrivenIdentities:
             'C2/C3 drive this exact identity expecting an {0,1} ceiling'
         )
 
-    def test_promote_allowed_contains_only_the_watcher_auto_identity(self) -> None:
-        assert frozenset({'orchestrator-escalation-watcher-auto'}) == PROMOTE_ALLOWED, (
-            "C4's disallowed-identity case ('some-other-agent') relies on "
-            'PROMOTE_ALLOWED containing exactly this identity and no other'
+    def test_promote_allowed_is_exactly_the_three_promoting_identities(self) -> None:
+        assert frozenset({
+            'orchestrator-escalation-watcher-auto',
+            'orchestrator-escalation-executor',
+            'interactive:coordinator',
+        }) == PROMOTE_ALLOWED, (
+            'PROMOTE_ALLOWED is exactly the auto-watcher, the executor '
+            '(plans/decision-stream-prd.md §3 decision 3: "promote allowed") '
+            'and the coordinator (decision 3: "full levels, denied only on a '
+            'record carrying a fresh executor claim", which an identified '
+            'caller refused promote_to_l2 would contradict); any other change '
+            'to who may mint an L2 needs re-examination here'
+        )
+        assert 'some-other-agent' not in PROMOTE_ALLOWED, (
+            "C4's disallowed-identity case drives 'some-other-agent' expecting denial"
         )
 
 

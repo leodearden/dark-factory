@@ -292,7 +292,7 @@ class TestComposeCostSource:
     — so the label COMPOSES: agreement → that source, disagreement (with judge
     dollars actually in the sum) → ``'mixed'``.
 
-    ``'mixed'`` is deliberately the SAME word ``report._summarize_cost_source``
+    ``'mixed'`` is deliberately the SAME word ``composite_report.py::_summarize_cost_source``
     already emits for the cross-trial form of the same situation, so the
     reporting vocabulary stays one word list and no report-side change is
     needed.

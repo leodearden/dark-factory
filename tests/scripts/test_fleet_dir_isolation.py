@@ -60,6 +60,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
@@ -84,6 +85,8 @@ from df_pytest_isolation import (  # noqa: E402
     synthetic_heartbeats_in,
     synthetic_unit,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # NOT `from df_pytest_isolation import _df_...`. Importing a FIXTURE into a test
 # module binds it as a module-scoped fixture that SHADOWS the conftest's — which

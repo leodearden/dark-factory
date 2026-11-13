@@ -2770,9 +2770,26 @@ class TestRenderDigest:
         assert meta['cwd'] == _DIGEST_CWD
         assert meta['date'] == '2026-07-11'
         assert meta['agent_class'] == 'interactive'
-        # No transcript path given -> encoded_dir falls back to the mirror of
-        # session_registry.encode_cwd (every '/', '.' and '_' maps to '-').
+        # No transcript path given -> encoded_dir falls back to
+        # inventory.encode_cwd (every '/', '.' and '_' maps to '-').
         assert meta['encoded_dir'] == '-home-leo-src-dark-factory'
+
+    # Observed on-disk ~/.claude/projects dir names, hard-coded as literals:
+    # an expected value computed by an encoder cannot catch that encoder's bug.
+    @pytest.mark.parametrize(('cwd', 'expected_dir'), [
+        ('/home/leo/src/dark-factory/.worktrees/2573', '-home-leo-src-dark-factory--worktrees-2573'),
+        ('/home/leo/src/warm-lanes/worktrees/_lane-39', '-home-leo-src-warm-lanes-worktrees--lane-39'),
+        ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
+    ])
+    def test_encoded_dir_fallback_matches_real_on_disk_dir_names(self, cwd, expected_dir):
+        records = [_with_session_meta(_user_text('hi'), cwd=cwd)]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['encoded_dir'] == expected_dir
 
     def test_encoded_dir_prefers_transcript_path_parent_dir_name(self, tmp_path):
         # An arbitrary dir name unrelated to cwd's mirror encoding, so a
@@ -2824,7 +2841,7 @@ class TestRenderDigest:
 
 def _oversized_not_found_records(n=600):
     """One gold user-correction plus *n* not-found hits -- enough bytes to
-    exceed the default 15360-byte soft cap on its own."""
+    exceed the DEFAULT_MAX_BYTES soft cap on its own."""
     records = [_with_session_meta(_user_text('This approach is wrong, please redo it properly.'))]
     for i in range(n):
         records.append(_with_session_meta(
@@ -2853,7 +2870,7 @@ class TestRenderDigestTruncation:
     def test_default_cap_is_respected_and_gold_survives(self):
         digest = mod.render_digest(_oversized_not_found_records(), agent_class='interactive')
 
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
         assert '## User Corrections' in digest
         # truncation genuinely trimmed the low-signal section, not a no-op
         assert digest.count('command not found') < 600
@@ -2882,21 +2899,52 @@ class TestRenderDigestTruncation:
         assert digest.count('Bash x3:') < 60
 
 
+class TestDefaultMaxBytes:
+    def test_default_max_bytes_is_the_prd_7_2_cap(self):
+        assert mod.DEFAULT_MAX_BYTES == 15360
+
+    def test_render_digest_defaults_to_the_module_cap(self):
+        records = _oversized_not_found_records()
+
+        default = mod.render_digest(records, agent_class='interactive')
+
+        assert default == mod.render_digest(
+            records, agent_class='interactive', max_bytes=mod.DEFAULT_MAX_BYTES,
+        )
+        assert default != mod.render_digest(
+            records, agent_class='interactive', max_bytes=mod.DEFAULT_MAX_BYTES - 1024,
+        )
+
+    def test_build_digest_defaults_to_the_module_cap(self, tmp_path):
+        path = _write_jsonl(tmp_path, _oversized_not_found_records())
+
+        assert mod.build_digest(path) == mod.build_digest(path, max_bytes=mod.DEFAULT_MAX_BYTES)
+
+    def test_cli_max_bytes_defaults_to_the_module_cap(self, tmp_path, capsys):
+        path = _write_jsonl(tmp_path, _oversized_not_found_records())
+
+        mod.main([str(path)])
+
+        assert capsys.readouterr().out == (
+            mod.build_digest(path, max_bytes=mod.DEFAULT_MAX_BYTES) + '\n'
+        )
+
+
 # ---------------------------------------------------------------------------
 # _cap_item / _item_byte_cap -- R2 part 1 (confusion census 2026-07-24 Sec
 # 4): a per-item byte cap applied at the single _build_sections choke
 # point, so ONE oversized item (an enormous pasted user turn, a huge
 # tool_result echo, ...) can never evict every sibling section before
 # being popped itself. Capping is byte-wise and UTF-8-safe: the whole
-# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the 15360
-# soft cap), so a naive character-wise slice would not actually bound it
+# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the
+# DEFAULT_MAX_BYTES soft cap), so a naive character-wise slice would not actually bound it
 # for non-ASCII content, and a naive byte slice can split a multi-byte
 # codepoint mid-sequence.
 # ---------------------------------------------------------------------------
 
 def _oversized_user_correction_records():
     """One ORDINARY (non-briefing-shaped) human user turn whose text alone
-    exceeds the default 15360-byte soft cap, plus a genuine is_error
+    exceeds the DEFAULT_MAX_BYTES soft cap, plus a genuine is_error
     tool_result error neighborhood and a 'command not found' not-found
     hit. Deliberately NOT briefing-shaped: R2 (whole-item truncation
     eviction) is a distinct pathology from R1 (harness-turn exclusion), so
@@ -3023,7 +3071,7 @@ class TestPerItemByteCap:
         assert '## User Corrections' in digest
         assert '## Error Neighborhoods' in digest
         assert '## Not Found' in digest
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
         assert mod.ITEM_TRUNCATION_MARKER in digest
 
     def test_gold_section_still_precedes_error_neighborhoods_under_cap(self):
@@ -3072,7 +3120,7 @@ def _multiple_oversized_items_records():
 
 class TestTruncatedItemsFrontmatter:
     def test_truncated_items_is_zero_when_nothing_was_truncated(self):
-        # _all_signals_records() is well under the 15360 default cap, so
+        # _all_signals_records() is well under the DEFAULT_MAX_BYTES cap, so
         # nothing is truncated and the key must say so rather than be absent.
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
 
@@ -3629,7 +3677,7 @@ class TestBuildDigestBoundary:
         for heading in ('User Corrections', 'Error Neighborhoods', 'Self-Corrections', 'Retry Loops'):
             assert f'## {heading}' in digest, f'missing heading: {heading}'
 
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
@@ -3665,7 +3713,7 @@ class TestMainCLI:
         assert '## User Corrections' in captured.out
         # print() appends exactly one trailing newline beyond the digest
         # itself -- strip it before checking the digest's own soft cap.
-        assert len(captured.out.rstrip('\n').encode('utf-8')) <= 15360
+        assert len(captured.out.rstrip('\n').encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
 
     def test_agent_class_flag_overrides_frontmatter_class(self, tmp_path, capsys):
         path = _write_jsonl(tmp_path, _boundary_records())

@@ -5,30 +5,40 @@ import errno
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 import threading
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _plan_model_helpers import read_model
 from _review_fixtures import review_aggregation, review_issue
+from _review_payloads import blocking_review, pass_review
+from escalation.disposition import ReviewerDisposition
 from shared import safe_io
 
 from orchestrator.artifacts import (
+    LANE_SYMLINKED_ARTIFACTS,
     PLAN_BASE_COMMIT_KEY,
     PLAN_SCHEMA_VERSION,
     PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
+    PlanConfirmation,
     PlanMutexNotHeld,
+    PlanState,
     ReviewAggregation,
+    ReviewsRootMissing,
     TaskArtifacts,
     _normalize_plan,
     iteration_entry_written_by_orchestrator,
     plan_task_text_fp,
 )
-from orchestrator.review_payload import ReviewPayloadError
+from orchestrator.mcp.verdict_tools import _submit_review_verdict
+from orchestrator.review_payload import NoteDisposition, ReviewPayloadError
 
 
 @pytest.fixture
@@ -469,37 +479,70 @@ VALID_PLAN_WITH_STEPS = {
     ],
 }
 
+CONFIRMED_AT = '2026-01-01T00:00:00+00:00'
+CONFIRMED_PLAN_WITH_STEPS = {**VALID_PLAN_WITH_STEPS, '_finalized_at': CONFIRMED_AT}
+
+
+def _artifacts_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == 'orchestrator.artifacts' and record.levelname == 'WARNING'
+    ]
+
 
 class TestPlanProvenance:
     def test_stamp_plan_provenance_adds_session_id_and_created_at(self, artifacts: TaskArtifacts):
         # Must use a valid plan with at least one step (empty steps raises ValueError)
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         updated = artifacts.read_plan()
         assert updated['_session_id'] == 'session-abc123'
         assert '_created_at' in updated
 
-    def test_stamp_plan_provenance_backfills_finalized_marker(self, artifacts: TaskArtifacts):
-        # Invariant: a provenance-stamped plan is complete, so it carries the
-        # completeness marker even when confirm_plan was not the writer (eval
-        # initial_plan / SIMPLE_TASK paths).
+    def test_stamping_an_unconfirmed_plan_confirms_it_injected_and_warns(
+        self, artifacts: TaskArtifacts, caplog: pytest.LogCaptureFixture,
+    ):
         artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
-        artifacts.stamp_plan_provenance('session-abc123')
-        assert artifacts.read_plan()['_finalized_at']
+        with caplog.at_level('WARNING', logger='orchestrator.artifacts'):
+            artifacts.stamp_plan_provenance('session-abc123')
+        plan = read_model(artifacts)
+        assert plan.state is PlanState.STAMPED
+        assert plan.lifecycle.confirmation is PlanConfirmation.INJECTED
+        assert artifacts.read_plan()['_confirmed_by'] == 'injected'
+        (warning,) = _artifacts_warnings(caplog)
+        assert 'task-1' in warning
+        assert 'partial' in warning
+
+    def test_stamping_a_confirmed_plan_keeps_its_confirmation_silently_and_returns_the_plan(
+        self, artifacts: TaskArtifacts, caplog: pytest.LogCaptureFixture,
+    ):
+        artifacts.write_plan({**CONFIRMED_PLAN_WITH_STEPS, '_confirmed_by': 'architect'})
+        with caplog.at_level('WARNING', logger='orchestrator.artifacts'):
+            written = artifacts.stamp_plan_provenance('session-abc123')
+        plan = read_model(artifacts)
+        assert written == plan
+        assert plan.state is PlanState.STAMPED
+        assert plan.lifecycle.confirmed_at == CONFIRMED_AT
+        assert plan.lifecycle.confirmed_by is PlanConfirmation.ARCHITECT
+        assert _artifacts_warnings(caplog) == []
+
+    def test_the_returned_plan_is_the_plan_on_disk_for_an_unversioned_plan(self, artifacts: TaskArtifacts):
+        artifacts.artifact_path('plan.json').write_text(json.dumps(CONFIRMED_PLAN_WITH_STEPS))
+        written = artifacts.stamp_plan_provenance('session-abc123')
+        assert written.lifecycle.schema_version == PLAN_SCHEMA_VERSION
+        assert written == read_model(artifacts)
 
     def test_stamp_plan_provenance_preserves_existing_finalized_marker(self, artifacts: TaskArtifacts):
-        # setdefault must not clobber a marker the architect already stamped.
-        plan = dict(VALID_PLAN_WITH_STEPS)
-        plan['_finalized_at'] = '2026-01-01T00:00:00+00:00'
-        artifacts.write_plan(plan)
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
-        assert artifacts.read_plan()['_finalized_at'] == '2026-01-01T00:00:00+00:00'
+        assert artifacts.read_plan()['_finalized_at'] == CONFIRMED_AT
 
     def test_stamp_plan_provenance_preserves_existing_plan_data(self, artifacts: TaskArtifacts):
         plan = {
             'task_id': 'task-1',
             'analysis': 'Some analysis',
             'steps': [{'id': 'step-1', 'status': 'pending'}],
+            '_finalized_at': CONFIRMED_AT,
         }
         artifacts.write_plan(plan)
         artifacts.stamp_plan_provenance('session-abc123')
@@ -511,7 +554,7 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_writes_the_task_text_fingerprint(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
         updated = artifacts.read_plan()
         assert updated[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
@@ -521,14 +564,14 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_fingerprint_overwrites_a_stale_one(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_plan({**VALID_PLAN_WITH_STEPS, PLAN_TASK_TEXT_FP_KEY: 'tfp:old'})
+        artifacts.write_plan({**CONFIRMED_PLAN_WITH_STEPS, PLAN_TASK_TEXT_FP_KEY: 'tfp:old'})
         artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
         assert artifacts.read_plan()[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
 
     def test_stamp_plan_provenance_without_fingerprint_keeps_the_existing_one(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('planner', task_text_fp='tfp:authored')
         artifacts.stamp_plan_provenance('implementer-iteration')
         updated = artifacts.read_plan()
@@ -538,7 +581,7 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_without_fingerprint_adds_none(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert PLAN_TASK_TEXT_FP_KEY not in artifacts.read_plan()
 
@@ -552,17 +595,17 @@ class TestPlanProvenance:
         assert plan_task_text_fp(plan) is None
 
     def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert artifacts.validate_plan_owner('session-abc123') is True
 
     def test_validate_plan_owner_false_for_mismatched_session(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert artifacts.validate_plan_owner('session-different') is False
 
     def test_validate_plan_owner_false_when_no_provenance(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         # Not stamped — no _session_id in plan
         assert artifacts.validate_plan_owner('session-abc123') is False
 
@@ -575,7 +618,7 @@ class TestPlanProvenance:
         sessions must be accepted as valid owners; a third party still
         is not.
         """
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('orig-planner')
         artifacts.bump_revalidation_stamp('reval-runner')
 
@@ -649,7 +692,7 @@ class TestBumpRevalidationStamp:
     """Tests for ``bump_revalidation_stamp`` — Lever B's confirm_plan-equivalent."""
 
     def test_stamps_revalidated_at_and_session(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.bump_revalidation_stamp('sess-1')
         updated = artifacts.read_plan()
         assert '_revalidated_at' in updated
@@ -659,7 +702,7 @@ class TestBumpRevalidationStamp:
         worktree.mkdir(parents=True, exist_ok=True)
         ta = TaskArtifacts(worktree)
         ta.init('task-1', 'T', 'd', base_commit='originalsha')
-        ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         ta.bump_revalidation_stamp('sess-1', base_commit='newsha456')
         assert ta.read_plan()[PLAN_BASE_COMMIT_KEY] == 'newsha456'
         assert ta.read_base_commit() == 'originalsha'
@@ -668,7 +711,7 @@ class TestBumpRevalidationStamp:
         worktree.mkdir(parents=True, exist_ok=True)
         ta = TaskArtifacts(worktree)
         ta.init('task-1', 'T', 'd', base_commit='originalsha')
-        ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         ta.stamp_plan_provenance('s0', base_commit='planbase')
         ta.bump_revalidation_stamp('sess-1')  # base_commit=None default
         assert ta.read_base_commit() == 'originalsha'
@@ -682,6 +725,16 @@ class TestBumpRevalidationStamp:
         artifacts.artifact_path('plan.json').write_text('{"steps": []}')
         with pytest.raises(ValueError, match='valid plan'):
             artifacts.bump_revalidation_stamp('sess-1')
+
+    def test_a_stamped_plan_stays_stamped(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('planner')
+        before = read_model(artifacts)
+        artifacts.bump_revalidation_stamp('reval', base_commit='newbase')
+        after = read_model(artifacts)
+        assert after.state is PlanState.STAMPED
+        assert after.lifecycle.confirmed_at == before.lifecycle.confirmed_at
+        assert after.lifecycle.session_id == 'planner'
 
 
 class TestSetPlanFiles:
@@ -698,6 +751,7 @@ class TestSetPlanFiles:
                 {'id': 'step-1', 'type': 'test', 'description': 'Write test', 'status': 'pending', 'commit': None},
             ],
             'design_decisions': [{'decision': 'Use X', 'rationale': 'Because Y'}],
+            '_finalized_at': CONFIRMED_AT,
         }
         artifacts.write_plan(plan)
         artifacts.stamp_plan_provenance('S')
@@ -715,7 +769,7 @@ class TestSetPlanFiles:
     def test_preserves_original_session_id_when_owner_via_revalidation(
         self, artifacts: TaskArtifacts,
     ):
-        plan = dict(VALID_PLAN_WITH_STEPS)
+        plan = dict(CONFIRMED_PLAN_WITH_STEPS)
         plan['files'] = ['a.py']
         artifacts.write_plan(plan)
         artifacts.stamp_plan_provenance('orig-planner')
@@ -728,6 +782,33 @@ class TestSetPlanFiles:
         assert updated['_session_id'] == 'orig-planner'
         assert updated['_revalidated_by_session'] == 'reval-runner'
         assert artifacts.validate_plan_owner('reval-runner') is True
+
+    def test_a_stamped_plan_stays_stamped(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('S')
+        before = read_model(artifacts)
+        artifacts.set_plan_files(['a.py'], 'S')
+        after = read_model(artifacts)
+        assert after.state is PlanState.STAMPED
+        assert after.lifecycle == before.lifecycle
+
+    def test_an_unowned_confirmed_plan_passes_to_the_caller_with_created_at_backfilled(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
+        artifacts.set_plan_files(['a.py'], 'scope')
+        after = read_model(artifacts)
+        assert after.state is PlanState.STAMPED
+        assert after.lifecycle.session_id == 'scope'
+        assert after.lifecycle.created_at is not None
+        assert after.lifecycle.confirmed_at == CONFIRMED_AT
+
+    def test_an_ownership_transfer_does_not_clobber_an_existing_created_at(self, artifacts: TaskArtifacts):
+        artifacts.write_plan({**CONFIRMED_PLAN_WITH_STEPS, '_created_at': CONFIRMED_AT})
+        artifacts.set_plan_files(['a.py'], 'scope')
+        after = read_model(artifacts)
+        assert after.lifecycle.session_id == 'scope'
+        assert after.lifecycle.created_at == CONFIRMED_AT
 
 
 class TestStalePlanLock:
@@ -1443,6 +1524,77 @@ class TestReviews:
         assert agg.errored_reviews == {}
 
 
+_ADDRESSED_NOTE = {
+    'escalation_id': 'esc-42-1', 'disposition': 'addressed', 'rationale': 'fixed in foo.py',
+}
+_WORK_NOTE = {
+    'escalation_id': 'esc-42-2', 'disposition': 'work', 'rationale': 'needs its own task',
+}
+_TYPED_NOTES = (
+    NoteDisposition('esc-42-1', ReviewerDisposition.ADDRESSED, 'fixed in foo.py'),
+    NoteDisposition('esc-42-2', ReviewerDisposition.WORK, 'needs its own task'),
+)
+
+
+class TestReviewNoteDispositions:
+    def test_mirrored_review_dispositions_reach_the_aggregation_in_order(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+            'note_dispositions': [dict(_ADDRESSED_NOTE), dict(_WORK_NOTE)],
+        })
+
+        assert artifacts.aggregate_reviews().note_dispositions == _TYPED_NOTES
+
+    def test_an_error_review_contributes_no_dispositions(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error',
+            'note_dispositions': [dict(_ADDRESSED_NOTE)],
+        })
+
+        assert artifacts.aggregate_reviews().note_dispositions == ()
+
+    def test_a_review_without_the_key_gives_none(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+        })
+
+        assert artifacts.aggregate_reviews().note_dispositions == ()
+
+    def test_dispositions_survive_the_verdict_tool_to_mirror_round_trip(
+        self, artifacts: TaskArtifacts,
+    ):
+        role = 'reviewer_comprehensive'
+        result = _submit_review_verdict(
+            artifacts, role, 'sid', role, 'PASS', [], 'OK',
+            note_dispositions=[dict(_ADDRESSED_NOTE), dict(_WORK_NOTE)],
+        )
+        assert result['status'] == 'ok'
+        envelope = artifacts.read_verdict(role)
+        assert envelope is not None
+
+        artifacts.write_review(role, envelope['verdict'])
+
+        assert artifacts.aggregate_reviews().note_dispositions == _TYPED_NOTES
+
+    def test_a_directly_built_aggregation_carries_no_dispositions(self):
+        aggregation = ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={},
+        )
+
+        assert aggregation.note_dispositions == ()
+
+
 class TestBlockingDependency:
     """Round-trip and edge-case tests for the architect's
     ``.task/blocking_dependency.json`` artifact."""
@@ -1935,6 +2087,42 @@ class TestPlanNormalizationIntegration:
         assert 'steps' in raw_on_disk
         assert 'tdd_steps' not in raw_on_disk
 
+    def test_peek_plan_normalizes_without_writing_back(self, artifacts: TaskArtifacts):
+        plan_path = artifacts.artifact_path('plan.json')
+        raw = {'task_id': 'task-1', 'tdd_steps': [{'id': 'step-1', 'status': 'pending'}]}
+        plan_path.write_text(json.dumps(raw))
+        bytes_before = plan_path.read_bytes()
+        listing_before = sorted(p.name for p in plan_path.parent.iterdir())
+
+        plan = artifacts.peek_plan()
+
+        assert 'tdd_steps' not in plan
+        assert [step['id'] for step in plan['steps']] == ['step-1']
+        assert plan_path.read_bytes() == bytes_before
+        assert sorted(p.name for p in plan_path.parent.iterdir()) == listing_before
+
+    def test_only_the_on_disk_repair_warns(self, artifacts: TaskArtifacts, caplog):
+        plan_path = artifacts.artifact_path('plan.json')
+        plan_path.write_text(json.dumps({'tdd_steps': ['write the test']}))
+
+        def artifact_warnings() -> list[str]:
+            return [
+                record.getMessage()
+                for record in caplog.records
+                if record.name == 'orchestrator.artifacts'
+                and record.levelname == 'WARNING'
+            ]
+
+        with caplog.at_level('WARNING'):
+            artifacts.peek_plan()
+            artifacts.peek_plan()
+            assert artifact_warnings() == []
+
+            artifacts.read_plan()
+            [repair_warning] = artifact_warnings()
+
+        assert str(plan_path) in repair_warning
+
     def test_read_plan_no_write_when_valid(self, artifacts: TaskArtifacts):
         valid = {
             'task_id': 'task-1',
@@ -1999,21 +2187,6 @@ class TestStringItemResilience:
 class TestWorktreeMissingTolerance:
     """Best-effort writes survive a deleted worktree without raising."""
 
-    def test_write_review_skips_when_root_gone(self, tmp_path: Path, caplog):
-        worktree = tmp_path / 'gone'
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.init('task-x', 'gone', 'desc')
-        # Remove the worktree out-of-band
-        import shutil
-        shutil.rmtree(worktree)
-        assert not ta.task_root.is_dir()
-
-        # Must not raise
-        ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
-        # And nothing was created
-        assert not ta.task_root.exists()
-
     def test_write_verdict_skips_when_root_gone(self, tmp_path: Path):
         worktree = tmp_path / 'gone-verdict'
         worktree.mkdir()
@@ -2042,6 +2215,29 @@ class TestWorktreeMissingTolerance:
 
         # _write_json into an artifact whose root is gone — should swallow
         ta._write_json('reviews/foo.json', {'a': 1})  # no exception
+        assert not ta.task_root.exists()
+        assert not worktree.exists()
+
+    @pytest.mark.parametrize('write', [
+        pytest.param(lambda ta: ta.set_review_counters(review_cycles_total=1),
+                     id='set_review_counters'),
+        pytest.param(lambda ta: ta.record_review_verdict('tree', 'PASS', False),
+                     id='record_review_verdict'),
+        pytest.param(lambda ta: ta.write_plan({'task_id': 't', 'title': 'p', 'steps': []}),
+                     id='write_plan'),
+        pytest.param(lambda ta: ta.write_blocking_dependency('7', 'r', 'sha'),
+                     id='write_blocking_dependency'),
+    ])
+    def test_default_path_writers_leave_a_vanished_root_gone(self, tmp_path: Path, write):
+        worktree = tmp_path / 'gone-default'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-d', 'gone', 'desc')
+        shutil.rmtree(worktree)
+
+        write(ta)
+
+        assert not worktree.exists()
 
     def test_write_review_still_raises_for_genuine_io_errors(
         self, tmp_path: Path, monkeypatch
@@ -2053,12 +2249,10 @@ class TestWorktreeMissingTolerance:
         # Root exists, so the FileNotFoundError tolerance in ``_write_json``
         # must NOT engage and a genuine I/O failure must surface.
         #
-        # The patch deliberately targets ``Path.mkdir`` — a seam BOTH write
-        # strategies traverse: the historical ``path.parent.mkdir(...)`` +
-        # ``path.write_text(...)`` pair, and the atomic
-        # ``safe_io.atomic_write_text(..., mkdir=True)`` delegation that
-        # replaced it (which calls ``p.parent.mkdir(parents=True,
-        # exist_ok=True)`` itself).  Do NOT re-narrow this to ``write_text``:
+        # The patch deliberately targets ``Path.mkdir``: ``_write_json``
+        # creates the artifact's own directory (here reviews/) with
+        # ``Path.mkdir`` before the atomic write, which is why patching it
+        # still exercises the seam.  Do NOT re-narrow this to ``write_text``:
         # the atomic writer writes through an ``os.fdopen`` handle and never
         # calls it, so such a patch would stop exercising anything.
         import pathlib
@@ -2255,6 +2449,7 @@ class TestReadPlanNewThenOldCompat:
         (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
 
         ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
         ta.write_plan({'steps': [{'id': 'new-step', 'status': 'pending', 'commit': None}]})
 
         read = ta.read_plan()
@@ -2440,49 +2635,57 @@ class TestReviewCounters:
         assert rec['reviewer_fingerprint'] == 'FP1'
 
 
-class TestEnsureLanePlanSymlink:
-    """`ensure_lane_plan_symlink()` single-sources plan.json: the lane copy
-    `<worktree>/.task/plan.json` becomes an ABSOLUTE symlink INTO the durable
-    meta-root plan.json (`artifact_path('plan.json')`). Any residual reader of the
-    lane path then transparently resolves to the meta-root file — the esc-5205-9
-    stale-trap (a regular-file lane copy that diverges from the meta-root) is
-    impossible because the lane path IS the meta-root file. No-op in legacy
-    `meta_root=None` mode, where the lane path already IS the durable copy.
+_LANE_ARTIFACT_WRITERS: dict[str, Callable[[TaskArtifacts], None]] = {
+    'plan.json': lambda a: a.write_plan({'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}),
+    'iterations.jsonl': lambda a: a.append_iteration_log({'iteration': 1}),
+}
+"""Plants each `LANE_SYMLINKED_ARTIFACTS` name through its public writer."""
+
+
+class TestEnsureLaneSymlinks:
+    """`ensure_lane_symlinks()` single-sources each name in
+    `LANE_SYMLINKED_ARTIFACTS`: the lane copy `<worktree>/.task/<name>` becomes
+    an ABSOLUTE symlink INTO the durable `artifact_path(<name>)`. Any reader or
+    appender of the lane path then transparently reaches the durable file —
+    the esc-5205-9 stale-trap (a regular-file lane copy that diverges from the
+    durable one) is impossible because the lane path IS the durable file.
+    No-op in legacy `meta_root=None` mode, where the lane path already IS the
+    durable copy.
     """
 
     @pytest.fixture
     def meta_root(self, worktree: Path) -> Path:
         return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
 
-    def test_creates_absolute_symlink_to_meta_root_plan(
-        self, worktree: Path, meta_root: Path
+    @pytest.fixture
+    def ta(self, worktree: Path, meta_root: Path) -> TaskArtifacts:
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        return ta
+
+    @pytest.mark.parametrize('name', LANE_SYMLINKED_ARTIFACTS)
+    def test_creates_absolute_symlink_to_meta_root_artifact(
+        self, ta: TaskArtifacts, worktree: Path, meta_root: Path, name: str
     ):
         # meta_root mode: init() does NOT create <worktree>/.task (see
         # TestMetaRootConstructor.test_init_and_write_plan_land_under_meta_root_only),
         # so the method itself must mkdir the lane .task/ before symlinking.
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
         assert not (worktree / '.task').exists()
 
-        ta.ensure_lane_plan_symlink()
+        ta.ensure_lane_symlinks()
 
-        lane_plan = worktree / '.task' / 'plan.json'
-        assert lane_plan.is_symlink()
-        # ABSOLUTE target pointing at the durable meta-root copy.
-        target = os.readlink(lane_plan)
-        assert os.path.isabs(target)
-        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
+        lane_link = worktree / '.task' / name
+        assert lane_link.is_symlink()
+        assert os.path.isabs(os.readlink(lane_link))
+        assert lane_link.resolve() == (meta_root / name).resolve()
 
     def test_read_through_returns_meta_root_content(
-        self, worktree: Path, meta_root: Path
+        self, ta: TaskArtifacts, worktree: Path, meta_root: Path
     ):
-        # (b) read-through proof: write_plan lands at meta_root/plan.json;
-        # reading the lane symlink returns the same content.
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
-        ta.ensure_lane_plan_symlink()
+        # write_plan lands at meta_root/plan.json; reading the lane symlink
+        # returns the same content.
+        ta.ensure_lane_symlinks()
         ta.write_plan(
             {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
         )
@@ -2490,106 +2693,84 @@ class TestEnsureLanePlanSymlink:
         lane_plan = worktree / '.task' / 'plan.json'
         read = json.loads(lane_plan.read_text())
         assert read['steps'][0]['id'] == 'step-1'
-        # Same bytes as the durable meta-root copy.
         assert read == json.loads((meta_root / 'plan.json').read_text())
 
+    @pytest.mark.parametrize('name', LANE_SYMLINKED_ARTIFACTS)
     def test_replaces_preplanted_regular_file(
-        self, worktree: Path, meta_root: Path
+        self, ta: TaskArtifacts, worktree: Path, meta_root: Path, name: str
     ):
-        # (c) the esc-5205-9 stale-trap: a pre-existing regular-FILE lane
-        # plan.json is REPLACED by the symlink.
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
+        # The esc-5205-9 stale-trap: a pre-existing regular-FILE lane copy is
+        # REPLACED by the symlink.
+        lane_link = worktree / '.task' / name
+        lane_link.parent.mkdir(parents=True, exist_ok=True)
+        lane_link.write_text('{"stale": "trap"}')
+        assert lane_link.is_file() and not lane_link.is_symlink()
 
-        lane_task = worktree / '.task'
-        lane_task.mkdir(parents=True, exist_ok=True)
-        lane_plan = lane_task / 'plan.json'
-        lane_plan.write_text('{"stale": "trap"}')
-        assert lane_plan.is_file() and not lane_plan.is_symlink()
+        ta.ensure_lane_symlinks()
 
-        ta.ensure_lane_plan_symlink()
+        assert lane_link.is_symlink()
+        assert lane_link.resolve() == (meta_root / name).resolve()
 
-        assert lane_plan.is_symlink()
-        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
-
+    @pytest.mark.parametrize('name', LANE_SYMLINKED_ARTIFACTS)
     def test_replaces_broken_symlink(
-        self, worktree: Path, meta_root: Path
+        self, ta: TaskArtifacts, worktree: Path, meta_root: Path, name: str
     ):
-        # A pre-existing stale/broken symlink (points at a now-absent target)
-        # is REPLACED by a valid absolute symlink INTO the meta-root — exercises
-        # the `unlink` occupant-removal branch on a dangling link.
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
-
+        # A dangling symlink is retargeted at the meta-root, not left
+        # pointing at its absent target.
         lane_task = worktree / '.task'
         lane_task.mkdir(parents=True, exist_ok=True)
-        lane_plan = lane_task / 'plan.json'
-        os.symlink(lane_task / 'gone.json', lane_plan)  # dangling target
-        assert lane_plan.is_symlink() and not lane_plan.exists()  # broken
+        lane_link = lane_task / name
+        os.symlink(lane_task / 'gone.json', lane_link)
+        assert lane_link.is_symlink() and not lane_link.exists()
 
-        ta.ensure_lane_plan_symlink()
+        ta.ensure_lane_symlinks()
 
-        # Retargeted at the meta-root, not left dangling at gone.json.
-        assert lane_plan.is_symlink()
-        assert os.path.isabs(os.readlink(lane_plan))
-        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
+        assert lane_link.is_symlink()
+        assert os.path.isabs(os.readlink(lane_link))
+        assert lane_link.resolve() == (meta_root / name).resolve()
 
+    @pytest.mark.parametrize('name', LANE_SYMLINKED_ARTIFACTS)
     def test_replaces_stray_directory(
-        self, worktree: Path, meta_root: Path
+        self, ta: TaskArtifacts, worktree: Path, meta_root: Path, name: str
     ):
-        # (pathological) a stray non-empty DIRECTORY at the lane plan path is
-        # rmtree'd and REPLACED by the symlink — exercises the destructive
-        # `shutil.rmtree` occupant-removal branch (a plain rmdir would raise on
-        # the non-empty dir).
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
+        # A stray NON-EMPTY directory is removed and replaced (a plain rmdir
+        # would raise on it).
+        lane_link = worktree / '.task' / name
+        lane_link.mkdir(parents=True)
+        (lane_link / 'junk.txt').write_text('stray')
+        assert lane_link.is_dir() and not lane_link.is_symlink()
 
-        lane_task = worktree / '.task'
-        lane_task.mkdir(parents=True, exist_ok=True)
-        lane_plan = lane_task / 'plan.json'
-        lane_plan.mkdir()
-        (lane_plan / 'junk.txt').write_text('stray')  # non-empty
-        assert lane_plan.is_dir() and not lane_plan.is_symlink()
+        ta.ensure_lane_symlinks()
 
-        ta.ensure_lane_plan_symlink()
+        assert lane_link.is_symlink()
+        assert lane_link.resolve() == (meta_root / name).resolve()
 
-        assert lane_plan.is_symlink()
-        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
+    @pytest.mark.parametrize('name', LANE_SYMLINKED_ARTIFACTS)
+    def test_idempotent(
+        self, ta: TaskArtifacts, worktree: Path, meta_root: Path, name: str
+    ):
+        ta.ensure_lane_symlinks()
+        ta.ensure_lane_symlinks()
 
-    def test_idempotent(self, worktree: Path, meta_root: Path):
-        # (d) calling twice yields a symlink to the same target, no error.
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
-        ta.ensure_lane_plan_symlink()
-        ta.ensure_lane_plan_symlink()
+        lane_link = worktree / '.task' / name
+        assert lane_link.is_symlink()
+        assert lane_link.resolve() == (meta_root / name).resolve()
 
-        lane_plan = worktree / '.task' / 'plan.json'
-        assert lane_plan.is_symlink()
-        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
-
+    @pytest.mark.parametrize('name', LANE_SYMLINKED_ARTIFACTS)
     def test_noop_in_legacy_meta_root_none_mode(
-        self, artifacts: TaskArtifacts, worktree: Path
+        self, artifacts: TaskArtifacts, worktree: Path, name: str
     ):
-        # (e) legacy meta_root=None mode (the `artifacts` fixture builds
-        # TaskArtifacts(worktree), rooted at worktree/.task): a
-        # pre-existing real plan.json is left a regular FILE — no
-        # self-referential symlink is created.
+        # Legacy meta_root=None mode (the `artifacts` fixture builds
+        # TaskArtifacts(worktree), rooted at worktree/.task): a pre-existing
+        # real file stays a regular FILE — no self-referential symlink.
         assert artifacts.lane_root == artifacts.task_root == worktree / '.task'
-        artifacts.write_plan(
-            {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
-        )
-        lane_plan = worktree / '.task' / 'plan.json'
-        assert lane_plan.is_file() and not lane_plan.is_symlink()
+        _LANE_ARTIFACT_WRITERS[name](artifacts)
 
-        artifacts.ensure_lane_plan_symlink()
+        artifacts.ensure_lane_symlinks()
 
-        # Still a regular file — no symlink, no self-reference.
-        assert lane_plan.is_file()
-        assert not lane_plan.is_symlink()
+        lane_file = worktree / '.task' / name
+        assert lane_file.is_file()
+        assert not lane_file.is_symlink()
 
 
 _LANE_ARTIFACT_NAMES = (
@@ -2751,7 +2932,7 @@ class TestDualRootRouting(_DualRootLayout):
         assert arts.zero_output_evidence_path(1) == root / 'zero_output_evidence-iter1.json'
 
     def test_lane_plan_symlink_targets_the_task_plan(self, arts, wt, task):
-        arts.ensure_lane_plan_symlink()
+        arts.ensure_lane_symlinks()
         lane_plan = wt / '.task' / 'plan.json'
         assert lane_plan.is_symlink()
         assert lane_plan.resolve() == (task / 'plan.json').resolve()
@@ -2764,14 +2945,39 @@ class TestDualRootRouting(_DualRootLayout):
         stored = json.loads((task / 'plan.json').read_text())
         assert stored['steps'][0]['status'] == 'done'
 
-    def test_task_root_gone_is_tolerated(self, arts, lane, task):
-        import shutil
+    def test_lane_iterations_symlink_targets_the_task_log(self, arts, wt, task):
+        arts.ensure_lane_symlinks()
+        lane_log = wt / '.task' / 'iterations.jsonl'
+        task_log = task / 'iterations.jsonl'
+        assert lane_log.is_symlink()
+        assert lane_log.resolve() == task_log.resolve()
+
+        with open(lane_log, 'a') as f:
+            f.write(json.dumps({'iteration': 0, 'source': 'agent'}) + '\n')
+        assert task_log.is_file()
+        entries, _ = arts.read_iteration_log()
+        assert entries == [{'iteration': 0, 'source': 'agent'}]
+
+        arts.append_iteration_log({'iteration': 1})
+        assert [json.loads(line)['iteration'] for line in lane_log.read_text().splitlines()] == [0, 1]
+
+        arts.clear_iteration_log()
+        assert lane_log.is_symlink()
+        assert not task_log.exists()
+        with open(lane_log, 'a') as f:
+            f.write(json.dumps({'iteration': 2, 'source': 'agent'}) + '\n')
+        assert task_log.is_file()
+
+    def test_task_root_gone_refuses_only_the_review_write(self, arts, lane, task):
         shutil.rmtree(task)
 
-        arts.write_review('r', {'verdict': 'PASS'})
+        with pytest.raises(ReviewsRootMissing):
+            arts.write_review('r', {'verdict': 'PASS'})
         arts.write_verdict('judge', _VERDICT)
         with arts.plan_mutex():
             pass
+        arts.set_review_counters(review_cycles_total=1)
+        arts.write_plan(copy.deepcopy(_PLAN))
         assert not task.exists()
 
         arts.write_blocking_dependency('7', 'r', 'sha')
@@ -2785,13 +2991,133 @@ class TestDualRootRouting(_DualRootLayout):
 
     def test_lane_symlink_view_shares_the_task_plan_mutex(self, arts, wt):
         arts.write_plan(copy.deepcopy(_PLAN))
-        arts.ensure_lane_plan_symlink()
+        arts.ensure_lane_symlinks()
         with arts.plan_mutex():
             TaskArtifacts(wt).write_plan(copy.deepcopy(_PLAN), mutex_held=True)
 
     def test_unheld_mutex_claim_names_the_task_plan(self, arts, task):
         with pytest.raises(PlanMutexNotHeld, match=re.escape(str(task / 'plan.json'))):
             arts.write_plan(copy.deepcopy(_PLAN), mutex_held=True)
+
+
+class TestClearReviews(_DualRootLayout):
+    """``clear_reviews()`` empties reviews/ so the next aggregation holds only
+    reviews written after it (task 3158; PRD plans/task-meta-task-keying-prd.md
+    boundary B7)."""
+
+    def test_removes_every_review_and_keeps_the_dir(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+        artifacts.write_review('merge', blocking_review('merge'))
+        reviews_dir = artifacts.artifact_path('reviews')
+        (reviews_dir / 'notes.txt').write_text('stray\n')
+
+        artifacts.clear_reviews()
+
+        assert reviews_dir.is_dir()
+        assert list(reviews_dir.iterdir()) == []
+        assert artifacts.read_reviews() == {}
+
+    def test_a_retired_reviewers_blocking_file_is_not_aggregated_after_clear(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_review('reviewer_retired', blocking_review('reviewer_retired'))
+
+        artifacts.clear_reviews()
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+
+        agg = artifacts.aggregate_reviews()
+        assert agg.has_blocking_issues is False
+        assert set(agg.reviews) == {'reviewer_comprehensive'}
+        assert agg.reviewer_errors == []
+
+    def test_leaves_archives_verdicts_review_state_and_plan_alone(
+        self, artifacts: TaskArtifacts,
+    ):
+        archive = artifacts.review_archive_dir('amend-1')
+        archive.mkdir()
+        (archive / 'reviewer_comprehensive.json').write_text(
+            json.dumps(blocking_review('reviewer_comprehensive'))
+        )
+        artifacts.write_verdict('judge', _VERDICT)
+        artifacts.set_review_counters(review_cycles_total=2)
+        artifacts.write_plan(copy.deepcopy(_PLAN))
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+
+        artifacts.clear_reviews()
+
+        assert (archive / 'reviewer_comprehensive.json').is_file()
+        assert artifacts.read_verdict('judge') == _VERDICT
+        assert artifacts.get_review_cycles_total() == 2
+        assert artifacts.read_plan()['steps'] == _PLAN['steps']
+
+    def test_is_idempotent(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+
+        artifacts.clear_reviews()
+        artifacts.clear_reviews()
+
+        assert artifacts.read_reviews() == {}
+
+    def test_root_gone_is_a_no_op_that_recreates_nothing(self, artifacts: TaskArtifacts):
+        shutil.rmtree(artifacts.task_root)
+
+        artifacts.clear_reviews()
+
+        assert not artifacts.task_root.exists()
+
+    def test_dual_root_empties_the_task_root_reviews(self, arts, task):
+        arts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+        assert (task / 'reviews' / 'reviewer_comprehensive.json').is_file()
+
+        arts.clear_reviews()
+
+        assert (task / 'reviews').is_dir()
+        assert list((task / 'reviews').iterdir()) == []
+
+
+class TestWriteReviewRefusesVanishedRoot:
+    """``write_review`` raises instead of skipping when its root is gone, and
+    never recreates that root: reviews/ is the review gate's only input, so a
+    skipped write would read as a PASS (task 3158)."""
+
+    def test_raises_when_root_gone(self, tmp_path: Path):
+        worktree = tmp_path / 'gone'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-x', 'gone', 'desc')
+        shutil.rmtree(worktree)
+        assert not ta.task_root.is_dir()
+
+        with pytest.raises(ReviewsRootMissing) as excinfo:
+            ta.write_review('reviewer-x', pass_review('reviewer-x'))
+
+        assert isinstance(excinfo.value, FileNotFoundError)
+        assert 'reviewer-x' in str(excinfo.value)
+        assert str(ta.task_root) in str(excinfo.value)
+        assert not ta.task_root.exists()
+
+    def test_a_root_vanishing_mid_write_raises_and_stays_gone(
+        self, artifacts: TaskArtifacts, monkeypatch: pytest.MonkeyPatch,
+    ):
+        real_write = safe_io.atomic_write_text
+
+        def root_vanishes_then_write(path, text, **kwargs):
+            shutil.rmtree(artifacts.task_root)
+            return real_write(path, text, **kwargs)
+
+        monkeypatch.setattr(safe_io, 'atomic_write_text', root_vanishes_then_write)
+
+        with pytest.raises(ReviewsRootMissing):
+            artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+
+        assert not artifacts.task_root.exists()
+
+    def test_creates_a_missing_reviews_dir_under_a_live_root(self, artifacts: TaskArtifacts):
+        shutil.rmtree(artifacts.artifact_path('reviews'))
+
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+
+        assert set(artifacts.read_reviews()) == {'reviewer_comprehensive'}
 
 
 class TestReadTitle:
@@ -3131,7 +3457,7 @@ class TestWriteJsonPreservesMode:
 class TestWriteJsonFollowsSymlinks:
     """A write through the lane symlink reaches the REAL file, never eats it.
 
-    `ensure_lane_plan_symlink` makes `<worktree>/.task/plan.json` an absolute
+    `ensure_lane_symlinks` makes `<worktree>/.task/plan.json` an absolute
     symlink onto the meta-root plan, and `_artifacts_from_args` still supports
     the legacy `meta_root=None` shape rooted at `<worktree>/.task`
     (mcp_lifecycle's `meta_root` parameter defaults to None) — so
@@ -3155,7 +3481,7 @@ class TestWriteJsonFollowsSymlinks:
         meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
         meta = TaskArtifacts(worktree, meta_root)
         meta.init('task-1', 'Test Task', 'Desc')
-        meta.ensure_lane_plan_symlink()
+        meta.ensure_lane_symlinks()
 
         lane_plan = worktree / '.task' / 'plan.json'
         assert lane_plan.is_symlink()
@@ -3276,9 +3602,10 @@ class TestWriteJsonFollowsSymlinks:
     ):
         """The dangling check must be gated on `is_symlink()`.
 
-        For an ordinary path a missing parent is NOT an error — `mkdir=True`
-        creates it, which is how `reviews/` and `verdicts/` come into being.
-        An unconditional parent check would break artifact creation outright.
+        For an ordinary path a missing parent is NOT an error — `_write_json`
+        creates the artifact's own directory with `Path.mkdir`, which is how
+        `reviews/` and `verdicts/` come into being under a live root.  An
+        unconditional parent check would break artifact creation outright.
         """
         import shutil
         shutil.rmtree(artifacts.artifact_path('verdicts'))
@@ -3295,12 +3622,10 @@ class TestWriteJsonFollowsSymlinks:
 # task 3957 amendment — the DELEGATION contract of ``_write_json``.
 #
 # Everything else in this group asserts an observable property (torn reads,
-# mode, symlink write-through).  The two kwargs below have no observable
-# property to assert against on a live filesystem: dropping ``fsync=True``
-# leaves the whole orchestrator suite green while silently retiring the
-# durability half of the docstring's contract, and dropping ``mkdir=True``
-# only shows up as a FileNotFoundError on the first write into a directory
-# nothing has created yet.  So they are pinned directly.
+# mode, symlink write-through).  The kwarg below has no observable property
+# to assert against on a live filesystem: dropping ``fsync=True`` leaves the
+# whole orchestrator suite green while silently retiring the durability half
+# of the docstring's contract.  So it is pinned directly.
 # ---------------------------------------------------------------------------
 
 
@@ -3334,7 +3659,7 @@ class TestWriteJsonDelegatesToSharedSafeIo:
         monkeypatch.setattr(safe_io, 'atomic_write_text', spy)
         return calls
 
-    def test_the_plan_write_is_fsynced_and_creates_its_parent(
+    def test_the_plan_write_is_fsynced(
         self, artifacts: TaskArtifacts, monkeypatch
     ):
         calls = self._spy(monkeypatch)
@@ -3352,20 +3677,13 @@ class TestWriteJsonDelegatesToSharedSafeIo:
             'safe_io defaults it to False — so dropping or flipping the '
             f'kwarg silently retires the guarantee.  Saw: {call["kwargs"]}'
         )
-        assert call['kwargs'].get('mkdir') is True, (
-            f'mkdir=True creates the artifact\'s parent.  Saw: {call["kwargs"]}'
-        )
         # The write really happened — the spy is not standing in for it.
         assert json.loads(artifacts.artifact_path('plan.json').read_text())['title'] == 'p'
 
     def test_a_nested_artifact_delegates_on_the_same_terms(
         self, artifacts: TaskArtifacts, monkeypatch
     ):
-        """The contract belongs to the seam, not to ``write_plan``.
-
-        ``verdicts/<role>.json`` also exercises ``mkdir=True`` for real: the
-        parent directory is what ``mkdir`` has to conjure.
-        """
+        """The contract belongs to the seam, not to ``write_plan``."""
         import shutil
         shutil.rmtree(artifacts.artifact_path('verdicts'))
         calls = self._spy(monkeypatch)
@@ -3376,6 +3694,5 @@ class TestWriteJsonDelegatesToSharedSafeIo:
         })
 
         assert [c['kwargs'].get('fsync') for c in calls] == [True]
-        assert [c['kwargs'].get('mkdir') for c in calls] == [True]
         assert calls[0]['path'] == artifacts.artifact_path('verdicts') / 'judge.json'
         assert artifacts.read_verdict('judge') is not None

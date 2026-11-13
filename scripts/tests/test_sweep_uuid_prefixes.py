@@ -27,6 +27,9 @@ import sweep_uuid_prefixes as sweep
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
 from shared.uuid_prefix import PrefixToken
 from shared.uuid_prefix_guard import Candidate, Resolution, ResolverUnavailable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UNIQUE = 'bff81530'
 FULL = 'bff81530-70e5-4ab6-939e-507299d1bcd2'

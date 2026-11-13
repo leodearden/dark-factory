@@ -32,7 +32,7 @@ THREE RULES A LATER READER MUST NOT UNDO
    3628), which has landed — but ``--results-dir`` still replays artifacts
    written before it, and on those, reporting ``0`` would let ``plan_quality``
    read as fully validity-bounded when nothing bounded it. Mirrors
-   ``report.py``'s own ``mean_plan_quality=None`` convention — "we measured
+   ``plan_quality_report.py::build_plan_quality_report``'s own ``mean_plan_quality=None`` convention — "we measured
    nothing" must never read as "it scored nothing".
 
    The count is SURFACED from ``build_plan_quality_report`` rather than derived
@@ -260,8 +260,8 @@ MARKER_KEY = 'judged_without_reference'
 UNMEASURED_CELLS_KEY = 'judged_without_reference_unmeasured_cells'
 
 # What an unmeasured marker renders as. Deliberately a WORD, never ``0`` and
-# never the ``-`` report.py uses for an empty mean: this one has to survive
-# being skimmed.
+# never the ``-`` that ``plan_quality_report.py::format_plan_quality_table``
+# renders for an empty mean: this one has to survive being skimmed.
 UNMEASURED = 'unmeasured'
 
 # The per-candidate breakout of ``declined`` by terminal kind (task 4760).
@@ -409,7 +409,7 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     Rows are sorted by ``config_name`` so a committed report artifact diffs
     cleanly.
     """
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     report = build_plan_quality_report(results)
     rows = []

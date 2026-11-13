@@ -132,7 +132,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import functools
 import json
 import logging
 import sys
@@ -147,6 +146,7 @@ from fused_memory.backends.mem0_client import (
 from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
+from fused_memory.utils.script_loader import load_script
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # This script reports through ``print``; stdout carries its machine-read
@@ -290,38 +290,9 @@ DEFAULT_MAX_PAGES = DEFAULT_SCROLL_MAX_PAGES
 # The corpus partition — borrowed, never restated
 # ---------------------------------------------------------------------------
 
-@functools.cache
 def load_census_module() -> Any:
-    """Load ``census_memory_metadata`` by path.
-
-    ``scripts/`` is not a package, so a plain import cannot reach it.  Same
-    importlib idiom — including the ``sys.modules``-first lookup — that
-    ``census_memory_metadata.py::_load_probe_module`` and
-    ``retro_stamp_topics.py::_load_probe_module`` already established for
-    exactly this cross-script reuse: that slot may already hold a module
-    another by-path loader executed, and re-executing would hand back
-    DIFFERENT class objects, silently breaking identity across the seam.
-
-    Memoized because the load is not free and because the identity above is
-    only stable if it happens once.
-    """
-    import importlib.util  # noqa: PLC0415
-
-    mod_name = 'census_memory_metadata'
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, _CENSUS_SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_CENSUS_SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    """Load ``census_memory_metadata`` by path via ``load_script``, sharing its key's module."""
+    return load_script(_CENSUS_SCRIPT_PATH, 'census_memory_metadata')
 
 
 def census_categories() -> tuple[str, ...]:

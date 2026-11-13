@@ -12,13 +12,12 @@ marker, so the merge lane's default selection runs them.
 
 import json
 import math
-import shutil
-import subprocess
 from functools import cache
-from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from arm_harness._lme_artifacts import REPO_ROOT, committed_run_dir, git
 from fused_memory.arm_harness.arm_spec import load_arm_spec
 from fused_memory.arm_harness.corpus import corpus_sha
 from fused_memory.arm_harness.llm_metrics import (
@@ -40,7 +39,8 @@ from fused_memory.arm_harness.preregistration import (
 from fused_memory.arm_harness.run import OUTCOMES_FILENAME, RUN_MANIFEST_FILENAME, load_outcomes
 from fused_memory.arm_harness.run_manifest import RunManifest, load_run_manifest
 
-REPO_ROOT = Path(__file__).parents[3]
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 CONTROLS_RELATIVE = 'plans/local-memory-models-eval-controls'
 CONTROLS = REPO_ROOT / CONTROLS_RELATIVE
 CORPUS_MANIFEST = (
@@ -54,38 +54,18 @@ SCREENING_EPISODES = 20
 FROZEN_GRAPH = 'evalmem_lme_ref_incumbent_a'
 
 
-def _git(*args: str) -> subprocess.CompletedProcess[str]:
-    if shutil.which('git') is None:
-        pytest.skip('git is not available; cannot check the committed index')
-    inside = subprocess.run(
-        ['git', 'rev-parse', '--is-inside-work-tree'],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
-    )
-    if inside.returncode != 0:
-        pytest.skip('not a git working tree; cannot check the committed index')
-    return subprocess.run(
-        ['git', *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False
-    )
-
-
 def _tracked() -> list[str]:
-    return _git('ls-files', '--', CONTROLS_RELATIVE).stdout.splitlines()
-
-
-def _run_dir(arm_id: str) -> Path:
-    stamps = sorted(path for path in (CONTROLS / 'runs' / arm_id).iterdir() if path.is_dir())
-    assert len(stamps) == 1, f'{arm_id} must have exactly one committed stamp dir: {stamps}'
-    return stamps[0]
+    return git('ls-files', '--', CONTROLS_RELATIVE).stdout.splitlines()
 
 
 @cache
 def _run(arm_id: str) -> RunManifest:
-    return load_run_manifest(_run_dir(arm_id) / RUN_MANIFEST_FILENAME)
+    return load_run_manifest(committed_run_dir(CONTROLS, arm_id) / RUN_MANIFEST_FILENAME)
 
 
 @cache
 def _records(arm_id: str) -> tuple[MetricsRecord, ...]:
-    return load_metrics_records(_run_dir(arm_id))
+    return load_metrics_records(committed_run_dir(CONTROLS, arm_id))
 
 
 def _manifest_episode_ids() -> tuple[str, ...]:
@@ -145,7 +125,7 @@ def test_every_run_is_pinned_to_one_code_sha_and_the_committed_corpus():
     assert len(code_shas) == 1, code_shas
     assert corpus_shas == {corpus_sha(CORPUS_MANIFEST.read_bytes())}
     (code_sha,) = code_shas
-    assert _git('merge-base', '--is-ancestor', code_sha, 'HEAD').returncode == 0
+    assert git('merge-base', '--is-ancestor', code_sha, 'HEAD').returncode == 0
 
 
 @pytest.mark.parametrize('arm_id', (ARM_A, ARM_B))
@@ -162,7 +142,7 @@ def test_the_screening_runs_cover_the_first_twenty_manifest_episodes(arm_id):
 
 
 def _outcomes(arm_id: str):
-    return load_outcomes(_run_dir(arm_id) / OUTCOMES_FILENAME)
+    return load_outcomes(committed_run_dir(CONTROLS, arm_id) / OUTCOMES_FILENAME)
 
 
 def _derived_inputs():
@@ -178,7 +158,7 @@ def _derived_inputs():
 
 def test_run_b_was_measured_against_run_a():
     committed = GraphSamenessDetails.model_validate_json(
-        (_run_dir(ARM_B) / GRAPH_SAMENESS_DETAILS_FILENAME).read_text()
+        (committed_run_dir(CONTROLS, ARM_B) / GRAPH_SAMENESS_DETAILS_FILENAME).read_text()
     )
 
     assert committed == graph_sameness_details(_outcomes(ARM_B), _outcomes(ARM_A))
@@ -198,7 +178,7 @@ def test_the_committed_inputs_are_the_formula_over_the_committed_runs():
 
 
 def test_the_parity_deltas_are_the_differences_of_the_two_screening_runs():
-    parity_dir = _run_dir(GENERIC_20) / 'parity' / OPENAI_20
+    parity_dir = committed_run_dir(CONTROLS, GENERIC_20) / 'parity' / OPENAI_20
     deltas = load_metrics_records(parity_dir)
     generic = {record.metric.metric_id: record for record in _records(GENERIC_20)}
     openai = {record.metric.metric_id: record for record in _records(OPENAI_20)}

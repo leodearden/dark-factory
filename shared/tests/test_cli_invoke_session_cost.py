@@ -22,6 +22,7 @@ from shared.cli_invoke import AgentResult, invoke_claude_agent, invoke_with_cap_
 from shared.process_cost import ProcessCostBasis
 from shared.testing import make_gate_mock
 from shared.testing_fake_claude import FakeClaudeCli, install_fake_claude_cli
+from shared.testing_resume_rejection import measured_resume_rejection
 
 _SESSIONS = json.loads(
     (Path(__file__).parent / 'fixtures' / 'cumulative_cost' / 'sessions.json').read_text()
@@ -218,12 +219,7 @@ class TestCapRetryCarriesSessionPrior:
         assert _PRIOR_KWARG not in _second_call_kwargs(invoke_fn)
 
     @pytest.mark.parametrize(('first', 'cap_hits', 'extra'), [
-        (
-            AgentResult(success=False, output='resume broke', turns=3,
-                        duration_ms=60_000, cost_usd=1.0),
-            [False, False],
-            {},
-        ),
+        (measured_resume_rejection('S'), [False, False], {}),
         (
             AgentResult(success=False, output='Unauthorized', api_error_status=401),
             [False, False],

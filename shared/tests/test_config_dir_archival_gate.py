@@ -35,6 +35,10 @@ import pytest
 from config_dir_archival_allowlist import ARCHIVED, AUDITED_SITES, DISPOSITIONS
 from silent_fallthrough_scan import ParsedFile, _build_parent_map, _compute_qualname
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Site keys omit lineno deliberately: a line number drifts on every unrelated

@@ -53,6 +53,10 @@ subset.
 
 ledger_covers_claimant(task) is E-2's ledger_covers: metadata.claimant_exception
 names the claimant the row still carries. It is status-agnostic.
+
+carries_claimant(task) is the one "does this row carry a claimant" reading: only
+None, an absent key and blank strings mean no claimant; it ignores status,
+heartbeat and metadata.
 """
 
 from __future__ import annotations
@@ -65,6 +69,7 @@ import pytest
 import shared.task_claimant
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    carries_claimant,
     compose_claimant_run_id,
     has_live_claimant,
     is_hygiene_tier_claimant,
@@ -473,6 +478,31 @@ class TestSpecialisationsDelegate:
         )
 
 
+class TestCarriesClaimant:
+    @pytest.mark.parametrize('claimant', [None, '', '   ', '\t\n'])
+    def test_none_or_blank_is_no_claimant(self, claimant):
+        assert carries_claimant(_row('pending', claimant, None)) is False
+
+    def test_absent_key_is_no_claimant(self):
+        assert carries_claimant({}) is False
+
+    @pytest.mark.parametrize('claimant', ['run-x', 'run-a/4028-x/pid=1'])
+    def test_non_blank_string_is_a_claimant(self, claimant):
+        assert carries_claimant(_row('pending', claimant, None)) is True
+
+    def test_non_string_value_counts_as_carried(self):
+        assert carries_claimant(_row('pending', 0, None)) is True
+
+    @pytest.mark.parametrize('row', _GRID)
+    def test_ignores_status_heartbeat_and_metadata(self, row):
+        assert carries_claimant(row) is (row['claimant_run_id'] == 'run-x')
+
+    @pytest.mark.parametrize('row', _GRID)
+    def test_live_claimant_implies_carried(self, row):
+        if has_live_claimant(row, _GRID_NOW, _TTL):
+            assert carries_claimant(row)
+
+
 class TestViolatesTerminalClaimantInvariant:
     _FRESH = (_GRID_NOW - timedelta(minutes=1)).isoformat()
     _STALE = (_GRID_NOW - timedelta(hours=12)).isoformat()
@@ -673,6 +703,7 @@ class TestLedgerCoversClaimant:
 
 def test_public_api_surface():
     assert {
+        'carries_claimant',
         'is_stranded_any_status',
         'DEFAULT_CLAIMANT_HEARTBEAT_TTL',
         'violates_terminal_claimant_invariant',

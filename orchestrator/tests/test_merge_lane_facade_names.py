@@ -23,11 +23,11 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Reads every tracked .py that names the façade and ast-parses it, so it carries
 # the whole-tree scan ceiling; WHY lives at
-# _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Same import of the scripts directory as test_merge_lane_ratchet.py:

@@ -155,7 +155,9 @@ measured:
     and ``cleanup_test_collections`` also mutate unguarded, but only ever touch
     scratch ``_test_*`` substrate and never the shared store, so they are
     deliberately in neither column. Task 4293 wrote that reasoning, with the
-    premises that would kill it, into each of those two files.
+    premises that would kill it, into each of those two files. Task 7792 added
+    ``seed_scratch_reference_graph`` on the same footing: it writes only
+    ``evalmem_`` graphs on the scratch FalkorDB and never touches mem0 or Qdrant.
 
 ``tests/test_store_mutation_conformance.py`` is that mechanism now, for the
 RULE. The three columns above are all still hand-written prose rather than
@@ -467,12 +469,14 @@ PREFLIGHT_EXEMPT_SCRIPTS: dict[str, str] = {
         'load_cleanup_script().E2_BAKEOFF_PREFIX on the run\'s own config '
         "copy, and no CLI flag reaches it (--project-suffix moves only the "
         "suffix), so neither call can be pointed at a 'fused'-prefixed "
-        'production collection; seed_arm also stubs mem0\'s shared '
-        'add_history writer before the first add, so it writes no shared '
-        'SQLite history either. Measured against this file as it stands '
-        '(task 4293), not a standing exemption: it dies the moment a CLI '
-        'flag reaches the collection prefix, or seed_arm stops stubbing the '
-        'shared history writer. Does not cover the live path\'s '
+        'production collection; run_bake_off also sets '
+        'config.mem0.persist_history=False on that same copy, so every arm\'s '
+        'mem0 instance keeps its history in a private in-memory DB and writes '
+        'no shared SQLite history either. Measured against this file as it '
+        'stands (task 4293 for the collection prefix, task 6100 for the '
+        'history), not a standing exemption: it dies the moment a '
+        'CLI flag reaches the collection prefix, or run_bake_off stops turning '
+        'config.mem0.persist_history off. Does not cover the live path\'s '
         'MemoryService.initialize() call (Graphiti startup maintenance '
         'against production FalkorDB) -- that residual is unaddressed here '
         'and stays tracked by tasks 4318 and 4350.'
@@ -490,5 +494,20 @@ PREFLIGHT_EXEMPT_SCRIPTS: dict[str, str] = {
         'standing exemption: it dies the moment this script constructs a '
         'MemoryService, or any input can widen PREFIXES past its two '
         'test-only names.'
+    ),
+    'seed_scratch_reference_graph.py': (
+        'Its unprobed mutations (RESTORE of the copy, graph.delete() of that '
+        'same fresh copy when verification fails, and SAVE) are FalkorDB-only '
+        'and bounded to the scratch server: the target comes from '
+        'scratch_falkordb_from_env, which raises ProductionFalkorDBTarget for '
+        'production, and every graph name passes require_scratch_name '
+        "(evalmem_ only). RESTORE never uses REPLACE and refuses a name the "
+        'target already holds, so it cannot overwrite anything. It constructs '
+        'no MemoryService and no Qdrant client, so it writes no mem0 SQLite '
+        'history and needs none of the capability this probe tests for. '
+        'Measured against this file as it stands (task 7792), not a standing '
+        'exemption: it dies the moment this script gains a MemoryService or a '
+        'Qdrant client, its target can resolve to production, or a graph name '
+        'can bypass require_scratch_name.'
     ),
 }

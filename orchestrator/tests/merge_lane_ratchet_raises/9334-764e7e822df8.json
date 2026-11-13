@@ -1,0 +1,24 @@
+{
+  "task_id": "9334",
+  "reason": "amend (reviewer heuristic 10): branch_work_landed's containment arm maps an unreadable git cherry (rc != 0) straight to git_error instead of re-probing ref health, so a failed cherry on a healthy repo no longer reads not_landed; one added guard in _containment_rejection",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 164,
+      "current": 165
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py::_containment_rejection",
+      "baseline": 4,
+      "current": 5
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5143,
+      "current": 5144
+    }
+  ]
+}

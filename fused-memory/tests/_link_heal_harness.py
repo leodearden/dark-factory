@@ -15,6 +15,7 @@ in ``FakeMem0.writes`` under its own name, where a test can see it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections import Counter
@@ -45,6 +46,7 @@ from fused_memory.maintenance.link_heal_executor import (
 from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import (
     CensusFailed,
+    CreatedWindow,
     LinkHealStore,
     ToolCaller,
     text_sha256,
@@ -183,11 +185,15 @@ class FakeMem0:
         ]
         return rows[:limit]
 
-    async def linked_ids(self, project_id: str) -> list[str]:
+    async def linked_ids(
+        self, project_id: str, created_in: CreatedWindow | None = None,
+    ) -> list[str]:
         return [
             memory_id
             for (project, memory_id), payload in self.points.items()
-            if project == project_id and payload.get(PARENT_ID_KEY) not in (None, [])
+            if project == project_id
+            and payload.get(PARENT_ID_KEY) not in (None, [])
+            and (created_in is None or created_in.admits(payload))
         ]
 
     def search_results(self, query: str, project_id: str, limit: int) -> SearchResults:
@@ -206,7 +212,9 @@ class FailingCensus:
 
     DETAIL = 'qdrant is down'
 
-    async def linked_ids(self, project_id: str) -> list[str]:
+    async def linked_ids(
+        self, project_id: str, created_in: CreatedWindow | None = None,
+    ) -> list[str]:
         raise CensusFailed(project_id, 'ResponseHandlingException', self.DETAIL)
 
 
@@ -445,6 +453,7 @@ async def run_deterministic_apply(
 Answer = Verdict | AdjudicationFailure
 
 FAKE_ADJUDICATOR_MODEL = 'fake-model'
+FAKE_PROMPT_SHA256 = hashlib.sha256(b'the fake adjudicator prompt').hexdigest()
 
 
 class FakeAdjudicator:
@@ -458,7 +467,10 @@ class FakeAdjudicator:
         answer_for: Callable[[str], Answer],
         *,
         storm: Mapping[str, Any] | None = None,
+        prompt_sha256: str = FAKE_PROMPT_SHA256,
     ) -> None:
+        self.model = FAKE_ADJUDICATOR_MODEL
+        self.prompt_sha256 = prompt_sha256
         self.calls: list[list[LinkPair]] = []
         self._answer_for = answer_for
         self._storm = storm

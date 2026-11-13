@@ -16,14 +16,14 @@ marker, so the merge lane's default selection runs them.
 """
 
 import json
-import shutil
-import subprocess
 from functools import cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from arm_harness._lme_artifacts import REPO_ROOT, git
 from fused_memory.arm_harness.arm_spec import LlmArmSpec, load_arm_spec
 from fused_memory.arm_harness.corpus import corpus_sha
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
@@ -48,7 +48,8 @@ from fused_memory.arm_harness.screening_evidence import (
 )
 from fused_memory.arm_harness.slate import LOOPBACK_HOST, SlateArm, candidate_spec, load_llm_slate
 
-REPO_ROOT = Path(__file__).parents[3]
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 SCREENING_RELATIVE = 'plans/local-memory-models-eval-screening'
 SCREENING = REPO_ROOT / SCREENING_RELATIVE
 CONTROLS = REPO_ROOT / 'plans' / 'local-memory-models-eval-controls'
@@ -62,22 +63,8 @@ SLATE: tuple[SlateArm, ...] = load_llm_slate(ARMS_YAML)
 SLATE_IDS = [arm.arm_id for arm in SLATE]
 
 
-def _git(*args: str) -> subprocess.CompletedProcess[str]:
-    if shutil.which('git') is None:
-        pytest.skip('git is not available; cannot check the committed index')
-    inside = subprocess.run(
-        ['git', 'rev-parse', '--is-inside-work-tree'],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
-    )
-    if inside.returncode != 0:
-        pytest.skip('not a git working tree; cannot check the committed index')
-    return subprocess.run(
-        ['git', *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False
-    )
-
-
 def _tracked() -> list[str]:
-    return _git('ls-files', '--', SCREENING_RELATIVE).stdout.splitlines()
+    return git('ls-files', '--', SCREENING_RELATIVE).stdout.splitlines()
 
 
 @cache
@@ -157,8 +144,8 @@ def test_one_preregistration_sha_that_carries_the_doc_and_is_on_this_history():
     assert len(shas) == 1
     (sha,) = shas
     assert sha is not None
-    assert _git('cat-file', '-e', f'{sha}:{PREREGISTRATION_DOC}').returncode == 0
-    assert _git('merge-base', '--is-ancestor', sha, 'HEAD').returncode == 0
+    assert git('cat-file', '-e', f'{sha}:{PREREGISTRATION_DOC}').returncode == 0
+    assert git('merge-base', '--is-ancestor', sha, 'HEAD').returncode == 0
 
 
 # --- the runs -------------------------------------------------------------------------

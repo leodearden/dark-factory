@@ -21,8 +21,11 @@ from types import ModuleType
 
 import pytest
 from _watched_module_removals import ModuleRemovals, removals_since
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from df_pytest_isolation import synthetic_unit
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

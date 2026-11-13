@@ -45,7 +45,7 @@ from _config_default_scan import (
     iter_config_path_blanking_sites,
     iter_default_asserting_tests,
 )
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 
@@ -56,7 +56,7 @@ from orchestrator.config import OrchestratorConfig
 # --max-worker-restart=0 then truncates the ENTIRE suite, reporting against
 # some innocent guard that shared the dead worker (esc-3980-1, esc-3787-1).
 # WHY 300s and the guard that ENFORCES this mark rather than trusting it to be
-# sprinkled: see WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# sprinkled: see shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -1123,6 +1123,8 @@ _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION = frozenset({
      'TestLayeredConfig.test_load_config_raises_when_no_config_and_no_env'),
     ('test_flake_report.py',
      'TestFlakeLedgerCommand.test_no_config_and_no_env_exits_one_with_an_error'),
+    ('test_verify_cache_status_cli.py',
+     'TestVerifyCacheStatus.test_no_config_and_no_env_exits_one_with_an_error'),
     ('test_eval_task_sampler.py',
      'TestEvalListFixturesCLI.test_needs_no_orchestrator_config'),
     ('test_code_default_hatch_guard.py',

@@ -236,18 +236,23 @@ so the live-thread index never names a terminal record.
 
 ### M5 — host-qualified liveness
 
-New module `orchestrator/src/orchestrator/session_liveness.py` (stdlib + `shared.process_identity`,
-reachable through `session_registry.py`'s existing `shared/src` bootstrap, pinned by
-`orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment`): `capture(pid)`
-and `judge(identity, pid) -> Liveness`. `SessionRecord` gains `launcher_identity` and
+New module `shared/src/shared/session_liveness.py` (stdlib + `shared.process_identity`, a
+registered member of `shared/tests/test_pure_stdlib_leaves.py::PURE_STDLIB_LEAVES`), beside
+`shared/src/shared/process_identity.py`, which already provides `capture` and `liveness`: the
+new module is a thin `judge(identity, pid) -> Liveness` (D16). Bare-python3 consumers reach it
+through `session_registry.py`'s existing `shared/src` bootstrap, pinned by
+`orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment`; it imports
+nothing from `orchestrator`. `SessionRecord` gains `launcher_identity` and
 `claude_owner_identity` (`ProcessIdentity` as a dict; additive, default `None`), stamped
 where the pids are stamped today (`::_run_launching`; `session_hooks.py::_bind_claude_session_id`,
 `::_reclaim_dead_owner_pid`; the new-record path of `::run_session_start`). Every reader that
 decides "dead" switches from `_pid_alive(pid)` to `judge(...) is Liveness.DEAD`: `OTHER_HOST`
 is neither alive nor dead, so sweeps skip, `is_over` answers not-over, `_reclaim_dead_owner_pid`
 does not reclaim, and `session_self_exit.py::_first_refusal` gains `SelfExitRefusal.OTHER_HOST`
-ahead of the pid comparison. An identity of `None` falls back to `_pid_alive` (legacy), and
-readers that print a record say `host=unqualified`.
+ahead of the pid comparison. An identity of `None` falls back to
+`session_registry.py::pid_alive` (legacy) — passed into `judge` or kept at the call site,
+since the shared module cannot import the registry — and readers that print a record say
+`host=unqualified`.
 
 ### M6 — T3 end-of-work acts: settle, archive, and the watcher's handoff archive
 
@@ -377,8 +382,8 @@ unwatched; successor spawn failed (<exit code / reason>)`, and stops. `skills/es
   field (no reboot or pid-reuse immunity; a second liveness vocabulary); copying
   `process_identity` into the registry (the bootstrap already reaches stdlib-only `shared`
   leaves; SPOT).
-- **D9 — new code lives in new modules.** `t3_mcp_client.py` and `session_liveness.py`
-  are added; `session_registry.py` (~6,090 lines) gains only the pointer-dir helpers in the
+- **D9 — new code lives in new modules.** `t3_mcp_client.py` and
+  `shared/src/shared/session_liveness.py` (D16) are added; `session_registry.py` (~6,090 lines) gains only the pointer-dir helpers in the
   shape of the two existing pointer dirs and two record fields. No leaf splits
   `session_registry.py` (heuristics 13 and 14 bind: a split stitched back together with
   imports is the forbidden cheat; a real split is its own design question, out of scope).
@@ -413,6 +418,19 @@ unwatched; successor spawn failed (<exit code / reason>)`, and stops. `skills/es
   names its record. *Rejected:* "newest record carrying the title" (predecessor and
   successor share `escalation-watcher:<project_id> handoff`); retrying the spawn blind (two
   watchers racing one lease).
+- **D16 — the liveness predicate lives in `shared`, not `orchestrator`** (Leo ruling,
+  option A, 2026-11-04, esc-8125-3). `judge` is `shared/src/shared/session_liveness.py`, a
+  registered `PURE_STDLIB_LEAVES` member beside `shared.process_identity`. Two reasons:
+  `session_registry.py`'s header NOTE forbids `from orchestrator import <sibling>` (tier-1
+  run-by-path containment, `TestStdlibOnlySelfContainment`), and ruling R17
+  (`plans/review-all-program-dark_factory-2026-10-10.md`) moves the registry's stdlib-only
+  parts to a shared session package. The legacy `None`-identity branch uses
+  `session_registry.py::pid_alive`, passed in or kept at the call site. An unreadable
+  `/proc` answers `ALIVE`, consistent with task 7283's planned shared
+  `process_identity.liveness_or_unread` helper (unread → `None`, which `judge` maps to
+  `ALIVE`). *Rejected:* `orchestrator/src/orchestrator/session_liveness.py` (the original
+  M5 text: unimportable from the run-by-path registry; the G3 row checked only
+  `shared.process_identity`'s reachability, not the new module's).
 
 ## 6. Contracts (H)
 
@@ -461,9 +479,10 @@ exists. The index is the sweep's iteration set.
 `SessionRecord` additive fields: `launcher_identity: ProcessIdentity | None`,
 `claude_owner_identity: ProcessIdentity | None`; `Display.t3_environment_id: str | None`.
 `SCHEMA_VERSION` bumps; old records read with `None`.
-`session_liveness.judge(identity, pid) -> Liveness`: `OTHER_HOST` when `identity.host !=
+`shared.session_liveness.judge(identity, pid) -> Liveness`: `OTHER_HOST` when `identity.host !=
 gethostname()`; `DEAD` on boot-id or start-ticks mismatch or an exited pid; `ALIVE`
-otherwise; `None` identity → `ALIVE`/`DEAD` from `_pid_alive(pid)`; an unreadable `/proc`
+otherwise; `None` identity → `ALIVE`/`DEAD` from `session_registry.py::pid_alive(pid)`
+(passed in or at the call site, D16); an unreadable `/proc`
 answers `ALIVE` (never evidence of death, `process_identity.ProcessIdentityUnreadable`).
 Readers decide "dead" only on `DEAD`.
 
@@ -540,7 +559,7 @@ All verified 2026-11-01 by re-opening the symbol; none is queued as a prerequisi
 | `T3CODE_THREAD_ID` set on every Claude launch and resume | `apps/server/src/preview/PortScanner.ts::AGENT_THREAD_ENV`; `ClaudeAdapterV2.ts::ClaudeAgentSdkQueryRunner` `open` |
 | Hooks fire inside T3 threads | measured: tasks 7614 and 7617 (hand-launched T3 records on the live fleet root, 2026-10-27) |
 | `server-runtime.json` carries `origin`, `pid`, `startedAt`, `serverVersion` | read on this host 2026-11-01 (`{"origin": "http://127.0.0.1:3773", …}`) |
-| `shared.process_identity` reachable from bare-python3 registry consumers | `session_registry.py` module-scope `shared/src` bootstrap; `TestStdlibOnlySelfContainment` tier rules |
+| `shared.process_identity` reachable from bare-python3 registry consumers | `session_registry.py` module-scope `shared/src` bootstrap; `TestStdlibOnlySelfContainment` tier rules. Corrected 2026-11-04 (esc-8125-3): this row verified only `shared.process_identity`; the original M5 claim that a new `orchestrator/src/orchestrator/session_liveness.py` was reachable the same way was wrong — the bootstrap reaches `shared` leaves, and the header NOTE forbids orchestrator-sibling imports. The new module therefore lives at `shared/src/shared/session_liveness.py` (D16), reachable by this same row |
 | `t3_thread_organize` actions `archive`, `settle` (and `pin|unpin|snooze|unsnooze|unsettle|unarchive|mark_unread`), `threadId` omitted = the calling thread | `apps/server/src/mcp/toolkits/thread/tools.ts::ThreadOrganizeTool`; `thread/handlers.ts` `t3_thread_organize` (dispatches `thread.<action>`; `settle` → `settleThread({byOwnAgent})`) |
 | A thread may organize itself; the mode-limit check skips the caller's own thread | `apps/server/src/mcp/McpToolAccess.ts::writesThreads` (`threadId === caller.scope.thread?.threadId` → continue) |
 | Self-settle with an active run defers to turn end | `apps/server/src/orchestration-v2/ThreadManagementService.ts::settleThread` (`settlesWhenTurnEnds: true` via `settleAfterRun`); "Settlement rejects active or blocked runs" (`Orchestrator.ts` dispatch comment) |
@@ -625,10 +644,11 @@ Heuristics: 11 (the pointer dir is the one index of live T3 records; the sweep h
 existing pointer-dir shape; no new block of logic in `session_registry.py`; no split).
 
 **δ — host-qualified liveness.**
-Files: `orchestrator/src/orchestrator/session_liveness.py` (new), `session_registry.py`
+Files: `shared/src/shared/session_liveness.py` (new, D16), `shared/tests/test_pure_stdlib_leaves.py`
+(register it in `PURE_STDLIB_LEAVES`), `session_registry.py`
 (fields, stamp in `_run_launching`, three readers), `session_hooks.py` (stamp at bind and
 reclaim, new-record path), `orchestrator/src/orchestrator/session_self_exit.py`,
-`skills/review-all/scripts/program/watch_sessions.py`, `orchestrator/tests/test_session_liveness.py`
+`skills/review-all/scripts/program/watch_sessions.py`, `shared/tests/test_session_liveness.py`
 (new), `orchestrator/tests/test_session_registry.py`, `orchestrator/tests/test_session_hooks_ownership.py`,
 `tests/scripts/test_review_all_program_watch_sessions.py`. ~500–700 LOC.
 Deps: none (parallel with α/β).

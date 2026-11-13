@@ -13,8 +13,7 @@ docs session lands its new or edited documents the same way:
 
 lands every path as ONE commit through ONE merge request on the queue of the
 orchestrator whose escalation MCP listens on 127.0.0.1:*port*. `land_file` is
-its single-path form, and `land_or_exit` that form exiting through
-`_config_reload_gate.die` on a refusal.
+its single-path form.
 
 Paths are relative to the checkout *repo*; an absolute path inside it is
 accepted. The content is the caller's, authored outside the target checkout,
@@ -68,13 +67,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from _config_reload_gate import die, load_transport, transport_not_importable_remedy
+from _config_reload_gate import load_transport, transport_not_importable_remedy
 
 try:
     from shared.merge_state import (
@@ -166,6 +165,7 @@ def land_files(
     repo: str, files: Mapping[str, bytes], base_sha: str, *,
     port: str, label: str, message: str,
     timeout_secs: float | str | None = None, main_branch: str = "main",
+    clock: Callable[[], float] = time.monotonic,
 ) -> Landing:
     """Land each of *files*' content as its path (relative to the checkout
     *repo*) on *main_branch*, as one commit branching from *base_sha*, through
@@ -179,13 +179,14 @@ def land_files(
     timeout (SUBMIT_REPLY_TIMEOUT_SECS for the submit, POLL_REPLY_TIMEOUT_SECS
     for a poll), and a request still unsettled is then cancelled
     (POLL_REPLY_TIMEOUT_SECS more), so land_files can return up to about 190 s,
-    plus its git teardown, after the deadline.
+    plus its git teardown, after the deadline. *clock* is the monotonic clock
+    the deadline is measured on, time.monotonic by default.
     """
     queue = _MergeQueue.connect(port)
     target = _Target.of(Path(repo), files, main_branch)
     target.check_change(base_sha)
     target.check_checkout_clean()
-    deadline = time.monotonic() + float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS)
+    deadline = _Deadline.after(float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS), clock)
     with (
         _stop_signals_held() as stop,
         _deploy_branch(target, base_sha, label=label, message=message) as deploy,
@@ -197,24 +198,16 @@ def land_file(
     repo: str, path: str, base_sha: str, content: bytes, *,
     port: str, label: str, message: str,
     timeout_secs: float | str | None = None, main_branch: str = "main",
+    clock: Callable[[], float] = time.monotonic,
 ) -> Landing:
     """`land_files` of *content* as the one *path*."""
     return land_files(
         repo, {path: content}, base_sha, port=port, label=label, message=message,
-        timeout_secs=timeout_secs, main_branch=main_branch,
+        timeout_secs=timeout_secs, main_branch=main_branch, clock=clock,
     )
 
 
-def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: str,
-                 **kwargs: Any) -> Landing:
-    """`land_file`, exiting through `die` with the refusal's detail."""
-    try:
-        return land_file(repo, path, base_sha, content, **kwargs)
-    except LandingNotConfirmed as exc:
-        die(prog, exc.detail)
-
-
-def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: float,
+def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: _Deadline,
           stop: _StopSignals, *, description: str) -> Landing:
     stop.check()
     try:
@@ -234,6 +227,22 @@ def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: 
 # ---------------------------------------------------------------------------
 # Stopping: the deadline and the stop signals
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _Deadline:
+    """The moment *at* which the landing's ceiling passes, on the monotonic
+    *clock* it was taken from."""
+
+    at: float
+    clock: Callable[[], float]
+
+    @classmethod
+    def after(cls, timeout_secs: float, clock: Callable[[], float]) -> _Deadline:
+        return cls(clock() + timeout_secs, clock)
+
+    def remaining(self) -> float:
+        return self.at - self.clock()
+
 
 class _CeilingReached(Exception):
     """The landing's deadline passed with its request still unsettled."""
@@ -309,8 +318,8 @@ def _stop_signals_held() -> Iterator[_StopSignals]:
         signal.raise_signal(stop.received)
 
 
-def _sleep_before_poll(delay: float, deadline: float, stop: _StopSignals) -> None:
-    remaining = deadline - time.monotonic()
+def _sleep_before_poll(delay: float, deadline: _Deadline, stop: _StopSignals) -> None:
+    remaining = deadline.remaining()
     if remaining <= 0:
         raise _CeilingReached("the landing timed out")
     stop.wait(min(delay, remaining))
@@ -734,7 +743,7 @@ class _Pending:
 
 
 def _poll_until_landed(queue: _MergeQueue, target: _Target, deploy: _DeployBranch,
-                       pending: _Pending, deadline: float, stop: _StopSignals) -> dict:
+                       pending: _Pending, deadline: _Deadline, stop: _StopSignals) -> dict:
     """The merge_status reply that shows the *pending* request landed,
     cancelling the request if the deadline, a stop signal or a git failure
     comes first."""

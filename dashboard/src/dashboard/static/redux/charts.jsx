@@ -30,9 +30,19 @@ const {
   axisY,
   axisMax,
   axisPaths,
+  bandPaths,
   barFractions,
   stackedAreaPaths,
 } = window.DF_SPARK_PATH;
+
+// The marker overlay's decisions (placement, kind -> style, hover, legend) —
+// chart_marks.js, loaded before this file. Module scope, no fallback.
+const { markStyleFor, markHover, legendEntries } = window.DF_CHART_MARKS;
+
+// The plot box inset of LineChart and StackedAreaChart, and therefore of the
+// Markers overlay drawn over either: one copy, so a mark cannot drift off the
+// column it names.
+const PLOT_PAD = Object.freeze({ l: 38, r: 12, t: 8, b: 22 });
 
 const PALETTE = {
   accent:  'oklch(0.72 0.14 230)',
@@ -71,6 +81,7 @@ const PALETTE = {
     'multi-pass':      'oklch(0.72 0.14 230)',
     'via-steward':     'oklch(0.80 0.14 80)',
     'via-interactive': 'oklch(0.72 0.10 50)',
+    'requeued':        'oklch(0.62 0.20 305)',
     'blocked':         'oklch(0.68 0.18 25)',
   },
 };
@@ -128,7 +139,10 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
 //
 // Whether the y-axis is a COUNT is the single `countAxis` prop on both charts
 // (task 6370); formatY is presentation only. Rationale at spark_path.js::axisMax.
-function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, countAxis = false }) {
+// `band` ({ lo, hi, color? }) is drawn beneath the series wherever both bounds
+// are plottable, and its hi joins the axis fold. A series with `dash` is drawn
+// dashed. `minAxisMax` is the least axis maximum, the seed of that fold.
+function LineChart({ series, labels, band, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, countAxis = false, minAxisMax = 1 }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
   useEffect(() => {
@@ -137,19 +151,20 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
     ro.observe(ref.current);
     return () => ro.disconnect();
   }, []);
-  const padL = 38, padR = 12, padT = 8, padB = 22;
+  const { l: padL, r: padR, t: padT, b: padB } = PLOT_PAD;
   const chartW = Math.max(w - padL - padR, 50);
   const chartH = height - padT - padB;
-  const all = series.flatMap(s => s.values);
+  const all = series.flatMap(s => s.values).concat(band ? band.hi || [] : []);
   // Hole-excluding fold (task 3489): one undefined/NaN sample used to poison
   // maxV to NaN, `range = NaN - NaN || 1` silently fell back to 1, and every y
   // became NaN — a single NaN token invalidates the whole `d` attribute, so SVG
-  // dropped the ENTIRE path. The `1` seed is preserved deliberately, as is
-  // minV = 0: switching to a `Math.min(...)` fold would newly bring negative
-  // samples in-range and silently re-frame every LineChart on the dashboard.
-  // This is a null-handling fix, not a re-scaling.
+  // dropped the ENTIRE path. The `1` seed is preserved deliberately as the
+  // minAxisMax default, as is minV = 0: switching to a `Math.min(...)` fold
+  // would newly bring negative samples in-range and silently re-frame every
+  // LineChart on the dashboard. This is a null-handling fix, not a re-scaling;
+  // a chart of small fractions opts out of the seed by passing minAxisMax.
   const ticks = 4;
-  const maxV = axisMax(plottableMax(all, 1), ticks, countAxis);
+  const maxV = axisMax(plottableMax(all, minAxisMax), ticks, countAxis);
   const minV = 0;
   const range = maxV - minV || 1;
   const n = labels.length;
@@ -168,6 +183,8 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   // whose labels no longer line up with its marks renders as a plausible chart
   // rather than an error.
   const built = series.map(s => axisPaths(s.values, geom));
+  const bandColor = (band && band.color) || PALETTE.accent;
+  const bandSubpaths = band ? bandPaths(band.lo, band.hi, geom) : [];
   // The axes and label row render even with no series at all (an empty frame
   // reads as "no data in this window"), so the x-mapping is taken from a builder
   // call either way — never recomputed here.
@@ -192,6 +209,9 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
             <text key={i} x={x} y={height - 6} fontSize="9" fill={PALETTE.fg3} textAnchor="middle" fontFamily="JetBrains Mono">{formatX(lab)}</text>
           );
         })}
+        {bandSubpaths.map((d, i) => (
+          <path key={`band-${i}`} className="chart-band" d={d} fill={bandColor} fillOpacity={0.15} stroke="none" />
+        ))}
         {series.map((s, si) => {
           const color = s.color || PALETTE.accent;
           const { line, area } = built[si];
@@ -204,7 +224,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
           return (
             <g key={si}>
               {s.fill !== false && area && <path d={area} fill={color} fillOpacity={0.10} />}
-              <path d={line} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" />
+              <path d={line} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" strokeDasharray={s.dash ? '4 3' : undefined} />
             </g>
           );
         })}
@@ -222,7 +242,7 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
     const ro = new ResizeObserver(([e]) => setW(e.contentRect.width));
     ro.observe(ref.current); return () => ro.disconnect();
   }, []);
-  const padL = 38, padR = 12, padT = 8, padB = 22;
+  const { l: padL, r: padR, t: padT, b: padB } = PLOT_PAD;
   const chartW = Math.max(w - padL - padR, 50);
   const chartH = height - padT - padB;
   const n = labels.length;
@@ -284,6 +304,127 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
           return <path key={st.key} d={d} fill={st.color} fillOpacity={0.85} stroke={st.color} strokeWidth={0.5} />;
         })}
       </svg>
+    </div>
+  );
+}
+
+// ── The marker overlay ──
+// An HTML layer over a chart drawn with PLOT_PAD: a mark at fraction f sits
+// over column f of the plot box at whatever width the chart renders. Marks
+// come from chart_marks.js (dateLabelMarks, or a tab's own placement).
+const MARK_LINE_BOTTOM = 20;
+const MARK_LABEL_STYLE = Object.freeze({
+  position: 'absolute', top: 0, left: 3, fontSize: 9, color: 'var(--fg-3)',
+  whiteSpace: 'nowrap', transform: 'translateY(-2px)',
+});
+const MARK_HATCH = 'repeating-linear-gradient(45deg, transparent 0 3px, var(--fg-3) 3px 4px)';
+const MARK_SWATCH = Object.freeze({
+  line: { borderLeft: '1px dashed var(--fg-3)' },
+  tick: { borderLeft: '1px solid var(--fg-3)', opacity: 0.6 },
+  rug: { borderLeft: '2px solid var(--fg-3)' },
+  range: { background: MARK_HATCH },
+  alarm: { borderLeft: '1px solid var(--warn)' },
+});
+
+function markLeft(fraction) {
+  return `calc(${PLOT_PAD.l}px + ${fraction} * (100% - ${PLOT_PAD.l + PLOT_PAD.r}px))`;
+}
+
+function markSpan(fraction) {
+  return `calc(${fraction} * (100% - ${PLOT_PAD.l + PLOT_PAD.r}px))`;
+}
+
+// A labelled vertical line. With no hover and no class this is exactly the
+// DOM tab_escalation_analytics.jsx's regime markers always rendered.
+function LabelledMark({ mark, className, color = 'var(--fg-3)', line = 'dashed' }) {
+  const hover = markHover(mark);
+  const box = { position: 'absolute', left: markLeft(mark.fraction), top: 0, bottom: MARK_LINE_BOTTOM };
+  return (
+    <div className={className} title={hover ?? undefined} style={hover ? { ...box, pointerEvents: 'auto' } : box}>
+      <div style={{ height: '100%', borderLeft: `1px ${line} ${color}` }} />
+      <span style={{ ...MARK_LABEL_STYLE, color }}>{mark.label}</span>
+    </div>
+  );
+}
+
+// A tick (top edge of the plot box) or rug (bottom edge) mark draws no label,
+// so its hover always names it.
+function UnlabelledMark({ mark, style }) {
+  const edge = style === 'tick' ? { top: PLOT_PAD.t } : { bottom: PLOT_PAD.b };
+  return (
+    <div
+      className={`chart-mark-${style}`}
+      title={markHover(mark) ?? mark.label}
+      style={{
+        position: 'absolute', left: markLeft(mark.fraction), ...edge,
+        height: 6, ...MARK_SWATCH[style], pointerEvents: 'auto',
+      }}
+    />
+  );
+}
+
+function RangeMark({ mark }) {
+  const hover = markHover(mark);
+  return (
+    <div
+      className="chart-mark-range"
+      title={hover ?? undefined}
+      style={{
+        position: 'absolute', left: markLeft(mark.fraction), width: markSpan(mark.endFraction - mark.fraction),
+        minWidth: 1, top: PLOT_PAD.t, bottom: PLOT_PAD.b, background: MARK_HATCH,
+        pointerEvents: hover ? 'auto' : 'none',
+      }}
+    >
+      <span style={MARK_LABEL_STYLE}>{mark.label}</span>
+    </div>
+  );
+}
+
+function OneMark({ mark }) {
+  switch (markStyleFor(mark.kind)) {
+    case 'tick': return <UnlabelledMark mark={mark} style="tick" />;
+    case 'rug': return <UnlabelledMark mark={mark} style="rug" />;
+    case 'range': return <RangeMark mark={mark} />;
+    case 'alarm': return <LabelledMark mark={mark} className="chart-mark-alarm" color="var(--warn)" line="solid" />;
+    default: return <LabelledMark mark={mark} />;
+  }
+}
+
+function MarkLegend({ marks }) {
+  return (
+    <div
+      className="chart-mark-legend"
+      style={{
+        position: 'absolute', top: 0, right: PLOT_PAD.r, transform: 'translateY(-100%)',
+        display: 'flex', gap: 8, fontSize: 9, color: 'var(--fg-3)',
+      }}
+    >
+      {legendEntries(marks).map(entry => (
+        <span key={entry.style} className="chart-mark-legend-entry" style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+          <span style={{ display: 'inline-block', width: 6, height: 8, ...MARK_SWATCH[entry.style] }} />
+          {entry.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function Markers({ marks, legend = false }) {
+  if (!marks || marks.length === 0) return null;
+  return (
+    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+      {marks.map(mark => <OneMark key={mark.key} mark={mark} />)}
+      {legend && <MarkLegend marks={marks} />}
+    </div>
+  );
+}
+
+// A time chart with the marker overlay drawn over it.
+function MarkedChart({ marks, legend = false, children }) {
+  return (
+    <div style={{ position: 'relative' }}>
+      {children}
+      <Markers marks={marks} legend={legend} />
     </div>
   );
 }
@@ -523,10 +664,13 @@ const DATUM_AGE_STYLE = Object.freeze({ fontFamily: 'var(--mono)', fontSize: 10,
 // The age badge sits beside the delta, in the same row: both are secondary
 // annotations on the value above them, and putting the age there costs the
 // value cell no width when there is nothing to badge.
-function StatTile({ label, datum, history, format, unit, delta, deltaDir, sparkColor, hint }) {
+//
+// `title` is the whole tile's tooltip; a hole's reason still wins over it on
+// the value cell.
+function StatTile({ label, datum, history, format, unit, delta, deltaDir, sparkColor, hint, title }) {
   const view = datumView(datum, { now: Date.now(), format });
   return (
-    <div className="kpi">
+    <div className="kpi" title={title}>
       <div className="lbl">{label}{hint && <span style={{ color: 'var(--fg-3)', textTransform: 'none', letterSpacing: 0, fontSize: 10 }}> · {hint}</span>}</div>
       <div className="val" title={view.title || undefined}>{view.text}{unit && <span className="unit">{unit}</span>}</div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 6 }}>
@@ -634,4 +778,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries };
+window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, PLOT_PAD, Sparkline, StepSpark, LineChart, StackedAreaChart, Markers, MarkedChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries };

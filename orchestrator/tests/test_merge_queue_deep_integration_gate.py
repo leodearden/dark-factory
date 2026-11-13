@@ -824,7 +824,7 @@ def _ladder_after(
 
     Both are taken through the SHIPPED functions
     (:func:`orchestrator.workflow._compute_merge_outcome_signature`,
-    :func:`orchestrator.workflow._evaluate_merge_thrash`) rather than
+    :func:`orchestrator.workflow.evaluate_merge_thrash`) rather than
     transcribed.  A transcription would let a signature-format change or a
     counter-arithmetic change pass this gate silently, which for a row whose
     entire content is "the shipped ladder does not move" would be the one
@@ -859,7 +859,7 @@ def _ladder_after(
             signature would show up as either an increment or a reset.
         requests: the scene's request registry, scanned for a blocked outcome
             rendered for any item the rounds do not already account for.
-        threshold: what ``_evaluate_merge_thrash`` escalates at.  Affects only
+        threshold: what ``evaluate_merge_thrash`` escalates at.  Affects only
             the verdict's ``escalate`` flag, which this helper drops — the
             counter arithmetic is threshold-independent — but is threaded so
             the control test can state the number it is asserting against.
@@ -869,7 +869,7 @@ def _ladder_after(
         :func:`_assert_two_way_quiescent` as ``ladder={'before': ..., 'after':
         ...}`` to make the unmoved claim part of the round-by-round oracle.
     """
-    from orchestrator.workflow import _evaluate_merge_thrash
+    from orchestrator.workflow import evaluate_merge_thrash
 
     current = RetryLedger() if ledger is None else ledger
 
@@ -891,7 +891,7 @@ def _ladder_after(
         if outcome is None or getattr(outcome, 'status', None) != 'blocked':
             continue
         signature = _blocked_signature(outcome)
-        current = _evaluate_merge_thrash(
+        current = evaluate_merge_thrash(
             current, current.last_merge_outcome_signature, signature, threshold,
         ).ledger
     return current
@@ -1005,9 +1005,9 @@ def _assert_two_way_quiescent(
         green over a genuinely leaking one.
       * *main_sha* must be a REAL sha, never falsy and never the literal
         ``'unknown'``.  ``two_layer_invariants`` gates its base-chain
-        (``check_frozen_prefix_invariant``) and verify-base sub-checks on
-        exactly that condition, leaving only the two graph-consistency checks
-        running for the sentinel.
+        (``check_frozen_prefix_invariant``, INV-3) sub-check on exactly that
+        condition, leaving only the two graph-consistency checks running for
+        the sentinel.
 
     WORKER SIDE
       (a) every request in *requests* has resolved (done or cancelled) — no
@@ -1060,9 +1060,9 @@ def _assert_two_way_quiescent(
     )
     assert main_sha and main_sha != 'unknown', (
         f'_assert_two_way_quiescent requires a REAL main_sha, got '
-        f'{main_sha!r}: two_layer_invariants silently skips its base-chain and '
-        f'verify-base sub-checks for a falsy or \'unknown\' sha, so surface '
-        f'(e) would pass vacuously'
+        f'{main_sha!r}: two_layer_invariants silently skips its base-chain '
+        f'(INV-3) sub-check for a falsy or \'unknown\' sha, so surface (e) '
+        f'would pass vacuously'
     )
 
     # ── (a) every tracked request resolved ──────────────────────────────────
@@ -1162,8 +1162,8 @@ def _assert_two_way_quiescent(
 #     both `return []` immediately when `not self._running` (stop() over-
 #     releases both semaphores by depth+1 as a shutdown safety valve, which
 #     would otherwise read as a spurious violation);
-#   * `two_layer_invariants(main_sha)` SKIPS its base-chain and verify-base
-#     sub-checks for a falsy or 'unknown' main_sha (the snapshot() sentinel).
+#   * `two_layer_invariants(main_sha)` SKIPS its base-chain (INV-3) sub-check
+#     for a falsy or 'unknown' main_sha (the snapshot() sentinel).
 #
 # — so the oracle must REJECT those inputs rather than consume them.  This
 # class pins all three as POSITIVE CONTROLS, and pins a forced permit leak as
@@ -1242,8 +1242,8 @@ class TestTwoWayOracleContract:
         """VACUITY TRAP (ii): ``two_layer_invariants`` skips sub-checks for 'unknown'.
 
         ``snapshot()`` passes the literal ``'unknown'`` when ``get_main_sha()``
-        is unavailable, and the base-chain + verify-base sub-checks are gated
-        off for it (and for a falsy sha) so startup does not report spurious
+        is unavailable, and the base-chain (INV-3) sub-check is gated off for
+        it (and for a falsy sha) so startup does not report spurious
         violations.  A gate that handed the oracle that sentinel would be
         asserting only the two graph-consistency checks and calling it §5.3.
 
@@ -1315,7 +1315,7 @@ class TestTwoWayOracleContract:
         """CAS/LEDGER half (b): row 8's claim is about workflow.py's LADDER.
 
         The `after` ledger is produced by the REAL
-        ``workflow._evaluate_merge_thrash`` over a real ``RetryLedger`` rather
+        ``workflow.evaluate_merge_thrash`` over a real ``RetryLedger`` rather
         than by hand, so a change to the ladder's counter arithmetic moves this
         control rather than leaving it stale.  ``before is after`` is the
         UNMOVED shape row 8 asserts; a single genuine blocked signature folded
@@ -1325,7 +1325,7 @@ class TestTwoWayOracleContract:
 
         from orchestrator.workflow import (
             _compute_merge_outcome_signature,
-            _evaluate_merge_thrash,
+            evaluate_merge_thrash,
         )
 
         worker = _make_worker(_make_git_ops(git_repo))
@@ -1333,7 +1333,7 @@ class TestTwoWayOracleContract:
 
         before = RetryLedger()
         signature = _compute_merge_outcome_signature('merge_conflict', 'shared.txt', '')
-        moved = _evaluate_merge_thrash(before, None, signature, 2).ledger
+        moved = evaluate_merge_thrash(before, None, signature, 2).ledger
         assert moved.consecutive_merge_thrash == 1, (
             f'the ladder control is inert: folding one genuine blocked '
             f'signature must move the counter off 0, got '
@@ -3115,7 +3115,7 @@ class TestRow3HalvingIsolatesTheBadItem:
 #   unmoved.
 #
 #   LEDGER SIDE (original here): the pair of rounds' real observable outputs
-#   are folded through the SHIPPED ladder — ``workflow._evaluate_merge_thrash``
+#   are folded through the SHIPPED ladder — ``workflow.evaluate_merge_thrash``
 #   over a real ``shared.task_metadata.RetryLedger``, keyed by the SHIPPED
 #   ``workflow._compute_merge_outcome_signature`` — and the ladder comes back
 #   byte-identical.  Deriving the signature THROUGH the production function
@@ -3286,7 +3286,7 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         """LEDGER SIDE — the conclusion, folded through the REAL ladder.
 
         The pair's own observable outputs are handed to
-        ``workflow._evaluate_merge_thrash``.  It has nothing to eat, because the
+        ``workflow.evaluate_merge_thrash``.  It has nothing to eat, because the
         ladder is fed ONLY from a rendered blocked ``MergeOutcome`` (workflow.py
         stashes ``result.reason`` into ``_last_merge_block_reason`` and gates
         the whole thrash check on it being non-None), and a deep red tip

@@ -7,9 +7,12 @@ import shutil
 from unittest.mock import AsyncMock
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture(autouse=True)

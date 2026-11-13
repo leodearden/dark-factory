@@ -183,7 +183,7 @@ def test_the_lane_symlink_view_and_the_meta_root_view_share_one_mutex(tmp_path: 
     meta_view = TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree_base, 'lane'))
     meta_view.init('task-1', 'Test Task', 'A test task description')
     meta_view.write_plan(_seed_plan())
-    meta_view.ensure_lane_plan_symlink()
+    meta_view.ensure_lane_symlinks()
     lane_view = TaskArtifacts(worktree)
     assert lane_view.artifact_path('plan.json').is_symlink()
     entered = threading.Event()

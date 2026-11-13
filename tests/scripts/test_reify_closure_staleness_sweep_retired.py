@@ -34,6 +34,9 @@ import pathlib
 import subprocess
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -78,6 +81,29 @@ ALLOWED_UNCONDITIONALLY = {
         'by sha256 in the eval set\'s summary. A quoted memory that names the '
         'retired wiring is data, not a live reference; editing it would break '
         'the pinned sha and falsify what the raters saw'
+    ),
+    'plans/followup-packing-sweep-prd.pack-pool-2026-11-04.json': (
+        'FROZEN pool snapshot — the held-follow-up packing sweep PRD\'s '
+        '2026-11-04 pool capture, consumed as a fixture by tasks 8451 and '
+        '8454. A held task\'s file list that names the retired wiring is '
+        'data about that task, not a live reference; editing it would '
+        'falsify the snapshot the pack judge was calibrated on (task 8468)'
+    ),
+    'plans/followup-packing-sweep-prd.packs-a2c2.csv': (
+        'FROZEN pool snapshot — the a2/c2 generator output over the same '
+        '2026-11-04 pool, consumed as a fixture by tasks 8451 and 8454; '
+        'same reasoning as the pool JSON above (task 8468)'
+    ),
+    'fused-memory/tests/fixtures/pack_pool_2026-11-04.json': (
+        'FROZEN fixture — task 8451\'s verbatim copy of '
+        'plans/followup-packing-sweep-prd.pack-pool-2026-11-04.json, which '
+        'test_followup_packing.py replays to reproduce the a2/c2 packs. Same '
+        'reasoning as that original above: editing it would falsify the snapshot'
+    ),
+    'fused-memory/tests/fixtures/packs-a2c2-2026-11-04.csv': (
+        'FROZEN fixture — task 8451\'s verbatim copy of '
+        'plans/followup-packing-sweep-prd.packs-a2c2.csv, the expected packs '
+        'test_followup_packing.py asserts against; same reasoning as above'
     ),
 }
 

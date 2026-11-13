@@ -30,6 +30,14 @@ from orchestrator.cli import (
 from orchestrator.config import GitConfig, OrchestratorConfig
 
 
+@pytest.fixture(autouse=True)
+def spawn_temp_sweep(monkeypatch) -> MagicMock:
+    """No test in this module may sweep the real /tmp through the ``run`` command."""
+    sweep = MagicMock(return_value=0)
+    monkeypatch.setattr(cli_module, 'sweep_orphaned_spawn_temp_files', sweep, raising=True)
+    return sweep
+
+
 class TestParseDuration:
     def test_hours(self):
         assert _parse_duration("4h") == 14400
@@ -520,6 +528,22 @@ class TestForceExitWatchdog:
         )
 
 
+def _wire_run_with_fake_harness(monkeypatch, fake_report):
+    """Wire mocks so the real _main coroutine runs and calls harness.run once."""
+    # Stub the watchdog so no real daemon timer thread is spawned.
+    monkeypatch.setattr(
+        cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock()
+    )
+    fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+    fake_harness = MagicMock()
+    # AsyncMock so `await harness.run(...)` inside the real _main resolves.
+    fake_harness.run = AsyncMock(return_value=fake_report)
+    monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
+    return fake_harness
+
+
 class TestRunUntilIdleFlag:
     """The --until-idle flag must thread through to harness.run(until_idle=...).
 
@@ -527,27 +551,11 @@ class TestRunUntilIdleFlag:
     legacy exit-on-drain (until_idle=True).
     """
 
-    def _setup(self, monkeypatch, fake_report):
-        """Wire mocks so the real _main coroutine runs and calls harness.run once."""
-        # Stub the watchdog so no real daemon timer thread is spawned.
-        monkeypatch.setattr(
-            cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock()
-        )
-        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
-
-        fake_harness = MagicMock()
-        # AsyncMock so `await harness.run(...)` inside the real _main resolves.
-        from unittest.mock import AsyncMock
-        fake_harness.run = AsyncMock(return_value=fake_report)
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
-        return fake_harness
-
     def test_flag_threads_until_idle_true(self, monkeypatch):
         fake_report = MagicMock()
         fake_report.blocked = 0
         fake_report.summary.return_value = 'ok'
-        fake_harness = self._setup(monkeypatch, fake_report)
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, fake_report)
 
         result = CliRunner().invoke(
             main, ['run', '--config', '/dev/null', '--until-idle']
@@ -563,7 +571,7 @@ class TestRunUntilIdleFlag:
         fake_report = MagicMock()
         fake_report.blocked = 0
         fake_report.summary.return_value = 'ok'
-        fake_harness = self._setup(monkeypatch, fake_report)
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, fake_report)
 
         result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
 
@@ -572,6 +580,50 @@ class TestRunUntilIdleFlag:
             f'default run must pass until_idle=False (run forever); '
             f'kwargs={fake_harness.run.call_args.kwargs!r}'
         )
+
+
+class TestRunSweepsOrphanedSpawnTempFiles:
+    """run() sweeps orphaned agent-spawn temp files once, before building the Harness,
+    and a failing sweep never blocks startup."""
+
+    @staticmethod
+    def _report() -> MagicMock:
+        report = MagicMock()
+        report.blocked = 0
+        report.summary.return_value = 'ok'
+        return report
+
+    def test_sweeps_once_before_the_harness_is_built(self, monkeypatch, spawn_temp_sweep):
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, self._report())
+        events: list[str] = []
+        spawn_temp_sweep.side_effect = lambda *a, **k: events.append('sweep') or 0
+
+        def _recording_harness(config, **_):
+            events.append('harness')
+            return fake_harness
+
+        monkeypatch.setattr('orchestrator.harness.Harness', _recording_harness)
+
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 0, result.output
+        assert events.index('sweep') < events.index('harness'), events
+        spawn_temp_sweep.assert_called_once()
+
+    def test_a_failing_sweep_does_not_block_startup(self, monkeypatch, spawn_temp_sweep, caplog):
+        fake_harness = _wire_run_with_fake_harness(monkeypatch, self._report())
+        spawn_temp_sweep.side_effect = RuntimeError('boom')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.cli'):
+            result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 0, result.output
+        fake_harness.run.assert_awaited()
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.cli' and r.levelno == logging.WARNING
+        ]
+        assert any('spawn temp files' in m for m in warnings), warnings
 
 
 class TestRunArmsWatchdog:

@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import app_clock
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, unknown_datum
 from dashboard.data.db import DbPool
@@ -56,7 +57,7 @@ async def api_invariants(request: Request) -> JSONResponse:
     """INVARIANTS + served_at — one E-1 record per known project root, in roster order."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    now = app_clock(request.app)()
     corpus = await _escalation_corpus(config, now=now)
     roots = config.all_project_roots
     db_paths = [root / TASKS_DB_REL_PATH for root in roots]

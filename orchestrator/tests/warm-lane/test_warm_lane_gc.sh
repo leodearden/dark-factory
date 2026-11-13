@@ -247,12 +247,10 @@ _TMPDIRS+=("$ERR_FILE")
 # other call site (same idiom as K4's PATH prefix and O-env's).
 #
 # The pin is behaviour-NEUTRAL, not merely believed to be. $LANE_PROTECT_GLOB_FALLBACK
-# is a strict SUPERSET of what gc.sh renders by default: the same bands, plus
-# `_merge-verify` (already covered by `_merge-*`) and `.lane-state`/`.task-meta`
-# (dot-prefixed, and gc.sh's candidate loop is `"$WORKTREES_DIR"/*/` with no
-# `shopt -s dotglob` anywhere, so neither can ever match an enumerated entry).
-# If pinning ever MOVES an existing assert, that superset argument has broken
-# and the seam — not the assert — is what needs revisiting.
+# EQUALS, byte for byte, what gc.sh renders by default, and
+# orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackIsAVerbatimRender
+# fails the build on any difference in either direction. If pinning ever MOVES
+# an existing assert, the seam — not the assert — is what needs revisiting.
 #
 # >>> A BLOCK THAT ASSERTS WHAT THE **DEFAULT** PROTECTS MUST CALL
 # >>> run_helper_live_default, OR IT SILENTLY TESTS THE PIN INSTEAD OF THE
@@ -2571,9 +2569,9 @@ assert "S6: summary reports reset=1 (only the released lane was reclaimed)" \
 
 # ── S-reasons: the reason vocabulary, the gate ORDER, and the counter ─────────
 # Three preserved lanes in ONE pass:
-#   _lane-6  state `in_use` — leaf δ has no writer yet, so the record is
-#            hand-written here; this is what makes the raw state's visibility
-#            testable NOW rather than after δ lands.
+#   _lane-6  state `in_use` — hand-written here even though leaf δ (task
+#            3076) now writes it, because this bash test must not depend on
+#            Python; the writer is pinned in orchestrator/tests/test_lane_in_use.py.
 #   _lane-7  state `assigned` with task_id JSON `null` — the record must never
 #            render a dangling "assigned to task " with an empty id.
 #   _lane-8  state `assigned` AND a live process reference. It would be
@@ -2628,8 +2626,8 @@ assert "S7: in_use _lane-6 preserved (seed NOT invoked, marker intact)" \
     bash -c '([ ! -f "$1" ] || ! grep -q "_lane-6" "$1") && [ -f "$2" ]' _ \
     "$SR_SEED_LOG" "$SR_WORKTREES/_lane-6/target/DIVERGENT_MARKER"
 # The RAW state stays visible in the reason, so `assigned` and `in_use` are
-# distinguishable in dark-factory's logs the moment leaf δ starts writing the
-# latter — leaf ε depends on that distinction.
+# distinguishable in dark-factory's logs now that leaf δ writes the latter
+# (orchestrator/tests/test_lane_in_use.py) — leaf ε depends on that distinction.
 assert "S8: stderr surfaces the RAW state for _lane-6 (in_use, not flattened to assigned)" \
     bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-6: assigned to task 5551 (state=in_use)"' _ "$ERR_OUT"
 assert "S9: a null task_id gets its own wording for _lane-7" \

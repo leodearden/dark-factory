@@ -19,7 +19,7 @@ import random
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -52,8 +52,8 @@ class AdmissionPolicy:
     promote_after_secs: float
 
     def __post_init__(self) -> None:
-        if self.slots < 1:
-            raise ValueError(f'AdmissionPolicy.slots must be >= 1: slots={self.slots!r}')
+        if self.slots < 0:
+            raise ValueError(f'AdmissionPolicy.slots must be >= 0: slots={self.slots!r}')
         if self.order not in get_args(AdmissionOrder):
             raise ValueError(
                 f'AdmissionPolicy.order must be one of {get_args(AdmissionOrder)}: '
@@ -66,6 +66,16 @@ class AdmissionPolicy:
             )
 
 
+@dataclass(eq=False)
+class PlanLatch:
+    """Whether any leg of one verify plan has been granted its turn. One-way."""
+
+    granted: bool = False
+
+    def mark_granted(self) -> None:
+        self.granted = True
+
+
 @dataclass(frozen=True)
 class AdmissionRequest:
     role: str
@@ -74,6 +84,7 @@ class AdmissionRequest:
     task_id: str | None
     module: str | None
     scope_kind: str | None
+    plan_latch: PlanLatch | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         role_class(self.role)
@@ -88,9 +99,13 @@ class AdmissionPlan:
     task_id: str | None
     arrival: float
     arrived_at: datetime
+    latch: PlanLatch = field(default_factory=PlanLatch, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         role_class(self.role)
+
+    def has_been_granted(self) -> bool:
+        return self.latch.granted
 
     @classmethod
     def begin(cls, *, role: str, task_id: str | None) -> AdmissionPlan:
@@ -110,6 +125,7 @@ class AdmissionPlan:
             task_id=self.task_id,
             module=module,
             scope_kind=scope_kind,
+            plan_latch=self.latch,
         )
 
 
@@ -234,6 +250,10 @@ class AdmissionGate:
             for w in sorted(self._holding.values(), key=lambda w: w.seq)
         )
         return AdmissionSnapshot(waiters=waiters, holders=holders)
+
+    def redispatch(self, policy: AdmissionPolicy) -> None:
+        """Readmission re-runs the dispatch because it is neither an arrival nor a departure."""
+        self._dispatch(policy)
 
     def _leave(self, waiter: _Waiter, policy: Callable[[], AdmissionPolicy]) -> None:
         # The single queue exit (PRD invariant 1): a waiter still queued just

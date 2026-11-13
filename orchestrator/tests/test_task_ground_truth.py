@@ -838,9 +838,9 @@ class TestDeriveTruthLiveClaimant:
         assert report.live_claimant is None
 
     async def test_plan_lock_dead_owner_pid_returns_none(self, worktree: Path) -> None:
-        # _pid_alive(2**31 - 1) is deterministically False — not a valid
+        # pid_alive(2**31 - 1) is deterministically False — not a valid
         # live PID on any standard Linux (mirrors
-        # test_pid_alive_contract.py's identical convention) — so a
+        # shared/tests/test_proc_liveness.py's identical convention) — so a
         # plan.lock whose owner process has died must NOT be treated as a
         # live claimant (review finding #3).
         artifacts = _plan_lock_artifacts(worktree, '25')
@@ -1018,6 +1018,29 @@ class TestDeriveTruthLiveClaimant:
         resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
 
         report = await resolver.derive_truth('34')
+
+        assert report.live_claimant is None
+
+    @pytest.mark.parametrize('owner_pid', [10**20, True], ids=['unrepresentable', 'json-true'])
+    async def test_corrupt_owner_pid_in_a_fresh_lock_is_not_a_live_claimant(
+        self, worktree: Path, owner_pid: object,
+    ) -> None:
+        """A pid no process can hold reads as no claimant, without raising.
+
+        10**20 overflows the C pid_t, and a JSON ``true`` must not become pid 1.
+        The lock is fresh, so only the pid judgment can produce the None.
+        """
+        _write_plan_lock(worktree, '41', {
+            'session_id': 'sess-corrupt-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': owner_pid,
+            'run_id': 'run-corrupt',
+        })
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
+
+        report = await resolver.derive_truth('41')
 
         assert report.live_claimant is None
 

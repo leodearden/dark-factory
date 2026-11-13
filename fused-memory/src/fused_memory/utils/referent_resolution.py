@@ -351,7 +351,7 @@ def _conflicting_referents(
 
     Five load-bearing choices, each invisible from the code alone:
 
-    1. KIND-SCOPED, not global. ``_KIND_LABELS`` holds one entry today, so the
+    1. KIND-SCOPED, not global. ``KIND_LABELS`` holds one entry today, so the
        scoping is a no-op and NO test can construct a second kind — the guard
        therefore has to be structural, exactly as β's kind-keyed ambiguity
        partition is. The moment 'escalation' joins the registry, a global rule
@@ -535,11 +535,11 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
 
         # Checked BEFORE the Referent(...) construction below, not folded into
         # the `except ValueError` around it: __post_init__'s membership test
-        # `self.kind not in _KIND_LABELS` raises TypeError for an UNHASHABLE
+        # `self.kind not in KIND_LABELS` raises TypeError for an UNHASHABLE
         # kind, and TypeError is not a ValueError, so that handler structurally
         # cannot convert it. The two layers are deliberate, not redundant — and
         # a str kind must still fall through to __post_init__ so the
-        # unregistered-kind message keeps naming _KIND_LABELS and where to add
+        # unregistered-kind message keeps naming KIND_LABELS and where to add
         # one. (bool needs no separate check: it is not a str.)
         kind = entry.get('kind', 'task')
         if not isinstance(kind, str):

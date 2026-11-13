@@ -28,11 +28,11 @@ from typing import Any, TypedDict
 
 from falkordb.asyncio import FalkorDB
 
-from fused_memory.backends.graphiti_client import (
-    _DEFAULT_READ_PAGE_SIZE,
-    _RESULTSET_SIZE,
+from fused_memory.backends.paged_read import (
+    DEFAULT_READ_PAGE_SIZE,
+    RESULTSET_SIZE,
     PagedRead,
-    _paged_ro_query,
+    paged_ro_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ class PagedQuery:
 
     Both strings are built from the one ``match``, so the page and the census
     always describe the same population, as
-    ``fused_memory/backends/graphiti_client.py::_paged_ro_query`` requires.
+    ``fused_memory/backends/paged_read.py::paged_ro_query`` requires.
 
     PRECONDITION: the MATCH yields exactly one result row per binding of
     ``row`` — a directed edge pattern with ``row`` the relationship, or a
@@ -172,7 +172,7 @@ class ReadOnlyGraphReader:
     An injected *graph* is wrapped at construction and stays its caller's to
     close; otherwise the handle is opened by :func:`open_graph` on the first
     read and closed by :meth:`aclose`. A None paging knob means the default in
-    ``fused_memory/backends/graphiti_client.py``.
+    ``fused_memory/backends/paged_read.py``.
     """
 
     def __init__(
@@ -190,8 +190,8 @@ class ReadOnlyGraphReader:
         self._uri = uri
         self._host = host
         self._port = port
-        self._page_size = _DEFAULT_READ_PAGE_SIZE if page_size is None else page_size
-        self._resultset_size = _RESULTSET_SIZE if resultset_size is None else resultset_size
+        self._page_size = DEFAULT_READ_PAGE_SIZE if page_size is None else page_size
+        self._resultset_size = RESULTSET_SIZE if resultset_size is None else resultset_size
         self._opened: Any | None = None
         self._guarded = None if graph is None else ReadOnlyGraphProxy(graph)
 
@@ -213,7 +213,7 @@ class ReadOnlyGraphReader:
     async def read_paged(
         self, query: PagedQuery, *, params: dict[str, Any] | None = None
     ) -> PagedRead:
-        return await _paged_ro_query(
+        return await paged_ro_query(
             self.guarded_graph(),
             query.page_template,
             query.census_cypher,

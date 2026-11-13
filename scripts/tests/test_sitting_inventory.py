@@ -13,7 +13,10 @@ from orchestrator.session_registry import (
     list_decisions,
     normalize_escalations_dir,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import inventory as mod
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
 
@@ -293,6 +296,31 @@ class TestDecisionProject:
             mod.OpenItem(key=mod.escalation_key('/q', 'esc-1-1'), escalation_id='esc-1-1', decision_project='reify')
 
 
+class TestStoreTaskId:
+    @pytest.mark.parametrize(
+        ('task_id', 'expected'),
+        [('4125', '4125'), ('dashboard-watchdog-restart-ceiling', None), ('', None), (None, None)],
+    )
+    def test_only_a_store_task_id_names_a_task(self, task_id, expected):
+        item = mod.OpenItem(key=mod.escalation_key('/q', 'esc-1-1'), escalation_id='esc-1-1', task_id=task_id)
+
+        assert item.store_task_id == expected
+
+    def test_a_reconciliation_queue_escalation_names_no_task_of_its_project(self):
+        queue = '/src/dark-factory/data/reconciliation/escalations'
+        item = mod.OpenItem(key=mod.escalation_key(queue, 'esc-7459-1'), escalation_id='esc-7459-1',
+                            queue_dir=queue, task_id='7459')
+
+        assert item.store_task_id is None
+
+    def test_a_decision_item_from_a_reconciliation_queue_keeps_its_task(self):
+        queue = '/src/dark-factory/data/reconciliation/escalations'
+        item = mod.OpenItem(key=mod.decision_key('reify-recon-esc-7459-1'), decision_id='reify-recon-esc-7459-1',
+                            decision_project='reify', queue_dir=queue, project='reify', task_id='7459')
+
+        assert item.store_task_id == '7459'
+
+
 class TestQueueTag:
     def test_the_two_known_queue_shapes(self, df_root):
         assert mod.queue_tag(_queue(df_root)) == ''
@@ -412,3 +440,36 @@ class TestReadOnly:
         assert _snapshot(fleet, df_root) == before
         assert not [p for p in tmp_path.rglob('*.lock')]
         assert not absent_queue.exists()
+
+
+class TestAuditKey:
+    def test_an_audit_key_names_its_decision_and_round_trips(self):
+        key = mod.audit_key('dec-1')
+
+        assert key == ('audit', 'dec-1')
+        assert mod.parse_key(mod.key_str(key)) == key
+
+    @pytest.mark.parametrize('text', ['["audit"]', '["audit", "a", "b"]'])
+    def test_a_malformed_audit_key_is_refused(self, text):
+        with pytest.raises(ValueError):
+            mod.parse_key(text)
+
+    def test_the_audit_kind_is_not_a_question_kind(self):
+        assert {'esc', 'decision'} == mod.QUESTION_KINDS
+        assert mod.AUDIT_KIND == 'audit'
+        assert mod.AUDIT_KIND not in mod.QUESTION_KINDS
+
+
+class TestIndexQueue:
+    def test_maps_every_root_and_archive_record_to_its_path(self, df_root):
+        queue = df_root / 'data' / 'escalations'
+        _write_escalation(queue, id='esc-61-1', level=2)
+        _write_escalation(queue, subdir='archive/2026-09-01', id='esc-61-2', status='resolved')
+
+        assert dict(mod.index_queue(str(queue))) == {
+            'esc-61-1': queue / 'esc-61-1.json',
+            'esc-61-2': queue / 'archive' / '2026-09-01' / 'esc-61-2.json',
+        }
+
+    def test_a_missing_queue_indexes_nothing(self, tmp_path):
+        assert dict(mod.index_queue(str(tmp_path / 'absent'))) == {}

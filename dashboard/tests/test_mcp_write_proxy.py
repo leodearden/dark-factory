@@ -1,7 +1,9 @@
-"""Every MCP-write route renders tool results and failures identically.
+"""Every MCP-write route renders tool results and failures, and fails over, identically.
 
 Driven through the public HTTP seam only: each route is posted a valid body
-while ``memory.mcp_tool_call`` is scripted to answer that route's tool.
+while ``memory.mcp_tool_call`` is scripted to answer that route's tool. The
+two-URL cases pin that a write is failed over to the next fused-memory URL only
+when the failure proves it never reached the server.
 """
 
 from __future__ import annotations
@@ -77,11 +79,14 @@ _RENDERED_FAILURES = [
 ]
 
 
-def _scripted(tool_name: str, outcome: object) -> Callable[..., Awaitable[object]]:
-    """Answer *tool_name* with *outcome* (raised if an exception); every other tool gets ``{}``.
+def _scripted_per_url(
+    tool_name: str, outcome_for: Callable[[str], object], dialed: list[str]
+) -> Callable[..., Awaitable[object]]:
+    """Answer *tool_name* at *url* with ``outcome_for(url)`` (raised if an exception).
 
-    The lifespan's background samplers dial the same patched seam, so they are
-    kept inert rather than sharing the route's outcome.
+    Each URL *tool_name* is dialed at is appended to *dialed*. Every other tool
+    gets ``{}``: the lifespan's background samplers dial the same patched seam,
+    so they are kept inert rather than sharing the route's outcome.
     """
 
     async def _scripted_mcp_tool_call(
@@ -89,11 +94,17 @@ def _scripted(tool_name: str, outcome: object) -> Callable[..., Awaitable[object
     ) -> object:
         if called_tool != tool_name:
             return {}
+        dialed.append(url)
+        outcome = outcome_for(url)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
     return _scripted_mcp_tool_call
+
+
+def _scripted(tool_name: str, outcome: object) -> Callable[..., Awaitable[object]]:
+    return _scripted_per_url(tool_name, lambda _url: outcome, dialed=[])
 
 
 def _post_with_tool_outcome(
@@ -159,3 +170,79 @@ def test_failure_names_its_type_once_capped_in_the_502_detail_but_whole_in_the_w
     assert _call_site_warnings(caplog, tool_name) == [
         f'{tool_name} failed for {url}: {rendered_cause}'
     ]
+
+
+def _two_fused_memory_urls(client) -> tuple[str, str]:
+    first, second = client.app.state.config.fused_memory_urls
+    return first, second
+
+
+def _post_with_per_url_outcomes(
+    client, path: str, body: dict, tool_name: str, outcomes: dict[str, object]
+) -> tuple[httpx.Response, list[str]]:
+    dialed: list[str] = []
+    scripted = _scripted_per_url(tool_name, outcomes.__getitem__, dialed)
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=scripted)):
+        resp = client.post(path, json=body)
+    return resp, dialed
+
+
+@pytest.mark.parametrize(
+    'exc',
+    [
+        pytest.param(httpx.ReadTimeout('read timed out'), id='ReadTimeout'),
+        pytest.param(httpx.WriteTimeout('write timed out'), id='WriteTimeout'),
+        pytest.param(_http_status_error('server error'), id='HTTPStatusError'),
+        pytest.param(ValueError('bad payload'), id='ValueError'),
+        pytest.param(TimeoutError('slow'), id='TimeoutError'),
+    ],
+)
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_ambiguous_failure_on_the_first_url_is_never_repeated_on_the_next(
+    two_url_client, path, body, tool_name, exc
+):
+    first, second = _two_fused_memory_urls(two_url_client)
+    resp, dialed = _post_with_per_url_outcomes(
+        two_url_client, path, body, tool_name, {first: exc, second: {'ok': True}}
+    )
+
+    assert dialed == [first]
+    assert resp.status_code == 502
+    assert resp.json()['error'] == 'fused_memory_outcome_unknown'
+    assert resp.json()['detail'].startswith(f'{first}: ')
+    assert second not in resp.json()['detail']
+
+
+@pytest.mark.parametrize(
+    'exc',
+    [
+        pytest.param(httpx.ConnectError('refused'), id='ConnectError'),
+        pytest.param(httpx.ConnectTimeout('connect timed out'), id='ConnectTimeout'),
+        pytest.param(httpx.PoolTimeout(''), id='PoolTimeout'),
+    ],
+)
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_undelivered_failure_on_the_first_url_fails_over_to_the_next(
+    two_url_client, path, body, tool_name, exc
+):
+    first, second = _two_fused_memory_urls(two_url_client)
+    resp, dialed = _post_with_per_url_outcomes(
+        two_url_client, path, body, tool_name, {first: exc, second: {'ok': True}}
+    )
+
+    assert dialed == [first, second]
+    assert resp.status_code == 200
+    assert resp.json() == {'ok': True}
+
+
+@pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
+def test_undelivered_failure_on_every_url_is_unreachable(two_url_client, path, body, tool_name):
+    first, second = _two_fused_memory_urls(two_url_client)
+    refused = httpx.ConnectError('refused')
+    resp, dialed = _post_with_per_url_outcomes(
+        two_url_client, path, body, tool_name, {first: refused, second: refused}
+    )
+
+    assert dialed == [first, second]
+    assert resp.status_code == 502
+    assert resp.json()['error'] == 'fused_memory_unreachable'

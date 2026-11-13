@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from shared.project_layout import tasks_db
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_projection import (
@@ -33,6 +34,8 @@ from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _FULL_ROW: dict[str, Any] = {
     'id': '7',
@@ -49,6 +52,8 @@ _FULL_ROW: dict[str, Any] = {
     'claimant_run_id': None,
     'heartbeat_at': None,
     'candidate_key': None,
+    'created_at': '2026-10-22T00:00:00.000Z',
+    'created_at_source': 'stamped',
 }
 
 
@@ -78,6 +83,23 @@ def test_requested_metadata_keys_present_on_the_task_are_kept_and_absent_ones_om
 def test_id_is_always_returned():
     assert _project(['status']) == {'id': '7', 'status': 'pending'}
     assert _project([]) == {'id': '7'}
+
+
+def test_a_requested_created_at_key_a_store_without_the_columns_lacks_is_omitted():
+    unmigrated = {
+        key: value
+        for key, value in _FULL_ROW.items()
+        if key not in ('created_at', 'created_at_source')
+    }
+
+    assert _project(['created_at', 'created_at_source'], unmigrated) == {'id': '7'}
+
+
+def test_a_requested_core_row_key_the_row_lacks_fails_loudly_rather_than_vanishing():
+    broken = {key: value for key, value in _FULL_ROW.items() if key != 'status'}
+
+    with pytest.raises(KeyError, match='status'):
+        _project(['status'], broken)
 
 
 def test_no_metadata_entry_means_no_metadata_key():

@@ -8,7 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `update_task` with none of `prompt`, `metadata`, `title`, `description`, `details`, `priority` or `dependencies` now raises `NoFieldsToUpdateError` (wire `error_type='NoFieldsToUpdateError'`) instead of bumping `updated_at` and returning `updated: True`; `dependencies=[]` and `metadata='{}'` still write (task 4867).
+- fused-memory's primary and recon-report MCP servers now refuse a tool call naming an argument the tool does not declare, instead of silently dropping it: a structured `ToolError` with `code='unknown_argument'`, each unknown name with its `closest_declared` name (a spelling guess, so no ready-to-resubmit call is offered) and the `declared` list. Nothing runs, and the server logs one WARNING per refusal. The declared set is read live from the tool's schema; the guard lets the call through unchecked when there is no usable schema. Fixed the in-repo callers that relied on the drop: the dashboard's Unpin no longer clears the whole override row (it sent `fields`; now one `field` per call), and its pin-queue reorder sends `ordered_task_ids` (task 4867).
+
 ### Added
+
+#### `mem0.persist_history` keeps mem0's change history off the shared DB (task 6100)
+
+New restart-only leaf `Mem0BackendConfig.persist_history`. It defaults to True, and
+under that default the config mem0 receives is byte-identical to before. At False,
+each mem0 instance keeps its history in a private in-memory SQLite DB instead of the
+process-shared `$MEM0_DIR/history.db`. The conftest `mock_config` and
+`fused-memory/scripts/bake_off_storage_shape.py::run_bake_off` now turn it off, and no
+longer patch mem0's private `instance.db.add_history`.
 
 #### `consolidate_memories` teaches the write-time topic guard its topic (task 3135)
 
@@ -1711,6 +1725,23 @@ points at a strictly smaller key, and no cycle can form. What an operator will s
 shadows), and a park owner can pass a lower-key park on a key it has not parked.
 `request_park_eviction` behaves as before. Rationale:
 `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, Amendment (task 7799).
+
+#### resolve_escalation_shas reports git faults as failed_shas (task 7485)
+
+- **A git fault is never read as "no twin".** `GitOps.resolve_rebased_citation` used to
+  return None, the "already on main, not a commit, or no twin" answer, when git could not
+  answer: a `project_root` that is not a git repository, an unknown main branch, or a
+  failed `diff-tree`, `patch-id` or `log` mid-lookup. It now raises the new
+  `GitQueryFailed` for each of these (`WorktreeMissing` when `project_root` no longer
+  exists). Only empty output stays a fact.
+- **Only tokens that name a commit count against the cap.** One `git cat-file
+  --batch-check` (`GitOps.commits_named`) checks every cited token's object type before
+  `MAX_CITED_SHAS_RESOLVED` is applied. UUID segments, digit runs and hashes are dropped,
+  so they no longer push a real SHA into `skipped_shas`.
+- **New response key `failed_shas: [{cited, error}]`**, in cited order, for each token git
+  could not answer for. Nothing may be concluded about those tokens. Each fault is also
+  logged at WARNING with its traceback. When git cannot check the tokens at all, every
+  token counts against the cap, so the response stays bounded.
 
 #### plan.json writers serialise on a cross-writer mutex (task 5745)
 

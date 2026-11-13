@@ -13,9 +13,7 @@ re-copies it (INV-5). The append / prune / count step is public on its own as
 Task 3689 PROMOTED it to ``shared`` when that fourth consumer arrived:
 ``shared.mcp_markup_middleware`` keys a burst by ``(project, policy_outcome)``,
 and ``shared`` is the base layer every other package imports, so it may not
-import ``fused_memory``. The old module is now a re-export shim naming this one
-as the single home; fused-memory's own test suite keeps exercising the
-contract through that path, which is what pins the shim honest.
+import ``fused_memory``.
 
 Uses bulk_reset_guard's guard-side injectable-clock convention
 (``time_provider`` stored as ``self._now``) so a 3600s window can be tested by

@@ -65,7 +65,14 @@ package's schema, and this package's fixture feed renders in the portal (two-way
     `data.merge_sha` is the landed fact; `train_merged` carries `member_task_ids`; `merge_verify` and
     `workflow_verify` carry `passed` and `duration_ms`; `phase_enter`/`phase_exit` carry the phase in
     `events.phase`; `scheduler_paused`/`scheduler_resumed`; `escalation_created`/`escalation_resolved`, whose `data`
-    carries `level` on some rows only (452 of 2,675 on 2026-10-14); `task_results.review_cycles`);
+    carries `level` on some rows only (452 of 2,675 on 2026-10-14), and which the feed no longer reads: open
+    escalations come from the escalation queue below (§12, 2026-11-02); `task_results.review_cycles`);
+  - the escalation queue at `<root>/data/escalations/` (`shared.project_layout.escalation_queue_dir`), holding
+    one `esc-*.json` per pending record at its root (`escalation/src/escalation/models.py::Escalation`).
+    Resolving or dismissing a record archives it under `archive/<date>/`
+    (`escalation/src/escalation/queue.py::EscalationQueue.resolve`); parking keeps it pending at level 2
+    (`escalation/src/escalation/queue.py::EscalationQueue.park`). Measured twice on 2026-11-02: 24, then 25,
+    pending records at the root, against 1,811, then 1,841, left open by replaying runs.db's escalation rows;
   - the verify archive at `<root>/data/verify-logs/<task_id>/` (`attempt-N[.module].junit-<ts>.xml.gz`
     for task legs on every verify — 2,294 reports under 1,885 task directories on 2026-10-14 — and for
     merge runs only under `merge_verify_breadth: full`; `summary-<ts>.json` with `category` and `rc`;
@@ -101,7 +108,8 @@ client-feed/src/client_feed/
   policy.py          the publisher's config: root, dirs, visibility globs, reveal proportion and floor, free/never globs, counting caps
   feed_io.py         append-only writer (O_APPEND, O_NOFOLLOW, monotonic seq), torn-tail truncation, rotation, atomic state (mkstemp+rename), inbox tailer, cursor file
   fold.py            state = fold(feed) up to a seq watermark; the one reducer both state.json and tests use
-  sources/tasks.py   tasks.db read-only projection (tag pinned), incremental by updated_at; waiting_on from open escalations
+  sources/tasks.py   tasks.db read-only projection (tag pinned), incremental by updated_at; waiting_on from sources/escalations.py
+  sources/escalations.py  the escalation queue root's pending records, read-only: each open escalation by task, at its current level
   sources/events.py  runs.db read-only cursor over events.id → typed events, incl. factory_state and review_completed
   sources/git.py     head, branches, merge stats, visible-tree snapshot with counted lines and kinds, blob content via cat-file
   sources/archive.py junit → test_results (ids, outcomes, durations, exception type); summary → gate legs
@@ -114,8 +122,8 @@ client-feed/src/client_feed/
 client-feed/tests/   contract fixtures, source tests over fixture stores, audit-hook isolation, canary, end-to-end on this repo
 ```
 
-The publisher never imports `orchestrator`, `fused_memory` or `dashboard`; it depends on `shared` only
-for `shared.project_layout` (`tasks_db`, `runs_db`) and `shared.task_metadata` (`done_provenance`), plus, from
+The publisher never imports `orchestrator`, `fused_memory`, `dashboard` or `escalation`; it depends on `shared` only
+for `shared.project_layout` (`tasks_db`, `runs_db`, `escalation_queue_dir`) and `shared.task_metadata` (`done_provenance`), plus, from
 §14, `shared.defects` (the ref rule, in the non-vendorable `defect_ref.py`) and `shared.mcp_session` (the filer only),
 and on `pydantic`, `pyyaml` and the standard library. It uses no helper that defaults to the factory's
 own checkout (`shared.project_layout.default_project_root` is banned in `client_feed` by a test).
@@ -141,7 +149,10 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
    caps. Nothing the portal writes can widen what a client may see.
 5. **Direct read-only reads of the two stores, never the fused-memory MCP.** Opened with `mode=ro`
    URIs; `tasks` queried with `tag = 'master'` pinned (the only tag on the live store, checked
-   2026-10-14). The publisher has no write path to any store.
+   2026-10-14). The escalation queue's root records are read read-only too, never through the
+   escalation server and without taking its locks
+   (`client-feed/src/client_feed/sources/escalations.py::read_open_escalations`). The publisher has no
+   write path to any store.
 6. **Field allowlist, not denylist.** A task contributes `id, title, status, updated_at, depends_on,
    prd_path, prd_task_label, landed_commit, waiting_on`. `description`, `details`, `test_strategy`
    and the rest of `metadata` never leave the publisher. Titles and PRD excerpts have `/home/...` and
@@ -162,8 +173,10 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
    reader validates as closed is not minor for that reader; §14.3 states the ordering that makes it safe.
 10. **Never hide red, from recorded sources.** A failed verify is `verify_run.passed == false`; a
     blocked task is `task_upserted` with that status and `waiting_on: leo` when an open escalation
-    whose recorded `level` is 2 exists for it, else `factory` (an open escalation with no recorded
-    level is the factory's own ladder, not Leo); `factory_state` carries `scheduler: running|paused`, `last_event_at`
+    at level 2 exists for it, else `factory`. The open escalations are the escalation queue root's pending
+    records, each at its current level. An escalation counts for its own task and for the task of each
+    member that is itself a pending record, so an L2 cluster makes every member task wait on Leo.
+    `factory_state` carries `scheduler: running|paused`, `last_event_at`
     and `idle_seconds` from the project's own `runs.db`. Where a fact is not recorded (no junit, no
     summary) the event says `not_recorded`, never pass.
 11. **The publisher reports its own health.** Every `heartbeat` carries `head`, `as_of`,
@@ -244,7 +257,7 @@ corrupt feed. Events with a natural key (`task_upserted.task_id`, `prd_upserted.
 | `heartbeat` | `head`, `as_of`, `engagement_version`, `watermark_seq`, `degraded: [{source, reason}]` | publisher | every pass (default 5 s) and on start |
 | `factory_state` | `scheduler: running\|paused`, `since`, `last_event_at`, `idle_seconds` | `scheduler_paused`/`scheduler_resumed`; newest `events.timestamp` | when any field changes |
 | `prd_upserted` | `prd_path`, `title`, `excerpt`, `task_counts: {status: n}` | `sources/prds.py`; title = first H1, excerpt = first non-heading paragraph, paths redacted | first seen or counts change |
-| `task_upserted` | `task_id`, `title`, `status`, `waiting_on: factory\|leo\|null`, `updated_at`, `depends_on`, `prd_path`, `prd_task_label`, `landed_commit` | `sources/tasks.py`; open escalation from `escalation_created`/`escalation_resolved` | `updated_at` moves past the cursor or an escalation opens/closes |
+| `task_upserted` | `task_id`, `title`, `status`, `waiting_on: factory\|leo\|null`, `updated_at`, `depends_on`, `prd_path`, `prd_task_label`, `landed_commit` | `sources/tasks.py`; open escalations from the escalation queue's pending records (`client-feed/src/client_feed/sources/escalations.py::read_open_escalations`) | `updated_at` moves past the cursor or an escalation opens/closes |
 | `task_phase` | `task_id`, `phase`, `entered: bool`, `at` | `phase_enter`/`phase_exit` | per event |
 | `verify_run` | `run_key`, `task_id`, `kind: task\|merge`, `passed`, `duration_ms`, `commit`, `legs: [{name, category, rc}] \| not_recorded` | `workflow_verify`/`merge_verify` + summary JSON | per event |
 | `test_results` | `run_key`, `counts: {passed, failed, skipped, errored, truncated}`, `duration_ms`, `cases: [{id, outcome, duration_ms, criterion, exception_type}]` | junit under the task's archive dir matching the run; the criterion map file beside it | when a junit report is found for a `verify_run` |
@@ -315,7 +328,8 @@ portal's tests also run); `client-feed criteria-results …` (§7.7).
 
 For a publisher configured with root R, output directory O and inbox directory I: every byte it writes
 under O is a function of R's git objects, R's `.taskmaster/tasks/tasks.db` rows with `tag='master'`,
-R's `data/orchestrator/runs.db`, R's `data/verify-logs/`, R's `acceptance/criteria.yaml`, the policy,
+R's `data/orchestrator/runs.db`, R's `data/escalations/` queue-root records, of which only `id`,
+`task_id`, `status`, `level` and `members` are read, R's `data/verify-logs/`, R's `acceptance/criteria.yaml`, the policy,
 and I's `inbox.jsonl` and `engagement.json`, filtered by the policy's visible set. It opens no other
 path. It writes nowhere but O. The portal account reads O and nothing under R.
 
@@ -334,7 +348,7 @@ The client defect filer is a separate process under its own invariant (§14.5); 
 | B7 | Red shown | an archived red attempt summary (a leg rc ≠ 0) and a junit with one failure under the task's archive dir | `verify_run.passed == false`; `test_results.counts.failed == 1`; `exception_type` present, no message |
 | B8 | Not recorded | a `verify_run` whose task dir has no junit | `test_results` absent; `verify_run.legs == "not_recorded"` |
 | B9 | Factory state | `scheduler_paused` then nothing for 3 h | `factory_state.scheduler == paused`, `idle_seconds ≥ 10800` |
-| B10 | Waiting on Leo | task 9 blocked with an open `escalation_created` level 2 | `task_upserted.waiting_on == "leo"`; after `escalation_resolved`, `"factory"` |
+| B10 | Waiting on Leo | task 9 blocked, an L1 promoted to a pending L2 | `task_upserted.waiting_on == "leo"`; after the L2 is resolved and its members cascade, `"factory"` |
 | B11 | Visible set | tree with `dark-factory-orchestrator.yaml`, `.mcp.json`, `plans/review.md`, `src/a.py`; policy visible `src/**`, `tests/**` | `tree_snapshot.files` lists only `src/a.py`; a reveal of `.mcp.json` is `reveal_refused not_visible` |
 | B12 | Reveal within budget | 1,000 counted lines, proportion 0.25, floor 50; request a 200-line production file | `file_revealed` with content; `spent_lines == 200` |
 | B13 | Reveal over budget and floor | spent 210 of 250; request a 100-line file; then a 10-line file | both `reveal_refused over_budget` (the first costs 100: 310 > 250; the second costs the floor 50: 260 > 250) |
@@ -652,6 +666,52 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
   - (f) For σ2: the filer's template is another `UNITS` entry with its own explicit `--unit` call
     site in setup-host. `tests/scripts/test_render_systemd_unit.py::test_setup_host_renders_each_unit_from_the_template_its_spec_names`
     pairs each registry key with that call site.
+
+- 2026-11-02, from task 7280. This supersedes the closing rule, the runs.db replay and the
+  follow-up ticket of 2026-10-20 (b), and closes tkt_0RW1F0587N3HXAH0PN8A4A5TYJ:
+  - (a) Open escalations are the pending records at the root of the escalation queue
+    (`client-feed/src/client_feed/sources/escalations.py::read_open_escalations`). runs.db's
+    `escalation_created` and `escalation_resolved` rows are no longer read. A record is open at its
+    current `level` for its own task and for the task of each member that is itself a pending root
+    record. A member's task comes from that record's `task_id`, never from its id.
+    `client-feed/src/client_feed/sources/tasks.py::waiting_on` is otherwise unchanged. No level is
+    unrecorded any more, because the producer defaults it to 0.
+  - (b) A missing or unlistable queue degrades `events`, and the reason names `data/escalations`. A
+    malformed or unreadable record is skipped and counted under `events`
+    (`skipped N records in data/escalations: malformed_record=N`). A `status` outside the producer's
+    `pending`, `resolved` and `dismissed` makes the record malformed, so it is counted rather than
+    read as closed. `client-feed dump-sources` prints the open escalations and names each skipped
+    record by file. A record that is gone between listing and reading was archived in between, so
+    it is not open.
+  - (c) The publisher reads the queue as its own unit
+    (`client-feed/src/client_feed/publisher.py::_escalations_unit`), apart from runs.db. An unreadable
+    runs.db therefore no longer blinds `waiting_on`, and an unreadable queue does not hold the stream.
+    While the queue is unreadable, each task keeps its recorded `waiting_on`, as it did while runs.db
+    was unreadable.
+  - (d) No `Source` member is added and `FEED_VERSION` is unchanged. `events` already names the
+    factory's orchestrator records to the client, and a new member of an enum the portal validates as
+    closed is not a minor change for it (§4.9). The reason string tells the two stores apart for the
+    operator.
+  - (e) `client-feed/tests/test_import_boundary.py` forbids importing `escalation`. The reader parses
+    the producer's files and never imports the producer.
+  - (f) `tests/scripts/test_client_feed_escalation_queue_boundary.py` checks the reader against the
+    real producer. It drives the escalation server's own tools (`escalate_blocker`, `promote_to_l2`,
+    `resolve_issue`) on a tmp root and checks:
+    - `level`, in every test;
+    - that every record the producer leaves parses, in every read: a `status` or a field type the
+      reader refuses would be skipped as malformed, which for a closed record reads exactly like a
+      close, so a skip fails the test;
+    - own-task attribution, and member attribution across tasks: an L1 on one task promoted under
+      another task's L2 makes the member task wait on `leo` until the cascade;
+    - the `status` filter: a resolution whose archival fails, forced by a regular file at
+      `data/escalations/archive`, leaves the closed records at the root
+      (`escalation/src/escalation/queue.py::EscalationQueue._archive_resolved`), and they are not open;
+    - archival, the L2 cascade and park.
+
+    The records that `client-feed/tests/_stores.py::EscalationQueueDir` writes by hand cannot catch
+    producer drift, any more than the copied DDL can (2026-10-21 (g)). For this seam the boundary test
+    does.
+
 
 ## 13. Open questions (tactical)
 

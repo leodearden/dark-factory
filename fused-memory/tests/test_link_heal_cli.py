@@ -1,4 +1,4 @@
-"""The link-heal CLI (tasks 6181, 6184; plans/write-triage-link-healing-prd.md H1, H2).
+"""The link-heal CLI (tasks 6181, 6184, 7159; plans/write-triage-link-healing-prd.md H1, H2).
 
 ``scripts/link_heal.py`` is driven through ``await run(argv, env)``. The env
 swaps in the in-process server from ``_link_heal_harness`` as the transport,
@@ -14,6 +14,9 @@ import dataclasses
 import hashlib
 import json
 import os
+import shlex
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,8 @@ from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     COMPLETION_META,
     DF,
+    FAKE_ADJUDICATOR_MODEL,
+    FAKE_PROMPT_SHA256,
     REIFY,
     WITHOUT_LINK_HEAL_PREFIX,
     Answer,
@@ -35,17 +40,23 @@ from _link_heal_harness import (
     assert_store_invariants,
     build_harness,
 )
+from escalation.queue import EscalationQueue
 
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
 from fused_memory.maintenance.link_heal import RunCounts, Verdict
+from fused_memory.maintenance.link_heal_calibration import load_soak_population
 from fused_memory.maintenance.link_heal_executor import (
     ADJUDICATOR_ANCHOR,
+    CALIBRATION_ANCHOR,
+    RUN_REPORT_ANCHOR,
     SHARE_STOP,
     RunReport,
+    undo_command,
 )
 from fused_memory.maintenance.link_heal_ledger import (
     LEDGER_FILENAME,
     LOCK_FILENAME,
+    ActionState,
     LinkHealLedger,
     RunLock,
     RunRow,
@@ -99,7 +110,13 @@ class Workspace:
     def data_dir(self) -> Path:
         return self.root / 'reconciliation'
 
-    def write_config(self, *, max_actions_per_run: int = 25) -> None:
+    @property
+    def reports_dir(self) -> Path:
+        return self.root / 'reports'
+
+    def write_config(
+        self, *, max_actions_per_run: int = 25, link_heal: Mapping[str, Any] | None = None,
+    ) -> None:
         self.config_path.write_text(yaml.safe_dump({
             'server': {'port': SERVER_PORT},
             'taskmaster': {'project_root': str(self.root / 'dark-factory')},
@@ -108,8 +125,14 @@ class Workspace:
                 'max_actions_per_run': max_actions_per_run,
                 'backlog_multiplier': 5,
                 'write_failure_streak': 3,
+                **(link_heal or {}),
             },
         }))
+
+    def pending_escalations(self, anchor: str) -> list[Any]:
+        """The home project's pending escalations filed under *anchor*."""
+        queue = EscalationQueue(self.home_root / 'data' / 'escalations')
+        return [record for record in queue.get_pending() if record.task_id == anchor]
 
     def runs(self) -> list[RunRow]:
         """Every run the ledger holds, newest first; none when it does not exist."""
@@ -132,6 +155,28 @@ class Workspace:
         ledger = LinkHealLedger(self.ledger_path)
         try:
             return len(ledger.adjudication_verdicts({run_id}))
+        finally:
+            ledger.close()
+
+    def action_states(self, run_id: str) -> list[ActionState]:
+        """The states of the heals plan run *run_id* staged, oldest first."""
+        ledger = LinkHealLedger(self.ledger_path)
+        try:
+            return [row.state for row in ledger.run_actions(run_id)]
+        finally:
+            ledger.close()
+
+    def calibrate_fake_adjudicator(self, *, passed: bool) -> str:
+        """Ledger a calibration of the fake adjudicator's model and prompt; its run id."""
+        self.ledger_dir.mkdir(parents=True, exist_ok=True)
+        ledger = LinkHealLedger(self.ledger_path)
+        try:
+            run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
+            ledger.add_calibration(
+                run_id, model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=FAKE_PROMPT_SHA256,
+                population_sha256='0' * 64, passed=passed, report={'passed': passed},
+            )
+            return run_id
         finally:
             ledger.close()
 
@@ -571,6 +616,22 @@ class TestApplyAndUndo:
         assert first['counts']['applied'] == 1
         assert second['counts']['applied'] == 2
         assert harness.mem0.write_count == 3
+
+
+class TestTheUndoCommandOperatorsAreShown:
+    RUN_ID = '0123456789abcdef0123456789abcdef'
+
+    def test_it_names_this_script_from_the_repo_root(self):
+        script, *_arguments = shlex.split(undo_command(self.RUN_ID))
+
+        assert Path(script).parts == SCRIPT_PATH.resolve().parts[-3:]
+
+    def test_this_script_parses_it_as_an_undo_of_that_run(self):
+        _script, *arguments = shlex.split(undo_command(self.RUN_ID))
+
+        args = cli.build_parser().parse_args(arguments)
+
+        assert (args.command, args.run) == ('undo', self.RUN_ID)
 
 
 class TestExitCodes:
@@ -1038,3 +1099,382 @@ class TestStatusShowsWhatAPlanCameTo:
         assert report['plan_path'] == str(workspace.root / 'reviewed.json')
         assert await run_cli(env, workspace, 'status') == 0
         assert report['plan_path'] in latest_plan_line(status_lines(capsys), RunSource.CORPUS)
+
+
+SWEEP_NOW = datetime(2026, 11, 12, 2, 15, tzinfo=UTC)
+NEW = '2026-11-11T12:00:00+00:00'
+FIXTURES = Path(__file__).resolve().parent / 'fixtures'
+RATINGS = FIXTURES / 'link_heal_calibration_ratings.jsonl'
+ITEMS = FIXTURES / 'link_heal_calibration_items.json'
+
+
+def sweep_env_for(harness: LinkHealHarness, workspace: Workspace, **kwargs: Any) -> Any:
+    """:func:`env_for`, with the reports under *workspace* and the clock at :data:`SWEEP_NOW`."""
+    return dataclasses.replace(
+        env_for(harness, workspace, **kwargs),
+        reports_dir_for=lambda _config: workspace.reports_dir,
+        now=lambda: SWEEP_NOW,
+    )
+
+
+def seed_sightings_created(
+    harness: LinkHealHarness, indices: range, *, created_at: str = NEW, project: str = DF,
+) -> None:
+    """Sightings ``cli sighting <n>`` for each n in *indices*, created at *created_at*."""
+    for index in indices:
+        child, parent = _sighting_ids(index)
+        harness.seed_link(
+            kind=SIGHTING_KIND, child=child, parent=parent, project=project,
+            child_text=f'cli sighting {index}', parent_text=f'cli parent {index}',
+            meta={'created_at': created_at},
+        )
+
+
+async def sweep(env: Any, workspace: Workspace, capsys, *argv: str) -> tuple[int, dict[str, Any]]:
+    code = await run_cli(env, workspace, 'sweep', *argv)
+    return code, printed_report(capsys)
+
+
+def asked_texts(fake: FakeAdjudicator) -> list[str]:
+    return sorted(pair.child_text for pair in fake.pairs)
+
+
+class TestSweep:
+    @pytest.mark.asyncio
+    async def test_a_dry_run_prints_its_runs_report_and_counts(self, harness, workspace, capsys):
+        env = sweep_env_for(harness, workspace)
+
+        code, report = await sweep(env, workspace, capsys, '--dry-run')
+
+        assert code == 0
+        assert report['apply_run_id'] is None
+        (run,) = workspace.runs()
+        assert (run.run_id, run.source, run.writes) == (report['plan_run_id'], RunSource.SWEEP, False)
+        assert Path(report['report_path']).is_file()
+        assert Path(report['report_path']).parent == workspace.reports_dir
+        assert report['counts']['plan']['examined'] == 0
+        assert report['counts']['apply'] is None
+
+    @pytest.mark.asyncio
+    async def test_since_and_project_bound_what_is_examined(self, harness, workspace, capsys):
+        seed_sightings_created(harness, range(100, 101), created_at='2026-10-20T00:00:00+00:00')
+        seed_sightings_created(harness, range(101, 102), created_at='2026-10-01T00:00:00+00:00')
+        seed_sightings_created(
+            harness, range(200, 201), created_at='2026-10-20T00:00:00+00:00', project=REIFY,
+        )
+        fake = always(Verdict.EXTENDS)
+
+        code, report = await sweep(
+            sweep_env_for(harness, workspace, adjudicator=fake), workspace, capsys,
+            '--since', '2026-10-11T00:00:00+00:00', '--project', DF,
+        )
+
+        assert code == 0
+        assert asked_texts(fake) == ['cli sighting 100']
+        assert report['counts']['plan']['examined'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_report_it_cannot_write_exits_1_and_says_why(self, harness, workspace, capsys):
+        blocker = workspace.root / 'a-regular-file'
+        blocker.write_text('')
+        env = dataclasses.replace(
+            sweep_env_for(harness, workspace), reports_dir_for=lambda _config: blocker / 'reports',
+        )
+
+        code, report = await sweep(env, workspace, capsys, '--dry-run')
+
+        assert code == 1
+        assert report['report_unwritten']
+        assert report['escalation_id'] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_since_without_an_offset_is_refused_before_any_run(
+        self, harness, workspace, capsys,
+    ):
+        code = await run_cli(
+            sweep_env_for(harness, workspace), workspace, 'sweep', '--since', '2026-10-11',
+        )
+
+        assert code == 2
+        assert '--since' in capsys.readouterr().err
+        assert workspace.runs() == []
+
+    @pytest.mark.asyncio
+    async def test_without_a_project_it_sweeps_the_configured_projects(
+        self, harness, workspace, capsys,
+    ):
+        workspace.write_config(link_heal={'projects': [REIFY]})
+        seed_sightings_created(harness, range(100, 101))
+        seed_sightings_created(harness, range(200, 201), project=REIFY)
+        fake = always(Verdict.EXTENDS)
+
+        code, _report = await sweep(
+            sweep_env_for(harness, workspace, adjudicator=fake), workspace, capsys,
+        )
+
+        assert code == 0
+        assert asked_texts(fake) == ['cli sighting 200']
+
+    @pytest.mark.asyncio
+    async def test_with_no_project_configured_it_sweeps_the_home_project(
+        self, harness, workspace, capsys,
+    ):
+        home = resolve_project_id(str(workspace.home_root))
+        seed_sightings_created(harness, range(300, 301), project=home)
+        seed_sightings_created(harness, range(100, 101))
+        fake = always(Verdict.EXTENDS)
+
+        code, _report = await sweep(
+            sweep_env_for(harness, workspace, adjudicator=fake), workspace, capsys,
+        )
+
+        assert code == 0
+        assert [pair.key.split(':')[0] for pair in fake.pairs] == [home]
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_with_adjudication_failures_exits_1(self, harness, workspace, capsys):
+        seed_sightings_created(harness, range(100, 102))
+        fake = FakeAdjudicator(
+            lambda text: AdjudicationFailure.PARSE_FAILURE if text.endswith('100') else Verdict.EXTENDS,
+        )
+
+        code, report = await sweep(
+            sweep_env_for(harness, workspace, adjudicator=fake), workspace, capsys, '--project', DF,
+        )
+
+        assert code == 1
+        assert report['counts']['plan']['adjudication_failed'] == 1
+        assert report['outcome'] == 'partial'
+
+    @pytest.mark.asyncio
+    async def test_its_report_is_filed_into_the_home_queue(self, harness, workspace, capsys):
+        code, report = await sweep(sweep_env_for(harness, workspace), workspace, capsys)
+
+        assert code == 0
+        (filed,) = workspace.pending_escalations(RUN_REPORT_ANCHOR)
+        assert report['report_path'] in filed.summary
+        assert filed.id == report['escalation_id']
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_sweep_action_is_refused_before_any_run(
+        self, harness, workspace, capsys,
+    ):
+        workspace.write_config(link_heal={'sweep_actions': ['detach', 'explode']})
+
+        code = await run_cli(sweep_env_for(harness, workspace), workspace, 'sweep')
+
+        assert code == 2
+        assert 'explode' in capsys.readouterr().err
+        assert workspace.runs() == []
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_server_is_refused_before_any_adjudication(
+        self, harness, workspace, capsys,
+    ):
+        seed_sightings_created(harness, range(100, 101))
+        fake = always(Verdict.EXTENDS)
+        env = sweep_env_for(harness, workspace, tool_caller=refusing_tool_caller(), adjudicator=fake)
+
+        code = await run_cli(env, workspace, 'sweep', '--project', DF)
+
+        assert code == 2
+        assert DEFAULT_SERVER_URL in capsys.readouterr().err
+        assert fake.calls == []
+        assert workspace.runs() == []
+
+
+def calibrated_answers(overrides: Mapping[str, Answer] | None = None) -> dict[str, Answer]:
+    """Each rated pair's final verdict, keyed by its child text."""
+    answers: dict[str, Answer] = {
+        item.child_text: item.final for item in load_soak_population(RATINGS, ITEMS)
+    }
+    answers.update(overrides or {})
+    return answers
+
+
+async def calibrate(env: Any, workspace: Workspace, capsys, *paths: Path) -> tuple[int, dict[str, Any]]:
+    ratings, items = paths or (RATINGS, ITEMS)
+    code = await run_cli(env, workspace, 'calibrate', '--ratings', str(ratings), '--items', str(items))
+    return code, printed_report(capsys)
+
+
+class TestCalibrate:
+    @pytest.mark.asyncio
+    async def test_a_passing_adjudicator_exits_0_naming_its_report(
+        self, harness, workspace, capsys,
+    ):
+        fake = FakeAdjudicator(calibrated_answers().__getitem__)
+
+        code, report = await calibrate(sweep_env_for(harness, workspace, adjudicator=fake), workspace, capsys)
+
+        assert code == 0
+        assert report['passed'] is True
+        assert Path(report['report_path']).is_file()
+        assert Path(report['report_path']).parent == workspace.reports_dir
+        (run,) = workspace.runs()
+        assert (run.run_id, run.source) == (report['run_id'], RunSource.CALIBRATION)
+        assert workspace.pending_escalations(CALIBRATION_ANCHOR) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_adjudicator_exits_1_and_files_the_escape(
+        self, harness, workspace, capsys,
+    ):
+        fake = always(Verdict.UNCLEAR)
+
+        code, report = await calibrate(sweep_env_for(harness, workspace, adjudicator=fake), workspace, capsys)
+
+        assert code == 1
+        assert report['passed'] is False
+        (filed,) = workspace.pending_escalations(CALIBRATION_ANCHOR)
+        assert filed.id == report['escalation_id']
+
+    @pytest.mark.asyncio
+    async def test_a_missing_input_file_is_refused_before_any_run(self, harness, workspace, capsys):
+        missing = workspace.root / 'no-such-ratings.jsonl'
+
+        code = await run_cli(
+            sweep_env_for(harness, workspace), workspace,
+            'calibrate', '--ratings', str(missing), '--items', str(ITEMS),
+        )
+
+        assert code == 2
+        assert str(missing) in capsys.readouterr().err
+        assert workspace.runs() == []
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_input_file_is_refused_before_any_run(
+        self, harness, workspace, capsys,
+    ):
+        malformed = workspace.root / 'items.json'
+        malformed.write_text('not json')
+
+        code = await run_cli(
+            sweep_env_for(harness, workspace), workspace,
+            'calibrate', '--ratings', str(RATINGS), '--items', str(malformed),
+        )
+
+        assert code == 2
+        assert 'items.json' in capsys.readouterr().err
+        assert workspace.runs() == []
+
+    @pytest.mark.asyncio
+    async def test_a_passing_calibration_lets_a_writing_sweep_apply(
+        self, harness, workspace, capsys,
+    ):
+        workspace.write_config(link_heal={'writes': True})
+        seed_sightings_created(harness, range(100, 101))
+        fake = FakeAdjudicator(
+            calibrated_answers({'cli sighting 100': Verdict.EXTENDS}).__getitem__,
+        )
+        env = sweep_env_for(harness, workspace, adjudicator=fake)
+        withheld_code, withheld = await sweep(env, workspace, capsys, '--project', DF)
+        assert (withheld_code, withheld['apply_run_id']) == (0, None)
+        assert (await calibrate(env, workspace, capsys))[0] == 0
+
+        code, report = await sweep(
+            env, workspace, capsys, '--project', DF, '--since', '2026-11-01T00:00:00+00:00',
+        )
+
+        assert code == 0
+        assert report['apply_run_id'] is not None
+        assert report['undo_run_id'] == report['apply_run_id']
+        assert report['counts']['apply']['applied'] == 1
+
+
+class TestTheSweepThroughApplyAndStatus:
+    @pytest.mark.asyncio
+    async def test_apply_sweep_drains_the_sweeps_pending_heals(self, harness, workspace, capsys):
+        workspace.write_config(link_heal={'writes': True})
+        seed_sightings_created(harness, range(100, 102))
+        env = sweep_env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        await sweep(env, workspace, capsys, '--dry-run', '--project', DF)
+        assert workspace.pending(RunSource.SWEEP) == 2
+        workspace.calibrate_fake_adjudicator(passed=True)
+
+        code, applied = await apply(env, workspace, capsys, '--sweep')
+
+        assert code == 0
+        assert applied['counts']['applied'] == 2
+        assert workspace.pending(RunSource.SWEEP) == 0
+
+    @pytest.mark.asyncio
+    async def test_status_lists_the_latest_sweep_plan(self, harness, workspace, capsys):
+        seed_sightings_created(harness, range(100, 101))
+        env = sweep_env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        _code, report = await sweep(env, workspace, capsys, '--project', DF)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        lines = status_lines(capsys)
+        assert report['plan_run_id'][:8] in latest_plan_line(lines, RunSource.SWEEP)
+        assert 'sweep  writes no' in run_line(lines, report['plan_run_id'])
+
+
+class TestApplySweepNeedsWrites:
+    @pytest.mark.asyncio
+    async def test_apply_sweep_is_refused_while_writes_are_off(self, harness, workspace, capsys):
+        workspace.write_config(link_heal={'writes': False})
+        seed_sightings_created(harness, range(100, 102))
+        env = sweep_env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        await sweep(env, workspace, capsys, '--dry-run', '--project', DF)
+        assert workspace.pending(RunSource.SWEEP) == 2
+
+        code = await run_cli(env, workspace, 'apply', '--sweep')
+
+        assert code == 2
+        assert 'link_heal.writes' in capsys.readouterr().err
+        assert [run for run in workspace.runs() if run.writes] == []
+        assert harness.mem0.write_count == 0
+        assert workspace.pending(RunSource.SWEEP) == 2
+
+    @pytest.mark.asyncio
+    async def test_apply_sweep_withholds_heals_of_an_uncalibrated_adjudicator(
+        self, harness, workspace, capsys,
+    ):
+        workspace.write_config(link_heal={'writes': True})
+        seed_sightings_created(harness, range(100, 102))
+        env = sweep_env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        _code, planned = await sweep(env, workspace, capsys, '--dry-run', '--project', DF)
+
+        code, applied = await apply(env, workspace, capsys, '--sweep')
+
+        assert code == 0
+        assert harness.mem0.write_count == 0
+        assert workspace.action_states(planned['plan_run_id']) == [
+            ActionState.WITHHELD_UNCALIBRATED, ActionState.WITHHELD_UNCALIBRATED,
+        ]
+        assert workspace.pending(RunSource.SWEEP) == 0
+        assert applied['counts']['withheld_uncalibrated'] == 2
+        assert applied['counts']['applied'] == 0
+
+    @pytest.mark.asyncio
+    async def test_the_writes_leaf_does_not_govern_an_attended_adjudicator_apply(
+        self, harness, workspace, capsys,
+    ):
+        workspace.write_config(link_heal={'writes': False})
+        seed_unrated_sightings(harness, 1)
+        env = env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        await plan_adjudicated(env, workspace, capsys, '--project', DF)
+
+        code, applied = await apply(env, workspace, capsys, '--from-adjudicator')
+
+        assert code == 0
+        assert applied['counts']['applied'] == 1
+        assert harness.mem0.write_count == 1
+
+
+class TestTheNewCommandsHoldTheLock:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('argv', [
+        ('sweep', '--dry-run'),
+        ('calibrate', '--ratings', str(RATINGS), '--items', str(ITEMS)),
+    ])
+    async def test_a_held_lock_is_refused(self, harness, workspace, capsys, argv):
+        workspace.ledger_dir.mkdir(parents=True)
+
+        with RunLock(workspace.ledger_dir / LOCK_FILENAME):
+            code = await run_cli(sweep_env_for(harness, workspace), workspace, *argv)
+
+        assert code == 2
+        assert str(os.getpid()) in capsys.readouterr().err
+        assert workspace.runs() == []

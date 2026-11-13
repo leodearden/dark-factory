@@ -22,7 +22,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.models.reconciliation import Watermark
 from fused_memory.models.scope import ProjectRoot
@@ -39,6 +40,8 @@ from fused_memory.reconciliation.live_workflow_section import (
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 from fused_memory.services.landed_on_main import LandingEvidence, LandingVerdict
 from fused_memory.services.live_workflow_detector import ClaimantLabel
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
 #: Outside the detector's recent-commit window, so a commit here is not live.

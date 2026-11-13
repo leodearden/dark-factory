@@ -88,6 +88,15 @@ class ContextItem:
             self.token_estimate = len(self.formatted) // 4
 
 
+@dataclass(frozen=True)
+class ContextFetchFailure:
+    """An event whose related context could not be fetched: absent context for it is unknown, not empty."""
+
+    event_id: str
+    event_type: str
+    error: str
+
+
 @dataclass
 class AssembledPayload:
     """Result of the ContextAssembler — a token-budgeted chunk of events with
@@ -98,6 +107,7 @@ class AssembledPayload:
     total_tokens: int = 0
     events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
     token_budget: int = 0
+    context_fetch_failures: tuple[ContextFetchFailure, ...] = ()
 
     def budget_report(self) -> dict[str, int]:
         """How much of token_budget this chunk spent, and on how many events and context items."""
@@ -141,11 +151,10 @@ class RunStatus(StrEnum):
     failed = 'failed'
     rolled_back = 'rolled_back'
     circuit_breaker = 'circuit_breaker'
-    # A run whose in-flight stage was cancelled by a restart while
-    # config.resume_after_restart was set. Unlike 'failed', an interrupted run
-    # keeps its drained events and per-run transcript so the startup
-    # adopt-and-resume pass (task σ) can --resume the SAME run_id at its
-    # stage_cursor rather than re-running from stage 1.
+    # Legacy, read-only. Task 2717's retired resume path wrote it for a run
+    # cancelled mid-stage; nothing writes it since task 5514, and
+    # harness.py::ReconciliationHarness._recover_legacy_interrupted_runs
+    # converts any such row to 'failed' at startup.
     interrupted = 'interrupted'
 
 
@@ -165,8 +174,7 @@ class ReconciliationRun(BaseModel):
     instance_id: str | None = None  # EventBuffer.instance_id of the harness that started the run
     # CLI session id minted for the in-flight stage subprocess (cleared between
     # stages). Best-effort: reflects the value minted before launch and may be
-    # stale after an internal cap retry regenerates the session — σ's resume
-    # gate must validate the transcript exists before --resume. See
+    # stale after an internal cap retry regenerates the session. See
     # ReconciliationJournal.record_run_session.
     session_id: str | None = None
     stage_cursor: str | None = None  # StageId.value of the in-flight stage (cleared between stages)

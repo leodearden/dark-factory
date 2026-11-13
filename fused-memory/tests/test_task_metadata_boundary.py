@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,6 +27,7 @@ from orchestrator.deterministic_runner import (  # type: ignore[import-not-found
 )
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome  # type: ignore[import-not-found]
 from pydantic import ValidationError
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, observed_item
 from shared.task_metadata import (
     MemoryHints,
     RetryLedger,
@@ -33,9 +35,12 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest_asyncio.fixture
@@ -1060,3 +1065,70 @@ class TestSliceCardinalityAtWriteBoundary:
         assert _schema_warning_messages(caplog) == []
         task = await enforce_backend.get_task(task_id, project_root=project_root)
         assert task['metadata']['files'] == ['orchestrator/src/orchestrator/thing.py']
+
+
+class TestFollowupItemsAtWriteBoundary:
+    """``followup_items`` reaches the backend's enforce-mode write gate as a registered list slice.
+
+    The shared rows in ``shared/tests/test_followup_items.py`` prove ``parse_metadata``
+    validates the slice; these prove the fused-memory write boundary routes a malformed
+    one to a raise with no row behind it, and lets a well-formed one land without a
+    census line (``plans/follow-up-filing-shape-prd.md`` §4.1).
+    """
+
+    @staticmethod
+    def _items_blob() -> dict[str, list[dict[str, Any]]]:
+        items = [
+            observed_item(summary='one', files=['pkg/a.py'], origin_task='8414'),
+            observed_item(summary='two', files=['pkg/a.py', 'pkg/b.py'], origin_task='8414'),
+        ]
+        return {FOLLOWUP_ITEMS_METADATA_KEY: [item.model_dump(mode='json') for item in items]}
+
+    @pytest.mark.asyncio
+    async def test_a_dict_shaped_slice_is_rejected_with_no_row(self, make_backend, tmp_path):
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+        element = self._items_blob()[FOLLOWUP_ITEMS_METADATA_KEY][0]
+
+        with pytest.raises(TypeError):
+            await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps({FOLLOWUP_ITEMS_METADATA_KEY: element}),
+            )
+
+        assert (await backend.get_tasks(project_root=project_root))['tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_an_element_without_files_is_rejected(self, make_backend, tmp_path):
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+        element = dict(self._items_blob()[FOLLOWUP_ITEMS_METADATA_KEY][0])
+        element.pop('files')
+
+        with pytest.raises(ValidationError):
+            await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps({FOLLOWUP_ITEMS_METADATA_KEY: [element]}),
+            )
+
+        assert (await backend.get_tasks(project_root=project_root))['tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_a_well_formed_list_writes_clean_and_round_trips(
+        self, make_backend, tmp_path, caplog,
+    ):
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+        blob = self._items_blob()
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'
+        ):
+            caplog.clear()
+            dto = await backend.add_task(
+                project_root=project_root, title='t', metadata=json.dumps(blob),
+            )
+
+        assert _schema_warning_messages(caplog) == []
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'][FOLLOWUP_ITEMS_METADATA_KEY] == blob[FOLLOWUP_ITEMS_METADATA_KEY]

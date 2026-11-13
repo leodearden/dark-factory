@@ -201,7 +201,7 @@ class TestTaskMetaSymlinkResolution:
     naive join: the real meta dir lives at `<tmp>/real-meta/<name>`, and
     `<base>/.task-meta` is a symlink to `<tmp>/real-meta`. Also creates
     `<worktree>/.task/plan.json` as an actual symlink into that real meta
-    dir (via `TaskArtifacts.ensure_lane_plan_symlink`) to mirror production.
+    dir (via `TaskArtifacts.ensure_lane_symlinks`) to mirror production.
     """
 
     def test_task_meta_resolves_through_symlinked_base(
@@ -218,7 +218,7 @@ class TestTaskMetaSymlinkResolution:
         ta = TaskArtifacts(worktree, meta_root)
         ta.init('task-2904', 'Test Task', 'Desc')
         ta.write_plan({'steps': []})
-        ta.ensure_lane_plan_symlink()
+        ta.ensure_lane_symlinks()
 
         ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
 

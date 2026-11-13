@@ -182,7 +182,7 @@ tasks:
           kind: manual
           reason: "structural property asserted by θ's git-failure-branch completeness test"
   - label: "ι"
-    task_id: null
+    task_id: 6764
     title: "Route stamper and manifest audits through shared sidecar_for / tracked_sidecar_paths"
     note: "HELD (metadata.x_seam_wait stream S20 contract C3): released by the S20 /prd decompose session after its C3 leaf (shared.capability_manifest SIDECAR_SUFFIX/sidecar_for/tracked_sidecar_paths) is filed; also depends on 6037."
     capabilities:
@@ -294,7 +294,7 @@ tasks:
           kind: manual
           reason: "asserted by ν's lines-only-rise-passes / cognitive-rise-fails fixture tests; the measure names stay in the report so a grep cannot tell ratcheted from reported"
   - label: "ξ"
-    task_id: null
+    task_id: 6770
     title: "Sitting close-safety gates read pin_declared_by and duplicate_of only"
     note: "HELD (metadata.x_seam_wait stream S2 contract C5): released by the S2 /prd decompose session after its C5 leaf (Escalation.duplicate_of) is filed. Lead ruling 2026-10-11: the esc-3169-2 declare_pin migration is step 1 of this leaf, with its own check, not a decompose-time action."
     capabilities:

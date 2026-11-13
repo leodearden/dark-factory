@@ -38,6 +38,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import (
+    FakeClock,
     FakeVerifier,
     VerifyScript,
     fails,
@@ -68,12 +69,16 @@ from _wait_hygiene_scan import (
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.remerge_base import RemergeClaim
+from orchestrator.merge_lane.types import QueuedBranch, RemergeBase, RemergeReason
+from orchestrator.merge_lane.verify_cancellation import VerifyCancel, VerifyCancelCause
 from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
     MergeOutcome,
     MergeRequest,
+    SpeculativeItem,
     SpeculativeMergeWorker,
 )
 from orchestrator.verify import VerifyResult
@@ -136,6 +141,37 @@ async def _make_branch_with_file(
     (worktree / filename).write_text(content)
     await git_ops.commit(worktree, f'Add {filename}')
     return worktree
+
+
+RemergeCall = tuple[str, RemergeClaim, SpeculativeItem]
+
+
+def _record_remerges(
+    worker: SpeculativeMergeWorker, monkeypatch: pytest.MonkeyPatch,
+) -> list[RemergeCall]:
+    """Wrap the worker's re-merge to record each call's task id, claim and
+    replacement (task 8524); the re-merge itself runs unchanged."""
+    calls: list[RemergeCall] = []
+    original = worker._remerge
+
+    async def _recording(
+        req: MergeRequest, started: float | None, *, claim: RemergeClaim,
+    ) -> SpeculativeItem:
+        out = await original(req, started, claim=claim)
+        calls.append((req.task_id, claim, out))
+        return out
+
+    monkeypatch.setattr(worker, '_remerge', _recording)
+    return calls
+
+
+def _one_remerge(
+    calls: list[RemergeCall], task_id: str,
+) -> tuple[RemergeClaim, SpeculativeItem]:
+    """The single re-merge of *task_id*: its claim and its replacement."""
+    mine = [(claim, out) for tid, claim, out in calls if tid == task_id]
+    assert len(mine) == 1, calls
+    return mine[0]
 
 
 # THIS FILE CARRIES DEBT under rule `wall-clock-deadline` in
@@ -2221,6 +2257,7 @@ class TestChainInvalidationUnderOverlap:
         git_repo: Path,
         git_config: GitConfig,
         config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """N's local verify fails; N+1's remote verify is aborted and re-verified.
 
@@ -2259,6 +2296,7 @@ class TestChainInvalidationUnderOverlap:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, gated_remote)
+        remerges = _record_remerges(worker, monkeypatch)
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -2322,6 +2360,13 @@ class TestChainInvalidationUnderOverlap:
             'GREEN (step-20): head-failure cascade clears _inflight, '
             're-dispatches N+1 via the redispatch park → "done".'
         )
+        # The head failed and the cascade cleared _inflight, so no live tip
+        # was left: N+1's replacement fell to main, holding no permit, with
+        # the reason on the item (plans/merge-lane-policy-prd.md D1).
+        claim, replacement = _one_remerge(remerges, 'ci-b')
+        assert claim.anchor.tip is None and claim.permit is None, claim
+        assert replacement.remerge_base == claim.anchor
+        assert replacement.speculative is False
 
         # ── RED: fails here (cancel_verify not called) ───────────────────────
         # Exactly 2 cancel_verify calls on the clean-cancel (rc=0) path:
@@ -2447,10 +2492,10 @@ class TestChainInvalidationUnderOverlap:
         mid_remerge_state: list[Any] = []
         original_remerge = worker._remerge
 
-        async def _spying_remerge(req_: Any, started: Any) -> Any:
+        async def _spying_remerge(req_: Any, started: Any, claim: Any = None) -> Any:
             if req_.request_id == req_b.request_id:
                 mid_remerge_state.append(worker._lifecycle.current(req_b.request_id))
-            return await original_remerge(req_, started)
+            return await original_remerge(req_, started, claim=claim)
 
         worker._remerge = _spying_remerge  # type: ignore[method-assign]
 
@@ -2620,9 +2665,9 @@ class TestHaltAndUnavailable:
         _original_remerge = worker._remerge
         remerge_task_ids: list[str] = []
 
-        async def _spy_remerge(req: Any, started_mono: Any) -> Any:
+        async def _spy_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             remerge_task_ids.append(req.task_id)
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
@@ -2676,6 +2721,7 @@ class TestHaltAndUnavailable:
         git_repo: Path,
         git_config: GitConfig,
         config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """RUNNER_UNAVAILABLE mid-overlap: host quarantined, item re-dispatched on LOCAL.
 
@@ -2722,6 +2768,7 @@ class TestHaltAndUnavailable:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, dead_remote)
+        remerges = _record_remerges(worker, monkeypatch)
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -2765,6 +2812,13 @@ class TestHaltAndUnavailable:
                 req_b.result,
                 label='unav-b: MergeOutcome (re-dispatched on local after quarantine)',
             )
+            # N had landed by N+1's finalize, so nothing was left to stack on:
+            # N+1's replacement fell to main and its permit was freed, not
+            # carried (plans/merge-lane-policy-prd.md D1).
+            claim, replacement = _one_remerge(remerges, 'unav-b')
+            assert claim.anchor == RemergeBase(None, RemergeReason.NO_TIP)
+            assert claim.permit is None and replacement.permit is None
+            assert worker.speculation_accounting_violations() == []
         finally:
             await stop_merge_worker(worker, worker_task)
 
@@ -4077,13 +4131,13 @@ class TestCascadeErrorContainment:
         # Simulates merge_to_main → _create_merge_worktree failing under ENOSPC.
         _original_remerge = worker._remerge
 
-        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+        async def _killer_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             if req.task_id == 'cas-b':
                 raise RuntimeError(
                     'Failed to create merge worktree: '
                     '/repo/.worktrees/cas-b No space left on device'
                 )
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _killer_remerge  # type: ignore[method-assign]
 
@@ -4767,7 +4821,7 @@ class TestVerifyTeardownHelper:
 
         verify_task.cancel = _spy_cancel  # type: ignore[method-assign]
 
-        await worker._teardown_verify_task(lease, verify_task, 'df3204-order')
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-order', cancel=None)
 
         assert calls == ['abort', 'cancel'], calls
         # Asserted OUT HERE, where nothing can swallow it.
@@ -4786,7 +4840,7 @@ class TestVerifyTeardownHelper:
         verify_task = _never_finishes()
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
-        await worker._teardown_verify_task(lease, verify_task, 'df3204-awaited')
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-awaited', cancel=None)
 
         assert verify_task.done()
         assert verify_task.cancelled()
@@ -4799,7 +4853,7 @@ class TestVerifyTeardownHelper:
         worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
         verify_task = _never_finishes()
 
-        await worker._teardown_verify_task(None, verify_task, 'df3204-nolease')
+        await worker._teardown_verify_task(None, verify_task, 'df3204-nolease', cancel=None)
 
         worker._abort_remote_verify.assert_not_awaited()
         assert verify_task.cancelled()
@@ -4813,7 +4867,7 @@ class TestVerifyTeardownHelper:
         runner.cancel_verify = AsyncMock(return_value=0)
         lease = HostLease(name='remote', runner=runner, is_local=False)
 
-        await worker._teardown_verify_task(lease, None, 'df3204-notask')
+        await worker._teardown_verify_task(lease, None, 'df3204-notask', cancel=None)
 
         runner.cancel_verify.assert_awaited_once()
 
@@ -4821,7 +4875,7 @@ class TestVerifyTeardownHelper:
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
 
-        await worker._teardown_verify_task(None, None, 'df3204-both-none')
+        await worker._teardown_verify_task(None, None, 'df3204-both-none', cancel=None)
 
         worker._abort_remote_verify.assert_not_awaited()
 
@@ -4840,7 +4894,7 @@ class TestVerifyTeardownHelper:
         verify_task = asyncio.get_running_loop().create_task(_boom())
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
-        await worker._teardown_verify_task(lease, verify_task, 'df3204-raiser')
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-raiser', cancel=None)
 
         assert verify_task.done()
 
@@ -4862,7 +4916,7 @@ class TestVerifyTeardownHelper:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
         await worker._teardown_verify_task(
-            lease, verify_task, 'df3204-defensive', shutdown_defensive=True,
+            lease, verify_task, 'df3204-defensive', cancel=None, shutdown_defensive=True,
         )
 
         worker._abort_remote_verify.assert_awaited_once()
@@ -4884,13 +4938,65 @@ class TestVerifyTeardownHelper:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
         with pytest.raises(asyncio.CancelledError):
-            await worker._teardown_verify_task(lease, verify_task, 'df3204-propagates')
+            await worker._teardown_verify_task(
+                lease, verify_task, 'df3204-propagates', cancel=None,
+            )
 
         # Clean up the task this deliberately-aborted teardown left behind.
         verify_task.cancel()
         with contextlib.suppress(BaseException):
             await verify_task
 
+    async def test_records_the_cancel_of_a_running_task_only(self, git_ops: GitOps) -> None:
+        """A deliberate cancel of a RUNNING verify writes one
+        ``merge_verify_cancelled`` row; a finished task, or a reap
+        (``cancel=None``), writes none.
+        """
+        from test_merge_speculation import _LateArrivalFakeEventStore
+
+        store = _LateArrivalFakeEventStore()
+        clock = FakeClock(time=1000.0)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store, clock=clock)
+        cancel = VerifyCancel(VerifyCancelCause.SHUTDOWN, started_at=clock.time - 2.0, host='local')
+        finished = asyncio.get_running_loop().create_task(asyncio.sleep(0))
+        await finished
+
+        await worker._teardown_verify_task(None, _never_finishes(), 'tid', cancel=cancel)
+        await worker._teardown_verify_task(None, finished, 'tid-finished', cancel=cancel)
+        await worker._teardown_verify_task(None, _never_finishes(), 'tid-reap', cancel=None)
+
+        assert [
+            (row['task_id'], row['data'])
+            for row in store.speculative_events(EventType.merge_verify_cancelled)
+        ] == [('tid', {'elapsed_ms': 2000, 'fraction': None, 'cause': 'shutdown', 'host': 'local'})]
+
+    async def test_a_second_canceller_of_one_dispatch_records_nothing(
+        self, git_ops: GitOps,
+    ) -> None:
+        """An abort trigger cancels the inner verify, then stop() drains the
+        entry's outer task while the trigger still cleans up: one dispatch,
+        one row.
+        """
+        from test_merge_speculation import _LateArrivalFakeEventStore
+
+        store = _LateArrivalFakeEventStore()
+        clock = FakeClock(time=1000.0)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store, clock=clock)
+
+        def _cancel(cause: VerifyCancelCause) -> VerifyCancel:
+            return VerifyCancel(cause, started_at=clock.time - 1.0, host='local')
+
+        await worker._teardown_verify_task(
+            None, _never_finishes(), 'tid', cancel=_cancel(VerifyCancelCause.OPERATOR_HALT),
+        )
+        await worker._teardown_verify_task(
+            None, _never_finishes(), 'tid', cancel=_cancel(VerifyCancelCause.SHUTDOWN),
+        )
+
+        assert [
+            row['data']['cause']
+            for row in store.speculative_events(EventType.merge_verify_cancelled)
+        ] == ['operator_halt']
 
 # ---------------------------------------------------------------------------
 # task 4164: stop()'s shutdown-drain teardowns must pass shutdown_defensive=True

@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,17 +18,21 @@ import pytest
 from _curator_helpers import agent_result as _agent_result
 from _curator_helpers import (
     batch_create_result,
+    candidate_titles,
     candidates_in,
     empty_corpus,
     escalator_double,
     invoke_by_role,
     must_not_invoke,
+    tripwire,
     zot_agent_result,
 )
 from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
 from _curator_helpers import prepared as _bundle
 from shared.cli_invoke import AgentResult, no_mcp_servers_config
+from shared.declared_scope import derive_declared_scope
+from shared.followup_items import observed_item
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
     ArtifactProvenance,
@@ -36,6 +41,7 @@ from shared.prompt_artifact import (
     compose_prompt,
 )
 from shared.task_statuses import TaskStatus
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
@@ -48,6 +54,7 @@ from fused_memory.middleware.candidate_key import compute_candidate_key, normali
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_types import (
+    POOL_SOURCES,
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
@@ -76,6 +83,54 @@ from fused_memory.middleware.task_curator import (
     _trim_pool,
     flatten_task_tree,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+
+async def _prepare_and_curate(
+    curator: TaskCurator, candidates: list[CandidateTask], project_id: str, project_root: str,
+) -> list[CuratorDecision]:
+    """``curate_prepared`` over freshly prepared bundles, as the ticket worker drives it."""
+    bundles = [
+        await curator.prepare_candidate(candidate, project_id, project_root)
+        for candidate in candidates
+    ]
+    return await curator.curate_prepared(bundles, project_id, project_root)
+
+
+def _answering_with(
+    decide: Callable[[list[CandidateTask]], Awaitable[list[CuratorDecision]]],
+    prepared: list[PreparedCandidate],
+) -> Callable[..., Awaitable[AgentResult]]:
+    """An injected invoker's side effect that answers each LLM call with *decide*'s decisions.
+
+    *decide* receives the candidates the call carries, in prompt order, and
+    its decisions are rendered back into the verdict the curator parses, at
+    either spec. The candidates are looked up by title among *prepared*'s, so
+    a test may assert on their identity.
+    """
+    by_title = {bundle.candidate.title: bundle.candidate for bundle in reversed(prepared)}
+
+    async def invoke(**kwargs: Any) -> AgentResult:
+        candidates = [by_title[title] for title in candidate_titles(kwargs['prompt'])]
+        decisions = await decide(candidates)
+        verdicts = [
+            {
+                'candidate_index': i,
+                'action': decision.action,
+                'target_id': decision.target_id,
+                'batch_target_index': decision.batch_target_index,
+                'justification': decision.justification,
+            }
+            for i, decision in enumerate(decisions)
+        ]
+        if kwargs['role'] == 'task_curator':
+            [verdict] = verdicts
+            return _agent_result(verdict)
+        return _agent_result({'decisions': verdicts})
+
+    return invoke
+
 
 # ----------------------------------------------------------------------
 # Pure helper tests
@@ -185,9 +240,10 @@ class TestCombineEligibilityNoDivergence:
 
     Scope is deliberately narrow: these assertions drive
     ``_to_pool_entry`` and say nothing about the interceptor. Because
-    ``_to_pool_entry`` calls ``is_combine_eligible_status`` directly, they
-    fail only if that call is deleted or re-forked into a second literal —
-    which is exactly the selection-side half of the 20.2% race.
+    ``_to_pool_entry`` reaches ``is_combine_eligible_status`` through
+    ``curator_types.is_combine_eligible``, they fail only if that route is
+    deleted or re-forked into a second literal — which is exactly the
+    selection-side half of the 20.2% race.
 
     The EXECUTION site (``task_interceptor._execute_combine``, the half that
     actually diverged and caused the incident) cannot be covered from here;
@@ -446,6 +502,74 @@ class TestPoolWithheld:
         with pytest.raises(dataclasses.FrozenInstanceError):
             census.by_source = {'module': 2}  # type: ignore[misc]
 
+    def test_a_failed_stream_renders_even_when_nothing_was_truncated(self):
+        census = PoolWithheld(unavailable_streams=('embedding',))
+        assert census.total == 0
+        rendered = census.render()
+        assert rendered is not None
+        assert 'stream embedding unavailable: absence is not proof of no overlap' in (
+            rendered.splitlines()
+        )
+        assert 'pool_truncated:' not in rendered
+
+    def test_each_failed_stream_gets_its_own_line_in_the_order_given(self):
+        rendered = PoolWithheld(unavailable_streams=('module', 'embedding')).render()
+        assert rendered is not None
+        assert [line for line in rendered.splitlines() if 'unavailable' in line] == [
+            'stream module unavailable: absence is not proof of no overlap',
+            'stream embedding unavailable: absence is not proof of no overlap',
+        ]
+
+    def test_truncation_and_failed_streams_render_together(self):
+        census = PoolWithheld(
+            by_source={'module': 7}, caps={'module': 15}, unavailable_streams=('dependency',),
+        )
+        rendered = census.render()
+        assert rendered is not None
+        assert self._payload(rendered)['withheld'] == {'module': 7}
+        assert 'stream dependency unavailable: absence is not proof of no overlap' in (
+            rendered.splitlines()
+        )
+
+    def test_an_unknown_stream_name_is_refused(self):
+        with pytest.raises(ValueError, match='nonsense') as excinfo:
+            PoolWithheld(unavailable_streams=('nonsense',))
+        for source in POOL_SOURCES:
+            assert source in str(excinfo.value)
+
+
+class TestFailedStreamCensusOnDecisions:
+    """The failed corpus streams travel from the bundle onto the decision's log fields."""
+
+    def test_a_decision_logs_its_failed_streams(self):
+        decision = CuratorDecision(
+            action='create', degraded=False, unavailable_streams=('module', 'embedding'),
+        )
+        assert decision.to_log_fields()['unavailable_streams'] == ['module', 'embedding']
+
+    def test_a_default_decision_logs_no_failed_streams(self):
+        assert CuratorDecision(action='create', degraded=False).to_log_fields()[
+            'unavailable_streams'
+        ] == []
+
+    def test_a_decision_refuses_an_unknown_stream_name(self):
+        with pytest.raises(ValueError, match='nonsense'):
+            CuratorDecision(action='create', degraded=False, unavailable_streams=('nonsense',))
+
+    def test_a_corpus_failed_bundle_carries_the_streams_that_failed(self):
+        bundle = PreparedCandidate.corpus_failed(
+            CandidateTask(title='t'), 'boom', unavailable_streams=('module', 'embedding'),
+        )
+        assert bundle.corpus_error == 'boom'
+        assert bundle.withheld is not None
+        assert bundle.withheld.unavailable_streams == ('module', 'embedding')
+
+    def test_the_two_argument_corpus_failed_bundle_has_an_empty_census(self):
+        bundle = PreparedCandidate.corpus_failed(CandidateTask(title='t'), 'boom')
+        assert bundle.withheld is not None
+        assert bundle.withheld.unavailable_streams == ()
+        assert bundle.withheld.render() is None
+
 
 class TestCandidateHash:
     def test_same_payload_same_hash(self):
@@ -507,6 +631,31 @@ class TestCandidateHash:
         b1 = CandidateTask(title='T', description='D', details='X', execution_class='operational')
         b2 = CandidateTask(title='T', description='D', details='X', execution_class='operational')
         assert b1.payload_hash() == b2.payload_hash()
+
+    @staticmethod
+    def _items(*summaries: str):
+        return tuple(observed_item(summary=s, files=['pkg/a.py'], origin_task='8414') for s in summaries)
+
+    def test_items_affect_hash(self):
+        """(task 8414) a cached curator decision is never served for a bundle whose items changed."""
+        one = CandidateTask(title='T', items=self._items('first'))
+        two = CandidateTask(title='T', items=self._items('first', 'second'))
+        other = CandidateTask(title='T', items=self._items('other'))
+        assert one.payload_hash() != two.payload_hash()
+        assert one.payload_hash() != other.payload_hash()
+
+    def test_item_order_insensitive(self):
+        a = CandidateTask(title='T', items=self._items('first', 'second'))
+        b = CandidateTask(title='T', items=self._items('second', 'first'))
+        assert a.payload_hash() == b.payload_hash()
+
+    def test_items_vs_none_differ(self):
+        a = CandidateTask(title='T', items=self._items('first'))
+        b = CandidateTask(title='T', items=())
+        assert a.payload_hash() != b.payload_hash()
+
+    def test_items_default_to_empty(self):
+        assert CandidateTask(title='T').items == ()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -797,7 +946,7 @@ async def _reported_failure(
         config=config or _make_config(), taskmaster=None, escalator=escalator,
         invoke=AsyncMock(return_value=result),
     )
-    await curator.curate_batch_prepared([_bundle('T')], 'p', '/x')
+    await curator.curate_prepared([_bundle('T')], 'p', '/x')
     escalator.report_failure.assert_awaited_once()
     return escalator.report_failure.await_args.kwargs
 
@@ -919,39 +1068,26 @@ class TestCurateFallbacks:
         assert kwargs['schema_tool_denied'] is True
 
     @pytest.mark.asyncio
-    async def test_escalator_raise_propagates_out_of_curate(self):
-        """R2: interactive path — escalator re-raise is not swallowed.
-
-        When no orchestrator is running, CuratorEscalator re-raises
-        CuratorFailureError. That must reach the MCP boundary so the
-        caller sees a loud failure instead of a silent
-        ``action='create'``.
+    async def test_escalator_raise_is_decided_as_a_defer(self):
+        """Interactive path: with no orchestrator, CuratorEscalator raises
+        CuratorFailureError instead of filing. The failure mapper decides it
+        exactly as on the orchestrator path, so the candidate defers and
+        nothing raises; never a silent ``action='create'``.
         """
-        config = _make_config()
-
-        async def escalator_raise(**kwargs):
-            raise CuratorFailureError('no orchestrator')
-
-        escalator = AsyncMock()
-        escalator.report_failure = escalator_raise
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
+        escalator = escalator_double()
+        escalator.report_failure = AsyncMock(side_effect=CuratorFailureError('no orchestrator'))
         failing_result = AgentResult(
             success=False, output='err', structured_output=None,
         )
         curator = TaskCurator(
-            config=config, taskmaster=None, escalator=escalator,
+            config=_make_config(), taskmaster=None, escalator=escalator,
             invoke=AsyncMock(return_value=failing_result),
         )
-        with (
-            patch.object(curator, '_build_corpus', side_effect=empty_corpus),
-            pytest.raises(CuratorFailureError),
-        ):
-            await curator.curate(
-                CandidateTask(title='T'), project_id='p', project_root='/x',
-            )
+
+        [decision] = await curator.curate_prepared([_bundle('T')], 'p', '/x')
+
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
+        escalator.report_failure.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_failure_message_surfaces_timeout_diagnostics(self):
@@ -1002,7 +1138,7 @@ class TestCurateFallbacks:
             config=_make_config(), taskmaster=None,
             invoke=AsyncMock(return_value=salvaged_result),
         )
-        [decision] = await curator.curate_batch_prepared(
+        [decision] = await curator.curate_prepared(
             [_bundle('T', _pool_with_ids(('42', 'pending')))], 'p', '/x',
         )
         assert decision.action == 'drop'
@@ -1017,7 +1153,7 @@ class TestCurateFallbacks:
         """
         mock = AsyncMock(return_value=_agent_result({'action': 'create', 'justification': 'x'}))
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=mock)
-        await curator.curate_batch_prepared([_bundle('T')], 'p', '/x')
+        await curator.curate_prepared([_bundle('T')], 'p', '/x')
         _, kwargs = mock.call_args
         assert kwargs['max_turns'] >= 3
 
@@ -1139,12 +1275,11 @@ class TestUnexpectedExceptionArmReports:
         assert exc_name in kwargs['subtype']
 
     @pytest.mark.asyncio
-    async def test_report_failure_raise_propagates_and_leaves_nothing_behind(self):
+    async def test_report_failure_raise_defers_and_leaves_nothing_behind(self):
         """With no orchestrator to escalate to, report_failure raises
-        CuratorFailureError. From this arm, as from the CuratorFailureError
-        arm, that raise reaches the caller as a loud failure instead of a
-        create, and leaves no degraded decision behind: none cached for the
-        payload, none counted toward the streak."""
+        CuratorFailureError. The failure mapper absorbs that raise and defers
+        the candidate instead of creating it, and leaves no degraded decision
+        behind: none cached for the payload, none counted toward the streak."""
         escalator = AsyncMock()
         escalator.report_failure = AsyncMock(
             side_effect=CuratorFailureError('no orchestrator running'),
@@ -1164,8 +1299,8 @@ class TestUnexpectedExceptionArmReports:
         candidate = CandidateTask(title='T')
 
         with patch.object(curator, '_build_corpus', side_effect=corpus_with_target):
-            with pytest.raises(CuratorFailureError, match='no orchestrator running'):
-                await curator.curate(candidate, project_id='p', project_root='/x')
+            first = await curator.curate(candidate, project_id='p', project_root='/x')
+            assert (first.action, first.defer_reason) == ('defer', DeferReason.LLM_FAILED)
 
             # Uncounted: a fresh run still needs all five degradations to fire.
             await _degrade(curator, 4, prefix='Deg')
@@ -1365,14 +1500,22 @@ class TestStartupSelfCheck:
         assert await curator.startup_self_check(project_id='p', project_root='/x') is False
 
 
+_GOLDEN_FILES = ['src/parser.py', 'tests/test_parser.py']
 _GOLDEN_CANDIDATE = CandidateTask(
     title='Fix the parser',
     description='The parser drops trailing commas.',
     details='See parser.py::parse_list.',
-    files_to_modify=['src/parser.py', 'tests/test_parser.py'],
+    files_to_modify=_GOLDEN_FILES,
     priority='high',
     spawned_from='4242',
     spawn_context='review',
+    items=(
+        observed_item(summary='The parser drops trailing commas', files=['src/parser.py'], origin_task='4242'),
+        observed_item(summary='No test covers a trailing comma', files=['tests/test_parser.py'], origin_task='4242'),
+    ),
+    declared_scope=derive_declared_scope(
+        _GOLDEN_FILES, 'The parser drops trailing commas.', 'See parser.py::parse_list.', basis='submit',
+    ),
 )
 _GOLDEN_CENSUS = PoolWithheld(
     by_source={'module': 5},
@@ -1390,21 +1533,25 @@ _GOLDEN_SINGLE_PROMPT = (
     '  description: The parser drops trailing commas.\n'
     '  details: See parser.py::parse_list.\n'
     '  files_to_modify: src/parser.py, tests/test_parser.py\n'
+    '  declared_scope: narrow (files=2, text_chars=59, basis=submit)\n'
+    '  followup_items: 2\n'
     '\n'
     '# Pool (2 tasks)\n'
     '[Task 10] status=pending priority=medium source=module '
-    'combine_eligible=True\n'
+    'combine_eligible=True followup_items=0\n'
     '  title: t\n'
     '  description: \n'
     '  details: \n'
     '  files_to_modify: (none)\n'
+    '  declared_scope: unstamped\n'
     '\n'
     '[Task 11] status=done priority=medium source=module '
-    'combine_eligible=False\n'
+    'combine_eligible=False followup_items=0\n'
     '  title: t\n'
     '  description: \n'
     '  details: \n'
     '  files_to_modify: (none)\n'
+    '  declared_scope: unstamped\n'
     '\n'
     'pool_truncated: {"caps": {"dependency": 3, "embedding": 10, "module": '
     '15, "total_cap": 30}, "withheld": {"module": 5}}\n'
@@ -1427,21 +1574,25 @@ _GOLDEN_BATCH_PROMPT = (
     '  description: The parser drops trailing commas.\n'
     '  details: See parser.py::parse_list.\n'
     '  files_to_modify: src/parser.py, tests/test_parser.py\n'
+    '  declared_scope: narrow (files=2, text_chars=59, basis=submit)\n'
+    '  followup_items: 2\n'
     '\n'
     '# Pool for batch_index=0 (2 tasks)\n'
     '[Task 10] status=pending priority=medium source=module '
-    'combine_eligible=True\n'
+    'combine_eligible=True followup_items=0\n'
     '  title: t\n'
     '  description: \n'
     '  details: \n'
     '  files_to_modify: (none)\n'
+    '  declared_scope: unstamped\n'
     '\n'
     '[Task 11] status=done priority=medium source=module '
-    'combine_eligible=False\n'
+    'combine_eligible=False followup_items=0\n'
     '  title: t\n'
     '  description: \n'
     '  details: \n'
     '  files_to_modify: (none)\n'
+    '  declared_scope: unstamped\n'
     '\n'
     'pool_truncated: {"caps": {"dependency": 3, "embedding": 10, "module": '
     '15, "total_cap": 30}, "withheld": {"module": 5}}\n'
@@ -1456,6 +1607,8 @@ _GOLDEN_BATCH_PROMPT = (
     '  title: Add a lint rule\n'
     '  priority: medium\n'
     '  spawn_context: manual\n'
+    '  declared_scope: unstamped\n'
+    '  followup_items: 0\n'
     '\n'
     '# Pool for batch_index=1 (0 tasks)\n'
     '  (empty — no candidates; answer "create")\n'
@@ -1505,7 +1658,7 @@ class TestInjectedInvoker:
         curator = self._curator(tmp_path, invoke, config)
         pool = _pool_with_ids(('10', 'pending'), ('11', 'done'))
 
-        [decision] = await curator.curate_batch_prepared(
+        [decision] = await curator.curate_prepared(
             [_bundle('Fix the parser', pool)], 'p', '/p',
         )
 
@@ -1537,7 +1690,7 @@ class TestInjectedInvoker:
         cfg = config.curator
         curator = self._curator(tmp_path, invoke, config)
 
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             [_bundle('Alpha'), _bundle('Beta'), _bundle('Gamma')], 'p', '/p',
         )
 
@@ -1574,7 +1727,7 @@ class TestInjectedInvoker:
         curator = self._curator(tmp_path, invoke)
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            decisions = await curator.curate_batch_prepared(
+            decisions = await curator.curate_prepared(
                 [_bundle('Alpha'), _bundle('Beta')], 'p', '/p',
             )
 
@@ -1596,7 +1749,7 @@ class TestInjectedInvoker:
             candidate=_GOLDEN_CANDIDATE, withheld=_GOLDEN_CENSUS,
         )
 
-        await curator.curate_batch_prepared([bundle], 'p', '/p')
+        await curator.curate_prepared([bundle], 'p', '/p')
 
         assert invoke.await_args is not None
         assert invoke.await_args.kwargs['prompt'] == _GOLDEN_SINGLE_PROMPT
@@ -1613,7 +1766,7 @@ class TestInjectedInvoker:
             _bundle('Add a lint rule'),
         ]
 
-        await curator.curate_batch_prepared(bundles, 'p', '/p')
+        await curator.curate_prepared(bundles, 'p', '/p')
 
         assert invoke.await_args is not None
         assert invoke.await_args.kwargs['prompt'] == _GOLDEN_BATCH_PROMPT
@@ -1639,7 +1792,7 @@ class TestNeutralCliCwd:
     ):
         mock = AsyncMock(return_value=verdict)
         curator = TaskCurator(config=_make_config(), taskmaster=None, cwd=tmp_path, invoke=mock)
-        await curator.curate_batch_prepared(
+        await curator.curate_prepared(
             [_bundle(title) for title in titles], 'p', str(tmp_path),
         )
         _, kwargs = mock.call_args
@@ -1737,7 +1890,7 @@ class TestCuratorInvocationLedger:
             invoke=mock,
         )
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            await curator.curate_batch(
+            await _prepare_and_curate(curator,
                 [CandidateTask(title='T0'), CandidateTask(title='T1')],
                 'proj-b', str(tmp_path),
             )
@@ -1994,9 +2147,10 @@ class TestCuratorDecisionZotMarker:
 
     @staticmethod
     async def _curate(curator: TaskCurator, candidate: CandidateTask):
-        return await curator.curate(
-            candidate, project_id='p', project_root='/x', prepared=_prepared(candidate),
+        [decision] = await curator.curate_prepared(
+            [_prepared(candidate)], project_id='p', project_root='/x',
         )
+        return decision
 
     def test_defaults_are_not_degraded(self):
         decision = CuratorDecision(action='create')
@@ -2046,7 +2200,7 @@ class TestCuratorDecisionZotMarker:
             _prepared(CandidateTask(title='Batch Alpha', description='alpha details')),
             _prepared(CandidateTask(title='Batch Beta', description='beta details')),
         ]
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             prepared, project_id='p', project_root='/x',
         )
         assert len(decisions) == 2
@@ -2055,18 +2209,21 @@ class TestCuratorDecisionZotMarker:
             assert decision.degraded_by_zot is False
 
     @pytest.mark.asyncio
-    async def test_interactive_path_reraises_with_the_zot_marker(self, tmp_path):
+    async def test_interactive_path_creates_with_the_zot_marker(self, tmp_path):
+        """With no orchestrator the escalator raises; the ZOT is decided, not raised."""
         curator = TaskCurator(
             config=_make_config(), taskmaster=None, escalator=CuratorEscalator(),
             invoke=AsyncMock(return_value=zot_agent_result()),
         )
         candidate = CandidateTask(title='ZOT with no orchestrator')
-        with pytest.raises(CuratorFailureError) as exc_info:
-            await curator.curate(
-                candidate, project_id='p', project_root=str(tmp_path),
-                prepared=_prepared(candidate),
-            )
-        assert exc_info.value.zero_output_timeout is True
+        [decision] = await curator.curate_prepared(
+            [_prepared(candidate)], project_id='p', project_root=str(tmp_path),
+        )
+        assert (decision.action, decision.degraded, decision.degraded_by_zot) == (
+            'create', True, True,
+        )
+        assert decision.zot_escalation_id is None
+        assert decision.justification.startswith('curator-failed: CuratorFailureError')
 
     @pytest.mark.asyncio
     async def test_successful_curate_is_not_marked(self):
@@ -2278,7 +2435,7 @@ class TestZeroOutputBreakerBatchReset:
 
         await self._curate(curator, 'Alpha')
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            await curator.curate_batch_prepared(
+            await curator.curate_prepared(
                 [_bundle('Batch1'), _bundle('Batch2')], 'p', '/x',
             )
         await self._curate(curator, 'Bravo')
@@ -2302,7 +2459,7 @@ class TestZeroOutputBreakerBatchReset:
             PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
         ]
 
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             prepared, project_id='p', project_root='/x',
         )
 
@@ -2333,7 +2490,7 @@ class TestZeroOutputBreakerBatchReset:
         await self._curate(curator, 'Seed ZOT')
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            await curator.curate_batch_prepared([_bundle('A'), _bundle('B')], 'p', '/x')
+            await curator.curate_prepared([_bundle('A'), _bundle('B')], 'p', '/x')
 
         assert [call.kwargs['role'] for call in invoke.await_args_list] == [
             'task_curator', 'task_curator_batch', 'task_curator', 'task_curator',
@@ -2346,49 +2503,53 @@ class TestZeroOutputBreakerBatchReset:
         decision 3: a successful batch call closes an ALREADY-OPEN
         breaker/cooldown too, not just the consecutive counter.
 
-        During a real bisect, `_call_llm_batch_with_fallback`'s two halves run
-        concurrently under asyncio.gather. A left half that bisected down to
-        size-1 curate() calls can open the breaker (two ZOTs, threshold=2)
-        while a sibling right-half batch call is still in flight; when that
-        sibling batch succeeds, this reset now cancels the cooldown the left
-        half just opened. Pre-task-4143 the batch path had no reset at all,
-        so it could never close an open breaker either — this is new
-        behaviour introduced by the fix, not a narrowing of pre-existing
-        behaviour. It is accepted rather than restricted to counter-only
-        because a completed LLM round-trip is still proof the backend isn't
-        wedged (see the plan's design-decision rationale).
+        During a real bisect, the two halves run concurrently under
+        asyncio.gather. A left half that bisected down to size-1 leaves can
+        open the breaker (two ZOTs, threshold=2) while the right half's batch
+        call is still in flight; when that sibling batch succeeds, this reset
+        cancels the cooldown the left half just opened. It is accepted rather
+        than restricted to counter-only because a completed LLM round-trip is
+        still proof the backend isn't wedged (see the plan's design-decision
+        rationale).
 
-        An open breaker defers the whole batch at the public entry point, so
-        this drives the bisecting dispatcher directly, as a sibling half does."""
+        The right half's batch call is held until the left half's second ZOT,
+        so the breaker is open while that call is in flight."""
         zot = self._zot_result()
-        healthy_single = _agent_result({'action': 'create', 'justification': 'ok'})
-        invoke = AsyncMock(
-            side_effect=[zot, zot, self._healthy_batch_result(2), zot, healthy_single],
-        )
+        left_opened = asyncio.Event()
+        single_zots = 0
+
+        async def invoke_side_effect(**kwargs: Any) -> AgentResult:
+            nonlocal single_zots
+            titles = candidate_titles(kwargs['prompt'])
+            if titles == ['A', 'B', 'E', 'F']:
+                return AgentResult(success=False, output='boom', subtype='error_max_turns')
+            if titles == ['A', 'B']:
+                return zot
+            if titles == ['E', 'F']:
+                await left_opened.wait()
+                return self._healthy_batch_result(2)
+            if titles in (['A'], ['B']):
+                single_zots += 1
+                if single_zots == 2:
+                    left_opened.set()
+                return zot
+            if titles == ['Reaches the LLM']:
+                return zot
+            return _agent_result({'action': 'create', 'justification': 'ok'})
+
+        invoke = AsyncMock(side_effect=invoke_side_effect)
         curator = self._curator(invoke)
 
-        # A sibling bisect half has already tripped the breaker.
-        await self._curate(curator, 'Opener A')
-        await self._curate(curator, 'Opener B')
-        assert (await self._curate(curator, 'Blocked')).defer_reason is (
-            DeferReason.ZERO_OUTPUT_BREAKER_OPEN
+        decisions = await curator.curate_prepared(
+            [_bundle(title) for title in ('A', 'B', 'E', 'F')], 'p', '/x',
         )
-
-        decisions = await curator._call_llm_batch_with_fallback(
-            [CandidateTask(title='E'), CandidateTask(title='F')],
-            [[], []],
-            [empty_pool_sizes(), empty_pool_sizes()],
-            0.0,
-            'p',
-            '/x',
-        )
-        assert len(decisions) == 2
+        assert [d.degraded_by_zot for d in decisions] == [True, True, False, False]
 
         after_close = await self._curate(curator, 'Reaches the LLM')
         assert after_close.degraded_by_zot is True
         after_one_zot = await self._curate(curator, 'Counter was reset')
         assert after_one_zot.action == 'create'
-        assert invoke.await_count == 5
+        assert after_one_zot.degraded_by_zot is False
 
 
 class TestDegradedStreakBatchReset:
@@ -2444,7 +2605,7 @@ class TestDegradedStreakBatchReset:
         await _degrade(curator, 5, prefix='Before')
         escalator.report_consecutive_degraded.assert_awaited_once()
 
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             [_bundle('A'), _bundle('B')], 'p', '/x',
         )
 
@@ -2474,7 +2635,7 @@ class TestDegradedStreakBatchReset:
 
         # Distinct titles again, so every batch is a real round-trip.
         for i in range(20):
-            await curator.curate_batch_prepared(
+            await curator.curate_prepared(
                 [_bundle(f'B{i}a'), _bundle(f'B{i}b')], 'p', '/x',
             )
 
@@ -2510,7 +2671,7 @@ class TestDegradedStreakBatchReset:
         escalator.report_consecutive_degraded.assert_awaited_once()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            decisions = await curator.curate_batch_prepared(
+            decisions = await curator.curate_prepared(
                 [_bundle('A'), _bundle('B')], 'p', '/x',
             )
 
@@ -2544,7 +2705,7 @@ class TestDegradedStreakBatchReset:
         escalator.report_consecutive_degraded.assert_not_awaited()
 
         # Well-formed, prompt, success=True — and structurally unusable.
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             [_bundle('A'), _bundle('B')], 'p', '/x',
         )
 
@@ -2572,7 +2733,7 @@ class TestDegradedStreakBatchReset:
         curator, escalator = self._curator_with_escalator(invoke)
         await _degrade(curator, 4, prefix='Before')
 
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             [_bundle('A'), _bundle('B')], 'p', '/x',
         )
 
@@ -2698,7 +2859,7 @@ class TestPayloadFailureDegradedness:
         await _degrade(curator, 4, prefix='Deg')
         escalator.report_consecutive_degraded.assert_not_awaited()
 
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             [_bundle('A'), _bundle('B')], 'p', '/x',
         )
 
@@ -3209,9 +3370,25 @@ class _CorpusHarness:
         async def get_task(tid, project_root=None, **kw):
             return by_id.get(str(tid))
 
+        async def get_tasks(project_root=None, tag=None, statuses=None, **kw):
+            return {'tasks': [t for t in tasks if statuses is None or t['status'] in statuses]}
+
+        async def get_dependency_edges(project_root=None, tag=None):
+            return {
+                int(t['id']): sorted(int(dep) for dep in t['dependencies'])
+                for t in tasks if t.get('dependencies')
+            }
+
+        async def get_statuses_raw(project_root=None, tag=None, ids=None):
+            return {
+                t['id']: t['status'] for t in tasks if ids is None or t['id'] in ids
+            }
+
         tm = AsyncMock()
         tm.get_task = AsyncMock(side_effect=get_task)
-        tm.get_tasks = AsyncMock(return_value={'tasks': tasks})
+        tm.get_tasks = AsyncMock(side_effect=get_tasks)
+        tm.get_dependency_edges = AsyncMock(side_effect=get_dependency_edges)
+        tm.get_statuses_raw = AsyncMock(side_effect=get_statuses_raw)
         return tm
 
     def _neighbor_ids(self, n: int) -> list[str]:
@@ -3263,9 +3440,39 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
     """`_build_corpus` reports what each cap kept OUT of the pool.
 
     The census must count at every cap, not only at the final `_trim_pool`
-    pass: under stock config a maximal pool is 29 entries against a total cap
-    of 30, so a census keyed on the final trim alone never fires.
+    pass: a stream cap discards entries before `_trim_pool` ever sees them,
+    so a census keyed on the final trim alone would miss them.
     """
+
+    def _every_non_sibling_stream_overflowing(
+        self, config,
+    ) -> tuple[TaskCurator, CandidateTask, list[str]]:
+        """An anchored candidate whose module, embedding and dependency streams each overflow their cap; it has no siblings."""
+        cur = config.curator
+        anchor = self._anchor_task('100')
+        modules = [self._module_task(str(200 + i)) for i in range(cur.pool_module_cap + 5)]
+        deps = [
+            self._dependent_task(str(500 + i), '100')
+            for i in range(cur.pool_dependency_cap + 3)
+        ]
+        neighbor_ids = self._neighbor_ids(cur.pool_embedding_cap + 20)
+        neighbors = []
+        for tid in neighbor_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            neighbors.append(t)
+        curator = TaskCurator(
+            config=config,
+            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        )
+        candidate = CandidateTask(
+            title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100',
+        )
+        return curator, candidate, neighbor_ids
+
+    def _untrimmed_pool_size(self, cur) -> int:
+        """The pool ``_every_non_sibling_stream_overflowing`` yields before ``_trim_pool``: the anchor and three streams at their caps."""
+        return 1 + cur.pool_module_cap + cur.pool_embedding_cap + cur.pool_dependency_cap
 
     @pytest.mark.asyncio
     async def test_module_cap_excess_is_counted(self):
@@ -3313,7 +3520,7 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         ``overfetch = pool_embedding_cap + 20`` bounds how many neighbours are
         ever fetched, so its unvisited tail is at most 20 however many
         near-duplicates the corpus actually holds. Unlike ``module`` and
-        ``dependency`` — both corpus-exhaustive — this count is a FLOOR when
+        ``dependency`` — both exhaustive over the open backlog — this count is a FLOOR when
         the window filled, and the prompt has to say so: it is the one stream
         ordered by actual similarity, so its withheld entries are the likeliest
         duplicates of all.
@@ -3385,70 +3592,56 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         }
 
     @pytest.mark.asyncio
-    async def test_a_full_pool_never_reaches_the_total_cap(self):
-        """FINDING 1: a census keyed only on `_trim_pool` would report nothing.
+    async def test_a_full_pool_is_trimmed_dependency_first_then_embedding_tail(self):
+        """Under stock caps a full pool overruns the total cap.
 
-        anchor(1) + module(15) + embedding(10) + dependency(3) = 29 <= 30, so
-        the final trim short-circuits even when every stream overflowed.
+        The trim spends the dependency stream first, then the embedding tail,
+        so the embedding head and the whole module stream survive.
         """
         config = _make_config()
-        anchor = self._anchor_task('100')
-        modules = [self._module_task(str(200 + i)) for i in range(20)]
-        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
-        neighbor_ids = self._neighbor_ids(30)
-        neighbors = []
-        for tid in neighbor_ids:
-            t = self._module_task(tid)
-            t['files_to_modify'] = []
-            neighbors.append(t)
-        curator = TaskCurator(
-            config=config,
-            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
-        )
+        cur = config.curator
+        curator, candidate, neighbor_ids = self._every_non_sibling_stream_overflowing(config)
 
         pool, sizes, withheld = await self._corpus(
-            curator,
-            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
-            neighbor_ids=neighbor_ids,
+            curator, candidate, neighbor_ids=neighbor_ids,
         )
 
-        assert len(pool) == 29
-        assert len(pool) <= config.curator.pool_total_cap
-        assert withheld.by_source['total_cap'] == 0
-        # ...and yet 28 eligible entries were withheld.
+        assert len(pool) == cur.pool_total_cap
+        assert withheld.by_source['total_cap'] == self._untrimmed_pool_size(cur) - cur.pool_total_cap
+        assert sizes == {
+            'anchor': 1,
+            'sibling': 0,
+            'module': cur.pool_module_cap,
+            'dependency': 0,
+            'embedding': cur.pool_total_cap - 1 - cur.pool_module_cap,
+        }
+        kept_embedding = [e.task_id for e in pool if e.source == 'embedding']
+        assert kept_embedding == neighbor_ids[:sizes['embedding']]
         assert withheld.by_source['module'] == 5
-        assert withheld.by_source['embedding'] == 20
         assert withheld.by_source['dependency'] == 3
-        assert withheld.total == 28
-        assert withheld.render() is not None
 
     @pytest.mark.asyncio
     async def test_total_cap_drops_are_counted_when_the_trim_does_fire(self):
+        """A total cap no larger than the module stream runs the trim through every stream it may cut."""
         config = _make_config()
-        config.curator.pool_total_cap = 20
-        anchor = self._anchor_task('100')
-        modules = [self._module_task(str(200 + i)) for i in range(20)]
-        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
-        neighbor_ids = self._neighbor_ids(30)
-        neighbors = []
-        for tid in neighbor_ids:
-            t = self._module_task(tid)
-            t['files_to_modify'] = []
-            neighbors.append(t)
-        curator = TaskCurator(
-            config=config,
-            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        cur = config.curator
+        cur.pool_total_cap = cur.pool_module_cap
+        curator, candidate, neighbor_ids = self._every_non_sibling_stream_overflowing(config)
+
+        pool, sizes, withheld = await self._corpus(
+            curator, candidate, neighbor_ids=neighbor_ids,
         )
 
-        pool, _sizes, withheld = await self._corpus(
-            curator,
-            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
-            neighbor_ids=neighbor_ids,
-        )
-
-        assert len(pool) == 20
-        assert withheld.by_source['total_cap'] == 29 - 20
-        assert withheld.caps['total_cap'] == 20
+        assert len(pool) == cur.pool_total_cap
+        assert sizes == {
+            'anchor': 1,
+            'sibling': 0,
+            'module': cur.pool_total_cap - 1,
+            'dependency': 0,
+            'embedding': 0,
+        }
+        assert withheld.by_source['total_cap'] == self._untrimmed_pool_size(cur) - cur.pool_total_cap
+        assert withheld.caps['total_cap'] == cur.pool_total_cap
 
     @pytest.mark.asyncio
     async def test_an_untruncated_pool_yields_a_quiet_census(self):
@@ -3458,6 +3651,7 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
 
         _pool, _sizes, withheld = await self._corpus(
             curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+            neighbor_ids=[],
         )
 
         assert withheld.total == 0
@@ -3467,13 +3661,15 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
     async def test_pool_sizes_shape_is_untouched(self):
         """The census must not leak into `pool_sizes` (owned by task 4718)."""
         config = _make_config()
-        tasks = [self._module_task(str(200 + i)) for i in range(20)]
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
         curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
 
-        _pool, sizes, _withheld = await self._corpus(
+        _pool, sizes, withheld = await self._corpus(
             curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
         )
 
+        assert withheld.total > 0
         assert set(sizes) == {'anchor', 'sibling', 'module', 'embedding', 'dependency'}
         assert sizes == {
             'anchor': 0,
@@ -3601,28 +3797,15 @@ class TestCuratorConfigBatch:
 
 
 # ----------------------------------------------------------------------
-# curate_batch
+# curate_prepared
 # ----------------------------------------------------------------------
 
 
-class TestCurateBatch:
+class TestCuratePreparedEmpty:
     @pytest.mark.asyncio
-    async def test_curate_batch_empty_returns_empty_list(self):
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-        result = await curator.curate_batch([], project_id='p', project_root='/x')
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_curate_batch_single_item_delegates_to_curate(self):
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-        decision = CuratorDecision(action='drop', target_id='7', justification='cached')
-        candidate = CandidateTask(title='Fix parser')
-        curator.curate = AsyncMock(return_value=decision)
-        result = await curator.curate_batch([candidate], project_id='p', project_root='/x')
-        assert result == [decision]
-        curator.curate.assert_awaited_once_with(candidate, 'p', '/x')
+    async def test_no_bundles_return_no_decisions(self):
+        curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=must_not_invoke())
+        assert await curator.curate_prepared([], project_id='p', project_root='/x') == []
 
 
 # ----------------------------------------------------------------------
@@ -4104,7 +4287,7 @@ async def _prompt_sent_for(bundles: list[PreparedCandidate]) -> str:
     )
     invoke = AsyncMock(return_value=verdict)
     curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
-    await curator.curate_batch_prepared(bundles, 'p', '/x')
+    await curator.curate_prepared(bundles, 'p', '/x')
     invoke.assert_awaited_once()
     assert invoke.await_args is not None
     return invoke.await_args.kwargs['prompt']
@@ -4358,7 +4541,7 @@ class TestBatchCallScaling:
     async def _batch_kwargs(n: int) -> dict[str, Any]:
         mock = AsyncMock(return_value=batch_create_result(n))
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=mock)
-        await curator.curate_batch_prepared(
+        await curator.curate_prepared(
             [_bundle(f'T{i}') for i in range(n)], 'p', '/x',
         )
         mock.assert_awaited_once()
@@ -4414,13 +4597,13 @@ class TestFailedBatchCall:
             patch.object(curator, '_build_corpus', side_effect=empty_corpus),
             caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_curator'),
         ):
-            decisions = await curator.curate_batch_prepared(
+            decisions = await curator.curate_prepared(
                 [_bundle('A'), _bundle('B')], 'p', '/x',
             )
 
         assert [d.justification for d in decisions] == ['single', 'single']
         [bisect] = [r.getMessage() for r in caplog.records if 'bisecting' in r.getMessage()]
-        assert 'bisecting size-2 batch on CuratorFailureError' in bisect
+        assert 'bisecting a size-2 batch on CuratorFailureError' in bisect
         assert '(subtype=error_max_turns timed_out=False)' in bisect
 
 
@@ -4488,7 +4671,7 @@ class TestBatchCallBudgetScaling:
     async def _batch_budget(n: int) -> float:
         mock = AsyncMock(return_value=batch_create_result(n))
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=mock)
-        await curator.curate_batch_prepared(
+        await curator.curate_prepared(
             [_bundle(f'T{i}') for i in range(n)], 'p', '/x',
         )
         _, kwargs = mock.call_args
@@ -4607,18 +4790,28 @@ class TestBatchBisectFallback:
     Pool unavailability defers instead: test_curator_pool_deferral.py."""
 
     @pytest.mark.asyncio
-    async def test_n1_base_case_delegates_to_curate(self):
-        """At n=1 the helper bypasses the batch prompt and calls curate()."""
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-        c = CandidateTask(title='T')
-        d = CuratorDecision(action='create', justification='ok')
-        with patch.object(curator, 'curate', new=AsyncMock(return_value=d)) as mc:
-            result = await curator._call_llm_batch_with_fallback(
-                [c], [[]], [{}], 0.0, 'p', '/x',
-            )
-        assert result == [d]
-        mc.assert_awaited_once_with(c, 'p', '/x')
+    async def test_a_size_one_leaf_is_a_single_spec_call_over_the_prepared_pool(self):
+        """The bottom of a bisection invokes over the bundle's own pool, never
+        re-entering the guard chain or rebuilding a corpus (left unstubbed:
+        with no embedder configured, a rebuild would defer)."""
+        def single(kwargs: dict[str, Any]) -> AgentResult:
+            assert '[Task 42]' in kwargs['prompt']
+            return _agent_result({'action': 'drop', 'target_id': '42', 'justification': 'dup'})
+
+        invoke = invoke_by_role(
+            batch=AgentResult(success=False, output='boom', subtype='error_max_turns'),
+            single=single,
+        )
+        curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
+        decisions = await curator.curate_prepared(
+            [_bundle('T0', _pool_with_ids(('42', 'pending'))),
+             _bundle('T1', _pool_with_ids(('42', 'pending')))],
+            'p', '/x',
+        )
+        assert [(d.action, d.target_id) for d in decisions] == [('drop', '42'), ('drop', '42')]
+        assert [call.kwargs['role'] for call in invoke.await_args_list] == [
+            'task_curator_batch', 'task_curator', 'task_curator',
+        ]
 
     @pytest.mark.asyncio
     async def test_curator_failure_error_bisects(self):
@@ -4635,10 +4828,10 @@ class TestBatchBisectFallback:
             return batch_create_result(n)
 
         invoke = invoke_by_role(
-            batch=batch, single=AssertionError('the halves are batches, not singles'),
+            batch=batch, single=tripwire('the halves are batches, not singles'),
         )
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             [_bundle(f'T{i}') for i in range(4)], 'p', '/x',
         )
         assert len(decisions) == 4
@@ -4659,11 +4852,10 @@ class TestBatchBisectFallback:
             single=_agent_result({'action': 'create', 'justification': 'from-curate'}),
         )
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            decisions = await curator.curate_batch_prepared(
-                [_bundle('T0'), _bundle('T1')], 'p', '/x',
-            )
-        # Bisect to n=1 twice; each is a single-candidate curation.
+        decisions = await curator.curate_prepared(
+            [_bundle('T0'), _bundle('T1')], 'p', '/x',
+        )
+        # Bisect to n=1 twice; each is a single-spec call over its prepared pool.
         assert [d.justification for d in decisions] == ['from-curate', 'from-curate']
         assert [call.kwargs['role'] for call in invoke.await_args_list] == [
             'task_curator_batch', 'task_curator', 'task_curator',
@@ -4700,10 +4892,10 @@ class TestBatchBisectFallback:
             ]})
 
         invoke = invoke_by_role(
-            batch=batch, single=AssertionError('the halves are batches, not singles'),
+            batch=batch, single=tripwire('the halves are batches, not singles'),
         )
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             [_bundle(f'T{i}') for i in range(4)], 'p', '/x',
         )
 
@@ -4756,9 +4948,9 @@ class TestPrepareCandidate:
         assert prepared.prompt_tokens > 0  # candidate has real text
 
     @pytest.mark.asyncio
-    async def test_corpus_failure_degrades_to_empty_pool(self):
-        """Per the existing curate_batch contract, corpus errors degrade to
-        an empty pool so the curator can still call the LLM."""
+    async def test_corpus_failure_yields_a_corpus_failed_bundle(self):
+        """A corpus failure yields a ``corpus_failed`` bundle over an empty pool,
+        which the pipeline defers ``CORPUS_FAILED`` without calling the LLM."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         async def boom(*a, **k):
@@ -4767,6 +4959,7 @@ class TestPrepareCandidate:
             prepared = await curator.prepare_candidate(
                 CandidateTask(title='X'), 'p', '/x',
             )
+        assert prepared.corpus_error is not None
         assert prepared.pool == []
         assert prepared.pool_sizes == {
             'anchor': 0, 'sibling': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
@@ -4774,13 +4967,13 @@ class TestPrepareCandidate:
 
 
 # ----------------------------------------------------------------------
-# curate_batch N>1 happy path
+# curate_prepared N>1 happy path
 # ----------------------------------------------------------------------
 
 
 class TestCurateBatchHappyPath:
     @pytest.mark.asyncio
-    async def test_curate_batch_n3_returns_ordered_decisions(self):
+    async def test_a_batch_of_three_returns_ordered_decisions(self):
         """N=3 batch issues exactly one LLM call and returns per-candidate decisions."""
         config = _make_config()
         candidates = [
@@ -4822,7 +5015,7 @@ class TestCurateBatchHappyPath:
         mock = AsyncMock(return_value=batch_result)
         curator = TaskCurator(config=config, taskmaster=None, invoke=mock)
         with patch.object(curator, '_build_corpus', side_effect=fake_corpus):
-            result = await curator.curate_batch(candidates, 'p', '/x')
+            result = await _prepare_and_curate(curator, candidates, 'p', '/x')
 
         assert len(result) == 3
         assert [d.action for d in result] == ['create', 'drop', 'create']
@@ -4974,7 +5167,7 @@ class TestWithheldReachesTheLlmPrompt:
         ]
         mock = AsyncMock(return_value=self._batch_result(2))
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=mock)
-        decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+        decisions = await curator.curate_prepared(prepared, 'p', '/x')
 
         assert len(decisions) == 2
         assert mock.await_args is not None
@@ -4989,7 +5182,7 @@ class TestWithheldReachesTheLlmPrompt:
         prepared = [self._prepared('Alpha', None), self._prepared('Beta', PoolWithheld())]
         mock = AsyncMock(return_value=self._batch_result(2))
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=mock)
-        await curator.curate_batch_prepared(prepared, 'p', '/x')
+        await curator.curate_prepared(prepared, 'p', '/x')
         assert mock.await_args is not None
         assert 'pool_truncated' not in mock.await_args.kwargs['prompt']
 
@@ -5003,7 +5196,7 @@ class TestWithheldReachesTheLlmPrompt:
             self._prepared('Alpha', self._census()),
             self._prepared('Beta', self._census(module=7)),
         ]
-        decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+        decisions = await curator.curate_prepared(prepared, 'p', '/x')
         for decision in decisions:
             assert decision.pool_sizes == self.POOL_SIZES
 
@@ -5032,7 +5225,7 @@ class TestWithheldReachesTheLlmPrompt:
             config=_make_config(), taskmaster=None,
             invoke=AsyncMock(side_effect=flaky),
         )
-        decisions = await curator.curate_batch_prepared(prepared, 'p', '/x')
+        decisions = await curator.curate_prepared(prepared, 'p', '/x')
 
         assert len(decisions) == 4
         # The right half (Gamma, Delta) re-ran and still carried Gamma's fact.
@@ -5047,7 +5240,7 @@ class TestWithheldReachesTheLlmPrompt:
 
 
 class TestSizeOneBatchReusesThePreparedCorpus:
-    """`curate_batch_prepared` short-circuits N=1 to `curate` — with the bundle.
+    """A size-1 `curate_prepared` judges over the bundle it was handed, never rebuilding it.
 
     Bigger per-candidate sections (the raised `entry_description_chars`) mean
     the worker's token accumulator admits fewer tickets per batch, so batches
@@ -5077,7 +5270,7 @@ class TestSizeOneBatchReusesThePreparedCorpus:
         )
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=llm)
         with patch.object(curator, '_build_corpus', new=build):
-            decisions = await curator.curate_batch_prepared(
+            decisions = await curator.curate_prepared(
                 [self._prepared()], 'p', '/x',
             )
 
@@ -5108,7 +5301,7 @@ class TestSizeOneBatchReusesThePreparedCorpus:
         )
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=llm)
         with patch.object(curator, '_build_corpus', new=build):
-            [decision] = await curator.curate_batch_prepared([prepared], 'p', '/x')
+            [decision] = await curator.curate_prepared([prepared], 'p', '/x')
 
         assert decision.action == 'defer'
         assert decision.defer_reason is DeferReason.CORPUS_FAILED
@@ -5143,7 +5336,7 @@ class TestSizeOneBatchReusesThePreparedCorpus:
 
 
 # ----------------------------------------------------------------------
-# curate_batch: pre-batch-dedup must not pollute the payload-hash cache
+# curate_prepared: pre-batch-dedup must not pollute the payload-hash cache
 # ----------------------------------------------------------------------
 
 
@@ -5192,7 +5385,7 @@ class TestCurateBatchPreDedupCachePollution:
             invoke=AsyncMock(return_value=batch_result),
         )
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            result = await curator.curate_batch([c1, c2], 'p', '/x')
+            result = await _prepare_and_curate(curator, [c1, c2], 'p', '/x')
 
         # Decision order preserved: c1 is the 'create', c2 is the synthetic drop.
         assert result[0].action == 'create'
@@ -5210,46 +5403,38 @@ class TestCurateBatchPreDedupCachePollution:
 
 
 # ----------------------------------------------------------------------
-# curate_batch: whole-batch fallback on LLM failure
+# curate_prepared: whole-batch fallback on LLM failure
 # ----------------------------------------------------------------------
 
 
 class TestCurateBatchWholeBatchFailure:
     @pytest.mark.asyncio
-    async def test_curator_failure_error_falls_back_to_per_candidate_curate(self):
-        """A failed batch call triggers N serial curate() calls."""
-        config = _make_config()
+    async def test_a_failed_batch_is_answered_by_single_calls_over_the_prepared_pools(self):
+        """A failed batch call bisects into single-spec calls, each over its own pool."""
+        def single(kwargs: dict[str, Any]) -> AgentResult:
+            if '[Task 9]' in kwargs['prompt']:
+                return _agent_result({'action': 'drop', 'target_id': '9', 'justification': 'fb2'})
+            return _agent_result({'action': 'create', 'justification': 'fb1'})
+
         invoke = invoke_by_role(
             batch=AgentResult(
                 success=False, output='whole-batch-failed', timed_out=False, duration_ms=5000,
             ),
-            single=AssertionError('the size-1 halves go through curate()'),
+            single=single,
         )
-        curator = TaskCurator(config=config, taskmaster=None, invoke=invoke)
-        c1 = CandidateTask(title='Task One')
-        c2 = CandidateTask(title='Task Two')
+        curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
 
-        fallback_decisions = [
-            CuratorDecision(action='create', justification='fb1'),
-            CuratorDecision(action='drop', target_id='9', justification='fb2'),
+        result = await curator.curate_prepared(
+            [_bundle('Task One'), _bundle('Task Two', _pool_with_ids(('9', 'pending')))],
+            'p', '/x',
+        )
+
+        assert [(d.action, d.target_id, d.justification) for d in result] == [
+            ('create', None, 'fb1'), ('drop', '9', 'fb2'),
         ]
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch.object(
-                 curator, 'curate',
-                 new=AsyncMock(side_effect=fallback_decisions),
-             ) as mock_curate:
-            result = await curator.curate_batch([c1, c2], 'p', '/x')
-
-        invoke.assert_awaited_once()
-        assert result == fallback_decisions
-        assert mock_curate.await_count == 2
-        # Called in order: c1 first, c2 second.
-        assert mock_curate.call_args_list[0].args[0] is c1
-        assert mock_curate.call_args_list[1].args[0] is c2
+        assert [call.kwargs['role'] for call in invoke.await_args_list] == [
+            'task_curator_batch', 'task_curator', 'task_curator',
+        ]
 
 
 # ----------------------------------------------------------------------
@@ -5304,7 +5489,7 @@ class TestBatchTargetIndex:
 
 
 # ----------------------------------------------------------------------
-# curate_batch: batch_target_index remap from unique-space to original-space
+# curate_prepared: batch_target_index remap from unique-space to original-space
 # ----------------------------------------------------------------------
 
 
@@ -5372,7 +5557,7 @@ class TestCurateBatchBatchTargetIndexRemap:
             invoke=AsyncMock(return_value=batch_result),
         )
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            decisions = await curator.curate_batch([A1, B1, A2, C, B2, D], 'p', '/x')
+            decisions = await _prepare_and_curate(curator, [A1, B1, A2, C, B2, D], 'p', '/x')
 
         # (a) correct length
         assert len(decisions) == 6
@@ -5405,12 +5590,12 @@ class TestCurateBatchBatchTargetIndexRemap:
 
 
 # ----------------------------------------------------------------------
-# curate_batch: decision cache check before LLM (suggestion 1)
+# curate_prepared: decision cache check before LLM (suggestion 1)
 # ----------------------------------------------------------------------
 
 
 class TestCurateBatchCacheCheck:
-    """curate_batch consults _check_cache before building corpus or calling LLM.
+    """curate_prepared consults _check_cache before building corpus or calling LLM.
 
     Cache hits are returned directly; only uncached unique candidates are sent
     to the batch LLM call.  If ALL unique candidates are cache hits, the LLM is
@@ -5435,7 +5620,7 @@ class TestCurateBatchCacheCheck:
         curator._store_cache(c3.payload_hash(), d3)
 
         with patch.object(curator, '_build_corpus', side_effect=Exception('no call expected')):
-            result = await curator.curate_batch([c1, c2, c3], 'p', '/x')
+            result = await _prepare_and_curate(curator, [c1, c2, c3], 'p', '/x')
 
         invoke.assert_not_awaited()
         assert len(result) == 3
@@ -5445,13 +5630,14 @@ class TestCurateBatchCacheCheck:
 
     @pytest.mark.asyncio
     async def test_partial_cache_hit_sends_only_uncached_to_llm(self):
-        """Two candidates cached, one uncached → uncached one goes to the curator
-        single-item path (the bisecting fallback's ``n==1`` base case calls
-        :meth:`TaskCurator.curate` rather than burning a batch prompt for one
-        item)."""
-        config = _make_config()
-        invoke = must_not_invoke()
-        curator = TaskCurator(config=config, taskmaster=None, invoke=invoke)
+        """Two candidates cached, one uncached: the uncached one is the only
+        candidate the LLM sees, through the single spec rather than a batch
+        prompt for one item."""
+        invoke = invoke_by_role(
+            single=_agent_result({'action': 'create', 'justification': 'new-from-llm'}),
+            batch=tripwire('one uncached candidate uses the single spec'),
+        )
+        curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
         c_cached1 = CandidateTask(title='Cached-One')
         c_new = CandidateTask(title='Brand-New')
         c_cached2 = CandidateTask(title='Cached-Two')
@@ -5461,34 +5647,13 @@ class TestCurateBatchCacheCheck:
         curator._store_cache(c_cached1.payload_hash(), d_cached1)
         curator._store_cache(c_cached2.payload_hash(), d_cached2)
 
-        d_new = CuratorDecision(action='create', justification='new-from-llm')
+        result = await curator.curate_prepared(
+            [_bundle(c.title, candidate=c) for c in (c_cached1, c_new, c_cached2)], 'p', '/x',
+        )
 
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        single_calls: list = []
-
-        async def capture_curate(candidate, project_id, project_root):
-            single_calls.append(candidate)
-            return d_new
-
-        # No batch call may fire — only one uncached candidate means the
-        # bisecting helper's size-1 base case routes through curate() instead.
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch.object(curator, 'curate', side_effect=capture_curate):
-            result = await curator.curate_batch(
-                [c_cached1, c_new, c_cached2], 'p', '/x',
-            )
-
-        invoke.assert_not_awaited()
-        assert len(single_calls) == 1
-        assert single_calls[0] is c_new
-
-        # Result order matches original candidate list.
-        assert len(result) == 3
-        assert result[0].justification == 'c1-cached'
-        assert result[1].justification == 'new-from-llm'
-        assert result[2].justification == 'c2-cached'
+        [call] = invoke.await_args_list
+        assert candidate_titles(call.kwargs['prompt']) == [c_new.title]
+        assert [d.justification for d in result] == ['c1-cached', 'new-from-llm', 'c2-cached']
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -5562,7 +5727,7 @@ class TestCuratorCapWaitSanityBound:
 
         mock = AsyncMock(return_value=verdict)
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=mock)
-        await curator.curate_batch_prepared([_bundle(title) for title in titles], 'p', '/x')
+        await curator.curate_prepared([_bundle(title) for title in titles], 'p', '/x')
         _, kwargs = mock.call_args
         assert kwargs['cap_wait_sanity_secs'] == _CURATOR_CAP_WAIT_SANITY_SECS
 
@@ -6015,7 +6180,9 @@ class TestCuratorBlocklistShortCircuit:
 
         with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))) as mock_corpus, \
              patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
-            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+            [decision] = await curator.curate_prepared(
+                [_bundle(candidate.title, candidate=candidate)], project_id="p", project_root="/x",
+            )
 
         assert decision.action == "refuse"
         assert decision.justification.startswith("cancelled-premise-blocklist:")
@@ -6103,7 +6270,8 @@ class TestCuratorBatchBlocklistShortCircuit:
             desc_subs=["fixc_flags_deleted_not_found"],
         )
         config = _make_config_with_blocklist(str(blocklist))
-        curator = TaskCurator(config=config, taskmaster=None)
+        llm = AsyncMock()
+        curator = TaskCurator(config=config, taskmaster=None, invoke=llm)
 
         # candidates[0] matches the blocklist
         c0 = CandidateTask(
@@ -6130,16 +6298,14 @@ class TestCuratorBatchBlocklistShortCircuit:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        llm.side_effect = _answering_with(decide, prepared)
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
         # (a) Three decisions returned, one per prepared candidate
         assert len(decisions) == 3
@@ -6753,11 +6919,11 @@ class TestCancelledPremiseBlocklistPinsVerifySummaryGlobPremise:
 
 @pytest.mark.asyncio
 class TestZeroOutputBreakerBatchPath:
-    """Step-9 RED: consecutive-ZOT circuit breaker also gates curate_batch_prepared.
+    """Step-9 RED: consecutive-ZOT circuit breaker also gates curate_prepared.
 
-    The production path uses curate_batch_prepared; the breaker in curate() alone
+    The production path uses curate_prepared; the breaker in curate() alone
     would not stop every call from burning the full batch LLM round-trip during a
-    sustained hang window.  These tests confirm that curate_batch_prepared checks
+    sustained hang window.  These tests confirm that curate_prepared checks
     the breaker BEFORE dispatching the LLM.
     """
 
@@ -6769,7 +6935,7 @@ class TestZeroOutputBreakerBatchPath:
         )
 
     async def test_breaker_open_gates_batch_llm_calls(self):
-        """With breaker OPEN, curate_batch_prepared defers all LLM-bound
+        """With breaker OPEN, curate_prepared defers all LLM-bound
         candidates without invoking invoke_with_cap_retry."""
         from fused_memory.middleware.curator_types import PreparedCandidate
 
@@ -6803,7 +6969,7 @@ class TestZeroOutputBreakerBatchPath:
             PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
         ]
 
-        decisions = await curator.curate_batch_prepared(
+        decisions = await curator.curate_prepared(
             prepared, project_id='p', project_root='/x',
         )
 
@@ -6817,14 +6983,14 @@ class TestZeroOutputBreakerBatchPath:
         assert mock_llm.await_count == call_count_before_batch
 
     async def test_batch_zot_without_preopen_trips_breaker(self):
-        """A curate_batch_prepared call (no pre-opened breaker) where all candidates
+        """A curate_prepared call (no pre-opened breaker) where all candidates
         hit ZOT must open the breaker and bound escalation submissions.
 
-        Bisect funnels to size-1 curate() calls which each record ZOTs.  After
-        threshold consecutive recordings the breaker opens; subsequent size-1 calls
-        within the same asyncio.gather check the breaker and short-circuit.
-        A follow-on batch with the breaker open produces no LLM calls and no
-        new escalation submissions.
+        A size-1 batch is a single-spec call, which records its ZOT. After
+        threshold consecutive recordings the breaker opens. Every dispatch,
+        each bisected half and leaf included, checks the breaker before it
+        invokes, so a follow-on batch with the breaker open produces no LLM
+        calls and no new escalation submissions.
         """
         from fused_memory.middleware.curator_types import PreparedCandidate
 
@@ -6839,7 +7005,7 @@ class TestZeroOutputBreakerBatchPath:
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
         # First batch: 1 candidate, no pre-opened breaker.
-        # Bisects immediately to size-1 → curate() → ZOT → counter=1 → opens (threshold=1).
+        # One single-spec call → ZOT → counter=1 → opens (threshold=1).
         prepared_first = [
             PreparedCandidate(
                 candidate=CandidateTask(title='ZOT batch candidate', description='desc1'),
@@ -6847,7 +7013,7 @@ class TestZeroOutputBreakerBatchPath:
             )
         ]
         curator = TaskCurator(config=config, taskmaster=None, escalator=escalator, invoke=mock_llm)
-        first_decisions = await curator.curate_batch_prepared(
+        first_decisions = await curator.curate_prepared(
             prepared_first, project_id='p', project_root='/x',
         )
 
@@ -6868,7 +7034,7 @@ class TestZeroOutputBreakerBatchPath:
             )
             for i in range(3)
         ]
-        second_decisions = await curator.curate_batch_prepared(
+        second_decisions = await curator.curate_prepared(
             prepared_second, project_id='p', project_root='/x',
         )
 
@@ -6925,7 +7091,7 @@ class TestSingleCallBudgetScaling:
     async def _single_budget(pool_size: int) -> float:
         mock = AsyncMock(return_value=_agent_result({'action': 'create', 'justification': 'x'}))
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=mock)
-        await curator.curate_batch_prepared([_bundle('T', _make_pool(pool_size))], 'p', '/x')
+        await curator.curate_prepared([_bundle('T', _make_pool(pool_size))], 'p', '/x')
         _, kwargs = mock.call_args
         return kwargs['max_budget_usd']
 
@@ -6952,9 +7118,9 @@ class TestSingleCallBudgetScaling:
     async def test_oversized_pool_clamped_at_cap(self):
         """N=50 → unclamped would be 2.00 + 0.0125*50 = 2.625; clamped at $2.00.
 
-        NOTE: In production _trim_pool caps the pool at pool_total_cap (default 30)
-        while the corpus is assembled, so len(pool) can never exceed 30
-        on the normal code path.  The cap (2.00) now equals the base floor, so
+        NOTE: In production _trim_pool caps the pool at pool_total_cap while
+        the corpus is assembled, so len(pool) can never exceed that cap on the
+        normal code path.  The cap (2.00) now equals the base floor, so
         every pool size — including pathologically large ones — clamps to the
         same flat $2.00.  This test verifies the clamping arithmetic but does
         NOT represent a reachable runtime scenario — it bypasses _trim_pool by
@@ -7025,7 +7191,9 @@ class TestCuratorPremiseRefutedDrop:
 
         with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))) as mock_corpus, \
              patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
-            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+            [decision] = await curator.curate_prepared(
+                [_bundle(candidate.title, candidate=candidate)], project_id="p", project_root="/x",
+            )
 
         assert decision.action == "refuse"
         assert decision.justification.startswith("recon-premise-refuted:")
@@ -7289,7 +7457,7 @@ class TestPremiseGuardRunsOffEventLoop:
         """RED: an exception from the offloaded verification must fail OPEN.
 
         _maybe_premise_refuted_drop's own docstring promises "Never raises",
-        and both its callers — curate() and curate_batch_prepared() — invoke
+        and both its callers — curate() and curate_prepared() — invoke
         it unguarded, so an escaping exception would take down the whole
         task submission. That contract held for free while the callees were
         the guard module's own never-raising functions; offloading
@@ -7504,7 +7672,7 @@ class TestPremiseGuardRunsOffEventLoop:
         This pins THIS METHOD's own except-Exception wrapper around the
         offloaded load — the last line of defence for
         _maybe_premise_refuted_drop's "Never raises" contract, whose callers
-        curate() / curate_batch_prepared() invoke it unguarded. Two distinct
+        curate() / curate_prepared() invoke it unguarded. Two distinct
         properties: (a) the exception does not escape, and (b)
         _premise_registry_load_attempted still latches, so a one-shot
         failure does not become a permanent one for the life of the process
@@ -7685,7 +7853,8 @@ class TestCuratorBatchPremiseRefutedDrop:
             ],
         )
         config = _make_config_with_premise_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+        llm = AsyncMock()
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root, invoke=llm)
 
         # candidates[0] is premise-refuted by the registry entry above
         c0 = CandidateTask(
@@ -7707,16 +7876,14 @@ class TestCuratorBatchPremiseRefutedDrop:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        llm.side_effect = _answering_with(decide, prepared)
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
         # (a) Two decisions returned, one per prepared candidate
         assert len(decisions) == 2
@@ -7755,7 +7922,8 @@ class TestCuratorBatchPremiseRefutedDrop:
             ],
         )
         config = _make_config_with_premise_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+        llm = AsyncMock()
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root, invoke=llm)
 
         c0 = CandidateTask(title="Improve worker logging", description="Normal task")
         c1 = CandidateTask(title="Add telemetry to recon pipeline", description="Normal task 2")
@@ -7774,16 +7942,14 @@ class TestCuratorBatchPremiseRefutedDrop:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        llm.side_effect = _answering_with(decide, prepared)
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
         assert len(decisions) == 2
         assert len(llm_candidates_received) == 2
@@ -7793,7 +7959,7 @@ class TestCuratorBatchPremiseRefutedDrop:
     async def test_batch_premise_drop_self_corrects_after_source_change(self, tmp_path):
         """Same self-correction scenario as
         TestCuratorPremiseRefutedDrop.test_premise_drop_self_corrects_after_source_change,
-        driven through curate_batch_prepared() twice: the first call drops the
+        driven through curate_prepared() twice: the first call drops the
         candidate pre-LLM; after the fixture source is rewritten to no longer
         refute the premise, the identical candidate must reach the (mocked) LLM
         on the second call instead of being suppressed by a stale cached drop.
@@ -7816,11 +7982,10 @@ class TestCuratorBatchPremiseRefutedDrop:
             ],
         )
         config = _make_config_with_premise_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+        llm = AsyncMock()
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root, invoke=llm)
 
-        # A second, ordinary candidate keeps this a genuine 2-item batch so
-        # curate_batch_prepared exercises the real bisecting-LLM path instead
-        # of its len(prepared) == 1 shortcut straight to curate().
+        # A second, ordinary candidate keeps this a genuine 2-item batch.
         c0 = CandidateTask(
             title="Fix entity-summary rebuild missing invalid_at filter",
             description="Rebuild does not check missing invalid_at filter before writing.",
@@ -7835,7 +8000,7 @@ class TestCuratorBatchPremiseRefutedDrop:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return [
                 CuratorDecision(action="create", justification=f"genuinely new {i}",
@@ -7843,30 +8008,28 @@ class TestCuratorBatchPremiseRefutedDrop:
                 for i in range(len(cands))
             ]
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
-        ):
-            decisions1 = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        llm.side_effect = _answering_with(decide, prepared)
+        decisions1 = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
-            # c0 is refused pre-LLM; only the ordinary c1 reaches the mocked LLM.
-            assert decisions1[0].action == "refuse"
-            assert decisions1[0].justification.startswith("recon-premise-refuted:")
-            assert decisions1[1].action == "create"
-            assert len(llm_candidates_received) == 1
-            assert llm_candidates_received[0] is c1
-            assert c0.payload_hash() not in curator._decision_cache
+        # c0 is refused pre-LLM; only the ordinary c1 reaches the mocked LLM.
+        assert decisions1[0].action == "refuse"
+        assert decisions1[0].justification.startswith("recon-premise-refuted:")
+        assert decisions1[1].action == "create"
+        assert len(llm_candidates_received) == 1
+        assert llm_candidates_received[0] is c1
+        assert c0.payload_hash() not in curator._decision_cache
 
-            llm_candidates_received.clear()
+        llm_candidates_received.clear()
 
-            # Premise now VALID: rewrite the fixture, removing the must_contain
-            # token — a genuine bug now exists (the filter really is missing).
-            source_file.write_text("def rebuild():\n    pass\n", encoding="utf-8")
+        # Premise now VALID: rewrite the fixture, removing the must_contain
+        # token — a genuine bug now exists (the filter really is missing).
+        source_file.write_text("def rebuild():\n    pass\n", encoding="utf-8")
 
-            decisions2 = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        decisions2 = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
         # c0 must now reach the (mocked) LLM instead of being suppressed by a
         # stale cached drop from the first call.
@@ -7885,7 +8048,7 @@ class TestBatchDuplicateInheritsRefusal:
     """A deterministic refusal must not be bypassable by submitting the SAME
     candidate twice in one batch.
 
-    The pre-batch payload_hash dedup in ``curate_batch_prepared`` runs BEFORE
+    The pre-batch payload_hash dedup in ``curate_prepared`` runs BEFORE
     the blocklist and premise guards, so a byte-identical duplicate is assigned
     a synthetic ``CuratorDecision(action='drop', batch_target_index=<first>)``
     and is excluded from ``unique_indices`` — the guards never see it. At
@@ -7925,13 +8088,9 @@ class TestBatchDuplicateInheritsRefusal:
             PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback",
-            new=AsyncMock(side_effect=AssertionError("batch LLM must not be called")),
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
         invoke.assert_not_awaited()
 
         assert len(decisions) == 2
@@ -7981,13 +8140,9 @@ class TestBatchDuplicateInheritsRefusal:
             PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback",
-            new=AsyncMock(side_effect=AssertionError("batch LLM must not be called")),
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
         invoke.assert_not_awaited()
 
         assert len(decisions) == 2
@@ -8011,7 +8166,8 @@ class TestBatchDuplicateInheritsRefusal:
             desc_subs=["fixc_flags_deleted_not_found"],
         )
         config = _make_config_with_blocklist(str(blocklist))
-        curator = TaskCurator(config=config, taskmaster=None)
+        llm = AsyncMock()
+        curator = TaskCurator(config=config, taskmaster=None, invoke=llm)
 
         def _ordinary():
             return CandidateTask(title="Improve worker logging", description="Normal task")
@@ -8025,18 +8181,16 @@ class TestBatchDuplicateInheritsRefusal:
             PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             return [
                 CuratorDecision(action="create", justification="new-1",
                                 pool_sizes=empty_sizes, latency_ms=0),
             ]
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        llm.side_effect = _answering_with(decide, prepared)
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
         assert decisions[0].action == "create"
         assert decisions[1].action == "drop"
@@ -8430,7 +8584,9 @@ class TestCuratorCurateRouteDeterministicIntegration:
         )
 
         with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))) as mock_corpus:
-            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+            [decision] = await curator.curate_prepared(
+                [_bundle(candidate.title, candidate=candidate)], project_id="p", project_root="/x",
+            )
 
         assert decision.action == "route_deterministic"
         assert decision.justification.startswith("operational-ask-registry:")
@@ -8570,7 +8726,8 @@ class TestCuratorBatchRouteDeterministic:
             desc_subs=["--apply"],
         )
         config = _make_config_with_operational_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        llm = AsyncMock()
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path, invoke=llm)
 
         c0 = CandidateTask(
             title="Run prune_recon_cycle_summaries --apply against live Mem0",
@@ -8586,7 +8743,7 @@ class TestCuratorBatchRouteDeterministic:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             # Mirrors the real batch LLM: one decision per candidate it
             # actually receives. Its output schema has no 'route_deterministic'
             # action, so anything reaching it can only ever come back 'create'.
@@ -8597,12 +8754,10 @@ class TestCuratorBatchRouteDeterministic:
                 for i in range(len(cands))
             ]
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        llm.side_effect = _answering_with(decide, prepared)
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
         # (d) two decisions, one per prepared candidate
         assert len(decisions) == 2
@@ -8643,7 +8798,8 @@ class TestCuratorBatchRouteDeterministic:
             cancelled_premise_blocklist_path=str(blocklist),
             operational_ask_registry_path=str(operational_registry),
         )
-        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        llm = AsyncMock()
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path, invoke=llm)
 
         c0 = CandidateTask(
             title="Run prune_recon_cycle_summaries --apply against live Mem0",
@@ -8663,16 +8819,14 @@ class TestCuratorBatchRouteDeterministic:
         ]
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             llm_candidates_received.extend(cands)
             return llm_decisions_returned
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        llm.side_effect = _answering_with(decide, prepared)
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
         assert decisions[0].action == "refuse"
         assert decisions[0].justification.startswith("cancelled-premise-blocklist:")
@@ -8692,7 +8846,8 @@ class TestCuratorBatchRouteDeterministic:
             desc_subs=["--apply"],
         )
         config = _make_config_with_operational_registry(str(registry))
-        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        llm = AsyncMock()
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path, invoke=llm)
 
         c0 = CandidateTask(
             title="Run prune_recon_cycle_summaries --apply against live Mem0",
@@ -8712,7 +8867,7 @@ class TestCuratorBatchRouteDeterministic:
 
         llm_candidates_received: list[CandidateTask] = []
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
+        async def decide(cands):
             # Mirrors the real batch LLM: one decision per candidate it
             # actually receives. If c0 reaches it, it can only come back
             # 'create' — its output schema has no 'route_deterministic'.
@@ -8723,12 +8878,10 @@ class TestCuratorBatchRouteDeterministic:
                 for i in range(len(cands))
             ]
 
-        with patch.object(
-            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
-        ):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id="p", project_root="/x"
-            )
+        llm.side_effect = _answering_with(decide, prepared)
+        decisions = await curator.curate_prepared(
+            prepared, project_id="p", project_root="/x"
+        )
 
         # (d) two decisions, one per prepared candidate
         assert len(decisions) == 2
@@ -9053,7 +9206,7 @@ class TestCuratorPromptLoaderWiringSingle:
 
         # Nothing pinned yet: the loader must fall back to the in-code baseline.
         curator = TaskCurator(config=config, taskmaster=None, prompt_store=store, invoke=mock)
-        await curator.curate_batch_prepared([_bundle('T')], 'p', '/x')
+        await curator.curate_prepared([_bundle('T')], 'p', '/x')
         assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == CURATOR_SINGLE_SPEC.in_code_constant
 
@@ -9068,7 +9221,7 @@ class TestCuratorPromptLoaderWiringSingle:
         )
 
         # A new title, so the idempotency cache cannot answer for the LLM.
-        await curator.curate_batch_prepared([_bundle('T2')], 'p', '/x')
+        await curator.curate_prepared([_bundle('T2')], 'p', '/x')
         assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == compose_prompt(
             CURATOR_SINGLE_SPEC.contract, heuristics,
@@ -9152,7 +9305,7 @@ class TestCuratorPromptLoaderWiringBatch:
 
         # Nothing pinned yet: the loader must fall back to the in-code baseline.
         curator = TaskCurator(config=config, taskmaster=None, prompt_store=store, invoke=mock)
-        await curator.curate_batch_prepared([_bundle('T0'), _bundle('T1')], 'p', '/x')
+        await curator.curate_prepared([_bundle('T0'), _bundle('T1')], 'p', '/x')
         assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == CURATOR_BATCH_SPEC.in_code_constant
 
@@ -9167,7 +9320,7 @@ class TestCuratorPromptLoaderWiringBatch:
         )
 
         # New titles, so the idempotency cache cannot answer for the LLM.
-        await curator.curate_batch_prepared([_bundle('T2'), _bundle('T3')], 'p', '/x')
+        await curator.curate_prepared([_bundle('T2'), _bundle('T3')], 'p', '/x')
         assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == compose_prompt(
             CURATOR_BATCH_SPEC.contract, heuristics,

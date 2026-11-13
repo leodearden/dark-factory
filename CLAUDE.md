@@ -433,9 +433,14 @@ directly, not just interactive agents.
 - For a direct-to-main commit under contention, use `git commit --only <path>`
   (not a bare `git commit`) so you don't sweep up unrelated staged/dirty state
   from a concurrent process.
-- `pre-commit` runs pyright **only for packages with staged `.py` changes**
-  (`hooks/project-checks`, task 2551): a docs-only commit prints
-  `pyright skipped (no Python changes)` and is quick. When a commit does stage
+- `pre-commit` runs the merge gate's module checks **only for modules with
+  staged `.py` changes** (`hooks/project-checks` via
+  `scripts/hook_module_checks.py`, task 8531). A commit mapping to none prints
+  `merge-gate checks skipped (...)` and is quick. A docs-only commit runs the
+  `scripts/merge_screen.yaml` screen instead (about 10 s warm) when it stages
+  anything under `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md`
+  outside a workspace package, root-level docs such as this file included;
+  other docs-only commits skip the merge-gate checks. When a commit does stage
   Python, pass `timeout: 300000` (or higher) to `Bash`, or run detached via
   `setsid` and poll, rather than letting the default timeout kill it mid-hook.
 - `git commit --only` holds `.git/index.lock` for that **entire** hook run,

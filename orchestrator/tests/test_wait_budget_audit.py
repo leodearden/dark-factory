@@ -7,18 +7,24 @@ case is non-vacuous and does not shift when another file is edited.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import dataclasses
+import importlib.util
 import math
 from collections.abc import Mapping
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 from _wait_budget_audit import (
     AMBIENT_TEST_TIMEOUT,
+    RESPONSIVE_WAIT_HELPERS,
     ItemWaitAudit,
     LimitSource,
     audit_module,
     is_module_level_item,
+    is_responsive_wait_call,
     item_wait_budgets,
 )
 
@@ -749,6 +755,162 @@ async def settle():
         assert budgets == {'test_x': 90.0}, (
             f'Expected the module-level test_x billed at 90.0 under its bare '
             f'name and the non-test helper ignored, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        ('context', 'expected'),
+        [
+            pytest.param('asyncio.timeout(30.0)', 30.0, id='literal-delay'),
+            pytest.param('asyncio.timeout(MERGE_RESULT_TIMEOUT)', 45.0, id='named-delay'),
+            pytest.param('asyncio.timeout(delay=12.0)', 12.0, id='keyword-delay'),
+            pytest.param('asyncio.timeout(some_var)', math.inf, id='unreadable-delay'),
+            pytest.param('asyncio.timeout(None)', math.inf, id='no-deadline'),
+            pytest.param('gate.timeout(999.0)', 0.0, id='not-asyncio'),
+        ],
+    )
+    def test_an_asyncio_timeout_block_bills_its_delay(
+        self, context: str, expected: float
+    ) -> None:
+        """An `asyncio.timeout(X)` block is wait_for's deadline spelled as a
+        context, so it bills X exactly as `asyncio.wait_for(..., timeout=X)`
+        does -- an unreadable or None delay fails closed at `math.inf` -- and
+        a non-`asyncio` `.timeout(...)` contributes 0.0.
+        """
+        source = f'''
+class TestTimeoutBlock:
+    async def test_it(self):
+        async with {context}:
+            while not ready():
+                await asyncio.sleep(0.01)
+'''
+        budgets = item_wait_budgets(source)
+
+        assert budgets == {'TestTimeoutBlock::test_it': expected}, (
+            f'Expected `async with {context}:` around a poll to bill '
+            f'{expected}, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        ('context', 'expected'),
+        [
+            pytest.param('asyncio.timeout_at(deadline)', math.inf, id='named-deadline'),
+            pytest.param(
+                'asyncio.timeout_at(loop.time() + 5.0)', math.inf, id='clock-arithmetic'
+            ),
+            pytest.param('asyncio.timeout_at(when=deadline)', math.inf, id='keyword'),
+            pytest.param('gate.timeout_at(deadline)', 0.0, id='not-asyncio'),
+        ],
+    )
+    def test_an_asyncio_timeout_at_block_fails_closed(
+        self, context: str, expected: float
+    ) -> None:
+        """`asyncio.timeout_at(when)` takes an absolute deadline, which the
+        per-call model cannot read as a duration, so it bills `math.inf` like
+        any unreadable bound rather than slipping through at 0.0; a
+        non-`asyncio` `.timeout_at(...)` contributes 0.0.
+        """
+        source = f'''
+class TestTimeoutAtBlock:
+    async def test_it(self):
+        async with {context}:
+            while not ready():
+                await asyncio.sleep(0.01)
+'''
+        budgets = item_wait_budgets(source)
+
+        assert budgets == {'TestTimeoutAtBlock::test_it': expected}, (
+            f'Expected `async with {context}:` around a poll to bill '
+            f'{expected}, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        ('call', 'expected'),
+        [
+            pytest.param("poll_responsive(pred, label='x')", 90.0, id='bare-default'),
+            pytest.param(
+                "poll_responsive(pred, timeout=MERGE_GATE_BARRIER_TIMEOUT, label='x')",
+                30.0,
+                id='gate-barrier-nominal',
+            ),
+            pytest.param(
+                "poll_responsive(pred, timeout=1.0, max_wall_s=1000.0, label='x')",
+                1000.0,
+                id='explicit-wall-cap',
+            ),
+        ],
+    )
+    def test_poll_responsive_bills_exactly_as_wait_responsive(
+        self, call: str, expected: float
+    ) -> None:
+        """`poll_responsive` delegates its accounting to `wait_responsive`,
+        so it bills the same stretched-and-clamped nominal, or an explicit
+        `max_wall_s` verbatim.
+        """
+        source = f'''
+class TestPollResponsive:
+    async def test_it(self):
+        await {call}
+'''
+        budgets = item_wait_budgets(source)
+
+        assert budgets == {'TestPollResponsive::test_it': expected}, (
+            f'Expected `{call}` to bill {expected}, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        ('call', 'is_responsive'),
+        [
+            ("wait_responsive(req.result, label='x')", True),
+            ("poll_responsive(pred, label='x')", True),
+            ("wait_until(pred, label='x')", False),
+            ("x.wait_responsive(req.result, label='x')", False),
+        ],
+    )
+    def test_is_responsive_wait_call_names_exactly_the_responsive_helpers(
+        self, call: str, is_responsive: bool
+    ) -> None:
+        node = ast.parse(call, mode='eval').body
+
+        assert is_responsive_wait_call(node) is is_responsive, (
+            f'is_responsive_wait_call({call!r}) should be {is_responsive}'
+        )
+
+
+# Rule C's checker: stdlib-only, so it holds a literal copy of the responsive
+# helper names that this package derives from the helpers themselves.
+_RULE_C_CHECKER_PATH = (
+    Path(__file__).resolve().parents[2]
+    / 'fused-memory'
+    / 'scripts'
+    / 'check_bare_magicmock_config.py'
+)
+
+
+def _load_rule_c_checker() -> ModuleType:
+    """A fresh copy of the Rule C checker, loaded by path: it is a script."""
+    spec = importlib.util.spec_from_file_location(
+        '_rule_c_checker_for_wait_budget_audit', _RULE_C_CHECKER_PATH
+    )
+    assert spec is not None and spec.loader is not None, (
+        f'no import spec for {_RULE_C_CHECKER_PATH}'
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestRuleCRecognisesTheBilledHelpers:
+    def test_rule_c_and_the_audit_name_the_same_responsive_helpers(self) -> None:
+        """A helper the audit bills and leak-scans must also be a Rule C
+        call shape, or a raw literal bound on it escapes the lint."""
+        checker = _load_rule_c_checker()
+
+        assert set(checker.RESPONSIVE_WAIT_HELPERS) == RESPONSIVE_WAIT_HELPERS, (
+            'RESPONSIVE_WAIT_HELPERS in fused-memory/scripts/'
+            'check_bare_magicmock_config.py must name exactly the helpers '
+            'orchestrator/tests/_wait_budget_audit.py::RESPONSIVE_WAIT_HELPERS '
+            f'names: {sorted(checker.RESPONSIVE_WAIT_HELPERS)} != '
+            f'{sorted(RESPONSIVE_WAIT_HELPERS)}'
         )
 
 

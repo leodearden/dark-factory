@@ -19,6 +19,11 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+from fused_memory.server.grouped_read import DEFAULT_AMENDMENT_TEXT_CHARS
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
@@ -275,7 +280,7 @@ def _without(row: dict[str, Any], field: str) -> dict[str, Any]:
 
 EARLY = 'Early detail sits here.'
 LATE = 'Late detail sits here.'
-LONG_CHILD = f'{EARLY} {"x" * 300} {LATE}'
+LONG_CHILD = f'{EARLY} {"x" * (DEFAULT_AMENDMENT_TEXT_CHARS + 300)} {LATE}'
 
 
 def _with_spans(row: dict[str, Any], *spans: str) -> dict[str, Any]:
@@ -1309,3 +1314,198 @@ class TestCurrentDerivations:
         assert [(str(gap.binary), str(gap.kind)) for gap in derivations['tied', 'p1'].missing] == [
             ('conflict', 'tied')]
         assert _rounds().pairs_reading_loss(derivations) == {('kept', 'p1')}
+
+
+def _loss_yes_row(entry: str, *spans: str, role: str = 'primary', digest: str) -> dict[str, Any]:
+    """A rater's LOSS YES row carrying a stored DIGEST, as a committed corpus holds it."""
+    row = _with_spans(_rated(entry, role=role, home='YES', conflict='NO', loss='YES'), *spans)
+    return {**row, 'digest': digest}
+
+
+_DERIVED_ROW = {
+    'entry_id': 'd0', 'target_id': 'p1', 'basis': 'current', 'rater': 'v1', 'role': 'derived',
+    'batch': 'v1', 'home': 'NO', 'conflict': 'NO',
+}
+
+
+class TestRedigest:
+    """DIGEST re-derived under the shipped render; every rater answer kept as it was."""
+
+    def _verdicts(self) -> list[dict[str, Any]]:
+        return [
+            _DERIVED_ROW,
+            _loss_yes_row('e0', EARLY, LATE, digest='NO'),
+            _rated('e0', role='second', home='YES', conflict='NO', loss='NO'),
+            _loss_yes_row('e1', LATE, role='second', digest='NO'),
+            _loss_yes_row('e2', EARLY, digest='YES'),
+        ]
+
+    def _child_texts(self) -> dict[str, str]:
+        return {'e0': f'{EARLY} {"x" * 300} {LATE}', 'e1': LONG_CHILD, 'e2': LONG_CHILD}
+
+    def test_a_loss_yes_row_gets_digest_as_with_digest_gives_it(self) -> None:
+        rows = _mod().redigest(self._verdicts(), self._child_texts())
+
+        assert [row.get('digest') for row in rows] == [None, 'YES', None, 'NO', 'YES']
+        assert rows == [
+            row if row.get('role') == 'derived'
+            else _rounds().with_digest(row, self._child_texts()[row['entry_id']])
+            for row in self._verdicts()
+        ]
+
+    def test_only_digest_moves(self) -> None:
+        rows = _mod().redigest(self._verdicts(), self._child_texts())
+
+        assert [_without(row, 'digest') for row in rows] == [
+            _without(row, 'digest') for row in self._verdicts()]
+
+    def test_a_derived_row_never_gets_a_digest(self) -> None:
+        derived_loss = {**_DERIVED_ROW, 'loss': 'YES', 'loss_spans': [EARLY]}
+
+        assert _mod().redigest([derived_loss], {'d0': LONG_CHILD}) == [derived_loss]
+
+    def test_the_given_rows_are_not_changed(self) -> None:
+        verdicts = self._verdicts()
+        before = json.dumps(verdicts, sort_keys=True)
+
+        _mod().redigest(verdicts, self._child_texts())
+
+        assert json.dumps(verdicts, sort_keys=True) == before
+
+    def test_a_loss_yes_row_whose_entry_has_no_child_text_is_refused_by_name(self) -> None:
+        with pytest.raises(ValueError, match='e9'):
+            _mod().redigest([_loss_yes_row('e9', EARLY, digest='NO')], self._child_texts())
+
+
+def _child_text_of(entry_id: str) -> str:
+    """The fake bundle's child text for *entry_id* (``c-<intent>``), as ``_attach`` writes it."""
+    return f'child text of {entry_id.removeprefix("c-")}'
+
+
+def _file_bytes(root: Path) -> dict[str, bytes]:
+    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob('*') if path.is_file()}
+
+
+class TestTheRedigestCommand:
+    """``redigest`` rewrites the DIGEST column of committed verdict files from the bundle's child texts."""
+
+    @pytest.fixture
+    def bundle(self, tmp_path: Path) -> _Bundle:
+        bundle = _Bundle(tmp_path)
+        assert bundle.shards() == 0
+        _rate(bundle)
+        assert bundle.run('assemble', '--out-dir', str(tmp_path / 'out')) == 0
+        return bundle
+
+    @pytest.fixture
+    def assembled(self, bundle: _Bundle, tmp_path: Path) -> list[dict[str, Any]]:
+        return _jsonl(tmp_path / 'out' / 'write_triage_v2_soak_verdicts.jsonl')
+
+    @staticmethod
+    def _stale(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """*rows* as a render that showed none of their spans left them: every DIGEST NO."""
+        return [{**row, 'digest': 'NO'} if 'digest' in row else row for row in rows]
+
+    @staticmethod
+    def _write(path: Path, rows: list[dict[str, Any]]) -> Path:
+        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+        return path
+
+    def _redigest(self, bundle: _Bundle, *paths: Path) -> int:
+        return bundle.run('redigest', '--verdicts', *map(str, paths))
+
+    def test_rewrites_each_file_with_digest_under_the_current_render(
+        self, bundle: _Bundle, assembled: list[dict[str, Any]], tmp_path: Path,
+    ) -> None:
+        loss = [row for row in assembled if row.get('loss') == 'YES']
+        assert loss and all(row['digest'] == 'YES' for row in loss)
+        first = self._write(tmp_path / 'first.jsonl', self._stale(assembled))
+        second = self._write(tmp_path / 'second.jsonl', self._stale(assembled))
+
+        assert self._redigest(bundle, first, second) == 0
+
+        expected = ''.join(json.dumps(row, sort_keys=True) + '\n' for row in assembled)
+        assert first.read_text() == expected
+        assert second.read_text() == expected
+
+    def test_a_second_run_changes_nothing(
+        self, bundle: _Bundle, assembled: list[dict[str, Any]], tmp_path: Path,
+    ) -> None:
+        path = self._write(tmp_path / 'verdicts.jsonl', self._stale(assembled))
+        assert self._redigest(bundle, path) == 0
+        once = path.read_bytes()
+
+        assert self._redigest(bundle, path) == 0
+
+        assert path.read_bytes() == once
+
+    def test_prints_a_summary_per_file(
+        self, bundle: _Bundle, assembled: list[dict[str, Any]], tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = self._write(tmp_path / 'verdicts.jsonl', self._stale(assembled))
+        capsys.readouterr()
+
+        assert self._redigest(bundle, path) == 0
+
+        loss = [row for row in assembled if row.get('loss') == 'YES' and row['role'] != 'derived']
+        assert json.loads(capsys.readouterr().out) == {str(path): {
+            'rows': len(assembled),
+            'loss_yes_rows': len(loss),
+            'digest_yes': len(loss),
+            'digest_no': 0,
+            'changed': len(loss),
+            'longest_loss_child_chars': max(len(_child_text_of(row['entry_id'])) for row in loss),
+        }}
+
+    def test_never_writes_inside_the_bundle_or_the_scratch(
+        self, bundle: _Bundle, assembled: list[dict[str, Any]], tmp_path: Path,
+    ) -> None:
+        path = self._write(tmp_path / 'verdicts.jsonl', self._stale(assembled))
+        before = (_file_bytes(bundle.dir), _file_bytes(bundle.scratch))
+
+        assert self._redigest(bundle, path) == 0
+
+        assert (_file_bytes(bundle.dir), _file_bytes(bundle.scratch)) == before
+
+    @pytest.mark.parametrize('inside', ['dir', 'scratch'])
+    def test_refuses_a_verdicts_path_inside_the_bundle_or_the_scratch(
+        self, bundle: _Bundle, assembled: list[dict[str, Any]], inside: str,
+    ) -> None:
+        self._write(getattr(bundle, inside) / 'verdicts.jsonl', self._stale(assembled))
+        before = (_file_bytes(bundle.dir), _file_bytes(bundle.scratch))
+
+        with pytest.raises(SystemExit):
+            self._redigest(bundle, getattr(bundle, inside) / 'verdicts.jsonl')
+
+        assert (_file_bytes(bundle.dir), _file_bytes(bundle.scratch)) == before
+
+
+LONGEST_RATED_LOSS_CHILD_CHARS = 1_394
+"""The longest child among the committed soak corpora's LOSS YES rows.
+
+Measured by ``redigest``'s summary (``longest_loss_child_chars``) from the
+2026-10-19 soak bundle. While the shipped amendment text cap is at least this,
+every rated child renders whole and every committed DIGEST reads YES.
+"""
+
+COMMITTED_SOAK_VERDICTS = [
+    pytest.param(SCRIPTS.parent / 'calibration' / name, id=name)
+    for name in ('write_triage_v2_soak_verdicts.jsonl', 'write_triage_v2_soak_verdicts_v2_2.jsonl')
+]
+
+
+class TestTheCommittedSoakDigest:
+    """The committed corpora carry DIGEST as the shipped amendment render gives it."""
+
+    def test_the_shipped_cap_shows_every_rated_loss_child_whole(self) -> None:
+        assert DEFAULT_AMENDMENT_TEXT_CHARS >= LONGEST_RATED_LOSS_CHILD_CHARS, (
+            'the cap fell below a rated child: run build_write_triage_v2_soak_baseline.py '
+            'redigest over the committed verdicts and regenerate the baselines')
+
+    @pytest.mark.parametrize('path', COMMITTED_SOAK_VERDICTS)
+    def test_every_rater_loss_yes_row_reads_digest_yes(self, path: Path) -> None:
+        loss = [row for row in _jsonl(path) if row['role'] != 'derived' and row.get('loss') == 'YES']
+
+        assert loss
+        assert [(row['entry_id'], row['rater']) for row in loss if row['digest'] != 'YES'] == []

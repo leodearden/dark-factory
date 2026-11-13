@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wait_responsive
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 
@@ -382,11 +383,11 @@ class TestHarnessMergeLivenessGuard:
     """
 
     @pytest.mark.asyncio
-    async def test_cold_9000_now_starts_cleanly(self, tmp_path: Path) -> None:
-        """cold_timeout=9000 (refused by old model) must start cleanly under heartbeat model.
+    async def test_cold_9000_now_constructs_cleanly(self, tmp_path: Path) -> None:
+        """cold_timeout=9000 (refused by old model) must construct cleanly under heartbeat model.
 
         Old model: worst_case = 1 × 9000 = 9000 ≥ 8100 → refused.
-        Heartbeat model: worst_case = 600 < 8100 → safe → worker starts.
+        Heartbeat model: worst_case = 600 < 8100 → safe → worker constructed.
         """
         config = OrchestratorConfig(
             project_root=tmp_path,
@@ -394,51 +395,24 @@ class TestHarnessMergeLivenessGuard:
         )
         harness = Harness(config)
 
-        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
-            pass
+        # Must NOT raise MergeLivenessConfigError under heartbeat model
+        await harness._start_merge_worker()
 
-        with patch(
-            'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run',
-            _noop_run,
-        ):
-            # Must NOT raise MergeLivenessConfigError under heartbeat model
-            await harness._start_merge_worker()
-
-        try:
-            assert harness._merge_worker_task is not None
-        finally:
-            await harness._stop_merge_worker()
+        assert harness._merge_worker is not None
 
     @pytest.mark.asyncio
-    async def test_in_budget_config_starts_worker(self, tmp_path: Path) -> None:
-        """Default/in-budget config (cold_timeout=7200 default, bound=1) must NOT raise.
-
-        Patch SpeculativeMergeWorker.run to a no-op coroutine so the asyncio
-        task doesn't run indefinitely and the test tears down cleanly.
-        """
+    async def test_in_budget_config_constructs_worker(self, tmp_path: Path) -> None:
+        """Default/in-budget config (cold_timeout=7200 default, bound=1) must NOT raise."""
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
 
-        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
-            pass
+        # Must NOT raise MergeLivenessConfigError
+        await harness._start_merge_worker()
 
-        with patch(
-            'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run',
-            _noop_run,
-        ):
-            # Must NOT raise MergeLivenessConfigError
-            await harness._start_merge_worker()
-
-        try:
-            # Worker task was created and will have completed (no-op)
-            assert harness._merge_worker_task is not None
-        finally:
-            # Explicit teardown: stop the worker and await the task so the test
-            # cannot leave dangling asyncio tasks or open resources.
-            await harness._stop_merge_worker()
+        assert harness._merge_worker is not None
 
     @pytest.mark.asyncio
-    async def test_crash_config_starts_worker(self, tmp_path: Path) -> None:
+    async def test_crash_config_constructs_worker(self, tmp_path: Path) -> None:
         """K=2 config (one enabled runner) + cold_timeout=7200 must NOT raise.
 
         Regression-lock: stays green under BOTH the old per-host model
@@ -457,20 +431,10 @@ class TestHarnessMergeLivenessGuard:
         )
         harness = Harness(config)
 
-        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
-            pass
+        # Must NOT raise MergeLivenessConfigError under either model
+        await harness._start_merge_worker()
 
-        with patch(
-            'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run',
-            _noop_run,
-        ):
-            # Must NOT raise MergeLivenessConfigError under either model
-            await harness._start_merge_worker()
-
-        try:
-            assert harness._merge_worker_task is not None
-        finally:
-            await harness._stop_merge_worker()
+        assert harness._merge_worker is not None
 
     @pytest.mark.asyncio
     async def test_over_budget_via_low_tolerance_raises(self, tmp_path: Path) -> None:
@@ -493,7 +457,7 @@ class TestHarnessMergeLivenessGuard:
 
 
 class TestHarnessMergeVerifySurvivorBarrierWiring:
-    """Harness._start_merge_worker must invoke the startup survivor barrier
+    """Harness._launch_merge_worker_loop must invoke the startup survivor barrier
     (GitOps.reap_merge_verify_survivors) ONCE, BEFORE the merge-worker loop is
     scheduled — so a previous run's orphaned verify subtree under _merge-verify
     is reaped before the worker's first reset_persistent_merge_worktree can
@@ -529,6 +493,7 @@ class TestHarnessMergeVerifySurvivorBarrierWiring:
                 'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run', _noop_run,
             ):
                 await harness._start_merge_worker()
+                await harness._launch_merge_worker_loop()
                 await asyncio.wait_for(worker_started.wait(), timeout=5)
 
             reap_mock.assert_awaited_once()
@@ -536,37 +501,39 @@ class TestHarnessMergeVerifySurvivorBarrierWiring:
                 'the survivor barrier must run to completion BEFORE the merge '
                 f'worker loop starts; got order {call_order}'
             )
-            assert harness._merge_worker_task is not None
         finally:
             await harness._stop_merge_worker()
 
     @pytest.mark.asyncio
     async def test_barrier_failure_is_fail_open(self, tmp_path: Path) -> None:
-        """A raising barrier must NOT propagate — the worker still starts.
+        """A raising barrier must NOT propagate — the worker loop still launches.
 
         Mirrors the enforce_merge_liveness_margin generic-except precedent: the
         barrier is best-effort, so a failure is logged and swallowed rather than
-        aborting merge-worker startup.
+        aborting the merge-worker launch.
         """
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
 
         reap_mock = AsyncMock(side_effect=RuntimeError('scan blew up'))
         harness.git_ops.reap_merge_verify_survivors = reap_mock  # type: ignore[method-assign]
+        worker_started = asyncio.Event()
 
         async def _noop_run(self_w):  # type: ignore[no-untyped-def]
-            pass
+            worker_started.set()
 
         try:
             with patch(
                 'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run', _noop_run,
             ):
-                # Must NOT raise despite the barrier raising.
                 await harness._start_merge_worker()
+                # Must NOT raise despite the barrier raising.
+                await harness._launch_merge_worker_loop()
+                await wait_responsive(
+                    worker_started.wait(),
+                    label='the merge-worker loop launches despite a failing barrier',
+                )
 
             reap_mock.assert_awaited_once()
-            assert harness._merge_worker_task is not None, (
-                'a fail-open barrier must still create the merge-worker task'
-            )
         finally:
             await harness._stop_merge_worker()

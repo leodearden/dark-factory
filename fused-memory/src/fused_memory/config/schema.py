@@ -130,7 +130,7 @@ class ServerConfig(BaseModel):
     """Server configuration."""
 
     transport: Literal['http', 'stdio', 'sse'] = Field(default='http', description='Transport: http, stdio, or sse')
-    host: str = Field(default='0.0.0.0', description='Server host')
+    host: str = Field(default='127.0.0.1', description='Bind host of the MCP and recon-report listeners (loopback by default)')
     port: int = Field(default=8002, description='Server port (canonical: 8002)')
     stateless_http: bool = Field(default=True, description='Stateless HTTP mode (no sessions)')
     json_response: bool = Field(default=False, description='JSON responses instead of SSE')
@@ -375,6 +375,19 @@ class Mem0BackendConfig(BaseModel):
 
     qdrant_url: str = Field(default='http://localhost:6333')
     collection_prefix: str = Field(default='fused')
+    persist_history: bool = Field(
+        default=True,
+        description=(
+            'When False, mem0 keeps its change history in a private in-memory '
+            'SQLite DB that dies with the instance, instead of the '
+            'process-shared $MEM0_DIR/history.db. For tests and scratch runs, '
+            'where the shared file is xdist-contended or read-only in the '
+            'sandbox; leave it True in production, because out-of-band readers '
+            'such as fused-memory/scripts/build_write_triage_v2_soak_baseline.py '
+            'read the shared file. Restart-only: Mem0Backend reads it once, '
+            'when it creates the instance for a project.'
+        ),
+    )
 
 
 # --- Routing ---
@@ -457,9 +470,10 @@ class WriteJournalConfig(BaseModel):
     ``restart_required`` — honest, rather than a leaf advertised hot-reloadable
     while silently ignoring reloads.
 
-    The three horizons are not interchangeable, and the asymmetry is the whole
-    point: see ``services/write_journal.py::prune_write_ops`` for the measured
-    row-mix that set them.
+    The three write_ops horizons (read/search/write) are not interchangeable,
+    and the asymmetry is the whole point: see
+    ``services/write_journal.py::prune_write_ops`` for the measured row-mix
+    that set them.
     """
 
     #: Non-search reads (``get_task``/``get_tasks``/``get_statuses``/
@@ -498,6 +512,12 @@ class WriteJournalConfig(BaseModel):
     #: pass) re-verifies every row against the live graph, so a long horizon
     #: loses nothing.
     referent_findings_retention_days: float = Field(default=365.0, gt=0)
+    #: Terminal ``mem0_intents`` (which statuses count:
+    #: ``services/write_journal.py::WriteJournal.prune_mem0_intents``).
+    mem0_intents_retention_days: float = Field(default=30.0, gt=0)
+    #: ``idempotent_ops`` client keys, which only need to outlive the retry
+    #: window they guard (``services/write_journal.py::WriteJournal.prune_idempotent_ops``).
+    idempotent_ops_retention_days: float = Field(default=7.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
@@ -1842,16 +1862,17 @@ class ReconciliationConfig(BaseModel):
     # Restart-tier: read from config each cycle; deliberately NOT in
     # RELOADABLE_FIELDS.
     auto_unhalt_after_cooldown: bool = Field(default=False)
-    # Judge transport/infra-failure tolerance (task 2947 ask a). Bounds the
-    # number of CONSECUTIVE judge CLI transport/infra failures (api_error,
-    # timeout, cap-wait exhaustion, etc. — NOT genuinely-malformed reachable
-    # content) a project may accumulate before review_run applies a truthful
-    # judge-unreachable halt and routes an infra_issue escalation. Below this
-    # threshold each infra failure is bounded backoff: no verdict is stamped
-    # and no halt fires (the transient outage is given room to recover). Any
-    # successful transport (a parsed verdict) resets the per-project counter.
+    # Judge no-verdict tolerance (task 2947 ask a; task 5370). Bounds the
+    # number of CONSECUTIVE no-verdict failures on a loaded run — judge CLI
+    # transport/infra failures (api_error, timeout, cap-wait exhaustion, etc. —
+    # NOT genuinely-malformed reachable content) and review errors — a project
+    # may accumulate before review_run applies a truthful halt (judge-unreachable
+    # or judge-review-error, after the last failure) and routes an infra_issue
+    # escalation. Below this threshold each failure is bounded backoff: no
+    # verdict is stamped and no halt fires (the transient outage is given room
+    # to recover). A completed review resets the per-project counter.
     # Gated on halt_on_judge_serious, same master switch as the serious-verdict
-    # halt. ge=1 → a value of 1 halts on the first infra failure.
+    # halt. ge=1 → a value of 1 halts on the first no-verdict failure.
     judge_infra_max_consecutive_failures: int = Field(default=3, ge=1)
 
     # Escalation
@@ -1883,68 +1904,6 @@ class ReconciliationConfig(BaseModel):
             'count crosses dead_owner_suppression_storm_threshold. Also doubles '
             'as the per-window rate limit: the alarm cannot re-fire within this '
             'window. Task 1755 / PRD β.'
-        ),
-    )
-
-    # Interrupted-run resume knobs (task 2717 / PRD σ, rec 13). Gate the
-    # startup adopt-and-resume pass (_resume_interrupted_runs): a fused-memory
-    # restart mid-stage marks the run 'interrupted' (keeping its drained events
-    # and per-run transcript), and the next startup --resume's the SAME run_id
-    # at its stage_cursor. On ANY doubt the pass falls back to today's
-    # failed+restore recovery path.
-    resume_after_restart: bool = Field(
-        default=True,
-        description=(
-            'Master switch for interrupted-run resume. When True, run_full_cycle '
-            "marks a restart-cancelled run 'interrupted' (no restore_drained, "
-            'transcript preserved) and the startup pass adopts and --resume\'s it. '
-            'Set False to opt a deploy out of resume when it changes recon prompts '
-            'or tooling — a resumed session finishes under the OLD system prompt by '
-            'construction (--resume skips the system prompt), so a prompt/tool '
-            'change must not be resumed into. When False, a cancelled cycle keeps '
-            "today's failed + restore_drained + GC behaviour verbatim."
-        ),
-    )
-    resume_freshness_window_seconds: int = Field(
-        default=3600,
-        gt=0,
-        description=(
-            'Max age (seconds) of an interrupted run — measured from its '
-            'completed_at (the interrupt instant stamped by complete_run) — that '
-            'the startup pass will still --resume. Beyond this window the run is '
-            "treated as too stale to resume and falls back to today's "
-            'failed+restore path. Default 3600s.'
-        ),
-    )
-    resume_max_attempts_per_run: int = Field(
-        default=2,
-        gt=0,
-        description=(
-            'Per-run cap on resume attempts (tracked in '
-            "stage_reports['_resume'].count). Once a run has been resumed this "
-            'many times it falls back to failed+restore instead of resuming again, '
-            'bounding a resume→re-interrupt→resume loop. Default 2.'
-        ),
-    )
-    resume_failure_storm_threshold: int = Field(
-        default=6,
-        gt=0,
-        description=(
-            'Number of unresumable/failed resume attempts within '
-            'resume_failure_storm_window_seconds that triggers a single loud '
-            'recon_resume_failure_storm escalation. Mirrors '
-            'dead_owner_suppression_storm_threshold. Default 6 per 3600s.'
-        ),
-    )
-    resume_failure_storm_window_seconds: float = Field(
-        default=3600.0,
-        gt=0,
-        description=(
-            'Rolling time window (seconds) for counting resume failures. A single '
-            'recon_resume_failure_storm alarm fires per window when the count '
-            'crosses resume_failure_storm_threshold; also doubles as the '
-            'per-window rate limit. Mirrors '
-            'dead_owner_suppression_storm_window_seconds. Default 3600.0.'
         ),
     )
 
@@ -2335,28 +2294,59 @@ class CuratorConfig(BaseModel):
 
     # Corpus caps — see design notes in shared/docs (the pool streams).
     #
-    # For a pool without siblings, pool_total_cap is UNREACHABLE at these
-    # stock values, and that is worth knowing before tuning any of them: a
-    # maximal such pool is anchor(<=1) + 15 + 10 + 3 = 29 <= 30, so
-    # ``_trim_pool``'s ``len(pool) <= total_cap`` short-circuits. An
-    # agent-followup candidate with two or more siblings does reach the trim
-    # at stock caps, and the trim then takes dependency entries first. The
-    # binding constraints are the three
-    # STREAM caps, which is where a genuinely overlapping task is actually
-    # lost — the module stream especially, since it is ordered by status and
-    # priority rather than relevance (see the lock_depth note below).
-    # ``test_config_schema.py::TestCuratorEntryCharCaps`` pins this
-    # arithmetic so an edit that re-strands or un-strands the final trim is
-    # caught here rather than as a silent census.
+    # Re-tuned by task 5397 against the ``pool_truncated`` census
+    # (``curator_types.py::PoolWithheld``) and the decisions the curator took
+    # on it. Measured 2026-10-28 from archived curator transcripts
+    # (data/orchestrator/agent-transcripts/fm-curator-*, 2026-10-26..28): 435
+    # distinct candidates, 86 drop/combine decisions, at caps 15/10/3/30.
     #
-    # These four are deliberately NOT re-tuned by task 5364. Nothing measured
-    # how often they bind; the ``pool_truncated`` census that task installs
-    # (``curator_types.py::PoolWithheld``) IS that instrument, and tuning waits
-    # on what it reports rather than repeating the 2026-04 guess.
-    pool_module_cap: int = Field(default=15)
-    pool_embedding_cap: int = Field(default=10)
-    pool_dependency_cap: int = Field(default=3)
-    pool_total_cap: int = Field(default=30)
+    #   stream      capped on  withheld when capped   drop/combine targets
+    #   module      64.4%      p50 91, p90 575        31, spread over ranks 1-14
+    #   embedding   100%       17-20 (window floor)   42: 31 at rank 1, 40 in 1-3
+    #   dependency  10.1%      p50 2, max 7           0
+    #   total_cap   0%         unreachable: 1+15+10+3 = 29 <= 30
+    #
+    # The embedding stream is ordered by similarity and its tail is nearly
+    # dead: one target past rank 5, at rank 10. The module stream is ordered
+    # by status/priority/id, so its targets run flat to the cap (6 in ranks
+    # 11-15); in 165 of the 280 capped pools the cut fell among pending,
+    # combine-eligible tasks. The embedding count is no signal on its own: the
+    # qdrant window filled on every candidate, so it is always a floor.
+    #
+    # The re-tune moves slots instead of adding them: pool_module_cap 15 -> 20,
+    # and pool_total_cap 30 -> 29, the old reachable maximum, so ``_trim_pool``
+    # is the live control. With the module stream full, the trim takes
+    # dependency entries first, then the embedding tail, leaving
+    # 29 - 1 - 20 = 8 embedding entries. The floor is 5: ranks 1-5 held 41 of
+    # the embedding stream's 42 targets, so a module cap leaving fewer than 5
+    # would cut measured targets. A sibling-free pool whose module stream fits
+    # the old cap of 15 keeps every stream at its cap.
+    #
+    # The trade: the worst-case pool is unchanged, so cost and batch fan-in at
+    # the maximum are unchanged too. Input is ~4.7K + ~930 tokens per entry; a
+    # 28+-entry pool cost p50 $0.18 (max $0.36) against the flat $2.00
+    # single_call_budget_cap_usd. All 74 observed multi-candidate batches still
+    # fit batch_token_threshold; 25/10/3/35 would have split 62 of them. The
+    # mean pool grows 23.6 -> 24.9 entries.
+    #
+    # Limits: a larger module cap is not that stream's fix — at 20 it is still
+    # capped on 57% of candidates; its defect is the ordering. Embedding 10 and
+    # dependency 3 stay: neither tail showed targets worth more slots, and the
+    # trim already gives their slots to the module stream when it needs them.
+    # The sample is two days and 86 decisions, hence a token-neutral step. The
+    # module figures predate task 6708's active-only module stream.
+    #
+    # The sample also predates task 6227's sibling stream (pool_sibling_cap
+    # below). The trim cuts siblings only after the module stream, so with the
+    # module stream full each sibling costs one embedding entry: s siblings
+    # leave 8 - s. The floor of 5 therefore holds up to 3 siblings, the
+    # per-parent p90 measured for that cap, and not at its p99 of 4.
+    #
+    # ``test_config_schema.py::TestCuratorPoolCaps`` pins these relationships.
+    pool_module_cap: int = Field(default=20, ge=0)
+    pool_embedding_cap: int = Field(default=10, ge=0)
+    pool_dependency_cap: int = Field(default=3, ge=0)
+    pool_total_cap: int = Field(default=29, ge=1)
     # Caps the sibling stream (task 6227): an agent-followup candidate's
     # non-cancelled tasks that share its metadata.spawned_from. 10 comes from
     # the live store, measured 2026-10-30: 1,406 agent_followup parents, 2,140
@@ -2419,13 +2409,12 @@ class CuratorConfig(BaseModel):
     # single_call_budget_cap_usd — 4x headroom. batch_token_threshold stays at
     # 50K deliberately: it is what holds a multi-candidate batch under that
     # same flat per-call ceiling, so easing batch fan-in is the soft threshold
-    # working as designed, not a regression to patch. Easier fan-in did carry
-    # one real cost — a batch that lands at size 1 takes
-    # ``task_curator.py::TaskCurator.curate_batch_prepared``'s short-circuit,
-    # which used to DISCARD the already-built corpus and reassemble it
-    # (get_tasks over the whole tree + an embedder call + a qdrant query).
-    # That path now hands the prepared bundle to ``curate``, so a smaller
-    # batch no longer costs a rebuild.
+    # working as designed, not a regression to patch. Easier fan-in once
+    # carried one real cost — a batch that landed at size 1 used to DISCARD
+    # the already-built corpus and reassemble it (get_tasks over the whole
+    # tree + an embedder call + a qdrant query). The prepared bundle now flows
+    # through ``task_curator.py::TaskCurator.curate_prepared`` at every batch
+    # size, so a smaller batch costs no rebuild.
     entry_description_chars: int = Field(default=2000, ge=1)
     entry_details_chars: int = Field(default=1500, ge=1)
 
@@ -2468,9 +2457,10 @@ class CuratorConfig(BaseModel):
     #   budget = min(max_budget_usd + per_pool_entry_budget_usd * len(pool),
     #                single_call_budget_cap_usd)
     # Durable flat $2.00 ceiling (task 1980 / esc-task-curator-194): a full
-    # 30-entry pool (pool_total_cap=30) costs ~$0.30574 (esc-task-curator-191)
-    # — comfortably under $2.00 with no per-size tuning required. The prior
-    # scaled cap (0.75, derived from 0.30 + 0.0125*30 = $0.675) was raised
+    # 30-entry pool, measured when pool_total_cap was 30, cost ~$0.30574
+    # (esc-task-curator-191) — comfortably under $2.00 with no per-size tuning
+    # required. The prior scaled cap (0.75, derived from 0.30 + 0.0125*30 =
+    # $0.675) was raised
     # alongside max_budget_usd to the SAME $2.00 value: single_call_budget_cap_usd
     # must be >= max_budget_usd or it silently clamps the raised base back
     # down, defeating the durable raise (see TestCuratorConfigBudgetRaise in
@@ -2878,7 +2868,20 @@ class WriteTriageConfig(BaseModel):
             '(INV-4). Bounded gt=0 because a zero budget would fail every call '
             'and read as a total judge outage caused by nothing. 15 s rather '
             'than 10 s because the frontier judge arms measured p95 4.6-6.4 s '
-            '(plans/write-triage-flip-readiness-prd.md §11.2 D15).'
+            '(plans/write-triage-flip-readiness-prd.md §11.2 D15). This budget '
+            'is the judge call\'s overall bound, and nothing retries inside it: '
+            'every judge arm builds its SDK client with max_retries=0 '
+            '(server/write_triage_judge.py::_JUDGE_SDK_MAX_RETRIES), so a '
+            'provider 5xx, 429 or connection error is raised on its first '
+            'occurrence and the fail-open record names it, instead of being '
+            'retried with backoff inside this budget and logged as a bare '
+            'TimeoutError. The SDK\'s own per-attempt timeouts still apply '
+            'within the budget: the openai and anthropic connect timeout '
+            'defaults to 5 s, so a DNS or connect stall fails open at about 5 s '
+            'as APITimeoutError, and a budget below 5 s expires first. The '
+            'accepted cost: a transient error a retry would have rescued is a '
+            'counted fail-open, and the write is still stored (contract C1). '
+            'Task 8521.'
         ),
     )
     judge_reasoning_effort: JudgeReasoningEffort | None = Field(
@@ -2926,9 +2929,9 @@ class WriteTriageConfig(BaseModel):
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
             'because a zero cap would elide every field to nothing and show the '
             'model empty records. Green-tier hot-reloadable, read live per '
-            'middle-band write. The same cap bounds a contesting child\'s text '
+            'middle-band write. The same cap bounds every amendment\'s text '
             'in grouped search and get_memory_by_id reads '
-            '(server/grouped_read.py::_digest_entry).'
+            '(server/grouped_read.py::amendment_text).'
         ),
     )
     judge_accuracy_report_path: str | None = Field(
@@ -3163,7 +3166,7 @@ class Mem0UpdateConfig(BaseModel):
             'mid-run over its own success count. Green-tier hot-reloadable — read '
             'live on every call and passed into StormCounter.record(), which is '
             'what makes the leaf genuinely reloadable rather than restart-only in '
-            'disguise (see server/storm_counter.py).'
+            'disguise (see shared/src/shared/storm_counter.py).'
         ),
     )
     storm_window_seconds: float = Field(
@@ -3267,7 +3270,7 @@ class EntityMintConfig(BaseModel):
             'has already landed. Green-tier hot-reloadable — read live on every '
             'call and passed into StormCounter.record(), which is what makes the '
             'leaf genuinely reloadable rather than restart-only in disguise (see '
-            'server/storm_counter.py).'
+            'shared/src/shared/storm_counter.py).'
         ),
     )
     storm_window_seconds: float = Field(
@@ -3530,7 +3533,8 @@ class ConsolidationAutoConfig(BaseModel):
 
 
 class LinkHealConfig(BaseModel):
-    """Caps, storm escapes and adjudicator knobs for link healing (tasks 6181, 6184).
+    """Caps, storm escapes, adjudicator knobs and the scheduled sweep for link
+    healing (tasks 6181, 6184, 7159).
 
     Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
     escapes", and H2, the link adjudicator. The consumers are
@@ -3611,6 +3615,59 @@ class LinkHealConfig(BaseModel):
             'Consecutive failed adjudicator shards that stop adjudicating. A plan run '
             'records the storm as would_escape under link-heal-adjudicator and files '
             'nothing; a writing run that adjudicates files it. PRD H1, H2.'
+        ),
+    )
+    projects: list[str] = Field(
+        default_factory=list,
+        description=(
+            'The projects one scheduled sweep covers, in one run, so a parent in '
+            'another listed project is told apart from a deleted one. Read by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    writes: bool = Field(
+        default=False,
+        description=(
+            'Whether a scheduled sweep may apply its heals. A writing sweep also '
+            'needs a passing calibration for the exact adjudicator model and '
+            'prompt; false records and reports only. Read by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    sweep_actions: list[str] = Field(
+        default_factory=lambda: ['detach', 'relabel'],
+        description=(
+            'The heal actions a scheduled sweep may stage; every other heal is '
+            'recorded as not_enabled. Strings, parsed as heal actions by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    sweep_window_hours: int = Field(
+        default=24,
+        ge=1,
+        description=(
+            'How far back the first scheduled sweep looks for newly created '
+            'children; later sweeps start where the last complete one ended. '
+            'Read by maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    calibration_kappa_margin: float = Field(
+        default=0.10,
+        ge=0,
+        le=1,
+        description=(
+            "How far below the raters' own kappa the adjudicator's kappa may fall, "
+            'per binary, pooled and per gated project, and still pass. Read by '
+            'maintenance/link_heal_calibration.py at each run start. Task 7159.'
+        ),
+    )
+    calibration_min_project_items: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            'Rated pairs a project needs before calibration gates on its own '
+            'kappa; smaller projects are reported, not gated. Read by '
+            'maintenance/link_heal_calibration.py at each run start. Task 7159.'
         ),
     )
 

@@ -26,7 +26,14 @@ from pathlib import Path
 
 import pytest
 
-from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
+from escalation.authority import (
+    L2_AUTO_CLOSE_DENY_CATEGORIES,
+    L2_AUTO_CLOSE_DENY_ROLES,
+    POLICY_TABLE,
+    REVERSIBILITY_WAIVED_ACTIONS,
+    REVERSIBLE_POLICY_ACTIONS,
+    PolicyAction,
+)
 from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
@@ -449,6 +456,7 @@ _EXPECTED_CATEGORY_SLUGS: dict[str, str] = {
     'milestone_check_failed': 'milestone_gate',
     'milestone_check_stalled': 'milestone_gate',
     'curator_adjudication_missing': 'deterministic_runner_filing',
+    'review_due': 'deterministic_runner_filing',
 }
 
 
@@ -526,8 +534,7 @@ class TestMechanicalGateSpot:
         """DERIVED, not re-listed: the detector's set must be the imported
         frozenset minus its one named exclusion, so a member added in
         escalation/src/escalation/authority.py propagates here instead of
-        drifting. A hand-written literal fails this even if it happens to agree
-        today."""
+        drifting."""
         excluded = {_DESIGN_CONCERN}
         assert L2_AUTO_CLOSE_DENY_CATEGORIES - excluded == GATED_CATEGORIES
 
@@ -1332,6 +1339,89 @@ def test_comparable_actions_stay_in_lockstep_with_the_c1_vocabulary():
     from escalation.server import RESOLVE_ACTIONS
 
     assert REVERSIBLE_ACTIONS & frozenset(RESOLVE_ACTIONS) == COMPARABLE_ACTIONS
+
+
+_LANDING_PROVENANCE = 'landing_provenance'
+
+
+def _done_flip_ruling() -> ShadowRuling:
+    return ShadowRuling(
+        ruling_class=_LANDING_PROVENANCE, proposed_action='done_flip',
+        evidence='git merge-base --is-ancestor <sha> main -> rc=0', confidence=0.9,
+    )
+
+
+class TestPolicyTableLockstep:
+    """The shadow vocabulary is the policy table's, not a second enumeration
+    (plans/decision-stream-prd.md §5.1): every class the table names can be
+    stamped, and every action a stamp proposes is an act the table knows.
+    FIRST_TRANCHE_CLASSES equal to the table's slugs is held by
+    tests/scripts/test_shadow_ruling_doc_contract.py."""
+
+    # Rows whose deciding act no stamp may propose, so their agreement rate
+    # measures only the trailing close. Exact, so a fifth cannot appear silently.
+    _PROXY_MEASURED_ROWS = frozenset({
+        'b3_low_risk_unblock', 'dead_letter_replayed', 'red_main_recovery', 'verify_host_reprobed',
+    })
+
+    def test_every_row_has_an_act_a_stamp_may_propose(self):
+        unstampable = sorted(
+            row.policy_class for row in POLICY_TABLE
+            if not {action.value for action in row.actions} & REVERSIBLE_ACTIONS
+        )
+        assert not unstampable, (
+            f'rows with no act in REVERSIBLE_ACTIONS cannot be measured at all: {unstampable}'
+        )
+
+    def test_rows_measured_on_a_proxy_act_are_exactly_the_documented_four(self):
+        proxy_measured = frozenset(
+            row.policy_class for row in POLICY_TABLE
+            if {action.value for action in row.actions} - REVERSIBLE_ACTIONS
+        )
+        assert proxy_measured == self._PROXY_MEASURED_ROWS, (
+            'a row allowing an act outside REVERSIBLE_ACTIONS is measured on a proxy act; '
+            "change docs/escalation-standing-policy.md '## Classes measured on a proxy act' "
+            'together with _PROXY_MEASURED_ROWS'
+        )
+
+    def test_done_flip_is_stampable_under_its_waiver(self):
+        """PRD §3 decision 7: done_flip is stampable, not reversible, under the
+        2026-11-04 waiver (Leo)."""
+        assert 'done_flip' in REVERSIBLE_ACTIONS
+
+    def test_reversible_actions_agree_with_the_policy_tables_vocabulary(self):
+        """A lockstep pin: the codec and PolicyRow.reversible must read one list.
+        Production derives REVERSIBLE_ACTIONS from authority's two sets; this
+        catches the two drifting apart, and cannot tell that derivation from a
+        literal that happens to agree."""
+        derived = frozenset(
+            action.value for action in REVERSIBLE_POLICY_ACTIONS | REVERSIBILITY_WAIVED_ACTIONS
+        )
+        assert derived == REVERSIBLE_ACTIONS
+
+    def test_done_flip_is_the_only_waived_action(self):
+        """Sitting item 522 (Leo, 2026-11-09) declined to waive abandon, so a
+        second waiver must arrive by ruling, not silently."""
+        assert {PolicyAction.DONE_FLIP} == REVERSIBILITY_WAIVED_ACTIONS
+
+    def test_a_landing_provenance_done_flip_stamp_round_trips(self):
+        """The codec half of boundary row 2."""
+        ruling = _done_flip_ruling()
+        assert parse_shadow_ruling(ruling.to_note_line()) == ruling
+
+    def test_a_done_flip_proposal_is_compared_as_its_trailing_close_only(self, tmp_path: Path):
+        """PRD §3 decision 7: a done_flip ends in a close_only resolution, so a
+        human close_only is agreement, a resume diverges, and a record with no
+        resolution_action stays not_comparable."""
+        fixture = _Fixture(tmp_path)
+        for observed_action in ('close_only', 'resume', None):
+            fixture.stamped_and_resolved(
+                _done_flip_ruling(), observed_action=observed_action, resolved_by='interactive',
+            )
+
+        klass = fixture.report().for_class(_LANDING_PROVENANCE)
+        assert klass is not None
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (1, 1, 1)
 
 
 # ---------------------------------------------------------------------------

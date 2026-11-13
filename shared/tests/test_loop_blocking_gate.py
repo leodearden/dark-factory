@@ -71,6 +71,10 @@ from silent_fallthrough_scan import (
     reconcile_against_allowlist,
 )
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 
 def _src(text: str) -> str:
     """Dedent one triple-quoted chunk of a synthetic module source."""
@@ -879,10 +883,11 @@ class TestPrimitiveTable:
     def test_primitive_is_detected_directly_in_an_async_body(self, body, expected):
         """A primitive written INLINE in a coroutine needs no helper hop to count.
 
-        This is the ``manifest_stamping::_stamp_capability_manifests_impl``
-        shape: ``read_text`` + ``yaml.safe_load`` + ``write_text`` +
-        ``yaml.safe_dump`` all in one coroutine body, with no helper anywhere
-        for a definition-side census to point at.
+        This was the ``manifest_stamping::_stamp_capability_manifests_impl``
+        shape the scanner was built to see: ``read_text`` +
+        ``yaml.safe_load`` + ``write_text`` + ``yaml.safe_dump`` all in one
+        coroutine body, with no helper anywhere for a definition-side census
+        to point at.
         """
         sources = {
             'pkg/mod.py': _module(

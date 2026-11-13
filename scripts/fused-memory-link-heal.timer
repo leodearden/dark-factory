@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily timer for the scheduled link-heal sweep (task 7159)
+
+[Timer]
+# 02:15, the first rung of the OPERATIONS.md nightly ladder, ahead of the
+# 02:30 transcript-secret sweep. A sweep window starts where the last complete
+# one ended, so a run missed while the host slept loses no links.
+OnCalendar=*-*-* 02:15:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

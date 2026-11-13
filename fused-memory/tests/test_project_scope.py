@@ -161,7 +161,6 @@ class TestProjectScopeTypeGateRejection:
     pyright compile-time error rather than a runtime bug.
     """
 
-    @pytest.mark.timeout(120)
     def test_pyright_rejects_transposition_and_frozen_mutation(self, tmp_path: Path):
         launcher = _resolve_pyright_launcher()
         if launcher is None:

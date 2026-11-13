@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
+from fused_memory.services.queued_writes import QueuedEpisodeWrite
+
 
 class HeldWrites:
-    """An execute_write fake that holds each write, keyed by its payload ``name``, open until released.
+    """An execute_write fake that holds each write, keyed by its ``name``, open until released.
 
     Entry is stamped with ``datetime.now(UTC)``, standing in for the
     ``utc_now()`` that graphiti_core's add_episode takes as the episode's
@@ -28,8 +30,8 @@ class HeldWrites:
     def _release_event(self, name: str) -> asyncio.Event:
         return self._releases.setdefault(name, asyncio.Event())
 
-    async def execute(self, operation: str, payload: dict) -> dict:
-        name = payload['name']
+    async def execute(self, value: QueuedEpisodeWrite) -> dict:
+        name = value.name
         self.entered_at[name] = datetime.now(UTC)
         await self._release_event(name).wait()
         if self._fail_on_release:

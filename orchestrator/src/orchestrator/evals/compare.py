@@ -22,11 +22,11 @@ from .judge import _strip_metadata, parse_confidence, parse_winner
 from .measurement import (
     MeasurementStage,
     Unmeasured,
+    format_invocation_errors,
     json_answer,
     measured_call,
     require_answer_iff_measured,
 )
-from .report import format_invocation_errors
 from .results import EvalResult
 from .scoring import quality_from_reviews
 from .snapshots import get_diff

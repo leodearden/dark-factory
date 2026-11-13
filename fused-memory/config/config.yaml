@@ -3,7 +3,8 @@
 
 server:
   transport: "http"
-  host: "0.0.0.0"
+  # Loopback only; also the bind host of the self-bound server.recon_report_port.
+  host: "127.0.0.1"
   port: 8002
   stateless_http: true
   json_response: true
@@ -268,6 +269,10 @@ taskmaster:
 # referent_findings_retention_days (task 5551) ages out the referent diagnosis
 # log at startup. Measured 2026-10-31: 416 rows from 2026-09-17 to 2026-10-31,
 # ~12.6/day, so the 365-day horizon keeps ~4.6k rows.
+#
+# mem0_intents_retention_days ages out terminal mem0_intents at startup (which
+# statuses count: services/write_journal.py::WriteJournal.prune_mem0_intents).
+# idempotent_ops_retention_days ages out idempotent_ops client keys at startup.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
@@ -278,6 +283,8 @@ write_journal:
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
   prune_interval_seconds: ${WRITE_JOURNAL_PRUNE_INTERVAL_SECONDS:1800}
   referent_findings_retention_days: ${WRITE_JOURNAL_REFERENT_FINDINGS_RETENTION_DAYS:365}
+  mem0_intents_retention_days: ${WRITE_JOURNAL_MEM0_INTENTS_RETENTION_DAYS:30}
+  idempotent_ops_retention_days: ${WRITE_JOURNAL_IDEMPOTENT_OPS_RETENTION_DAYS:7}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every
@@ -588,13 +595,25 @@ mem0_update:
   # storm_threshold: 20
   # storm_window_seconds: 3600.0
 
-# Link-heal executor caps and link adjudicator knobs (tasks 6181, 6184;
-# plans/write-triage-link-healing-prd.md H1, H2). Read by
-# fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at each
-# run start, so an edit takes effect on the next run with no restart. Every
-# value below is the shipped default, shown so the knobs are discoverable.
-# Uncomment to change one.
-# link_heal:
+# Link-heal executor caps, link adjudicator knobs and the scheduled sweep
+# (tasks 6181, 6184, 7159; plans/write-triage-link-healing-prd.md H1, H2). Read
+# by fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at
+# each run start, so an edit takes effect on the next run with no restart. The
+# commented values are the shipped defaults, shown so the knobs are
+# discoverable. Uncomment to change one.
+link_heal:
+  # The projects with write-triage children in the 2026-10-19 soak.
+  projects: [dark_factory, reify, solar_challenge, solar_challenge_platform, scoping_intake]
+  # Writes need a passing soak calibration and an operator flip (INV-12 owned hold; runbook: OPERATIONS.md).
+  writes: false
+#   # Heal actions a sweep may stage; the rest are recorded as not_enabled.
+#   sweep_actions: [detach, relabel]
+#   # How far back the first sweep looks; later sweeps resume from the last complete one.
+#   sweep_window_hours: 24
+#   # Calibration passes at no less than the raters' own kappa minus this.
+#   calibration_kappa_margin: 0.10
+#   # Rated pairs a project needs before calibration gates on it.
+#   calibration_min_project_items: 60
 #   # Write attempts per unattended run, oldest-planned first; the rest stay
 #   # pending as skipped_cap. 0 applies nothing unattended.
 #   max_actions_per_run: 25

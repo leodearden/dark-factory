@@ -263,7 +263,7 @@ def landlock_matrix_scaffold():
     change in the worktree, ready for a row's own ``git commit``; a
     ``<worktree>/.task/plan.json`` symlink into ``<base>/.task-meta/<name>/
     plan.json`` (the target itself is left ABSENT — row 7's child write is
-    what creates it, mirroring ``TaskArtifacts.ensure_lane_plan_symlink``'s
+    what creates it, mirroring ``TaskArtifacts.ensure_lane_symlinks``'s
     real production symlink shape); ``~/.local/share/uv/`` pre-created
     as an empty, non-writable-by-contract sibling of the (writable)
     ``~/.cache/uv/``, so row 8's denial is a true EACCES rather than ENOENT;

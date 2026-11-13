@@ -19,7 +19,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import (
-    WHOLE_TREE_SCAN_TEST_TIMEOUT,
     git_env_with_ceiling,
     pydantic_spec,
     stamp_stock_routing_config,
@@ -27,6 +26,7 @@ from _orch_helpers import (
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore

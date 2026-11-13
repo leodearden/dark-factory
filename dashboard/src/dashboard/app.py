@@ -6,7 +6,7 @@ The aggregator layer in ``dashboard.data.*`` is shared by every endpoint.
 
 This file owns app construction, lifespan wiring, the route table for the
 handlers that live in ``dashboard.api.*``, the ``/healthz`` probe apparatus
-and the endpoints not yet extracted. The two background samplers live in
+and the endpoints not yet extracted. The three background samplers live in
 ``dashboard.loops``.
 """
 
@@ -37,8 +37,11 @@ from dashboard.api import invariants as api_invariants_routes
 from dashboard.api import memory as api_memory_routes
 from dashboard.api import merge_queue as api_merge_queue_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
+from dashboard.api import prds as api_prds_routes
+from dashboard.api import quality as api_quality_routes
 from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
+from dashboard.api.clock import app_clock, install_clock, live_clock
 from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
@@ -62,7 +65,12 @@ from dashboard.data.costs import (
 )
 from dashboard.data.datum import unknown_datum
 from dashboard.data.db import DbPool
-from dashboard.data.escalation_corpus import reconciliation_queue
+from dashboard.data.escalation_corpus import (
+    CORPUS_FRESHNESS_BOUND_SECONDS,
+    acquire_corpus,
+    corpus_queues,
+    reconciliation_queue,
+)
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
     FANOUT_FAILURE_EXCEPTIONS,
@@ -93,12 +101,19 @@ from dashboard.data.reconciliation import (
     partition_burst_state,
 )
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.task_snapshot import ROW_READ_STATUSES
+from dashboard.data.task_snapshot import ROW_READ_FIELDS, ROW_READ_STATUSES
 from dashboard.data.tasks import fetch_task_page
-from dashboard.data.utils import resolve_now, safe_gather_result
+from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import MEMORY_OPS_FRESHNESS_BOUND_SECONDS, get_memory_ops
 from dashboard.http_pool import reaper_loop
-from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
+from dashboard.loops import (
+    _burndown_loop,
+    _BurndownStore,
+    _metrics_loop,
+    _MetricsStore,
+    _quality_loop,
+    _QualityStore,
+)
 from dashboard.project_dbs import _cost_dbs, _cost_sources
 
 _pkg_dir = Path(__file__).parent
@@ -246,7 +261,7 @@ async def _close_each(*closers: Callable[[], Awaitable[object]]) -> None:
 
     Independence is the entire point. These are the handles ``lifespan``
     opened, and one that refuses to close must not take its neighbours with
-    it: the objects at stake are two writable WAL connections and a
+    it: the objects at stake are three writable WAL connections and a
     ``DbPool``, and a stranded one's finaliser queues work onto a by-then
     closed loop — the ``RuntimeError: Event loop is closed`` class
     :func:`lifespan` documents. ``AsyncSqliteBase.close`` awaits
@@ -324,7 +339,7 @@ async def lifespan(app: FastAPI):
     closed on every exit path** — one where a teardown step above them raises,
     and equally one where an earlier CLOSE raises, which is why they go
     through :func:`_close_each` rather than standing as a flat sequence.  The
-    objects at stake are the two writable WAL connections and the ``DbPool``
+    objects at stake are the three writable WAL connections and the ``DbPool``
     above: strand one and its finaliser queues work onto a by-then-closed
     loop, the same ``RuntimeError`` this docstring already describes — so a
     failure anywhere in teardown must not be able to cause the very condition
@@ -337,6 +352,7 @@ async def lifespan(app: FastAPI):
     # on the client, so evaluating it first is safe.
     config = DashboardConfig.from_env()
     app.state.config = config
+    install_clock(app, live_clock)
     http_client = httpx.AsyncClient(
         follow_redirects=True,
         limits=_build_http_limits(config),
@@ -359,11 +375,16 @@ async def lifespan(app: FastAPI):
     app.state.metrics_store = metrics_store
     app.state.metrics_db_path = metrics_path  # preserved for healthz / other callers
 
+    # Quality sampler store (third WAL writer). Bound to the LOCAL config only:
+    # its loop is its one user, so app.state gets no handle.
+    quality_store = _QualityStore(config.quality_db, busy_timeout_ms=5000)
+    await quality_store.open()
+
     # Every background task is created here, LAST, with nothing awaited between
     # here and the yield. Startup has no try/except, so a task created above an
     # `await ...store.open()` is stranded — still ticking against a client
     # nobody will close — if that open raises. One site also makes them read as
-    # the set the teardown below cancels as a set. The two samplers' gate (task
+    # the set the teardown below cancels as a set. The samplers' gate (task
     # 5826) reads the LOCAL config, never app.state.config, for the reason task
     # 3771 binds the loops themselves to it.
     #
@@ -377,6 +398,7 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(
                 _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
             ),
+            asyncio.create_task(_quality_loop(quality_store, config)),
         )
         if config.samplers_enabled
         else ()
@@ -407,6 +429,7 @@ async def lifespan(app: FastAPI):
         await _close_each(
             burndown_store.close,
             metrics_store.close,
+            quality_store.close,
             pool.close_all,
             http_client.aclose,
         )
@@ -426,6 +449,8 @@ app.include_router(api_orchestrators_routes.router)
 app.include_router(api_escalations_routes.router)
 app.include_router(api_task_prose_routes.router)
 app.include_router(api_invariants_routes.router)
+app.include_router(api_prds_routes.router)
+app.include_router(api_quality_routes.router)
 
 
 # ---------------------------------------------------------------------------
@@ -665,6 +690,7 @@ async def _fanout_probe_completion(
     await fetch_task_page(
         client, config, config.project_root,
         statuses=sorted(ROW_READ_STATUSES), page_size=1, offset=0,
+        fields=ROW_READ_FIELDS,
     )
     return asyncio.get_running_loop().time()
 
@@ -938,34 +964,37 @@ async def api_memory_graphs(request: Request) -> JSONResponse:
     """MEMORY_OPS from the write journal; a failed read is an unknown reading, never a 500."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
+    clock = app_clock(request.app)
     db = await pool.get(config.write_journal_db)
+    render_at = clock()
     try:
-        ops = await get_memory_ops(db)
+        ops = await get_memory_ops(db, now=render_at)
     except Exception as exc:
         logger.warning('memory-graphs: memory ops read failed', exc_info=True)
         ops = unknown_datum(
             f'memory ops read failed: {type(exc).__name__}: {exc}',
             MEMORY_OPS_FRESHNESS_BOUND_SECONDS,
         )
-    served_at = resolve_now(None)
+    served_at = clock()
     return JSONResponse(redux_api.shape_memory_graphs(ops, served_at=served_at))
 
 
 @app.get('/api/v2/dashboard/recon')
 async def api_recon(request: Request) -> JSONResponse:
     """RECON_STATE + AGENTS — latest reconciliation buffer/burst/runs/verdict."""
+    now = app_clock(request.app)()
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.reconciliation_db)
 
     metrics_db = await pool.get(config.metrics_db)
     bs_r, burst_r, wm_r, verdict_r, runs_r, sparks_r = await asyncio.gather(
-        get_buffer_stats(db),
-        get_burst_state(db),
+        get_buffer_stats(db, now=now),
+        get_burst_state(db, now=now),
         get_watermarks(db),
         get_latest_verdict(db),
         get_recent_runs(db),
-        get_recon_sparks(metrics_db, days=1),
+        get_recon_sparks(metrics_db, days=1, now=now),
         return_exceptions=True,
     )
     buffer_stats = safe_gather_result(
@@ -974,7 +1003,7 @@ async def api_recon(request: Request) -> JSONResponse:
         'recon/buffer',
     )
     burst_state_raw = safe_gather_result(burst_r, [], 'recon/burst')
-    active_burst, _ = partition_burst_state(burst_state_raw)
+    active_burst, _ = partition_burst_state(burst_state_raw, now=now)
     watermarks = safe_gather_result(wm_r, [], 'recon/watermarks')
     verdict = safe_gather_result(verdict_r, None, 'recon/verdict')
     runs = safe_gather_result(runs_r, [], 'recon/runs')
@@ -1005,7 +1034,7 @@ async def api_costs(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     window = _parse_window(request.query_params)
     dbs = await _cost_sources(config, pool)
-    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    now = app_clock(request.app)()
     summary, by_project, by_account, by_role, trend, events, by_model_role = await asyncio.gather(
         aggregate_cost_summary(dbs, days=window.days, now=now),
         aggregate_cost_by_project(dbs, days=window.days, now=now),
@@ -1037,7 +1066,7 @@ async def api_performance(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
     window = _parse_window(request.query_params, default='7d')
-    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    now = app_clock(request.app)()
     cards_r, history_r = await asyncio.gather(
         aggregate_performance_cards(dbs, esc_dirs, days=window.days, now=now),
         aggregate_performance_history(dbs, days=window.days, now=now),
@@ -1074,6 +1103,13 @@ def _fused_memory_unreachable_response(errors: list[str]) -> JSONResponse:
     )
 
 
+def _fused_memory_outcome_unknown_response(errors: list[str]) -> JSONResponse:
+    return JSONResponse(
+        {'error': 'fused_memory_outcome_unknown', 'detail': '; '.join(errors)},
+        status_code=502,
+    )
+
+
 async def _mcp_write_proxy(
     http_client: httpx.AsyncClient,
     config: DashboardConfig,
@@ -1085,9 +1121,14 @@ async def _mcp_write_proxy(
     """The single MCP-write proxy behind the curator-cancel and scheduler write routes.
 
     Validation and argument construction stay in the calling route handler.
-    This fans *tool_name* out over all fused_memory_urls and returns the first
-    success, rendering transport errors, mapping not_found to 404 when
-    *treat_not_found_as_404*, and answering 502 when every URL fails.
+    This calls *tool_name* on fused_memory_urls in order, rendering transport
+    errors and mapping not_found to 404 when *treat_not_found_as_404*. It fails
+    over to the next URL only when the failure proves the request never reached
+    the server, answering 502 ``fused_memory_unreachable`` when every URL fails
+    that way. Any other failure answers 502 ``fused_memory_outcome_unknown``
+    without trying another URL, because every URL reaches the same store and
+    none of these tools is idempotent (DESIGN.md "Curator Tickets & Routing
+    Invariant").
     """
 
     async def _call(url: str) -> JSONResponse:
@@ -1115,6 +1156,7 @@ async def _mcp_write_proxy(
         # stays quiet and the failure is reported exactly once.
         log_failures=False,
         offline_result=_fused_memory_unreachable_response,
+        ambiguous_result=_fused_memory_outcome_unknown_response,
     )
 
 
@@ -1167,7 +1209,7 @@ async def api_curator(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     http_client: httpx.AsyncClient = request.app.state.http_client
-    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    now = app_clock(request.app)()
 
     # 1 + 2 + 3. Fan-out list_tickets, latency sparks, and cap intervals all
     #              run concurrently — the fan-out dominates latency under slow
@@ -1186,13 +1228,13 @@ async def api_curator(request: Request) -> JSONResponse:
     # leg uses mcp_tool_call (not pool.get) and is therefore unaffected.
     async def _sparks_leg() -> dict[str, dict[str, list]]:
         md = await pool.get(config.metrics_db)
-        return await get_curator_sparks(md, days=1)
+        return await get_curator_sparks(md, days=1, now=now)
 
     async def _intervals_leg() -> list[CapInterval]:
         cd = await _cost_dbs(config, pool)
         # days=7 matches _sample_curator look-back so caps older than 1 day are
         # not misreported as uncapped (consistent with metrics.py:323).
-        return await read_cap_intervals(cd, days=7)
+        return await read_cap_intervals(cd, days=7, now=now)
 
     fanout_r, sparks_r, intervals_r, state_r = await asyncio.gather(
         fan_out_list_tickets(
@@ -1268,7 +1310,7 @@ async def api_curator(request: Request) -> JSONResponse:
     _empty_capped: ChartData = {'labels': [], 'values': []}
     try:
         capped_now, capped_windows = compute_capped_now_and_windows(intervals, account_count)
-        capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
+        capped_spark: ChartData = bucketise_cap_sparkline(capped_windows, now=now)
     except Exception:
         # Raise to WARNING so the silent capped_now=0 degrade is always visible in logs.
         # The prior code returned capped_now=1 when any interval was open-ended; that
@@ -1441,7 +1483,13 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
 
 @app.post('/api/v2/dashboard/scheduler/clear-override')
 async def api_scheduler_clear_override(request: Request) -> JSONResponse:
-    """Proxy POST /scheduler/clear-override → clear_task_priority_override MCP tool."""
+    """Proxy POST /scheduler/clear-override → clear_task_priority_override MCP tool.
+
+    Without ``fields`` the whole override row is cleared. With ``fields`` each
+    named field is cleared by its own call, because the tool clears one
+    ``field`` per call; the first response that is not a 200 is returned, else
+    the last one.
+    """
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1460,9 +1508,10 @@ async def api_scheduler_clear_override(request: Request) -> JSONResponse:
 
     fields = body.get('fields')
     if fields is not None:
-        if not isinstance(fields, list):
+        if not isinstance(fields, list) or not fields:
             return JSONResponse(
-                {'error': 'invalid_fields', 'detail': 'fields must be a list'}, status_code=400
+                {'error': 'invalid_fields', 'detail': 'fields must be a non-empty list'},
+                status_code=400,
             )
         invalid = [f for f in fields if f not in _VALID_CLEAR_FIELDS]
         if invalid:
@@ -1471,15 +1520,25 @@ async def api_scheduler_clear_override(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
-    args: dict = {'task_id': task_id, 'project_root': project_root}
-    if fields is not None:
-        # Translate 'ttl_until' → 'ttl': the dashboard boundary speaks 'ttl_until'
-        # (matching the row shape), but the MCP tool's wire format uses 'ttl'.
-        args['fields'] = ['ttl' if f == 'ttl_until' else f for f in fields]
-
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    return await _mcp_write_proxy(http_client, config, 'clear_task_priority_override', args)
+    row = {'task_id': task_id, 'project_root': project_root}
+
+    async def clear(args: dict) -> JSONResponse:
+        return await _mcp_write_proxy(http_client, config, 'clear_task_priority_override', args)
+
+    if fields is None:
+        return await clear(row)
+    for field_name in fields[:-1]:
+        response = await clear({**row, 'field': _mcp_clear_field(field_name)})
+        if response.status_code != 200:
+            return response
+    return await clear({**row, 'field': _mcp_clear_field(fields[-1])})
+
+
+def _mcp_clear_field(field_name: str) -> str:
+    """The dashboard boundary speaks 'ttl_until' (the row shape); the tool's field is 'ttl'."""
+    return 'ttl' if field_name == 'ttl_until' else field_name
 
 
 @app.post('/api/v2/dashboard/scheduler/reorder-pin-queue')
@@ -1525,7 +1584,7 @@ async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
         http_client,
         config,
         'reorder_pin_queue',
-        {'task_ids': task_ids, 'project_root': project_root},
+        {'ordered_task_ids': task_ids, 'project_root': project_root},
         treat_not_found_as_404=False,
     )
 
@@ -1590,12 +1649,12 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     """MEMORY_EVALS — metric trends, verdicts, limits provenance and escalation parity.
 
     The artifact scan (every metrics-*.json across every eval dir, plus the
-    limits/verdicts artifacts and the escalation queue) runs in a worker thread
-    via asyncio.to_thread behind a ~60s single-flight TTL cache, so a cold scan
-    never blocks the event loop and repeated polls within the window are free.
-    No clock read here — the aggregator resolves `now` once internally via
-    resolve_now (clock-discipline guard scans dashboard/data/*.py + app.py;
-    resolve_now is the sanctioned site).
+    limits/verdicts artifacts) runs in a worker thread via asyncio.to_thread
+    behind a ~60s single-flight TTL cache, so a cold scan never blocks the
+    event loop and repeated polls within the window are free. Each rebuild
+    reads `now` once from the app's clock (dashboard.api.clock); it stamps
+    the payload, and stamps the escalation corpus walk only if this rebuild
+    triggers one.
 
     A scan that never REACHED the tree is served but NOT cached (cache_ok=
     root_scan_succeeded): an absent root and an unwalkable one are both O(1) to
@@ -1619,20 +1678,34 @@ async def api_memory_evals(request: Request) -> JSONResponse:
 
     The escalation source is the reconciliation queue
     (escalation_corpus.py::reconciliation_queue): memory-eval regressions are
-    filed onto the 8103 recon queue (memory-eval-program.md M3), which is the
-    same queue the Escalations tab renders — so a linked alarm and its
-    escalation cannot disagree. The directory read and the queue id the payload
-    names (MEMORY_EVALS.escalation_queue, the key the client's links resolve
-    under) both come from that one QueueRef, so they cannot disagree either.
+    filed onto the 8103 recon queue (memory-eval-program.md M3). It is read
+    through the escalation corpus' one walk and cache, the same the Escalations
+    tab reads, so a linked alarm and its escalation row cannot disagree. The
+    queue joined and the queue id the payload names (MEMORY_EVALS.
+    escalation_queue, the key the client's links resolve under) both come from
+    that one QueueRef, so they cannot disagree either. A corpus walk that
+    raises is joined as an unknown corpus, an unreadable_escalations issue on a
+    payload cached like any degraded row, never a 500.
     """
     config: DashboardConfig = request.app.state.config
     memory_evals_dir = config.memory_evals_dir
     queue = reconciliation_queue(config)
-    escalations_dir = queue.directory
-    key = f'{memory_evals_dir}|{escalations_dir}'
+    key = f'{memory_evals_dir}|{queue.directory}'
+    clock = app_clock(request.app)
 
     async def _refresh() -> dict:
-        return await asyncio.to_thread(build_memory_evals, memory_evals_dir, escalations_dir)
+        now = clock()
+        try:
+            corpus = await acquire_corpus(corpus_queues(config), now=now)
+        except Exception as exc:
+            logger.exception('memory-evals: escalation corpus walk failed; joining no escalations')
+            corpus = unknown_datum(
+                f'the escalation corpus walk failed: {type(exc).__name__}: {exc}',
+                CORPUS_FRESHNESS_BOUND_SECONDS,
+            )
+        return await asyncio.to_thread(
+            build_memory_evals, memory_evals_dir, corpus, queue.id, now=now,
+        )
 
     result = await _memory_evals_cache.get_or_refresh(key, _refresh, cache_ok=root_scan_succeeded)
     return JSONResponse(redux_api.shape_memory_evals(**result, escalation_queue=queue.id))

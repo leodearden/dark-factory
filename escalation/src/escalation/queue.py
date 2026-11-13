@@ -11,9 +11,10 @@ import os
 import re
 import tempfile
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Generic, Literal, TypedDict, TypeVar
 
 from shared.timestamps import parse_timestamp_or_warn
 
@@ -53,8 +54,10 @@ from escalation.models import (
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
     LateResolution,
+    cascade_resolved_by,
     max_severity,
     note_to_file_class_conflict,
+    recut_action_conflict,
 )
 
 logger = logging.getLogger(__name__)
@@ -304,15 +307,35 @@ class AmendWithoutRecord(TypedDict):
 AmendResult = AmendWithRecord | AmendWithoutRecord
 
 
+R = TypeVar('R')
+
+
+@dataclass(frozen=True)
+class ClaimResult(Generic[R]):
+    """What ONE :meth:`EscalationQueue.claim_policy_class` call did.
+
+    ``record`` is the claimed record, or ``refusal`` is what the caller's
+    refuse callback returned; never both. Both ``None`` means the id was not
+    found in the queue root, failed to parse, or is not pending.
+    """
+
+    record: Escalation | None
+    refusal: R | None
+
+    def __post_init__(self) -> None:
+        if self.record is not None and self.refusal is not None:
+            raise ValueError('a claim cannot both succeed and be refused')
+
+
 class ResolveOutcome(TypedDict):
     """What ONE :meth:`EscalationQueue.resolve` call actually DID (task 4495).
 
-    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: the
-    ``Escalation`` is ``resolve()``'s primary return value and every existing
-    call site reads it directly, so widening the return into a tuple would churn
-    all of them — the member cascade, ``dismiss_all_pending``, the steward, the
-    five workflow auto-dismiss backstops — for a fact only ``server.resolve_issue``
-    wants.
+    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: only
+    ``server.resolve_issue`` and ``dismiss_all_pending`` want this fact, while the
+    ``Escalation`` is ``resolve()``'s primary return value and every other call
+    site reads it directly — the member cascade, the steward, the five workflow
+    auto-dismiss backstops — so widening the return into a tuple would churn all
+    of them.
 
     WHY IT EXISTS: ``resolve()``'s already-terminal branch is a no-op, so a caller
     whose text did NOT apply gets back a perfectly healthy-looking ``Escalation``
@@ -694,11 +717,38 @@ def read_escalation_for_scan(
         return None, 'unparsable'
 
 
+def _warn_cross_tier_duplicates(root_paths: list[Path], archive_paths: list[Path]) -> None:
+    """WARN once per escalation id that has a copy in BOTH the queue root and the archive.
+
+    That signals a crash-mid-resolve or a backup-restore needing reconciliation.
+    Each path's tier is known from which list it came in, so ids are matched
+    by filename alone, with no JSON parsing and no per-path ``.parent``.  An id
+    present in several dated archive subdirs but not the root is NOT warned
+    about: ``queue.py::EscalationQueue._locate_path`` selects the newest copy.
+    """
+    root_names = {path.name for path in root_paths}
+    archive_copies: dict[str, list[Path]] = {}
+    for path in archive_paths:
+        if path.name in root_names:
+            archive_copies.setdefault(path.name, []).append(path)
+    for root_copy in root_paths:
+        copies = archive_copies.get(root_copy.name)
+        if copies:
+            esc_paths = [root_copy, *copies]
+            logger.warning(
+                f'Escalation {root_copy.stem!r} exists in both queue_dir and archive: '
+                f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
+            )
+
+
 class EscalationQueue:
     """Filesystem queue for escalations.
 
     Each escalation is a JSON file named {id}.json in the queue directory.
     Writes are atomic (tmp file + rename). Reads tolerate partial writes.
+    The read paths (``get`` / ``get_by_task`` / ``get_pending``) may run on
+    worker threads while writes run on the loop thread, which is why
+    iteration over the archive-listing memo is snapshot-based.
     """
 
     def __init__(self, queue_dir: Path):
@@ -886,7 +936,7 @@ class EscalationQueue:
         listing = self._get_archive_listing()
         candidates = [
             archive_root / subdir / f'{escalation_id}.json'
-            for subdir, stems in listing.items()
+            for subdir, stems in list(listing.items())
             if escalation_id in stems
             and (archive_root / subdir / f'{escalation_id}.json').exists()
         ]
@@ -1072,8 +1122,7 @@ class EscalationQueue:
         anyway.
 
         Recovery is further gated to a ``'vanished'`` path whose parent is
-        the queue ROOT (the same root/archive tier test the pre-scan above
-        already makes).  An archive-tier path going ``'vanished'`` is
+        the queue ROOT.  An archive-tier path going ``'vanished'`` is
         overwhelmingly ``archive.prune_archive`` rmtree-ing its whole dated
         subdir wholesale — a genuine deletion recovery cannot help with, not
         the root -> archive move this recovery targets — and re-locating it
@@ -1082,42 +1131,15 @@ class EscalationQueue:
         that is genuinely gone.  This deliberately leaves a second,
         archive-to-archive relocation (e.g. a re-date) unrecovered.
         """
-        # Build the candidate path list.
-        paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
-        if status != 'pending':
-            paths.extend(self._iter_archive_paths('esc-*.json'))
-
-        # Pre-scan: detect ids that span both queue_dir root and archive subtree.
-        # Uses filename stems only (no JSON parsing) to avoid extra I/O.
-        #
-        # Tier-membership: classify each path by comparing its parent directory
-        # to self.queue_dir.  Files written by queue_dir.glob('esc-*.json') are
-        # non-recursive, so their parent IS self.queue_dir (root tier).  Files
-        # from _iter_archive_paths come from archive_root.rglob(...) and land
-        # inside a dated subdir (e.g. archive/2025-06-15/); their parent is that
-        # date dir, NOT self.queue_dir (archive tier).
-        #
-        # A single id can legitimately appear multiple times within the archive
-        # tier (the same stem in two different dated subdirs after a requeue or
-        # backup-restore).  That situation is handled by get()'s newest-by-date
-        # selection (queue.py:102-117) and is NOT a cross-tier inconsistency.
-        # We warn only when an id has members in BOTH tiers — that signals a
-        # crash-mid-resolve or backup-restore scenario requiring reconciliation.
-        id_to_paths: dict[str, list[Path]] = {}
-        for path in paths:
-            id_to_paths.setdefault(path.stem, []).append(path)
-        for esc_id, esc_paths in id_to_paths.items():
-            has_root = any(p.parent == self.queue_dir for p in esc_paths)
-            has_archive = any(p.parent != self.queue_dir for p in esc_paths)
-            if has_root and has_archive:
-                logger.warning(
-                    f'Escalation {esc_id!r} exists in both queue_dir and archive: '
-                    f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
-                )
+        root_paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
+        archive_paths: list[Path] = (
+            list(self._iter_archive_paths('esc-*.json')) if status != 'pending' else []
+        )
+        _warn_cross_tier_duplicates(root_paths, archive_paths)
 
         seen: set[str] = set()
         results = []
-        for path in paths:
+        for path in root_paths + archive_paths:
             # The glob above snapshotted the listing; nothing holds a lock over
             # these reads, so a concurrent resolve()/sweep can relocate any of
             # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
@@ -1132,8 +1154,7 @@ class EscalationQueue:
                 # vanish -- re-locate it fresh and retry the read once before
                 # giving up on it.
                 #
-                # Gated to the ROOT tier (path.parent == self.queue_dir), the
-                # same root/archive test the pre-scan above already uses.
+                # Gated to the ROOT tier (path.parent == self.queue_dir).
                 # An ARCHIVE-tier path going 'vanished' is overwhelmingly
                 # archive.prune_archive rmtree-ing its whole dated subdir --
                 # a genuine deletion this recovery cannot help with, not the
@@ -1174,7 +1195,13 @@ class EscalationQueue:
             results.append(esc)
         return results
 
-    def has_open_l1(self, task_id: str, *, category: str | None = None) -> bool:
+    def has_open_l1(
+        self,
+        task_id: str,
+        *,
+        category: str | None = None,
+        dedupe_fingerprint: str | None = None,
+    ) -> bool:
         """Return True when the task has at least one pending level-1 escalation.
 
         Level-1 is the handed-to-human tier: the presence of one signals that
@@ -1184,8 +1211,12 @@ class EscalationQueue:
         ``.category`` matches — a signature filter (task 2757).  This lets a NEW
         root cause (a different failure category) escape being silently
         suppressed by an UNRELATED open L1.  Default None preserves the exact
-        prior behavior (any pending L1 counts).  A non-None ``category`` outside
-        ``escalation.categories.EscalationCategory`` raises
+        prior behavior (any pending L1 counts).  ``dedupe_fingerprint``, when
+        given, further restricts the check to open L1s carrying that exact
+        ``.dedupe_fingerprint``; its first caller is
+        ``fused-memory/scripts/memory_eval_runner.py``, which files many
+        fingerprints under one synthetic task id.  A non-None ``category``
+        outside ``escalation.categories.EscalationCategory`` raises
         ``UnregisteredEscalationCategory``.
         """
         if category is not None:
@@ -1193,6 +1224,10 @@ class EscalationQueue:
         open_l1s = self.get_by_task(task_id, status='pending', level=1)
         if category is not None:
             open_l1s = [esc for esc in open_l1s if esc.category == category]
+        if dedupe_fingerprint is not None:
+            open_l1s = [
+                esc for esc in open_l1s if esc.dedupe_fingerprint == dedupe_fingerprint
+            ]
         return bool(open_l1s)
 
     def dismiss_if_covered(self, esc: Escalation, *, resolver: str) -> list[str]:
@@ -1354,6 +1389,7 @@ class EscalationQueue:
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
         resolution_action: str | None = None,
+        recut: bool = False,
         outcome: ResolveOutcome | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
@@ -1372,6 +1408,14 @@ class EscalationQueue:
         path, and not propagated through the member cascade.  Legality is the
         caller's job: ``escalation/action_effects.py::effect_for`` is the
         authority ``escalation/server.py::resolve_issue`` consults first.
+
+        ``recut`` (task 5516): qualifies a ``'restart'`` resolution — the next
+        dispatch re-cuts the task fresh off main.  Any other pairing
+        (``models.recut_action_conflict``) raises ``ValueError`` BEFORE the
+        lock, so nothing is persisted (INV-1).  Stamped beside
+        ``resolution_action`` on the applied path only; never on the
+        already-terminal path and not propagated through the member cascade —
+        a cascade member inherits it from its parent, as it does the action.
 
         ``resolution_class`` (plans/escalation-lifecycle-dashboard-prd.md Seam 1):
         an optional explicit ``'benign' | 'actionable'`` classification stamp,
@@ -1415,9 +1459,10 @@ class EscalationQueue:
 
         Cascade: if the escalation is an L2 with a non-empty ``members`` list,
         after archiving the L2 each member id is resolved recursively with the
-        same *resolution* text.  The cascade uses
-        ``resolved_by='l2-cascade:{escalation_id}'`` so the audit trail
-        distinguishes direct resolves from cascades.  *dismiss* is propagated
+        same *resolution* text.  The cascade stamps
+        ``resolved_by=models.cascade_resolved_by(escalation_id)`` (read back by
+        ``models.cascade_parent_id``) so the audit trail distinguishes direct
+        resolves from cascades.  *dismiss* is propagated
         so a dismissed L2 dismisses its members too.
 
         Cascade contract:
@@ -1461,6 +1506,8 @@ class EscalationQueue:
                 f'invalid resolution_class {resolution_class!r}; '
                 f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
             )
+        if (conflict := recut_action_conflict(resolution_action, recut)) is not None:
+            raise ValueError(conflict)
 
         # Seed BEFORE the lock so the early returns below leave a complete dict
         # rather than a stale caller-supplied one (the add_members_to_l2
@@ -1517,6 +1564,7 @@ class EscalationQueue:
                 esc.granted_files = granted_files
             if resolution_action is not None:
                 esc.resolution_action = resolution_action
+            esc.recut = recut
 
             self._atomic_write(escalation_id, esc.to_json())
             self._archive_resolved(escalation_id, esc.resolved_at)
@@ -1544,14 +1592,14 @@ class EscalationQueue:
         # Cascade to member L1s (L2 clusters only — L0/L1 have empty members).
         # Recursion is bounded: L1 members carry empty members[], so no deeper nesting.
         if esc.members:
-            cascade_resolved_by = f'l2-cascade:{escalation_id}'
+            member_resolved_by = cascade_resolved_by(escalation_id)
             for member_id in esc.members:
                 try:
                     self.resolve(
                         member_id,
                         resolution,
                         dismiss=dismiss,
-                        resolved_by=cascade_resolved_by,
+                        resolved_by=member_resolved_by,
                         resolution_class=esc.resolution_class,
                     )
                 except Exception as e:
@@ -1793,7 +1841,7 @@ class EscalationQueue:
                         )
                         continue
                     # In-memory cascade signal only; no disk write.
-                    member.resolved_by = f'l2-cascade:{escalation_id}'
+                    member.resolved_by = cascade_resolved_by(escalation_id)
                     if self._resolve_callback:
                         try:
                             self._resolve_callback(member)
@@ -2236,6 +2284,22 @@ class EscalationQueue:
                 )
             return esc
 
+    def _load_root_pending(self, escalation_id: str) -> Escalation | None:
+        """The pending record at the queue root, or ``None`` when absent, unparsable or not pending.
+
+        Never falls back to the archive, so a caller that rewrites the result
+        cannot resurrect an archived record. Call it under ``escalation_id_lock``.
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        if not path.exists():
+            return None
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+            return None
+        return esc if esc.status == 'pending' else None
+
     def stamp_triage(
         self, escalation_id: str, *, triaged_by: str | None = None, triage_note: str = '',
     ) -> Escalation | None:
@@ -2280,16 +2344,8 @@ class EscalationQueue:
         (archived/resolved/dismissed).
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return None
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return None
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return None
 
             esc.triaged_at = datetime.now(UTC).isoformat()
@@ -2300,6 +2356,42 @@ class EscalationQueue:
             self._rewrite(escalation_id, esc)
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc
+
+    def claim_policy_class(
+        self, escalation_id: str, *, policy_class: str, claimed_by: str,
+        refuse: Callable[[Escalation], R | None],
+    ) -> ClaimResult[R]:
+        """Stamp a policy-class claim on a pending escalation (task 8422).
+
+        The sole writer of ``policy_class`` / ``claimed_at`` / ``claimed_by``.
+        It has :meth:`stamp_triage`'s write shape for the same reasons: it is
+        serialized per id by ``escalation_id_lock``, it loads from the queue
+        root only, so an archived record is refused rather than resurrected, it
+        refuses a non-pending record, and it leaves ``updated_at`` alone
+        because a claim is not a content change.
+
+        *refuse* is evaluated on the record as read under the lock, so a
+        check on the existing claim cannot race another claim. A non-``None``
+        return is handed back as the refusal and nothing is written. This
+        method owns ``claimed_at``'s clock, as :meth:`stamp_triage` owns
+        ``triaged_at``'s.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
+                return ClaimResult(record=None, refusal=None)
+            refusal = refuse(esc)
+            if refusal is not None:
+                return ClaimResult(record=None, refusal=refusal)
+
+            esc.policy_class = policy_class
+            esc.claimed_at = datetime.now(UTC).isoformat()
+            esc.claimed_by = claimed_by
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'claim_policy_class: %s claimed %s as %s', claimed_by, escalation_id, policy_class,
+            )
+            return ClaimResult(record=esc, refusal=None)
 
     def amend(
         self, escalation_id: str, *, root_cause: str = '', summary: str = '',
@@ -2427,16 +2519,8 @@ class EscalationQueue:
         *declared_by* normalises to nothing new.
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return None
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return None
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return None
 
             existing = list(esc.pin_declared_by)
@@ -2928,16 +3012,17 @@ class EscalationQueue:
         notes survive for the orphan reaper
         (plans/info-l0-disposition-router-prd.md boundary #16).
 
-        Returns the number of escalations where resolve() returned non-None.
-        This is an UPPER BOUND on the records this call dismissed, not an exact
-        count.  Other processes, among them fused-memory's middlewares and
-        reconciliation, write this queue directory concurrently, so a record
-        one of them resolves between get_pending() and resolve() is still
-        counted: resolve() on an already-terminal record is a no-op that
-        returns the stored record.  Nor does the count distinguish the three
-        per-record outcomes — age-annotated, strand-stamped, or
-        ``pending_secs=unknown`` for a record whose timestamp would not parse;
-        a caller that needs that detail reads the resolved records themselves.
+        Returns the exact number of records THIS call dismissed: a record is
+        counted only when resolve()'s ``ResolveOutcome`` reports it applied.
+        Other processes, among them fused-memory's middlewares and
+        reconciliation, routinely write this queue directory, so a record one
+        of them resolves between get_pending() and resolve() is an
+        already-terminal no-op here and is not counted.  The stale-strand tally
+        in the INFO line is counted the same way.  The count does not
+        distinguish the three per-record outcomes — age-annotated,
+        strand-stamped, or ``pending_secs=unknown`` for a record whose
+        timestamp would not parse; a caller that needs that detail reads the
+        resolved records themselves.
         """
         pending = self.get_pending()
         now = now or datetime.now(UTC)
@@ -2968,14 +3053,16 @@ class EscalationQueue:
                 else:
                     is_strand = False
                     per_record = f'{resolution} [pending_secs=unknown severity={esc.severity}]'
-                resolved = self.resolve(
+                outcome = blank_resolve_outcome()
+                self.resolve(
                     esc.id,
                     per_record,
                     dismiss=True,
                     resolved_by='auto-dismissed',
                     resolution_class='stale-strand' if is_strand else None,
+                    outcome=outcome,
                 )
-                if resolved is not None:
+                if outcome['applied']:
                     count += 1
                     strands += int(is_strand)
             except Exception as e:

@@ -3,9 +3,10 @@
 Contract: ``docs/task-authoring.md`` §5. Lives in ``shared`` so the run-time
 executor (``orchestrator/src/orchestrator/deterministic_runner.py``) and the
 submit-time check
-(``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``,
-which validates ``script_base / script``) can read one definition. Both choose
-``script_base`` through ``resolve_script_base``.
+(``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
+read one definition: both take the script path from
+``resolve_before_done_paths``, with the base chosen by ``resolve_script_base``,
+and both refuse a non-string cwd through ``before_done_cwd``.
 """
 
 from __future__ import annotations
@@ -63,6 +64,24 @@ def resolve_script_base(
     return factory_root_resolver()
 
 
+class CwdRefused(ValueError):
+    """``before_done.cwd`` is present but not a string path."""
+
+
+def before_done_cwd(before_done: Mapping[str, Any]) -> str | None:
+    """``before_done['cwd']``: a string path, or ``None`` when absent.
+
+    The single statement of the cwd type rule, enforced by the submit guard and
+    by ``resolve_before_done_paths``; any other value raises ``CwdRefused``.
+    """
+    cwd = before_done.get('cwd')
+    if cwd is not None and not isinstance(cwd, str):
+        raise CwdRefused(
+            f'before_done.cwd must be a string path when present (got {type(cwd).__name__!r}).',
+        )
+    return cwd
+
+
 def resolve_before_done_paths(
     before_done: Mapping[str, Any], project_root: Path, *, script_base: Path | None = None,
 ) -> BeforeDonePaths:
@@ -70,7 +89,7 @@ def resolve_before_done_paths(
     ``cwd`` is set: the file the submit guard validated is the file that runs.
     ``cwd`` always joins ``project_root``."""
     base = script_base if script_base is not None else project_root
-    cwd = before_done.get('cwd')
+    cwd = before_done_cwd(before_done)
     return BeforeDonePaths(
         script=base / before_done['script'],
         cwd=project_root / cwd if cwd else project_root,

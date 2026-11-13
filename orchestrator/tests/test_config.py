@@ -1026,7 +1026,8 @@ class TestLayeredConfig:
         assert config.max_concurrent_tasks == 8
         # Preserved from package defaults
         assert config.models.architect == 'opus'
-        assert config.effort.architect == 'max'
+        assert config.effort.architect == 'xhigh'
+        assert config.max_turns.architect == 180
 
     def test_deep_merge_preserves_sibling_keys(self, tmp_path):
         """Overriding one key in a nested dict should not clobber siblings."""
@@ -3546,7 +3547,7 @@ class TestOrchestratorConfigPrices:
     """
 
     _SEED_KEYS = {
-        'gpt-5.4', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'o4-mini',
+        'gpt-5.4', 'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'o4-mini',
         'gemini-3.1-pro-preview', 'gemini-3-flash',
     }
 
@@ -3558,10 +3559,10 @@ class TestOrchestratorConfigPrices:
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
         assert config.prices['gpt-6-astra'].input_per_1m == 10.00
         assert config.prices['gpt-6-astra'].output_per_1m == 50.00
-        assert config.prices['gpt-5.6-sol'].input_per_1m == 4.00
-        assert config.prices['gpt-5.6-sol'].output_per_1m == 20.00
-        assert config.prices['gpt-5.6-terra'].input_per_1m == 2.00
-        assert config.prices['gpt-5.6-terra'].output_per_1m == 12.00
+        assert config.prices['gpt-6.1-sol'].input_per_1m == 2.00
+        assert config.prices['gpt-6.1-sol'].output_per_1m == 10.00
+        assert config.prices['gpt-6.1-terra'].input_per_1m == 1.00
+        assert config.prices['gpt-6.1-terra'].output_per_1m == 5.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
         assert config.prices['o4-mini'].output_per_1m == 4.40
         assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25
@@ -3580,10 +3581,10 @@ class TestOrchestratorConfigPrices:
         assert OrchestratorConfig().prices['gpt-6-astra'].cached_input_per_1m == 1.00
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_sol_and_terra_have_no_cached_input_rate(self):
+    def test_sol_and_terra_seed_their_published_cached_input_rates(self):
         prices = OrchestratorConfig().prices
-        assert prices['gpt-5.6-sol'].cached_input_per_1m is None
-        assert prices['gpt-5.6-terra'].cached_input_per_1m is None
+        assert prices['gpt-6.1-sol'].cached_input_per_1m == 0.10
+        assert prices['gpt-6.1-terra'].cached_input_per_1m == 0.05
 
     def test_default_price_table_matches_defaults_yaml(self):
         """config.py's `_DEFAULT_PRICES` constant and defaults.yaml's

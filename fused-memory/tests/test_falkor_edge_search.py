@@ -20,11 +20,13 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from _query_recorder import IssuedQuery, recording_driver
 from graphiti_core.driver.search_interface.search_interface import SearchInterface
+from graphiti_core.errors import GroupIdValidationError
 from graphiti_core.search import search_utils
 from graphiti_core.search.search_filters import SearchFilters
 
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE
 
 if TYPE_CHECKING:
     from falkordb.asyncio import FalkorDB
@@ -96,9 +98,6 @@ FALLBACK_LEGS: dict[str, SearchLeg] = {
     'get_embeddings_for_communities': lambda driver: search_utils.get_embeddings_for_communities(
         driver, []
     ),
-    'node_bfs_search': lambda driver: search_utils.node_bfs_search(
-        driver, ['origin'], SearchFilters(), 2, ['g']
-    ),
     'node_distance_reranker': lambda driver: search_utils.node_distance_reranker(
         driver, ['a', 'b'], 'center'
     ),
@@ -155,6 +154,17 @@ CANNED_EDGE_RECORD: dict[str, Any] = {
     'attributes': {},
 }
 
+# One row shaped like graphiti's FalkorDB node projection (get_entity_node_return_query).
+CANNED_NODE_RECORD: dict[str, Any] = {
+    'uuid': 'node-uuid',
+    'name': 'alpha node',
+    'group_id': 'g',
+    'created_at': '2026-10-03T00:00:00+00:00',
+    'summary': '',
+    'labels': ['Entity'],
+    'attributes': {},
+}
+
 
 class TestEdgeFulltextSearch:
     @staticmethod
@@ -179,10 +189,42 @@ class TestEdgeFulltextSearch:
     async def test_forwards_graphiti_params(self) -> None:
         _, issued = await self._search()
 
-        params = issued[0].params
-        assert params['query'] == '(@group_id:"g") (alpha | beta)'
-        assert params['group_ids'] == ['g']
-        assert params['limit'] == 20
+        (query,) = issued
+        assert query.params['query'] == '(@group_id:"g") (alpha | beta)'
+        assert query.params['group_ids'] == ['g']
+        assert query.params['limit'] == 20
+        assert 'e.group_id IN $group_ids' in query.cypher
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('text', 'group_ids'),
+        [
+            ('Please note _ is the Python throwaway variable', ['g']),
+            ('note `` empty code span', ['g']),
+            ('<alpha>{beta}[gamma] task 877', ['g']),
+            ('alpha beta', ['a-b']),
+            ('alpha beta', None),
+        ],
+    )
+    async def test_the_union_is_the_fulltext_query_graphiti_builds_for_every_leg(
+        self, text: str, group_ids: list[str] | None
+    ) -> None:
+        """The node and episode legs get theirs from graphiti's fulltext_query; the edge leg's union must not drift from it."""
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+        await search_utils.edge_fulltext_search(driver, text, SearchFilters(), group_ids, 20)
+
+        assert issued[-1].params['query'] == search_utils.fulltext_query(text, group_ids, driver)
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_group_id_is_refused_before_any_query(self) -> None:
+        """As graphiti's own fulltext_query does; build_edge_queries escapes group ids, it does not validate them."""
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+
+        with pytest.raises(GroupIdValidationError):
+            await search_utils.edge_fulltext_search(
+                driver, 'alpha beta', SearchFilters(), ['bad group'], 20
+            )
+        assert issued == []
 
     @pytest.mark.asyncio
     async def test_applies_graphiti_search_filter_predicates(self) -> None:
@@ -209,6 +251,66 @@ class TestEdgeFulltextSearch:
 
         assert edges == []
         assert issued == []
+
+
+class TestEdgeFulltextIdentifierTier:
+    """An edge matching every identifier term ranks first when the whole tier fits in the leg."""
+
+    LIMIT = 20
+
+    @classmethod
+    async def _issued(cls, query: str, tier_rows: int = 1) -> list[IssuedQuery]:
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD] * tier_rows)
+        await search_utils.edge_fulltext_search(
+            driver, query, SearchFilters(edge_uuids=['x']), ['g'], cls.LIMIT
+        )
+        return issued
+
+    @pytest.mark.asyncio
+    async def test_the_tier_query_intersects_the_identifiers_under_the_leg_filters(self) -> None:
+        tier, _ = await self._issued('alpha 877')
+
+        assert tier.params['query'] == '(877)'
+        assert tier.params['tier_cap'] == self.LIMIT + 1
+        assert (tier.params['group_ids'], tier.params['edge_uuids']) == (['g'], ['x'])
+        assert '$group_ids' in tier.cypher
+        assert '$edge_uuids' in tier.cypher
+        assert 'ORDER BY' not in tier.cypher.upper()
+        assert 'MATCH' not in tier.cypher.upper()
+
+    @pytest.mark.asyncio
+    async def test_only_the_tier_query_applies_the_active_edge_predicate(self) -> None:
+        """Retired edges are not promoted, while the ranked rows keep graphiti's filter semantics."""
+        tier, union = await self._issued('alpha 877')
+
+        assert ACTIVE_EDGE_PREDICATE in tier.cypher
+        assert ACTIVE_EDGE_PREDICATE not in union.cypher
+
+    @pytest.mark.asyncio
+    async def test_the_union_ranks_the_tier_first_then_by_score(self) -> None:
+        _, union = await self._issued('alpha 877')
+
+        assert union.params['query'] == '(@group_id:"g") (alpha | 877)'
+        assert union.params['promoted_uuids'] == ['edge-uuid']
+        assert 'ORDER BY e.uuid IN $promoted_uuids DESC, score DESC' in union.cypher
+
+    @pytest.mark.asyncio
+    async def test_a_tier_that_exactly_fills_the_leg_is_promoted(self) -> None:
+        _, union = await self._issued('alpha 877', tier_rows=self.LIMIT)
+
+        assert union.params['promoted_uuids'] == ['edge-uuid'] * self.LIMIT
+
+    @pytest.mark.asyncio
+    async def test_a_tier_larger_than_the_leg_promotes_nothing(self) -> None:
+        _, union = await self._issued('alpha 877', tier_rows=self.LIMIT + 1)
+
+        assert union.params['promoted_uuids'] == []
+
+    @pytest.mark.asyncio
+    async def test_a_query_without_identifiers_issues_only_the_union(self) -> None:
+        (union,) = await self._issued('alpha beta')
+
+        assert union.params['promoted_uuids'] == []
 
 
 class TestEdgeSimilaritySearch:
@@ -343,6 +445,94 @@ class TestEdgeBfsSearch:
             'edge-uuid',
             'source-uuid',
             'target-uuid',
+        )
+
+
+class TestNodeBfsSearch:
+    @staticmethod
+    async def _search(
+        origins: Sequence[str] | None = ('origin-entity', 'origin-episode'),
+        depth: int = 3,
+        search_filter: SearchFilters | None = None,
+        group_ids: Sequence[str] | None = ('g',),
+    ) -> tuple[list[Any], list[IssuedQuery]]:
+        driver, issued = hardened_driver([CANNED_NODE_RECORD])
+        nodes = await search_utils.node_bfs_search(
+            driver,
+            None if origins is None else list(origins),
+            search_filter or SearchFilters(),
+            depth,
+            None if group_ids is None else list(group_ids),
+            20,
+        )
+        return nodes, issued
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('origins', 'depth'),
+        [(None, 3), ([], 3), (['origin-entity'], 0)],
+        ids=['no-origins', 'empty-origins', 'zero-depth'],
+    )
+    async def test_no_reachable_nodes_issues_nothing(
+        self, origins: list[str] | None, depth: int
+    ) -> None:
+        """graphiti's contract: no origins or depth < 1 means no results and no query."""
+        nodes, issued = await self._search(origins, depth)
+
+        assert nodes == []
+        assert issued == []
+
+    @pytest.mark.asyncio
+    async def test_origins_are_not_looked_up_one_row_at_a_time(self) -> None:
+        """Stock unwinds the origin list into an unlabeled ``{uuid:}`` match, which FalkorDB plans as a scan re-run per origin."""
+        _, issued = await self._search()
+
+        (query,) = issued
+        assert 'UNWIND $bfs_origin_node_uuids' not in query.cypher
+        assert '(origin {' not in query.cypher
+
+    @pytest.mark.asyncio
+    async def test_forwards_graphiti_params(self) -> None:
+        _, issued = await self._search()
+
+        (query,) = issued
+        assert query.params['bfs_origin_node_uuids'] == ['origin-entity', 'origin-episode']
+        assert query.params['limit'] == 20
+        assert query.params['group_ids'] == ['g']
+        assert '*1..3' in query.cypher
+
+    @pytest.mark.asyncio
+    async def test_group_filter_is_omitted_without_group_ids(self) -> None:
+        _, issued = await self._search(group_ids=None)
+
+        assert 'group_ids' not in issued[0].params
+
+    @pytest.mark.asyncio
+    async def test_every_origin_label_leg_applies_the_node_predicates(self) -> None:
+        """A leg missing one returns its own unfiltered nodes, which only the live parity tests see."""
+        _, issued = await self._search(search_filter=SearchFilters(node_labels=['Preference']))
+
+        (query,) = issued
+        legs = ('MATCH (origin:Entity)', 'MATCH (origin:Episodic)')
+        assert all(leg in query.cypher for leg in legs)
+        for predicate in (
+            'origin.uuid IN $bfs_origin_node_uuids',
+            'n.group_id = origin.group_id',
+            'origin.group_id IN $group_ids',
+            'n:Preference',
+        ):
+            assert query.cypher.count(predicate) == len(legs), predicate
+
+    @pytest.mark.asyncio
+    async def test_parses_records_into_entity_nodes(self) -> None:
+        nodes, _ = await self._search()
+
+        (node,) = nodes
+        assert (node.uuid, node.name, node.group_id, node.labels) == (
+            'node-uuid',
+            'alpha node',
+            'g',
+            ['Entity'],
         )
 
 

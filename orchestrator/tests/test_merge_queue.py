@@ -30,6 +30,7 @@ from _merge_lane_fakes import (
     merge_through_lane,
     passes,
     raises,
+    remerge_on_main,
     running_lane,
     times_out,
 )
@@ -48,7 +49,7 @@ from _resolution_merges import resolution_merge
 from _verify_result_doubles import fake_verify_result
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     AdvanceOutcome,
@@ -69,8 +70,15 @@ from orchestrator.merge_lane.intake import (
 )
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
+from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
-from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch, TerminalOutcomeRecord
+from orchestrator.merge_lane.types import (
+    DiskGuardOutcome,
+    QueuedBranch,
+    RemergeBase,
+    RemergeReason,
+    TerminalOutcomeRecord,
+)
 from orchestrator.merge_lane.worker import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     NEEDS_REBASE_REASON_PREFIX,
@@ -3987,7 +3995,7 @@ class TestSpeculativeMergeWorker:
         )
 
     async def test_verifier_already_delivered_token_drives_nfailed_chain(
-        self, git_ops: GitOps, config: OrchestratorConfig,
+        self, git_ops: GitOps, config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """already_delivered failure token flips n_failed, triggering _remerge.
 
@@ -4023,7 +4031,8 @@ class TestSpeculativeMergeWorker:
             immediate_outcome=remerge_outcome,
             already_delivered=False,
         )
-        worker._remerge = AsyncMock(return_value=remerged_item)  # type: ignore[method-assign]
+        remerge = AsyncMock(return_value=remerged_item)
+        monkeypatch.setattr(worker, '_remerge', remerge)
 
         # token2 is discarded by the n_failed short-circuit and replaced by
         # worker._remerge's mocked return value — it must be a REAL item
@@ -4031,7 +4040,7 @@ class TestSpeculativeMergeWorker:
         # immediate-outcome branch returns a passthrough entry BEFORE the
         # chain-invalidation check ever runs, so a DECIDED token2 would skip
         # _remerge entirely. merge_wt/merge_result content is unread on the
-        # exercised path (mocked _remerge only takes req + started_monotonic),
+        # exercised path (the mocked _remerge reads nothing from the item),
         # so a dummy worktree path (established pattern elsewhere in this file)
         # is a safe filler.
         dummy_wt2 = git_ops.project_root / '.worktrees' / 'vot-b2-stale'
@@ -4048,7 +4057,12 @@ class TestSpeculativeMergeWorker:
 
         await worker._verifier_loop()
 
-        worker._remerge.assert_awaited_once()  # type: ignore[attr-defined]
+        remerge.assert_awaited_once()
+        # Nothing is verifying, so the claim falls to main (task 8524).
+        assert remerge.await_args is not None
+        claim = remerge.await_args.kwargs.get('claim')
+        assert isinstance(claim, RemergeClaim), remerge.await_args
+        assert claim.anchor == RemergeBase(None, RemergeReason.NO_TIP)
         assert not worker._speculation_slot.locked(), (
             '_speculation_slot must have a free permit after verifier drains both tokens'
         )
@@ -4809,6 +4823,10 @@ class TestSpeculativeMergeWorker:
           (3) N+2's verify sees BOTH N's and N+1's files (proves it merged on top
               of the advanced tree, not a stale base).
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_follower.db'
         event_store = EventStore(db_path=db_path, run_id='test-follower')
 
@@ -4933,6 +4951,10 @@ class TestSpeculativeMergeWorker:
         — proving the merge gate ran before advance_main.  All outcomes 'done';
         all files land on main.
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_1687a.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687a')
 
@@ -5046,6 +5068,10 @@ class TestSpeculativeMergeWorker:
           file_prb_n2.py is NOT on main (red tree did not advance).
           file_prb_n.py and file_prb_n1.py ARE on main (unaffected).
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_1687b.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687b')
 
@@ -6326,7 +6352,7 @@ class TestWipHaltSpeculativeMergeWorker:
 
         # Build a real flowing item BEFORE the patch block so _remerge's
         # own merge paths run against the real git_ops (not the raising mock).
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -8940,7 +8966,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         worker = SpeculativeMergeWorker(git_ops, queue)
 
         _, req = await self._setup_overlap_branch_for_gate(git_ops, branch, config)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -9266,7 +9292,9 @@ class TestMergedBranchTipCarryThroughRebuild:
         With the PRIMARY fix, it is carried through.
 
         advance_main is mocked: first call → 'cas_failed', second call → 'advanced'.
-        _resolve_second_parent is patched to None (eliminate term-1).
+        The retried advance lands a single-parent (rebase-flattened) commit, as
+        advance_main's CAS-retry rebase does, so advanced_sha^2 does not exist
+        (term-1 = None).
         req.snapshot_tip is None by default (eliminate term-3).
         So only term-2 (merged_branch_tip from the rebuilt item) can provide the tip.
 
@@ -9295,6 +9323,21 @@ class TestMergedBranchTipCarryThroughRebuild:
         assert merge_result.merge_worktree is not None
         actual_merge_commit = merge_result.merge_commit
         worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        rc, out, err = await _run(
+            [
+                'git', 'commit-tree', f'{actual_merge_commit}^{{tree}}',
+                '-p', base_sha, '-m', 'Flattened landing (test)',
+            ],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        flattened = out.strip()
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '-q', f'{flattened}^2'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'the flattened landing must have no second parent'
 
         req = _make_request(branch, branch, branch_wt, config)
         # req.snapshot_tip = None by default → term-3 = None
@@ -9325,17 +9368,12 @@ class TestMergedBranchTipCarryThroughRebuild:
             advance_calls[0] += 1
             if advance_calls[0] == 1:
                 return AdvanceOutcome('cas_failed')
-            return AdvanceOutcome('advanced', advanced_sha=actual_merge_commit)
+            return AdvanceOutcome('advanced', advanced_sha=flattened)
 
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
             patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=base_sha)),
-            # Eliminate term-1 so only term-2 (merged_branch_tip) can provide the tip.
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),
-            ),
             patch(
                 'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 side_effect=_spy_equiv,
@@ -9350,7 +9388,8 @@ class TestMergedBranchTipCarryThroughRebuild:
         assert advanced, 'Expected True (main advanced)'
         outcome = req.result.result()
         assert outcome.status == 'done', f'unexpected outcome: {outcome!r}'
-        # Term-1 = None (patched); term-3 = None (snapshot_tip default).
+        # Term-1 = None (the retried advance landed a single-parent, rebase-flattened
+        # commit, so advanced_sha^2 does not exist); term-3 = None (snapshot_tip default).
         # RED: without PRIMARY fix, cas_failed rebuild drops merged_branch_tip
         # → merged_tip=None ≠ ORIGINAL_TIP.
         assert captured_equiv_kw.get('merged_tip') == ORIGINAL_TIP, (
@@ -9448,7 +9487,8 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         def _spy_replace(obj, **changes):
             rebuilt = _real_replace(obj, **changes)
-            captured.append(rebuilt)
+            if isinstance(rebuilt, (RealMergeItem, DecidedItem)):
+                captured.append(rebuilt)
             return rebuilt
 
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
@@ -9534,7 +9574,8 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         def _spy_replace(obj, **changes):
             rebuilt = _real_replace(obj, **changes)
-            captured.append(rebuilt)
+            if isinstance(rebuilt, (RealMergeItem, DecidedItem)):
+                captured.append(rebuilt)
             return rebuilt
 
         advance_calls = [0]
@@ -9549,12 +9590,6 @@ class TestMergedBranchTipCarryThroughRebuild:
         with (
             patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=new_main_sha)),
-            # Eliminate term-1 so an unrelated merged_branch_tip regression
-            # elsewhere can't accidentally mask a dropped field here too.
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),
-            ),
             patch(
                 'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
@@ -10597,7 +10632,7 @@ class TestMergeFailureDiagnostic:
         worker = SpeculativeMergeWorker(git_ops, queue)
 
         req = _make_request('ghost', 'ghost', git_ops.project_root, config)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, DecidedItem)
         outcome = item.immediate_outcome
@@ -12308,7 +12343,7 @@ class TestSpeculationRaceRetry:
         actual_main = await git_ops.get_main_sha()
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-            item = await worker._remerge(req, None)
+            item = await remerge_on_main(worker, req)
 
         # merge_to_main must have been called exactly twice
         assert call_count == 2, f'Expected 2 calls to merge_to_main, got {call_count}'
@@ -12404,7 +12439,7 @@ class TestSpeculationRaceRetry:
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         # Exactly 2 calls — no 3rd retry
         assert call_count == 2, f'Expected exactly 2 calls, got {call_count}'
@@ -12488,7 +12523,7 @@ class TestSpeculationRaceRetry:
             )
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_base_is_main)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert call_count == 1, (
             f'Expected exactly 1 call (base==main, not a race), got {call_count}'
@@ -12518,7 +12553,7 @@ class TestSpeculationRaceRetry:
             )
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_non_loadbearing)
-        item2 = await worker._remerge(req2, None)
+        item2 = await remerge_on_main(worker, req2)
 
         assert call_count == 1, (
             f'Expected 1 call (non-race stderr), got {call_count}'
@@ -12588,7 +12623,7 @@ class TestSpeculationRaceRetry:
         monkeypatch.setattr(git_ops, 'cleanup_merge_worktree', fake_cleanup)
         monkeypatch.setattr('orchestrator.merge_lane.worker._emit_merge_attempt', fake_emit)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         # Exactly 2 calls — no 3rd retry
         assert call_count == 2, f'Expected 2 calls, got {call_count}'
@@ -12662,7 +12697,7 @@ class TestSpeculationRaceRetry:
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert call_count == 2, f'Expected 2 calls, got {call_count}'
         assert isinstance(item, RealMergeItem), (
@@ -12695,7 +12730,7 @@ class TestSpeculationRaceRetry:
         """task-1724: _remerge always returns skip_verify=False (unconditionally fail-closed).
 
         The force_verify/prev_skip_verify/prev_merge_tree parameters were removed.
-        _remerge(req, None) with pre_rebased=True and main unchanged yields
+        remerge_on_main(worker, req) with pre_rebased=True and main unchanged yields
         skip_verify=False regardless of request state.
         """
         wt = await _make_branch_with_file(
@@ -12705,7 +12740,7 @@ class TestSpeculationRaceRetry:
         worker = SpeculativeMergeWorker(git_ops, queue)
         req = _make_request('fv-a', 'fv-a', wt, config, pre_rebased=True)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, RealMergeItem), (
             f'Expected flowing item; got {item!r}'
@@ -12751,7 +12786,7 @@ class TestRemergeAlwaysVerifies:
         req = _make_request('tp-a', 'tp-a', wt, config, pre_rebased=True)
 
         # task-1724: simplified call — no probe needed, no kwargs.
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, RealMergeItem), (
             f'Expected flowing item; got {item!r}'
@@ -12778,7 +12813,7 @@ class TestRemergeAlwaysVerifies:
     ) -> None:
         """(b) Minimal call → always fail-closed → skip_verify=False.
 
-        _remerge(req, None) is the canonical production call shape after task-1724.
+        remerge_on_main(worker, req) is the no-tip production call shape after task-1724.
         The prev_skip_verify/prev_merge_tree parameters were removed; skip_verify
         is structurally always False on the return value.
         """
@@ -12787,7 +12822,7 @@ class TestRemergeAlwaysVerifies:
         worker = SpeculativeMergeWorker(git_ops, queue)
         req = _make_request('tp-c', 'tp-c', wt, config, pre_rebased=True)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         _wt = item_merge_wt(item)
         if _wt:
             await git_ops.cleanup_merge_worktree(_wt)
@@ -15169,225 +15204,6 @@ class TestFinalizeAdvancedMerge:
             f'got merge_sha={outcome.merge_sha!r}, expected {ADVANCED!r}'
         )
 
-    # ------- Task-1928 FAIL-SAFE: _finalize_advanced_merge wiring tests -------
-
-    async def test_failsafe_skips_gate_when_no_tip_and_linear_commit(self) -> None:
-        """FAIL-SAFE positive: when all three tip terms are None AND advanced_sha
-        is positively linear (_commit_is_linear=True), _check_post_merge_equivalence
-        must be invoked with allow_worktree_head_fallback=False — skipping the
-        live worktree-HEAD read.  Outcome must be 'done'.
-
-        The rebased tree was already re-verified green by _reverify_rebased_tree
-        on this path, so reading a potentially drifted worktree HEAD is redundant
-        and hazardous.  The fail-safe eliminates that risk without suppressing the
-        gate when a trusted tip IS recoverable (see negative guard below).
-
-        RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
-        """
-        from orchestrator.merge_lane.worker import (
-            _finalize_advanced_merge,
-        )
-
-        LINEAR_SHA = 'aabbccdd1234567890' * 2  # fake but deterministic
-        git_ops = self._make_git_ops()
-        req = self._make_req()
-        req.snapshot_tip = None  # ensure term-3 = None
-        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
-        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
-
-        captured_equiv_kw: dict = {}
-
-        async def _spy_equiv(*args, **kwargs):
-            captured_equiv_kw.update(kwargs)
-            return []  # clean — gate would pass if invoked
-
-        with (
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),  # term-1 = None
-            ),
-            # Patch _commit_is_linear → True: advanced_sha is positively linear.
-            # RED: AttributeError because _commit_is_linear does not exist yet.
-            patch(
-                'orchestrator.merge_lane.gates._commit_is_linear',
-                AsyncMock(return_value=True),
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
-                side_effect=_spy_equiv,
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_pyright',
-                AsyncMock(return_value=pyright_clean),
-            ),
-        ):
-            outcome = await _finalize_advanced_merge(
-                git_ops, req, None,
-                merge_commit_fallback='fallback-sha',
-                base_sha='base-sha',
-                started_monotonic=0.0,
-                cas_retries=cas_retries,
-                timeouts=timeouts,
-                enospc_retries=enospc_retries,
-                merged_branch_tip=None,  # term-2 = None; all three terms collapse
-                advanced_sha=LINEAR_SHA,
-            )
-
-        assert outcome.status == 'done', (
-            f'expected done (fail-safe should skip gate → clean); got {outcome!r}'
-        )
-        assert outcome.merge_sha == LINEAR_SHA
-        # Key assertion: gate must have been invoked with allow_worktree_head_fallback=False
-        # so it skipped the live HEAD read.
-        # RED: without step-6 wiring, allow_worktree_head_fallback is not passed
-        # → captured_kw has no such key → .get() returns None (≠ False).
-        assert captured_equiv_kw.get('allow_worktree_head_fallback') is False, (
-            f'_check_post_merge_equivalence must be called with '
-            f'allow_worktree_head_fallback=False when all tip terms are None '
-            f'and advanced_sha is linear; '
-            f'got {captured_equiv_kw.get("allow_worktree_head_fallback")!r}'
-        )
-
-    async def test_failsafe_not_taken_when_second_parent_recoverable(self) -> None:
-        """FAIL-SAFE negative guard (B): when _resolve_second_parent returns a
-        real tip (term-1 non-None), resolved_merged_tip is non-None → fail-safe
-        MUST NOT fire.  A genuine file drop is still detected and blocks.
-
-        The gate is invoked with merged_tip=RECOVERABLE_TIP and the default
-        allow_worktree_head_fallback=True (i.e. NOT suppressed).
-
-        This test passes in both RED and GREEN states: it validates that the
-        fail-safe never weakens the gate when the 2nd parent IS structurally
-        recoverable.  It does NOT reference _commit_is_linear (which would
-        fail with AttributeError in RED state).
-        """
-        from orchestrator.merge_lane.worker import (
-            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            _finalize_advanced_merge,
-        )
-
-        RECOVERABLE_TIP = 'dead' * 10  # fake recoverable branch tip
-        git_ops = self._make_git_ops()
-        req = self._make_req()
-        req.snapshot_tip = None
-        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
-
-        captured_equiv_kw: dict = {}
-
-        async def _spy_equiv_drop(*args, **kwargs):
-            captured_equiv_kw.update(kwargs)
-            return ['dropped.py']  # genuine drop detected
-
-        with (
-            # _resolve_second_parent returns the real branch tip → term-1 non-None
-            # → resolved_merged_tip = RECOVERABLE_TIP → fail-safe never fires.
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=RECOVERABLE_TIP),
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
-                side_effect=_spy_equiv_drop,
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_pyright',
-                AsyncMock(),
-            ),
-        ):
-            outcome = await _finalize_advanced_merge(
-                git_ops, req, None,
-                merge_commit_fallback='fallback-sha',
-                base_sha='base-sha',
-                started_monotonic=0.0,
-                cas_retries=cas_retries,
-                timeouts=timeouts,
-                enospc_retries=enospc_retries,
-                merged_branch_tip=None,  # term-2 = None; term-1 provides the tip
-            )
-
-        # Genuine drop → outcome must be 'blocked' (fail-safe did NOT skip the gate).
-        assert outcome.status == 'blocked', (
-            f'expected blocked (genuine drop, fail-safe must not skip); got {outcome!r}'
-        )
-        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
-        # Gate was called with the real recovered tip, not suppressed.
-        assert captured_equiv_kw.get('merged_tip') == RECOVERABLE_TIP, (
-            f'gate must use RECOVERABLE_TIP; got {captured_equiv_kw.get("merged_tip")!r}'
-        )
-        # allow_worktree_head_fallback must be True (the default) — fail-safe NOT active.
-        fb = captured_equiv_kw.get('allow_worktree_head_fallback', True)
-        assert fb is not False, (
-            f'allow_worktree_head_fallback must be truthy when tip is recoverable; '
-            f'got {fb!r}'
-        )
-
-    async def test_failsafe_not_taken_when_nonlinear_commit(self) -> None:
-        """FAIL-SAFE micro-guard: when resolved_merged_tip is None BUT advanced_sha
-        is NON-linear (_commit_is_linear=False, e.g. transient ^2 git error on a
-        real --no-ff merge), the fail-safe must NOT fire.
-
-        The gate is called with allow_worktree_head_fallback=True (legacy HEAD
-        read retained) so a real drop on a non-rebased merge is not masked.
-
-        RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
-        """
-        from orchestrator.merge_lane.worker import (
-            _finalize_advanced_merge,
-        )
-
-        git_ops = self._make_git_ops()
-        req = self._make_req()
-        req.snapshot_tip = None  # term-3 = None
-        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
-        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
-
-        captured_equiv_kw: dict = {}
-
-        async def _spy_equiv_clean(*args, **kwargs):
-            captured_equiv_kw.update(kwargs)
-            return []
-
-        with (
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),  # term-1 = None (transient error)
-            ),
-            # _commit_is_linear=False: advanced_sha has 2+ parents (real merge commit,
-            # or linearity check failed due to transient git error).
-            # RED: AttributeError because _commit_is_linear does not exist yet.
-            patch(
-                'orchestrator.merge_lane.gates._commit_is_linear',
-                AsyncMock(return_value=False),
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
-                side_effect=_spy_equiv_clean,
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_pyright',
-                AsyncMock(return_value=pyright_clean),
-            ),
-        ):
-            outcome = await _finalize_advanced_merge(
-                git_ops, req, None,
-                merge_commit_fallback='fallback-sha',
-                base_sha='base-sha',
-                started_monotonic=0.0,
-                cas_retries=cas_retries,
-                timeouts=timeouts,
-                enospc_retries=enospc_retries,
-                merged_branch_tip=None,  # all terms None; non-linear → fail-safe inert
-            )
-
-        assert outcome.status == 'done', f'unexpected: {outcome!r}'
-        # Gate must use the LEGACY HEAD path (allow_worktree_head_fallback=True)
-        # because linearity was NOT confirmed — fail-safe must stay inert.
-        fb = captured_equiv_kw.get('allow_worktree_head_fallback', True)
-        assert fb is not False, (
-            f'allow_worktree_head_fallback must be truthy for non-linear advanced_sha; '
-            f'got {fb!r}'
-        )
-
 
 # ---------------------------------------------------------------------------
 # TestMapAdvanceFailure — unit tests for the _map_advance_failure helper
@@ -16571,7 +16387,7 @@ class TestReverifyRebasedTree:
 class TestSpeculativeMergeWorkerGate:
     """End-to-end integration tests for the disjoint-delta re-verify gate.
 
-    Each test builds a SpeculativeItem via worker._remerge(req, None),
+    Each test builds a SpeculativeItem via remerge_on_main(worker, req),
     simulates intervening main movement by committing directly in
     project_root, then drives drive_verify_and_advance(worker, item) and asserts
     the expected outcome and run_scoped_verification call count.
@@ -16640,7 +16456,7 @@ class TestSpeculativeMergeWorkerGate:
         _, req = await self._setup_overlap_branch(git_ops, branch, config)
 
         # _remerge: merge branch into current main
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -16708,7 +16524,7 @@ class TestSpeculativeMergeWorkerGate:
 
         _, req = await self._setup_overlap_branch(git_ops, branch, config)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -16778,7 +16594,7 @@ class TestSpeculativeMergeWorkerGate:
         scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
         req = _make_request(branch, branch, branch_wt, scoped)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # Move main: add a DISJOINT file (no shared files touched)
@@ -16840,7 +16656,7 @@ class TestSpeculativeMergeWorkerGate:
         scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
         req = _make_request(branch, branch, branch_wt, scoped)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # Drift from a writer that is NOT the merge queue — never registered
@@ -16885,7 +16701,7 @@ class TestSpeculativeMergeWorkerGate:
         )
         req = _make_request(branch, branch, branch_wt, config)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # main does NOT move
@@ -21565,6 +21381,10 @@ class TestSpeculationSlotSemaphoreDepth:
         Fails RED because _speculation_slot is still an Event (depth-1); with the Event
         the merger only builds N+1 speculatively (peak ≤ 2), so ≥ 3 assertion fails.
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'k2d-n', 'k2d_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'k2d-n1', 'k2d_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'k2d-n2', 'k2d_n2.py', 'n2 = 3\n')

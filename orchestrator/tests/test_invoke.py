@@ -21,6 +21,7 @@ from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 from shared.invocation_outcome import CapHit
 from shared.process_cost import ProcessCostBasis
 from shared.testing_fake_claude import install_fake_claude_cli
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
@@ -251,7 +252,7 @@ class TestCapHitResume:
         assert not any(isinstance(arg, CapHit) for arg in reported)
 
     async def test_resume_failure_falls_back_to_fresh(self):
-        """Resume returns success=False → retry with original prompt."""
+        """The CLI rejects the resume (measured payload) → retry with original prompt."""
         gate = _make_gate_yielding([
             _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
             _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
@@ -259,9 +260,7 @@ class TestCapHitResume:
         ])
 
         capped_result = _make_result(success=False, session_id='sess-abc')
-        failed_resume = _make_result(success=False)
-        failed_resume.duration_ms = 6000
-        failed_resume.turns = 2
+        failed_resume = measured_resume_rejection('sess-abc')
         ok_result = _make_result(success=True, cost_usd=0.5)
         ok_result.duration_ms = 6000
         ok_result.turns = 2

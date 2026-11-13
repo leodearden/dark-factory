@@ -33,6 +33,9 @@ from shared.delivered_check_polarity import (
     evaluate_grep_at_tree,
     evaluate_path_at_tree,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Task 6036: re-anchored on both sides.
 _REANCHORED = [

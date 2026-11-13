@@ -20,7 +20,11 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
 from _ast_guard import imported_names_from, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 MIDDLEWARE = SRC_ROOT / 'middleware'
@@ -39,8 +43,11 @@ FORMER_SCC_MEMBERS = (
 )
 
 ALLOWED_FIRST_PARTY = frozenset({
+    'shared.declared_scope',
+    'shared.followup_items',
     'shared.task_statuses',
     'fused_memory.middleware.curation_deferral',
+    'fused_memory.middleware.followup_hold',
     'fused_memory.utils.clip_disclosure',
 })
 

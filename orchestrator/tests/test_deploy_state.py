@@ -16,11 +16,13 @@ import json
 import pytest
 import shared.task_metadata as task_metadata_module
 from shared.deploy_state import DeployPhase, DeployState, VerifyBaseline
-from shared.task_metadata import parse_metadata
+from shared.task_metadata import DoneProvenance, parse_metadata
 
 from orchestrator.deploy_state import (
     _LEGAL,
+    SCHEDULED_DEPLOY_PROVENANCE_KIND,
     IllegalDeployTransition,
+    awaits_scheduled_restart,
     enforce_transition,
     is_legal_transition,
 )
@@ -180,6 +182,12 @@ class TestLegalTransitionTable:
         assert is_legal_transition(DeployPhase.VERIFIED, DeployPhase.SCHEDULED) is False
         assert is_legal_transition(DeployPhase.RAN, DeployPhase.RAN) is False
 
+    def test_settler_edges_from_scheduled_are_legal(self) -> None:
+        """The scheduled-deploy settler observes the restart land (verified)
+        or the transient fail at fire time (failed)."""
+        assert is_legal_transition(DeployPhase.SCHEDULED, DeployPhase.VERIFIED) is True
+        assert is_legal_transition(DeployPhase.SCHEDULED, DeployPhase.FAILED) is True
+
     def test_legal_table_shape_and_default_false_fallback(self) -> None:
         assert isinstance(_LEGAL, dict)
         for (old, new), legal in _LEGAL.items():
@@ -189,6 +197,56 @@ class TestLegalTransitionTable:
         # A pair absent from the table falls back to False rather than KeyError.
         assert (DeployPhase.SCHEDULED, DeployPhase.DONE) not in _LEGAL
         assert is_legal_transition(DeployPhase.SCHEDULED, DeployPhase.DONE) is False
+
+
+def _scheduled(phase: object = 'scheduled', **overrides: object) -> dict:
+    metadata: dict = {
+        'done_provenance': {
+            'kind': 'deterministic-deploy-scheduled',
+            'unit': 'orchestrator-dark-factory.service',
+            'transient_unit': 'orch-redeploy-restart-7238.service',
+            'fire_delay_secs': 60,
+        },
+        'deploy_state': {'phase': phase},
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def _without(metadata: dict, key: str) -> dict:
+    return {k: v for k, v in metadata.items() if k != key}
+
+
+class TestAwaitsScheduledRestart:
+    """A done scheduled self-deploy holds its dependents until the restart lands."""
+
+    @pytest.mark.parametrize(
+        ('metadata', 'held'),
+        [
+            pytest.param(_scheduled('scheduled'), True, id='scheduled-holds'),
+            pytest.param(_scheduled('failed'), True, id='failed-holds'),
+            pytest.param(_scheduled('escalated'), True, id='escalated-holds'),
+            pytest.param(_scheduled('verified'), False, id='verified-releases'),
+            pytest.param(_scheduled('done'), False, id='done-releases'),
+            pytest.param(
+                _scheduled('scheduled', done_provenance={'kind': 'deterministic-deploy'}),
+                False,
+                id='non-scheduled-provenance',
+            ),
+            pytest.param(_without(_scheduled(), 'done_provenance'), False, id='no-provenance'),
+            pytest.param(_without(_scheduled(), 'deploy_state'), False, id='pre-ds1-legacy'),
+            pytest.param(_scheduled(deploy_state='scheduled'), True, id='non-dict-slice-holds'),
+            pytest.param(_scheduled('bogus'), True, id='invalid-phase-holds'),
+            pytest.param(None, False, id='none-metadata'),
+            pytest.param([], False, id='list-metadata'),
+        ],
+    )
+    def test_hold_table(self, metadata: object, held: bool) -> None:
+        assert awaits_scheduled_restart(metadata) is held
+
+    def test_scheduled_provenance_kind_is_in_the_shared_vocabulary(self) -> None:
+        provenance = DoneProvenance(kind=SCHEDULED_DEPLOY_PROVENANCE_KIND)
+        assert provenance.kind == SCHEDULED_DEPLOY_PROVENANCE_KIND
 
 
 class TestEnforceTransition:

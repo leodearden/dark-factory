@@ -7,19 +7,29 @@ judgement reaches the page only through ``prepare_sitting.py record``, which
 writes ``data/sitting/``. The render that follows re-measures every figure
 itself, so a failed night costs thinner recommendations, never a wrong page.
 
-Recommend-only regardless of flags. The CLI runs under ``--permission-mode
-dontAsk`` with ``nightly_allowed_tools`` as the only tools it may use and
-``NIGHTLY_DENIED_TOOLS`` naming every apply verb. It reads no settings file
-(``setting_sources=[]``), so no ambient allow rule widens that list. Its one
-write channel is a fresh per-run inbox, ``data/sitting/inbox/<UTC stamp>/``:
-it Writes JSON batches there and runs ``prepare_sitting.py record --from
-<file>``. The child env also carries ``NIGHTLY_CONFINEMENT_ENV``, set to the
-run's inbox, under which ``prepare_sitting.py`` itself refuses any other subcommand, ``record`` from
-stdin or from outside that inbox, a non-default ``--preparation``, ``--ledger``
-and ``--apply-closes``. Two mechanisms confine the run: the CLI allow rule with no settings files
-limits its file writes to its inbox, and ``prepare_sitting.py`` limits in code what ``record`` reads
-(a ``.json`` file directly in the run's inbox, named by ``NIGHTLY_CONFINEMENT_ENV``) and where it writes
-(the default store).
+Recommend-only regardless of flags. Three layers confine the run:
+
+- Landlock is the write boundary. The CLI runs under
+  ``orchestrator/src/orchestrator/agents/sandbox_dispatch.py::wrap_command``
+  pinned to Landlock, so the whole tree is read-only except ``data/sitting/``
+  (the inbox, the store and the run's ``CLAUDE_CONFIG_DIR``), ``~/.cache/uv``,
+  ``/tmp`` and ``<root>/.task/``, which Landlock always grants in its cwd (the
+  run's cwd is the root, since ``PREPARE_COMMAND`` is repo-relative). Without
+  Landlock the run is refused, never launched unconfined; bwrap is not a
+  fallback, since its mount order leaves the host ``/tmp`` read-only.
+- The CLI rules are the first gate. It runs under ``--permission-mode dontAsk``
+  with ``nightly_allowed_tools`` as the only tools it may use, reading no
+  settings file (``setting_sources=[]``), and ``NIGHTLY_DENIED_TOOLS`` naming
+  every apply verb. They are not a write boundary: the CLI matches rules
+  against raw command text, so a shell-quoted ``--output`` passes the git
+  denies (``shared/src/shared/git_read_rules.py``). Through its own tools the
+  run Writes JSON batches to a fresh per-run inbox,
+  ``data/sitting/inbox/<UTC stamp>/``, and runs ``prepare_sitting.py record
+  --from <file>``.
+- ``prepare_sitting.py`` confines itself in code. The child env carries
+  ``NIGHTLY_CONFINEMENT_ENV``, set to the run's inbox, under which it refuses
+  any other subcommand, ``record`` from stdin or from outside that inbox, a
+  non-default ``--preparation``, ``--ledger`` and ``--apply-closes``.
 
 The outcome is measured from structured data, not from the agent's say-so:
 ``recorded`` counts the item keys whose store entry equals a preparation the
@@ -30,29 +40,39 @@ checkout's ``.mcp.json`` and passed with ``--strict-mcp-config``. The
 allowlisted reads therefore never depend on the ambient project config being
 approved for a headless run, and no other server starts.
 
-The account comes from the shared pool (``account_pool.build_pool``): one
-lease, read and handed straight back before the run, because nothing in the
-child can settle a slot. The known cost is that this run's spend is invisible
-to the gate. With no lease the child inherits this process's environment as
-``shared.secret_env.agent_subprocess_env`` leaves it, and a lease replaces
-``CLAUDE_CODE_OAUTH_TOKEN`` on top of that. Either way the child holds no API
-key or other secret, no endpoint selection and no Python-environment selection
-(OPERATIONS.md §12, "Legibility trickle accounts (03:00)").
+The account comes from the fleet pool (``account_pool.build_pool``), and the
+run goes through the shared session runner,
+``shared.cli_invoke.invoke_with_cap_retry``, in roster order like every other
+session:
+
+- A seat at its usage limit, or one whose credentials are rejected (401/403),
+  hands the run to the next seat; a capped session that had made progress
+  resumes there.
+- It never parks: ``max_cap_retries`` is one pass over the pool, and a pool
+  with no admissible seat ends the run at once.
+- ``--timeout-secs`` bounds the whole run, failovers and the cooldowns
+  between them included.
+- The leased token lives in the run's config dir and is removed on every exit
+  that reaches ``run``'s ``finally`` (a SIGKILL leaves it).
+- An empty pool skips the night (exit 1): the host login is never a fallback.
+
+The runner builds the child's env as ``shared.secret_env.agent_subprocess_env``
+of this process's, with the seat's ``CLAUDE_CODE_OAUTH_TOKEN`` on top, so it
+holds no API key or other secret, no endpoint selection and no
+Python-environment selection (OPERATIONS.md §12, "Legibility trickle accounts
+(03:00)").
 
 Exit codes: 0 the run completed and recorded something; 1 it failed, timed out,
-hit a usage limit or recorded nothing; 2 a configuration error. ``main`` never raises,
-though the wrapper renders the page whatever this returns.
+found no seat that could take it or recorded nothing; 2 a configuration error.
+``main`` never raises, though the wrapper renders the page whatever this returns.
 """
 from __future__ import annotations
 
 import argparse
-import contextlib
+import asyncio
 import json
 import logging
-import os
 import shutil
-import signal
-import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -70,9 +90,22 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
     sys.path.append(str(_REPO_ROOT / 'scripts' / 'legibility'))
 
 from legibility import account_pool  # noqa: E402
-from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
-from shared.cli_invoke import build_claude_argv, claude_binary_spec  # noqa: E402  # debt: task 6760
-from shared.secret_env import agent_subprocess_env  # noqa: E402  # debt: task 6760
+from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6760
+    Backend,
+    SandboxUnavailable,
+    resolve_backend_or_refuse,
+    set_backend,
+    wrap_command,
+)
+from shared.cli_invoke import (  # noqa: E402  # debt: task 6760
+    AgentResult,
+    AllAccountsCappedException,
+    claude_binary_spec,
+    invoke_with_cap_retry,
+)
+from shared.config_dir import TaskConfigDir  # noqa: E402  # debt: task 6760
+from shared.git_read_rules import git_read_rules  # noqa: E402  # debt: task 6760
+from shared.usage_gate import PoolFrozen, UsageGate  # noqa: E402  # debt: task 6760
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
@@ -82,7 +115,7 @@ DEFAULT_BUDGET_USD = 10.0
 DEFAULT_TIMEOUT_SECS = 2700.0
 DEFAULT_MAX_TURNS = 200
 PERMISSION_MODE = 'dontAsk'
-STREAM_TAIL_CHARS = 2000
+TAIL_CHARS = 2000
 
 DEFAULT_MCP_JSON = _REPO_ROOT / '.mcp.json'
 NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
@@ -90,12 +123,13 @@ NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
 PREPARE_COMMAND = 'uv run --frozen --project shared python scripts/sitting/prepare_sitting.py'
 """The one shell spelling the run may execute; repo-relative, so the child runs in the run's root."""
 
+_GIT_READS = git_read_rules('show', 'log')
+
 NIGHTLY_READ_TOOLS: tuple[str, ...] = (
     'Read',
     'Grep',
     'Glob',
-    'Bash(git show:*)',
-    'Bash(git log:*)',
+    *_GIT_READS.allow,
     f'Bash({PREPARE_COMMAND} brief --json:*)',
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_pending_escalations',
@@ -110,6 +144,8 @@ NIGHTLY_READ_TOOLS: tuple[str, ...] = (
 
 TIMESTAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 
+SITTING_DATA_PATH = preparation.DEFAULT_PREPARATION_PATH.parent
+
 
 def nightly_allowed_tools(inbox: Path) -> tuple[str, ...]:
     """The reads, plus the one write the run has: files in *inbox* (``//`` marks an absolute path; the Write tool is gated by an ``Edit`` rule) and ``record --from``.
@@ -122,6 +158,7 @@ def nightly_allowed_tools(inbox: Path) -> tuple[str, ...]:
 
 NIGHTLY_DENIED_TOOLS: tuple[str, ...] = (
     'NotebookEdit',
+    *_GIT_READS.deny,
     'mcp__escalation__resolve_issue',
     'mcp__escalation__stamp_triage',
     'mcp__escalation__promote_to_l2',
@@ -171,6 +208,7 @@ class Settings:
     max_turns: int
     mcp_json: Path
     root: Path
+    sandbox_backend: Backend = 'landlock'
 
 
 class McpConfigUnusable(Exception):
@@ -187,16 +225,27 @@ class Outcome:
 
 
 @dataclass(frozen=True)
-class Completed:
-    """What the CLI left behind; ``returncode`` is None when the timeout killed it."""
+class TimedOut:
+    """The run's own wall clock ran out; it covers every seat the run failed over to."""
 
-    returncode: int | None
-    stdout: str
-    stderr: str
+    after_secs: float
+
+
+@dataclass(frozen=True)
+class PoolExhausted:
+    """No seat could take the run: every one capped or rejecting its credentials, as the gate held them at the end."""
+
+    capped: tuple[str, ...]
+    auth_failed: tuple[str, ...]
+    earliest_reset: datetime | None
+
+
+Ending = AgentResult | TimedOut | PoolExhausted
+"""How a run ended: the CLI's own result, or the bound or the pool ending it first."""
 
 
 def run(settings: Settings, *, gate: Any = None) -> int:
-    """Lease an account, run the CLI once with the prompt on stdin, and judge how it ended."""
+    """Run the CLI on the fleet pool under the OS sandbox with the prompt on stdin, and judge how it ended."""
     claude = shutil.which(settings.claude_bin)
     if claude is None:
         _log(f'claude binary not found or not executable: {settings.claude_bin!r}')
@@ -206,42 +255,102 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     except McpConfigUnusable as exc:
         _log(f'no usable MCP config: {exc}')
         return EXIT_CONFIG
+    set_backend(settings.sandbox_backend)
+    try:
+        resolve_backend_or_refuse()
+    except SandboxUnavailable as exc:
+        _log(f'refusing to run unconfined: {exc}')
+        return EXIT_CONFIG
+    if gate is None:
+        gate = account_pool.build_pool()
+    if not gate.account_count:
+        _log('no pool account resolved; skipping: the nightly never uses the host login')
+        return EXIT_FAILED
     root = settings.root.resolve()
     inbox = _new_inbox(root)
-    env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox)
-    argv, temp_files = build_claude_argv(
-        model=settings.model,
-        max_budget_usd=settings.budget_usd,
-        system_prompt=NIGHTLY_SYSTEM_PROMPT,
-        max_turns=settings.max_turns,
-        permission_mode=PERMISSION_MODE,
-        allowed_tools=list(nightly_allowed_tools(inbox)),
-        disallowed_tools=list(NIGHTLY_DENIED_TOOLS),
-        mcp_config=mcp_config,
-        output_schema=None,
-        effort=None,
-        resume_session_id=None,
-        session_id=None,
-        strict_mcp_config=True,
-        setting_sources=[],
-    )
-    argv[0] = claude
+    sitting_data = root / SITTING_DATA_PATH
+    config_dir = TaskConfigDir(f'nightly-prepare-{inbox.name}', base_dir=sitting_data / 'config')
+    try:
+        return _run_confined(
+            claude=claude, settings=settings, mcp_config=mcp_config, gate=gate, config_dir=config_dir,
+            root=root, inbox=inbox, grants=(sitting_data, _ensure_uv_cache()),
+        )
+    finally:
+        config_dir.remove_credentials()
+
+
+def _ensure_uv_cache() -> Path:
+    """``~/.cache/uv``, created if absent: Landlock can grant only a directory that exists."""
+    uv_cache = Path.home() / '.cache' / 'uv'
+    uv_cache.mkdir(parents=True, exist_ok=True)
+    return uv_cache
+
+
+def _run_confined(*, claude: str, settings: Settings, mcp_config: dict[str, Any], gate: UsageGate,
+                  config_dir: TaskConfigDir, root: Path, inbox: Path, grants: Sequence[Path]) -> int:
     store_path = root / preparation.DEFAULT_PREPARATION_PATH
     held_before = _load_or_empty(store_path)
     try:
-        completed = _run_bounded(argv, env, settings.timeout_secs, cwd=root, prompt=nightly_prompt(inbox, root))
+        ending = asyncio.run(_invoke_on_pool(
+            gate,
+            timeout_secs=settings.timeout_secs,
+            config_dir=config_dir,
+            prompt=nightly_prompt(inbox, root),
+            system_prompt=NIGHTLY_SYSTEM_PROMPT,
+            cwd=root,
+            model=settings.model,
+            max_turns=settings.max_turns,
+            max_budget_usd=settings.budget_usd,
+            permission_mode=PERMISSION_MODE,
+            allowed_tools=list(nightly_allowed_tools(inbox)),
+            disallowed_tools=list(NIGHTLY_DENIED_TOOLS),
+            mcp_config=mcp_config,
+            strict_mcp_config=True,
+            setting_sources=[],
+            env_overrides={preparation.NIGHTLY_CONFINEMENT_ENV: str(inbox)},
+            sandbox_wrap=_spawn_command(claude, root, grants),
+        ))
     except OSError as exc:
         _log(f'claude could not be started ({claude!r}): {exc}')
         return EXIT_CONFIG
+    return _judge(ending, settings, _measure(inbox, store_path, held_before))
+
+
+async def _invoke_on_pool(gate: UsageGate, *, timeout_secs: float, **invoke_kwargs: Any) -> Ending:
+    """One run through the shared runner, failing over across *gate*'s seats, under ONE wall clock.
+
+    The clock covers every attempt and every cap cooldown between them; its expiry kills the CLI's
+    process group. ``max_cap_retries`` is one pass over the pool, and a frozen pool raises rather
+    than parks. Every gate read happens here, and the gate is shut down on this loop, before it closes.
+    """
+    deadline = asyncio.timeout(timeout_secs)
+    try:
+        async with deadline:
+            return await invoke_with_cap_retry(
+                gate, 'nightly_prepare', max_cap_retries=gate.account_count, park_on_frozen_pool=False,
+                **invoke_kwargs,
+            )
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        return TimedOut(timeout_secs)
+    except (AllAccountsCappedException, PoolFrozen):
+        return PoolExhausted(gate.capped_account_names, gate.auth_failed_account_names, gate.soonest_resets_at)
     finally:
-        for path in temp_files:
-            Path(path).unlink(missing_ok=True)
-    return _judge(completed, settings, _measure(inbox, store_path, held_before))
+        await gate.shutdown()
 
 
-def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT) -> int:
+def _spawn_command(claude: str, root: Path, grants: Sequence[Path]) -> Callable[[list[str]], list[str]]:
+    """The command actually spawned for a built argv: *claude* as the binary, confined under the pinned backend."""
+    writable = [str(grant) for grant in grants]
+    return lambda argv: wrap_command([claude, *argv[1:]], root, [], writable_extras=writable)
+
+
+def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT,
+         sandbox_backend: Backend = 'landlock') -> int:
     args = _parser().parse_args(argv)
-    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json, root)
+    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json,
+                        root, sandbox_backend)
     try:
         return run(settings, gate=gate)
     except Exception as exc:
@@ -267,36 +376,6 @@ def _mcp_config(path: Path) -> dict[str, Any]:
     if missing:
         raise McpConfigUnusable(f'{path}: no mcpServers block for {", ".join(missing)}')
     return {'mcpServers': {name: servers[name] for name in NIGHTLY_MCP_SERVERS}}
-
-
-def _child_env(gate: Any, inbox: Path) -> dict[str, str]:
-    env = agent_subprocess_env(os.environ)
-    env[preparation.NIGHTLY_CONFINEMENT_ENV] = str(inbox)
-    lease = gate.try_lease(reverse=True)
-    if lease is None:
-        _log('no pool account available; the run inherits this environment')
-        return env
-    try:
-        env['CLAUDE_CODE_OAUTH_TOKEN'] = lease.token
-        return env
-    finally:
-        gate.release_probe_slot(lease.token)
-
-
-def _run_bounded(argv: list[str], env: dict[str, str], timeout_secs: float, *, cwd: Path, prompt: str) -> Completed:
-    """Kill the whole process group on timeout: the CLI's own children would otherwise hold the pipes open."""
-    proc = subprocess.Popen(
-        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, cwd=cwd, start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(prompt, timeout=timeout_secs)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        stdout, stderr = proc.communicate()
-        return Completed(None, stdout, stderr)
-    return Completed(proc.returncode, stdout, stderr)
 
 
 def _load_or_empty(store_path: Path) -> preparation.PreparationStore:
@@ -347,25 +426,24 @@ def _offered(inbox: Path) -> tuple[dict[str, list[preparation.Preparation]], int
     return offered, undecodable
 
 
-def _judge(completed: Completed, settings: Settings, outcome: Outcome) -> int:
-    run_label = f'model={settings.model!r}, recorded={outcome.recorded}'
-    if completed.returncode is None:
-        _log(f'claude timed out after {settings.timeout_secs:g}s ({run_label}): {_tails(completed)}')
+def _judge(ending: Ending, settings: Settings, outcome: Outcome) -> int:
+    account = f', account={ending.account_name!r}' if isinstance(ending, AgentResult) else ''
+    run_label = f'model={settings.model!r}{account}, recorded={outcome.recorded}'
+    if isinstance(ending, TimedOut):
+        _log(f'claude timed out after {ending.after_secs:g}s, failovers included ({run_label})')
         return EXIT_FAILED
-    if completed.returncode != 0:
-        _log(f'claude exited {completed.returncode} ({run_label}){_banner_clause(completed)}: {_tails(completed)}')
+    if isinstance(ending, PoolExhausted):
+        reset = ending.earliest_reset.isoformat() if ending.earliest_reset else 'unknown'
+        _log(f'no pool account could take the run: capped [{", ".join(ending.capped)}], '
+             f'auth-failed [{", ".join(ending.auth_failed)}]; earliest reset {reset} ({run_label})')
         return EXIT_FAILED
-    result = _parse_result(completed.stdout)
-    if result is None:
-        _log(f'claude exited 0 without a JSON result ({run_label}){_banner_clause(completed)}: {_tails(completed)}')
+    if not ending.success:
+        _log(f'claude failed (subtype={ending.subtype!r}, api_error_status={ending.api_error_status!r}, '
+             f'{run_label}): {_tails(ending)}')
         return EXIT_FAILED
-    if result.get('is_error'):
-        _log(f'claude reported an error result (subtype={result.get("subtype")!r}, {run_label}): {_tails(completed)}')
-        return EXIT_FAILED
-    summary = (f'model={settings.model!r}, turns={result.get("num_turns")}, cost_usd={result.get("total_cost_usd")}, '
-               f'recorded={outcome.recorded} of {outcome.offered_keys}, undecodable={outcome.undecodable}, '
-               f'permission_denials={len(result.get("permission_denials") or [])}')
-    verdict = f'{result.get("result", "")!s:.200}'
+    summary = (f'model={settings.model!r}{account}, turns={ending.turns}, cost_usd={ending.cost_usd}, '
+               f'recorded={outcome.recorded} of {outcome.offered_keys}, undecodable={outcome.undecodable}')
+    verdict = f'{ending.output:.200}'
     if outcome.recorded == 0:
         _log(f'recorded nothing; {outcome.offered_keys} item key(s) offered ({summary}): {verdict}')
         return EXIT_FAILED
@@ -373,23 +451,9 @@ def _judge(completed: Completed, settings: Settings, outcome: Outcome) -> int:
     return EXIT_OK
 
 
-def _parse_result(stdout: str) -> dict[str, Any] | None:
-    """The CLI's ``--output-format json`` result object; a reply that parses is a verdict, never a banner."""
-    try:
-        result = json.loads(stdout)
-    except ValueError:
-        return None
-    return result if isinstance(result, dict) else None
-
-
-def _banner_clause(completed: Completed) -> str:
-    marker = looks_like_blocking_banner(f'{completed.stdout}\n{completed.stderr}')
-    return f', usage-limit banner {marker!r}' if marker else ''
-
-
-def _tails(completed: Completed) -> str:
-    return (f'stdout={completed.stdout[-STREAM_TAIL_CHARS:]!r} '
-            f'stderr={completed.stderr[-STREAM_TAIL_CHARS:]!r}')
+def _tails(result: AgentResult) -> str:
+    return (f'result={result.output[-TAIL_CHARS:]!r} '
+            f'stderr={result.stderr[-TAIL_CHARS:]!r}')
 
 
 def _log(message: str) -> None:

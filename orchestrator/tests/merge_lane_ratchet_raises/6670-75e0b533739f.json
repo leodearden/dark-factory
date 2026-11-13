@@ -1,0 +1,18 @@
+{
+  "task_id": "6670",
+  "reason": "net-additive host-health wiring (task 6670): readmit_host calls the harness's on_host_readmitted hook through _notify_host_readmitted, whose None check and try/except keep a task-pool fault from undoing or blocking a merge-lane readmission",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1932,
+      "current": 1934
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5035,
+      "current": 5037
+    }
+  ]
+}

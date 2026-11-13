@@ -1,7 +1,9 @@
 """Autonomous dry-run unblock — fire-and-forget investigation at block time.
 
 Invoked by workflow._mark_blocked when a task transitions to blocked.
-Runs the unblock-auto skill read-only, then persists a proposal entry to
+Runs the unblock-auto skill (with config.sandbox.enabled and a claude backend,
+under the OS sandbox: writable only <worktree>/.task, plan.json included, and
+/tmp), then persists a proposal entry to
 metadata.dry_run_proposals[] via scheduler.update_task(metadata_mode='additive')
 (list-union — preserves prior entries) and trims the list to keep_last entries
 via a separate update_task(default merge — overwrites dry_run_proposals wholesale
@@ -31,10 +33,18 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.git_async import GitResult, run_git
+from shared.git_read_rules import git_read_rules
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
+from orchestrator.agents.sandbox_dispatch import (
+    SandboxUnavailable,
+    get_backend,
+    resolve_active_backend,
+    resolve_backend_or_refuse,
+)
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventType
 from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
@@ -105,11 +115,9 @@ _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
 
 # Outer wall-clock sanity bound for invoke_with_cap_retry's cap patience,
 # covering both its cap-retry loop and the gate's park on a pool frozen at
-# spawn (shared/src/shared/cli_invoke.py cap-wait policy table). This is a
-# fire-and-forget, best-effort block-time investigation — it must NOT inherit
-# the 14-day default, which would leave a background task pending for weeks
-# under a sustained cap storm. Mirrors the 1800s reconciliation-stage
-# precedent (short-lived stage runners, same table).
+# spawn. This is a fire-and-forget, best-effort block-time investigation — it
+# must NOT inherit the 14-day default, which would leave a background task
+# pending for weeks under a sustained cap storm.
 _DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 
@@ -258,25 +266,23 @@ def _task_context(task: dict[str, Any] | None) -> _TaskContext:
     return _TaskContext('\n'.join(lines), False)
 
 
-# The investigation's enforced envelope: it runs under --permission-mode
-# dontAsk, so the CLI denies, without a prompt, any tool call no allow rule
-# admits. Every entry is therefore a grant, and each must be read-only.
-# Bash(pytest:*) and Bash(cargo:*) are omitted: both write build artefacts or
-# fetch from the network. Git is granted per read-only subcommand, never as a
-# wildcard and never `git branch`, which creates and deletes refs. A prefix
-# rule admits any flag after its subcommand, so the one file-writing flag of
-# diff, log and show, --output, is denied below wherever it appears. Residual:
-# `git status` may refresh the index's stat cache, which changes no content.
+# The investigation's CLI envelope: it runs under --permission-mode dontAsk,
+# so the CLI denies, without a prompt, any tool call no allow rule admits.
+# Every entry is therefore a grant of a read. Bash(pytest:*) and Bash(cargo:*)
+# are omitted: both write build artefacts or fetch from the network. Git is
+# granted per read subcommand, never as a wildcard and never `git branch`,
+# which creates and deletes refs; the --output denies come from
+# shared/src/shared/git_read_rules.py and refuse only the plain spelling.
+# These rules are the first gate, not the write boundary: the boundary is the
+# OS sandbox of _investigation_sandbox_modules. Residual: `git status` may
+# refresh the index's stat cache, which changes no content.
+_GIT_READS = git_read_rules('log', 'diff', 'status', 'show', 'rev-parse', 'ls-files')
+
 _ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
     'Grep',
-    'Bash(git log:*)',
-    'Bash(git diff:*)',
-    'Bash(git status:*)',
-    'Bash(git show:*)',
-    'Bash(git rev-parse:*)',
-    'Bash(git ls-files:*)',
+    *_GIT_READS.allow,
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
@@ -296,9 +302,7 @@ _DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
-    'Bash(git diff *--output*)',
-    'Bash(git log *--output*)',
-    'Bash(git show *--output*)',
+    *_GIT_READS.deny,
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__delete_memory',
@@ -312,6 +316,29 @@ _DISALLOWED_TOOLS: list[str] = [
     # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
     'Skill',
 ]
+
+def _investigation_sandbox_modules(config: Any) -> list[str] | None:
+    """``[]`` confines a claude investigation to writing ``<worktree>/.task``, where its config dir lives; ``None`` leaves it unconfined.
+
+    Raises ``SandboxUnavailable`` when confinement is required and no OS
+    sandbox resolves, so the run is refused rather than launched unconfined.
+    """
+    # gemini and pi stay unconfined: their CLIs' config-dir write sets are not mapped.
+    if not (config.sandbox.enabled and config.unblock_auto.backend == 'claude'):
+        return None
+    backend = get_backend()
+    if backend == 'none':
+        resolve_backend_or_refuse()  # the operator's escape hatch: logs the workflow's WARN and never refuses
+        return None
+    # Non-consuming check: the outage escalation is TaskWorkflow._guard_sandbox's, so no dry run spends its escalate-once token.
+    if resolve_active_backend() == 'none':
+        raise SandboxUnavailable(
+            f'Sandboxing is required for the dry-run investigation but backend={backend!r} resolved to no '
+            f'available OS sandbox (landlock/bwrap); refusing to run it unconfined.',
+            should_escalate=False, backend_state=backend,
+        )
+    return []
+
 
 # ---------------------------------------------------------------------------
 # In-flight identity
@@ -516,6 +543,27 @@ def _load_skill_system_prompt() -> str:
     return load_skill_system_prompt('unblock-auto')
 
 
+def _reviews_directory(worktree: str, task_id: str, reviews_dir: Path | None) -> str:
+    """The prompt's ``**Reviews directory:**`` value.
+
+    The caller's *reviews_dir* when given, since the dispatching workflow owns
+    which root its reviewers write to; else the task root's, the root every
+    non-eval dispatch uses. A task id no task root can be named for degrades
+    this one line to ``(unavailable: <reason>)`` rather than failing the
+    investigation.
+    """
+    if reviews_dir is not None:
+        return str(reviews_dir)
+    try:
+        return str(TaskArtifacts.for_task(Path(worktree), task_id).artifact_path('reviews'))
+    except ValueError as exc:
+        logger.warning(
+            'dry_run_unblock: no reviews directory for task %s — investigating '
+            'without it: %s', task_id, exc,
+        )
+        return f'(unavailable: {exc})'
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -533,6 +581,7 @@ async def run_dry_run_unblock(
     usage_gate: Any = None,
     cost_store: Any = None,
     block_class: BlockClass | None = None,
+    reviews_dir: Path | None = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
@@ -544,6 +593,9 @@ async def run_dry_run_unblock(
     explicitly (e.g. workflow._spawn_dry_run_unblock classifies `reason`
     up front); when omitted (None), it is derived via
     ``classify_block_reason(reason)`` as a defensive fallback.
+
+    *reviews_dir* is where this dispatch's reviewers wrote their verdicts;
+    when omitted it is the task root's (see ``_reviews_directory``).
     """
     import time
 
@@ -627,6 +679,8 @@ async def run_dry_run_unblock(
             )
             return
 
+        sandbox_modules = _investigation_sandbox_modules(config)
+
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
         # the main task's `claude-config-{task_id}` dir so this background
         # investigation cannot collide with the blocked task's own session/
@@ -641,7 +695,8 @@ async def run_dry_run_unblock(
             f'Task ID: {task_id}\n'
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
-            f'Detail: {detail or "(none)"}\n\n'
+            f'Detail: {detail or "(none)"}\n'
+            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n\n'
             f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'
         )
@@ -698,6 +753,7 @@ async def run_dry_run_unblock(
                 max_turns=decision.max_turns,
                 max_budget_usd=decision.budget_usd,
                 permission_mode='dontAsk',
+                sandbox_modules=sandbox_modules,
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
                 mcp_config=mcp_config,

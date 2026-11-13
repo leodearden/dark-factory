@@ -33,6 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
@@ -47,6 +48,8 @@ from df_pytest_isolation import (  # noqa: E402
     git_ceiling_value,
     reject_unsafe_basetemp,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CEILING_KEY = 'GIT_CEILING_DIRECTORIES'
 

@@ -18,16 +18,13 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from _fm_helpers import load_script_module
 
-SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
+from fused_memory.eval import retrieval_probe
+from fused_memory.eval.topic_registry import load_topic_registry
+
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
 SNAPSHOT_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_registry_live_canonicals.json'
 CALIBRATION_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
-
-
-def _mod():
-    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_retrieval_probe')
 
 
 def _snapshot_records() -> list[dict]:
@@ -55,7 +52,7 @@ per_record = pytest.mark.parametrize(
 
 @pytest.fixture(scope='module')
 def registry():
-    return _mod().load_topic_registry(REGISTRY_PATH)
+    return load_topic_registry(REGISTRY_PATH)
 
 
 @pytest.fixture(scope='module')
@@ -81,18 +78,16 @@ def test_records_name_distinct_registry_topics_in_their_own_project(snapshot, re
 
 @per_record
 def test_the_probe_finds_the_live_canonical_by_content_hash(record, registry):
-    m = _mod()
-    entry = registry.by_topic[record['topic']]
-    outcome = m.canonical_hit([_Hit(record['id'], record['content'])], entry, 1)
-    assert outcome == m.MatchOutcome(hit=True, rank=1, matched_by=m.MATCHED_BY_CONTENT_HASH)
+    canonical = registry.by_topic[record['topic']].canonical
+    outcome = retrieval_probe.canonical_hit([_Hit(record['id'], record['content'])], canonical, 1)
+    assert outcome == retrieval_probe.MatchOutcome(hit=True, rank=1, matched_by=retrieval_probe.MATCHED_BY_CONTENT_HASH)
 
 
 @per_record
 def test_a_reworded_canonical_falls_back_to_its_live_id(record, registry):
-    m = _mod()
-    entry = registry.by_topic[record['topic']]
-    outcome = m.canonical_hit([_Hit(record['id'], 'reworded since the snapshot')], entry, 1)
-    assert outcome.matched_by == m.MATCHED_BY_LAST_KNOWN_ID
+    canonical = registry.by_topic[record['topic']].canonical
+    outcome = retrieval_probe.canonical_hit([_Hit(record['id'], 'reworded since the snapshot')], canonical, 1)
+    assert outcome.matched_by == retrieval_probe.MATCHED_BY_LAST_KNOWN_ID
 
 
 @per_record
@@ -113,7 +108,7 @@ def test_every_supersedes_pair_points_at_its_entrys_canonical(registry):
 
 
 def test_every_curator_gate_canonical_is_keyed_from_committed_content(snapshot, registry):
-    content_key = _mod().content_key
+    content_key = retrieval_probe.content_key
     calibration = _calibration_canonical_content_by_cluster()
     frozen = {record['topic']: record['content'] for record in snapshot}
     curator_gates = [e for e in registry.entries if e.derived_from == 'curator_gate']

@@ -6,7 +6,8 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 from _fm_held_writes import HeldWrites
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
+from _queued_write_fixtures import queued
 
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.memory_service import MemoryService
@@ -38,10 +39,7 @@ async def service(mock_config, tmp_path, held):
 
 async def _start_held_write(svc: MemoryService, held: HeldWrites) -> None:
     assert svc.durable_queue is not None
-    await svc.durable_queue.enqueue(
-        group_id='proj', operation='add_episode',
-        payload={'content': 'x', 'group_id': 'proj', 'name': HELD_WRITE},
-    )
+    await svc.durable_queue.enqueue(queued('add_episode', {'content': 'x', 'group_id': 'proj', 'name': HELD_WRITE}, group_id='proj'))
     await poll_until(
         lambda: HELD_WRITE in held.entered_at, message='the write never began executing',
     )

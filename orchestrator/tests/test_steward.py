@@ -16,9 +16,11 @@ from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AllAccountsCappedException
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.event_store import EventType
 from orchestrator.steward import (
     StewardMetrics,
     TaskSteward,
@@ -26,6 +28,7 @@ from orchestrator.steward import (
     _is_timeout_kill,
 )
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardReescalatedL1,
@@ -41,7 +44,6 @@ def _sole_invocation_end_data(emit_mock) -> dict:
     no longer holds. Filter to the ``invocation_end`` call (asserting it fired
     exactly once) rather than relaxing to the last-call heuristic.
     """
-    from orchestrator.event_store import EventType
     calls = [
         c for c in emit_mock.call_args_list
         if c.args and c.args[0] == EventType.invocation_end
@@ -633,6 +635,118 @@ class TestStewardWedgeGuardInheritance:
         # session (reviewer_comprehensive: robustness_context_loss).
         assert second_call.kwargs.get('prompt') == 'REBUILT-INITIAL'
         assert result is success_result
+
+
+@pytest.mark.asyncio
+class TestStewardResumeRejectionOnly:
+    """Task 5579 at the steward: only a CLI-rejected resume replaces the session.
+
+    A resumed run that did work is returned and its session kept; a proven
+    rejection is retried fresh, and the replacement is reported as a
+    ``session_resume_failed(stage='cli', role='steward')`` row.
+    """
+
+    @staticmethod
+    def _resume_failed_emits(steward) -> list:
+        return [
+            c.kwargs for c in steward.event_store.emit.call_args_list
+            if c.args and c.args[0] is EventType.session_resume_failed
+        ]
+
+    async def _invoke(self, steward, worktree, side_effect, *, gate=None):
+        steward.usage_gate = gate or _make_pre_triage_gate()
+        steward.event_store = MagicMock(run_id='run-5579')
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc
+        with (
+            patch(
+                'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+                side_effect=side_effect,
+            ) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            result = await steward._invoke_with_session(
+                prompt='handle this escalation', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=esc,
+            )
+        return result, mock_invoke
+
+    async def test_a_completed_resumed_run_is_kept(self, steward, worktree):
+        steward._session_id = 'sess-old'
+        downgraded = _make_result(
+            success=False, subtype='success', ended_awaiting_background=True,
+            turns=40, cost=2.195, session_id='sess-old',
+        )
+
+        result, mock_invoke = await self._invoke(steward, worktree, [downgraded])
+
+        mock_invoke.assert_awaited_once()
+        assert mock_invoke.await_args_list[0].kwargs['resume_session_id'] == 'sess-old'
+        assert result is downgraded
+        assert steward._session_id == 'sess-old'
+        assert self._resume_failed_emits(steward) == []
+
+    async def test_a_budget_kill_is_surfaced_not_rerun(self, steward, worktree):
+        steward._session_id = 'sess-old'
+        budget_kill = _make_result(
+            success=False, subtype='error_max_budget_usd', turns=1, cost=4.96,
+            session_id='sess-old',
+        )
+
+        result, mock_invoke = await self._invoke(steward, worktree, [budget_kill])
+
+        mock_invoke.assert_awaited_once()
+        assert result is budget_kill
+        assert result.cost_usd == 4.96
+        assert steward._session_id == 'sess-old'
+        assert self._resume_failed_emits(steward) == []
+
+    async def test_a_proven_rejection_is_reported_and_replaces_the_session(
+        self, steward, worktree, mock_briefing, caplog,
+    ):
+        steward._session_id = 'sess-old'
+        mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+        caplog.set_level(logging.WARNING, logger='orchestrator.steward')
+
+        result, mock_invoke = await self._invoke(
+            steward, worktree,
+            [measured_resume_rejection('sess-old'), _make_result(session_id='sess-fresh')],
+        )
+
+        assert mock_invoke.await_count == 2
+        assert 'resume_session_id' not in mock_invoke.await_args_list[1].kwargs
+        assert steward._session_id == 'sess-fresh'
+        assert self._resume_failed_emits(steward) == [{
+            'task_id': steward.task_id,
+            'data': {
+                'stage': 'cli', 'session_id': 'sess-old', 'session_ids': ['sess-old'],
+                'role': 'steward', 'fallbacks': 1,
+            },
+        }]
+        assert any(
+            r.levelno == logging.WARNING
+            and 'sess-old' in r.getMessage() and 'sess-fresh' in r.getMessage()
+            for r in caplog.records
+        )
+        assert result.session_id == 'sess-fresh'
+
+    async def test_a_loop_rearmed_rejection_is_not_reported(self, steward, worktree, mock_briefing):
+        steward._session_id = None
+        mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+
+        _result, mock_invoke = await self._invoke(
+            steward, worktree,
+            [
+                _make_capped_result(session_id='sess-capped'),
+                measured_resume_rejection('sess-capped'),
+                _make_result(session_id='sess-fresh'),
+            ],
+            gate=_make_pre_triage_gate(cap_effects=[True, False, False]),
+        )
+
+        assert mock_invoke.await_count == 3
+        assert mock_invoke.await_args_list[1].kwargs['resume_session_id'] == 'sess-capped'
+        assert self._resume_failed_emits(steward) == []
 
 
 # ---------------------------------------------------------------------------
@@ -3390,8 +3504,38 @@ class TestStewardOutcomeChannelResolved:
             mock_invoke.return_value = _make_result(session_id='sess-abc')
             await steward._handle_escalation(esc)
 
-        outcome = channel.get_nowait()
-        assert outcome == StewardResolved(resolution_text='the fix')
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardResolved(resolution_text='the fix'),
+        )
+
+    async def test_each_publication_is_tagged_with_its_own_escalation(
+        self, steward,
+    ):
+        """One steward, one channel, two escalations: every envelope names the
+        escalation it is about, so a waiter for one can never be ended by the
+        other's outcome (task 5563)."""
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        resolved_first = _make_escalation(id='esc-42-1')
+        capped_second = _make_escalation(id='esc-42-2')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved', resolution='older fixed',
+        )
+        steward._retry_counts['esc-42-2'] = 1  # at cap; no wip probe wired
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-abc')
+            await steward._handle_escalation(resolved_first)
+            await steward._handle_escalation(capped_second)
+
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            'esc-42-1', StewardResolved(resolution_text='older fixed'),
+        )
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            'esc-42-2',
+            StewardInterrupted(reason='attempt_cap', wip_commits_present=False),
+        )
+        assert channel.empty()
 
     async def test_no_channel_set_is_a_back_compat_noop(self, steward):
         """A steward with no channel wired (the default) must still run
@@ -3437,8 +3581,10 @@ class TestStewardOutcomeChannelGiveUpGuards:
 
         mock_invoke.assert_not_called()
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='attempt_cap', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=True,
+            ),
         )
 
     async def test_retry_cap_wip_absent_publishes_interrupted_and_files_l1(
@@ -3455,8 +3601,10 @@ class TestStewardOutcomeChannelGiveUpGuards:
             await steward._handle_escalation(esc)
 
         _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='attempt_cap', wip_commits_present=False,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=False,
+            ),
         )
 
     async def test_budget_guard_publishes_budget_exhausted(
@@ -3474,7 +3622,9 @@ class TestStewardOutcomeChannelGiveUpGuards:
             await steward._handle_escalation(esc)
 
         _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
-        assert channel.get_nowait() == StewardBudgetExhausted()
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardBudgetExhausted(),
+        )
 
     async def test_timeout_cap_wip_present_publishes_interrupted_no_l1(
         self, steward, mock_config,
@@ -3491,8 +3641,10 @@ class TestStewardOutcomeChannelGiveUpGuards:
 
         mock_invoke.assert_not_called()
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='timeout', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='timeout', wip_commits_present=True,
+            ),
         )
 
     async def test_timeout_cap_wip_absent_publishes_interrupted_and_files_l1(
@@ -3509,8 +3661,10 @@ class TestStewardOutcomeChannelGiveUpGuards:
             await steward._handle_escalation(esc)
 
         _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='timeout', wip_commits_present=False,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='timeout', wip_commits_present=False,
+            ),
         )
 
     async def test_empty_output_cap_publishes_reescalated_l1(
@@ -3526,7 +3680,9 @@ class TestStewardOutcomeChannelGiveUpGuards:
             await steward._handle_escalation(esc)
 
         submitted = _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
-        assert channel.get_nowait() == StewardReescalatedL1(esc_id=submitted.id)
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardReescalatedL1(esc_id=submitted.id),
+        )
 
     async def test_worktree_missing_preflight_publishes_reescalated_l1(
         self, steward,
@@ -3546,7 +3702,9 @@ class TestStewardOutcomeChannelGiveUpGuards:
         steward.escalation_queue.submit.assert_called_once()
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
-        assert channel.get_nowait() == StewardReescalatedL1(esc_id=submitted.id)
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardReescalatedL1(esc_id=submitted.id),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3617,8 +3775,10 @@ class TestGiveUpAlwaysDismissesOwnL0:
         # Task-2060 resume-plan semantics are preserved: dismissal is NOT an
         # L1 hand-off.  The workflow resumes the plan; it does not triage.
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='attempt_cap', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=True,
+            ),
         )
         assert channel.empty(), 'exactly one outcome must be published'
 
@@ -3648,8 +3808,10 @@ class TestGiveUpAlwaysDismissesOwnL0:
         mock_invoke.assert_not_called()
         _assert_dismissed_own_l0(steward, 'esc-42-1')
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='timeout', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='timeout', wip_commits_present=True,
+            ),
         )
         assert channel.empty(), 'exactly one outcome must be published'
 

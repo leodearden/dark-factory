@@ -11,7 +11,11 @@ from __future__ import annotations
 from functools import cache
 from pathlib import Path
 
+import pytest
 from _ast_guard import calls_named, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 TESTS_ROOT = Path(__file__).resolve().parent.parent
 SELF = Path(__file__).resolve()

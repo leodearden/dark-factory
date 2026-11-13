@@ -47,7 +47,7 @@ from __future__ import annotations
 import pathlib
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 _REDUX_DIR = pathlib.Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 

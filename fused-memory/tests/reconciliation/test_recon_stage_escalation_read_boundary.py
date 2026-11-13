@@ -5,7 +5,9 @@ Each real stage's ``run()`` spawns a fake ``claude``, reached through
 those are checked against the tool surface of a real reconciliation-identity
 escalation server. PRD §11 open question 4 was resolved during α (task 3163) as
 OMISSION — ``--disallowed-tools`` drops a tool from the agent's surface — so no
-rejection is asserted.
+rejection is asserted. The same seam also covers the widened half of PRD §11
+open question 3 (task 6553): the orchestrator runtime snapshot, which the
+harness-less reconciliation server can only answer as "online, nothing running".
 """
 
 from __future__ import annotations
@@ -142,6 +144,17 @@ async def spawn(
     return json.loads(dump.read_text())
 
 
+def visible_escalation_tools(
+    received: dict[str, Any], registered: set[str],
+) -> tuple[str, set[str]]:
+    """Return the child's escalation server key and the qualified tool names it can still see."""
+    servers = received['mcp_config']['mcpServers']
+    keys = [key for key, entry in servers.items() if entry.get('url') == ESCALATION_URL]
+    assert len(keys) == 1, servers
+    key = keys[0]
+    return key, {f'mcp__{key}__{name}' for name in registered} - denied_by(received['argv'])
+
+
 @STAGES
 @pytest.mark.asyncio
 async def test_b8_recon_stage_cannot_obtain_an_escalation_read_result(
@@ -156,13 +169,32 @@ async def test_b8_recon_stage_cannot_obtain_an_escalation_read_result(
         registered = {tool.name for tool in await client.list_tools()}
         answer = await client.call_tool('get_pending_escalations', {'task_id': '5534'})
 
-    servers = received['mcp_config']['mcpServers']
-    keys = [key for key, entry in servers.items() if entry.get('url') == ESCALATION_URL]
-    assert len(keys) == 1, servers
-    key = keys[0]
-    visible = {f'mcp__{key}__{name}' for name in registered} - denied_by(received['argv'])
+    key, visible = visible_escalation_tools(received, registered)
 
     assert set(PER_TASK_ESCALATION_READS) <= registered
     assert answer.structured_content == {'result': []}
     for read in PER_TASK_ESCALATION_READS:
         assert f'mcp__{key}__{read}' not in visible, read
+
+
+@STAGES
+@pytest.mark.asyncio
+async def test_recon_stage_cannot_obtain_the_task_runtime_snapshot(
+    stage_cls: type[BaseStage],
+    stage_id: StageId,
+    tmp_path: Path,
+    fake_claude: Path,
+    recon_escalation_server: FastMCP,
+) -> None:
+    received = await spawn(stage_cls, stage_id, tmp_path, fake_claude)
+    async with Client(recon_escalation_server) as client:
+        registered = {tool.name for tool in await client.list_tools()}
+        answer = await client.call_tool('get_task_runtime_state', {})
+
+    key, visible = visible_escalation_tools(received, registered)
+
+    assert 'get_task_runtime_state' in registered
+    assert answer.structured_content is not None
+    assert answer.structured_content['offline'] is False
+    assert answer.structured_content['tasks'] == []
+    assert f'mcp__{key}__get_task_runtime_state' not in visible

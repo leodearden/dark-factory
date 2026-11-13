@@ -38,7 +38,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo, load_script_module
+from _fm_git_repos import _init_git_repo
+from _fm_helpers import load_script_module
 from shared.briefing_queries import (
     CONVENTIONS_AREA,
     CONVENTIONS_GENERIC,
@@ -48,6 +49,9 @@ from shared.briefing_queries import (
     BriefingScope,
     queries_for,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'

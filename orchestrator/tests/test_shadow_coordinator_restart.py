@@ -56,6 +56,7 @@ def _seeded(index: int, *, state: ShadowCellState, run_id: str | None = 'run-dea
         base_sha='a' * 40,
         state=state,
         cost_basis=CostBasis.METERED,
+        configured_model='sonnet',
         plan_source=PlanSource.PRODUCTION,
         run_id=run_id,
         opened_at=opened_at,

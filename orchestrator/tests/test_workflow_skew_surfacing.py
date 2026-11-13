@@ -95,6 +95,7 @@ class TestWorkflowVerifyProducerEmit:
             'branch': f'{wf.config.git.branch_prefix}{wf.task_id}',
             # task 5651: this workflow holds no VerifyResult, so every verdict fact is None.
             'site': 'implement',
+            'runner': 'local',
             'duration_ms': None,
             'slot_wait_secs': None,
             'plan_hash': None,

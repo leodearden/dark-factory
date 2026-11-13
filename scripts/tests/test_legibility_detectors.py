@@ -26,6 +26,9 @@ from legibility_carrier_fixtures import (
     user_record,
     with_origin,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
 """The sighted line verbatim (plans/confusion-census-2026-07-31.md:97)."""

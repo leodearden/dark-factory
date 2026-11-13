@@ -11,8 +11,6 @@ the tab's queues and names the task each row's card needs.
   owning project via worktree-prefix matching or an active-row probe.
 - ``card_task_refs`` / ``card_datums`` — the task each row's card names, and
   each row's card as a ``Datum`` once those have been looked up.
-- ``load_queue_escalations`` — the older root-only ``esc-*.json`` reader of
-  one queue directory.  Its one consumer is ``dashboard.data.memory_evals``.
 - ``fetch_pins_recovery`` — the one ASYNC function here: fans
   ``get_pending_escalations`` out across every configured escalation MCP and
   returns each project's per-record ``pins_recovery`` annotation.
@@ -21,7 +19,6 @@ the tab's queues and names the task each row's card needs.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -42,74 +39,6 @@ from dashboard.data.memory import enclosing_deadline, mcp_tool_call
 from dashboard.data.task_lookup import FETCHED_ROW_FRESHNESS_BOUND_SECONDS, TaskRef
 
 logger = logging.getLogger(__name__)
-
-
-def load_queue_escalations(
-    esc_dir: Path,
-    *,
-    skipped: list[dict[str, Any]] | None = None,
-) -> list[dict]:
-    """Load all escalation JSON files from *esc_dir* (root only, no archive).
-
-    Only ``esc-*.json`` files directly inside *esc_dir* are read — subdirectories
-    (including ``archive/YYYY-MM-DD/``) are **not** traversed.  This is an
-    intentional divergence from :func:`escalation.queue.iter_all_escalation_paths`,
-    which also walks the archive subtree.
-
-    Only ``esc-*.json`` names an escalation.  The queue directory has other
-    residents: ``orchestrator/src/orchestrator/b3_gate.py::STATE_FILENAME``
-    keeps ``b3-state.json`` there, and a ``*.json`` glob read it as an id-less
-    escalation.  :func:`escalation.queue.iter_all_escalation_paths`, and so the
-    corpus walk the Escalations tab reads, globs ``esc-*.json`` for the same
-    reason; ``plans/escalation-watcher-queue-ops-hardening-prd.md`` invariant D6
-    names protecting that file as why the glob is never widened.
-
-    A missing or non-directory *esc_dir* returns ``[]`` without raising.
-    A file that cannot be read or parsed as JSON is skipped with a ``WARNING``
-    log — and, if the caller opted in, recorded in *skipped*.
-
-    Skipping is the right behaviour (one corrupt file must not fail a whole
-    queue scan), but a skip with no return channel is a silent discard: the
-    caller cannot tell "this queue holds nothing" from "this queue holds
-    something I could not read".  *skipped* is that channel, and it is what
-    lets a consumer report the loss as structured payload rather than leaving
-    it in a log line only a human tailing stderr will ever see (INV-2,
-    ``structured-facts-at-failure``).
-
-    An out-parameter is a deliberate divergence from the sibling readers in
-    this subsystem (``_index_escalations``, ``_read_limits``), which return a
-    tuple when they have a second result to report.  It predates the corpus
-    walk, when this reader had a second caller that wanted none of this.
-
-    Args:
-        esc_dir: Path to the escalation queue root directory.
-        skipped: Optional accumulator for the files this call dropped.  When a
-            list is passed, one record per skipped file is **appended** to it
-            as ``{'path': Path, 'error': str}`` — appended, not assigned, so a
-            single list can span several queue dirs across several calls.
-            ``path`` stays a ``Path`` (the caller may want ``.name`` or a retry
-            read); stringify at the payload boundary, not here.  The default
-            ``None`` leaves behaviour verbatim as it was before this parameter
-            existed.  The ``WARNING`` log is emitted either way, so it remains
-            the signal for a caller that does not opt in.
-
-    Returns:
-        List of escalation dicts (fields passed through unchanged).  Unaffected
-        by *skipped*: opting in adds a report, it never changes what is read.
-    """
-    if not esc_dir.is_dir():
-        return []
-
-    results: list[dict] = []
-    for path in esc_dir.glob('esc-*.json'):
-        try:
-            results.append(json.loads(path.read_text()))
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Failed to load escalation %s: %s', path, exc)
-            if skipped is not None:
-                skipped.append({'path': path, 'error': str(exc)})
-            continue
-    return results
 
 
 Owner = TypeVar('Owner')

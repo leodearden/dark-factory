@@ -8,10 +8,13 @@ from pathlib import Path
 import pytest
 from escalation.shadow_ruling import SHADOW_RULING_MARKER
 from orchestrator.session_registry import decision_path_for_id
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import payloads as mod
 from sitting.inventory import OpenItem, decision_key, escalation_key, queue_tag
 
 from orchestrator import session_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ESCALATION_SERVER = REPO_ROOT / 'escalation' / 'src' / 'escalation' / 'server.py'
@@ -24,12 +27,26 @@ TOOL_SOURCES = {
     'update_task': (FUSED_MEMORY_TOOLS, 'create_mcp_server'),
     'add_dependency': (FUSED_MEMORY_TOOLS, 'create_mcp_server'),
     'submit_task': (FUSED_MEMORY_TOOLS, 'create_mcp_server'),
+    'stamp_triage': (ESCALATION_SERVER, 'create_server'),
+    'add_memory': (FUSED_MEMORY_TOOLS, 'create_mcp_server'),
 }
 
 PROJECT_ROOT = '/home/leo/src/dark-factory'
 RULING = mod.Ruling(esc_id='esc-4803-2', action='resume', text='Leo: option B', resolved_by='leo',
                     at='2026-09-26T09:00:00+00:00')
 FINDING = mod.Finding(escalation_id='esc-6798-1', summary='rebase hazard', detail='use rerere.enabled=false')
+PREPARED = mod.PreparedMarker(recommendation='B', no_lean_reason='', sitting_id='nightly-2026-09-26',
+                              prepared_at='2026-09-26T05:30:00+00:00')
+AGREED = mod.AgreedMarker(answer='B', agreed=True, answer_rounds=1, at='2026-09-26T09:00:00+00:00')
+
+DF_QUEUE = '/src/dark-factory/data/escalations'
+DF_RECON_QUEUE = '/src/dark-factory/data/reconciliation/escalations'
+
+
+def _l2(queue_dir: str = DF_QUEUE, project: str = 'dark_factory', **overrides) -> OpenItem:
+    fields = {'key': escalation_key(queue_dir, 'esc-4803-2'), 'escalation_id': 'esc-4803-2', 'queue_dir': queue_dir,
+              'project': project, 'task_id': '4803', 'severity': 'blocking', 'text': 'the question'}
+    return OpenItem(**{**fields, **overrides})
 
 
 def _tool_parameters(tool: str) -> tuple[set[str], set[str]]:
@@ -76,6 +93,10 @@ def _all_builder_payloads() -> list[mod.ApplyPayload]:
         mod.append_details_payload('5255', PROJECT_ROOT, FINDING),
         mod.add_dependency_payload('5255', '4803', PROJECT_ROOT),
         mod.submit_task_payload(PROJECT_ROOT, 'title', 'description', metadata={'source': 'sitting-preparer'}),
+        mod.stamp_markers_payload('esc-4803-2', 'verified', PREPARED, AGREED),
+        *mod.memory_payloads(
+            _l2(), option_label='B', option_text='rebase', note='', rationale='reversible', agent_id='a',
+        ),
     ]
 
 
@@ -190,16 +211,6 @@ class TestRouteFindingToOwner:
         assert metadata['source'] == 'sitting-preparer'
 
 
-DF_QUEUE = '/src/dark-factory/data/escalations'
-DF_RECON_QUEUE = '/src/dark-factory/data/reconciliation/escalations'
-
-
-def _l2(queue_dir: str = DF_QUEUE, project: str = 'dark_factory', **overrides) -> OpenItem:
-    fields = {'key': escalation_key(queue_dir, 'esc-4803-2'), 'escalation_id': 'esc-4803-2', 'queue_dir': queue_dir,
-              'project': project, 'task_id': '4803', 'severity': 'blocking', 'text': 'the question'}
-    return OpenItem(**{**fields, **overrides})
-
-
 def _flag(argv: list[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
 
@@ -301,11 +312,6 @@ class TestSittingDecisionId:
             mod.sitting_decision_id(item)
 
 
-PREPARED = mod.PreparedMarker(recommendation='B', no_lean_reason='', sitting_id='nightly-2026-09-26',
-                              prepared_at='2026-09-26T05:30:00+00:00')
-AGREED = mod.AgreedMarker(answer='B', agreed=True, answer_rounds=1, at='2026-09-26T09:00:00+00:00')
-
-
 class TestMarkers:
     def test_prepared_marker_is_one_sorted_json_line_that_round_trips(self):
         line = mod.render_prepared_marker(PREPARED)
@@ -386,3 +392,85 @@ class TestMarkerVocabulary:
     @pytest.mark.parametrize('marker', [mod.PREPARED_MARKER, mod.AGREED_MARKER])
     def test_the_watcher_skill_names_each_marker_slug(self, marker):
         assert marker.removesuffix(':') in SKILL.read_text(encoding='utf-8')
+
+
+class TestStampMarkersPayload:
+    def test_appends_both_markers_to_the_existing_note(self):
+        payload = mod.stamp_markers_payload('esc-4803-2', 'verified 2026-09-25', PREPARED, AGREED)
+
+        assert payload.tool == 'stamp_triage'
+        assert set(_args(payload)) == {'escalation_id', 'triage_note'}
+        assert _args(payload)['escalation_id'] == 'esc-4803-2'
+        note = _args(payload)['triage_note']
+        assert note == mod.append_markers(
+            'verified 2026-09-25', mod.render_prepared_marker(PREPARED), mod.render_agreed_marker(AGREED),
+        )
+        assert mod.parse_prepared_marker(note) == PREPARED
+        assert mod.parse_agreed_marker(note) == AGREED
+
+    def test_an_unprepared_item_stamps_no_prepared_line(self):
+        unprepared = mod.AgreedMarker(answer='C', agreed=None, answer_rounds=1, at='2026-09-26T09:00:00+00:00')
+
+        note = _args(mod.stamp_markers_payload('esc-4803-2', '', None, unprepared))['triage_note']
+
+        assert mod.parse_prepared_marker(note) is None
+        assert mod.parse_agreed_marker(note) == unprepared
+
+
+class TestRulingResolution:
+    def test_names_the_option_and_appends_a_note(self):
+        text = mod.ruling_resolution('B', 'rebase onto main', 'after the freeze')
+
+        assert 'B' in text and 'rebase onto main' in text and 'after the freeze' in text
+
+    def test_an_empty_note_adds_nothing(self):
+        assert mod.ruling_resolution('B', 'rebase onto main', '') == mod.ruling_resolution(
+            'B', 'rebase onto main', '   '
+        ).rstrip()
+        assert 'note' not in mod.ruling_resolution('B', 'rebase onto main', '').lower()
+
+
+class TestMemoryPayloads:
+    def _payloads(self, item: OpenItem) -> tuple[mod.ApplyPayload, ...]:
+        return mod.memory_payloads(
+            item, option_label='B', option_text='rebase onto main', note='after the freeze',
+            rationale='reversible, and the freeze lifts Friday', agent_id='sitting-apply',
+        )
+
+    def test_a_decision_and_its_rationale(self):
+        decision, rationale = self._payloads(_l2(project='Dark-Factory'))
+
+        assert decision.tool == rationale.tool == 'add_memory'
+        assert _args(decision)['category'] == mod.MEMORY_DECISION_CATEGORY == 'decisions_and_rationale'
+        assert _args(rationale)['category'] == mod.MEMORY_RATIONALE_CATEGORY == 'observations_and_summaries'
+        assert 'reversible, and the freeze lifts Friday' in _args(rationale)['content']
+        for payload in (decision, rationale):
+            args = _args(payload)
+            assert args['project_id'] == 'dark_factory'
+            assert args['agent_id'] == 'sitting-apply'
+            assert 'esc-4803-2' in args['content']
+            assert args['entities'] == [{'kind': 'task', 'id': 4803}]
+            assert 'task 4803' in args['content']
+
+    @pytest.mark.parametrize('task_id', [None, 'dashboard-watchdog'])
+    def test_an_item_without_a_numeric_task_declares_no_entity(self, task_id):
+        decision, rationale = self._payloads(_l2(task_id=task_id))
+
+        assert _args(decision)['entities'] == _args(rationale)['entities'] == []
+
+    def test_a_reconciliation_gate_declares_no_task_of_the_queue_project(self):
+        decision, rationale = self._payloads(_l2(DF_RECON_QUEUE, task_id='7459'))
+
+        for payload in (decision, rationale):
+            args = _args(payload)
+            assert args['entities'] == []
+            assert 'task 7459' not in args['content']
+            assert 'esc-4803-2' in args['content']
+
+    def test_a_decision_item_cites_its_decision_id(self):
+        item = OpenItem(key=decision_key('dec-77'), decision_id='dec-77', decision_project='reify',
+                        project='reify', text='q')
+
+        decision, _ = self._payloads(item)
+
+        assert 'dec-77' in _args(decision)['content']

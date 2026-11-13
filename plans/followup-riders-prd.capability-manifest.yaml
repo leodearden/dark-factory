@@ -1,0 +1,383 @@
+# Machine-readable twin of followup-riders-prd.capability-manifest.md
+# Schema: shared/src/shared/capability_manifest.py::CapabilityManifestDoc
+# task_id values are stamped by commit_planning at decompose.
+prd: plans/followup-riders-prd.md
+schema_version: 1
+signal_leaves: ["γ"]
+tasks:
+  - label: "α"
+    task_id: 8438
+    title: "Rider offers in observe mode: pure selector, config, events, rider ledger"
+    note: "Resolved at decompose: α also commits riders {enabled: true, mode: observe} to dark-factory-orchestrator.yaml, because no leaf owned the observe-mode enablement δ's series depend on (defaults.yaml keeps enabled false)."
+    capabilities:
+      - name: "host-view-model"
+        binding: "capability→producer — new orchestrator/src/orchestrator/riders.py (§4.1)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class HostView"
+          paths: ["orchestrator/src/orchestrator/riders.py"]
+          expect: present
+      - name: "select-rider-offers"
+        binding: "capability→producer — the pure selector, subset rule, PRD-host rule, ranking, cap"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def select_rider_offers\\("
+          paths: ["orchestrator/src/orchestrator/riders.py"]
+          expect: present
+      - name: "offerable-predicate"
+        binding: "capability→producer — offer-side predicate over followup_hold (producer 8417 upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def offerable\\("
+          paths: ["orchestrator/src/orchestrator/riders.py"]
+          expect: present
+      - name: "selector-wired-at-plan-boundary"
+        binding: "capability→producer (wired) — TaskWorkflow._plan after _reconcile_plan_scope succeeds"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "select_rider_offers"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+      - name: "riders-config"
+        binding: "capability→producer — config.py RidersConfig registered in RELOADABLE_FIELDS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RidersConfig"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "offer-events"
+        binding: "capability→producer — EventType rider_offered"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rider_offered"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "offers-skipped-event"
+        binding: "capability→producer — EventType rider_offers_skipped (sketch row 21)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rider_offers_skipped"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "rider-ledger-model"
+        binding: "capability→producer — new shared/src/shared/rider_ledger.py (RiderLedger, DeferredPromotion)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RiderLedger"
+          paths: ["shared/src/shared/rider_ledger.py"]
+          expect: present
+      - name: "rider-ledger-registered"
+        binding: "capability→producer — register_metadata_submodel under the quoted key literal"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "['\"]rider_ledger['\"]"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "apply-verdicts-observe-arm"
+        binding: "capability→producer — new fused-memory middleware/rider_carry.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def apply_rider_verdicts\\("
+          paths: ["fused-memory/src/fused_memory/middleware/rider_carry.py"]
+          expect: present
+      - name: "apply-verdicts-mcp-verb"
+        binding: "capability→producer (wired) — server/tools.py exposes the verb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "apply_rider_verdicts"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "df-observe-enabled"
+        binding: "capability→producer — resolved at decompose: riders stanza in df's own project config"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^riders:"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+      - name: "observe-rows-on-live-dispatch"
+        binding: "manual — sketch rows 1, 20, 21 and a reload_config of riders.max_offers reported applied"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "observed on a live df dispatch after deploy; counted by δ"
+  - label: "β"
+    task_id: 8439
+    title: "Architect rider pass in shadow and offer modes: prompt builder, plan tools, typed verdicts, carry writes, write-authority refusal"
+    capabilities:
+      - name: "rider-verdict-record"
+        binding: "capability→producer — new orchestrator/src/orchestrator/plan_riders.py (DescopedStep idiom)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RiderVerdict"
+          paths: ["orchestrator/src/orchestrator/plan_riders.py"]
+          expect: present
+      - name: "decline-reasons-enum"
+        binding: "capability→producer — DECLINE_REASONS closed set"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "DECLINE_REASONS"
+          paths: ["orchestrator/src/orchestrator/plan_riders.py"]
+          expect: present
+      - name: "accept-rider-tool"
+        binding: "capability→producer + rejection-mechanism — typed refusals (rows 4, 5) created in this leaf"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def accept_rider\\("
+          paths: ["orchestrator/src/orchestrator/mcp/plan_tools.py"]
+          expect: present
+      - name: "decline-rider-tool"
+        binding: "capability→producer — plan-tools decline_rider"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def decline_rider\\("
+          paths: ["orchestrator/src/orchestrator/mcp/plan_tools.py"]
+          expect: present
+      - name: "riders-key-carried-forward"
+        binding: "capability→producer — _riders / _rider_offers join the create_plan carry-forward set"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "RIDERS_KEY"
+          paths: ["orchestrator/src/orchestrator/mcp/plan_tools.py"]
+          expect: present
+      - name: "architect-holds-rider-tools"
+        binding: "capability→producer — _PLAN_CREATOR_TOOLS gains the two tool names"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "accept_rider"
+          paths: ["orchestrator/src/orchestrator/agents/roles.py"]
+          expect: present
+      - name: "rider-offer-prompt"
+        binding: "capability→producer — BriefingAssembler.build_rider_offer_prompt; items via _format_followup_items (producer 8414 upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def build_rider_offer_prompt\\("
+          paths: ["orchestrator/src/orchestrator/agents/briefing.py"]
+          expect: present
+      - name: "rider-pass-in-workflow"
+        binding: "capability→producer (wired) — TaskWorkflow._run_rider_pass"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_run_rider_pass"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+      - name: "pass-failed-event"
+        binding: "rejection-mechanism — typed modules_changed path (row 7) emits rider_pass_failed"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rider_pass_failed"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "carried-event"
+        binding: "capability→producer — EventType rider_carried"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rider_carried"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "carry-writes-merge-items"
+        binding: "capability→producer — offer arm of apply_rider_verdicts merges items (merge_items, producer 8414 upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_items"
+          paths: ["fused-memory/src/fused_memory/middleware/rider_carry.py"]
+          expect: present
+      - name: "write-authority-error"
+        binding: "rejection-mechanism — row 18; created by β"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RiderWriteAuthorityError"
+          paths: ["fused-memory/src/", "shared/src/"]
+          expect: present
+      - name: "write-authority-wired"
+        binding: "capability→producer (wired) — refused at the interceptor's submit_task and update_task"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "RiderWriteAuthorityError"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "shadow-and-offer-in-production"
+        binding: "manual — sketch rows 2, 2s, 3-7b, 14-18 through a df dispatch"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "agent behaviour at dispatch; shadow rows counted by δ"
+  - label: "γ"
+    task_id: 8440
+    title: "Deliverability stamp, close and release in the status transition, carry sweep, integration gate"
+    note: "Integration gate and signal leaf. RIDER_RESERVE_DAYS is produced by PRD 2 P1 (task 8452, plans/followup-packing-sweep-prd.md); edge 8440 -> 8452 wired 2026-11-04."
+    capabilities:
+      - name: "stamp-deliverability"
+        binding: "capability→producer — rider_carry.stamp_rider_deliverability"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def stamp_rider_deliverability\\("
+          paths: ["fused-memory/src/fused_memory/middleware/rider_carry.py"]
+          expect: present
+      - name: "release-rider"
+        binding: "capability→producer — rider_carry.release_rider (re-validates rider_of under the lock)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def release_rider\\("
+          paths: ["fused-memory/src/fused_memory/middleware/rider_carry.py"]
+          expect: present
+      - name: "close-or-release"
+        binding: "capability→producer — rider_carry.close_or_release_riders_for (total close)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def close_or_release_riders_for\\("
+          paths: ["fused-memory/src/fused_memory/middleware/rider_carry.py"]
+          expect: present
+      - name: "close-wired-in-status-transition"
+        binding: "capability→producer (wired) — TaskInterceptor._apply_status_transition awaits it in the host's _write_lock unit"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "close_or_release_riders_for"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "carry-sweep"
+        binding: "capability→producer — rider_carry.reconcile_carries"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def reconcile_carries\\("
+          paths: ["fused-memory/src/fused_memory/middleware/rider_carry.py"]
+          expect: present
+      - name: "carry-sweep-wired"
+        binding: "capability→producer (wired) — server/main.py starts the sweep after PRD 1's backfill"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reconcile_carries"
+          paths: ["fused-memory/src/fused_memory/server/main.py"]
+          expect: present
+      - name: "sweep-interval-config"
+        binding: "capability→producer — fused-memory config/schema.py riders.carry_sweep_interval_secs"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "carry_sweep_interval_secs"
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
+          expect: present
+      - name: "promotion-guard"
+        binding: "capability→producer — rider_carry.rider_promotion_guard; hook register_promotion_guard is 8418's companion correction (upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def rider_promotion_guard\\("
+          paths: ["fused-memory/src/fused_memory/middleware/rider_carry.py"]
+          expect: present
+      - name: "promotion-guard-registered"
+        binding: "capability→producer (wired) — registered explicitly in server/main.py, never at import time"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rider_promotion_guard"
+          paths: ["fused-memory/src/fused_memory/server/main.py"]
+          expect: present
+      - name: "workflow-carry-reconcile"
+        binding: "capability→producer (wired) — TaskWorkflow._reconcile_rider_carry at execute→review, after _replan, after a narrowing commit"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_reconcile_rider_carry"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+      - name: "close-failed-event"
+        binding: "capability→producer — rider_close_failed emitted by the total close"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rider_close_failed"
+          paths: ["fused-memory/src/", "orchestrator/src/"]
+          expect: present
+      - name: "release-rider-verb"
+        binding: "capability→producer (wired) — human-callable release_rider in server/tools.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "release_rider"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "carry-clock-constant"
+        binding: "producer:task-8452 followup_packing.RIDER_RESERVE_DAYS — PRD 2 P1, upstream via edge 8440 -> 8452. γ imports, never redefines"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "RIDER_RESERVE_DAYS"
+          paths: ["fused-memory/src/fused_memory/middleware/rider_carry.py"]
+          expect: present
+      - name: "boundary-suite"
+        binding: "capability→producer — new fused-memory/tests/integration/test_followup_riders.py driving public interfaces only"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_"
+          paths: ["fused-memory/tests/integration/test_followup_riders.py"]
+          expect: present
+      - name: "every-row-green"
+        binding: "manual — every §4.6 row passes on the integrated tree (row 19 shared with PRD 2's gate)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the gate's own verify run is the evidence"
+      - name: "operations-riders-section"
+        binding: "manual — OPERATIONS.md riders section (modes, KILL line, release_rider, the sweep)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "prose; gating δ on its wording would be a prose guard (INV-10)"
+  - label: "δ"
+    task_id: 8441
+    title: "Follow-up riders observation report, 14 days after the integration gate"
+    capabilities:
+      - name: "report-script"
+        binding: "capability→producer — new read-only scripts/followup_riders_report.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "producer has not written"
+          paths: ["scripts/followup_riders_report.py"]
+          expect: present
+      - name: "kill-line"
+        binding: "capability→producer — matched-pair KILL verdict at +0.5 verifies per landing, n >= 30"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "KILL"
+          paths: ["scripts/followup_riders_report.py"]
+          expect: present
+      - name: "dated-report"
+        binding: "manual — delayed milestone; dated report under plans/portfolio-review-2026-11-01/followups/"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a measurement over live stores, judged by the report it writes"

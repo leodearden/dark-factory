@@ -26,16 +26,23 @@ from shared.proc_group import (
     ProcessGroupMember,
     SigkillDispatch,
     StatFields,
+    cpu_ticks_under_path,
     pid_running,
     process_group_members,
     process_group_terminated,
+    read_cpu_ticks,
+    read_session_id,
     read_stat_fields,
     reap_process_groups,
     scan_process_groups_under_path,
     sigkill_process_group,
     snapshot_process_group,
     terminate_process_group,
+    unified_cgroup_path,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 async def _await_group_membership(
@@ -270,18 +277,27 @@ def unreaped_zombie_pgid():
 
 
 def _synthetic_stat_line(
-    pid: int, pgrp: int, *, state: str = 'S', comm: str = 'weird (name) proc'
+    pid: int,
+    pgrp: int,
+    *,
+    state: str = 'S',
+    comm: str = 'weird (name) proc',
+    cpu: tuple[int, int, int, int] = (0, 0, 0, 0),
+    session: int | None = None,
 ) -> str:
-    """A real-format ``/proc/<pid>/stat`` for a fabricated /proc: ``pid (comm) state 1 pgrp ...``.
+    """A real-format ``/proc/<pid>/stat`` for a fabricated /proc: ``pid (comm) state 1 pgrp session ...``.
 
     The default *comm* deliberately contains spaces AND a ``)`` so the parser's
     ``rfind(')')`` idiom stays pinned — a ``split()``-based parser would
     mis-read this line, and the kernel really does allow it (a process can
-    set an arbitrary 15-char comm).
+    set an arbitrary 15-char comm).  *cpu* is utime, stime, cutime and cstime,
+    stat fields 14-17.  *session* is stat field 6, and defaults to *pgrp*.
     """
+    counters = ['0'] * 4 + [str(ticks) for ticks in cpu] + ['0'] * 12
+    sid = pgrp if session is None else session
     return (
-        f'{pid} ({comm}) {state} 1 {pgrp} {pgrp} 0 -1 4194304 '
-        + ' '.join(['0'] * 20)
+        f'{pid} ({comm}) {state} 1 {pgrp} {sid} 0 -1 4194304 '
+        + ' '.join(counters)
         + '\n'
     )
 
@@ -2273,3 +2289,260 @@ class TestReapProcessGroups:
         assert calls == [], (
             f'refused pgids must never be signalled; got killpg calls {calls}'
         )
+
+
+class TestCpuTicksUnderPathAgainstASyntheticProc:
+    """The CPU-time fingerprint of the processes working under a directory (task 5290).
+
+    Fabricated /proc, as in :class:`TestScanProcessGroupsAgainstASyntheticProc`.
+    The fingerprint is utime+stime+cutime+cstime summed per PID (not per
+    group) over the pids whose cwd is at-or-under root.
+    """
+
+    @pytest.fixture
+    def fake_proc(self, tmp_path, monkeypatch):
+        """Build the fabricated /proc; returns ``(proc_root, root)``.
+
+        ==== ===== ============================ ============== ==========
+        pid  pgrp  cwd                          cpu            counted
+        ==== ===== ============================ ============== ==========
+        100  100   <root>                       1+2+3+4        yes (==)
+        200  200   <root>/build/deep            10+20+30+40    yes (under)
+        300  300   <root>XYZ                    1000           no
+        400  400   an unrelated dir             5000           no
+        510  500   <root>/build                 100            yes
+        520  500   <root>/build                 200            yes (same group, own pid)
+        600  --    stat is a DIRECTORY          --             skipped
+        700  --    no stat at all               --             skipped
+        800  --    stat has no ')'              --             skipped
+        820  820   <root>, CPU fields not ints  --             skipped
+        900  900   unrelated cwd, fd+maps in    7000           no (cwd only)
+        ==== ===== ============================ ============== ==========
+        """
+        proc_root = tmp_path / 'proc'
+        proc_root.mkdir()
+        base = (tmp_path / 'work').resolve()
+        root = base / '_merge-verify'
+        (root / 'build' / 'deep').mkdir(parents=True)
+        sibling = base / '_merge-verifyXYZ'
+        outside = base / 'other'
+        for d in (sibling, outside):
+            d.mkdir(parents=True)
+
+        def _pid(pid: int, pgrp: int, cwd, cpu: tuple[int, int, int, int]) -> Path:
+            entry = proc_root / str(pid)
+            entry.mkdir()
+            (entry / 'stat').write_text(_synthetic_stat_line(pid, pgrp, cpu=cpu))
+            (entry / 'cwd').symlink_to(cwd)
+            return entry
+
+        _pid(100, 100, root, (1, 2, 3, 4))
+        _pid(200, 200, root / 'build' / 'deep', (10, 20, 30, 40))
+        _pid(300, 300, sibling, (1000, 0, 0, 0))
+        _pid(400, 400, outside, (5000, 0, 0, 0))
+        _pid(510, 500, root / 'build', (100, 0, 0, 0))
+        _pid(520, 500, root / 'build', (0, 200, 0, 0))
+
+        (proc_root / '600' / 'stat').mkdir(parents=True)
+        (proc_root / '600' / 'cwd').symlink_to(root)
+        (proc_root / '700').mkdir()
+        (proc_root / '700' / 'cwd').symlink_to(root)
+        (proc_root / '800').mkdir()
+        (proc_root / '800' / 'stat').write_text('no closing paren here\n')
+        (proc_root / '800' / 'cwd').symlink_to(root)
+        (proc_root / '820').mkdir()
+        (proc_root / '820' / 'stat').write_text(
+            '820 (x) S 1 820 820 0 -1 4194304 0 0 0 0 u s cu cs 0 0\n'
+        )
+        (proc_root / '820' / 'cwd').symlink_to(root)
+
+        fd_only = _pid(900, 900, outside, (7000, 0, 0, 0))
+        (fd_only / 'fd').mkdir()
+        (fd_only / 'fd' / '3').symlink_to(root / 'build')
+        (fd_only / 'maps').write_text(
+            f'7f0a1d000000-7f0a1d002000 r-xp 00000000 08:01 4242       {root}/lib.so\n'
+        )
+
+        (proc_root / 'self').mkdir()
+        (proc_root / 'cpuinfo').write_text('processor : 0\n')
+
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+        return proc_root, root
+
+    def test_sums_every_pid_whose_cwd_is_at_or_under_root(self, fake_proc):
+        """Equality and strictly-under count; the <root>XYZ sibling and outside do not."""
+        _proc_root, root = fake_proc
+        assert cpu_ticks_under_path(root) == 10 + 100 + 100 + 200
+
+    def test_exclude_pgids_drops_pids_by_their_group(self, fake_proc):
+        _proc_root, root = fake_proc
+        assert cpu_ticks_under_path(root, exclude_pgids=frozenset({500})) == 10 + 100
+        assert cpu_ticks_under_path(root, exclude_pgids=frozenset({100, 200, 500})) is None
+
+    def test_unreadable_and_malformed_pids_are_skipped_not_raised(self, fake_proc):
+        """600/700/800/820 all sit at root, so a failure to skip one would change the sum."""
+        proc_root, root = fake_proc
+        assert cpu_ticks_under_path(root) == 410
+        for pid in ('600', '700', '800', '820'):
+            assert read_cpu_ticks(proc_root / pid) is None, pid
+
+    def test_a_link_through_an_fd_or_maps_alone_is_not_counted(self, fake_proc):
+        """Only cwd decides: the cost decision is two small reads per pid, no fd or maps walk.
+
+        The group scan, which does read fds and maps, finds pid 900 for the
+        same root, so its links are real.
+        """
+        _proc_root, root = fake_proc
+        assert 900 in scan_process_groups_under_path(root)
+        assert cpu_ticks_under_path(root) == 410
+
+    def test_no_process_is_none_and_an_idle_one_is_zero(self, tmp_path, monkeypatch):
+        """'No process' is not 'an idle process'."""
+        proc_root = tmp_path / 'proc'
+        idle_root = (tmp_path / 'idle').resolve()
+        empty_root = (tmp_path / 'empty').resolve()
+        for d in (idle_root, empty_root):
+            d.mkdir()
+        entry = proc_root / '100'
+        entry.mkdir(parents=True)
+        (entry / 'stat').write_text(_synthetic_stat_line(100, 100))
+        (entry / 'cwd').symlink_to(idle_root)
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+
+        assert cpu_ticks_under_path(idle_root) == 0
+        assert cpu_ticks_under_path(empty_root) is None
+
+    def test_a_missing_proc_root_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path / 'absent')
+        assert cpu_ticks_under_path(tmp_path) is None
+
+
+class TestReadCpuTicks:
+    """utime+stime+cutime+cstime of one ``/proc/<pid>``, on the parse read_stat_fields uses."""
+
+    def test_a_well_formed_line_sums_the_four_cpu_fields(self, tmp_path):
+        entry = tmp_path / '4242'
+        entry.mkdir()
+        (entry / 'stat').write_text(_synthetic_stat_line(4242, 4242, cpu=(5, 6, 7, 8)))
+
+        assert read_cpu_ticks(entry) == 26
+        assert read_stat_fields(entry, skip_malformed=False) == StatFields(
+            comm='weird (name) proc', state='S', ppid=1, pgrp=4242
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            *_MALFORMED_STAT_LINES,
+            pytest.param('7 (x) S 1 7 7 0 -1 0 0 0 0 0 1 2\n', id='cpu-fields-truncated'),
+            pytest.param('7 (x) S 1 7 7 0 -1 0 0 0 0 0 1 2 x 4\n', id='cpu-field-not-an-int'),
+        ],
+    )
+    def test_a_malformed_line_is_none(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        assert read_cpu_ticks(entry) is None
+
+    @pytest.mark.parametrize('stat_is_a_directory', [False, True], ids=['missing', 'directory'])
+    def test_an_unreadable_entry_is_none(self, tmp_path, stat_is_a_directory):
+        entry = tmp_path / '600'
+        entry.mkdir()
+        if stat_is_a_directory:
+            (entry / 'stat').mkdir()
+
+        assert read_cpu_ticks(entry) is None
+
+
+class TestReadSessionId:
+    """The session id (stat field 6) of one ``/proc/<pid>``, on the parse read_stat_fields uses."""
+
+    def test_a_well_formed_line_reads_field_six_not_the_pgrp(self, tmp_path):
+        entry = tmp_path / '4242'
+        entry.mkdir()
+        (entry / 'stat').write_text(_synthetic_stat_line(4242, 4242, session=777))
+
+        assert read_session_id(entry) == 777
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            *_MALFORMED_STAT_LINES,
+            pytest.param('7 (x) S 1 7\n', id='session-truncated'),
+            pytest.param('7 (x) S 1 7 x 0\n', id='session-not-an-int'),
+        ],
+    )
+    def test_a_malformed_line_is_none(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        assert read_session_id(entry) is None
+
+    @pytest.mark.parametrize('stat_is_a_directory', [False, True], ids=['missing', 'directory'])
+    def test_an_unreadable_entry_is_none(self, tmp_path, stat_is_a_directory):
+        entry = tmp_path / '600'
+        entry.mkdir()
+        if stat_is_a_directory:
+            (entry / 'stat').mkdir()
+
+        assert read_session_id(entry) is None
+
+    def test_on_the_real_proc_it_is_our_own_session(self):
+        assert read_session_id(Path('/proc') / str(os.getpid())) == os.getsid(0)
+
+
+class TestUnifiedCgroupPath:
+    """The ``0::`` path of a ``/proc/<pid>/cgroup`` text."""
+
+    def test_the_unified_line_is_read_among_v1_lines(self):
+        text = '12:pids:/user.slice\n1:name=systemd:/x\n0::/user.slice/run-u7.scope\n'
+
+        assert unified_cgroup_path(text) == '/user.slice/run-u7.scope'
+
+    def test_the_root_cgroup_is_a_path(self):
+        assert unified_cgroup_path('0::/\n') == '/'
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('', id='empty'),
+            pytest.param('1:name=systemd:/x\n', id='v1-only'),
+            pytest.param('0::\n', id='no-path'),
+        ],
+    )
+    def test_no_unified_path_is_none(self, text):
+        assert unified_cgroup_path(text) is None
+
+    def test_on_the_real_proc_it_is_an_absolute_path(self):
+        unified = unified_cgroup_path((Path('/proc') / str(os.getpid()) / 'cgroup').read_text())
+
+        assert unified is not None and unified.startswith('/')
+
+
+class TestCpuTicksUnderPathOnTheRealProc:
+    """One bounded walk of the real /proc: a busy child's ticks rise."""
+
+    @pytest.mark.timeout(60)
+    def test_a_busy_child_working_under_root_moves_the_sum(self, tmp_path):
+        root = tmp_path.resolve()
+        proc = subprocess.Popen(
+            [sys.executable, '-c', 'while True: pass'],
+            cwd=root,
+            start_new_session=True,
+        )
+        try:
+            first = None
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                ticks = cpu_ticks_under_path(root)
+                if ticks is not None and first is None:
+                    first = ticks
+                elif ticks is not None and first is not None and ticks > first:
+                    return
+                time.sleep(0.05)
+            pytest.fail(f'cpu ticks under {root} never rose past {first} within 30s')
+        finally:
+            _kill_group(proc.pid)
+            proc.wait()

@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
+from shared.milestone_rearm import scheduled_fire_at
 from shared.recurrence_chains import current_links, recurrence_key
 from shared.task_metadata import Recurrence
 from shared.task_statuses import ACTIVE, TaskStatus
@@ -106,14 +107,16 @@ def _run_label(at: str) -> str:
     return f' [due {at}]'
 
 
-def _successor_title(pred_title: str, pred_at: object, at: str) -> str:
+def _successor_title(pred_title: str, pred_fire_at: str | None, at: str) -> str:
     """The chain's base title plus the successor's own run label.
 
     The store's candidate_key UNIQUE index covers done rows, so a verbatim
     title copy would collide with the predecessor. The predecessor's label is
-    recomputed from its milestone.at and removed, so labels never accumulate.
+    recomputed from its scheduled fire time
+    (``shared.milestone_rearm.scheduled_fire_at``), which a predicate re-arm
+    never moves, and removed, so labels never accumulate.
     """
-    base = pred_title.removesuffix(_run_label(pred_at)) if isinstance(pred_at, str) else pred_title
+    base = pred_title if pred_fire_at is None else pred_title.removesuffix(_run_label(pred_fire_at))
     return base + _run_label(at)
 
 
@@ -135,10 +138,9 @@ def _build_successor(predecessor: Mapping[str, Any], predecessor_id: str) -> _Su
     }
     if 'files' in pred_metadata:
         metadata['files'] = pred_metadata['files']
-    pred_milestone = pred_metadata.get('milestone')
-    pred_at = pred_milestone.get('at') if isinstance(pred_milestone, Mapping) else None
+    pred_fire_at = scheduled_fire_at(pred_metadata.get('milestone'))
     return _SuccessorSpec(
-        title=_successor_title(str(predecessor.get('title') or ''), pred_at, at),
+        title=_successor_title(str(predecessor.get('title') or ''), pred_fire_at, at),
         description=predecessor.get('description'),
         details=predecessor.get('details'),
         priority=predecessor.get('priority'),

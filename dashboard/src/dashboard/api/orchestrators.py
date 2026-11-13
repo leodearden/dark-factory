@@ -14,12 +14,12 @@ import asyncio
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import app_clock
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 from dashboard.data.db import DbPool
 from dashboard.data.metrics import get_orchestrators_running_series
 from dashboard.data.orchestrator import discover_orchestrators
-from dashboard.data.utils import resolve_now
 
 router = APIRouter()
 
@@ -40,11 +40,11 @@ async def api_orchestrators(request: Request) -> JSONResponse:
     """
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    served_at = resolve_now(None)
+    served_at = app_clock(request.app)()
     metrics_db = await pool.get(config.metrics_db)
     orchestrators, running_spark = await asyncio.gather(
         discover_orchestrators(config),
-        get_orchestrators_running_series(metrics_db, days=1),
+        get_orchestrators_running_series(metrics_db, days=1, now=served_at),
     )
     return JSONResponse(
         {

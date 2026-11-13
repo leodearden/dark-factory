@@ -73,7 +73,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "def known_project_roots"
-          paths: ["fused-memory/src/fused_memory/reconciliation/backlog_policy.py"]
+          paths: ["fused-memory/src/fused_memory/reconciliation/backlog_policy.py", "fused-memory/src/fused_memory/recon_state/backlog_policy.py"]
           expect: present
       - name: "enforce-flag-hot-reloadable"
         binding: "capability→producer — β allowlists cancel_children.enforce in config/reload.py (PRD §4.14)"

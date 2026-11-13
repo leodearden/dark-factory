@@ -36,9 +36,9 @@ sampling:
   top_fraction: 0.12
   per_stratum_min: 2
 census:
-  max_interval_days: 10
-  tasks_landed_threshold: 120
-  tasks_landed_min_days: 7
+  # The previous run's completion share that fires the census; see the Census
+  # model in scripts/legibility/config.py.
+  completion_threshold_pct: 70
   novelty_spike:
     count: 4
     window_hours: 72

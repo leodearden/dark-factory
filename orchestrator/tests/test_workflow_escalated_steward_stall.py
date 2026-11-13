@@ -63,7 +63,11 @@ from orchestrator.resume_resolution import CarriedResolution
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-from orchestrator.workflow_types import StewardInterrupted, StewardReescalatedL1
+from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
+    StewardInterrupted,
+    StewardReescalatedL1,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures (local — mirrors test_workflow_status_on_resume.py)
@@ -408,10 +412,11 @@ def _make_dismiss_and_publish_steward(
                     dismiss=True,
                     resolved_by='auto-dismissed',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardInterrupted('attempt_cap', wip_commits_present=True),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardInterrupted('attempt_cap', wip_commits_present=True),
+                    ))
 
         async def start(self) -> None:
             self.give_up_task = asyncio.create_task(self._give_up())
@@ -653,7 +658,7 @@ class TestStaleOutcomeHygiene:
         assert await scheduler.get_status(task_assignment.task_id) not in (
             'done', 'cancelled', 'deferred',
         ), 'a terminal status would short-circuit _await_steward_completion'
-        outcome = await asyncio.wait_for(workflow._await_steward_completion(), 10)
+        outcome = await asyncio.wait_for(workflow._await_steward_completion(escalation_id=None), 10)
 
         assert isinstance(outcome, StewardInterrupted), (
             f'nothing is published in this second cycle, so the grace period '
@@ -936,10 +941,11 @@ def _make_slow_healthy_steward(
                     dismiss=True,
                     resolved_by=resolved_by,
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardInterrupted('attempt_cap', wip_commits_present=True),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardInterrupted('attempt_cap', wip_commits_present=True),
+                    ))
 
         async def start(self) -> None:
             self.give_up_task = asyncio.create_task(self._give_up())
@@ -1163,10 +1169,11 @@ def _make_progressing_steward(
                     dismiss=True,
                     resolved_by=resolved_by,
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardInterrupted('attempt_cap', wip_commits_present=True),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardInterrupted('attempt_cap', wip_commits_present=True),
+                    ))
 
         async def start(self) -> None:
             self.work_task = asyncio.create_task(self._work())
@@ -1550,8 +1557,10 @@ def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
                     esc.id, 'Auto-dismissed: re-escalated to human',
                     dismiss=True, resolved_by='auto-dismissed',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(StewardReescalatedL1(esc_id=l1.id))
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id, StewardReescalatedL1(esc_id=l1.id),
+                    ))
 
         async def stop(self) -> None:
             pass

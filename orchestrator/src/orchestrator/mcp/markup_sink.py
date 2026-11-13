@@ -473,7 +473,7 @@ def file_residue(
         # 'blocking' even for the level-2 record the middleware declares, and
         # the reason is the SENTINEL-ROLE rule, not squeamishness: a born-at-L2
         # severity (`escalation.models.BORN_AT_L2_SEVERITIES`) is legal only for
-        # a role in `escalation.server._HARNESS_SENTINEL_ROLE_PREFIXES`, which
+        # a role in `escalation/models.py::HARNESS_SENTINEL_ROLE_PREFIXES`, which
         # `_chokepoint_or_submit` enforces by downgrading and `submit.py` by
         # rejecting. Every spec on this module's callers files under its own
         # server-named role (`plan-tools-markup-guard`,

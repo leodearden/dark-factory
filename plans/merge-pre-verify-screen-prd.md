@@ -189,7 +189,6 @@ No lane, metadata or diff-reachability proxy separates fixing verifies from doom
      - It returns `pass`, `fail`, `error` or `skipped` per node id, from junit's failing and never-ran vectors.
      - `screen.py` makes **one** `run_node_ids` call per screen, with every manifest id, and maps the per-id results back to checks through the manifest.
        - With `concurrent_groups=True`, the runner runs its module groups (here `scripts` and `orchestrator`) concurrently, each with its own junit path.
-       - The discriminator keeps the serial default.
        - Separate concurrent calls per check would collide on the per-module junit file, `<tree>/.df-verify-junit/report.<module>.xml` (critic K47).
      - A check is a `finding` when any of its ids fails.
      - A check is an `error` when any of its ids errors, is skipped or is not collected. SKIP is not ALLOW: the ratchet's node skips when its baseline is absent, and it must not read as green.
@@ -287,7 +286,7 @@ Each assumed capability is either verified by reading main `07bd68fd99` or built
 | A per-request "held" predicate in `_pop_next_pickable` / `chain_snapshot` | **built here (γ1)** | both skip only halted lanes today. `test_merge_queue_build_chain.py::test_is_the_merge_request_typed_twin_of_unfrozen_suffix` pins `chain_snapshot() == unfrozen_suffix()`; γ1 states the new relation and updates the test |
 | The red's owner (fix-main task + L1) and owner-resolution clearing | exists; one return value **built here (γ1)** | `_file_main_health_escalation` returns the id (`Optional[str]`); `_escalate_owned_main_break` returns `None` today, and γ1 threads the id out; `set_lane_halt_owner`; `Harness._on_escalation_resolved`. `force_unhalt_merge_queue` refuses owned halts, so the operator exit is `resolve_issue` |
 | The verdict's probe sha and failing ids at confirmation | exists inside the probe; **exported here (γ1)** | `_build_main_health_outcome` is the one builder on both probe modes; `VerifyResult.failing_test_ids`; γ1 adds structured fields on the MAIN_RED outcome |
-| Run named pytest node ids on a given tree and report each one's result | **built here (γ0)** | `verify.py::confirm_isolated_rerun_verdict` takes a `VerifyResult` and returns a flake verdict per call-site policy. γ0 extracts its group → command → `run_verification` body into a public `verify.py::run_node_ids`, which both the discriminator and the screen call (INV-5) |
+| Run named pytest node ids on a given tree and report each one's result | **built here (γ0)** | `verify.py::confirm_isolated_rerun_verdict` takes a `VerifyResult` and returns a flake verdict per call-site policy. It keeps its per-call-site `_RerunPolicy` engines, because it classifies each attempt from the whole `VerifyResult` (category, infra sentinels, `PYTEST_USAGE_ERROR`, setup-errors-only), which a per-id `Literal` return cannot carry. γ0 builds a public `verify.py::run_node_ids` for the screen and the F run. What the discriminator shares with it is the node-id → module mapping `verify.py::_group_node_ids_by_subproject`, which exists on main, and the group → scoped/serial/timeout test command builder `verify.py::_node_id_test_config`, which main does not have: γ0 builds it by extracting the identical block from the discriminator and both main-tip sweep sites (`_sweep_failure_reproduces_in_isolation`, `confirm_main_tip_failure_is_real`). After γ0, `run_node_ids`, the discriminator and both main-tip sweep sites all call those two (INV-5) |
 | `OutcomeKind` and `ChainTruncationReason` are extendable | exists | `merge_lane/types.py` |
 | A persistent worktree reset in place, keeping its venv | exists (pattern); **two screen lanes built here (α)** | `GitOps.reset_persistent_merge_worktree`, which serves the `_merge-verify` lane. The warm spec pool (`merge_spec_warm_lane_pool`) is off in this repo, so `acquire_spec_lane` is cold here |
 | A throwaway worktree at any sha, for the screen's cold fallback | exists | `GitOps.ephemeral_worktree(kind, sha)`. Bare-main re-probes run in `_screen-merger` (decision 4). The new `WorktreeKind.MERGE_SCREEN` and the two persistent screen lanes also need `git_ops.py::PROTECTED_PREFIXES` entries and their bash mirror in `orchestrator/scripts/warm-lane/lib_lane_state.sh::lane_protect_glob` |
@@ -312,7 +311,7 @@ Each assumed capability is either verified by reading main `07bd68fd99` or built
 | Main-health classification (1690, 3597, 5627), fix ownership (5471), auto-heal | consumes | γ1 arms only after the existing owner path has run. It does not change `verify_failure_is_preexisting_on_main`, `is_auto_heal_eligible` or `MainFixTaskFiler` | main-health; **this PRD** owns the verdict record and the hold |
 | Verify-base guard ruling (3206, 3981) | distinct | γ1 judges base *health* (failing tests), not base *identity* (frozen prefix). The advisory-by-decision ruling is untouched | — |
 | `plans/orchestrator-atomic-train-merge-prd.md`; task 6755 (train verify parity) | consumes, coordinates | α screens at `_do_train_merge`: a finding is a blocked outcome *without* `TRAIN_VERIFY_FAILED_REASON_PREFIX`, so the tip workflow escalates to a human. A γ1 hold uses `_stand_down_train`. α adds a call; 6755 rebinds the verify. There is no edge between them: whichever lands second rebases | **this PRD** owns the screen call; 6755 owns the verify binding |
-| `verify.py` (12k lines) | γ0 edits it | `run_node_ids` is extracted from the isolated-rerun discriminator, which keeps working through it | γ0 |
+| `verify.py` (12k lines) | γ0 edits it | `run_node_ids` is built on the mapping `_group_node_ids_by_subproject` and the command builder `_node_id_test_config`. γ0 extracts that builder, as a behaviour-preserving refactor, from the identical block in the isolated-rerun discriminator (`confirm_isolated_rerun_verdict`) and both main-tip sweep sites (`_sweep_failure_reproduces_in_isolation`, `confirm_main_tip_failure_is_real`). That extraction is γ0's only edit to the discriminator, which is not rewired onto `run_node_ids` | γ0 |
 | INV-12 inline-suppression gate (5611) | consumes | the manifest names the gate's own test node and does not change its contract | INV-12 PRD |
 | task 5375 (former deployed with 0 events) | answers | the flip rides this PRD's carrier; code deletion stays with 5375 | 5375 |
 | task 7739 (coalesce off) | sequenced | 7739 has landed; the former flip sits after it on this PRD's branch (adjacent yaml lines) | 7739 |
@@ -327,7 +326,7 @@ checks:
     node_ids: [scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded]
   - ...                            # C8 C11 C14 C15 C18 C20
 
-# orchestrator/src/orchestrator/verify.py (extracted, shared with the isolated-rerun discriminator)
+# orchestrator/src/orchestrator/verify.py (built on _group_node_ids_by_subproject and the _node_id_test_config that γ0 extracts; the discriminator shares both)
 async run_node_ids(tree: Path, config, module_configs, ids: Collection[str], *,
                    concurrent_groups: bool = False)   # True: per-group junit path
     -> Mapping[str, Literal['pass', 'fail', 'error', 'skipped']]
@@ -428,11 +427,12 @@ Rules for every leaf:
 The leaves:
 
 - **γ0, the shared node-id runner** (medium). No dependencies. It touches no `worker.py`, so it can start at once.
-  - Extracts `verify.py::run_node_ids` from the isolated-rerun discriminator (`confirm_isolated_rerun_verdict`), which then calls it.
+  - First extracts the command builder `verify.py::_node_id_test_config` from the identical scope → serial → per-test timeout → test-leg-only block in `confirm_isolated_rerun_verdict`, `_sweep_failure_reproduces_in_isolation` and `confirm_main_tip_failure_is_real`. The extraction is behaviour-preserving and is γ0's only edit to `confirm_isolated_rerun_verdict`.
+  - Builds `verify.py::run_node_ids` on the shared node-id → module mapping (`_group_node_ids_by_subproject`) and that command builder. The isolated-rerun discriminator (`confirm_isolated_rerun_verdict`) does **not** call `run_node_ids`: it keeps its `_RerunPolicy` engines and classifies each attempt from the whole `VerifyResult`, which `run_node_ids`'s per-id return cannot support.
     - It groups ids by module, runs each group as a structured pytest command under the module's own cwd and `uv run` form, and reads junit into `pass` / `fail` / `error` / `skipped`.
-    - `concurrent_groups=True` runs the groups concurrently, each with its own junit path. The default stays serial, as the discriminator's isolation requires.
-  - Modules: orchestrator (`verify.py` and the discriminator's tests). ~300 LOC.
-  - **Signal:** the discriminator's existing tests pass unchanged through the extracted runner. A new public-seam test runs `run_node_ids` on a real fixture tree with one passing, one failing and one uncollectable id, and gets `pass` / `fail` / `error`.
+    - `concurrent_groups=True` runs the groups concurrently, each with its own junit path. The default stays serial.
+  - Modules: orchestrator (`verify.py`). ~300 LOC.
+  - **Signal:** the discriminator's existing tests (`test_flake_discriminator.py`) pass unchanged, since the `_node_id_test_config` extraction is behaviour-preserving and the discriminator is not rewired onto `run_node_ids`. A new public-seam test runs `run_node_ids` on a real fixture tree with one passing, one failing and one uncollectable id, and gets `pass` / `fail` / `error`.
 - **α, the screen and the per-item lane screen** (high). Depends on γ0.
   - Builds `scripts/merge_screen.yaml` (the seven checks), `merge_lane/screen.py` (manifest load and validation, plus `run_screen` over `run_node_ids`), and the `classify_and_merge` (merger path) and `_do_train_merge` call sites.
   - Adds:
@@ -443,6 +443,7 @@ The leaves:
     - the config block `merge_screen.{manifest, timeout_secs, chain_timeout_secs, error_streak_alarm}` (reloadable, default off), enabled in this repo's yaml. That is a shipped-config change, so the whole orchestrator suite runs first (the conftest pins `ORCH_CONFIG_PATH` to the shipped yaml).
   - Adds a guard test that *runs* every manifest node id on the pinned tree and fails if any is missing or skipped (INV-10): a renamed or skipping test must not silently empty the screen.
   - Builds the two persistent screen lanes, each with an ephemeral fallback (decision 4).
+  - **Note, failure text (decision 5):** a screen finding carries the failure summary plus captured output, but `run_node_ids` returns per-id statuses only. α must either widen that return (for example to carry per-id failure text and captured output) or obtain the failure text some other way. If widened, the discriminator is unaffected, as it does not call `run_node_ids`.
   - **Acceptance:** the per-item lane screen's median wall is ≤ 20 s (decision 4), recorded in the commit, together with the warm figure re-measured through `run_node_ids`.
     - Basis: the `scripts` group ≈ 8–10 s warm and the `orchestrator` group ≈ 3–5 s, run concurrently, plus a reset of a few seconds.
     - With the groups run serially it would be ≈ 15–20 s, which is borderline.
@@ -507,7 +508,7 @@ The former-off flip is not a leaf. It rides this PRD's carrier (decision 11).
 | INV-2 | bounces carry structured findings and check ids; verdict events carry sha, F and owner |
 | INV-3 | arming re-checks the probe sha against main; clearing is a fresh probe; holds key on real main |
 | INV-4 | the screen's error streak files an L1. The verdict's re-probe has its own streak, which degrades the verdict and amends the owner L1. Expiry does the same |
-| INV-5 / INV-9 | one check list (the manifest), read by both screens; one node-id runner (`run_node_ids`) for the screen, the F run and the discriminator; one verdict home (`VerdictBook`) |
+| INV-5 / INV-9 | one check list (the manifest), read by both screens; one node-id runner (`run_node_ids`) for the screen and the F run, with the discriminator sharing its mapping (`_group_node_ids_by_subproject`) and command builder (`_node_id_test_config`); one verdict home (`VerdictBook`) |
 | INV-6 | holds write no status |
 | INV-7 | each hold is owned (`owner_esc_id`), bounded (`max_hold_secs`, degrade), operator-exitable (`resolve_issue` on the owner, or the disable reload) and visible with its age; a restart drops it coherently |
 | INV-8 | every screen is an awaited subprocess with a timeout, so nothing blocks the loop thread |

@@ -14,7 +14,13 @@ source cannot reach the model. Of the maintenance package, it imports only
 The seam is :class:`ShardAsker`: a structured :class:`Shard` in, a
 :class:`ShardReply` out. :func:`adjudicate_links` owns sharding, id validation,
 parsing and the failed-shard streak, so every asker, fake or real, runs through
-them. :class:`ClaudeShardAsker` is the production asker, in the shape of
+them. :func:`configured_adjudicator` reads the brief once and binds it, with
+the ``link_heal`` leaves, into a :class:`ConfiguredAdjudicator` that names its
+model and prompt version (:func:`prompt_sha256`), so every verdict of a run is
+attributable to the one prompt it was asked under. The model is named as
+``link_heal.adjudicator_model`` spells it: an alias such as ``opus`` names the
+same adjudicator after the CLI moves it to a newer model.
+:class:`ClaudeShardAsker` is the production asker, in the shape of
 ``middleware/path_scope_adjudicator.py::PathScopeAdjudicator.adjudicate`` and
 ``reconciliation/judge.py::Judge._call_judge_cli``: the Claude CLI over OAuth,
 schema-bound output, every tool denied, no MCP servers, a neutral cwd.
@@ -23,6 +29,7 @@ schema-bound output, every tool denied, no MCP servers, a neutral cwd.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -152,6 +159,14 @@ _PROTOCOL = (
 
 def render_system_prompt(brief_text: str) -> str:
     return f'{brief_text.rstrip()}\n\n## Protocol for this call\n\n{_PROTOCOL}\n'
+
+
+def prompt_sha256(brief_text: str, field_chars: int) -> str:
+    """The prompt version: the sha256 of everything besides the model that decides what
+    the model is asked, the system prompt *brief_text* renders and the *field_chars*
+    cap its pair texts are cut to."""
+    identity = {'system_prompt': render_system_prompt(brief_text), 'field_chars': field_chars}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode('utf-8')).hexdigest()
 
 
 def render_user_prompt(shard: Shard) -> str:
@@ -354,17 +369,20 @@ Invoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
 
 
 class ClaudeShardAsker:
-    """Asks one shard of the Claude CLI, with the rater brief read afresh as its instructions."""
+    """Asks one shard of the Claude CLI with the rater brief as its instructions:
+    *brief_text* when given, else the brief at *brief_path* read afresh per shard."""
 
     def __init__(
         self,
         *,
+        brief_text: str | None = None,
         brief_path: Path = RATER_BRIEF_PATH,
         invoke: Invoke = invoke_with_cap_retry,
         timeout_seconds: float = _SHARD_TIMEOUT_SECONDS,
         max_budget_usd: float = _SHARD_MAX_BUDGET_USD,
         max_turns: int = _MAX_TURNS,
     ) -> None:
+        self._brief_text = brief_text
         self._brief_path = brief_path
         self._invoke = invoke
         self._timeout_seconds = timeout_seconds
@@ -373,7 +391,9 @@ class ClaudeShardAsker:
 
     async def __call__(self, shard: Shard) -> ShardReply:
         try:
-            brief = await asyncio.to_thread(self._brief_path.read_text, encoding='utf-8')
+            brief = self._brief_text
+            if brief is None:
+                brief = await asyncio.to_thread(self._brief_path.read_text, encoding='utf-8')
             result = await self._invoke(
                 usage_gate=None,
                 label=f'link-adjudicator[{shard.model}]',
@@ -413,27 +433,64 @@ def _shard_reply(result: AgentResult) -> ShardReply:
 
 
 class LinkAdjudicator(Protocol):
+    """Judges pairs, naming the model and the prompt version its verdicts come from."""
+
+    @property
+    def model(self) -> str: ...
+
+    @property
+    def prompt_sha256(self) -> str: ...
+
     async def __call__(
         self, pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
     ) -> list[LinkVerdict]: ...
 
 
-def configured_adjudicator(
-    config: LinkHealConfig, *, ask: ShardAsker | None = None,
-) -> LinkAdjudicator:
-    """:func:`adjudicate_links` with the ``link_heal`` leaves bound, as read now."""
+@dataclass(frozen=True)
+class ConfiguredAdjudicator:
+    """:func:`adjudicate_links` with its leaves and one rendered prompt bound."""
 
-    async def adjudicate(
-        pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
+    model: str
+    prompt_sha256: str
+    shard_size: int
+    field_chars: int
+    failure_streak: int
+    ask: ShardAsker
+
+    async def __call__(
+        self, pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
     ) -> list[LinkVerdict]:
         return await adjudicate_links(
             pairs,
-            model=config.adjudicator_model,
-            shard_size=config.shard_size,
-            field_chars=config.field_chars,
-            failure_streak=config.shard_failure_streak,
-            ask=ask,
+            model=self.model,
+            shard_size=self.shard_size,
+            field_chars=self.field_chars,
+            failure_streak=self.failure_streak,
+            ask=self.ask,
             on_failure_storm=on_failure_storm,
         )
 
-    return adjudicate
+
+def configured_adjudicator(
+    config: LinkHealConfig,
+    *,
+    ask: ShardAsker | None = None,
+    brief_text: str | None = None,
+    brief_path: Path = RATER_BRIEF_PATH,
+    invoke: Invoke = invoke_with_cap_retry,
+) -> ConfiguredAdjudicator:
+    """The ``link_heal`` leaves and the brief, both read now, bound for a run.
+
+    *brief_text* defaults to the brief at *brief_path*, read once here; *ask*
+    defaults to a :class:`ClaudeShardAsker` over that same text, calling the CLI
+    through *invoke*.
+    """
+    brief = brief_path.read_text(encoding='utf-8') if brief_text is None else brief_text
+    return ConfiguredAdjudicator(
+        model=config.adjudicator_model,
+        prompt_sha256=prompt_sha256(brief, config.field_chars),
+        shard_size=config.shard_size,
+        field_chars=config.field_chars,
+        failure_streak=config.shard_failure_streak,
+        ask=ClaudeShardAsker(brief_text=brief, invoke=invoke) if ask is None else ask,
+    )

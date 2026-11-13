@@ -17,11 +17,12 @@ from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
 from typing import Literal
 
+from shared.whole_tree_guard_family import is_whole_tree_guard_module
+
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
     addopts_tokens,
     deselecting_expression_for_targets,
-    is_whole_tree_guard_module,
     locate_pytest_config,
 )
 from orchestrator.verify_cmd import (
@@ -37,6 +38,7 @@ from orchestrator.verify_cmd import (
     split_chain_tail,
     strip_cwd,
 )
+from orchestrator.verify_evidence import Leg
 
 logger = logging.getLogger(__name__)
 
@@ -1488,6 +1490,31 @@ def executed_module_prefixes(plan: VerifyPlan) -> frozenset[str]:
         prefix for prefix, runs in runs_by_prefix.items()
         if not (len(runs) == 1 and runs[0].cmd is None and runs[0].scope_kind is ScopeKind.SKIPPED)
     )
+
+
+# The tool prefix this module writes onto every per-tool run's reason; the only
+# record of a run's leg, since PlannedRun carries no leg field.
+_LEG_BY_REASON_PREFIX: tuple[tuple[str, Leg], ...] = (
+    ('lint:', Leg.LINT),
+    ('pyright:', Leg.TYPE),
+    ('pytest:', Leg.TEST),
+)
+
+
+def planned_run_leg(run: PlannedRun) -> Leg | None:
+    """The check *run* plans, from its reason prefix; None for a run keyed to no
+    check, such as the fallback's single 'no .py files touched' SKIPPED run."""
+    for prefix, leg in _LEG_BY_REASON_PREFIX:
+        if run.reason.startswith(prefix):
+            return leg
+    return None
+
+
+def module_of(run: PlannedRun) -> str | None:
+    """The registered module *run* belongs to; None for the fallback and TRIVIAL sentinels."""
+    if run.module_prefix in (_FALLBACK_PREFIX, ''):
+        return None
+    return run.module_prefix
 
 
 # ---------------------------------------------------------------------------

@@ -2262,3 +2262,131 @@ class TestHostAllocatorReprobeParkedSlots:
         assert len(infos) == 1, infos
         assert 'remoteA' in infos[0]
         assert 'source=reprobe_sweep' in infos[0]
+
+
+# ---------------------------------------------------------------------------
+# 8523: the lease records WHY acquire() granted its host (runner_reason)
+# ---------------------------------------------------------------------------
+
+
+def _local_factory() -> _FakeLocalRunner:
+    return _FakeLocalRunner()
+
+
+@pytest.mark.asyncio
+class TestAcquireStampsRunnerReason:
+    """``acquire`` stamps ``HostLease.reason`` with the allocation decision.
+
+    The PARKED case reaches PARKED through the public cancel-fail path
+    (``cancel_and_release`` whose cancel and every probe fail).
+    """
+
+    async def test_prefer_remote_takes_a_free_remote(self):
+        from orchestrator.merge_verify_facts import RunnerReason
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('laptop')])
+        lease = await alloc.acquire(_local_factory, policy='prefer_remote')
+        assert lease is not None and lease.name == 'laptop'
+        assert lease.reason is RunnerReason.PREFER_REMOTE_FREE
+
+    async def test_prefer_remote_falls_to_local_when_the_remote_is_held(self):
+        from orchestrator.merge_verify_facts import RunnerReason
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('laptop')])
+        held = await alloc.acquire(_local_factory, policy='prefer_remote')
+        assert held is not None and held.name == 'laptop'
+        lease = await alloc.acquire(_local_factory, policy='prefer_remote')
+        assert lease is not None and lease.is_local
+        assert lease.reason is RunnerReason.REMOTE_BUSY
+
+    async def test_prefer_remote_falls_to_local_when_the_remote_is_quarantined(self):
+        from orchestrator.merge_verify_facts import RunnerReason
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('laptop')], quarantine={'laptop'})
+        lease = await alloc.acquire(_local_factory, policy='prefer_remote')
+        assert lease is not None and lease.is_local
+        assert lease.reason is RunnerReason.REMOTE_QUARANTINED
+
+    async def test_prefer_remote_falls_to_local_when_the_remote_is_parked(self):
+        from orchestrator.merge_verify_facts import RunnerReason
+        from orchestrator.verify_runner import HostAllocator
+
+        remote = _FakeRemoteRunnerCancellable(
+            'laptop', cancel_rc=1, probe_sequence=[False] * 20,
+        )
+        alloc = HostAllocator([remote], quarantine=set())
+        held = alloc.acquire_remote()
+        assert held is not None
+        assert await alloc.cancel_and_release(
+            held, sleep=_noop_sleep, max_attempts=2,
+        ) is False
+        assert alloc.is_parked('laptop')
+
+        lease = await alloc.acquire(_local_factory, policy='prefer_remote')
+        assert lease is not None and lease.is_local
+        assert lease.reason is RunnerReason.REMOTE_QUARANTINED
+
+    async def test_a_busy_remote_outranks_a_quarantined_one(self):
+        from orchestrator.merge_verify_facts import RunnerReason
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator(
+            [_FakeRemoteRunner('busy'), _FakeRemoteRunner('benched')],
+            quarantine={'benched'},
+        )
+        held = await alloc.acquire(_local_factory, policy='prefer_remote')
+        assert held is not None and held.name == 'busy'
+        lease = await alloc.acquire(_local_factory, policy='prefer_remote')
+        assert lease is not None and lease.is_local
+        assert lease.reason is RunnerReason.REMOTE_BUSY
+
+    async def test_prefer_remote_with_no_remotes_is_local_by_rule(self):
+        from orchestrator.merge_verify_facts import RunnerReason
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([])
+        lease = await alloc.acquire(_local_factory, policy='prefer_remote')
+        assert lease is not None and lease.is_local
+        assert lease.reason is RunnerReason.LOCAL_ONLY_RULE
+
+    async def test_prefer_local_takes_free_local(self):
+        from orchestrator.merge_verify_facts import RunnerReason
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('laptop')])
+        lease = await alloc.acquire(_local_factory, policy='prefer_local')
+        assert lease is not None and lease.is_local
+        assert lease.reason is RunnerReason.PREFER_LOCAL_FREE
+
+    async def test_prefer_local_overflows_to_a_remote_when_local_is_held(self):
+        from orchestrator.merge_verify_facts import RunnerReason
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('laptop')])
+        held = await alloc.acquire(_local_factory, policy='prefer_local')
+        assert held is not None and held.is_local
+        lease = await alloc.acquire(_local_factory, policy='prefer_local')
+        assert lease is not None and lease.name == 'laptop'
+        assert lease.reason is RunnerReason.LOCAL_BUSY
+
+    async def test_nothing_eligible_is_still_none(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([])
+        assert await alloc.acquire(_local_factory, policy='prefer_remote') is not None
+        assert await alloc.acquire(_local_factory, policy='prefer_remote') is None
+        assert await alloc.acquire(_local_factory, policy='prefer_local') is None
+
+    async def test_direct_slot_acquisition_carries_no_reason(self):
+        from orchestrator.verify_runner import HostAllocator, HostLease
+
+        alloc = HostAllocator([_FakeRemoteRunner('laptop')])
+        local = alloc.acquire_local(_local_factory)
+        remote = alloc.acquire_remote()
+        assert local is not None and local.reason is None
+        assert remote is not None and remote.reason is None
+        bare = HostLease(name='local', runner=_FakeLocalRunner(), is_local=True)
+        assert bare.reason is None

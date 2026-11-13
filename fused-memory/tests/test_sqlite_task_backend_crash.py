@@ -81,7 +81,6 @@ async def reopened_backend(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(120)
 @pytest.mark.parametrize('n_commits', [50])
 async def test_committed_rows_survive_sigkill(
     tmp_path: Path,
@@ -113,7 +112,6 @@ async def test_committed_rows_survive_sigkill(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
 async def test_repeated_sigkill_cycles_preserve_durability(
     tmp_path: Path,
 ) -> None:

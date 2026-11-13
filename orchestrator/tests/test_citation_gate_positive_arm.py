@@ -83,7 +83,7 @@ import subprocess
 from pathlib import Path
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps
+from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps, render_citation_pattern
 
 TASK_ID = '4924'
 
@@ -148,7 +148,9 @@ def _citation_walk(root: Path, tid: str) -> str | None:
     AGREES with `_real_citation_walk` on the same repo, which is what
     keeps the runbook's transcription honest as production moves.
     """
-    pattern_str = DEFAULT_COMMIT_CITATION_PATTERN.format(tid=re.escape(tid))
+    pattern_str = render_citation_pattern(
+        DEFAULT_COMMIT_CITATION_PATTERN, tid, branch_prefix='task/', main_branch='main',
+    )
     compiled = re.compile(pattern_str)
     out = _git(
         root, 'log', 'main', '--extended-regexp',
@@ -234,7 +236,9 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
     tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
     assert tip == base, 'the phantom branch tip must be main\'s own old base commit'
     assert tip != sibling, 'the tip and the citing sha must be distinct commits'
-    compiled = re.compile(DEFAULT_COMMIT_CITATION_PATTERN.format(tid=re.escape(TASK_ID)))
+    compiled = re.compile(render_citation_pattern(
+        DEFAULT_COMMIT_CITATION_PATTERN, TASK_ID, branch_prefix='task/', main_branch='main',
+    ))
     base_subject = _git(root, 'log', '-1', '--format=%s', base)
     assert not compiled.search(base_subject), (
         f'the branch tip subject {base_subject!r} must NOT cite task {TASK_ID} -- that is '

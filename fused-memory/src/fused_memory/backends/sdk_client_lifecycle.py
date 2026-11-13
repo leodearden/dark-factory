@@ -1,7 +1,7 @@
 """Release the async SDK clients that graphiti_core wrappers mint and never close.
 
 Why an unclosed one matters is documented once, at
-fused-memory/tests/_fm_helpers.py::reap_leaked_async_httpx_clients.
+fused-memory/tests/_fm_httpx_leaks.py::reap_leaked_async_httpx_clients.
 """
 
 import inspect

@@ -1,10 +1,7 @@
 """Tests for L2 severity-gated born-at-L2 path and get_pending_escalations level filter.
 
-Uses the async FastMCP unit-test pattern from test_server_chokepoint.py:
-    tool = await server.get_tool(name)
-    result = await tool.fn(...)
-
-and tmp_path isolation with EscalationQueue.
+Drives tools through ``_tool_calls.py::call_tool``, directly or via a shared
+per-family wrapper, and uses tmp_path isolation with EscalationQueue.
 """
 
 from __future__ import annotations
@@ -21,8 +18,15 @@ from typing import Any
 import pytest
 from _escalation_seed import seed_escalation
 from _filing_tools import call_blocker, call_info, call_promote
-from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
+from _merge_tool_calls import (
+    call_get_merge_queue,
+    call_merge_cancel,
+    call_merge_request,
+    call_merge_status,
+)
+from _pending_tool_fixtures import _get_pending
 from _resolve_issue_call import call_resolve_issue
+from _tool_calls import call_tool
 from shared.merge_state import MergeReason
 
 from escalation import server as escalation_server
@@ -90,35 +94,20 @@ _COMMON_KWARGS: dict[str, Any] = {
 }
 
 
-async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
-    tool = await server.get_tool('get_pending_escalations')
-    # async def as of task 3543 — it awaits a batched scheduler status read to
-    # compute each record's pins_recovery annotation.
-    return await tool.fn(**kwargs)
-
-
 async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('stamp_triage')
-    # stamp_triage is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    return await call_tool(server, 'stamp_triage', **kwargs)
 
 
 async def _declare_pin(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('declare_pin')
-    # declare_pin is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    return await call_tool(server, 'declare_pin', **kwargs)
 
 
 async def _get_task_escalations(server, **kwargs: Any) -> list[dict[str, Any]]:
-    tool = await server.get_tool('get_task_escalations')
-    # get_task_escalations is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    return await call_tool(server, 'get_task_escalations', **kwargs)
 
 
 async def _get_escalation(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('get_escalation')
-    # get_escalation is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    return await call_tool(server, 'get_escalation', **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -4952,12 +4941,6 @@ class TestMergeRequestWorkflowVerifyEmission:
 # ---------------------------------------------------------------------------
 
 
-async def _call_get_merge_queue(server) -> dict[str, Any]:
-    """Invoke the get_merge_queue MCP tool directly (sync tool)."""
-    tool = await server.get_tool('get_merge_queue')
-    return tool.fn()
-
-
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestGetMergeQueue:
@@ -4966,14 +4949,34 @@ class TestGetMergeQueue:
     @staticmethod
     async def _finalize_through_gate(worker, entry) -> bool:
         """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
-        re-verify (task 6155), as
+        re-verify (task 6155) and following its rebased head when the gate's
+        re-verify became a dispatch (task 8525), as
         ``orchestrator/tests/_merge_queue_harness.py::finalize_through_gate``
         does for the orchestrator suite.  Returns True iff main advanced.
+
+        This suite's entries carry ``verify_task=None``, a pre-established
+        pass, so the followed head is launched as one too.
         """
+        from orchestrator.merge_lane.worker import InflightEntry
+
+        async def _launch_passed(head):
+            return InflightEntry(
+                item=head, lease=None, verify_task=None, merge_wt=head.merge_wt,
+                was_speculative=False,
+            )
+
         while True:
             advanced = await worker._finalize_inflight(entry)
-            if entry.gate is None:
-                return advanced
+            if entry.gate is not None:
+                continue
+            if advanced:
+                return True
+            followed = await worker.dispatch_parked_rebased_head(
+                entry.item.request.request_id, _launch_passed,
+            )
+            if followed is None:
+                return False
+            entry = followed
 
     def _make_finalize_fixture(
         self,
@@ -5073,7 +5076,7 @@ class TestGetMergeQueue:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)  # NO merge_queue — standalone
 
-        result = await _call_get_merge_queue(server)
+        result = await call_get_merge_queue(server)
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert 'error' in result, f'Expected error key, got: {result}'
@@ -5172,7 +5175,7 @@ class TestGetMergeQueue:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
 
-        result = await _call_get_merge_queue(server)
+        result = await call_get_merge_queue(server)
 
         assert isinstance(result, dict), f'Expected dict, got: {result}'
         assert 'error' not in result, f'Unexpected error: {result}'
@@ -5226,7 +5229,7 @@ class TestGetMergeQueue:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
 
-        result = await _call_get_merge_queue(server)
+        result = await call_get_merge_queue(server)
         entries = result.get('entries', [])
 
         live_entry = next((e for e in entries if e['task_id'] == 'LIVE'), None)
@@ -5333,7 +5336,7 @@ class TestGetMergeQueue:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
 
-        result = await _call_get_merge_queue(server)
+        result = await call_get_merge_queue(server)
 
         assert 'error' not in result, f'Unexpected error: {result}'
         entries = result['entries']
@@ -6745,19 +6748,6 @@ class TestCreateServerStartupSweep:
         assert not (queue.queue_dir / 'archive').exists()
 
 
-async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
-    """Invoke an async MCP tool by name.
-
-    *server* is intentionally typed ``Any`` so pyright does not reach into
-    FastMCP's ``Tool`` internals (``.fn``) — mirroring
-    ``_filing_tools.py::call_blocker`` / ``call_info`` and
-    ``_merge_tool_calls.py::call_merge_status``,
-    which the type-check gate accepts for exactly this reason.
-    """
-    tool = await server.get_tool(name)
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
 class TestOperatorHaltTools:
     """halt_merge_queue / halt_scheduler — operator-only halt-direction tools.
@@ -6781,7 +6771,7 @@ class TestOperatorHaltTools:
     ) -> None:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)  # no harness wired
-        result = await _call_tool(server, 'halt_merge_queue', reason='bad main')
+        result = await call_tool(server, 'halt_merge_queue', reason='bad main')
         assert result['halted'] is False
         assert 'standalone' in result['error']
 
@@ -6798,7 +6788,7 @@ class TestOperatorHaltTools:
         stub_harness = types.SimpleNamespace(halt_merge_queue=_halt)
         server = create_server(queue, harness=stub_harness)
 
-        result = await _call_tool(server, 'halt_merge_queue', reason='  infra incident  ')
+        result = await call_tool(server, 'halt_merge_queue', reason='  infra incident  ')
 
         assert calls == ['infra incident'], 'reason must be forwarded stripped'
         assert result == {'halted': True, 'reason': 'infra incident'}
@@ -6813,7 +6803,7 @@ class TestOperatorHaltTools:
         )
         server = create_server(queue, harness=stub_harness)
 
-        result = await _call_tool(server, 'halt_merge_queue', reason='   ')
+        result = await call_tool(server, 'halt_merge_queue', reason='   ')
 
         assert result['halted'] is False
         assert 'reason' in result['error']
@@ -6826,7 +6816,7 @@ class TestOperatorHaltTools:
     ) -> None:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)  # no harness wired
-        result = await _call_tool(server, 'halt_scheduler', reason='runaway')
+        result = await call_tool(server, 'halt_scheduler', reason='runaway')
         assert result['halted'] is False
         assert 'standalone' in result['error']
 
@@ -6846,7 +6836,7 @@ class TestOperatorHaltTools:
         stub_harness = types.SimpleNamespace(force_halt_scheduler=_force_halt)
         server = create_server(queue, harness=stub_harness)
 
-        result = await _call_tool(server, 'halt_scheduler', reason='  bad deploy  ')
+        result = await call_tool(server, 'halt_scheduler', reason='  bad deploy  ')
 
         assert calls == ['bad deploy'], 'reason must be forwarded stripped'
         assert result['halted'] is True
@@ -6865,7 +6855,7 @@ class TestOperatorHaltTools:
         stub_harness = types.SimpleNamespace(force_halt_scheduler=_force_halt)
         server = create_server(queue, harness=stub_harness)
 
-        result = await _call_tool(server, 'halt_scheduler', reason='')
+        result = await call_tool(server, 'halt_scheduler', reason='')
 
         assert result['halted'] is False
         assert 'reason' in result['error']
@@ -6893,7 +6883,7 @@ class TestReloadConfigTool:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)  # no harness wired
 
-        result = await _call_tool(server, 'reload_config')
+        result = await call_tool(server, 'reload_config')
 
         assert result['reloaded'] is False
         assert 'standalone' in result['error']
@@ -6918,7 +6908,7 @@ class TestReloadConfigTool:
         stub_harness = types.SimpleNamespace(reload_config=_reload_config)
         server = create_server(queue, harness=stub_harness)
 
-        result = await _call_tool(server, 'reload_config')
+        result = await call_tool(server, 'reload_config')
 
         assert result == canned_report, 'must return the harness report verbatim'
         assert calls == [((), {})], 'harness.reload_config must be awaited exactly once with no arguments'

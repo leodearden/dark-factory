@@ -1018,6 +1018,9 @@ async def open_conn(tmp_path: Path):
     seconds.  Belt and braces: connections are opened through
     :func:`connect_daemon`, the repo convention that marks the worker thread
     daemon, so even a teardown that is itself skipped cannot wedge exit.
+
+    Its connections skip fsync (``synchronous=OFF``); see
+    :func:`test_open_conn_commits_do_not_wait_on_the_disk`.
     """
     conns: list[aiosqlite.Connection] = []
 
@@ -1026,6 +1029,8 @@ async def open_conn(tmp_path: Path):
         conns.append(conn)
         conn.row_factory = aiosqlite.Row
         await apply_wal_pragmas(conn, busy_timeout_ms=5000)
+        # Rationale: test_open_conn_commits_do_not_wait_on_the_disk
+        await conn.execute('PRAGMA synchronous=OFF')
         return conn
 
     try:
@@ -1034,6 +1039,30 @@ async def open_conn(tmp_path: Path):
         for conn in conns:
             with suppress(Exception):
                 await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_open_conn_commits_do_not_wait_on_the_disk(tmp_path, open_conn):
+    """open_conn hands out connections running with PRAGMA synchronous=OFF.
+
+    Tests built on open_conn bound their units with wall-clock hang guards
+    (asyncio.wait_for, _GATE_HANG_GUARD_SECS).  Under
+    synchronous=FULL every write unit's COMMIT and every TRUNCATE checkpoint
+    is an fsync, whose latency is set by whatever else is writing to the host
+    disk, not by the code under test.  That is how a 10s guard in
+    TestAtomicConnectionCheckpoint fired with the write unit still in its
+    commit (task 8719).  No test here kills the process, so none needs
+    power-loss durability, and the lock and transaction semantics under test
+    do not depend on synchronous.
+    """
+    conn = await open_conn(tmp_path / 'sync.db')
+    async with conn.execute('PRAGMA synchronous') as cur:
+        row = await cur.fetchone()
+    assert row is not None and row[0] == 0, (
+        f'open_conn hands out PRAGMA synchronous={None if row is None else row[0]}, expected 0 (OFF): '
+        'every commit and TRUNCATE checkpoint would wait on host-disk fsync '
+        "latency inside this module's wall-clock hang guards"
+    )
 
 
 @pytest.mark.asyncio

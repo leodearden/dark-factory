@@ -287,9 +287,9 @@ def _assert_quiescent(
           ``sweep_resolved()`` runs; calling it here before ``is_empty()``
           is required, not optional.
       (e) worker.two_layer_invariants(main_sha) == [] — *main_sha* MUST be a
-          REAL sha, never 'unknown': the base-chain and verify-base
-          sub-checks are silently skipped for the 'unknown' sentinel, which
-          would make this assertion pass vacuously rather than meaningfully.
+          REAL sha, never 'unknown': the base-chain (INV-3) sub-check is
+          silently skipped for the 'unknown' sentinel, which would make this
+          assertion pass vacuously rather than meaningfully.
       (f) worker.snapshot()['entries'] == [] — the lane's public census is
           empty: every request_id has left both the containers and the
           ItemLifecycle registry (snapshot's own non-terminal section is
@@ -499,7 +499,7 @@ class TestLandedViaChainCarrier:
         assert set(rows[0]) == {
             'request_id', 'branch', 'state', 'snapshot_tip', 'merge_sha',
             'superseded_by', 'generation', 'reason', 'landed_via_chain',
-            'absorbed_request_ids',
+            'absorbed_request_ids', 'queue_to_land_secs',
         }
         assert rows[0]['absorbed_request_ids'] == []
         assert rows[0]['request_id'] == req.request_id
@@ -2636,8 +2636,9 @@ class TestAdoptedHeadLandsWithThePostVerifyWorktree:
     async def test_a_gated_adopted_head_still_heads_the_frozen_prefix(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """An adopted head has no verify task, and while it waits on its gate
-        re-verify it must still head the frozen prefix (task 6155).
+        """An adopted head has no verify task, and while it waits on its gate,
+        and then while its rebased commit re-verifies as a dispatch, it must
+        still head the frozen prefix (tasks 6155, 8525).
 
         Read off the verify task alone, the prefix drops it there: a follower
         then reads as the head, and dispatch reads no verify in flight.

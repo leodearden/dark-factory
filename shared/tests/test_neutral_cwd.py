@@ -8,6 +8,12 @@ call's cache-creation — see task 1989.
 
 from __future__ import annotations
 
+import pytest
+
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 
 class TestNeutralCliCwd:
     def test_returns_existing_directory(self):

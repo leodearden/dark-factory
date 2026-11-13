@@ -51,6 +51,9 @@ import check_lock_charter_drift as drift
 import pytest
 import shared.reify_checkout as reify_checkout
 from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_path
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The two vectors dark-factory declares, in the exact form the guard script
 # emits them (one per line, sorted).  Read from `shared.locking` — never from

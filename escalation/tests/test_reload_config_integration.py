@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import yaml
+from _tool_calls import call_tool
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -46,12 +47,6 @@ except ImportError:
     EventStore: Any = None
     Harness: Any = None
     RunStore: Any = None
-
-
-async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
-    """Invoke an async MCP tool by name (mirrors test_server.py:3661)."""
-    tool = await server.get_tool(name)
-    return await tool.fn(**kwargs)
 
 
 def _make_reload_harness(tmp_path: Path, monkeypatch) -> tuple[Any, Path]:
@@ -125,7 +120,7 @@ class TestReloadConfigToolIntegration:
         _edit_yaml(config_path, 'models.implementer', new_implementer)
         _edit_yaml(config_path, 'max_concurrent_tasks', live_mct + 1)
 
-        result = await _call_tool(server, 'reload_config')
+        result = await call_tool(server, 'reload_config')
 
         assert result['reloaded'] is True
         assert result['config_path'] == str(config_path)

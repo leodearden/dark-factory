@@ -29,6 +29,9 @@ from legibility import config as config_mod
 from legibility import plan_deviation_census as mod
 from shared.plan_deviation import DEVIATION_KINDS, DeviationRecord
 from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _LOGGER = 'legibility.plan_deviation_census'
 
@@ -1020,7 +1023,6 @@ def _run_red_night(
         target_date=date(2026, 10, 24),
         now=NOW,
         invoke=_never_invoked,
-        status_fetcher=lambda: {'statuses': {}},
         poster=lambda url, envelope: posted.append((url, envelope)),
         pass_kind=pass_kind,
         **seams,

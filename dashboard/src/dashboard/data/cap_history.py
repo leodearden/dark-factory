@@ -1,6 +1,6 @@
 """Shared cap-interval reader for the dashboard.
 
-Extracts ``cap_hit``/``resumed`` event pairs from ``account_events`` into
+Folds ``cap_hit``/``resumed`` events from ``account_events`` into
 :class:`CapInterval` objects.  The Curator tab (and any future consumer) should
 call :func:`read_cap_intervals` rather than inlining their own SQL; the Costs
 tab keeps its own CTE query for legacy reasons (see ``costs.py`` docstring on
@@ -10,7 +10,8 @@ Public API
 ----------
 - :class:`CapInterval` — frozen dataclass with ``account_name``, ``start``,
   ``end`` (``None`` means still capped at query time).
-- :func:`read_cap_intervals` — async reader over one or more DB connections.
+- :func:`read_cap_intervals` — async reader over one or more DB connections;
+  folds each account's events by cap state (see its docstring for the rules).
 - :func:`merge_all_accounts_capped` — intersect intervals across all accounts.
 - :func:`compute_overlap_ms` — sum capped-overlap milliseconds for a window.
 - :func:`bucketise_cap_sparkline` — produce a 0/1 :class:`ChartData` sparkline.
@@ -33,10 +34,10 @@ windows filtered out) and
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import aiosqlite
 
@@ -53,8 +54,8 @@ from dashboard.data.utils import resolve_now
 class CapInterval:
     """A contiguous period during which an account was capped.
 
-    ``end=None`` means the cap was still in effect at query time (no matching
-    ``resumed`` event was found within the query window).
+    ``end=None`` means the cap was still in effect at query time: no
+    ``resumed`` closed it and no known ``resets_at`` had passed.
     """
 
     account_name: str
@@ -85,6 +86,83 @@ def _to_utc(dt: datetime | None) -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# Cap-event parsing and folding
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _CapEvent:
+    """One ``account_events`` row: a cap (with its reset, when known) or a resume."""
+
+    kind: Literal['cap_hit', 'resumed']
+    at: datetime
+    resets_at: datetime | None = None
+
+
+def _details_dict(raw: str | bytes | None) -> dict | None:
+    """Return the ``details`` payload as a dict, or None when absent or not a JSON object."""
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _known_reset(details: dict | None, at: datetime) -> datetime | None:
+    """Return ``details.resets_at`` in UTC when it parses and lies after *at*."""
+    value = details.get('resets_at') if details is not None else None
+    if not isinstance(value, str):
+        return None
+    try:
+        resets_at = _to_utc(datetime.fromisoformat(value))
+    except ValueError:
+        return None
+    return resets_at if resets_at > at else None
+
+
+def _parse_cap_event(row: aiosqlite.Row) -> _CapEvent | None:
+    """Parse one row; None for a scoped (per-model) cap, which never caps the account."""
+    at = _to_utc(datetime.fromisoformat(row['created_at']))
+    if row['event_type'] == 'resumed':
+        return _CapEvent(kind='resumed', at=at)
+    details = _details_dict(row['details'])
+    if details is not None and 'scope' in details:
+        return None
+    return _CapEvent(kind='cap_hit', at=at, resets_at=_known_reset(details, at))
+
+
+def _fold_cap_events(
+    account_name: str, events: list[_CapEvent], now: datetime
+) -> list[CapInterval]:
+    """Fold one account's chronologically ordered events into its cap intervals.
+
+    The account is either uncapped (``start is None``) or capped since
+    ``start``, with ``reset`` its last known reset instant (or None).
+    """
+    intervals: list[CapInterval] = []
+    start: datetime | None = None
+    reset: datetime | None = None
+    for event in events:
+        if event.kind == 'resumed':
+            if start is not None:
+                intervals.append(CapInterval(account_name=account_name, start=start, end=event.at))
+            start = reset = None
+        elif start is None:
+            start, reset = event.at, event.resets_at
+        elif reset is not None and event.at >= reset:
+            intervals.append(CapInterval(account_name=account_name, start=start, end=reset))
+            start, reset = event.at, event.resets_at
+        elif event.resets_at is not None:
+            reset = event.resets_at
+    if start is not None:
+        end = reset if reset is not None and reset <= now else None
+        intervals.append(CapInterval(account_name=account_name, start=start, end=end))
+    return intervals
+
+
+# ---------------------------------------------------------------------------
 # read_cap_intervals
 # ---------------------------------------------------------------------------
 
@@ -98,16 +176,33 @@ async def read_cap_intervals(
     """Return all cap intervals across *dbs* within the last *days* days.
 
     Queries each DB's ``account_events`` table for ``cap_hit`` and ``resumed``
-    rows in the window, partitions rows by ``account_name``, and FIFO-pairs
-    them: each ``cap_hit`` consumes the next chronologically-later ``resumed``
-    for the same account.  Unpaired ``cap_hit`` rows become open-ended
-    intervals (``end=None``).
+    rows in the window and folds each account's rows, in time order, by cap
+    state rather than by counting events:
+
+    - a ``cap_hit`` while the account is uncapped opens an interval;
+    - a ``cap_hit`` while it is already capped is a re-detection of the same
+      cap (a restarted ``UsageGate`` re-logs it): it only updates the known
+      ``resets_at``, unless it lands at or after that reset, in which case the
+      old cap closes at its reset and a new one opens;
+    - a ``resumed`` closes the open cap at its own timestamp, and is ignored
+      when nothing is open;
+    - an unresumed cap whose known ``resets_at`` is at or before *now* closes
+      at that reset, because the gate uncaps there without writing
+      ``resumed`` (``shared/src/shared/usage_gate.py::UsageGate._refresh_capped_accounts``);
+      with an unknown reset it stays open (``end=None``);
+    - a scoped (per-model) ``cap_hit`` is ignored: it never caps the account
+      and is never resumed at account level
+      (``shared/src/shared/usage_gate.py::UsageGate._handle_cap_detected``).
+
+    A ``resets_at`` that is absent, malformed, or not after its own
+    ``cap_hit`` counts as unknown.
 
     Args:
         dbs: List of aiosqlite connections (``None`` entries are skipped).
         days: Look-back window in days.  Must be > 0; raises
             :exc:`ValueError` otherwise.
-        now: Reference instant for the look-back cutoff; defaults to
+        now: Reference instant for the look-back cutoff and for deciding
+            whether a ``resets_at`` has passed; defaults to
             ``datetime.now(UTC)``.  Pass an explicit timestamp to anchor the
             query to the same clock as the caller's other time computations
             (e.g. ticket bounds in ``_sample_curator``).  Any ``now`` value
@@ -129,7 +224,7 @@ async def read_cap_intervals(
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
         rows = await db.execute_fetchall(
-            'SELECT account_name, event_type, created_at '
+            'SELECT account_name, event_type, details, created_at '
             '  FROM account_events '
             " WHERE event_type IN ('cap_hit', 'resumed') "
             '   AND created_at >= ? '
@@ -137,31 +232,17 @@ async def read_cap_intervals(
             (cutoff,),
         )
 
-        # Group rows by account_name preserving chronological order
-        by_account: dict[str, list[tuple[str, datetime]]] = {}
+        by_account: dict[str, list[_CapEvent]] = {}
         for row in rows:
-            ts_str: str = row['created_at']
-            # Canonicalise to UTC: naive rows (no tzinfo) assumed UTC;
-            # tz-aware non-UTC rows converted via astimezone(UTC).
-            ts = _to_utc(datetime.fromisoformat(ts_str))
-            by_account.setdefault(row['account_name'], []).append((row['event_type'], ts))
+            event = _parse_cap_event(row)
+            if event is not None:
+                by_account.setdefault(row['account_name'], []).append(event)
 
-        intervals: list[CapInterval] = []
-        for account_name, events in by_account.items():
-            # FIFO pairing: pending cap_hits queue up; each resumed closes the
-            # oldest pending cap_hit; trailing cap_hits become open-ended.
-            pending: deque[datetime] = deque()
-            for event_type, ts in events:
-                if event_type == 'cap_hit':
-                    pending.append(ts)
-                elif event_type == 'resumed' and pending:
-                    start = pending.popleft()
-                    intervals.append(CapInterval(account_name=account_name, start=start, end=ts))
-            # Remaining pending cap_hits are open-ended
-            for start in pending:
-                intervals.append(CapInterval(account_name=account_name, start=start, end=None))
-
-        return intervals
+        return [
+            interval
+            for account_name, events in by_account.items()
+            for interval in _fold_cap_events(account_name, events, effective_now)
+        ]
 
     results = await asyncio.gather(*(with_db(db, _read_one, []) for db in dbs))
     flat: list[CapInterval] = []
@@ -452,18 +533,24 @@ def compute_capped_now_and_windows(
     """Derive (capped_now, capped_windows) from a single intervals list.
 
     Consolidates logic that was previously duplicated in api_curator and
-    _sample_curator.  Uses asymmetric semantics:
+    _sample_curator.  Both outputs use ONE account universe, of size
+    ``max(total_accounts, #accounts seen in intervals)`` (see
+    :func:`summarize_accounts`), so ``capped_now == 1`` exactly when
+    ``capped_windows`` ends open-ended:
 
-    - *capped_now* is 1 iff the account universe is non-empty AND no account
-      is currently usable (``available == 0``), where universe size =
-      ``max(total_accounts, #accounts seen in intervals)``.  Pass
-      ``total_accounts`` (the gate's ``account_count``) so healthy accounts
-      with no recent cap events are counted as available; omit it (``None``)
-      to fall back to the cap-history universe (preserves existing behaviour
-      when the gate is not reachable).
-    - *capped_windows* uses "all accounts simultaneously capped" semantics via
+    - *capped_now* is 1 iff the universe is non-empty AND no account is
+      currently usable (``available == 0``).  Pass ``total_accounts`` (the
+      gate's ``account_count``) so healthy accounts with no recent cap events
+      are counted as available; omit it (``None``) to fall back to the
+      cap-history universe (used when the gate is not reachable).
+    - *capped_windows* are the instants when ALL accounts were capped, via
       :func:`merge_all_accounts_capped` on a **sorted** ``account_names`` list
-      for deterministic merge-event ordering across reruns.
+      for deterministic merge-event ordering across reruns.  When the universe
+      holds an account with no cap history in the window, no such instant
+      exists and the list is empty.  That check compares counts, not names,
+      because the gate exposes only ``account_count``: a seen account outside
+      the configured set (retired, or another project's) can stand in for a
+      configured account that has no cap history.
 
     Args:
         intervals: List of :class:`CapInterval` objects.  Both call sites
@@ -480,6 +567,7 @@ def compute_capped_now_and_windows(
     """
     summary = summarize_accounts(intervals, total_accounts=total_accounts)
     capped_now = 1 if summary['total'] > 0 and summary['available'] == 0 else 0
-    # Reuse account_names from summary — avoids a third pass over intervals.
+    if summary['total'] > len(summary['account_names']):
+        return capped_now, []
     capped_windows = merge_all_accounts_capped(intervals, summary['account_names'])
     return capped_now, capped_windows

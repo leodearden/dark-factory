@@ -190,6 +190,13 @@ title + `files` copy is refused with `DuplicateCandidateKeyError` (esc-4866-5).
 `recurrence.key`: every chain resolves to exactly one of
 `scheduled | overdue | paused | broken | ended`, and the endpoint enumerates all of them with
 `measured_at`. `broken` and `overdue` are the alarm-shaped states.
+*(Amended, task 8335.)* A link's fire time is its scheduled fire time: `milestone.at` until a
+predicate re-arm (`plans/completion-driven-triggers-prd.md` C1) advances `at` to the next
+check, and from then on `milestone.scheduled_fire_at`, which the first re-arm stamps and no later
+one moves. The C-3 run-label strip and the C-4 gauge both read it through
+`shared/src/shared/milestone_rearm.py::scheduled_fire_at`, so a re-armed link's successor
+carries exactly one run label, and a link still re-arming past its scheduled fire time plus
+grace reads `overdue`.
 
 **C-5 (category).** Every escalation a carrier's deterministic run files carries
 `category='milestone_check_failed'`, on both the predicate-failure and timeout legs.

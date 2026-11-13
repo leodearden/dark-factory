@@ -19,13 +19,40 @@ from fused_memory.services.completion_claim_gate import (
     extract_completion_claims,
 )
 
-_KNOWN = frozenset({'reify', 'dark_factory'})
+_KNOWN = frozenset({'reify', 'dark_factory', 'solar_challenge', 'solar_challenge_platform'})
 
 # Verbatim from reify memory 4e6fb418. The quotation spans the '...' clause
 # boundary, so the clause holding 'shipped' has no closing quote of its own.
 _ESC_5471_4_MEMORY = (
     '- esc-unverified-claim-5471-3: "#5471 owns the shipped Bool-balance ... '
     'examples" while 5471 was pending.'
+)
+
+# Verbatim from solar_challenge_platform memory 04a1706d.
+_ESC_536_1_MEMORY = (
+    'solar_challenge_platform test convention (task 536, on branch task/536 until merged): '
+    'give a test SetpointCommand an expiry measured from the clock that judges it, via '
+    'tests/control/command_expiry.py::optimiser_expiry(issued_at), which is issued_at + 2 x '
+    'DEFAULT_OPTIMISER_INTERVAL_SECONDS (the 3600 s life optimiser/translate.py::to_setpoint '
+    "gives), e.g. optimiser_expiry(clock()) for a ControlPlane's clock or "
+    'optimiser_expiry(HARNESS_CLOCK_START) for a conformance harness. Never use a far-future '
+    'constant such as 2030-01-01: a ControlPlane on the real clock rejects it from that date. '
+    'To test I5 eviction without sleeping out the hour, give the plane a SteppableClock and '
+    'step it one REFRESH_INTERVAL past the expiry, as the task 536 cases in '
+    'tests/control/test_modbus_binding.py and tests/control/test_p3_sim_conformance.py do.'
+)
+
+# Verbatim from solar_challenge memory 0d38599e.
+_ESC_1053_1_MEMORY = (
+    "solar_challenge correction (task 1053 implementer, 2026-11-02): task 894's decision-15 "
+    'step split, merged to main at c6a4195, is what deleted load._try_richardsonpy_profile; '
+    'task 1053 deletes and renames nothing. On branch task/1053 (holds once merged), '
+    "load._simulated_household_kw's Elexon fallback warning reads \"the household model "
+    'failed; falling back to Elexon deterministic profile: <type>: <message>", pinned as '
+    'literals in two tests in tests/unit/test_load.py and in the forked child of '
+    'tests/unit/test_load_reproducibility.py, while docs/prds/rng-hand-off.md C7 '
+    'deliberately keeps quoting the old "richardsonpy stochastic generation failed" text as '
+    'a historical record.'
 )
 
 
@@ -37,8 +64,13 @@ def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionCla
     )
 
 
-def _triples(text: str) -> list[tuple[str, str, str]]:
-    return [(claim.kind, claim.subject, claim.ref) for claim in _extract(text)]
+def _triples(
+    text: str, default_project_id: str = 'reify',
+) -> list[tuple[str, str, str]]:
+    return [
+        (claim.kind, claim.subject, claim.ref)
+        for claim in _extract(text, default_project_id)
+    ]
 
 
 class TestQuotationsAreMentions:
@@ -203,10 +235,96 @@ class TestNonAssertiveScopes:
                 id='esc-unverified-claim-5023-2',
             ),
             pytest.param('when task 5422 has landed, re-run the sweep', id='when'),
+            pytest.param(
+                'On branch task/1053 (holds once it is merged), the warning reads X.',
+                id='once-it-is-merged',
+            ),
+            pytest.param(
+                'On branch task/1053 (holds once it has merged), the warning reads X.',
+                id='once-it-has-merged',
+            ),
+            pytest.param(
+                'Test convention (task 536, on branch task/536 until it is merged): '
+                'use optimiser_expiry.',
+                id='until-it-is-merged',
+            ),
         ],
     )
     def test_a_present_tense_temporal_scope_is_not_a_claim(self, text):
         assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(
+                'Test convention (task 536, on branch task/536 until merged): '
+                'use optimiser_expiry.',
+                'solar_challenge_platform',
+                id='esc-unverified-claim-536-1',
+            ),
+            pytest.param(
+                _ESC_536_1_MEMORY, 'solar_challenge_platform',
+                id='esc-unverified-claim-536-1-record',
+            ),
+            pytest.param(
+                'On branch task/1053 (holds once merged), the warning reads X.',
+                'solar_challenge',
+                id='esc-unverified-claim-1053-1',
+            ),
+            pytest.param(
+                'On branch task/1053 (true when merged), the warning reads X.',
+                'solar_challenge',
+                id='when-merged',
+            ),
+            pytest.param(
+                'On branch task/1053 (true until merged), the warning reads X.',
+                'solar_challenge',
+                id='until-merged',
+            ),
+            pytest.param(
+                'Task 758 adds tests/_schema_state.py::index_shapes for this '
+                '(holds once merged)',
+                'solar_challenge_platform',
+                id='esc-unverified-claim-758-2',
+            ),
+            pytest.param(
+                'Coordination for task 728 (telemetry_hh compression), from task '
+                "1378's plan, branch task/1378 (holds once merged)",
+                'solar_challenge_platform',
+                id='esc-unverified-claim-1378-2',
+            ),
+            pytest.param('task 5422 stays on its branch till merged', 'reify', id='till'),
+            pytest.param(
+                'task 5422 stays on its branch as soon as merged', 'reify', id='as-soon-as',
+            ),
+            pytest.param('task 5422 is rebased before merged', 'reify', id='before'),
+            pytest.param('task 5422 reopens the day merged', 'reify', id='the-day'),
+            pytest.param(
+                'the guard on branch task/5422 applies whenever landed', 'reify',
+                id='whenever',
+            ),
+            pytest.param(
+                'the guard on branch task/5422 holds after merged', 'reify', id='after',
+            ),
+            pytest.param('task 5422 (holds once fully merged)', 'reify', id='adverb'),
+            pytest.param('task 5422 stays open until cancelled', 'reify', id='disposition'),
+            pytest.param('task 5422 runs once queued', 'reify', id='filing'),
+            pytest.param('The freeze on task 5422 is until merged', 'reify', id='copular-until'),
+            pytest.param(
+                'the branch task/5422 guard is when merged', 'reify', id='copular-when',
+            ),
+            pytest.param(
+                'the branch task/5422 guard was after merged', 'reify', id='copular-after',
+            ),
+        ],
+    )
+    def test_a_verbless_temporal_clause_is_not_a_claim(self, text, project):
+        assert _triples(text, project) == []
+
+    def test_the_1053_record_does_not_claim_its_branch_task(self):
+        # Not '== []': the record also states task 894's true landing, which the gate misses.
+        claimed = {(subject, ref) for _, subject, ref in _triples(_ESC_1053_1_MEMORY, 'solar_challenge')}
+        assert ('task', '1053') not in claimed
 
     @pytest.mark.parametrize(
         ('text', 'ref'),
@@ -230,10 +348,33 @@ class TestNonAssertiveScopes:
                 'Task 5 has landed. Check the dashboard.', '5',
                 id='imperative-in-next-clause',
             ),
+            pytest.param('Task 536 merged in abc1234.', '536', id='declarative-merged-in'),
+            pytest.param('#5422 landed in abc123', '5422', id='declarative-hash-landed-in'),
+            pytest.param(
+                'task 5422 was merged and holds once merged', '5422',
+                id='verbless-clause-in-the-same-clause',
+            ),
+            pytest.param(
+                'Task 5 was once merged into main but reverted', '5',
+                id='adverbial-once-after-was',
+            ),
+            pytest.param(
+                'task 5422 had once landed before the revert', '5422',
+                id='adverbial-once-after-had',
+            ),
+            pytest.param('task 5422 has once been merged', '5422', id='adverbial-once-after-has'),
         ],
     )
     def test_an_asserted_landing_outside_any_scope_is_still_a_claim(self, text, ref):
         assert _triples(text) == [('applied_work', 'task', ref)]
+
+    def test_a_participle_after_a_temporal_preposition_still_binds_forward(self):
+        text = (
+            'They are named saved_fleet_presets and saved_fleet_preset_named, after '
+            "cancelled task 359's branch (commit 64dfb4a), and take α's Database in "
+            'place of a path'
+        )
+        assert _triples(text, 'solar_challenge') == [('disposition', 'task', '359')]
 
 
 _ESC_5471_1 = (

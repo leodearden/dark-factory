@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _tool_calls import call_tool
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -28,8 +29,7 @@ class _FakeHarness:
 
 
 async def _call(server: Any, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('clear_verify_host_quarantine')
-    return await tool.fn(**kwargs)
+    return await call_tool(server, 'clear_verify_host_quarantine', **kwargs)
 
 
 @pytest.fixture

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from _filing_tools import call_blocker, call_info
+from _resolve_issue_call import call_resolve_issue
 
 from escalation.dedupe import DedupeConfig
 from escalation.queue import EscalationQueue
@@ -647,9 +648,9 @@ class TestCrossTaskChildResumeContract:
         assert pending_42[0].id == parent_id
 
         # (5) Resolve the parent.
-        resolve_tool = await server.get_tool('resolve_issue')
-        assert resolve_tool is not None
-        resolved = resolve_tool.fn(escalation_id=parent_id, resolution='fused-memory restarted')  # type: ignore[attr-defined]
+        resolved = await call_resolve_issue(
+            server, escalation_id=parent_id, resolution='fused-memory restarted',
+        )
         assert resolved.get('status') in ('resolved', 'dismissed')
 
         # (6) Still no pending escalation under task 99 after the parent resolves.

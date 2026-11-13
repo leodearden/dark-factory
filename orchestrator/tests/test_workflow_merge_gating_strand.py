@@ -28,10 +28,10 @@ Three boundaries, one per disposition:
   the merge retry loop **in-slot**.  No re-dispatch is burned and the row
   stays ``in-progress`` under the live claimant for the whole wait (spec §4:
   ``in-progress`` covers Path-A escalated-waiting).
-* **#2 — born-at-L2 / level≥2 open.**  ``_wait_for_resolution``'s
+* **#2 — born-at-L2 / non-info level≥2 open.**  ``_wait_for_resolution``'s
   stop-the-line short-circuit (``workflow.py:12206-12217``) raises
-  ``_StewardReescalated`` BEFORE the wait loop, so a human-gated record is
-  never waited on in-slot; the handler parks the row ``blocked`` via
+  ``_NoStewardApplicable`` (a ``_HumanHandoff``) BEFORE the wait loop, so a
+  human-gated record is never waited on in-slot; the handler parks the row ``blocked`` via
   ``_mark_blocked(..., skip_escalation=True)`` and leaves the L2 untouched.
 * **#3 — the wait expires (silent producer).**  The existing give-up
   machinery stops the steward, emits ``escalation_resolved{outcome=
@@ -89,6 +89,7 @@ from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardResolved,
     WorkflowState,
     outcome_allows_status,
@@ -326,7 +327,7 @@ def _file_gating_l0_after_the_wait(
     """File a plain blocking L0 the moment ``_wait_for_resolution`` returns.
 
     That is the window AFTER the wait's tail read: the tail gates only what
-    ``_needs_human`` selects, and the wait loop only re-polls level 0 before
+    ``needs_human`` selects, and the wait loop only re-polls level 0 before
     it returns, so a plain blocking L0 landing here is seen by nothing but the
     merge-entry handler's single-shot ``_is_gating_escalation`` re-check.
     Deterministic, with no sleeps: the record exists before the handler reads
@@ -701,10 +702,11 @@ def _make_journalling_resolving_steward(
                     esc.id, 'Resolved by journalling FakeSteward',
                     resolved_by='fake-steward',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Resolved by FakeSteward'),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Resolved by FakeSteward'),
+                    ))
 
         async def stop(self) -> None:
             events.append('steward:stop')
@@ -721,7 +723,7 @@ def _make_chained_l2_steward(
     follow-on record is one the wait's LOOP never waits on: the loop polls
     ``get_by_task(..., level=0)``, and the entry-time stop-the-line check ran
     before this record existed.  The wait's TAIL applies the same
-    ``_needs_human`` rule to the full pending set, so it raises a
+    ``needs_human`` rule to the full pending set, so it raises a
     ``_HumanHandoff`` there and the handler parks rather than resuming the
     merge past an open, human-gated record (D4 stop-the-line).  (A chained
     plain-blocking L0, by contrast, IS caught by the wait loop, which re-polls
@@ -969,12 +971,12 @@ class TestMergeGateBailEntersBoundedWait:
 
 @pytest.mark.asyncio
 class TestMergeGateL2ShortCircuits:
-    """Boundary #2: a born-at-L2 (or level≥2) record open at MERGE entry parks
-    the row ``blocked`` immediately — it is never waited on in-slot.
+    """Boundary #2: a born-at-L2 (or non-info level≥2) record open at MERGE
+    entry parks the row ``blocked`` immediately — it is never waited on in-slot.
 
     ``_wait_for_resolution``'s stop-the-line check (``workflow.py:12206-12217``)
-    raises ``_StewardReescalated`` BEFORE the wait loop, so the handler's
-    ``except`` clause routes straight to ``_mark_blocked(...,
+    raises ``_NoStewardApplicable`` (a ``_HumanHandoff``) BEFORE the wait loop, so
+    the handler's ``except`` clause routes straight to ``_mark_blocked(...,
     skip_escalation=True)``.  Two properties matter equally: the row IS
     written (no strand, spec S1) and the human-facing L2 is NOT consumed
     (repend-PRD boundary B1 stop-the-line — ``_mark_blocked``'s straggler
@@ -1427,7 +1429,7 @@ class TestGateReFireIsBounded:
 
         ``_wait_for_resolution`` polls level-0 records only and ran its entry
         stop-the-line check before this record existed.  Its tail applies the
-        same ``_needs_human`` rule to the full pending set, so a level-2 filed
+        same ``needs_human`` rule to the full pending set, so a level-2 filed
         mid-resolution raises a ``_HumanHandoff`` there and the task parks
         through that arm; the handler's post-wait ``_is_gating_escalation``
         re-check remains as redundant enforcement behind it.
@@ -1532,7 +1534,7 @@ class TestGateReFireIsBounded:
 
         The steward resolves the entry L0, so the wait returns normally.  A
         plain blocking L0 then lands after the wait's tail read: the tail does
-        not gate it (it is not ``_needs_human``), and the wait loop has already
+        not gate it (it is not ``needs_human``), and the wait loop has already
         exited.  At merge entry there is no later gate, so without the re-check
         this record is merged straight past (D4).  The re-check must park the
         row with an L1 for a human, stop and clear the still-live steward

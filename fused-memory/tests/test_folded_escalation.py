@@ -28,19 +28,22 @@ import importlib.util
 import json
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
 from _ast_guard import parse_python_module
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.ticket_store import CurationBacklog
-from fused_memory.services.write_journal import JournalGrowthSample
+from fused_memory.services.write_journal import JournalGrowthSample, Mem0RetryBacklog
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: Applied PER CLASS rather than as a module-level ``pytestmark``, so the
 #: pairwise anchor-collision regression at the foot of this file keeps running
@@ -163,6 +166,127 @@ class TestTheFiledEscalation:
         esc_id = _emit(tmp_path, level=2)
         assert esc_id is not None
         assert _filed(tmp_path)[0]['level'] == 2
+
+
+@_needs_escalation
+class TestTheLinkHealCalibrationAndRunReportRoutes:
+    """The link-heal sweep's two anchors (task 7159), filed through
+    ``FoldedEscapeFiler`` into a real queue.
+
+    A failed calibration is an alarm, so a second filing folds into the open
+    record. A run report is a distinct payload per run, and a fold would
+    discard every later night's report path, so it never folds.
+    """
+
+    @staticmethod
+    def _file(tmp_path, anchor: str, summary: str, report: str) -> str | None:
+        from fused_memory.maintenance.link_heal_executor import (
+            Escape,
+            FoldedEscapeFiler,
+        )
+
+        return FoldedEscapeFiler(str(tmp_path))(
+            Escape(anchor=anchor, summary=summary, detail={'report': report}),
+        )
+
+    def test_a_failed_calibration_files_a_blocking_risk_and_folds(self, tmp_path):
+        from fused_memory.maintenance.link_heal_executor import (
+            CALIBRATION_ANCHOR,
+        )
+
+        first = self._file(tmp_path, CALIBRATION_ANCHOR, 'calibration failed', 'one.md')
+        second = self._file(tmp_path, CALIBRATION_ANCHOR, 'calibration failed again', 'two.md')
+
+        assert first is not None
+        assert second == first
+        [record] = _filed(tmp_path)
+        assert record['task_id'] == CALIBRATION_ANCHOR == 'link-heal-calibration'
+        assert (record['category'], record['severity'], record['level']) == (
+            'risk_identified', 'blocking', 1,
+        )
+
+    def test_a_run_report_files_info_and_never_folds(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.maintenance.link_heal_executor import (
+            RUN_REPORT_ANCHOR,
+        )
+
+        first = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+        second = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: two.md', 'two.md')
+
+        assert first is not None
+        assert second is not None
+        assert second != first
+        records = EscalationQueue(tmp_path / 'data' / 'escalations').get_by_task(RUN_REPORT_ANCHOR)
+        assert sorted(record.summary for record in records) == [
+            'link-heal sweep: one.md', 'link-heal sweep: two.md',
+        ]
+        for record in records:
+            assert record.task_id == RUN_REPORT_ANCHOR == 'link-heal-run-report'
+            assert (record.category, record.severity, record.level) == (
+                'link_heal_run_report', 'info', 1,
+            )
+
+    def test_a_new_run_report_dismisses_the_one_still_pending_before_it(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.maintenance.link_heal_executor import (
+            RUN_REPORT_ANCHOR,
+        )
+
+        first = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+        second = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: two.md', 'two.md')
+
+        assert first is not None and second is not None
+        queue = EscalationQueue(tmp_path / 'data' / 'escalations')
+        pending = queue.get_by_task(RUN_REPORT_ANCHOR, status='pending')
+        assert [record.id for record in pending] == [second]
+        dismissed = queue.get(first)
+        assert dismissed is not None
+        assert dismissed.status == 'dismissed'
+        assert second in (dismissed.resolution or '')
+
+    def test_a_run_report_leaves_another_filer_s_pending_record_alone(self, tmp_path):
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.maintenance.link_heal_executor import (
+            RUN_REPORT_ANCHOR,
+        )
+
+        queue = EscalationQueue(tmp_path / 'data' / 'escalations')
+        foreign = queue.submit(Escalation(
+            id=queue.make_id(RUN_REPORT_ANCHOR), task_id=RUN_REPORT_ANCHOR,
+            agent_role='someone-else', severity='info', category='link_heal_run_report',
+            summary='not a link-heal filing', detail='', suggested_action='', level=1,
+        ))
+
+        self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+
+        stored = queue.get(foreign)
+        assert stored is not None
+        assert stored.status == 'pending'
+
+    def test_a_run_report_suggests_the_undo_command_operators_are_shown(self, tmp_path):
+        from fused_memory.maintenance.link_heal_executor import (
+            FoldedEscapeFiler,
+            run_report_escape,
+            undo_command,
+        )
+
+        esc_id = FoldedEscapeFiler(str(tmp_path))(
+            run_report_escape({'plan_run_id': 'a1' * 16}, tmp_path / 'report.md'),
+        )
+
+        assert esc_id is not None
+        [record] = _filed(tmp_path)
+        assert undo_command('<undo_run_id>') in record['suggested_action']
+
+    def test_the_run_report_category_is_registered(self):
+        from escalation.categories import require_registered_category
+
+        require_registered_category('link_heal_run_report')
 
 
 @_needs_escalation
@@ -602,6 +726,19 @@ def _journal_growth(ceiling: str) -> Callable[[Any, str], object]:
     return fire
 
 
+def _mem0_retry_backlog(module: Any, project_root: str) -> object:
+    now = datetime(2026, 11, 3, 12, tzinfo=UTC)
+    return module.emit_mem0_retry_backlog_escalation(
+        project_root,
+        backlog=Mem0RetryBacklog(
+            project_id='dark_factory', count=1,
+            oldest_created_at=now - timedelta(hours=2), max_attempts=3,
+        ),
+        now=now,
+        max_age=timedelta(hours=1),
+    )
+
+
 def _unverified_claim(module: Any, project_root: str) -> object:
     return module.emit_unverified_claim_escalation(
         project_root,
@@ -725,6 +862,12 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             storm={'count': 5, 'threshold': 5, 'window_seconds': 3600.0,
                    'labels': ['llm_error']},
         ),
+        1,
+    ),
+    _Filer(
+        'mem0_retry_backlog_alarm',
+        'fused_memory.services.mem0_retry_backlog_alarm',
+        _mem0_retry_backlog,
         1,
     ),
     _Filer(
@@ -946,10 +1089,16 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         BACKLOG_ANCHOR as LINK_HEAL_BACKLOG_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
+        CALIBRATION_ANCHOR as LINK_HEAL_CALIBRATION_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
         CORRECTS_SHARE_ANCHOR as LINK_HEAL_CORRECTS_SHARE_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
         MISFILE_SHARE_ANCHOR as LINK_HEAL_MISFILE_SHARE_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
+        RUN_REPORT_ANCHOR as LINK_HEAL_RUN_REPORT_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
         WRITE_FAILURE_ANCHOR as LINK_HEAL_WRITE_FAILURE_ANCHOR,
@@ -1011,6 +1160,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.services.journal_growth_alarm import (
         _INSERT_RATE_ANCHOR_TASK_ID as JOURNAL_RATE_ANCHOR,
     )
+    from fused_memory.services.mem0_retry_backlog_alarm import (
+        ANCHOR_TASK_ID as MEM0_RETRY_BACKLOG_ANCHOR,
+    )
     from fused_memory.services.memory_metadata_census import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
     )
@@ -1033,16 +1185,19 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'journal_growth_alarm file_size': JOURNAL_SIZE_ANCHOR,
         'journal_growth_alarm insert_rate': JOURNAL_RATE_ANCHOR,
         'classification_fallback_alarm': CLASSIFICATION_FALLBACK_ANCHOR,
+        'mem0_retry_backlog_alarm': MEM0_RETRY_BACKLOG_ANCHOR,
         # -- markup_guard, which CALLS the tripwire's filers with anchors of
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
         'markup_guard residue': GUARD_RESIDUE_ANCHOR,
-        # -- the link-heal executor's run escapes (tasks 6181, 6184) ----------
+        # -- the link-heal executor's run escapes (tasks 6181, 6184, 7159) ----
         'link_heal backlog': LINK_HEAL_BACKLOG_ANCHOR,
         'link_heal write-failure': LINK_HEAL_WRITE_FAILURE_ANCHOR,
         'link_heal misfile-share': LINK_HEAL_MISFILE_SHARE_ANCHOR,
         'link_heal corrects-share': LINK_HEAL_CORRECTS_SHARE_ANCHOR,
         'link_heal adjudicator': LINK_HEAL_ADJUDICATOR_ANCHOR,
+        'link_heal calibration': LINK_HEAL_CALIBRATION_ANCHOR,
+        'link_heal run-report': LINK_HEAL_RUN_REPORT_ANCHOR,
         # -- the ticket janitor's curation backlog, one anchor per defer reason
         **{
             f'ticket_janitor curation-backlog {reason}': curation_backlog_anchor(reason)
@@ -1153,6 +1308,8 @@ class TestNoTwoFilersShareAnAnchor:
             'link_heal misfile-share',
             'link_heal corrects-share',
             'link_heal adjudicator',
+            'link_heal calibration',
+            'link_heal run-report',
             'curator_escalator',
             'ticket_janitor curator-bucket',
         ):

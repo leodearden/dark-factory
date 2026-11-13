@@ -8,8 +8,12 @@ from pathlib import Path
 import pytest
 from orchestrator.session_registry import SessionRecord, Status
 from shared.task_deferral import CarriedByDeferral, UntilConditionDeferral, record_to_json
+from shared.task_statuses import ACTIVE, TERMINAL
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import ownership as mod
 from sitting.inventory import OpenItem, escalation_key
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 QUEUE = '/src/dark-factory/data/escalations'
@@ -281,7 +285,19 @@ class TestSpawnedFollowupProbe:
         assert result.owner_task_status == 'pending'
 
     @FOLLOWUP_SPELLINGS
-    @pytest.mark.parametrize('status', ['done', 'cancelled'])
+    @pytest.mark.parametrize('status', [status.value for status in sorted(ACTIVE)])
+    def test_every_non_terminal_followup_owns(self, sessions_root, seed_tasks, status, key):
+        rows = seed_tasks([{'id': 7001, 'status': status, 'metadata': {key: 'esc-6798-1'}}])
+
+        result = _probe(_sweep(_item('esc-6798-1', '6798'), sessions_root=sessions_root, task_rows=rows),
+                        'spawned_followup')
+
+        assert result.status == 'owns'
+        assert result.owner_task_id == '7001'
+        assert result.owner_task_status == status
+
+    @FOLLOWUP_SPELLINGS
+    @pytest.mark.parametrize('status', [status.value for status in sorted(TERMINAL)])
     def test_terminal_followup_is_empty(self, sessions_root, seed_tasks, status, key):
         rows = seed_tasks([{'id': 7001, 'status': status, 'metadata': {key: 'esc-6798-1'}}])
 

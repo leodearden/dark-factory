@@ -15,6 +15,9 @@ from fused_memory.reconciliation.blocked_gate_audit_section import BLOCKED_GATE_
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
+from fused_memory.reconciliation.enumeration_guard import (
+    render_enumeration_guard_section,
+)
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
@@ -115,6 +118,8 @@ returned. Treat as success, not failure.
 {render_finding_provenance_section(can_file_tasks=True)}
 
 {render_execution_class_section()}
+
+{render_enumeration_guard_section()}
 
 {render_source_completion_section(can_file_tasks=True)}
 
@@ -571,7 +576,9 @@ locally, then write the COMPLETE new `description` with `append` OMITTED and \
 `expected_text_fp` set to that read's `{TASK_TEXT_FP_KEY}` (the compare-and-swap rule \
 below). If a write genuinely means to REPLACE the field, omit `append` (or pass \
 `append=False`) to confirm it; if the `append=True` was meant for `metadata` or \
-`details`, split it into a separate `update_task` call.
+`details`, split it into a separate `update_task` call. An `update_task` that supplies \
+no field to write is likewise REJECTED with a `TASKMASTER_TOOL_ERROR` (`error_type` \
+`NoFieldsToUpdateError`, whose message lists the writable fields) and writes nothing.
 
 TASK-TEXT AMENDMENTS (compare-and-swap + readback). The server enforces both halves of \
 this rule on every `description`/`details` amendment you make:

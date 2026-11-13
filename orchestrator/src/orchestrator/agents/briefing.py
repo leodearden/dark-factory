@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
+from escalation.models import Escalation
 from shared.briefing_queries import BriefingScope
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
+from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
 from orchestrator.agents.memory_recall import MemoryRecall
 from orchestrator.agents.review_briefing import (
     ReviewSubject,
@@ -22,12 +26,105 @@ from orchestrator.agents.review_briefing import (
     review_action_section,
 )
 from orchestrator.config import OrchestratorConfig
+from orchestrator.escalation_rulings import (
+    Ruling,
+    RulingAudience,
+    one_line,
+    render_rulings_section,
+)
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
+from orchestrator.scope_drift import ScopeDriftReport
 
 logger = logging.getLogger(__name__)
 
+IMPLEMENTER_ACTIONS: Mapping[ImplementerBriefVariant, str] = MappingProxyType({
+    ImplementerBriefVariant.WHOLE_PLAN: (
+        'Execute the next pending steps in TDD order. Commit after each step. '
+        'Call `mark_step_done(step_id, commit_sha)` to record progress. '
+        'Stop at a logical boundary.'
+    ),
+    ImplementerBriefVariant.ONE_STEP: (
+        'One-step mode: complete exactly ONE plan step this session — the next '
+        'pending item in `.task/plan.json`, prerequisites first, then steps. Do it '
+        'in TDD order, commit, call `mark_step_done(step_id, commit_sha)`, then '
+        'stop, even if more steps are pending; the orchestrator re-invokes you for '
+        'the next step.'
+    ),
+})
+"""The implementer brief's Action paragraph per ``config.implementer_brief_variant``."""
+
+
+def _implementer_action(variant: ImplementerBriefVariant) -> str:
+    """The Action paragraph *variant* selects, by the :func:`is_one_step` rule the cap and the bounds also use."""
+    return IMPLEMENTER_ACTIONS[
+        ImplementerBriefVariant.ONE_STEP if is_one_step(variant) else ImplementerBriefVariant.WHOLE_PLAN
+    ]
+
+
 DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
+
+
+OPEN_INFO_NOTES_HEADING = '# Implementer notes (open info escalations)'
+"""The heading of the reviewer's notes block; the reviewer contract in roles.py names it."""
+
+OPEN_INFO_NOTES_LIMIT = 20
+"""Max notes one reviewer briefing lists, the most recent kept; the rest stay pending for the exit router."""
+
+
+def _open_info_notes_section(
+    notes: Sequence[Escalation], *, reviewer_type: str, detail_chars: int,
+) -> str:
+    """The reviewer's notes block (plans/info-l0-disposition-router-prd.md D2).
+
+    It closes on the verdict call with ``note_dispositions``, so the last call
+    the reviewer is shown names the field.
+    """
+    by_age = sorted(notes, key=lambda note: note.timestamp or '')
+    listed = by_age[-OPEN_INFO_NOTES_LIMIT:]
+    entries = '\n'.join(_open_info_note_entry(note, detail_chars) for note in listed)
+    unlisted = len(by_age) - len(listed)
+    overflow = (
+        f'{unlisted} older note(s) are not listed; they stay pending for the exit router.\n\n'
+        if unlisted else ''
+    )
+    return f"""\
+{OPEN_INFO_NOTES_HEADING}
+
+These info notes were filed against this task while it was worked.
+
+{entries}
+{overflow}Disposition every id above as `addressed`, `no_action` or `work`, as your
+contract defines them, in the `note_dispositions` of your verdict call:
+`submit_review_verdict(reviewer="{reviewer_type}", verdict=..., issues=..., summary=..., note_dispositions=[...])`
+"""
+
+
+def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
+    full_detail = note.detail or ''
+    detail = full_detail[:detail_chars]
+    quoted = '\n'.join(f'> {line}' for line in detail.splitlines()) or '> (none)'
+    if len(full_detail) > detail_chars:
+        quoted += f'\n[detail truncated at {detail_chars} characters]'
+    return f"""\
+## {note.id}
+
+- filed by: {one_line(note.agent_role)}
+- filed at: {note.timestamp}
+- summary: {one_line(note.summary)}
+- suggested action: {one_line(note.suggested_action) or '(none)'}
+- detail:
+
+{quoted}
+"""
+
+
+def _with_review_rulings(prompt: str, rulings: Sequence[Ruling]) -> str:
+    """*prompt* with the reviewer's rulings block appended; no rulings leave it byte-identical."""
+    section = render_rulings_section(rulings, RulingAudience.REVIEW)
+    return prompt + '\n' + section if section else prompt
+
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -85,14 +182,15 @@ _TEXT_DRIFT_NOTICES = {
         '## The Task Text Has Changed\n\n'
         'The description or details under # Task have been amended since this '
         'plan was authored. Re-read them and change the plan to cover the '
-        'amended scope; call confirm_plan() only if it already does.'
+        'amended scope, then call confirm_plan(); if it already covers it, '
+        'confirm it unchanged.'
     ),
     TaskTextDrift.UNSTAMPED: (
         '## The Task Text May Have Changed\n\n'
         'This plan carries no record of the task text it was authored against, '
         'so the description or details under # Task may have been amended '
-        'since. Re-read them and change the plan if its scope has moved; call '
-        'confirm_plan() only if it already covers it.'
+        'since. Re-read them and change the plan if its scope has moved, then '
+        'call confirm_plan(); if it already covers it, confirm it unchanged.'
     ),
 }
 
@@ -280,6 +378,42 @@ def _delivered_check_field(check: dict, name: str) -> str:
     return f'{name}: {", ".join(str(v) for v in items) or _DELIVERED_CHECK_LIST_FIELDS[name]}'
 
 
+_FOLLOWUP_ITEMS_HEADING = f'## Follow-up Items (metadata.{FOLLOWUP_ITEMS_METADATA_KEY})'
+
+
+def _format_followup_items(raw: object) -> str:
+    """Render the task's follow-up items numbered (plans/follow-up-filing-shape-prd.md decision 1).
+
+    Fails open like :func:`_format_delivered_checks`: '' when absent, malformed entries counted visibly.
+    """
+    if not raw:
+        return ''
+    if not isinstance(raw, list):
+        return (
+            f'{_FOLLOWUP_ITEMS_HEADING}\n\n'
+            f'⚠ `metadata.{FOLLOWUP_ITEMS_METADATA_KEY}` is malformed (a {type(raw).__name__}, not a '
+            'list), so its observations cannot be shown here; read them from the task record.'
+        )
+    items = [item for item in map(parse_item, raw) if item is not None]
+    lines = [
+        f'{number}. {item.summary} — files: {", ".join(item.files)} (observed in task {item.origin_task})'
+        for number, item in enumerate(items, start=1)
+    ]
+    malformed = len(raw) - len(items)
+    if malformed:
+        noun = 'entry' if malformed == 1 else 'entries'
+        lines.append(
+            f'⚠ {malformed} malformed {noun} on `metadata.{FOLLOWUP_ITEMS_METADATA_KEY}` could not be '
+            'rendered here; read the full list from the task record.'
+        )
+    numbered = '\n'.join(lines)
+    return (
+        f'{_FOLLOWUP_ITEMS_HEADING}\n\n'
+        'Each numbered item is one observation this task was filed to address; the plan must '
+        f'cover every one.\n\n{numbered}'
+    )
+
+
 def _caller_agent_id(task_id: str | None, role: str) -> str:
     """The agent-id a dispatch is known by, in its prompt and in the journal.
 
@@ -354,6 +488,37 @@ def _format_verify_attempt(ctx: VerifyAttemptContext) -> str:
     return '# Verify Attempt\n\n' + '\n'.join(lines) + '\n\n'
 
 
+def _format_scope_drift(report: ScopeDriftReport | None) -> str:
+    """The briefing block reporting what the last writer boundary did with scope requests.
+
+    Empty for None or a report with nothing acquired or contested. The single
+    home of this briefing line; task 4371 reuses it.
+    """
+    if report is None or not (report.acquired or report.contested):
+        return ''
+    lines = [
+        '## Scope Requests',
+        '',
+        'The orchestrator applied the files reported with `report_missing_plan_file`:',
+        '',
+    ]
+    lines.extend(
+        f'- `{path}`: granted. It is now in plan.json `files`, and this task holds its lock.'
+        for path in report.acquired
+    )
+    lines.extend(
+        f'- `{path}`: contested, held by task {holder}.' for path, holder in report.contested
+    )
+    if report.contested:
+        lines.extend([
+            '',
+            'Do not edit a contested file. Revert any edit already made to it, or call '
+            "`escalate_blocker(category='scope_violation')` naming the file, the "
+            'holder and the design reason it must change.',
+        ])
+    return '\n'.join(lines) + '\n'
+
+
 @dataclass
 class CompletionJudgeVerdict:
     """Structured verdict returned by the completion judge agent.
@@ -424,6 +589,7 @@ class BriefingAssembler:
         *,
         include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt for the architect agent.
 
@@ -444,6 +610,7 @@ class BriefingAssembler:
                 None or empty — the truly-fresh first dispatch — the prompt is
                 byte-identical to the pre-γ baseline, so nothing is added on
                 the common path.
+            rulings: rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
         """
         preamble = await self._task_preamble(
             task, 'architect', context, include_files=False,
@@ -498,7 +665,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 {preamble}
 
 {prior_proposal_section}{committed_section}
-# Action
+{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
 2. Produce a TDD implementation plan using the plan-tools MCP tools:
@@ -521,6 +688,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         *,
         text_drift: TaskTextDrift | None = None,
         integrity_refusal: DoneStepIntegrityVerdict | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt for the architect to revalidate a plan after blast-radius requeue.
 
@@ -528,6 +696,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         locks were contended.  Main has since advanced (the contending task
         merged).  The architect reviews the existing plan against the changes
         and either confirms, updates, or recreates it.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
         """
         preamble = await self._task_preamble(task, 'architect', context)
         prior_proposal_section = self._format_prior_proposal(task)
@@ -562,6 +732,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         notice = _TEXT_DRIFT_NOTICES[text_drift] if text_drift is not None else ''
         text_drift_section = f'{notice}\n\n' if notice else ''
         refusal_section = _integrity_refusal_section(integrity_refusal)
+        rulings_section = render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)
         dispositions = ', '.join(f'`{d}`' for d in sorted(DESCOPE_DISPOSITIONS))
 
         return f"""\
@@ -587,7 +758,7 @@ and either confirm it, update it, or recreate it from scratch.
 
 {files_section}
 
-{refusal_section}## Action
+{refusal_section}{rulings_section}## Action
 
 1. Read the overlapping files (if any) to understand what changed.
 2. Decide whether your plan is still valid.
@@ -605,6 +776,10 @@ and either confirm it, update it, or recreate it from scratch.
    human ratification marker. A revalidation that drops a done step without
    that record, or newly marks a step done at another done step's commit, is
    refused.
+6. Once the plan is valid, after (a), (b) or (c) alike, call `confirm_plan()`
+   as your FINAL action. Editing the step set (b) or calling `create_plan` (c)
+   clears the plan's confirmation, so a revalidation that stops without it
+   leaves an unconfirmed plan.
 """
 
     async def build_plan_completion_prompt(
@@ -613,6 +788,8 @@ and either confirm it, update it, or recreate it from scratch.
         partial_plan: dict,
         worktree: Path | None = None,  # noqa: ARG002 — interface symmetry
         context: str | None = None,
+        *,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt to finish a partial plan left by an interrupted session.
 
@@ -623,6 +800,8 @@ and either confirm it, update it, or recreate it from scratch.
         whatever is missing, then finalize. The architect may also discard the
         partial entirely (``create_plan`` overwrites it) if it reflects a
         flawed approach.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
         """
         preamble = await self._task_preamble(task, 'architect', context)
 
@@ -647,7 +826,7 @@ to start over from nothing.
 {plan_json}
 ```
 
-## Action
+{render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)}## Action
 
 1. Read the relevant files to re-ground yourself in the task and verify the
    existing steps are still correct against the CURRENT state of the codebase
@@ -810,8 +989,7 @@ triage it.
 
 # Plan Schema Repair
 
-The plan for this task is on disk at `.task/plan.json` (a symlink into the
-durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`), but it has no
+The plan for this task is on disk at `.task/plan.json`, but it has no
 non-empty top-level `steps` array, so it cannot advance. It is NOT reproduced
 here — read the file in full.
 
@@ -839,12 +1017,16 @@ without calling `confirm_plan()` and the task will be re-planned.
         task: dict,
         review_feedback: str,
         context: str | None = None,
+        *,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Architect pass that extends the plan to answer blocking review issues.
 
         The plan is never copied into the prompt: plan.json is its single home,
         read through the lane's ``.task/plan.json``, so a replayed prompt cannot
         show stale steps.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
         """
         preamble = await self._task_preamble(task, 'architect', context)
 
@@ -857,11 +1039,10 @@ The implementation was reviewed and blocking issues were found.
 
 {review_feedback}
 
-## Action
+{render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)}## Action
 
-1. Read `.task/plan.json` (a symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json`) for the current plan
-   and each step's status — it is not reproduced here.
+1. Read `.task/plan.json` for the current plan and each step's status — it
+   is not reproduced here.
 2. Add the steps that address the blocking issues with
    `add_plan_step(step_id, step_type, description)`, using step ids not
    already in the plan. New steps are recorded as pending.
@@ -870,6 +1051,8 @@ The implementation was reviewed and blocking issues were found.
 4. Keep every existing step in place, in order: do not remove or reorder
    steps, and do not call `create_plan` — it replaces the plan wholesale and
    would discard completed steps.
+5. Call `confirm_plan()` as your FINAL action. Adding steps clears the plan's
+   confirmation, so a replan that stops without it leaves an unconfirmed plan.
 """
 
     async def build_simple_task_prompt(
@@ -877,13 +1060,20 @@ The implementation was reviewed and blocking issues were found.
         task: dict,
         worktree: Path | None = None,
         context: str | None = None,
+        *,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt for the SIMPLE_TASK agent (Lever C).
 
-        The agent will explore briefly, register a single-step plan via the
-        plan-tools MCP server, edit the listed files, commit, then call
-        ``mark_step_done`` and stop. The orchestrator then advances to VERIFY
-        without invoking the implementer.
+        The workflow and its exits live in
+        ``orchestrator/src/orchestrator/agents/roles.py::SIMPLE_TASK_WORKFLOW``,
+        which ``SIMPLE_TASK.system_prompt`` carries, so this briefing adds only
+        the task preamble and the listed files. Once the agent marks its step
+        done, the orchestrator advances to VERIFY without invoking the
+        implementer.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the
+        PLAN_AND_EXECUTE audience, since this one agent both plans and implements.
         """
         preamble = await self._task_preamble(task, 'simple_task', context)
 
@@ -894,47 +1084,14 @@ The implementation was reviewed and blocking issues were found.
         else:
             files_section = '_No files listed in task metadata — explore briefly to identify the target file(s)._'
 
-        # The stop-criterion prose below ("no new abstraction, no cross-module design,
-        # substantial architectural thought") mirrors _COMPLEXITY_RUBRIC in roles.py.
-        # Update both in lockstep if the rubric changes.
         return f"""\
 {preamble}
 
-# Action
+{render_rulings_section(rulings, RulingAudience.PLAN_AND_EXECUTE)}# Action
 
-This task was routed to the SIMPLE_TASK path because its author declared
-complexity:simple. A simple task may be high-priority and may span several
-files/modules — the declaration means the *change* is mechanically simple,
-not that the task is trivial. Your job is to do the change end-to-end in a
-single session:
-
-1. **Read the listed files** below. Confirm the change is mechanically
-   simple — no new abstraction, no cross-module design required.
-2. **Register a plan via plan-tools MCP** — call
-   `mcp__plan-tools__create_plan(task_id, title, analysis, files)`.
-   - For doc/comment-only or behaviour-preserving refactors: add a single
-     `impl` step via `add_plan_step`.
-   - If a new test belongs here: add `test` then `impl`.
-3. **Implement** — edit the file(s), run any tests touching the module,
-   commit (excluding `.task/`), then call
-   `mcp__plan-tools__mark_step_done(step_id, commit_sha)`.
-4. **Stop after marking done.** Do not loop further.
-
-If the change turns out to need cross-module design, a new abstraction, or
-substantial architectural thought, STOP without calling `create_plan` — do
-NOT stop merely because the change spans several files/modules. The
-orchestrator will route to the full architect path on the next dispatch.
-
-If the task spec itself is broken or unworkable, call
-`mcp__plan-tools__report_unactionable_task(reason, evidence)` and stop.
-
-If instead the work is already complete and green on THIS BRANCH and only
-the merge to main is missing — a clean fast-forward (main is an ancestor of
-the branch tip and the tip is not already contained in main), verify already
-PASSED on this exact tip, and review already returned PASS or
-suggestions-only on this exact tree — call
-`mcp__plan-tools__report_ready_to_merge(commit, evidence)` instead of
-`report_unactionable_task` and stop.
+Make this change end-to-end in this one session, following the workflow in
+your role instructions; it also says when to stop and which exit to report
+instead.
 
 {files_section}
 """
@@ -946,6 +1103,9 @@ suggestions-only on this exact tree — call
         rebase_notice: dict | None = None,
         task_id: str | None = None,
         wip_notice: list[dict] | None = None,
+        *,
+        rulings: Sequence[Ruling] = (),
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the implementer agent.
 
@@ -955,7 +1115,10 @@ suggestions-only on this exact tree — call
         string is the one that can lie, because the retry ladder replays an
         assembled prompt verbatim into a fresh session
         (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
-        orchestrator/tests/test_briefing_progress_spot.py.
+        orchestrator/tests/test_briefing_progress_spot.py. The Action paragraph
+        follows config.implementer_brief_variant and, for the same reason, names
+        no step id. *rulings* are rendered by ``orchestrator/escalation_rulings.py``
+        for the EXECUTE audience.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -981,6 +1144,9 @@ Your worktree was rebased onto the latest main branch.
 
 Review any overlap with your plan steps before continuing — file contents may have changed.
 """
+
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'\n{scope_drift_block}' if scope_drift_block else ''
 
         wip_section = ''
         if wip_notice:
@@ -1031,17 +1197,12 @@ Before writing any new code, walk the pending steps in plan order:
 **Analysis:** {plan.get('analysis', 'N/A')}
 
 {rebase_section}
-{wip_section}
+{wip_section}{scope_drift_section}
 # Session Startup Protocol
 
-1. Read `.task/plan.json` to see the full plan with current status — it is a
-   symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the
-   worktree-lane-lifecycle W11 relocation keeps plan/iteration state outside
-   the worktree for pooled lanes, and the symlink survives worktree resets),
-   so reading either path resolves to the same plan.
-2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT
-   symlinked into the lane) to see prior iteration details.
+1. Read `.task/plan.json` to see the full plan with current status.
+2. Read `.task/iterations.jsonl` to see prior iteration details (absent until
+   the first iteration is logged).
 3. Run `git log --oneline -10` to see recent commits.
 4. Identify the next pending step (prerequisites first, then steps).
 5. **Mandatory pre-flight — before writing any code for that step:** run
@@ -1056,9 +1217,9 @@ Before writing any new code, walk the pending steps in plan order:
    instead of re-implementing from scratch. Only write new code if the
    step is genuinely unsatisfied by what's already on disk.
 
-# Action
+{render_rulings_section(rulings, RulingAudience.EXECUTE)}# Action
 
-Execute the next pending steps in TDD order. Commit after each step. Call `mark_step_done(step_id, commit_sha)` to record progress. Stop at a logical boundary.
+{_implementer_action(self.config.implementer_brief_variant)}
 """
 
     async def build_amender_prompt(
@@ -1068,6 +1229,9 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
         locked_modules: list[str],
         context: str | None = None,
         task_id: str | None = None,
+        *,
+        rulings: Sequence[Ruling] = (),
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for an amendment pass — implementer applies in-scope
         review suggestions without re-planning.
@@ -1090,6 +1254,12 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
         Renders NO iteration history (task 5744), for the same reason as
         :meth:`build_implementer_prompt`: iterations.jsonl is its single home
         and the Action section below mandates reading it.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the EXECUTE audience.
+
+        Rule 3 tells the agent not to file a scope request in this pass; one
+        filed anyway is still applied at the pass boundary
+        (``workflow.py::TaskWorkflow._amend``), so none is orphaned.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1116,13 +1286,15 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
                 block.append(f'**Suggested fix:** {fix}')
             suggestion_blocks.append('\n'.join(block))
         suggestions_body = '\n\n'.join(suggestion_blocks)
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
 
 {identity}
 
-# Amendment Pass
+{scope_drift_section}# Amendment Pass
 
 The implementation for this task is complete and verification has passed.
 A code reviewer surfaced the suggestions below, all scoped to modules this
@@ -1147,12 +1319,13 @@ This task holds locks for the following modules:
    collide with another task's concurrent edits. Where the entries above are
    themselves single files, a new file is necessarily outside that list —
    that is expected, and not something to escalate.
-2. Do NOT modify the plan — it is durable at
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane
-   `.task/plan.json` is a symlink into it) and frozen for this pass.
+2. Do NOT modify the plan (`.task/plan.json`) — it is frozen for this pass.
 3. If a suggestion requires EDITING an existing file not covered above,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
+   This pass never widens the task's scope, so do NOT call
+   `report_missing_plan_file` here, whatever your role's standing scope
+   guidance says.
 4. Prefix amendment commit messages with `amend:` so they're distinguishable
    from the main plan commits.
 
@@ -1160,13 +1333,10 @@ This task holds locks for the following modules:
 
 {suggestions_body}
 
-# Action
+{render_rulings_section(rulings, RulingAudience.EXECUTE)}# Action
 
-1. Read `.task/plan.json` (a symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
-   worktree resets) and
-   `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT
-   symlinked into the lane) to refresh context on what was already done.
+1. Read `.task/plan.json` and `.task/iterations.jsonl` to refresh context on
+   what was already done.
 2. Run `git log --oneline -10` to see recent commits.
 3. Apply each in-scope suggestion above. Commit amendments with `amend:`
    prefixes, grouping related fixes when sensible.
@@ -1178,12 +1348,16 @@ This task holds locks for the following modules:
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
         *, attempt_context: VerifyAttemptContext | None = None,
+        rulings: Sequence[Ruling] = (),
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the debugger agent.
 
         *attempt_context* adds a ``# Verify Attempt`` section naming the
         failed attempt and the causes of earlier ones in the same loop; with
         ``None`` the prompt is byte-identical to the attempt-less form.
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the
+        EXECUTE audience.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1191,6 +1365,8 @@ This task holds locks for the following modules:
 
         identity = self._agent_identity(scope.task_id, 'debugger')
         verify_attempt = _format_verify_attempt(attempt_context) if attempt_context else ''
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
@@ -1202,13 +1378,13 @@ This task holds locks for the following modules:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-{verify_attempt}# Failures
+{verify_attempt}{scope_drift_section}# Failures
 
 ```
 {failures}
 ```
 
-# Action
+{render_rulings_section(rulings, RulingAudience.EXECUTE)}# Action
 
 1. Analyze the root cause of each failure.
 2. Make minimal, targeted fixes.
@@ -1221,6 +1397,8 @@ This task holds locks for the following modules:
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
         diff_cap_chars: int = DIFF_ONLY_DIFF_CAP_CHARS,
+        open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt for a reviewer agent.
 
@@ -1242,6 +1420,11 @@ This task holds locks for the following modules:
 
         *diff_cap_chars* is where the diff is cut; ``0`` inlines it whole.
         Production callers leave the default.
+
+        *open_info_notes* lists the task's open info notes for the reviewer to
+        disposition; none leaves the prompt byte-identical. *rulings* are
+        rendered by ``orchestrator/escalation_rulings.py`` for the REVIEW
+        audience, ahead of the notes.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
@@ -1267,25 +1450,43 @@ This task holds locks for the following modules:
         if amendment_suggestions:
             prompt += '\n' + amendment_scope_section(amendment_suggestions)
 
-        return prompt
+        prompt = _with_review_rulings(prompt, rulings)
+        return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
 
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build the context-complete (D2) reviewer prompt for *subject*.
 
         Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
         scopes it; the rendering lives in ``agents/review_briefing.py``.
+        *open_info_notes* and *rulings* are appended exactly as
+        :meth:`build_reviewer_prompt` appends them.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
-        return render_context_complete_review(
+        prompt = render_context_complete_review(
             reviewer_type=reviewer_type,
             subject=subject,
             context=context,
             task_block=self._format_task(subject.task, include_test_strategy=True),
             amendment_suggestions=amendment_suggestions,
+        )
+        prompt = _with_review_rulings(prompt, rulings)
+        return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
+
+    def _with_open_info_notes(
+        self, prompt: str, reviewer_type: str, notes: Sequence[Escalation] | None,
+    ) -> str:
+        """*prompt* with the reviewer's notes block appended; no notes leave it byte-identical."""
+        if not notes:
+            return prompt
+        return prompt + '\n' + _open_info_notes_section(
+            notes, reviewer_type=reviewer_type,
+            detail_chars=self.config.info_l0_note_detail_chars,
         )
 
     async def build_completion_judge_prompt(
@@ -1392,10 +1593,14 @@ Your disposition is read from the `submit_merge_disposition` tool call, not from
         escalation_summary: str,
         resolution: str,
         worktree: Path | None = None,
+        *,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
         context = await self._get_memory_context(BriefingScope.from_task(task), 'implementer')
         prior_proposal_section = self._format_prior_proposal(task)
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
@@ -1411,14 +1616,43 @@ This task was paused because an agent escalated a blocking issue.
 {resolution}
 
 {prior_proposal_section}
-## Action
+{scope_drift_section}## Action
 Resume the task applying the resolution(s) that answer this round's
 escalation(s), each attributed to its escalation id. The prior agent's work
-is preserved in the worktree. Read `.task/plan.json` (a symlink into the
-durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
-worktree resets) and `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl`
-(NOT symlinked into the lane) to understand current progress, then continue
-from where the previous agent left off.
+is preserved in the worktree. Read `.task/plan.json` and
+`.task/iterations.jsonl` to understand current progress, then continue from
+where the previous agent left off.
+"""
+
+    async def build_scope_drift_followup_prompt(
+        self, plan: dict, scope_drift: ScopeDriftReport, task_id: str | None = None,
+    ) -> str:
+        """Prompt for the one session that briefs a contested scope request no writer saw.
+
+        ``workflow.py::TaskWorkflow._brief_contested_scope_drift`` runs it when
+        the session that filed the request was the last writer session due.
+        That can be the judge's early exit with steps still pending, so the
+        prompt claims nothing about the plan's progress.
+        """
+        scope = _plan_scope(plan, task_id)
+        context = await self._get_memory_context(scope, 'implementer')
+        identity = self._agent_identity(scope.task_id, 'implementer')
+        return f"""\
+{context}
+
+{identity}
+
+# Scope Request Follow-up
+
+A file reported with `report_missing_plan_file` is locked by another task,
+and no other writer session is due to hear about it. This session exists only
+to settle it.
+
+{_format_scope_drift(scope_drift)}
+## Action
+For each contested file: revert your edits to it and commit, keeping the
+task's tests passing, or escalate as the section above says. Make no other
+change. Do not edit `.task/plan.json`.
 """
 
     async def build_steward_initial_prompt(
@@ -1445,6 +1679,10 @@ from where the previous agent left off.
             )
             pending_block = f'\n## Other Pending Escalations\n\n{items}\n'
 
+        already_merged = already_merged_step(
+            LandedShaSearches.for_task(str(task.get('id', '?')), self.config.git),
+        )
+
         return f"""\
 {preamble}
 
@@ -1461,7 +1699,7 @@ from where the previous agent left off.
 # Action
 
 1. Understand the escalation and the task context.
-2. Check whether this task's branch is already merged to main (`git merge-base --is-ancestor HEAD main` from the worktree; `git log --oneline main | head -20` is a sanity glance ONLY — never read a sha off it for `done_provenance`, per `skills/_shared/deriving-landed-sha.md`'s "never from HEAD or an eyeballed listing" rule). If the branch is already on main, set the task status to `done` via fused-memory's `set_task_status` tool — **`done_provenance` must always include `kind`**: pass `done_provenance={{"kind": "found_on_main", "commit": "<landing-sha-on-main>", "note": "<one-sentence explanation>"}}` (both `commit` and `note` are required for this kind — there is no commit-less fallback), e.g. note "covered by sibling task" or "already merged prior to this session". If there is no distinct merge commit to cite (e.g. a fast-forward merge, or work covered by a sibling task), do **not** use the branch's own tip commit SHA — `git merge-base --is-ancestor` passes trivially for a branch that never advanced, whose tip is `main`'s own OLD base commit and carries none of this task's work. Cite instead the commit on `main` that actually carries or cites the work (this branch's own commit whose subject cites the task, or the sibling's landing commit), and record the branch tip in `note` (e.g. "landing confirmed by task citation on main; no separate merge commit (branch tip <tip-sha>)"). Derive that sha with the citation gate — `git log main --extended-regexp --format='%H %s' --grep='^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)(\\(\\b<TASK_ID>\\b[):]|.*\\btask/<TASK_ID>\\b)|^Merge task/<TASK_ID> into |\\(#?<TASK_ID>\\)|\\(task <TASK_ID>\\)'` — walking the rows most-recent-first and taking the first whose **subject** (the `%s` field) cites the task: `--grep` matches the whole message, so a body line can match spuriously. Prefer, among the rows that qualify, one whose diff touches this task's declared `metadata.files`. `skills/_shared/deriving-landed-sha.md`'s step-4 citation gate is the full ladder, including the case where NO row cites the task — that is a phantom branch, not a landing, so do not stamp anything and report it as not-landed instead. `escalation/src/escalation/server.py::_found_on_main_response` resolves the same question the same way — task 3103 changed its live-branch path from the branch tip to the citation commit for exactly this reason. If the landing commit came from this session calling `merge_request`, use `done_provenance={{"kind": "merged", "commit": "<merge-sha>"}}` instead. Then call `resolve_issue` explaining the task was already merged. Do NOT attempt to fix code or re-merge.
+2. {already_merged}
 3. Read the relevant code.
 4. Handle the escalation — fix the issue, or triage suggestions.
 5. Run tests to verify any code changes.
@@ -1621,6 +1859,9 @@ A prior block-time investigation concluded the following; verify against the cur
 
         The descriptor contract itself lives in ``docs/task-authoring.md`` §3.3
         — pointed at, never restated (INV-9).
+
+        Then appends ``metadata.followup_items`` via :func:`_format_followup_items`, also exempt
+        from ``include_files=False``: the items are the task's charter, not a footprint guess.
         """
         metadata = task.get('metadata') or {}
         lines = []
@@ -1641,5 +1882,9 @@ A prior block-time investigation concluded the following; verify against the cur
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]
             lines.append(f'**Dependencies:** {", ".join(dep_ids)}')
         body = '\n'.join(lines) if lines else json.dumps(dict(task), indent=2)
-        checks_block = _format_delivered_checks(metadata.get('delivered_checks'))
-        return f'{body}\n\n{checks_block}' if checks_block else body
+        blocks = (
+            body,
+            _format_delivered_checks(metadata.get('delivered_checks')),
+            _format_followup_items(metadata.get(FOLLOWUP_ITEMS_METADATA_KEY)),
+        )
+        return '\n\n'.join(block for block in blocks if block)

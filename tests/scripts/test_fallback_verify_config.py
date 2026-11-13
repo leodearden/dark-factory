@@ -40,7 +40,10 @@ import pytest
 import verify_command_invariants as vci
 import yaml
 from orchestrator.config import ModuleConfig, _discover_module_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_budget_census_records import ORCHESTRATOR_BUDGET_CENSUS
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
@@ -843,9 +846,9 @@ def test_orchestrator_fleet_row_derives_from_the_shared_census_record() -> None:
 
     Task 6172. The record lives once, at
     ``tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS``,
-    and ``test_module_verify_budgets.py::RULED_BUDGET_CENSUS`` reads the same
-    object. A re-literalised row here would agree with it today and drift from
-    it at the next re-measure.
+    and ``verify_budget_census_records.py::RULED_BUDGET_CENSUS``, which the
+    budget gate reads, holds the same object. A re-literalised row here would
+    agree with it today and drift from it at the next re-measure.
     """
     home = 'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS'
     provenance = MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator']

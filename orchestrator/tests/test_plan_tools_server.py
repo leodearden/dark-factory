@@ -1080,6 +1080,11 @@ class TestConfirmPlan:
         assert '_finalized_at' in plan
         assert plan['_finalized_at']
 
+    def test_records_the_architect_as_confirmer(self, artifacts):
+        _setup_full_plan(artifacts)
+        assert _confirm_plan(artifacts)['status'] == 'ok'
+        assert artifacts.read_plan()['_confirmed_by'] == 'architect'
+
     def test_no_plan_returns_error(self, artifacts):
         result = _confirm_plan(artifacts)
         assert result['status'] == 'error'

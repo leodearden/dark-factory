@@ -218,10 +218,11 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
 
     # ``timeout`` is accepted-and-ignored: the unit threads
     # task_snapshot.PER_CALL_TIMEOUT into both reads, so a stub missing the
-    # keyword raises TypeError instead of shaping rows.
+    # keyword raises TypeError instead of shaping rows. ``fields`` is ignored
+    # too: *fetch* answers rows that are already shaped.
     async def _narrowed(
         client, config, project_root, *,
-        statuses=None, timeout=None,
+        statuses=None, fields=None, timeout=None,
     ):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
@@ -579,6 +580,8 @@ async def test_collect_tasks_with_counts_handles_missing_worktree_metadata(tmp_p
         # Claim projection (task 3543): carried on every row. A 'pending' task
         # is never stranded — the shared predicate gates on 'in-progress'.
         'claimant_run_id': None, 'heartbeat_at': None, 'stranded': False,
+        # Filing-time pair, carried on every row; this fixture's shaped task has none.
+        'created_at': None, 'created_at_source': None,
     }]
 
 
@@ -1070,144 +1073,19 @@ def test_build_task_row_external_deps_ignores_non_str_and_empty():
 
 
 # ---------------------------------------------------------------------------
-# prd field coalescing on task rows (step-1 / step-2)
+# prd field on task rows (coalescing itself: test_prd_attribution.py)
 # ---------------------------------------------------------------------------
 
 
-def test_build_task_row_prd_field_from_prd_path():
-    """_build_task_row coalesces metadata.prd_path into row['prd'] verbatim."""
+def test_shaped_row_prd_is_the_coalesced_provenance():
+    """A shaped row's 'prd' is its metadata's PRD provenance, suffix stripped."""
     task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 'plans/dashboard-taskgraph-legibility-prd.md'},
+        'id': 7, 'title': 'x', 'status': 'done', 'dependencies': [],
+        'metadata': {'prd_path': 'plans/x-prd.md#notes'},
+        'updated_at': '2026-11-01T00:00:00+00:00',
     }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/dashboard-taskgraph-legibility-prd.md'
-
-
-def test_build_task_row_prd_field_strips_anchor_suffix():
-    """A trailing '#anchor' fragment on prd_path is stripped."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 'plans/foo-prd.md#implementation-notes'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/foo-prd.md'
-
-
-def test_build_task_row_prd_field_strips_section_suffix():
-    """A trailing '§section' fragment on prd_path is stripped."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 'plans/foo-prd.md§Contract'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/foo-prd.md'
-
-
-def test_build_task_row_prd_field_trims_whitespace():
-    """Surrounding whitespace on prd_path is trimmed."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': '  plans/foo-prd.md  '},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/foo-prd.md'
-
-
-def test_build_task_row_prd_field_legacy_prd_key():
-    """Legacy 'prd' key is coalesced when prd_path is absent."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd': 'docs/legacy-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'docs/legacy-prd.md'
-
-
-def test_build_task_row_prd_field_legacy_prd_ref_key():
-    """Legacy 'prd_ref' key is coalesced when prd_path and prd are absent."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_ref': 'docs/legacy-ref-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'docs/legacy-ref-prd.md'
-
-
-def test_build_task_row_prd_field_precedence_prd_path_over_prd_and_ref():
-    """When multiple provenance keys are present, prd_path wins over prd and prd_ref."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {
-            'prd_path': 'plans/winner-prd.md',
-            'prd': 'plans/loser-prd.md',
-            'prd_ref': 'plans/loser-ref-prd.md',
-        },
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/winner-prd.md'
-
-
-def test_build_task_row_prd_field_empty_prd_path_falls_through_to_prd():
-    """An empty-string prd_path is skipped in favor of a non-empty prd."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': '', 'prd': 'plans/fallback-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/fallback-prd.md'
-
-
-def test_build_task_row_prd_field_suffix_only_prd_path_falls_through():
-    """A prd_path that is ONLY a suffix (cleans to '') falls through to the next key."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': '#just-an-anchor', 'prd': 'plans/fallback-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/fallback-prd.md'
-
-
-def test_build_task_row_prd_field_none_when_no_provenance_keys():
-    """row['prd'] is None when no prd_path/prd/prd_ref keys are present."""
-    task = {'id': 1, 'title': 'x', 'status': 'pending', 'metadata': {}}
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] is None
-
-
-def test_build_task_row_prd_field_non_string_values_skipped():
-    """Non-string prd_path values (int, None) are skipped, yielding None."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 123},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] is None
-
-    task_none = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': None},
-    }
-    row_none = _build_task_row('p', task_none, 1, {}, 'p/T-1')
-    assert row_none['prd'] is None
-
-
-def test_build_task_row_prd_kwarg_overrides_metadata_coalescing():
-    """An explicit prd= kwarg wins verbatim over metadata coalescing.
-
-    Callers that already ran _coalesce_prd (e.g. the terminal-bucket loop, to
-    decide live-PRD membership) pass the result through instead of paying for
-    the split/strip work a second time; this proves the passthrough is used
-    rather than silently re-deriving from metadata.
-    """
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 'plans/metadata-derived-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1', prd='plans/explicit-prd.md')
-    assert row['prd'] == 'plans/explicit-prd.md', (
-        'an explicit prd kwarg must win over metadata coalescing'
-    )
+    [row] = shape_terminal_rows('p', [task], now=datetime(2026, 11, 4, tzinfo=UTC))
+    assert row['prd'] == 'plans/x-prd.md'
 
 
 @pytest.mark.asyncio

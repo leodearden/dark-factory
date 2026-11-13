@@ -686,10 +686,10 @@ def deploy_clock_snapshot(
 # The provenance vocabulary (task 4823) — the three spellings four tiers must
 # agree on and none can import from another (see the module docstring's
 # stdlib+pytest import constraint). `scripts/restart-all-orchestrators.sh` and
-# `scripts/orchestrator-watchdog.py` each mirror them as their own literals, and
-# all three mirrors are pinned together by
+# `scripts/_watchdog_state.py` (the watchdog's clock writer) each mirror them as
+# their own literals, and all three mirrors are pinned together by
 # tests/scripts/test_restart_all_orchestrators.py and
-# tests/scripts/test_orchestrator_watchdog.py, which assert against THESE
+# tests/scripts/test_watchdog_state.py, which assert against THESE
 # objects rather than against strings of their own.
 PYTEST_SESSION_TOKEN_ENV = 'DF_PYTEST_SESSION_TOKEN'
 CLOCK_PROVENANCE_SOURCE_KEY = 'source'

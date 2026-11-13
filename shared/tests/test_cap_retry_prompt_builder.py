@@ -29,6 +29,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
 
 _INVOKE_PATCH = 'shared.cli_invoke.invoke_claude_agent'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
@@ -98,7 +99,7 @@ class _Trigger:
 _FRESH_TRIGGERS = {
     'cap-hit-no-session': _Trigger(first=_cap_banner(), detect_cap_hit=[True, False]),
     'failed-resume': _Trigger(
-        first=AgentResult(success=False, output='resume broke', cost_usd=0.5),
+        first=measured_resume_rejection('sess-caller'),
         invoke_kwargs={'resume_session_id': 'sess-caller'},
     ),
     'auth-failed': _Trigger(

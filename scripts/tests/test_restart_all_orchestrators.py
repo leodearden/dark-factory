@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The repo-wide deploy-clock guard's OWN snapshot/compare (task 3797), reused
 # rather than re-implemented here: two copies of the same "(bytes, mtime_ns) or
@@ -52,6 +53,8 @@ from df_pytest_isolation import (
     wait_pid_gone,
     wait_proof_grace_secs,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / "restart-all-orchestrators.sh"
 # SYNTHETIC, not the real `orchestrator-reify.service` this used to be (task
@@ -1947,6 +1950,31 @@ def _sweep_in_background(bin_dir, state_path, fleet_dir, lease_path, *extra_args
             proc.communicate(timeout=10)
 
 
+def _await_gate_poll(proc, trace_path, poll):
+    """Return once the backgrounded sweep's drain-poll ledger holds *poll*.
+
+    *poll* is a (verdict, unit) record. Fails, carrying the sweep's output, if
+    the sweep exits first, and fails at a must-not-hang deadline.
+    """
+    deadline = time.monotonic() + load_scaled_grace(
+        10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+    )
+    while poll not in read_drain_poll_trace(trace_path, complete_only=True):
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate(timeout=10)
+            pytest.fail(
+                f"the sweep exited (rc={proc.returncode}) before its gate polled "
+                f"{poll!r}; ledger="
+                f"{read_drain_poll_trace(trace_path, complete_only=True)!r} "
+                f"stdout={stdout!r} stderr={stderr!r}"
+            )
+        assert time.monotonic() < deadline, (
+            f"the sweep's gate never polled {poll!r}; ledger="
+            f"{read_drain_poll_trace(trace_path, complete_only=True)!r}"
+        )
+        time.sleep(0.05)
+
+
 def test_lease_is_held_mid_sweep_and_names_the_sweeps_own_pid(tmp_path):
     """(a) While the sweep runs, the lease records {pid, started_ts, current_unit}.
 
@@ -2113,7 +2141,13 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
+    # Fault injection, not the remedy: widens the acquire->advance window so a
+    # regression to snapshotting on the lease's first appearance fails the
+    # current_unit precondition below.
+    acquire_to_advance_latency_secs = 0.5
+    _install_spawn_latency(bin_dir, acquire_to_advance_latency_secs)
     _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
+    trace_path = tmp_path / "drain-poll-trace.tsv"
 
     with _sweep_in_background(
         bin_dir, state_path, fleet_dir, lease_path, "--drain",
@@ -2125,9 +2159,18 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
                 ))
             ),
             "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
         },
     ) as (proc, pgid):
-        held = json.loads(lease_path.read_text())
+        # The sweep rewrites the lease once per unit before its gate parks; once
+        # parked on UNIT_R it rewrites nothing more in the lease until its grace ends.
+        _await_gate_poll(proc, trace_path, ("busy", UNIT_R))
+        held = lease_path.read_bytes()
+        assert json.loads(held)["current_unit"] == UNIT_R, (
+            f"the snapshot must be the lease the sweep holds while parked on "
+            f"{UNIT_R}; a snapshot of an earlier write is a moving target the "
+            f"sweep may still overwrite before the kill. held={held!r}"
+        )
         os.killpg(pgid, signal.SIGKILL)
         proc.communicate(timeout=30)
         assert wait_pid_gone(proc.pid), "the SIGKILLed sweep must actually be gone"
@@ -2138,7 +2181,7 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
         "deleting leases, and the reader-side max-age bound is being asked to "
         "cover a case it was never given"
     )
-    assert json.loads(lease_path.read_text()) == held, (
+    assert lease_path.read_bytes() == held, (
         "the stranded lease must be byte-equal to what the sweep held"
     )
 
@@ -2869,13 +2912,7 @@ def test_sigterm_mid_sweep_removes_its_own_requests_and_leaves_another_sweeps(tm
             "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
         },
     ) as (proc, pgid):
-        deadline = time.monotonic() + load_scaled_grace(
-            10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
-        )
-        while ("verifying", UNIT_R) not in read_drain_poll_trace(trace_path, complete_only=True):
-            assert proc.poll() is None, f"the sweep exited before it awaited {UNIT_R}"
-            assert time.monotonic() < deadline, f"the sweep never polled {UNIT_R} verifying"
-            time.sleep(0.05)
+        _await_gate_poll(proc, trace_path, ("verifying", UNIT_R))
         os.killpg(pgid, signal.SIGTERM)
         stdout, stderr = proc.communicate(timeout=30)
 

@@ -7,6 +7,8 @@ stand-in binary on PATH: the escalation MCP the reload talks to (a loopback
 HTTP server speaking its measured STATEFUL protocol, plus the catalogue of
 ways its transport can fail and the reply of a tool that raised), the git repo
 holding the config, and the `python3` a caller's shell offers the reload step.
+The readers of the JSON verdict such a script ends with live here too, so every
+suite reads it one way.
 
 Stdlib only, and free of pytest, so every consumer imports it by bare name
 (scripts/tests/conftest.py appends scripts/tests to sys.path).
@@ -277,18 +279,40 @@ TRANSPORT_FAULTS: dict[str, McpFault] = {
 
 
 class ClosedPort:
-    """A port with nothing listening on it, for the dead-socket case.
+    """A port with nothing listening on it, for the dead-socket case, held for
+    a with-block.
 
-    Bound and released, so it is free -- and the script's connect is the only
-    thing racing for it. Carries the same `port` attribute a script driver
-    reads from a FakeEscalationMcp, so the no-server case is driven the same
-    way.
+    While held, the port is bound and not listening: no other socket can bind
+    it, and a connect to it is refused. `port` is offered only inside the
+    with-block. It is the same `port` attribute a script driver reads from a
+    FakeEscalationMcp, so the no-server case is driven the same way.
     """
 
     def __init__(self):
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.port = probe.getsockname()[1]
+        self._holder: socket.socket | None = None
+
+    @property
+    def port(self) -> int:
+        if self._holder is None:
+            raise RuntimeError("ClosedPort reserves its port only inside its with-block")
+        return self._holder.getsockname()[1]
+
+    def __enter__(self):
+        if self._holder is not None:
+            raise RuntimeError("ClosedPort is already held; enter a fresh one")
+        holder = socket.socket()
+        try:
+            holder.bind(("127.0.0.1", 0))
+        except BaseException:
+            holder.close()
+            raise
+        self._holder = holder
+        return self
+
+    def __exit__(self, *exc):
+        holder, self._holder = self._holder, None
+        if holder is not None:
+            holder.close()
 
 
 # ---------------------------------------------------------------------------
@@ -438,3 +462,52 @@ def commit_config(repo, text):
 def head(repo, *, short=False):
     """*repo*'s HEAD sha -- abbreviated as the scripts print it if *short*."""
     return git(repo, "rev-parse", *(["--short"] if short else []), "HEAD").strip()
+
+
+# ---------------------------------------------------------------------------
+# Reading a deploy script's JSON verdict
+#
+# Each script ends its stdout with one JSON object: `outcome: <name>` on
+# success, `failure: <tag>` on a designed failure. Every reader takes any
+# object carrying `.returncode` and `.stdout`, a CompletedProcess or a
+# namespace a test builds from a Popen's output.
+# ---------------------------------------------------------------------------
+
+def last_verdict(proc):
+    """The script's last non-empty stdout line, parsed as its JSON verdict."""
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    assert lines, f"no stdout at all; {_shown(proc)}"
+    return json.loads(lines[-1])
+
+
+def failure_tag(proc):
+    """The failure tag of a run that must have failed, read from its verdict."""
+    assert proc.returncode != 0, _shown(proc)
+    verdict = last_verdict(proc)
+    assert "outcome" not in verdict, verdict
+    return verdict["failure"]
+
+
+def verdict_lines(proc):
+    """(line, verdict) for every stdout line that parses as a JSON object."""
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            yield line, parsed
+
+
+def outcome_verdict_lines(proc):
+    """Every stdout line that parses as a verdict claiming any success outcome."""
+    return [line for line, verdict in verdict_lines(proc) if "outcome" in verdict]
+
+
+def _shown(proc):
+    """*proc*'s exit and output for an assertion message; a namespace built
+    from a Popen may carry no stderr."""
+    return f"rc={proc.returncode} stdout={proc.stdout} stderr={getattr(proc, 'stderr', None)}"

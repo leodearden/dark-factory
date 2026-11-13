@@ -9,15 +9,12 @@ its own knob's disposition in it. Everything between the landing and that
 check lives here once: importing the transport, calling reload_config through
 it, confirming the reload committed a re-read of the caller's own config file,
 and the operator-facing diagnostic for each way that can fail. The landing
-module shares this module's transport loader, its remedy and `die`.
+module shares this module's transport loader and its remedy.
 
-Two entry points, one fetch:
-
-* `fetch_reload_report` raises `ReloadNotConfirmed` on any failure. Its
-  `.failure` is a `ReloadFailure` whose value is the wire tag a caller may
-  print in its own verdict, and its `.detail` is the operator prose.
-* `reload_or_exit` is that same fetch without the re-read check, exiting
-  through `die` with the detail.
+`fetch_reload_report` is the one entry point. It raises `ReloadNotConfirmed`
+on any failure: its `.failure` is a `ReloadFailure` whose value is the wire
+tag a caller may print in its own verdict, and its `.detail` is the operator
+prose.
 
 The calling script's side of the contract:
 
@@ -38,7 +35,7 @@ import os
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from shared.mcp_session import McpCallError
@@ -72,12 +69,6 @@ class ReloadNotConfirmed(Exception):
         self.detail = detail
 
 
-def die(prog: str, message: str) -> NoReturn:
-    """Fail the deploy gate: `<prog>: <message>` on stderr, exit 1."""
-    print(f"{prog}: {message}", file=sys.stderr)
-    sys.exit(1)
-
-
 def load_transport():
     """The reload transport's two modules, `(shared.mcp_session, httpx)`, or
     ImportError when this interpreter cannot run it.
@@ -108,7 +99,7 @@ def transport_not_importable_remedy(exc: ImportError) -> str:
 
 
 def fetch_reload_report(
-    port: str, *, committed_as: str, config_path: str | None,
+    port: str, *, committed_as: str, config_path: str,
     timeout: float = RELOAD_REPLY_TIMEOUT_SECS,
 ) -> dict:
     """reload_config's report from the orchestrator whose escalation MCP
@@ -121,8 +112,7 @@ def fetch_reload_report(
     nothing about that file unless its reload committed and re-read exactly
     that file: any disposition it carries -- a key absent from `applied`, or
     present with the caller's value -- is equally produced by a rolled-back
-    reload or by a reload of another orchestrator. None skips that check, for
-    a caller that asks only for the report.
+    reload or by a reload of another orchestrator.
     """
     report = _call_reload_config(port, committed_as=committed_as, timeout=timeout)
     # reload_config's OWN error field -- a config that failed to parse --
@@ -131,8 +121,7 @@ def fetch_reload_report(
         raise ReloadNotConfirmed(
             ReloadFailure.RELOAD_ERROR, f"reload_config error: {report['error']}",
         )
-    if config_path is not None:
-        _confirm_reread_of(config_path, report)
+    _confirm_reread_of(config_path, report)
     return report
 
 
@@ -219,12 +208,3 @@ def _confirm_reread_of(config_path: str, report: dict) -> None:
             ReloadFailure.DIFFERENT_CONFIG_FILE,
             f"reload re-read a different file: config_path={reported!r} expected={expected!r}",
         )
-
-
-def reload_or_exit(port: str, *, prog: str, committed_as: str) -> dict:
-    """`fetch_reload_report` without the re-read check, exiting through `die`
-    with the refusal's detail."""
-    try:
-        return fetch_reload_report(port, committed_as=committed_as, config_path=None)
-    except ReloadNotConfirmed as exc:
-        die(prog, exc.detail)

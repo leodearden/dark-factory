@@ -14,13 +14,14 @@ scheduler's logger.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
 
 from shared.task_metadata import parse_metadata
 
+from orchestrator.deploy_state import awaits_scheduled_restart
 from orchestrator.task_status import TERMINAL_STATUSES
 
 logger = logging.getLogger('orchestrator.scheduler')
@@ -32,6 +33,7 @@ class DepKind(StrEnum):
     LOCAL = 'local'
     EXTERNAL = 'external'
     DELIVERED_CHECK = 'delivered_check'
+    SCHEDULED_DEPLOY = 'scheduled_deploy'
 
 
 class DepState(StrEnum):
@@ -106,6 +108,14 @@ def task_external_deps(task: dict) -> list[str]:
     return metadata.external_deps
 
 
+def task_dependency_ids(task: dict) -> list[str]:
+    """THE single reader of *task*'s local dependency ids, as strings, dict-shaped deps unwrapped."""
+    return [
+        str(d.get('id', d) if isinstance(d, dict) else d)
+        for d in task.get('dependencies', []) or []
+    ]
+
+
 def deps_verdict(
     task: dict,
     status_map: dict[str, str],
@@ -115,13 +125,14 @@ def deps_verdict(
     external_resolver_failed: bool = False,
     delivered_check_cache: dict[str, bool] | None = None,
     terminal_dep_records: dict[str, dict] | None = None,
+    deferred_terminal_deps: Collection[str] = frozenset(),
 ) -> DepsVerdict:
     """THE dependency predicate: are *task*'s dependencies satisfied?
 
-    Three arms, local then external then delivered-check, combined by
-    :meth:`DepsVerdict.combine`: the first arm known UNSATISFIED wins, else
-    the first UNKNOWN.  The arms run lazily in that order, so none runs, or
-    logs, after an UNSATISFIED one.
+    Four arms, local then scheduled-deploy then external then delivered-check,
+    combined by :meth:`DepsVerdict.combine`: the first arm known UNSATISFIED
+    wins, else the first UNKNOWN.  The arms run lazily in that order, so none
+    runs, or logs, after an UNSATISFIED one.
 
     **Local**: a dep is satisfied when its status is in
     :data:`TERMINAL_STATUSES` (``done`` or ``cancelled``).  ``cancelled``
@@ -140,6 +151,18 @@ def deps_verdict(
     and ``merge-deferred`` blocks like any other non-terminal status.  The
     allowance also requires the dep record to be present in *tasks_by_id*;
     a missing dep (stale snapshot) is treated conservatively as blocking.
+
+    **Scheduled self-deploy**: a TERMINAL local dep whose
+    ``done_provenance.kind`` is ``deterministic-deploy-scheduled`` holds its
+    dependent (UNSATISFIED) until its ``deploy_state.phase`` reaches
+    ``verified`` or ``done`` — see
+    ``orchestrator/src/orchestrator/deploy_state.py::awaits_scheduled_restart``;
+    the phase writer is ``orchestrator/src/orchestrator/scheduled_deploy_settle.py``.
+    The record is read from *tasks_by_id*, else *terminal_dep_records*.  A
+    missing record does not hold, unless the dep is in
+    *deferred_terminal_deps*: the per-tick record fetch budget deferred it
+    before it was ever cached, so it may be held, and the arm answers UNKNOWN
+    until a later tick fetches it.
 
     **Cross-project external deps**: consulted only when
     *external_status_cache* is not ``None``.  An external dep in
@@ -164,14 +187,15 @@ def deps_verdict(
     active-only ``get_tasks`` fetch that seeds *tasks_by_id* excludes
     DONE/CANCELLED tasks, so a just-completed dep is often genuinely ABSENT
     from *tasks_by_id* even though its TERMINAL status is already in
-    *status_map*.  When the delivered-check arm's ``tasks_by_id.get(dep_id)``
-    misses (``None``) and *terminal_dep_records* is not ``None``, the dep
-    record is looked up there instead — a purely ADDITIVE fallback consulted
-    ONLY in that arm (never the intra-train merge-deferred allowance above,
+    *status_map*.  When ``tasks_by_id.get(dep_id)`` misses (``None``) and
+    *terminal_dep_records* is not ``None``, the delivered-check and
+    scheduled-deploy arms look the dep record up there instead — a purely
+    ADDITIVE fallback (never the intra-train merge-deferred allowance above,
     which deals exclusively with non-terminal deps already present in
     *tasks_by_id*).  If the dep is present in *tasks_by_id*,
     *terminal_dep_records* is never consulted (*tasks_by_id* wins).  If the
-    dep is absent from BOTH, the arm skips it.
+    dep is absent from BOTH, the arm skips it, except that the scheduled-deploy
+    arm waits on a dep in *deferred_terminal_deps* (above).
 
     Handles three dependency formats:
       - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
@@ -182,12 +206,14 @@ def deps_verdict(
     and its current status to aid diagnosis of premature-dispatch issues.
     Emits a separate DEBUG log when the intra-train allowance fires.
     """
-    dep_ids = [
-        str(d.get('id', d) if isinstance(d, dict) else d)
-        for d in task.get('dependencies', [])
-    ]
+    dep_ids = task_dependency_ids(task)
     arms = (
         partial(_local_verdict, task, dep_ids, status_map, tasks_by_id),
+        partial(
+            _scheduled_deploy_verdict,
+            task, dep_ids, status_map, tasks_by_id, terminal_dep_records,
+            deferred_terminal_deps,
+        ),
         partial(_external_verdict, task, external_status_cache, external_resolver_failed),
         partial(
             _delivered_check_verdict,
@@ -249,6 +275,62 @@ def _local_verdict(
     return DEPS_SATISFIED
 
 
+def _dep_record(
+    dep_id: str,
+    tasks_by_id: dict[str, dict] | None,
+    terminal_dep_records: dict[str, dict] | None,
+) -> dict | None:
+    """*dep_id*'s record: *tasks_by_id* wins, *terminal_dep_records* is the fallback.
+
+    The active-only fetch that seeds *tasks_by_id* excludes a TERMINAL dep,
+    so its record usually arrives only through the per-tick backfill
+    (``scheduler.py::Scheduler._phase_backfill_terminal_dep_records``).
+    """
+    record = tasks_by_id.get(dep_id) if tasks_by_id is not None else None
+    if record is None and terminal_dep_records is not None:
+        record = terminal_dep_records.get(dep_id)
+    return record
+
+
+def _scheduled_deploy_verdict(
+    task: dict,
+    dep_ids: list[str],
+    status_map: dict[str, str],
+    tasks_by_id: dict[str, dict] | None,
+    terminal_dep_records: dict[str, dict] | None,
+    deferred_terminal_deps: Collection[str],
+) -> DepsVerdict:
+    """The scheduled-deploy arm of :func:`deps_verdict`."""
+    verdict = DEPS_SATISFIED
+    for dep_id in dep_ids:
+        if status_map.get(dep_id, 'unknown') not in TERMINAL_STATUSES:
+            continue
+        dep_task = _dep_record(dep_id, tasks_by_id, terminal_dep_records)
+        if dep_task is None:
+            if dep_id in deferred_terminal_deps:
+                logger.debug(
+                    'Task %s waits: dep %s record not fetched yet (deferred by the '
+                    'per-tick fetch budget), so its scheduled-deploy hold is unknown',
+                    task.get('id', '?'), dep_id,
+                )
+                verdict = DepsVerdict.unknown(DepKind.SCHEDULED_DEPLOY)
+            # Otherwise fail-open, as in the delivered-check arm below.
+            continue
+        metadata = dep_task.get('metadata')
+        if not isinstance(metadata, dict) or not awaits_scheduled_restart(metadata):
+            continue
+        deploy_slice = metadata.get('deploy_state')
+        logger.debug(
+            'Task %s held: dep %s is a scheduled self-deploy whose restart is '
+            'not yet verified (deploy_state.phase=%r)',
+            task.get('id', '?'),
+            dep_id,
+            deploy_slice.get('phase') if isinstance(deploy_slice, dict) else deploy_slice,
+        )
+        return DepsVerdict.unsatisfied(DepKind.SCHEDULED_DEPLOY)
+    return verdict
+
+
 def _external_verdict(
     task: dict,
     external_status_cache: dict[str, str] | None,
@@ -300,13 +382,7 @@ def _delivered_check_verdict(
     for dep_id in dep_ids:
         if status_map.get(dep_id, 'unknown') not in TERMINAL_STATUSES:
             continue
-        dep_task = tasks_by_id.get(dep_id)
-        if dep_task is None and terminal_dep_records is not None:
-            # Fallback (task 2692): the active-only get_tasks fetch
-            # excludes this TERMINAL dep from tasks_by_id — consult
-            # the per-tick backfilled record instead. Only reached
-            # when tasks_by_id genuinely misses (tasks_by_id wins).
-            dep_task = terminal_dep_records.get(dep_id)
+        dep_task = _dep_record(dep_id, tasks_by_id, terminal_dep_records)
         if dep_task is None:
             # Conscious fail-OPEN, not a gap: see the identical skip site in
             # scheduler.py::Scheduler._compute_delivered_check_cache (task

@@ -1,0 +1,567 @@
+{
+  "arms": {
+    "control": {
+      "entities": {
+        "mean_per_episode": 12.6042,
+        "mean_share_of_control": 1.0
+      },
+      "episodes": 48,
+      "instructions_version": "none",
+      "minted": 292,
+      "model": "gpt-4o-mini",
+      "population_weighted": {
+        "holding_share": {
+          "ci": [
+            0.3128,
+            0.4349
+          ],
+          "effective_n": 237.1,
+          "rate": 0.3718
+        },
+        "holdings_per_day": 34.9,
+        "minted_per_day": 94.0,
+        "overreach_per_day": 12.7,
+        "overreach_rate_minted": {
+          "ci": [
+            0.0977,
+            0.1849
+          ],
+          "effective_n": 237.1,
+          "rate": 0.1355
+        },
+        "overreach_rate_substantive": {
+          "ci": [
+            0.1071,
+            0.2004
+          ],
+          "effective_n": 222.3,
+          "rate": 0.1478
+        },
+        "weights": {
+          "dark_factory": {
+            "decision_anchor": 10.125,
+            "other_decisions": 25.625,
+            "ruling_lexeme": 10.625
+          },
+          "reify": {
+            "decision_anchor": 8.125,
+            "other_decisions": 11.25,
+            "ruling_lexeme": 8.625
+          }
+        },
+        "window_counts": {
+          "holding": 1292.875,
+          "minted": 3477.125,
+          "overreach": 471.0
+        }
+      },
+      "rates": {
+        "all": {
+          "episode_hit_rate": {
+            "ci": [
+              0.307,
+              0.5772
+            ],
+            "k": 21,
+            "n": 48,
+            "rate": 0.4375
+          },
+          "holding_share": {
+            "ci": [
+              0.3726,
+              0.4854
+            ],
+            "k": 125,
+            "n": 292,
+            "rate": 0.4281
+          },
+          "label_counts": {
+            "bookkeeping": 20,
+            "context": 103,
+            "holding": 125,
+            "misbound": 7,
+            "overreach": 37,
+            "unjudgeable": 0
+          },
+          "misbound_count": 7,
+          "overreach_rate_minted": {
+            "ci": [
+              0.0933,
+              0.1698
+            ],
+            "k": 37,
+            "n": 292,
+            "rate": 0.1267
+          },
+          "overreach_rate_substantive": {
+            "ci": [
+              0.1003,
+              0.1819
+            ],
+            "k": 37,
+            "n": 272,
+            "rate": 0.136
+          }
+        },
+        "decision_anchor": {
+          "episode_hit_rate": {
+            "ci": [
+              0.1848,
+              0.6136
+            ],
+            "k": 6,
+            "n": 16,
+            "rate": 0.375
+          },
+          "holding_share": {
+            "ci": [
+              0.3832,
+              0.5709
+            ],
+            "k": 50,
+            "n": 105,
+            "rate": 0.4762
+          },
+          "label_counts": {
+            "bookkeeping": 3,
+            "context": 40,
+            "holding": 50,
+            "misbound": 4,
+            "overreach": 8,
+            "unjudgeable": 0
+          },
+          "misbound_count": 4,
+          "overreach_rate_minted": {
+            "ci": [
+              0.0391,
+              0.1432
+            ],
+            "k": 8,
+            "n": 105,
+            "rate": 0.0762
+          },
+          "overreach_rate_substantive": {
+            "ci": [
+              0.0403,
+              0.1472
+            ],
+            "k": 8,
+            "n": 102,
+            "rate": 0.0784
+          }
+        },
+        "other_decisions": {
+          "episode_hit_rate": {
+            "ci": [
+              0.231,
+              0.6682
+            ],
+            "k": 7,
+            "n": 16,
+            "rate": 0.4375
+          },
+          "holding_share": {
+            "ci": [
+              0.1809,
+              0.3724
+            ],
+            "k": 21,
+            "n": 79,
+            "rate": 0.2658
+          },
+          "label_counts": {
+            "bookkeeping": 10,
+            "context": 37,
+            "holding": 21,
+            "misbound": 2,
+            "overreach": 9,
+            "unjudgeable": 0
+          },
+          "misbound_count": 2,
+          "overreach_rate_minted": {
+            "ci": [
+              0.0611,
+              0.2025
+            ],
+            "k": 9,
+            "n": 79,
+            "rate": 0.1139
+          },
+          "overreach_rate_substantive": {
+            "ci": [
+              0.0702,
+              0.2297
+            ],
+            "k": 9,
+            "n": 69,
+            "rate": 0.1304
+          }
+        },
+        "ruling_lexeme": {
+          "episode_hit_rate": {
+            "ci": [
+              0.28,
+              0.72
+            ],
+            "k": 8,
+            "n": 16,
+            "rate": 0.5
+          },
+          "holding_share": {
+            "ci": [
+              0.4073,
+              0.5927
+            ],
+            "k": 54,
+            "n": 108,
+            "rate": 0.5
+          },
+          "label_counts": {
+            "bookkeeping": 7,
+            "context": 26,
+            "holding": 54,
+            "misbound": 1,
+            "overreach": 20,
+            "unjudgeable": 0
+          },
+          "misbound_count": 1,
+          "overreach_rate_minted": {
+            "ci": [
+              0.1232,
+              0.2688
+            ],
+            "k": 20,
+            "n": 108,
+            "rate": 0.1852
+          },
+          "overreach_rate_substantive": {
+            "ci": [
+              0.132,
+              0.2862
+            ],
+            "k": 20,
+            "n": 101,
+            "rate": 0.198
+          }
+        }
+      },
+      "tokens": {
+        "extract_edges": {
+          "input_tokens": 215623,
+          "llm_calls": 48,
+          "output_tokens": 22270
+        },
+        "extract_nodes": {
+          "input_tokens": 32910,
+          "llm_calls": 48,
+          "output_tokens": 8143
+        }
+      }
+    },
+    "o1": {
+      "entities": {
+        "mean_per_episode": 18.4167,
+        "mean_share_of_control": 0.7321
+      },
+      "episodes": 48,
+      "instructions_version": "o1-v1-99b813d73cba",
+      "minted": 352,
+      "model": "gpt-4o-mini",
+      "population_weighted": {
+        "holding_share": {
+          "ci": [
+            0.3223,
+            0.4341
+          ],
+          "effective_n": 285.5,
+          "rate": 0.3766
+        },
+        "holdings_per_day": 43.6,
+        "minted_per_day": 115.9,
+        "overreach_per_day": 9.2,
+        "overreach_rate_minted": {
+          "ci": [
+            0.0534,
+            0.1167
+          ],
+          "effective_n": 285.5,
+          "rate": 0.0795
+        },
+        "overreach_rate_substantive": {
+          "ci": [
+            0.0596,
+            0.1295
+          ],
+          "effective_n": 257.6,
+          "rate": 0.0885
+        },
+        "weights": {
+          "dark_factory": {
+            "decision_anchor": 10.125,
+            "other_decisions": 25.625,
+            "ruling_lexeme": 10.625
+          },
+          "reify": {
+            "decision_anchor": 8.125,
+            "other_decisions": 11.25,
+            "ruling_lexeme": 8.625
+          }
+        },
+        "window_counts": {
+          "holding": 1614.5,
+          "minted": 4287.5,
+          "overreach": 340.75
+        }
+      },
+      "rates": {
+        "all": {
+          "episode_hit_rate": {
+            "ci": [
+              0.2702,
+              0.5369
+            ],
+            "k": 19,
+            "n": 48,
+            "rate": 0.3958
+          },
+          "holding_share": {
+            "ci": [
+              0.3811,
+              0.484
+            ],
+            "k": 152,
+            "n": 352,
+            "rate": 0.4318
+          },
+          "label_counts": {
+            "bookkeeping": 34,
+            "context": 129,
+            "holding": 152,
+            "misbound": 8,
+            "overreach": 29,
+            "unjudgeable": 0
+          },
+          "misbound_count": 8,
+          "overreach_rate_minted": {
+            "ci": [
+              0.058,
+              0.1158
+            ],
+            "k": 29,
+            "n": 352,
+            "rate": 0.0824
+          },
+          "overreach_rate_substantive": {
+            "ci": [
+              0.0642,
+              0.1279
+            ],
+            "k": 29,
+            "n": 318,
+            "rate": 0.0912
+          }
+        },
+        "decision_anchor": {
+          "episode_hit_rate": {
+            "ci": [
+              0.231,
+              0.6682
+            ],
+            "k": 7,
+            "n": 16,
+            "rate": 0.4375
+          },
+          "holding_share": {
+            "ci": [
+              0.3835,
+              0.5507
+            ],
+            "k": 62,
+            "n": 133,
+            "rate": 0.4662
+          },
+          "label_counts": {
+            "bookkeeping": 7,
+            "context": 50,
+            "holding": 62,
+            "misbound": 2,
+            "overreach": 12,
+            "unjudgeable": 0
+          },
+          "misbound_count": 2,
+          "overreach_rate_minted": {
+            "ci": [
+              0.0524,
+              0.1511
+            ],
+            "k": 12,
+            "n": 133,
+            "rate": 0.0902
+          },
+          "overreach_rate_substantive": {
+            "ci": [
+              0.0553,
+              0.1591
+            ],
+            "k": 12,
+            "n": 126,
+            "rate": 0.0952
+          }
+        },
+        "other_decisions": {
+          "episode_hit_rate": {
+            "ci": [
+              0.1018,
+              0.495
+            ],
+            "k": 4,
+            "n": 16,
+            "rate": 0.25
+          },
+          "holding_share": {
+            "ci": [
+              0.231,
+              0.4149
+            ],
+            "k": 30,
+            "n": 95,
+            "rate": 0.3158
+          },
+          "label_counts": {
+            "bookkeeping": 9,
+            "context": 51,
+            "holding": 30,
+            "misbound": 0,
+            "overreach": 5,
+            "unjudgeable": 0
+          },
+          "misbound_count": 0,
+          "overreach_rate_minted": {
+            "ci": [
+              0.0227,
+              0.1173
+            ],
+            "k": 5,
+            "n": 95,
+            "rate": 0.0526
+          },
+          "overreach_rate_substantive": {
+            "ci": [
+              0.0251,
+              0.129
+            ],
+            "k": 5,
+            "n": 86,
+            "rate": 0.0581
+          }
+        },
+        "ruling_lexeme": {
+          "episode_hit_rate": {
+            "ci": [
+              0.28,
+              0.72
+            ],
+            "k": 8,
+            "n": 16,
+            "rate": 0.5
+          },
+          "holding_share": {
+            "ci": [
+              0.3977,
+              0.571
+            ],
+            "k": 60,
+            "n": 124,
+            "rate": 0.4839
+          },
+          "label_counts": {
+            "bookkeeping": 18,
+            "context": 28,
+            "holding": 60,
+            "misbound": 6,
+            "overreach": 12,
+            "unjudgeable": 0
+          },
+          "misbound_count": 6,
+          "overreach_rate_minted": {
+            "ci": [
+              0.0562,
+              0.1616
+            ],
+            "k": 12,
+            "n": 124,
+            "rate": 0.0968
+          },
+          "overreach_rate_substantive": {
+            "ci": [
+              0.066,
+              0.1875
+            ],
+            "k": 12,
+            "n": 106,
+            "rate": 0.1132
+          }
+        }
+      },
+      "tokens": {
+        "extract_edges": {
+          "input_tokens": 232214,
+          "llm_calls": 48,
+          "output_tokens": 26514
+        },
+        "extract_nodes": {
+          "input_tokens": 44574,
+          "llm_calls": 48,
+          "output_tokens": 11997
+        }
+      }
+    }
+  },
+  "comparison": {
+    "o1": {
+      "bars": {
+        "holding_retention_min": 0.8,
+        "overreach_ratio_max": 0.5
+      },
+      "checks": {
+        "halves_overreach_per_day": false,
+        "halves_overreach_per_minted": false,
+        "retains_holdings": true,
+        "upper_bound_below_control_point": true
+      },
+      "holding_retention": 1.2488,
+      "overreach_ratio_minted": 0.5867,
+      "overreach_ratio_per_day": 0.7235,
+      "passes": false
+    }
+  },
+  "fidelity": {
+    "baseline": {
+      "ci": [
+        0.0876,
+        0.1721
+      ],
+      "rate": 0.1238
+    },
+    "control": {
+      "ci": [
+        0.0977,
+        0.1849
+      ],
+      "rate": 0.1355
+    },
+    "intervals_overlap": true
+  },
+  "sample": {
+    "cap": 8,
+    "hash_rule": "sha256(graph:uuid)",
+    "strata": [
+      "ruling_lexeme",
+      "decision_anchor",
+      "other_decisions"
+    ],
+    "window_end": "2026-10-01T00:00:00+00:00",
+    "window_start": "2026-08-25T00:00:00+00:00"
+  },
+  "verdicts": 644
+}

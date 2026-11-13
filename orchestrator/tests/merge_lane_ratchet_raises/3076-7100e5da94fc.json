@@ -1,0 +1,18 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 work \u2014 the crash-recovery sweep test drives the real Harness._recover_crashed_tasks reader, as test_lane_lifecycle_integration.py does",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_lane_in_use.py",
+      "baseline": 10,
+      "current": 11
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6668,
+      "current": 6669
+    }
+  ]
+}

@@ -23,7 +23,7 @@ from pathlib import Path
 
 import exception_register
 import pytest
-from _task_db_scan import tasks_db_path
+from _task_db_scan import decode_metadata, tasks_db_path
 from exception_owner_liveness import Liveness
 from exception_owner_sweep import (
     FAILURE_TASK_ID,
@@ -56,7 +56,9 @@ from exception_owner_sweep import (
     run,
     scan,
 )
+from fused_memory.middleware.candidate_key import compute_candidate_key
 from inline_suppression_fixtures import RUFF_CONFIG, SUBPROCESS_TIMEOUT_SECS, track_fixture_tree
+from inline_suppressions import BASELINE_PATH
 from shared.governed_exceptions import (
     Debt,
     Disposition,
@@ -67,6 +69,9 @@ from shared.governed_exceptions import (
     owner_record,
 )
 from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 TICKET = TicketRef('tkt_0A')
 
@@ -325,7 +330,9 @@ class StubMcp:
     and a created task is INSERTED into the temp store with the submitted
     metadata.  ``'pending'`` answers the unpersisted ``timeout`` of a curator
     that has not finished, so the task may still appear after the sweep has
-    stopped waiting.  The stub writes; the sweep only reads.
+    stopped waiting.  Like the store's ``(tag, candidate_key)`` index, which
+    covers done rows, it folds a created submission into any non-cancelled row
+    of the same key.  The stub writes; the sweep only reads.
     """
 
     def __init__(
@@ -372,8 +379,28 @@ class StubMcp:
             return self._update(int(str(args['id'])), args['metadata'])
         raise AssertionError(f'unexpected fused-memory tool {tool}')
 
+    def _colliding_row(self, args: dict) -> int | None:
+        key = compute_candidate_key(args['title'], args['metadata'].get('files'))
+        if key is None:
+            return None
+        with sqlite3.connect(self.db) as conn:
+            rows = conn.execute(
+                "SELECT id, title, metadata FROM tasks WHERE tag = 'master' AND status != 'cancelled'"
+            ).fetchall()
+        return next(
+            (
+                row_id
+                for row_id, title, raw in rows
+                if compute_candidate_key(title, decode_metadata(raw).get('files')) == key
+            ),
+            None,
+        )
+
     def _resolve_submitted(self, args: dict) -> dict:
         if self.submit_outcome == 'created':
+            colliding = self._colliding_row(args)
+            if colliding is not None:
+                return {'status': 'combined', 'task_id': str(colliding), 'reason': 'candidate_key_collision'}
             task_id = self.next_task_id
             self.next_task_id += 1
             with sqlite3.connect(self.db) as conn:
@@ -440,12 +467,12 @@ def ports_for(project_root: Path, stub: StubMcp) -> Ports:
     )
 
 
-def act_once(register: RegisterView, ports: Ports) -> Tally:
-    return act(scan(register, ports, now=NOW), ports, now=NOW)
+def act_once(register: RegisterView, ports: Ports, now: datetime.datetime = NOW) -> Tally:
+    return act(scan(register, ports, now=now), ports, now=now)
 
 
-def sweep_once(register: RegisterView, ports: Ports) -> ActOutcome:
-    return act_once(register, ports).counts()
+def sweep_once(register: RegisterView, ports: Ports, now: datetime.datetime = NOW) -> ActOutcome:
+    return act_once(register, ports, now).counts()
 
 
 def view(*citations: Citation, slack_total: int = 0) -> RegisterView:
@@ -793,6 +820,15 @@ def test_scenario_24_slack_files_one_tighten_task_across_runs(project_root, seed
     assert TIGHTEN_COMMAND in submitted['description']
 
 
+def test_the_tighten_task_declares_the_baseline_file_it_changes(project_root, seed):
+    stub = StubMcp(seed([]))
+
+    sweep_once(view(slack_total=54), ports_for(project_root, stub))
+
+    (submitted,) = stub.tool_calls('submit_task')
+    assert submitted['metadata']['files'] == [BASELINE_PATH]
+
+
 def test_no_slack_files_no_tighten_task(project_root, seed):
     stub = StubMcp(seed([]))
 
@@ -802,12 +838,18 @@ def test_no_slack_files_no_tighten_task(project_root, seed):
 
 
 def test_a_closed_tighten_task_is_followed_by_a_new_one_never_an_escalation(project_root, seed):
-    stub = StubMcp(seed([{'id': 5000, 'status': 'done', 'metadata': {FINDING_KEY_FIELD: TIGHTEN_KEY.record()}}]))
+    db = seed([])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    register = view(slack_total=6)
+    sweep_once(register, ports)
+    set_status(db, FIRST_CREATED_ID, 'done')
 
-    sweep_once(view(slack_total=3), ports_for(project_root, stub))
+    second = sweep_once(register, ports, now=NOW + datetime.timedelta(hours=4))
 
-    assert keys_of(stub) == [TIGHTEN_KEY.record()]
+    assert second.filed == 1
     assert stub.tool_calls('escalate_info') == []
+    assert keys_of(stub) == [TIGHTEN_KEY.record(), TIGHTEN_KEY.record()]
 
 
 def test_the_tighten_task_comes_after_findings_and_inside_the_bound(project_root, seed):

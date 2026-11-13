@@ -257,19 +257,19 @@ class TestResolveMergeShaByTaskId:
             ['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True, check=True,
         ).stdout.strip()
 
-        sha = resolve_merge_sha_by_task_id('9999', repo)
+        sha = resolve_merge_sha_by_task_id('9999', repo, branch_prefix='task/', main_branch='main')
 
         assert sha == expected_sha
 
     def test_returns_none_when_no_matching_commit(self, tmp_path: Path) -> None:
         repo, _merge_sha = make_git_repo_with_merge(tmp_path)
 
-        sha = resolve_merge_sha_by_task_id('no-such-task', repo)
+        sha = resolve_merge_sha_by_task_id('no-such-task', repo, branch_prefix='task/', main_branch='main')
 
         assert sha is None
 
     def test_returns_none_for_nonexistent_repo(self, tmp_path: Path) -> None:
-        sha = resolve_merge_sha_by_task_id('1234', tmp_path / 'does-not-exist')
+        sha = resolve_merge_sha_by_task_id('1234', tmp_path / 'does-not-exist', branch_prefix='task/', main_branch='main')
 
         assert sha is None
 
@@ -737,7 +737,9 @@ class TestRecoverCandidates:
     def test_a_candidate_with_a_merge_sha_is_recovered_from_it(self, tmp_path: Path) -> None:
         repo, merge_sha = make_git_repo_with_merge(tmp_path)
 
-        [recovered] = recover_candidates([_candidate('1', merge_sha)], existing_ids=set(), repo_path=repo)
+        [recovered] = recover_candidates(
+            [_candidate('1', merge_sha)], existing_ids=set(), repo_path=repo, branch_prefix='task/', main_branch='main',
+        )
 
         assert (recovered.candidate.task_id, recovered.merge_sha) == ('1', merge_sha)
         assert recovered.diff_text.strip()
@@ -747,18 +749,24 @@ class TestRecoverCandidates:
         candidate = _candidate('1', merge_sha)
 
         assert candidate.diff_id == 'mined_1'
-        assert recover_candidates([candidate], existing_ids={'mined_1'}, repo_path=repo) == []
+        assert recover_candidates(
+            [candidate], existing_ids={'mined_1'}, repo_path=repo, branch_prefix='task/', main_branch='main',
+        ) == []
 
     def test_an_unknown_sha_is_skipped(self, tmp_path: Path) -> None:
         repo, _merge_sha = make_git_repo_with_merge(tmp_path)
 
-        assert recover_candidates([_candidate('1', '0' * 40)], existing_ids=set(), repo_path=repo) == []
+        assert recover_candidates(
+            [_candidate('1', '0' * 40)], existing_ids=set(), repo_path=repo, branch_prefix='task/', main_branch='main',
+        ) == []
 
     def test_a_candidate_without_a_sha_is_found_by_its_merge_message(self, tmp_path: Path) -> None:
         repo, _merge_sha = make_git_repo_with_merge(tmp_path)
         sha = _commit_task_merge(repo, '77', 'fallback\n')
 
-        [recovered] = recover_candidates([_candidate('77', None)], existing_ids=set(), repo_path=repo)
+        [recovered] = recover_candidates(
+            [_candidate('77', None)], existing_ids=set(), repo_path=repo, branch_prefix='task/', main_branch='main',
+        )
 
         assert recovered.merge_sha == sha
         assert '+fallback' in recovered.diff_text
@@ -769,6 +777,7 @@ class TestRecoverCandidates:
 
         recovered = recover_candidates(
             [_candidate('88', big), _candidate('1', merge_sha)], existing_ids=set(), repo_path=repo,
+            branch_prefix='task/', main_branch='main',
         )
 
         assert [r.candidate.task_id for r in recovered] == ['1', '88']

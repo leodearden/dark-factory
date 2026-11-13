@@ -57,6 +57,9 @@ from shared.capability_manifest import (
     sidecar_path,
 )
 from shared.task_metadata import parse_metadata
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _task_dict(label='α', **overrides):

@@ -18,23 +18,23 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from _fm_helpers import (
-    FALKOR_HOST,
-    FALKOR_PORT,
     assert_ro_query_only,
     extract_cypher,
     extract_params,
-    falkor_skipif,
     make_rebuild_detail,
-    unique_graph_name,
 )
 from falkordb.asyncio import FalkorDB
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.graphiti_client import (
     GraphitiBackend,
     NodeNotFoundError,
     _MultiTenantFalkorDriver,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.redirect_node_edges
@@ -1252,7 +1252,7 @@ class TestDisallowListForMergeEntities:
 # shape, not FalkorDB's actual per-uuid-count(*) semantics or whether ID()
 # enumeration + WHERE ID(old)=$eid keying genuinely rewrites the intended
 # edges. The reachability probe, connection constants and per-run graph name
-# come from _fm_helpers (task 3502) — see its module docstring for why it is
+# come from _fm_falkor_live (task 3502) — see its module docstring for why it is
 # not conftest.py. Only the fixture body below is per-module; do not re-fork
 # the shared helpers back into this file.
 #

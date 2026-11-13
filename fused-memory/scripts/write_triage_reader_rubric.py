@@ -19,7 +19,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
-from fused_memory.server.grouped_read import _digest
+from fused_memory.server.grouped_read import amendment_text
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -440,11 +440,15 @@ def quote_found(quote: str, text: str) -> bool:
 
 
 def digest_visible(loss_spans: Sequence[str], child_text: str) -> bool:
-    """Whether every span lies inside the digest a reader of the parent sees of *child_text*."""
+    """DIGEST: whether every span lies in the amendment text a reader of the parent sees of *child_text*.
+
+    That text is ``grouped_read.amendment_text`` at its shipped default cap, so
+    an offline re-score is reproducible from git.
+    """
     if not loss_spans:
         raise ValueError('digest_visible needs at least one loss span')
-    digest = _digest(child_text)
-    return all(quote_found(span, digest) for span in loss_spans)
+    shown = amendment_text(child_text)
+    return all(quote_found(span, shown) for span in loss_spans)
 
 
 def _normalised(text: str) -> str:
@@ -475,7 +479,7 @@ CELL_RULES: Mapping[Cell, str] = MappingProxyType({
     ),
     Cell.DIGEST_CONFLICT: (
         'An amended write disputes its record (CONFLICT), and a reader of the record'
-        ' meets the dispute only as an untagged 240-character digest.'
+        ' meets the dispute only as an untagged amendment, not as a correction.'
     ),
     Cell.WRONG_HOME: (
         "An attached write is not about its record's claim (HOME=NO); a contest whose"

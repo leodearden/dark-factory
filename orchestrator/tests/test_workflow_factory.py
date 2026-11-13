@@ -22,7 +22,8 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT, pydantic_spec
+from _orch_helpers import pydantic_spec
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import orchestrator
 from orchestrator.config import OrchestratorConfig
@@ -35,7 +36,7 @@ from orchestrator.workflow import TaskWorkflow, build_workflow
 # because it is structurally identical to the three members that crashed.
 # WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
 # ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -115,7 +116,7 @@ _BUILD_WORKFLOW_PARAMS = (
     'escalation_queue', 'escalation_event', 'usage_gate', 'initial_plan',
     'steward_factory', 'merge_queue', 'merge_worker', 'merge_inflight_registry',
     'event_store', 'cost_store', 'cancel_event', 'resume_session_id', 'run_id',
-    'resume_outcome_sink',
+    'resume_outcome_sink', 'task_verify',
 )
 
 

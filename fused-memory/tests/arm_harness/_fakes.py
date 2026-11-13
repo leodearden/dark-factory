@@ -53,7 +53,7 @@ from fused_memory.arm_harness.slate import (
     candidate_spec,
     embedding_control_spec,
 )
-from fused_memory.arm_harness.usage_tap import CallRecord
+from fused_memory.arm_harness.usage_tap import CallRecord, StatusOrigin
 from fused_memory.backends.llm_token_usage import (
     AttributingTokenUsageTracker,
     LlmTokenUsage,
@@ -457,6 +457,7 @@ def call(
     duration_ms: float = 2000.0,
     error_excerpt: str | None = None,
     outlived_session: bool = False,
+    status_origin: StatusOrigin | None = None,
 ) -> CallRecord:
     succeeded = 200 <= status < 300
     return CallRecord(
@@ -473,6 +474,7 @@ def call(
         finish_reason=finish_reason if succeeded else None,
         error_excerpt=None if succeeded else (error_excerpt or f'error {status}'),
         outlived_session=outlived_session,
+        status_origin=status_origin,
     )
 
 

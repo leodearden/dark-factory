@@ -9,9 +9,15 @@ ensures that even if the dedicated-thread heartbeat is delayed, systemd gives
 the process 120s before SIGABRT (was 30s — too tight with the old on-loop design).
 """
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+import yaml
+from _loopback_host import is_loopback_host
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -236,6 +242,18 @@ class TestSocketActivation:
             f"ListenStream={recon.escalation_host}:{recon.escalation_port}",
         ]
 
+    def test_socket_listens_on_loopback_only(self) -> None:
+        listen_streams = [
+            d for d in _parse_systemd_unit(_SOCKET_UNIT)["Socket"]
+            if d.startswith("ListenStream=")
+        ]
+        assert listen_streams, f"{_SOCKET_UNIT.name} declares no ListenStream="
+        for directive in listen_streams:
+            host = directive.split("=", 1)[1].rpartition(":")[0]
+            assert is_loopback_host(host), (
+                f"{_SOCKET_UNIT.name}: {directive!r} does not bind a loopback IP address"
+            )
+
     @pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
     def test_service_wants_and_orders_after_the_socket(self, unit_path: Path) -> None:
         sections = _parse_systemd_unit(unit_path)
@@ -251,3 +269,149 @@ class TestSocketActivation:
         hooks = [d for d in service if d.startswith("ExecStopPost=")]
         assert len(hooks) == 1
         assert hooks[0].endswith("/scripts/stop-socket-unless-restarting.sh %n")
+
+
+@pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
+class TestKillModeMixed:
+    """A stop must signal only the main process, so the server receives one
+    SIGTERM and drains its in-flight tool calls (task 9493)."""
+
+    def test_service_kill_mode_is_mixed(self, unit_path: Path) -> None:
+        service = _parse_systemd_unit(unit_path)["Service"]
+        kill_modes = [d for d in service if d.startswith("KillMode=")]
+        assert kill_modes == ["KillMode=mixed"], (
+            f"{unit_path.name} must declare exactly one KillMode=mixed under [Service]; "
+            f"found {kill_modes}. With the default control-group, systemd SIGTERMs "
+            "every process in the cgroup, so the server receives 2+ stop signals and "
+            "the curator/judge subprocesses behind live tool calls are killed."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Local embedder start hooks and cutover hold (task 6797)
+# ---------------------------------------------------------------------------
+
+_SERVICE_TEMPLATE = _FM_DIR.parent / "scripts" / "fused-memory.service.template"
+_HOLD_DROPIN = _FM_DIR.parent / "scripts" / "fused-memory-cutover-hold.conf"
+_COMPOSE_FILE = _FM_DIR / "docker" / "docker-compose.yml"
+
+
+def _exec_start_pre(unit_path: Path) -> list[str]:
+    return [d for d in _parse_systemd_unit(unit_path)["Service"] if d.startswith("ExecStartPre=")]
+
+
+def _command_argv(exec_line: str) -> list[str]:
+    """The command an Exec*= line runs, without its directive name or `-` prefix."""
+    return exec_line.split("=", 1)[1].removeprefix("-").split()
+
+
+def _bound_secs(exec_line: str) -> int | None:
+    """How long the line's command may run, or None when nothing bounds it."""
+    argv = _command_argv(exec_line)
+    if argv[0] == "/usr/bin/timeout":
+        return int(argv[1])
+    if argv[0].endswith("wait-for-port.py"):
+        return int(argv[argv.index("--timeout") + 1])
+    return None
+
+
+def _required_bound_secs(exec_line: str) -> int:
+    bound = _bound_secs(exec_line)
+    assert bound is not None, exec_line
+    return bound
+
+
+def _published_embedder_address() -> str:
+    """The host side of the embedder's compose publish, e.g. 127.0.0.1:8420."""
+    compose = yaml.safe_load(_COMPOSE_FILE.read_text(encoding="utf-8"))
+    host_ip, host_port, _container_port = compose["services"]["embedder"]["ports"][0].split(":")
+    return f"{host_ip}:{host_port}"
+
+
+_EMBEDDER_ADDRESS = _published_embedder_address()
+_STORE_ADDRESSES = ("127.0.0.1:6379", "127.0.0.1:6333")
+
+
+def _is_embedder_up(line: str) -> bool:
+    argv = line.split()
+    return "compose" in argv and "up" in argv and "embedder" in argv
+
+
+def _is_embedder_wait(line: str) -> bool:
+    return "wait-for-port" in line and _EMBEDDER_ADDRESS in line.split()
+
+
+def _is_store_wait(line: str) -> bool:
+    return "wait-for-port" in line and set(_STORE_ADDRESSES) <= set(line.split())
+
+
+def _index_of(lines: list[str], is_wanted: Callable[[str], bool]) -> int:
+    matches = [index for index, line in enumerate(lines) if is_wanted(line)]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
+class TestEmbedderStartHooks:
+    """The embedder hooks never block fused-memory's start and fit the start timeout."""
+
+    def _embedder_lines(self) -> list[str]:
+        return [
+            line for line in _exec_start_pre(_SERVICE_TEMPLATE)
+            if "embedder" in line or _EMBEDDER_ADDRESS in line
+        ]
+
+    def test_only_the_up_and_the_wait_concern_the_embedder_and_both_ignore_failure(self) -> None:
+        embedder_lines = self._embedder_lines()
+        assert len(embedder_lines) == 2
+        assert sum(map(_is_embedder_up, embedder_lines)) == 1
+        assert sum(map(_is_embedder_wait, embedder_lines)) == 1
+        assert all(line.startswith("ExecStartPre=-") for line in embedder_lines)
+
+    def test_every_embedder_hook_is_bounded(self) -> None:
+        unbounded = [line for line in self._embedder_lines() if _bound_secs(line) is None]
+        assert unbounded == []
+
+    def test_embedder_up_never_pulls_never_starts_dependencies_and_names_only_the_embedder(self) -> None:
+        lines = _exec_start_pre(_SERVICE_TEMPLATE)
+        argv = lines[_index_of(lines, _is_embedder_up)].split()
+        assert "--pull=never" in argv
+        assert "--no-deps" in argv
+        assert argv[-1] == "embedder"
+
+    def test_embedder_is_started_before_the_store_wait_and_waited_on_after(self) -> None:
+        lines = _exec_start_pre(_SERVICE_TEMPLATE)
+        up = _index_of(lines, _is_embedder_up)
+        store_wait = _index_of(lines, _is_store_wait)
+        embedder_wait = _index_of(lines, _is_embedder_wait)
+        assert up < store_wait < embedder_wait
+
+    def test_store_wait_is_unprefixed_so_store_failure_still_fails_the_start(self) -> None:
+        lines = _exec_start_pre(_SERVICE_TEMPLATE)
+        assert lines[_index_of(lines, _is_store_wait)].startswith("ExecStartPre=/")
+
+    def test_store_wait_and_embedder_bounds_fit_inside_the_start_timeout(self) -> None:
+        service = _parse_systemd_unit(_SERVICE_TEMPLATE)["Service"]
+        start_timeout = int(next(d for d in service if d.startswith("TimeoutStartSec=")).split("=", 1)[1])
+        lines = _exec_start_pre(_SERVICE_TEMPLATE)
+        store_wait = _required_bound_secs(lines[_index_of(lines, _is_store_wait)])
+        embedder_bounds = [_required_bound_secs(line) for line in self._embedder_lines()]
+        assert store_wait + sum(embedder_bounds) < start_timeout
+
+
+class TestCutoverHoldDropin:
+    """The drop-in holds both units while the lock exists, and the lock survives a reboot."""
+
+    def _condition(self) -> str:
+        unit = _parse_systemd_unit(_HOLD_DROPIN)
+        assert list(unit) == ["Unit"]
+        assert len(unit["Unit"]) == 1
+        return unit["Unit"][0]
+
+    def test_condition_is_negated_path_existence(self) -> None:
+        assert self._condition().startswith("ConditionPathExists=!")
+
+    def test_lock_path_is_reboot_surviving_and_host_portable(self) -> None:
+        lock = self._condition().split("!", 1)[1]
+        assert lock.startswith("%h/.local/state/")
+        assert not lock.startswith(("/tmp", "/run", "/var/run"))
+        assert "XDG_RUNTIME_DIR" not in lock

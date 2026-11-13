@@ -15,11 +15,13 @@ from orchestrator import session_registry as sr
 
 
 def isolate_hook_env(monkeypatch: pytest.MonkeyPatch, fleet_root: Path) -> None:
-    """Scrub every ``CLAUDE_SPAWN_*`` var and pin ``CLAUDE_FLEET_ROOT`` to *fleet_root*.
+    """Scrub every ``CLAUDE_SPAWN_*`` var and ``T3CODE_THREAD_ID``, and pin ``CLAUDE_FLEET_ROOT`` to *fleet_root*.
 
     ``sh.main`` reads ``os.environ``, so a ``CLAUDE_SPAWN_*`` identity leaked
     from a fleet-spawned launching context would re-key or re-attribute the
-    records a test asserts on (tasks 2643, 2940). ``hook_session_slug`` reads
+    records a test asserts on (tasks 2643, 2940), and a ``T3CODE_THREAD_ID``
+    leaked from a T3-hosted runner would key them on that thread's pointer
+    and stamp them t3 (task 8124). ``hook_session_slug`` reads
     the registry, so the default root must not be the developer's real
     ``~/.claude/fleet`` (task 4193).
 
@@ -29,6 +31,7 @@ def isolate_hook_env(monkeypatch: pytest.MonkeyPatch, fleet_root: Path) -> None:
     """
     for name in [k for k in os.environ if k.startswith('CLAUDE_SPAWN_')]:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv('T3CODE_THREAD_ID', raising=False)
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(fleet_root))
 
 
@@ -40,6 +43,7 @@ def assert_hook_env_isolated(fleet_root: Path) -> None:
     the real fleet root.
     """
     assert [k for k in os.environ if k.startswith('CLAUDE_SPAWN_')] == []
+    assert 'T3CODE_THREAD_ID' not in os.environ
     assert os.environ.get('CLAUDE_FLEET_ROOT') == str(fleet_root)
 
 

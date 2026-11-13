@@ -57,6 +57,9 @@ from typing import Any, NamedTuple
 import pytest
 from pydantic import ValidationError
 from shared.task_metadata import DoneProvenance
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

@@ -45,8 +45,9 @@ stamps the tags this reads; the two are copies, pinned equal by a test.
 GROUPED_CHILD_KEYS = ('amendments', 'matched_children')
 """Where fused-memory nests child bodies inside a kept result's ``grouped`` block.
 
-``group_search_results`` hangs amendment digests under ``amendments`` and
-full swallowed bodies under ``matched_children``. Both render into the
+``group_search_results`` hangs amendment entries under ``amendments``, each
+carrying its text as ``content`` capped at the judge's field cap, and full
+swallowed bodies under ``matched_children``. Both render into the
 ``# Context`` block, so both are filtered and rendered. ``grouped['parent']``
 is absent because only ``get_memory_by_id`` produces it, and recall never
 calls that tool.
@@ -55,7 +56,7 @@ calls that tool.
 CONTESTED_CHILD_KEY = 'contested'
 """The flag fused-memory stamps on a grouped child that contests its parent.
 
-``fused-memory/src/fused_memory/server/grouped_read.py::_digest_entry`` stamps
+``fused-memory/src/fused_memory/server/grouped_read.py::_amendment_entry`` stamps
 it from ``is_contested_child``, the single definition of contested. It is read
 here exactly as stamped (``is True``), never re-derived from the child's own
 ``x_contested`` metadata. A copy rather than an import, because the
@@ -245,7 +246,13 @@ def _entry_id(entry: dict) -> str | None:
 
 
 def _entry_text(entry: Any) -> str | None:
-    """What an entry has to read, its ``content`` else its ``digest``; None when blank."""
+    """What an entry has to read, its ``content`` else its ``digest``; None when blank.
+
+    ``content`` is what fused-memory emits since task 7518: an amendment's text
+    capped at the judge's field cap. ``digest`` is the 240-char text a
+    pre-7518 server emits instead, kept so a briefing renders while the two
+    are redeployed at different times.
+    """
     if not isinstance(entry, dict):
         return None
     text = entry.get('content') or entry.get('digest')
@@ -318,10 +325,9 @@ def _contesting_bullet(
     When the reply carries the child's own top-level hit, that hit renders,
     with its whole uncapped body under its own store. Otherwise the grouped
     entry renders under its parent's store:
-    ``fused-memory/src/fused_memory/server/grouped_read.py::_digest_entry``
-    gives a contested entry its text as ``content``, capped at the judge's
-    field cap, so :func:`_entry_text` shows that rather than the 240-char
-    digest.
+    ``fused-memory/src/fused_memory/server/grouped_read.py::_amendment_entry``
+    gives every amendment entry its text as ``content``, capped at the judge's
+    field cap, and :func:`_entry_text` shows that.
     """
     label = 'contests its parent'
     child_id = _entry_id(child)

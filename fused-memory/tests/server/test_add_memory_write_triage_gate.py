@@ -58,8 +58,10 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
+    TRIAGE_FAIL_OPEN_KEY,
     TRIAGE_OUTCOMES,
     BandDecision,
+    FailOpenStage,
     TriageFailOpenCounter,
 )
 from fused_memory.services.memory_service import SearchResults
@@ -692,7 +694,7 @@ class TestTheForceStoreArms:
     async def test_a_declared_child_kind_alone_force_stores(self) -> None:
         """Either key alone is enough — the attach overwrites BOTH.
 
-        Deliberately wider than `grouped_read._parent_id_in_meta`, which needs
+        Deliberately wider than `grouped_read.child_parent_id`, which needs
         both keys well-formed to answer "does this record group?". The question
         here is "did the caller say anything about parentage that triage would
         overwrite?", and a half-declared link is a caller bug for
@@ -1479,12 +1481,13 @@ def _pending_retry_response() -> AddMemoryResponse:
     )
 
 
-class TestAPendingWriteClaimsNoSupersessionMark:
+class TestAPendingWriteDefersItsSupersessionMarks:
     """A write's supersedes targets are marked with its Mem0 id, which a write
-    pending server-side retry does not have yet (task 7156's seam)."""
+    pending server-side retry does not have yet; the retry pass marks them when
+    it lands, so the ack names them pending rather than unmarked."""
 
     @pytest.mark.asyncio
-    async def test_the_targets_are_reported_unmarked(self, monkeypatch) -> None:
+    async def test_the_targets_are_reported_pending_retry(self, monkeypatch) -> None:
         _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
@@ -1497,9 +1500,8 @@ class TestAPendingWriteClaimsNoSupersessionMark:
         assert result['stores_pending_retry'] == ['mem0'], f'{result!r}'
         supersession = result[SUPERSESSION_ACK_KEY]
         assert supersession['marked'] == [], f'{supersession!r}'
-        (unmarked,) = supersession['unmarked']
-        assert unmarked['id'] == superseded
-        assert unmarked['reason'] == 'no_superseding_mem0_record'
+        assert supersession['unmarked'] == [], f'{supersession!r}'
+        assert supersession['pending_retry'] == [superseded], f'{supersession!r}'
         mock_service.update_memory.assert_not_awaited()
 
 
@@ -1868,6 +1870,154 @@ class TestAVerdictWithNoWiredAttachKindIsVisible:
             'a gap between the judge vocabulary and the tool wiring is a '
             'fail-open, not a routing decision nobody notices (INV-4)'
         )
+
+
+class TestAFailOpenIsMarkedOnTheAck:
+    """INV-11 at the tool seam: an untriaged ``stored`` says so on its ack.
+
+    C1 keeps ``routed`` at ``stored`` and the write landing, so the marker is
+    the only thing telling a caller the write was never triaged. Every
+    genuine ``stored`` and every real attach omits it.
+    """
+
+    @staticmethod
+    def _service(**search) -> AsyncMock:
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        for attr, value in search.items():
+            setattr(mock_service.search, attr, value)
+        return mock_service
+
+    @staticmethod
+    def _assert_marked(result: dict, mock_service: AsyncMock, stage: FailOpenStage) -> None:
+        assert result[TRIAGE_FAIL_OPEN_KEY] == stage.value, f'{result!r}'
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert CANONICAL_ID_KEY not in result, f'{result!r}'
+        assert mock_service.add_memory.await_args.kwargs['content'] == _CONTENT, (
+            'C1: the write must land with its original content'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_search_is_marked_retrieve(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(side_effect=RuntimeError('mem0 unreachable'))
+
+        result = await _call(create_mcp_server(mock_service))
+
+        self._assert_marked(result, mock_service, FailOpenStage.RETRIEVE)
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_search_is_marked_retrieve(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(return_value=SearchResults(
+            [], degraded=True, failed_stores=['mem0'],
+        ))
+
+        result = await _call(create_mcp_server(mock_service))
+
+        self._assert_marked(result, mock_service, FailOpenStage.RETRIEVE)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_judge_is_marked_judge(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(
+            return_value=[search_candidate('canonical-A', _MIDDLE_BAND)],
+        )
+
+        with patch(_JUDGE_PATH, new=AsyncMock(side_effect=RuntimeError('provider down'))):
+            result = await _call(create_mcp_server(mock_service))
+
+        self._assert_marked(result, mock_service, FailOpenStage.JUDGE)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_attach_write_is_marked_attach_write(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(return_value=[search_candidate('m1', 0.97)])
+        fallback = MagicMock()
+        fallback.model_dump.return_value = {'id': 'fallback-id'}
+        mock_service.add_memory.side_effect = [
+            RuntimeError('parent_id rejected by the write seam'),
+            fallback,
+        ]
+
+        result = await _call(create_mcp_server(mock_service))
+
+        self._assert_marked(result, mock_service, FailOpenStage.ATTACH_WRITE)
+        assert result['id'] == 'fallback-id'
+
+    @pytest.mark.asyncio
+    async def test_an_attach_that_did_not_persist_is_marked_attach_not_durable(
+        self, monkeypatch,
+    ) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(return_value=[search_candidate('m1', 0.97)])
+        mock_service.add_memory.return_value = (
+            TestAnAttachThatDidNotLandIsNotAcked._failed_response()
+        )
+
+        result = await _call(create_mcp_server(mock_service))
+
+        self._assert_marked(result, mock_service, FailOpenStage.ATTACH_NOT_DURABLE)
+
+    @pytest.mark.asyncio
+    async def test_an_unwired_verdict_is_marked_unwired_verdict(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service()
+        monkeypatch.setattr(
+            tools, 'triage_write',
+            AsyncMock(return_value=BandDecision(
+                _UNWIRED_FUTURE_VERDICT, 'm1', 0.85, T_HIGH, T_LOW,
+            )),
+        )
+
+        result = await _call(create_mcp_server(mock_service))
+
+        self._assert_marked(result, mock_service, FailOpenStage.UNWIRED_VERDICT)
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_attach_is_not_marked(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(return_value=[search_candidate('m1', 0.97)])
+
+        result = await _call(create_mcp_server(mock_service))
+
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
+        assert TRIAGE_FAIL_OPEN_KEY not in result, f'{result!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_empty_search_is_not_marked(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(return_value=SearchResults([]))
+
+        result = await _call(create_mcp_server(mock_service))
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert TRIAGE_FAIL_OPEN_KEY not in result, f'{result!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_force_store_skips_retrieval_and_is_not_marked(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(side_effect=RuntimeError('retrieval must not run'))
+
+        result = await _call(
+            create_mcp_server(mock_service), metadata={'allow_near_duplicate': True},
+        )
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert TRIAGE_FAIL_OPEN_KEY not in result, f'{result!r}'
+        mock_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_triage_disabled_is_not_marked(self) -> None:
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, enabled=False)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.side_effect = RuntimeError('mem0 unreachable')
+
+        result = await _call(create_mcp_server(mock_service))
+
+        assert TRIAGE_FAIL_OPEN_KEY not in result, f'{result!r}'
 
 
 class TestAContestedVerdictLandsAsAFlaggedAmendmentChild:

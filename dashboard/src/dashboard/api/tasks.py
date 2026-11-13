@@ -19,6 +19,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import Clock, app_clock
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
     collect_census_snapshots,
@@ -43,7 +44,6 @@ from dashboard.data.task_snapshot import (
     classify,
     measured_terminal_total,
 )
-from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ async def _terminal_window(
 
 
 async def _terminal_answer(
-    client: httpx.AsyncClient, config: DashboardConfig, label: str,
+    client: httpx.AsyncClient, config: DashboardConfig, label: str, clock: Clock,
 ) -> dict[str, object]:
     """The whole ``?terminal=<label>`` answer: the window under its key, and ``served_at``.
 
@@ -183,12 +183,12 @@ async def _terminal_answer(
     unknown, and never the response.
     """
     what = f'the terminal window for {label}'
-    render_at = resolve_now(None)
+    render_at = clock()
     try:
         window = await _terminal_window(client, config, label, now=render_at)
     except Exception:
         window = _unknown_after_unexpected_error(what)
-    served_at = resolve_now(None)
+    served_at = clock()
     try:
         validate_datum(window, served_at)
     except DatumContractError as broken:
@@ -364,12 +364,13 @@ async def api_tasks(
     """
     config = request.app.state.config
     http_client = request.app.state.http_client
+    clock = app_clock(request.app)
     # A PRESENT parameter, even an empty one, selects the terminal answer.
     # Absent is not the same as empty: no parameter is the default render,
     # with no terminal read and no terminal key.
     terminal = request.query_params.get('terminal')
     if terminal is not None:
-        return JSONResponse(await _terminal_answer(http_client, config, terminal))
+        return JSONResponse(await _terminal_answer(http_client, config, terminal, clock))
     # TWO instants, in this order. render_at is the producer's: it stamps what
     # this render measures and ages its rows, one clock read for all of them.
     # served_at is resolved only AFTER the fan-out returns, and every Datum on
@@ -388,11 +389,11 @@ async def api_tasks(
     # narrowed active fetch and one compact get_statuses walk, concurrent and
     # under one TTL. The third slot in task_snapshot.PER_PROJECT_MCP_CALLS is
     # the terminal window, which only the `?terminal=` request spends.
-    render_at = resolve_now(None)
+    render_at = clock()
     snapshots = await _collect_snapshots(
         projection, http_client, config, now=render_at,
     )
-    served_at = resolve_now(None)
+    served_at = clock()
     offline_projects: list[str] = []
     degraded_projects: list[str] = []
     count_unknown_projects: list[str] = []

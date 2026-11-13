@@ -11,31 +11,62 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import httpx
-from _canned_mcp import CannedMCP, _raw_row
-from _dt_helpers import make_fixed_datetime_cls
+from _canned_mcp import CannedMCP, _raw_row, is_metadata_projection
+from _dt_helpers import fixed_clock, installed_clock
+from _prd_lanes_tree import (
+    CARRIER,
+    LaneTask,
+    Scenario,
+    holder_processes,
+    lanes_tree,
+    prd_key,
+    sidecar,
+    tree_tasks,
+)
+from _prd_tree import prd_tree_tasks
+from _quality_rows import (
+    NO_COST,
+    NO_OUTCOMES,
+    epochs_from,
+    history,
+    train,
+    write_landing_events,
+    write_marker_state_db,
+    write_quality_db,
+)
+from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
+from _served_reads import forget_escalation_corpus, forget_served_reads
 from escalation.archive import archive_dir_for_date
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 from fastapi.testclient import TestClient
+from shared.capability_manifest import sidecar_path
 from shared.locking import files_to_modules
+from shared.project_id import project_id_for_root
+from shared.quality_series.git_lines import ModuleLines
+from shared.quality_series.landings import GitCrossCheck, LinesBase
+from shared.quality_series.rows import Cost, LandingRow, Outcomes
 from shared.task_statuses import TaskStatus
 
 import dashboard.data.task_snapshot as snapshot_mod
-from dashboard.api.escalations import _analytics_memo_clear
 from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
-from dashboard.data.active_tasks import reset_task_snapshot_state
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
+from dashboard.data.quality_markers import Marker, MarkerKind, MarkerSource, SourceType
+from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS
+from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
@@ -49,6 +80,8 @@ ESCALATIONS = '/api/v2/dashboard/escalations'
 ESCALATION_ANALYTICS = '/api/v2/dashboard/escalation-analytics'
 MEMORY_GRAPHS = '/api/v2/dashboard/memory-graphs'
 SCHEDULER = '/api/v2/dashboard/scheduler'
+PRDS = '/api/v2/dashboard/prds'
+QUALITY = '/api/v2/dashboard/quality'
 
 # in_flight 43 (running 25), backlog 1310, terminal 4106: total 5459.
 DARK_FACTORY_COUNTS: Mapping[TaskStatus, int] = {
@@ -107,24 +140,6 @@ MERGE_ATTEMPTS: tuple[MergeAttempt, ...] = (
 )
 """One project's merges over three days: three inside 24h, all six inside 7d."""
 
-# The orchestrator's runs.db events table, as orchestrator/src/orchestrator/
-# event_store.py::_SCHEMA creates it; the dashboard does not depend on that package.
-_EVENTS_DDL = """\
-CREATE TABLE events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL,
-    duration_ms INTEGER
-);
-"""
-
-
 ESCALATIONS_FILED = 5
 ESCALATIONS_ARCHIVED = 3
 """Pending L1 records filed through the real queue, and how many then sit in its archive."""
@@ -170,6 +185,15 @@ HELD = 'H'
 LOCKED_FILE = 'src/m/x.py'
 LOCK_DEPTH = 2
 LOCKED_MODULE = files_to_modules([LOCKED_FILE], LOCK_DEPTH)[0]
+
+SCHEDULER_SNAPSHOT_AT = T0 - timedelta(hours=2)
+"""When every canned root's scheduler last wrote its state file: hours before any read of it."""
+CANNED_SCHEDULER_STATE: Mapping[str, Any] = {
+    'lock_depth': LOCK_DEPTH,
+    'current_holders': {LOCKED_MODULE: '1'},
+    'snapshot_at': SCHEDULER_SNAPSHOT_AT.isoformat(),
+}
+"""The scheduler state every canned root serves unless its scenario names another."""
 
 
 def ragged_day(index: int) -> datetime:
@@ -230,14 +254,52 @@ def _heal(substrate: CannedMCP) -> None:
 
 
 class _ByRoot:
-    """One canned substrate per project root, routed by the read's ``project_root``."""
+    """One canned substrate per project root, routed by the read's ``project_root``.
+
+    ``get_external_statuses`` names no root: it answers each ``project:id`` dep
+    from the substrate labelled ``project``, flat, with fused-memory's
+    ``unknown_project`` / ``unknown_task`` sentinels for one no substrate holds.
+    """
 
     def __init__(self, by_label: Mapping[str, CannedMCP]) -> None:
         self._by_label = by_label
 
     async def __call__(self, client, url, tool, args, **kwargs):
+        if tool == 'get_external_statuses':
+            return {dep: self._external_status(dep) for dep in args['deps']}
         substrate = self._by_label[Path(args['project_root']).name]
         return await substrate(client, url, tool, args, **kwargs)
+
+    def _external_status(self, dep: str) -> str:
+        label, _, task_id = dep.partition(':')
+        substrate = self._by_label.get(label)
+        if substrate is None:
+            return 'unknown_project'
+        return substrate.status_map.get(int(task_id), 'unknown_task')
+
+
+class _SchedulerByRoot:
+    """The scheduler fan-out, one canned state per root label; a label mapped to ``None`` is
+    unreachable. Every other root serves :data:`CANNED_SCHEDULER_STATE`, and no root has events."""
+
+    def __init__(self, states: Mapping[str, Mapping[str, Any] | None]) -> None:
+        self._states = states
+
+    async def __call__(self, _client, _url, tool, args, **_kwargs):
+        state = self._states.get(Path(args['project_root']).name, CANNED_SCHEDULER_STATE)
+        if state is None:
+            raise httpx.ConnectError('canned scheduler unreachable')
+        return dict(state) if tool == 'get_scheduler_state' else []
+
+
+def quiet_ledgers(root: Path) -> None:
+    """An empty run ledger and an empty escalation queue: a project that has recorded nothing."""
+    write_runs_db(root)
+    (root / 'data' / 'escalations').mkdir(parents=True, exist_ok=True)
+
+
+def _quietly(labels: Iterable[str]) -> dict[str, Callable[[Path], object]]:
+    return dict.fromkeys(labels, quiet_ledgers)
 
 
 def _get(client: TestClient, path: str, **params: str) -> dict[str, Any]:
@@ -248,34 +310,44 @@ def _get(client: TestClient, path: str, **params: str) -> dict[str, Any]:
 
 @contextmanager
 def _canned_roots(
-    client: TestClient, workdir: Path, substrates: Mapping[str, CannedMCP],
+    client: TestClient,
+    workdir: Path,
+    substrates: Mapping[str, CannedMCP],
+    *,
+    schedulers: Mapping[str, Mapping[str, Any] | None] | None = None,
+    furnish: Mapping[str, Callable[[Path], object]] | None = None,
 ) -> Iterator[Callable[[datetime], dict[str, Any]]]:
     """Configure the app over one tmp root per substrate; yield GET /tasks at a named instant.
 
     Every task read under it, by any route or by the sampler, is answered by
-    the substrate its root is labelled with. The unit TTL is zero, so every
-    acquisition reads the substrate and a failure lands on the very next one;
-    the last good store is what survives.
+    the substrate its root is labelled with, and every scheduler read by
+    *schedulers* (see :class:`_SchedulerByRoot`), so no read reaches a live
+    fused-memory. *furnish* lays out a labelled root's files before the first
+    read. The unit TTL is zero, so every acquisition reads the substrate and a
+    failure lands on the very next one; the last good store is what survives.
     """
     roots = [workdir / label for label in substrates]
     for root in roots:
         root.mkdir(parents=True)
+        if furnish is not None and root.name in furnish:
+            furnish[root.name](root)
     app.state.config = DashboardConfig(project_root=roots[0], known_project_roots=roots[1:])
-    reset_task_snapshot_state()
+    forget_served_reads()
 
     def render(at: datetime) -> dict[str, Any]:
-        with patch('dashboard.api.tasks.resolve_now', new=lambda _now: at):
+        with installed_clock(app, fixed_clock(at)):
             return _get(client, TASKS)
 
     try:
         with (
             patch('dashboard.data.tasks.mcp_tool_call', new=_ByRoot(substrates)),
+            patch('dashboard.data.scheduler.mcp_tool_call', new=_SchedulerByRoot(schedulers or {})),
             patch('dashboard.data.active_tasks.fetch_task_runtime', new=AsyncMock(return_value={})),
             patch.object(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0),
         ):
             yield render
     finally:
-        reset_task_snapshot_state()
+        forget_served_reads()
 
 
 def _census_family(client: TestClient, workdir: Path) -> dict[str, Any]:
@@ -319,24 +391,23 @@ def _sample(client: TestClient, at: datetime) -> None:
     orchestrator: the sampled roots are exactly the configured ones.
     """
     assert client.portal is not None, 'the sampler runs inside a live TestClient'
-    with (
-        patch('dashboard.data.burndown.datetime', make_fixed_datetime_cls(at)),
-        patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-    ):
-        client.portal.call(_collect_into_store, app.state.config, app.state.http_client)
+    with patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]):
+        client.portal.call(_collect_into_store, app.state.config, app.state.http_client, at)
 
 
-async def _collect_into_store(config: DashboardConfig, http_client: httpx.AsyncClient) -> None:
+async def _collect_into_store(
+    config: DashboardConfig, http_client: httpx.AsyncClient, at: datetime,
+) -> None:
     config.burndown_db.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(config.burndown_db) as conn:
         await conn.executescript(BURNDOWN_SCHEMA)
         await conn.commit()
-        await collect_snapshot(conn, config, http_client)
+        await collect_snapshot(conn, config, http_client, now=at)
 
 
 def _render_burndown(client: TestClient, at: datetime, window: str) -> dict[str, Any]:
     """GET /burndown?window=*window* on the real route, its single clock capture at *at*."""
-    with patch('dashboard.api.burndown.datetime', make_fixed_datetime_cls(at)):
+    with installed_clock(app, fixed_clock(at)):
         return _get(client, BURNDOWN, window=window)
 
 
@@ -377,10 +448,10 @@ def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:
 
 def _write_merge_attempts(root: Path) -> None:
     """*root*'s runs.db, holding :data:`MERGE_ATTEMPTS` as task ids 1, 2, ..."""
-    store = root / 'data' / 'orchestrator' / 'runs.db'
+    store = runs_db_path(root)
     store.parent.mkdir(parents=True)
     with closing(sqlite3.connect(store)) as conn:
-        conn.executescript(_EVENTS_DDL)
+        conn.executescript(EVENTS_DDL)
         conn.executemany(
             'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, data, duration_ms) '
             "VALUES (?, ?, ?, 'merge_attempt', 'merge', ?, ?)",
@@ -403,16 +474,10 @@ def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     with _canned_roots(client, workdir / 'merge', {'dark-factory': _substrate(REIFY_COUNTS)}):
         _write_merge_attempts(app.state.config.project_root)
         for window in ('7d', '24h'):
-            with patch('dashboard.api.merge_queue.resolve_now', new=lambda _now: T0):
+            with installed_clock(app, fixed_clock(T0)):
                 bodies[f'merge_{window}'] = _get(client, MERGE_QUEUE, window=window)
 
     return bodies
-
-
-def _clear_corpus() -> None:
-    """Forget the corpus walk and the analytics derived from it, through their own hooks."""
-    escalation_corpus._corpus_cache_clear()
-    _analytics_memo_clear()
 
 
 def _file_escalations(config: DashboardConfig) -> None:
@@ -458,17 +523,6 @@ def _write_memory_ops(config: DashboardConfig) -> None:
         conn.commit()
 
 
-@contextmanager
-def _memory_graphs_at_t0() -> Iterator[None]:
-    """Both clocks a /memory-graphs request reads, pinned to T0: the journal
-    read's as_of and the route's served_at."""
-    with (
-        patch('dashboard.data.write_journal.resolve_now', new=lambda now: now or T0),
-        patch('dashboard.app.resolve_now', new=lambda now: now or T0),
-    ):
-        yield
-
-
 def _held_tree() -> CannedMCP:
     """H's two in-progress tasks, both footprinting :data:`LOCKED_FILE`."""
     footprint = {'metadata': {'files': [LOCKED_FILE]}}
@@ -503,22 +557,22 @@ def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         _file_escalations(app.state.config)
         for hours, (generation, ttl) in enumerate(CORPUS_TTL_GENERATIONS.items()):
             at = T0 + timedelta(hours=hours)
-            _clear_corpus()
+            forget_escalation_corpus()
             with (
                 patch.object(escalation_corpus, 'CORPUS_TTL_SECONDS', ttl),
-                patch('dashboard.api.escalations.resolve_now', new=lambda _now, at=at: at),
+                installed_clock(app, fixed_clock(at)),
             ):
                 bodies[f'escalations_{generation}'] = _get(client, ESCALATIONS)
                 bodies[f'analytics_{generation}'] = _get(client, ESCALATION_ANALYTICS)
-        _clear_corpus()
+        forget_escalation_corpus()
 
     with _canned_roots(client, workdir / 'memory', {'dark-factory': _substrate(REIFY_COUNTS)}):
         _write_memory_ops(app.state.config)
-        with _memory_graphs_at_t0():
+        with installed_clock(app, fixed_clock(T0)):
             bodies['memory_ops'] = _get(client, MEMORY_GRAPHS)
     with (
         _canned_roots(client, workdir / 'memory_missing', {'dark-factory': _substrate(REIFY_COUNTS)}),
-        _memory_graphs_at_t0(),
+        installed_clock(app, fixed_clock(T0)),
     ):
         bodies['memory_ops_missing'] = _get(client, MEMORY_GRAPHS)
 
@@ -543,7 +597,7 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     owner-carrying row is checked against a shape the route really serves.
     """
     with _canned_roots(client, workdir / 'check_owner', {'dark-factory': _substrate(REIFY_COUNTS)}):
-        _clear_corpus()
+        forget_escalation_corpus()
         config = app.state.config
         queue = EscalationQueue(config.escalations_dir)
         queue.submit(Escalation(
@@ -562,10 +616,461 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         ))
         config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
         try:
-            with patch('dashboard.api.escalations.resolve_now', new=lambda _now: T0):
+            with installed_clock(app, fixed_clock(T0)):
                 return {'escalations_check_owner': _get(client, ESCALATIONS)}
         finally:
-            _clear_corpus()
+            forget_escalation_corpus()
+
+
+PRD_C = 'plans/c-prd.md'
+OVERLAY_ROW = 11
+ORPHAN = 12
+
+
+def prd_tree() -> CannedMCP:
+    """``_prd_tree.py``'s fixture tree at T0, served raw as one project's substrate."""
+    rows = [
+        _raw_row(
+            task_id, task.status, metadata=dict(task.metadata),
+            **({} if task.priority is None else {'priority': task.priority}),
+        )
+        for task_id, task in prd_tree_tasks(T0).items()
+    ]
+    return CannedMCP(rows, {int(row['id']): row['status'] for row in rows}, status_page_size=2000)
+
+
+def _grow_past_lineage(substrate: CannedMCP) -> None:
+    """A new active row naming its own PRD, and an id only the status map knows."""
+    substrate.rows.append(_raw_row(OVERLAY_ROW, 'pending', priority='medium', metadata={'prd_path': PRD_C}))
+    substrate.status_map[OVERLAY_ROW] = 'pending'
+    substrate.status_map[ORPHAN] = 'pending'
+
+
+def _render_prds(client: TestClient, at: datetime) -> dict[str, Any]:
+    with installed_clock(app, fixed_clock(at)):
+        return _get(client, PRDS)
+
+
+@contextmanager
+def canned_prd_roots(
+    client: TestClient,
+    workdir: Path,
+    substrates: Mapping[str, CannedMCP],
+    *,
+    schedulers: Mapping[str, Mapping[str, Any] | None] | None = None,
+) -> Iterator[Callable[[datetime], dict[str, Any]]]:
+    """:func:`_canned_roots` over quiet roots (:func:`quiet_ledgers`), yielding GET /prds at a
+    named instant."""
+    with _canned_roots(
+        client, workdir, substrates, schedulers=schedulers, furnish=_quietly(substrates),
+    ):
+        yield lambda at: _render_prds(client, at)
+
+
+def prd_view_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Boundary rows 8, 9 and 12: the PRD view over the census join.
+
+    ``prd_view_map_failed_tasks`` is the /tasks body served at the same
+    instant as ``prd_view_map_failed``, so its census reason is the one the
+    failed map half carried.
+    """
+    bodies: dict[str, Any] = {}
+
+    two_projects = {'dark-factory': prd_tree(), 'reify': _substrate(REIFY_COUNTS)}
+    with _canned_roots(
+        client, workdir / 'prd_view_fresh', two_projects, furnish=_quietly(two_projects),
+    ):
+        bodies['prd_view_fresh'] = _render_prds(client, T0)
+
+    growing = prd_tree()
+    with _canned_roots(
+        client, workdir / 'prd_view_overlay', {'dark-factory': growing},
+        furnish=_quietly(['dark-factory']),
+    ):
+        _render_prds(client, T0)
+        _grow_past_lineage(growing)
+        bodies['prd_view_overlay'] = _render_prds(client, T0 + timedelta(seconds=20))
+
+    failing = prd_tree()
+    with _canned_roots(
+        client, workdir / 'prd_view_map_failed', {'dark-factory': failing},
+        furnish=_quietly(['dark-factory']),
+    ) as render_tasks:
+        _render_prds(client, T0)
+        _fail_status_map(failing)
+        failed_at = T0 + timedelta(seconds=20)
+        bodies['prd_view_map_failed'] = _render_prds(client, failed_at)
+        bodies['prd_view_map_failed_tasks'] = render_tasks(failed_at)
+
+    return bodies
+
+
+LANES_ROOT = 'dark-factory'
+"""The lanes family's root holding the lanes tree, its run ledger, queue, sidecars and PRD files."""
+QUEUELESS_ROOT = 'reify'
+"""The lanes family's second root: a run ledger but no escalation queue, so the corpus as a
+whole is a lower bound while :data:`LANES_ROOT`'s own queue is read whole."""
+
+
+def lane_title(key: str) -> str:
+    """The H1 of the fixture PRD file at *key*."""
+    return f'Lanes fixture {key}'
+
+
+def lanes_substrate(tree: Mapping[str, Scenario]) -> CannedMCP:
+    """*tree*'s tasks, the outside tasks included, served raw as one project's substrate."""
+    tasks = tree_tasks(tree)
+    rows = [
+        _raw_row(
+            task_id, task.status, priority=task.priority,
+            dependencies=list(task.dependencies), metadata=dict(task.metadata),
+        )
+        for task_id, task in tasks.items()
+    ]
+    return CannedMCP(rows, {task_id: task.status for task_id, task in tasks.items()}, status_page_size=2000)
+
+
+def _lane_events(tree: Mapping[str, Scenario]) -> list[EventRow]:
+    events: list[EventRow] = []
+    for scenario in tree.values():
+        events.extend((at, str(task_id), 'task_started', {}) for task_id, at in scenario.started.items())
+        events.extend(
+            (at, str(task_id), 'task_completed', {'outcome': 'done'})
+            for task_id, at in scenario.completed.items()
+        )
+    return events
+
+
+def _file_lane_escalations(root: Path, tree: Mapping[str, Scenario]) -> None:
+    queue = EscalationQueue(root / 'data' / 'escalations')
+    for scenario in tree.values():
+        for filed in scenario.escalations:
+            queue.submit(Escalation(
+                id=filed.escalation_id,
+                task_id=str(filed.task_id),
+                agent_role='boundary-suite',
+                severity='blocking',
+                category='cleanup_needed',
+                summary=f'lanes escalation on #{filed.task_id}',
+                timestamp=(T0 - timedelta(hours=1)).isoformat(),
+                status='pending',
+                level=filed.level,
+            ))
+
+
+def _furnish_lanes(
+    tree: Mapping[str, Scenario], *, ledger_readable: bool = True, queue: bool = True,
+) -> Callable[[Path], None]:
+    """Lay out :data:`LANES_ROOT`: its run ledger (or bytes that are no database), its escalation
+    queue unless *queue* is False, and each scenario's PRD file and sidecar."""
+
+    def furnish(root: Path) -> None:
+        if ledger_readable:
+            write_runs_db(root, _lane_events(tree))
+        else:
+            runs_db_path(root).parent.mkdir(parents=True)
+            runs_db_path(root).write_bytes(b'this is not a sqlite database\n' * 64)
+        if queue:
+            _file_lane_escalations(root, tree)
+        for scenario in tree.values():
+            prd_file = root / scenario.key
+            prd_file.parent.mkdir(parents=True, exist_ok=True)
+            prd_file.write_text(f'# {lane_title(scenario.key)}\n\nA lanes fixture PRD.\n')
+            if (raw := sidecar(scenario)) is not None:
+                (root / sidecar_path(scenario.key)).write_text(json.dumps(raw))
+
+    return furnish
+
+
+def _lineage_read(call: dict) -> bool:
+    return call['tool'] == 'get_tasks' and is_metadata_projection(call['args'])
+
+
+CONTENDED_IDS = (950, 951, 952)
+"""Ready high-priority tasks outside the lanes tree, each footprinting :data:`LOCKED_FILE`."""
+_CARRIER_HOLDS_LOCKED_MODULE: Mapping[str, Any] = {
+    **CANNED_SCHEDULER_STATE,
+    'current_holders': {LOCKED_MODULE: str(CARRIER)},
+}
+"""A scheduler whose :data:`LOCKED_MODULE` is held by :data:`CARRIER`, a pending task the store holds."""
+
+
+def _contend(substrate: CannedMCP) -> None:
+    """Add :data:`CONTENDED_IDS` to *substrate*: pending, dependency-free, high priority, each
+    naming :data:`LOCKED_FILE`, so the contention line's ``top`` has a key ready tasks want."""
+    for task_id in CONTENDED_IDS:
+        substrate.rows.append(
+            _raw_row(task_id, TaskStatus.PENDING.value, priority='high', metadata={'files': [LOCKED_FILE]}),
+        )
+        substrate.status_map[task_id] = TaskStatus.PENDING.value
+
+
+SECOND_TAIL = 'second_tail'
+"""A second delivered-signal PRD beside the lanes tree's one, so the collapsed Tail line lists
+more than one title (boundary row 20)."""
+
+
+def _second_tail() -> Scenario:
+    """Its signal leaf 961 is done and its one follow-up, 962, is open."""
+    key = prd_key(SECOND_TAIL)
+    return Scenario(
+        {961: LaneTask('done', {'prd_path': key}), 962: LaneTask('pending', {'spawned_from': 961})},
+        signal_leaves={'gate': 961},
+        key=key,
+    )
+
+
+def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Boundary rows 13–21 end to end: the lanes tree served through every γ2 input.
+
+    :data:`LANES_ROOT` serves the lanes tree plus :data:`SECOND_TAIL` with its
+    run ledger, escalation queue, sidecars and PRD files, and :data:`QUEUELESS_ROOT` a plain tree with
+    a run ledger and no queue. The live session holder is a real process alive
+    while every body is served. ``prd_lanes_tasks`` is the /tasks body served
+    over the same substrate at the same instant as ``prd_lanes``.
+    ``prd_lanes_scheduler_offline`` has an unreachable scheduler on
+    :data:`LANES_ROOT`; ``prd_lanes_runs_db_unreadable`` a run ledger that is no
+    database; ``prd_lanes_lineage_failed`` a lineage read that fails;
+    ``prd_lanes_contended`` adds :data:`CONTENDED_IDS` under a scheduler whose
+    lock :data:`CARRIER` holds; ``prd_lanes_queueless`` lays out no escalation
+    queue, so its view is a lower bound that still draws every row.
+    """
+    bodies: dict[str, Any] = {}
+    with holder_processes() as (live, dead):
+        tree = {**lanes_tree(T0, live_holder=live, dead_holder=dead), SECOND_TAIL: _second_tail()}
+
+        def serve(
+            name: str,
+            *,
+            schedulers: Mapping[str, Mapping[str, Any] | None] | None = None,
+            ledger_readable: bool = True,
+            lineage_fails: bool = False,
+            contended: bool = False,
+            tasks_body: str | None = None,
+            queue: bool = True,
+        ) -> None:
+            substrate = lanes_substrate(tree)
+            if lineage_fails:
+                substrate.fail_when = _lineage_read
+            if contended:
+                _contend(substrate)
+            substrates = {LANES_ROOT: substrate, QUEUELESS_ROOT: _substrate(REIFY_COUNTS)}
+            furnish = {
+                LANES_ROOT: _furnish_lanes(tree, ledger_readable=ledger_readable, queue=queue),
+                QUEUELESS_ROOT: write_runs_db,
+            }
+            with _canned_roots(
+                client, workdir / name, substrates, schedulers=schedulers, furnish=furnish,
+            ) as render_tasks:
+                bodies[name] = _render_prds(client, T0)
+                if tasks_body is not None:
+                    bodies[tasks_body] = render_tasks(T0)
+
+        serve('prd_lanes', tasks_body='prd_lanes_tasks')
+        serve('prd_lanes_scheduler_offline', schedulers={LANES_ROOT: None})
+        serve('prd_lanes_runs_db_unreadable', ledger_readable=False)
+        serve('prd_lanes_lineage_failed', lineage_fails=True)
+        serve(
+            'prd_lanes_contended', contended=True,
+            schedulers={LANES_ROOT: _CARRIER_HOLDS_LOCKED_MODULE},
+        )
+        serve('prd_lanes_queueless', queue=False)
+    return bodies
+
+
+QUALITY_AT = datetime(2026, 11, 10, 12, 0, 0, tzinfo=UTC)
+"""The instant the quality scenarios are read at; their stored landings end a day before it."""
+QUALITY_WINDOW = 100
+QUALITY_STORED = 150
+"""Landings a full quality scenario stores: past the window and past a baseline's 100."""
+QUALITY_SMALL_N = 40
+QUALITY_OFF_LINE = QUALITY_STORED - 3
+QUALITY_LATE_CLAIM = QUALITY_STORED - 2
+"""The ordinals of the fresh scenario's landing off main's first parent and of its late claim,
+which re-claims the sha landed :data:`QUALITY_RECLAIMED_BACK` units before it."""
+QUALITY_RECLAIMED_BACK = 3
+QUALITY_GIT_CHECK = GitCrossCheck(off_first_parent=1, merges_without_landing=1, late_claims=1)
+"""The fresh scenario's git cross-check: its two landings off the line, and a merge commit
+runs.db records no landing for."""
+QUALITY_SOURCE_EPOCH = datetime(2026, 10, 21, tzinfo=UTC)
+"""review_completed's first row in the before-epoch scenario, after every landing it stores."""
+QUALITY_PENDING_TRAIN = ('7001', '7002', '7003')
+"""A train runs.db records after the main-ahead scenario's last tick, which quality.db lacks."""
+QUALITY_TICK = timedelta(seconds=QUALITY_SAMPLE_INTERVAL_SECONDS)
+QUALITY_MODULE = 'dashboard'
+QUALITY_MODULE_ORDINALS = tuple(range(0, QUALITY_STORED, 3))
+"""The module the drill-down scenario is read for, and the stored landings touching it."""
+QUALITY_SHIFT = 300
+"""The landing at which the alarm scenarios' rejection rate jumps from 3 in 10 to every landing:
+past the 200 a frozen baseline needs before the marker nearest it."""
+QUALITY_SHIFTED = 15
+"""Landings the alarm scenarios store from the shift on: enough for the up-CUSUM to cross h, too
+few to give the explaining marker's own segment a baseline of its own."""
+_NO_DISAGREEMENT = GitCrossCheck(0, 0, 0)
+
+
+def _quality_outcome(ordinal: int) -> Outcomes:
+    """Every landing reviewed; every fifth rejected and every fourth blocked in review."""
+    rejections = int(ordinal % 5 == 0)
+    return replace(NO_OUTCOMES, rejected=rejections > 0, rejection_events=rejections,
+                   reviewed=True, review_blocking=ordinal % 4 == 0)
+
+
+def _quality_cost(ordinal: int) -> Cost:
+    usd = 2.0 + (ordinal % 7) / 2
+    return replace(NO_COST, all_role_usd=usd, by_role=(('implementer', usd),),
+                   implementer_invocations=1 + ordinal % 3, turns=40 + ordinal % 11)
+
+
+def _quality_history(
+    n: int, *, cost: Callable[[int], Cost] = lambda ordinal: NO_COST,
+    outcome: Callable[[int], Outcomes] = _quality_outcome,
+    modules: Callable[[int], tuple[ModuleLines, ...]] = lambda ordinal: (),
+) -> list[LandingRow]:
+    """*n* landings two hours apart, the newest a day before :data:`QUALITY_AT`."""
+    return history(n, start=QUALITY_AT - timedelta(days=1, hours=2 * (n - 1)),
+                   outcome=outcome, cost=cost, modules=modules)
+
+
+def _shifted_outcome(ordinal: int) -> Outcomes:
+    """The first three of every ten landings rejected until :data:`QUALITY_SHIFT`, every one from it."""
+    rejected = ordinal >= QUALITY_SHIFT or ordinal % 10 < 3
+    return replace(NO_OUTCOMES, rejected=rejected, rejection_events=int(rejected))
+
+
+_MODULE_TOUCHED = frozenset(QUALITY_MODULE_ORDINALS)
+
+
+def _module_lines(ordinal: int) -> tuple[ModuleLines, ...]:
+    module = QUALITY_MODULE if ordinal in _MODULE_TOUCHED else 'orchestrator'
+    return (ModuleLines(module, 40),)
+
+
+def _off_the_line(rows: list[LandingRow]) -> list[LandingRow]:
+    """*rows* with :data:`QUALITY_OFF_LINE` off main's first parent and :data:`QUALITY_LATE_CLAIM`
+    a late claim on an earlier landing's sha, as α records each."""
+    served = list(rows)
+    off = served[QUALITY_OFF_LINE]
+    served[QUALITY_OFF_LINE] = replace(off, landing=replace(off.landing, git_first_parent=False))
+    late = served[QUALITY_LATE_CLAIM]
+    sha = served[QUALITY_LATE_CLAIM - QUALITY_RECLAIMED_BACK].landing.merge_sha
+    served[QUALITY_LATE_CLAIM] = replace(late, landing=replace(
+        late.landing, merge_sha=sha, unit_id=f'{sha}:{late.landing.task_id}', late_claim=True,
+        lines_base=LinesBase.UNMEASURABLE, base_sha=None,
+    ))
+    return served
+
+
+def _quality_root(workdir: Path) -> Path:
+    """Configure the app over one root named dark_factory under *workdir*."""
+    root = workdir / 'dark_factory'
+    root.mkdir(parents=True)
+    app.state.config = DashboardConfig(project_root=root)
+    return root
+
+
+def _store_quality(
+    client: TestClient, root: Path, rows: list[LandingRow], *, sampled_at: datetime,
+    git_check: GitCrossCheck = _NO_DISAGREEMENT,
+) -> None:
+    """Store *rows* in the app's quality.db with one value sample at *sampled_at* whose cursor is
+    the newest row, as a sampler tick that measured them would."""
+    sample = QualitySample.value(
+        project_id_for_root(root), sampled_at, cursor_sha=rows[-1].landing.merge_sha,
+        landings_sampled=len(rows), landings_deferred=0, git_check=git_check,
+    )
+    assert client.portal is not None, 'quality.db is written inside a live TestClient'
+    client.portal.call(write_quality_db, app.state.config.quality_db, rows, [sample])
+
+
+def _render_quality(client: TestClient, at: datetime, **module: str) -> dict[str, Any]:
+    """GET /quality?project=dark_factory&window=100 on the real route, its clock at *at*; a
+    ``module=`` keyword drills down to that module."""
+    with installed_clock(app, fixed_clock(at)):
+        return _get(client, QUALITY, project='dark_factory', window=str(QUALITY_WINDOW), **module)
+
+
+def _store_routing_marker(client: TestClient, at: datetime, *, refreshed_at: datetime) -> None:
+    """Store one derived reviewer effort change at *at* as dark_factory's marker derivation."""
+    marker = Marker(
+        marker_id=f'routing:reviewer_comprehensive:{at.isoformat()}', at=at, kind=MarkerKind.EFFORT,
+        scope='dark_factory', series=None, until=None,
+        label='reviewer_comprehensive effort high → xhigh',
+        source=MarkerSource(SourceType.ROUTING, role='reviewer_comprehensive'),
+    )
+    assert client.portal is not None, 'quality.db is written inside a live TestClient'
+    client.portal.call(partial(write_marker_state_db, app.state.config.quality_db, 'dark_factory',
+                               (marker,), refreshed_at=refreshed_at))
+
+
+def _alarm_scenario(
+    client: TestClient, workdir: Path, *, marker_before: int, sampled_at: datetime,
+) -> dict[str, Any]:
+    """Sketch row 9: the rejection rate shifts at :data:`QUALITY_SHIFT`, and the one derived
+    marker is dated at the landing *marker_before* landings before it."""
+    root = _quality_root(workdir)
+    rows = _quality_history(QUALITY_SHIFT + QUALITY_SHIFTED, outcome=_shifted_outcome)
+    write_landing_events(root, rows)
+    _store_quality(client, root, rows, sampled_at=sampled_at)
+    _store_routing_marker(client, rows[QUALITY_SHIFT - marker_before].landing.landed_at,
+                          refreshed_at=sampled_at)
+    return _render_quality(client, QUALITY_AT)
+
+
+def _quality_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Quality sketch rows 3, 4, 5, 9, 10 and 12 and the module drill-down: one project's
+    per-landing series as /quality serves it.
+
+    Each scenario stores rows in quality.db and records the same landings in runs.db, so the
+    read side's freshness is runs.db's verdict on the store, never a fixture's say-so.
+    """
+    bodies: dict[str, Any] = {}
+    sampled = QUALITY_AT - timedelta(minutes=5)
+
+    root = _quality_root(workdir / 'quality_fresh')
+    fresh = _off_the_line(_quality_history(QUALITY_STORED, cost=_quality_cost))
+    write_landing_events(root, fresh)
+    _store_quality(client, root, fresh, sampled_at=sampled, git_check=QUALITY_GIT_CHECK)
+    bodies['quality_fresh'] = _render_quality(client, QUALITY_AT)
+    bodies['quality_fresh_again'] = _render_quality(client, QUALITY_AT + timedelta(minutes=1))
+
+    root = _quality_root(workdir / 'quality_before_epoch')
+    start = QUALITY_SOURCE_EPOCH - timedelta(days=40)
+    before = history(QUALITY_STORED, start=start, outcome=_quality_outcome,
+                     epochs=replace(epochs_from(start), review_completed=QUALITY_SOURCE_EPOCH))
+    write_landing_events(root, before)
+    _store_quality(client, root, before, sampled_at=sampled)
+    bodies['quality_before_epoch'] = _render_quality(client, QUALITY_AT)
+
+    root = _quality_root(workdir / 'quality_small_n')
+    small = _quality_history(QUALITY_SMALL_N)
+    write_landing_events(root, small)
+    _store_quality(client, root, small, sampled_at=sampled)
+    bodies['quality_small_n'] = _render_quality(client, QUALITY_AT)
+
+    root = _quality_root(workdir / 'quality_main_ahead')
+    stored = _quality_history(QUALITY_STORED)
+    pending = train(QUALITY_PENDING_TRAIN, 'sha-pending-train', QUALITY_STORED,
+                    sampled + timedelta(minutes=2), epochs=stored[-1].rule_vintage)
+    write_landing_events(root, [*stored, *pending])
+    _store_quality(client, root, stored, sampled_at=sampled)
+    bodies['quality_main_ahead'] = _render_quality(client, QUALITY_AT)
+    next_tick = sampled + QUALITY_TICK
+    _store_quality(client, root, [*stored, *pending], sampled_at=next_tick)
+    bodies['quality_main_ahead_cleared'] = _render_quality(client, next_tick + timedelta(minutes=1))
+
+    bodies['quality_alarm_explained'] = _alarm_scenario(
+        client, workdir / 'quality_alarm_explained', marker_before=10, sampled_at=sampled)
+    bodies['quality_alarm_unexplained'] = _alarm_scenario(
+        client, workdir / 'quality_alarm_unexplained', marker_before=100, sampled_at=sampled)
+
+    root = _quality_root(workdir / 'quality_module')
+    touched = _quality_history(QUALITY_STORED, cost=_quality_cost, modules=_module_lines)
+    write_landing_events(root, touched)
+    _store_quality(client, root, touched, sampled_at=sampled)
+    bodies['quality_module'] = _render_quality(client, QUALITY_AT, module=QUALITY_MODULE)
+
+    return bodies
 
 
 def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
@@ -592,4 +1097,7 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_window_family(client, workdir),
             **_corpus_family(client, workdir),
             **_check_owner_family(client, workdir),
+            **prd_view_family(client, workdir),
+            **prd_lanes_family(client, workdir),
+            **_quality_family(client, workdir),
         }

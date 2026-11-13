@@ -16,7 +16,6 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
-import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -24,6 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 import graphiti_core
 import pytest
 from _ast_guard import parse_python_module
+from _falkor_plans import anchors_on_a_labelled_node, match_pattern
 from _query_recorder import IssuedQuery, recording_driver
 from _unused_embedder import UnusedEmbedder
 from graphiti_core.driver.driver import GraphDriver, GraphDriverSession
@@ -34,9 +34,12 @@ from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search import search_utils
 from graphiti_core.utils import bulk_utils
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_graph_operations import FalkorGraphOperations
 from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 if TYPE_CHECKING:
     from falkordb.asyncio import FalkorDB
@@ -389,16 +392,6 @@ SECOND_EDGE_RECORD: dict[str, Any] = {
     'uuid': 'second-edge-uuid',
     'fact': 'gamma delta',
 }
-
-
-def match_pattern(cypher: str) -> str:
-    """The text between MATCH and the first WITH, from which FalkorDB plans its scans."""
-    return cypher.split('MATCH', 1)[1].split('WITH', 1)[0]
-
-
-def anchors_on_a_labelled_node(pattern: str) -> bool:
-    """A labelled node such as ``(n:Entity)`` makes FalkorDB scan that label first."""
-    return re.search(r'\(\s*\w*\s*:', pattern) is not None
 
 
 class TestEdgeGetByUuid:

@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from _scan_race_helpers import concurrently_pruned_rmtree
 
 from escalation import archive
 
@@ -111,6 +118,56 @@ class TestPruneArchive:
         count = archive.prune_archive(tmp_path, retention_days=30, now=self._now())
 
         assert count == 2  # 2026-03-01 and 2026-03-15 removed
+
+    def test_subdir_pruned_concurrently_before_rmtree_is_skipped_not_counted(
+        self, tmp_path: Path, caplog
+    ):
+        """A subdir another prune removed first is skipped, not counted, and logged at DEBUG."""
+        self._make_archive_subdirs(
+            tmp_path, ['2026-03-01', '2026-03-15', '2026-04-20']
+        )
+        doomed = tmp_path / 'archive' / '2026-03-01'
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.archive'),
+            patch.object(shutil, 'rmtree', concurrently_pruned_rmtree(doomed)),
+        ):
+            count = archive.prune_archive(tmp_path, retention_days=30, now=self._now())
+
+        assert count == 1, 'only 2026-03-15 was removed by this call'
+        assert not doomed.exists()
+        assert not (tmp_path / 'archive' / '2026-03-15').exists()
+        assert (tmp_path / 'archive' / '2026-04-20').exists()
+        archive_records = [r for r in caplog.records if r.name == 'escalation.archive']
+        assert any(
+            r.levelno == logging.DEBUG and str(doomed) in r.getMessage()
+            for r in archive_records
+        ), [r.getMessage() for r in archive_records]
+        assert not any(
+            r.levelno == logging.INFO and str(doomed) in r.getMessage()
+            for r in archive_records
+        ), [r.getMessage() for r in archive_records]
+
+    def test_enoent_while_subdir_still_present_is_reraised(self, tmp_path: Path):
+        """An ENOENT about something other than the subdir itself stays loud."""
+        self._make_archive_subdirs(tmp_path, ['2026-03-01'])
+        doomed = tmp_path / 'archive' / '2026-03-01'
+        original = shutil.rmtree
+
+        def failing(path: Any, *args: Any, **kwargs: Any) -> None:
+            if Path(path) == doomed:
+                raise FileNotFoundError(
+                    errno.ENOENT, 'No such file or directory', str(doomed / 'esc-1-1.json')
+                )
+            return original(path, *args, **kwargs)
+
+        with (
+            patch.object(shutil, 'rmtree', failing),
+            pytest.raises(FileNotFoundError),
+        ):
+            archive.prune_archive(tmp_path, retention_days=30, now=self._now())
+
+        assert doomed.exists()
 
 
 class TestArchiveCli:

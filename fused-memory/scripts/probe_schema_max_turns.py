@@ -257,8 +257,10 @@ from shared.cli_invoke import (  # noqa: E402
     AgentFailureKind,
     AgentResult,
     classify_agent_failure,
+    claude_binary_spec,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    resolve_claude_binary,
     transcript_evidence_for_session,
     transcript_model_id_for_session,
 )
@@ -720,14 +722,24 @@ def _classify(result: AgentResult, has_payload: bool, timeout: float) -> tuple[s
 # ---------------------------------------------------------------------------
 
 
-def _cli_version() -> str:
+@dataclass(frozen=True)
+class ProbedCli:
+    """The ``claude`` the runs spawn, as ``build_claude_argv`` picks argv[0], and its version."""
+
+    binary: str
+    version: str
+
+
+def _probed_cli() -> ProbedCli:
+    binary = resolve_claude_binary() or claude_binary_spec()
     try:
         proc = subprocess.run(
-            ['claude', '--version'], capture_output=True, timeout=30, check=False,
+            [binary, '--version'], capture_output=True, timeout=30, check=False,
         )
-        return (proc.stdout or b'').decode(errors='replace').strip() or '(unknown)'
+        version = (proc.stdout or b'').decode(errors='replace').strip() or '(unknown)'
     except (OSError, subprocess.TimeoutExpired):
-        return '(claude CLI not runnable)'
+        version = '(claude CLI not runnable)'
+    return ProbedCli(binary=binary, version=version)
 
 
 def main() -> int:
@@ -776,7 +788,9 @@ def main() -> int:
 
     print('=' * 78)
     print('probe_schema_max_turns — MANUAL diagnostic, spends real tokens (tasks 3241, 4344)')
-    print(f'claude --version : {_cli_version()}')
+    cli = _probed_cli()
+    print(f'claude binary    : {cli.binary}')
+    print(f'claude --version : {cli.version}')
     caps = args.max_turns or "each shape's production cap"
     print(f'matrix           : max_turns={caps} x repeat={args.repeat}')
     print(f'cwd              : {codebase_root}')

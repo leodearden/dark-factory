@@ -96,6 +96,7 @@ class TestModuleLevelAll:
             'BUDGET_EXHAUSTED_SUBTYPE',
             'CAP_HIT_RESUME_PROMPT',
             'CRASH_RECOVERY_RESUME_PROMPT',
+            'PROGRESS_TIMEOUT_RESUME_PROMPT',
             'AgentFailureClass',
             'AgentFailureKind',
             'AgentResult',

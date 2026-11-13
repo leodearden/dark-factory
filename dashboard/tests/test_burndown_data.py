@@ -2979,8 +2979,8 @@ class TestCollectSnapshotExplicitRollback:
         """An unexpected exception inside collect_snapshot must trigger conn.rollback()
         and re-raise the original exception.
 
-        Injection point: patch `dashboard.data.burndown.datetime` so that
-        `datetime.now(UTC).isoformat()` raises RuntimeError('clock failure').
+        Injection point: patch `dashboard.data.burndown.resolve_now` so that
+        the cycle's clock read raises RuntimeError('clock failure').
         This fires before any per-project try/except, so the outer except
         must catch it, call rollback, then re-raise.
 
@@ -3002,16 +3002,13 @@ class TestCollectSnapshotExplicitRollback:
 
         conn.rollback = rollback_spy
 
-        # Patch datetime.now to raise RuntimeError — fires before any per-project try/except
-        class _FakeDatetime:
-            @staticmethod
-            def now(tz=None):
-                raise RuntimeError('clock failure')
-
         try:
             with (
                 _patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                _patch('dashboard.data.burndown.datetime', _FakeDatetime),
+                _patch(
+                    'dashboard.data.burndown.resolve_now',
+                    side_effect=RuntimeError('clock failure'),
+                ),
                 pytest.raises(RuntimeError, match='clock failure'),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)

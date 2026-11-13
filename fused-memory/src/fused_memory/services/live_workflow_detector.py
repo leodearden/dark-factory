@@ -89,8 +89,8 @@ pure_gate`` (rule 5 of :func:`_orchestrator_signal_ineligible`), with
 ``pure_gate`` passed in by the callers that hold the task's metadata.
 
 This is deliberately NOT a wholesale addition of ``'pending'`` to
-``ORCH_LIVE_INELIGIBLE_STATUSES``.  Beyond breaking every ordinary pending task
-(which is dispatch-eligible), it would race deterministic tasks that DO carry a
+``ORCH_LIVE_INELIGIBLE_STATUSES``.  Beyond breaking every dispatch-eligible
+pending task, it would race deterministic tasks that DO carry a
 ``before_done``: ``Harness._run_deterministic_slot`` never flips a deterministic
 task to ``'in-progress'`` before invoking the runner, so such a task stays
 ``'pending'`` for the whole duration of a blocking deploy/predicate script plus
@@ -106,6 +106,15 @@ by direct ``get_task`` read) stalled 3+ consecutive reconciliation cycles (runs
 0e98f0ac, f112de8), listed in Stage 2's Live-Workflow Signals with ONLY the bare
 ``orchestrator`` signal, which permanently blocked its recon disposition; tasks
 3741/3749 were earlier observed instances of the same shape.
+
+**Pending normal tasks awaiting a dependency (task 8330).** The scheduler never
+dispatches a task with an unmet local dependency (``Scheduler._eligible_for_dispatch``
+via ``dependency_verdict.py::deps_verdict``), so for an unclaimed pending task
+awaiting one the bare project lock cannot be evidence of a dispatch a recon
+write could race; rule 6 of :func:`_orchestrator_signal_ineligible` drops it,
+keyed on the caller's :func:`is_unclaimed_awaiting_dependency` verdict.
+Confirmed incident: reify tasks 8155-8165, held live by the bare lock
+alone through recon runs 1171aa98 and 276cb3b7.
 
 **Reaped worktrees and bare branches (task 2767, reify#5245).** A worktree
 entry in ``git worktree list --porcelain`` marked ``prunable`` (its directory
@@ -126,7 +135,7 @@ orchestrator lock. Both gates are fail-safe TOWARD live: a missing branch, a
 subprocess error, or an unparseable ``rev-list`` count never marks a worktree
 prunable or a branch bare — only positive evidence does.
 
-**In-progress corroboration gate (task 2963).** The three rules above force
+**In-progress corroboration gate (task 2963).** The rules above force
 the *project-wide* ``orchestrator_live`` signal False for statuses/task_kinds
 where the bare lock is not per-task evidence. A separate, orthogonal failure
 mode remains for **in-progress** tasks after a fleet redeploy: the redeploy
@@ -198,10 +207,16 @@ from pathlib import Path
 
 from shared.git_async import run_git
 from shared.scheduler_state import SchedulerStateSnapshot
-from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+from shared.task_claimant import (
+    DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    carries_claimant,
+    has_live_claimant,
+)
 from shared.task_metadata import RoutingState
+from shared.task_statuses import ACTIVE, TaskStatus
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
+from fused_memory.utils.task_dependency_ids import task_dependency_ids
 
 logger = logging.getLogger(__name__)
 
@@ -240,13 +255,14 @@ _GIT_TIMEOUT: int = 10
 # pipeline."  A blocked *deterministic* task is handled separately by
 # `_orchestrator_signal_ineligible` below — see its docstring — rather than by
 # adding 'blocked' here, since that would wrongly suppress normal blocked tasks.
-# The one 'pending' exception is likewise handled there, by rule 5 (task 3751):
-# a pending deterministic PURE GATE (`always_escalates` truthy, `before_done`
-# absent) is exempt, because its whole DeterministicRunner run is
-# file-escalation-then-block. It is scoped as a compound rule rather than a
-# status addition here because a pending deterministic task WITH `before_done`
-# can be mid-deploy inside the runner (its status is never flipped to
-# 'in-progress'), and every ordinary pending task is dispatch-eligible.
+# The two 'pending' exceptions are likewise handled there, as compound rules:
+# rule 5 (task 3751) exempts a pending deterministic PURE GATE (`always_escalates`
+# truthy, `before_done` absent), whose whole DeterministicRunner run is
+# file-escalation-then-block; rule 6 (task 8330) exempts an unclaimed pending
+# normal task awaiting an unmet dependency. 'pending' itself stays out of this
+# set because a pending task with no unmet dependency is dispatch-eligible, and
+# a pending deterministic task WITH `before_done` can be mid-deploy inside the
+# runner (its status is never flipped to 'in-progress').
 ORCH_LIVE_INELIGIBLE_STATUSES: frozenset[str] = frozenset({'deferred', 'done', 'cancelled'})
 
 # task_kind value used by the orchestrator/scheduler for deterministic tasks
@@ -259,6 +275,13 @@ DETERMINISTIC_TASK_KIND: str = 'deterministic'
 # _orchestrator_signal_ineligible (task 2409) to scope the blocked-normal
 # bare-orchestrator suppression.
 NORMAL_TASK_KIND: str = 'normal'
+
+# Dependency statuses that are positive evidence the scheduler will not dispatch
+# the dependent: a strict subset of what
+# orchestrator/src/orchestrator/dependency_verdict.py::_local_verdict counts
+# unsatisfied. Terminal satisfies there; a same-train merge-deferred dep may too.
+UNMET_DEPENDENCY_STATUSES: frozenset[str] = ACTIVE - {TaskStatus.MERGE_DEFERRED}
+
 
 @dataclass(frozen=True)
 class WorkflowLiveness:
@@ -324,6 +347,7 @@ async def detect_live_workflow(
     status: str | None = None,
     task_kind: str | None = None,
     pure_gate: bool | None = None,
+    unclaimed_awaiting_dependency: bool | None = None,
     corroborated: bool | None = None,
     _orchestrator_live: bool | None = None,
     worktree_index: Mapping[str, bool] | None = None,
@@ -380,7 +404,8 @@ async def detect_live_workflow(
             blocked task with genuine per-task evidence (a registered worktree
             or a recent commit), or for any non-blocked status, the
             orchestrator_live computation is unaffected by ``task_kind``.
-            ``task_kind`` also scopes rule 5 via ``pure_gate`` (below).
+            ``task_kind`` also scopes rules 5 and 6 via ``pure_gate`` and
+            ``unclaimed_awaiting_dependency`` (below).
         pure_gate: Whether the task's metadata has the ``DeterministicRunner``
             PURE-GATE shape (``always_escalates`` truthy AND ``before_done``
             absent), as classified by :func:`is_pure_gate_metadata` — passed in
@@ -400,6 +425,11 @@ async def detect_live_workflow(
             per-task ``worktree_registered``/``recent_commit`` signals are
             unaffected, so a pure gate that somehow did acquire a worktree is
             still ``is_live``.
+        unclaimed_awaiting_dependency: The caller's
+            :func:`is_unclaimed_awaiting_dependency` verdict, which keys rule 6
+            of :func:`_orchestrator_signal_ineligible` (task 8330): the
+            scheduler will not dispatch such a task. ``None`` (the default) and
+            ``False`` leave the rule inert.
         corroborated: Per-task corroboration verdict for the in-progress
             liveness gate (task 2963). Only an explicit ``False`` downgrades:
             when ``status == 'in-progress'`` AND there is no ``recent_commit``
@@ -532,15 +562,23 @@ async def detect_live_workflow(
     # be dispatched (or, for blocked deterministic tasks, never acquires a
     # worktree/branch of its own; or, for blocked normal tasks with no
     # per-task git evidence, task 2409; or, for pending deterministic PURE
-    # GATES whose whole run is file-escalation-then-block, task 3751; or,
+    # GATES whose whole run is file-escalation-then-block, task 3751; or, for
+    # unclaimed pending normal tasks awaiting an unmet dependency, task 8330; or,
     # status-agnostically, for a task whose branch is provably bare with its
     # worktree reaped, task 2767).  The FINAL worktree_registered/recent_commit
     # (post-prunable/post-bare, already computed above) and branch_bare are
-    # threaded through so rules 3 and 4 can evaluate the same evidence the
-    # caller sees.  pure_gate is normalized to a bool here so the default None
-    # (every caller that does not classify metadata) leaves rule 5 inert.
+    # threaded through so rules 3, 4 and 6 can evaluate the same evidence the
+    # caller sees.  pure_gate and unclaimed_awaiting_dependency are normalized to
+    # bools here so the default None (every caller that does not classify the
+    # task) leaves rules 5 and 6 inert.
     if _orchestrator_signal_ineligible(
-        status, task_kind, worktree_registered, recent_commit, branch_bare, bool(pure_gate)
+        status,
+        task_kind,
+        worktree_registered,
+        recent_commit,
+        branch_bare,
+        bool(pure_gate),
+        bool(unclaimed_awaiting_dependency),
     ):
         orchestrator_live = False
     else:
@@ -713,6 +751,14 @@ class ClaimantLabel(StrEnum):
     UNKNOWN = 'unknown'
 
 
+class TaskLiveness(StrEnum):
+    """UNKNOWN means a probe or its inputs failed, and is never collapsed into NOT_LIVE."""
+
+    LIVE = 'live'
+    NOT_LIVE = 'not_live'
+    UNKNOWN = 'unknown'
+
+
 def claimant_label(
     task: object,
     *,
@@ -728,10 +774,9 @@ def claimant_label(
     """
     if not isinstance(task, Mapping):
         return ClaimantLabel.UNKNOWN
-    claimant = task.get('claimant_run_id')
-    # The "no claimant" predicate of shared/task_claimant.py::_claimant_liveness_stranded.
-    if claimant is None or (isinstance(claimant, str) and not claimant.strip()):
+    if not carries_claimant(task):
         return ClaimantLabel.NONE
+    claimant = task.get('claimant_run_id')
     try:
         is_live = has_live_claimant(task, now, heartbeat_ttl)
     except Exception:
@@ -795,6 +840,28 @@ def is_pure_gate_metadata(metadata: object) -> bool:
     return bool(metadata.get('always_escalates')) and not metadata.get('before_done')
 
 
+def is_unclaimed_awaiting_dependency(task: object, dependency_statuses: object) -> bool:
+    """Return True when *task* is unclaimed and awaits at least one unmet local dependency.
+
+    Unclaimed means no claimant (null or blank ``claimant_run_id``) and no
+    ``heartbeat_at``. Unmet means a dependency id whose status in
+    *dependency_statuses* is in :data:`UNMET_DEPENDENCY_STATUSES`. Feeds rule 6
+    of :func:`_orchestrator_signal_ineligible` (task 8330).
+
+    Fail-safe toward live: only positive evidence returns True. A non-Mapping
+    input, a task with no dependencies, or a dependency that is missing from the
+    map, reads ``'unknown'`` or is merge-deferred all return False.
+    """
+    if not isinstance(task, Mapping) or not isinstance(dependency_statuses, Mapping):
+        return False
+    if carries_claimant(task) or task.get('heartbeat_at') is not None:
+        return False
+    return any(
+        dependency_statuses.get(dep_id) in UNMET_DEPENDENCY_STATUSES
+        for dep_id in task_dependency_ids(dict(task))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -842,12 +909,14 @@ def _orchestrator_signal_ineligible(
     recent_commit: bool = False,
     branch_bare: bool = False,
     pure_gate: bool = False,
+    unclaimed_awaiting_dependency: bool = False,
 ) -> bool:
     """Return True when the project-wide ``orchestrator_live`` signal must be
     forced False for this *status*/*task_kind*/*worktree_registered*/
-    *recent_commit*/*branch_bare*/*pure_gate* combination.
+    *recent_commit*/*branch_bare*/*pure_gate*/*unclaimed_awaiting_dependency*
+    combination.
 
-    Five independent rules are centralized here:
+    Six independent rules are centralized here:
 
     1. ``status`` is a member of :data:`ORCH_LIVE_INELIGIBLE_STATUSES`
        (``deferred``, ``done``, ``cancelled``) — statuses that are never
@@ -878,10 +947,9 @@ def _orchestrator_signal_ineligible(
        **status/task_kind-agnostic** — unlike rules 1-3, this rule is
        evaluated regardless of ``status``/``task_kind`` (including for
        ``pending``/``in-progress``/``review``/``merge-deferred``, and
-       independent of rules 2/3's blocked-only scoping), because
-       ``recon_write_policy`` Gate 2 calls the detector without ``task_kind``
-       and with whatever status the task currently holds — a status-gated
-       rule would not fire there. Not a race risk: an absent branch yields an
+       independent of rules 2/3's blocked-only scoping), because its evidence
+       (a bare branch and a reaped worktree) is per-task proof whatever the
+       task's status or kind. Not a race risk: an absent branch yields an
        unknown (not ``0``) commit count (see
        :func:`_branch_own_commit_count`), so a not-yet-dispatched task is
        unaffected; a just-started dispatch keeps a LIVE (non-prunable)
@@ -904,6 +972,15 @@ def _orchestrator_signal_ineligible(
        caller that does not classify the task's metadata. It is evaluated
        before rule 4 in the body below purely for readability — the rules form
        a disjunction of independent early returns, so their order is immaterial.
+    6. ``status == 'pending' and task_kind in (None, NORMAL_TASK_KIND) and not
+       worktree_registered and not recent_commit and
+       unclaimed_awaiting_dependency`` — an unclaimed pending normal task with a
+       positively unmet local dependency (classified by
+       :func:`is_unclaimed_awaiting_dependency`), which the scheduler refuses to
+       dispatch, so the bare project lock is not evidence of a dispatch a recon
+       write could race (task 8330). Guarded on the git signals like rule 3.
+       ``unclaimed_awaiting_dependency`` defaults False, so the rule is inert for
+       every caller that does not classify the task.
 
     ``'blocked'`` is deliberately NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``
     wholesale: a normal blocked task (``task_kind`` absent or not
@@ -915,11 +992,11 @@ def _orchestrator_signal_ineligible(
     to the "scoped by status" pattern, by design (see above).
 
     ``'pending'`` is likewise NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``:
-    every ordinary pending task is dispatch-eligible, and a pending
+    a pending task with no unmet dependency is dispatch-eligible, and a pending
     *deterministic* task carrying a ``before_done`` may be mid-deploy inside
     ``DeterministicRunner`` (``Harness._run_deterministic_slot`` never flips it
-    to ``'in-progress'``) with no git evidence to reveal it. Hence rule 5's
-    compound (status AND task_kind AND pure_gate) condition.
+    to ``'in-progress'``) with no git evidence to reveal it. Rules 5 and 6 are
+    the two compound pending exemptions.
     """
     if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
         return True
@@ -933,6 +1010,14 @@ def _orchestrator_signal_ineligible(
         ):
             return True
     if status == 'pending' and task_kind == DETERMINISTIC_TASK_KIND and pure_gate:
+        return True
+    if (
+        status == 'pending'
+        and task_kind in (None, NORMAL_TASK_KIND)
+        and not worktree_registered
+        and not recent_commit
+        and unclaimed_awaiting_dependency
+    ):
         return True
     return branch_bare and not worktree_registered and not recent_commit
 

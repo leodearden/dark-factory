@@ -10,7 +10,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from check_fused_memory_unit_parity import compose_up_bypasses_aof_gate
 from falkordb_aof_gate import CommandResult, main
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 COMPOSE = "/repo/fused-memory/docker/docker-compose.yml"
 CONTAINER = "dad0940ab28a"
@@ -384,6 +388,6 @@ def test_the_unit_template_brings_the_stores_up_only_through_the_gate():
     ]
 
     assert any("scripts/falkordb_aof_gate.py --compose-file" in line for line in exec_start_pre), exec_start_pre
-    assert not any("docker compose" in line for line in exec_start_pre), (
+    assert not any(compose_up_bypasses_aof_gate(line) for line in exec_start_pre), (
         "a bare compose-up would recreate falkordb without the AOF gate"
     )

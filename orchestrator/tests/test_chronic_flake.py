@@ -1637,3 +1637,36 @@ class TestSchedulerClientFindsTasksByMetadata:
     async def test_a_raising_dispatch_is_reported_not_raised(self):
         raised = RuntimeError('mcp down')
         assert await self._find(_StubScheduler(raises=raised)) == ([], raised)
+
+    @pytest.mark.asyncio
+    async def test_a_none_value_is_a_presence_lookup(self):
+        scheduler = _StubScheduler(mcp_tool_envelope(_metadata_page([])))
+        await self._client(scheduler).find_tasks_by_metadata('deploy_state', None, ('done',))
+        assert [call[:2] for call in scheduler.calls] == [
+            (
+                'find_tasks_by_metadata',
+                {
+                    'project_root': '/proj',
+                    'key': 'deploy_state',
+                    'statuses': ['done'],
+                    'limit': 100,
+                    'offset': 0,
+                },
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_presence_lookup_reports_a_raising_dispatch(self):
+        raised = RuntimeError('mcp down')
+        client = self._client(_StubScheduler(raises=raised))
+        assert await client.find_tasks_by_metadata('deploy_state', None, ('done',)) == ([], raised)
+
+    @pytest.mark.asyncio
+    async def test_include_value_is_forwarded_and_rows_keep_matched_value(self):
+        row = {**_LEGACY_ROW, 'matched_value': {'phase': 'scheduled'}}
+        scheduler = _StubScheduler(mcp_tool_envelope(_metadata_page([row])))
+        rows, error = await self._client(scheduler).find_tasks_by_metadata(
+            'deploy_state', None, ('done',), include_value=True,
+        )
+        assert (rows, error) == ([row], None)
+        assert scheduler.calls[0][1]['include_value'] is True

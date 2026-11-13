@@ -7,31 +7,35 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pytest
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from _fm_helpers import (
-    FALKOR_HOST,
-    FALKOR_PORT,
-    QDRANT_URL,
-    falkor_skipif,
     lease_dir_fixture,  # noqa: F401  # debt: task 6997
     load_script_module,
-    qdrant_skipif,
 )
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
+from _fm_sockets import has_pending_connection, refused_port, silent_listener
 from shared.lane_probe import OUTAGE_EXIT_STATUS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.config.falkordb_endpoints import (
+    PRODUCTION_FALKORDB,
+    FalkorEndpoint,
+    scratch_falkordb_from_env,
+)
 from fused_memory.config.schema import FusedMemoryConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FM_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = FM_ROOT / 'scripts' / 'lane_dependency_probe.py'
@@ -42,20 +46,18 @@ SUBPROCESS_TIMEOUT_SECS = 120
 EMPTY_COLLECTIONS = json.dumps({'result': {'collections': []}, 'status': 'ok', 'time': 0.0}).encode()
 
 
-def closed_port() -> int:
-    with closing(socket.socket()) as probe:
-        probe.bind(('127.0.0.1', 0))
-        return probe.getsockname()[1]
-
-
 def lease_files(directory: Path) -> list[str]:
     return sorted(p.name for p in directory.glob('*.lease')) if directory.is_dir() else []
 
 
-def run_probe(
+def probe_leases_of(pid: int, names: list[str]) -> list[str]:
+    return [name for name in names if name.startswith(f'{PROBE_LEASE_PREFIX}{pid}.')]
+
+
+def start_probe(
     *dependencies: str, lease_dir: Path, env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
         [sys.executable, str(SCRIPT), *dependencies],
         cwd=FM_ROOT,
         env={
@@ -64,10 +66,26 @@ def run_probe(
             LEASE_REAPER.LEASE_DIR_ENV: str(lease_dir),
             **(env or {}),
         },
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=SUBPROCESS_TIMEOUT_SECS,
     )
+
+
+def finish_probe(probe: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
+    with probe:
+        try:
+            stdout, stderr = probe.communicate(timeout=SUBPROCESS_TIMEOUT_SECS)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            raise
+    return subprocess.CompletedProcess(probe.args, probe.returncode, stdout, stderr)
+
+
+def run_probe(
+    *dependencies: str, lease_dir: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    return finish_probe(start_probe(*dependencies, lease_dir=lease_dir, env=env))
 
 
 def assert_names_dependency(result: subprocess.CompletedProcess[str], line: str) -> None:
@@ -125,7 +143,8 @@ def write_refusing_qdrant(watched_lease_dir: Path | None = None) -> Iterator[Run
 
 
 def test_unreachable_qdrant_is_an_outage_naming_qdrant(lease_dir: Path) -> None:
-    result = run_probe(lease_dir=lease_dir, env={'QDRANT_URL': f'http://127.0.0.1:{closed_port()}'})
+    with refused_port() as port:
+        result = run_probe(lease_dir=lease_dir, env={'QDRANT_URL': f'http://127.0.0.1:{port}'})
 
     assert result.returncode == OUTAGE_EXIT_STATUS, result.stderr
     assert result.stdout.startswith('qdrant: ')
@@ -143,19 +162,42 @@ def test_a_qdrant_that_refuses_writes_is_an_outage_at_the_step_that_was_refused(
 
 
 def test_unreachable_falkordb_is_an_outage_naming_falkordb(lease_dir: Path) -> None:
-    result = run_probe('falkordb', lease_dir=lease_dir, env={'FALKORDB_URI': f'redis://127.0.0.1:{closed_port()}'})
+    """The probe is steered by FALKOR_*, the tests' knob, never by the config's FALKORDB_URI."""
+    with refused_port() as port, silent_listener() as config_server:
+        result = run_probe(
+            'falkordb',
+            lease_dir=lease_dir,
+            env={
+                'FALKOR_HOST': '127.0.0.1',
+                'FALKOR_PORT': str(port),
+                'FALKORDB_URI': f'redis://127.0.0.1:{config_server.getsockname()[1]}',
+            },
+        )
+        config_server_was_dialled = has_pending_connection(config_server)
 
     assert result.returncode == OUTAGE_EXIT_STATUS, result.stderr
     assert result.stdout.startswith('falkordb: ')
     assert len(result.stdout.splitlines()) == 1
     assert 'Traceback' not in result.stdout + result.stderr
+    assert not config_server_was_dialled
+
+
+def test_a_falkordb_probe_aimed_at_production_is_a_broken_probe_not_an_outage(lease_dir: Path) -> None:
+    probe = load_script_module(SCRIPT, 'lane_dependency_probe_under_test')
+
+    result = run_probe('falkordb', lease_dir=lease_dir, env={'FALKOR_PORT': str(PRODUCTION_FALKORDB.port)})
+
+    assert result.returncode == probe.BROKEN_CONFIG_EXIT_STATUS
+    assert result.stdout == ''
+    assert 'production' in result.stderr
+    assert 'Traceback' not in result.stderr
 
 
 def test_the_same_outage_prints_the_same_line(lease_dir: Path) -> None:
-    env = {'QDRANT_URL': f'http://127.0.0.1:{closed_port()}'}
-
-    first = run_probe('qdrant', lease_dir=lease_dir, env=env)
-    second = run_probe('qdrant', lease_dir=lease_dir, env=env)
+    with refused_port() as port:
+        env = {'QDRANT_URL': f'http://127.0.0.1:{port}'}
+        first = run_probe('qdrant', lease_dir=lease_dir, env=env)
+        second = run_probe('qdrant', lease_dir=lease_dir, env=env)
 
     assert first.stdout == second.stdout
 
@@ -167,18 +209,18 @@ def test_a_bad_dependency_name_is_a_broken_probe_not_an_outage(lease_dir: Path) 
     assert result.stdout == ''
 
 
-def test_the_configuration_defaults_name_the_endpoints_the_integration_tests_use(
+def test_the_probe_checks_the_endpoints_the_integration_tests_use(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    probe = load_script_module(SCRIPT, 'lane_dependency_probe_under_test')
     monkeypatch.delenv('QDRANT_URL', raising=False)
-    monkeypatch.delenv('FALKORDB_URI', raising=False)
     cfg = FusedMemoryConfig()
 
     assert cfg.mem0.qdrant_url == QDRANT_URL
-    if 'FALKOR_HOST' in os.environ or 'FALKOR_PORT' in os.environ:
-        pytest.skip('FALKOR_HOST/FALKOR_PORT override the integration tests default')
-    falkor = urlparse(cfg.graphiti.falkordb.uri)
-    assert (falkor.hostname, falkor.port) == (FALKOR_HOST, FALKOR_PORT)
+    checked = probe.probe_config(cfg, scratch_falkordb_from_env()).graphiti.falkordb
+    assert checked.uri == FalkorEndpoint(FALKOR_HOST, FALKOR_PORT).uri
+    assert checked.password is None
+    assert checked.expected_graph_timeout_ms == cfg.graphiti.falkordb.expected_graph_timeout_ms
 
 
 def test_the_script_imports_the_fused_memory_tree_pytest_imports(tmp_path: Path) -> None:
@@ -209,30 +251,26 @@ def test_the_qdrant_check_holds_a_lease_in_the_given_lease_dir_while_it_works(
     lease_dir: Path,
 ) -> None:
     with write_refusing_qdrant(lease_dir) as qdrant:
-        run_probe('qdrant', lease_dir=lease_dir, env={'QDRANT_URL': qdrant.url})
+        probe = start_probe('qdrant', lease_dir=lease_dir, env={'QDRANT_URL': qdrant.url})
+        finish_probe(probe)
 
     [leases] = qdrant.leases_seen_at_listing
-    assert [name.split('.')[0] for name in leases] == ['lane-dependency-probe']
+    assert len(leases) == 1 and probe_leases_of(probe.pid, leases) == leases
     assert lease_files(lease_dir) == []
 
 
 def test_a_run_leaves_no_probe_lease_in_the_machine_global_lease_dir(lease_dir: Path) -> None:
-    def global_probe_leases() -> list[str]:
-        return [
-            name
-            for name in lease_files(LEASE_REAPER.DEFAULT_LEASE_DIR)
-            if name.startswith(PROBE_LEASE_PREFIX)
-        ]
-
-    before = global_probe_leases()
     with write_refusing_qdrant(LEASE_REAPER.DEFAULT_LEASE_DIR) as qdrant:
-        run_probe('qdrant', lease_dir=lease_dir, env={'QDRANT_URL': qdrant.url})
+        probe = start_probe('qdrant', lease_dir=lease_dir, env={'QDRANT_URL': qdrant.url})
+        result = finish_probe(probe)
 
-    assert global_probe_leases() == before
-    assert [
-        [name for name in listing if name.startswith(PROBE_LEASE_PREFIX)]
-        for listing in qdrant.leases_seen_at_listing
-    ] == [before]
+    assert_names_dependency(result, 'qdrant: create collection: HTTP 403')
+    assert len(qdrant.leases_seen_at_listing) == 1, (
+        'GET /collections reached this fake from outside the probe under test'
+        ' (a probe aimed at a released port?)'
+    )
+    assert [probe_leases_of(probe.pid, listing) for listing in qdrant.leases_seen_at_listing] == [[]]
+    assert probe_leases_of(probe.pid, lease_files(LEASE_REAPER.DEFAULT_LEASE_DIR)) == []
 
 
 def test_a_failure_line_never_carries_the_words_of_the_exception() -> None:

@@ -1,4 +1,4 @@
-"""Fixture tasks.db and runs.db stores under a root, in their producers' shape, without importing the producers."""
+"""Fixture tasks.db, runs.db and escalation-queue stores under a root, in their producers' shape, without importing the producers."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
 
-from shared.project_layout import runs_db, tasks_db
+from shared.project_layout import escalation_queue_dir, runs_db, tasks_db
 from shared.task_store_schema import TASK_STORE_DDL
 
 # orchestrator/src/orchestrator/event_store.py::_SCHEMA
@@ -199,3 +199,60 @@ class TasksDb:
             for dependency in depends_on
         ]
         _write(self.path, [task, *dependencies])
+
+
+@dataclass(frozen=True)
+class EscalationQueueDir:
+    path: Path
+
+    @classmethod
+    def create(cls, root: Path) -> EscalationQueueDir:
+        path = escalation_queue_dir(root)
+        path.mkdir(parents=True, exist_ok=True)
+        return cls(path)
+
+    def write(
+        self,
+        escalation_id: str,
+        *,
+        task_id: str | None,
+        level: object = 0,
+        status: str = 'pending',
+        members: Iterable[str] = (),
+        **fields: object,
+    ) -> Path:
+        """One root record; `level` is any JSON value, so a malformed level can be stored."""
+        # escalation/src/escalation/models.py::Escalation.to_json
+        record = {
+            'id': escalation_id,
+            'task_id': task_id,
+            'agent_role': 'steward',
+            'severity': 'blocking',
+            'category': 'design_concern',
+            'summary': 'SECRET-SUMMARY /home/leo/x',
+            'detail': 'SECRET-DETAIL',
+            'timestamp': '2026-11-01T00:00:00+00:00',
+            'status': status,
+            'resolution': None,
+            'level': level,
+            'resolved_at': None,
+            'members': list(members),
+            **fields,
+        }
+        return self.write_raw(f'{escalation_id}.json', json.dumps(record, indent=2))
+
+    def archive(self, escalation_id: str, *, status: str = 'resolved', on: str = '2026-11-01') -> None:
+        """Stamp the record closed and move it under archive/<on>/, as EscalationQueue.resolve does."""
+        record_path = self.path / f'{escalation_id}.json'
+        record = json.loads(record_path.read_text())
+        record.update(status=status, resolved_at=f'{on}T00:00:00+00:00')
+        archived = self.path / 'archive' / on / record_path.name
+        archived.parent.mkdir(parents=True, exist_ok=True)
+        archived.write_text(json.dumps(record, indent=2))
+        record_path.unlink()
+
+    def write_raw(self, name: str, text: str) -> Path:
+        """Any file at the root: a corrupt or legacy record, or a sidecar."""
+        path = self.path / name
+        path.write_text(text)
+        return path

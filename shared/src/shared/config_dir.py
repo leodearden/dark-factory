@@ -11,7 +11,6 @@ from __future__ import annotations
 import atexit
 import json
 import logging
-import os
 import re
 import shutil
 import tempfile
@@ -19,6 +18,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from shared.proc_liveness import pid_alive
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,8 @@ _HOME_CLAUDE = Path.home() / '.claude'
 # Provides settings/hooks without duplicating config.
 # Do NOT include projects/, sessions/, telemetry/ — those must be per-task.
 _SYMLINK_FILES = ['settings.json', 'settings.local.json']
+
+_CREDENTIALS_FILE = '.credentials.json'
 
 # Single source of truth for the config-dir naming template. Both
 # TaskConfigDir.__init__ (which constructs the names) and
@@ -48,33 +51,6 @@ _PID_SUFFIX_RE = re.compile(r'-(\d+)$')
 # per path is sufficient because the hook targets the resolved Path, not the
 # instance: a later TaskConfigDir at the same path is already covered by it.
 _atexit_registered_dirs: set[Path] = set()
-
-
-def _pid_alive(pid: int) -> bool:
-    """Return True if the process identified by *pid* is alive.
-
-    Copied (not imported) from ``orchestrator/session_registry.py`` — and
-    ultimately ``orchestrator/harness.py`` — to keep ``shared`` at the bottom
-    of the dependency stack with no import edge on ``orchestrator``. This is
-    the fourth instance of that deliberate copy-don't-import pattern.
-
-    - Returns False for pid <= 0 (invalid).
-    - Uses ``os.kill(pid, 0)``: success -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable — load-bearing here,
-      since a dir owned by another user's live process must never be
-      reclaimed); other OSError -> treated as dead.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
 
 
 def sweep_stale_pid_dirs(
@@ -170,7 +146,7 @@ def sweep_stale_pid_dirs(
             match = _PID_SUFFIX_RE.search(path.name)
             if match is None:
                 continue
-            if _pid_alive(int(match.group(1))):
+            if pid_alive(int(match.group(1))):
                 continue
             try:
                 if now - path.stat().st_mtime < min_age_secs:
@@ -380,10 +356,14 @@ class TaskConfigDir:
                 'accessToken': oauth_token,
             },
         }
-        creds_path = self._dir / '.credentials.json'
+        creds_path = self._dir / _CREDENTIALS_FILE
         creds_path.write_text(json.dumps(creds))
         # Restrict permissions (token is sensitive)
         creds_path.chmod(0o600)
+
+    def remove_credentials(self) -> None:
+        """Delete the written OAuth token, keeping the session transcripts."""
+        (self._dir / _CREDENTIALS_FILE).unlink(missing_ok=True)
 
     @property
     def path(self) -> Path:

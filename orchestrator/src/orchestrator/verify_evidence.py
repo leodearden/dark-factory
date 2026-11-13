@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
+from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_spec_shared import canonical_json
 
 _PROSE_RUN_KEYS = frozenset({'reason'})
@@ -17,16 +18,18 @@ _PROSE_RUN_KEYS = frozenset({'reason'})
 GLOBAL_MODULE = '__global__'
 
 
-class CacheMode(StrEnum):
-    OFF = 'off'
-    LOG = 'log'
-    ON = 'on'
-
-
 class UnitTier(StrEnum):
     TREE = 'tree'
     MODULE = 'module'
     TEST = 'test'
+
+
+class Leg(StrEnum):
+    """One check of a module; the values are ``verify.py::CheckRun`` labels."""
+
+    TEST = 'test'
+    LINT = 'lint'
+    TYPE = 'type'
 
 
 class UnitOutcome(StrEnum):
@@ -85,10 +88,15 @@ class VerifyUnit:
         return cls(**{**d, 'tier': UnitTier(d['tier']), 'outcome': UnitOutcome(d['outcome'])})
 
 
+def module_leg_name(module_prefix: str | None, leg: str) -> str:
+    """The unit name of one module leg, e.g. ``module:scripts:type``."""
+    return f'module:{module_prefix or GLOBAL_MODULE}:{leg}'
+
+
 def module_leg_unit(module_prefix: str | None, leg: str, rc: int) -> VerifyUnit:
     """The unit for one module leg that ran and exited *rc*."""
     return VerifyUnit(
-        unit=f'module:{module_prefix or GLOBAL_MODULE}:{leg}',
+        unit=module_leg_name(module_prefix, leg),
         tier=UnitTier.MODULE,
         key=None,
         outcome=UnitOutcome.RAN_GREEN if rc == 0 else UnitOutcome.RAN_RED,
@@ -109,11 +117,17 @@ def plan_hash(plan: Mapping[str, Any] | None) -> str | None:
     """
     if plan is None:
         return None
-    runs = [
-        {key: value for key, value in run.items() if key not in _PROSE_RUN_KEYS}
-        for run in plan['runs']
-    ]
+    runs = [_execution_spec(run) for run in plan['runs']]
     return hashlib.sha256(canonical_json(runs).encode()).hexdigest()
+
+
+def run_spec_hash(run: Mapping[str, Any]) -> str:
+    """sha256 of one rendered run minus its prose, by the same deny-list as :func:`plan_hash`."""
+    return hashlib.sha256(canonical_json(_execution_spec(run)).encode()).hexdigest()
+
+
+def _execution_spec(run: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in run.items() if key not in _PROSE_RUN_KEYS}
 
 
 class VerifyEvidence(Protocol):

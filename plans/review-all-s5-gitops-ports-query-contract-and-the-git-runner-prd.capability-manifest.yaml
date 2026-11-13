@@ -1,0 +1,714 @@
+# Machine-readable twin of review-all-s5-gitops-ports-query-contract-and-the-git-runner-prd.capability-manifest.md
+# Bindings verified at main ce0f71a384 (2026-11-01), re-run by the fold at d40ba048e9 (2026-11-02) and by the
+# post-sitting ruling fold at e634cfe658 (2026-11-10): every producer present-check is absent at that tree and
+# every producer absent-check is present there; substrate checks pass today. Fold-verify re-ran every check at
+# main bb1c659562 (2026-11-10): polarity holds; λ0 now sits second (lead sequencing ruling); σ is the OQ-5
+# follow-up (not a signal leaf). task_id is null for every block until the S5 decompose session runs
+# commit_planning.
+prd: plans/review-all-s5-gitops-ports-query-contract-and-the-git-runner-prd.md
+schema_version: 1
+signal_leaves: ["π"]
+tasks:
+  - label: "α"
+    task_id: 9255
+    title: "run_git is the factory-wide runner; git_run leaf; the 9 orchestrator importers of git_ops._run repointed; GitQueryFailed becomes GitQueryError"
+    capabilities:
+      - name: "git-runner-protocol-published"
+        binding: "C1 producer — α adds the GitRunner protocol beside run_git in shared.git_async"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class GitRunner\\(Protocol\\)"
+          paths: ["shared/src/shared/git_async.py"]
+          expect: present
+      - name: "worktree-run-leaf-exists"
+        binding: "C1 producer — the WorktreeMissing adaptation becomes git_run.run_in_worktree"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def run_in_worktree\\("
+          paths: ["orchestrator/src/orchestrator/git_run.py"]
+          expect: present
+      - name: "no-external-private-run-import"
+        binding: "13 orchestrator sites in 9 modules import or read git_ops._run today (measured at d40ba048e9; the pattern covers the multi-line imports and delivered_checks' runner defaults, and skips docstrings); escalation/server.py is S3 δ's, so escalation/src is not in the paths"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from orchestrator\\.git_ops import[^#]*\\b_run\\b|^\\s+_run,\\s*$|(= |await )git_ops(_module)?\\._run\\b"
+          paths: ["orchestrator/src", ":(exclude)orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+      - name: "git-query-error-single-name"
+        binding: "C1/D5 producer — task 7485's GitQueryFailed moves to git_run.py under R5's name; no GitQueryError exists today (measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class GitQueryError"
+          paths: ["orchestrator/src/orchestrator/git_run.py"]
+          expect: present
+      - name: "git-query-failed-retired"
+        binding: "one error, one name (heuristic 11) — GitQueryFailed is defined in git_ops.py and imported by workflow_types.py and scripts/restamp_degenerate_branch_bases.py today (measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "GitQueryFailed"
+          paths: ["orchestrator/src/orchestrator/", "scripts/"]
+          expect: absent
+      - name: "substrate-run-git-exists"
+        binding: "substrate — shared.git_async.run_git exists today (task 3778); passes at ce0f71a384, d40ba048e9 and e634cfe658 by design"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def run_git\\("
+          paths: ["shared/src/shared/git_async.py"]
+          expect: present
+  - label: "λ0"
+    task_id: 9256
+    title: "Codemod (complexity simple): QueuedBranch moves to shared.branch_names; every importer repointed, no re-export"
+    capabilities:
+      - name: "queued-branch-shared-home"
+        binding: "ruling OQ-2 — QueuedBranch lives in merge_lane/types.py today; λ0 (second in the chain, lead sequencing ruling 2026-11-10) moves it beside the prefix rule it delegates to"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class QueuedBranch"
+          paths: ["shared/src/shared/branch_names.py"]
+          expect: present
+      - name: "queued-branch-old-home-gone"
+        binding: "m6 — the class is defined in merge_lane/types.py today; no re-export shim stays behind"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class QueuedBranch"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: absent
+  - label: "β0"
+    task_id: 9257
+    title: "Codemod (complexity simple): the 135 test files that import git_ops._run move onto orchestrator/tests/_git.py::run"
+    capabilities:
+      - name: "test-git-helper-exists"
+        binding: "B3 producer — the 3-tuple test helper over git_run.run_in_worktree"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def run\\("
+          paths: ["orchestrator/tests/_git.py"]
+          expect: present
+      - name: "no-test-imports-private-run"
+        binding: "124 test files import _run from orchestrator.git_ops on one line today (158 lines, measured at e634cfe658); the multi-line form is enforced by β's deletion of _run (collection fails)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from orchestrator\\.git_ops import[^#]*\\b_run\\b"
+          paths: ["orchestrator/tests/", "escalation/tests/"]
+          expect: absent
+  - label: "β"
+    task_id: 9258
+    title: "GitOps takes its runner through the constructor; module-level _run deleted; patch-form tests move onto the port"
+    capabilities:
+      - name: "module-run-deleted"
+        binding: "C1 producer — the module-level adapter exists today; β deletes it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def _run\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+      - name: "gitops-runner-port"
+        binding: "C1 producer — GitOps.__init__ gains runner: GitRunner = run_git"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "runner: GitRunner"
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: present
+      - name: "scripted-runner-fake-exists"
+        binding: "Tests stance — the one fake tests inject through the public constructor (replaces _worktree_add_fakes.py's fake _run and _git_fault_shim.py)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class ScriptedGitRunner"
+          paths: ["orchestrator/tests/_git_runner_fakes.py"]
+          expect: present
+      - name: "path-shim-fake-retired"
+        binding: "heuristic 11 — task 7485 added a second git fake, a failing git placed first on PATH, which exists today (measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/_git_fault_shim.py"]
+          expect: absent
+  - label: "γ"
+    task_id: 9259
+    title: "Constructor ports: WarmLaneScripts, WarmBaseProbe, GitOpsLimits, GitOpsCallbacks"
+    capabilities:
+      - name: "warm-lane-scripts-port"
+        binding: "C2 producer — the 14 script wrappers and the seed wrappers move behind one class"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class WarmLaneScripts"
+          paths: ["orchestrator/src/orchestrator/warm_lane_scripts.py"]
+          expect: present
+      - name: "callbacks-bundle"
+        binding: "C2 producer — replaces the 4 post-construction installs"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class GitOpsCallbacks"
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: present
+      - name: "limits-dataclass"
+        binding: "C2 producer — replaces the 7 monkeypatched module constants and _INDEX_LOCK_STALE_FLOOR_S"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class GitOpsLimits"
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: present
+      - name: "env-override-retired"
+        binding: "production test accommodation present today (_DF_WARM_LANE_SCRIPT_DIR_ENV); dir-anchored because γ moves the script helpers to warm_lane_scripts.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ORCH_WARM_LANE_SCRIPT_DIR"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+      - name: "reexport-shim-retired"
+        binding: "production test accommodation present today (POOL_ROOT_SENTINEL noqa shim)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "re-export shim \\(test_pool_storage_guard"
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+      - name: "post-construction-installs-retired"
+        binding: "4 assignments onto a GitOps from another module today, all in Harness.__init__ (measured at d40ba048e9)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "git_ops\\.[a-zA-Z_]+ *= [^=]"
+          paths: ["orchestrator/src/orchestrator/", "escalation/src/escalation/"]
+          expect: absent
+  - label: "δ"
+    task_id: 9260
+    title: "WarmLaneUnavailable members carry requeue class, disposition, steal retryability and seed rcs (R5 option 1)"
+    capabilities:
+      - name: "disposition-leaf-exists"
+        binding: "C3 / D4 producer — BlockDisposition and RequeueKind move to a leaf so git_ops can import them without a cycle"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class BlockDisposition"
+          paths: ["orchestrator/src/orchestrator/block_disposition.py"]
+          expect: present
+      - name: "enum-maps-seed-rc"
+        binding: "C3 producer — replaces _seed_rc_to_unavailable and the 9 inline rc checks; WarmLaneUnavailable stays in git_ops.py (placement table)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def from_seed_rc\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: present
+      - name: "if-chain-deleted"
+        binding: "9 `pool_info is WarmLaneUnavailable.` arms exist in create_worktree today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pool_info is WarmLaneUnavailable\\."
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+      - name: "steal-retryable-placeholder-deleted"
+        binding: "the placeholder binding and its rebind exist today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_STEAL_RETRYABLE"
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+      - name: "workflow-types-rows-derive"
+        binding: "all nine hand-written warm-lane rows match today (measured at d40ba048e9); S9 derives from the enum"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "WarmLane[A-Za-z]* *: *BlockDisposition\\("
+          paths: ["orchestrator/src/orchestrator/workflow_types.py"]
+          expect: absent
+  - label: "ι"
+    task_id: 9261
+    title: "LaneLifecycle as the single public owner of durable lane records; Harness passes it; adopt_lane owns pool assignment"
+    capabilities:
+      - name: "lifecycle-release-method"
+        binding: "C6 producer — the pool's guarded RELEASED write becomes the one public method"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def release\\("
+          paths: ["orchestrator/src/orchestrator/lane_lifecycle.py"]
+          expect: present
+      - name: "pool-set-lifecycle-retired"
+        binding: "WarmLanePool.set_lane_lifecycle exists today beside the constructor parameter"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def set_lane_lifecycle\\("
+          paths: ["orchestrator/src/orchestrator/warm_lane_pool.py"]
+          expect: absent
+      - name: "no-lifecycle-reach"
+        binding: "10 code sites reach git_ops._lane_lifecycle today: harness.py 8, task_runtime.py 1, stranded_verified_green.py 1 (AST, measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "git_ops\\._lane_lifecycle"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+      - name: "adopt-lane-owner"
+        binding: "M13 producer — harness's 6 pool.restore_assignment calls (measured at e634cfe658) and _settle_branch_checkout's 2 route through one GitOps method (cluster c, stays in git_ops.py)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def adopt_lane\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: present
+      - name: "pool-slot-state-renamed"
+        binding: "two enums named LaneState exist today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class PoolSlotState"
+          paths: ["orchestrator/src/orchestrator/warm_lane_pool.py"]
+          expect: present
+      - name: "substrate-lifecycle-exists"
+        binding: "substrate — lane_lifecycle.LEGAL_TRANSITIONS exists today (task 2254); passes at ce0f71a384, d40ba048e9 and e634cfe658 by design"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^LEGAL_TRANSITIONS"
+          paths: ["orchestrator/src/orchestrator/lane_lifecycle.py"]
+          expect: present
+  - label: "κ"
+    task_id: 9262
+    title: "Acquire routes as one method each behind a classifier; one pool-storage bootstrap guard"
+    capabilities:
+      - name: "pool-storage-guard"
+        binding: "D10 producer — generalises _reconcile_pool_storage_before_sweep to every reader"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _ensure_pool_storage\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: present
+      - name: "route-classifier"
+        binding: "D10 producer — the seven routes are labelled after the fact today, not separated"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _classify_acquire_route\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: present
+      - name: "substrate-acquire-route-enum"
+        binding: "substrate — lane_lifecycle.AcquireRoute exists today (task 7863); passes at ce0f71a384, d40ba048e9 and e634cfe658 by design"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class AcquireRoute"
+          paths: ["orchestrator/src/orchestrator/lane_lifecycle.py"]
+          expect: present
+  - label: "ε"
+    task_id: 9263
+    title: "One GitQueryError contract for GitOps read queries (GitCommandFailed for a failed command); enumerators unified; worktree_work and branch_work replace nine predicates"
+    capabilities:
+      - name: "git-command-failed-exists"
+        binding: "C4 producer — no git-query error carries argv, cwd, rc and stderr today (GitQueryFailed is message-only, measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class GitCommandFailed\\(GitQueryError\\)"
+          paths: ["orchestrator/src/orchestrator/git_run.py"]
+          expect: present
+      - name: "raising-query-helper"
+        binding: "C1/C4 producer — git_ops._git_query's job moves to the leaf as git_run.query"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def query\\("
+          paths: ["orchestrator/src/orchestrator/git_run.py"]
+          expect: present
+      - name: "work-state-query"
+        binding: "C4 producer — the checkout query; dir-anchored because ρ may move query methods out of git_ops.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def worktree_work\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "branch-work-query"
+        binding: "C4 producer (M8) — the branch query for an orphan with no worktree; dir-anchored"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def branch_work\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "rc-dropping-predicates-retired"
+        binding: "has_dirty_working_tree drops both rcs today (fk-ad8c0528c5e1); dir-anchored so a move cannot pass it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def has_dirty_working_tree\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+      - name: "detect-unmerged-paths-retired"
+        binding: "folds task 7843 — _detect_unmerged_paths exists beside unmerged_paths today; dir-anchored"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _detect_unmerged_paths\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+  - label: "ζ"
+    task_id: 9264
+    title: "Typed diff, worktree-list and commit-count readers behind the hand parsers"
+    capabilities:
+      - name: "typed-diff-reader"
+        binding: "D6 producer — no FileDelta type exists today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class FileDelta"
+          paths: ["orchestrator/src/orchestrator/git_diff.py"]
+          expect: present
+      - name: "unguarded-parser-retired"
+        binding: "parse_diff_line_ranges is the unguarded parser (fk-d727d82341b3); ζ deletes the name and its projection lives in git_diff.py under a new name (M15); dir-anchored"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def parse_diff_line_ranges\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+      - name: "worktree-list-record"
+        binding: "D6 producer — five porcelain loops in git_ops today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class WorktreeEntry"
+          paths: ["orchestrator/src/orchestrator/worktree_list.py"]
+          expect: present
+      - name: "one-commit-count"
+        binding: "D6 producer — eight rev-list --count sites with six fail encodings today; dir-anchored because ρ may move it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def count_commits\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "η"
+    task_id: 9265
+    title: "_move_main under advance_main and recover_red_main; AdvanceOutcome.detail (frozen union) replaces the _last_* side channel, writes and reads"
+    capabilities:
+      - name: "advance-detail-type"
+        binding: "C5 producer — consumed by S6 (R1); a union alias (ruling OQ-7); dir-anchored because ο0 moves it into main_landing.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^(class AdvanceDetail|AdvanceDetail *(: *TypeAlias *)?=)"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "last-side-channel-deleted"
+        binding: "7 self._last_* writes exist in advance_main today; dir-anchored"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "self\\._last_overlap_files"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+      - name: "gates-read-detail"
+        binding: "5 getattr reads exist in gates._map_advance_failure today; anchored on the assignment so the function's comment does not match (m11); η deletes them (ruling OQ-8)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "= getattr\\(git_ops, '_last_"
+          paths: ["orchestrator/src/orchestrator/merge_lane/gates.py"]
+          expect: absent
+      - name: "move-main-primitive"
+        binding: "C5 producer — dir-anchored because ο later moves it into main_landing.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _move_main\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "θ"
+    task_id: 9266
+    title: "One lane_lease context manager for the local lease and the remote verify-merge CLI; compat co-lock becomes the span lock"
+    capabilities:
+      - name: "lane-lease-exists"
+        binding: "C7 producer — no lane_lease name exists in src today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def lane_lease\\("
+          paths: ["orchestrator/src/orchestrator/lane_lease.py"]
+          expect: present
+      - name: "span-lock-in-lease-module"
+        binding: "C7 producer (ruling OQ-5, B′) — the co-lock keeps purpose (i) under one name in lane_lease.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def span_lock\\("
+          paths: ["orchestrator/src/orchestrator/lane_lease.py"]
+          expect: present
+      - name: "compat-colock-renamed"
+        binding: "cli.py holds the co-lock as compat_fd today (7 lines, measured at d40ba048e9 and unchanged at e634cfe658; ruling OQ-5, B′)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "compat_fd"
+          paths: ["orchestrator/src/orchestrator/cli.py"]
+          expect: absent
+      - name: "old-binary-prose-gone"
+        binding: "n7 — the rollout-only rationale B′ deletes; matches 5 lines today (cli.py 4, git_ops.py 1, measured at e634cfe658), so a bare compat_fd rename cannot pass θ"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "in-flight OLD"
+          paths: ["orchestrator/src/orchestrator/cli.py", "orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+  - label: "λ"
+    task_id: 9267
+    title: "TaskBranchRefs owns writes and deletions of refs/heads/task/*; the rebase target is a closed OntoRef sum"
+    capabilities:
+      - name: "task-branch-owner"
+        binding: "C8 producer — 13 writer sites, 9 deleters and 10 rebase entry calls route through it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class TaskBranchRefs"
+          paths: ["orchestrator/src/orchestrator/task_branch.py"]
+          expect: present
+      - name: "onto-ref-sum"
+        binding: "C8 producer (M9) — MainTip | StackedOn | FrozenPrefix, so the suffix frozen-tip bounce is a validated variant"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^OntoRef = "
+          paths: ["orchestrator/src/orchestrator/task_branch.py"]
+          expect: present
+      - name: "try-both-resolver-deleted"
+        binding: "GitOps.resolve_queued_branch_ref tries both forms today (fk-718c82fcc1a2); dir-anchored"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def resolve_queued_branch_ref\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+  - label: "ξ0"
+    task_id: 9268
+    title: "Codemod (complexity simple): worktrees.py with the moved types and a one-step WorktreeOps surface; callers and tests repointed"
+    capabilities:
+      - name: "worktree-ops-module"
+        binding: "D14 producer — the public surface callers move onto before ξ moves the bodies"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class WorktreeOps"
+          paths: ["orchestrator/src/orchestrator/worktrees.py"]
+          expect: present
+      - name: "worktree-kind-moved"
+        binding: "M6 placement table — WorktreeKind is a git_ops.py class today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class WorktreeKind"
+          paths: ["orchestrator/src/orchestrator/worktrees.py"]
+          expect: present
+  - label: "ξ"
+    task_id: 9269
+    title: "h14 split I: worktree primitive bodies (cluster b) move below the pool cluster into worktrees.py"
+    capabilities:
+      - name: "registration-probe-moved"
+        binding: "_is_registered_worktree is a GitOps method today (16 test patch sites)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _is_registered_worktree\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+      - name: "ephemeral-body-moved"
+        binding: "GitOps.ephemeral_worktree is defined in git_ops.py today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def ephemeral_worktree\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+      - name: "retired-guard-prose-gone"
+        binding: "fk-739af676767e — the module docstring still ends with this sentence"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "No \\.task-specific guards remain"
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+  - label: "ο0"
+    task_id: 9270
+    title: "Codemod (complexity simple): main_landing.py with the moved types and a one-step MainLanding surface; callers and tests repointed"
+    capabilities:
+      - name: "main-landing-module"
+        binding: "D14 producer"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class MainLanding"
+          paths: ["orchestrator/src/orchestrator/main_landing.py"]
+          expect: present
+      - name: "advance-outcome-moved"
+        binding: "M6 placement table — AdvanceOutcome is a git_ops.py class today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class AdvanceOutcome"
+          paths: ["orchestrator/src/orchestrator/main_landing.py"]
+          expect: present
+  - label: "ο"
+    task_id: 9271
+    title: "h14 split II: merge worktrees and main landing bodies (cluster e) move into main_landing.py"
+    capabilities:
+      - name: "advance-main-moved"
+        binding: "advance_main is a 690-line GitOps method today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def advance_main\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+  - label: "ρ0"
+    task_id: 9272
+    title: "Codemod (complexity simple): git_queries.py with the query types and a one-step GitQueries surface; callers repointed"
+    capabilities:
+      - name: "git-queries-module"
+        binding: "D14 producer (ruling OQ-9) — cluster (f) has no home outside git_ops.py today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class GitQueries"
+          paths: ["orchestrator/src/orchestrator/git_queries.py"]
+          expect: present
+  - label: "ρ"
+    task_id: 9273
+    title: "h14 split III: the diff/query read bodies (cluster f) move into git_queries.py"
+    capabilities:
+      - name: "diff-query-moved"
+        binding: "GitOps.describe_commit_effect_in_main is a cluster (f) method in git_ops.py today (it holds _effect_probe_memo); the fold's anchor, get_diff_from_main, was deleted by task 5695"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def describe_commit_effect_in_main\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: absent
+  - label: "μ"
+    task_id: 9276
+    title: "fused-memory done-provenance probes rebuilt on shared.git_async.run_git; the runner threaded from TaskInterceptor.__init__"
+    capabilities:
+      - name: "probes-on-run-git"
+        binding: "D12 producer — 3 create_subprocess_exec probes exist in task_interceptor today; μ lands before S10's ν partitions the file"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "create_subprocess_exec"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: absent
+      - name: "probes-import-shared-runner"
+        binding: "no middleware module imports shared.git_async today; dir-anchored because S10's ν partitions task_interceptor.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^from shared\\.git_async import"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "git-runner-threaded"
+        binding: "m12 — the runner is a constructor-threaded parameter, not a dotted-name patch seam; dir-anchored"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "git_runner: "
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+  - label: "ν"
+    task_id: 9274
+    title: "TaskArtifacts non-plan readers through _read_json_object; typed architect exits"
+    capabilities:
+      - name: "typed-read-seam"
+        binding: "D13 producer — one typed variant of the fail-safe seam"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _read_model\\("
+          paths: ["orchestrator/src/orchestrator/artifacts.py"]
+          expect: present
+      - name: "typed-architect-exits"
+        binding: "m10 — the five frozen exit types; no such class exists today (a bare annotation change cannot pass this)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class (BlockingDependency|AlreadyDone|ReadyToMerge|UnactionableTask|FalsePremise)Exit"
+          paths: ["orchestrator/src/orchestrator/artifacts.py"]
+          expect: present
+      - name: "module-docstring-truthful"
+        binding: "line 1 of artifacts.py still names the retired .task/ root; ν is its one owner (M14)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Manages the \\.task/ directory structure in each worktree"
+          paths: ["orchestrator/src/orchestrator/artifacts.py"]
+          expect: absent
+  - label: "π"
+    task_id: 9275
+    title: "Integration gate: boundary tests B1-B28, private GitOps patch targets measured and zero, heuristic-13 import tripwire"
+    capabilities:
+      - name: "private-patch-measure-script"
+        binding: "M11 — the ratchet measures only LANE_PACKAGE = 'orchestrator.merge_lane' today, so the baseline cannot see git_ops targets; π adds the script that runs source_measures.patch_targets over git_ops and the S5 modules plus the instance-form count. A path check, not a script check: a script check may only name a script already on main"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/check_gitops_private_patch_targets.py"]
+          expect: present
+      - name: "no-dotted-private-gitops-patches"
+        binding: "§Goal bullet 2 — 24 test files name orchestrator.git_ops._ today (measured at ce0f71a384, unchanged at e634cfe658); the object-form patches are the script's"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "orchestrator\\.git_ops\\.(GitOps\\.)?_[A-Za-z]"
+          paths: ["orchestrator/tests/", "escalation/tests/"]
+          expect: absent
+      - name: "boundary-gate-exists"
+        binding: "the gate suite file is the leaf's deliverable"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_gitops_boundary_gate.py"]
+          expect: present
+      - name: "heuristic-14-measured"
+        binding: "git_ops.py's residual (≈6.6k lines, re-estimated at e634cfe658 from the partition) and the named remaining partition, cluster (c), recorded in the landing commit (Comments stance: the measurement lives in the commit record)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a line count is not a grep the gate can run; the measurement is recorded in the commit message per docs/code-quality.md heuristic 14"
+  - label: "σ"
+    task_id: 9277
+    title: "Follow-up (low): the re-entrant lane lease — a lease token lets reset_persistent_merge_worktree skip its own acquire; the span lock and .merge_verify.lock go"
+    capabilities:
+      - name: "lane-lease-token"
+        binding: "ruling OQ-5 A′ follow-up (lead sequencing ruling 2026-11-10) — no lease token exists today; lane_lease.py itself is θ's"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class LaneLeaseToken"
+          paths: ["orchestrator/src/orchestrator/lane_lease.py"]
+          expect: present
+      - name: "span-lock-file-retired"
+        binding: "the span lock's file name is assigned once today (verify_cancel.py::MERGE_VERIFY_LOCK_FILENAME, measured at bb1c659562) and θ keeps the file name (ruling OQ-5 B′); σ deletes the lock; dir-anchored"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "= '\\.merge_verify\\.lock'"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent

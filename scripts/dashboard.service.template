@@ -27,10 +27,11 @@ WorkingDirectory=__REPO_ROOT__
 # Keep-alive is not being asked to bound the drain; --timeout-graceful-shutdown already
 # does that. Pinning it makes the poll-interval/keep-alive relationship explicit and
 # greppable instead of hiding behind an implicit default. Enforced by
-# tests/scripts/test_dashboard_service_template.py::
+# tests/scripts/test_dashboard_unit_uvicorn_timeouts.py::
 # test_keep_alive_timeout_is_pinned_above_poll_interval, which derives this floor from
-# every poller registered in CLIENT_POLLERS -- so adding a slower poller, or slowing an
-# existing one, requires raising this value in BOTH unit files.
+# every poller registered in tests/scripts/dashboard_client_pollers.py::CLIENT_POLLERS
+# -- so adding a slower poller, or slowing an existing one, requires raising this
+# value in BOTH unit files.
 ExecStart=__UV_PATH__ run --no-sync --project dashboard \
   python -m uvicorn dashboard.app:app \
   --host 127.0.0.1 --port 8080 \
@@ -66,7 +67,7 @@ Environment=DASHBOARD_PROJECT_ROOT=__REPO_ROOT__
 # Requires systemd >= 254, which introduced BOTH directives. Below that they
 # are unknown keys: systemd logs "Unknown key name ... ignoring." and runs with
 # a flat 5s retry, so this stanza reads correct while doing nothing. That
-# degradation is what tests/scripts/test_dashboard_service_template.py::
+# degradation is what tests/scripts/test_dashboard_unit_restart_policy.py::
 # test_systemd_analyze_verify_reports_no_ignored_directives catches, which is
 # why it matches the warning case-insensitively.
 Restart=on-failure

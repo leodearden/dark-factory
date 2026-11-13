@@ -3,46 +3,41 @@
 // real .jsx renders in a jsdom window (dom_harness.mjs); every expected value
 // comes from calling the helper itself, never from source text.
 //
-// All render tests live in this one file: node --test runs each file in its
-// own process, and each process pays the Babel compile once.
+// node --test runs each file in its own process, and each process pays the
+// Babel compile once, so render tests share as few files as possible: this
+// one, and jsx_render_quality.test.mjs for the quality dashboard's seams. The
+// window/act/fetch plumbing both use is _render_helpers.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { caughtFrom } from './_caught.mjs';
+import { allowAsyncAct, click, openWindow, settle, stubFetch } from './_render_helpers.mjs';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
   escalationRow,
   escalationsPayload,
+  memoryEvalCard,
+  memoryEvalEscalation,
+  memoryEvalRow,
+  memoryEvalsPayload,
   mergeQueueBlock,
   openEscalationItem,
   orchestratorRow,
   projectRow,
   receiptsFor,
+  schedulerLockRow,
+  schedulerModule,
+  schedulerSnapshot,
   taskCensus,
+  taskRow,
   tasksSnapshotEntry,
   wireDatum,
 } from './wire_fixtures.mjs';
 
 const PROJECT = 'p';
 const TAB_PROPS = { projectFilter: [], search: '' };
-
-// React reports a broken render (a missing key, an update outside act(), a bad
-// prop) on console.error and renders on, so every test also asserts that
-// nothing reached it, through the unmount.
-function openWindow(t) {
-  const harness = buildDashboardWindow();
-  t.after(() => {
-    harness.close();
-    assert.deepEqual(harness.consoleErrors, [], 'the window wrote to console.error');
-  });
-  return harness;
-}
-
-function click(window, element) {
-  window.React.act(() => element.dispatchEvent(new window.MouseEvent('click', { bubbles: true })));
-}
 
 function spansDescribedBy(root, descriptor) {
   return [...root.querySelectorAll('span')].filter(
@@ -56,7 +51,7 @@ function spansDescribedBy(root, descriptor) {
 // ── Decision 1: the stranded badge (task_row_cells.js::strandBadgeState) ──
 
 function inProgressTask(stranded) {
-  return { id: '42', project: PROJECT, title: 'TT', status: 'in-progress', agent: 'impl', stranded, deps: [] };
+  return taskRow({ project: PROJECT, agent: 'impl', stranded });
 }
 
 // One running orchestrator for one project holding one task, as the
@@ -79,6 +74,26 @@ function graphNode(container, task) {
   return [...container.querySelectorAll('.node')].find(node => node.querySelector('.ttl')?.textContent === task.title);
 }
 
+// By PRD is the Tasks tab's default view, and it draws no graph until a lanes
+// row opens; a test that reads graph nodes lists the project flat first, as a
+// user who chose the list would have stored it.
+function listFlat(window) {
+  window.localStorage.setItem('df.tasksGroupByPrd', JSON.stringify({ [PROJECT]: 'flat' }));
+}
+
+// The Tasks tab's detail pane, opened on `task` by clicking its graph node;
+// undefined unless the pane names that task.
+function taskDetailOf(harness, task) {
+  listFlat(harness.window);
+  const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
+  const node = graphNode(container, task);
+  assert.ok(node, 'the task never reached the graph, so it cannot be selected');
+  click(harness.window, node);
+  const detail = container.querySelector('.task-detail');
+  const idText = harness.window.DF_SHELL.taskId(task.id);
+  return detail?.querySelector('.sub')?.textContent.includes(idText) ? detail : undefined;
+}
+
 // Each site's options are the ones its call site passes, and `render` returns
 // the element the badge belongs in: the task's row, node or detail pane.
 const STRAND_SITES = [
@@ -94,6 +109,7 @@ const STRAND_SITES = [
     site: 'tab_tasks.jsx::TaskGraph renderNode',
     options: { compact: true },
     render(harness, task) {
+      listFlat(harness.window);
       const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
       return graphNode(container, task);
     },
@@ -101,15 +117,7 @@ const STRAND_SITES = [
   {
     site: 'tab_tasks.jsx::TaskDetail',
     options: undefined,
-    render(harness, task) {
-      const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
-      const node = graphNode(container, task);
-      assert.ok(node, 'the task never reached the graph, so it cannot be selected');
-      click(harness.window, node);
-      const detail = container.querySelector('.task-detail');
-      const idText = harness.window.DF_SHELL.taskId(task.id);
-      return detail?.querySelector('.sub')?.textContent.includes(idText) ? detail : undefined;
-    },
+    render: taskDetailOf,
   },
 ];
 
@@ -478,6 +486,64 @@ test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth se
   assert.doesNotMatch(depth, /\bmerges\b/);
 });
 
+// ── The Completion-paths legend (charts.jsx::PALETTE.paths) ──
+// Every slice performance.py::get_completion_paths serves draws in a colour of
+// its own, so no slice reads as another or as nothing.
+
+const COMPLETION_PATHS = ['one-pass', 'multi-pass', 'via-steward', 'via-interactive', 'requeued', 'blocked'];
+
+// performance.py::PerformanceCards.to_wire, one attempt down each path.
+const PERF_CARDS = {
+  paths: COMPLETION_PATHS.map(path => ({ path, count: 1, pct: 16.7 })),
+  escalation: {
+    steward_rate: 0, interactive_rate: 0, interactive_count: 0,
+    human_attention: { zero: 0, minimal: 0, significant: 0 },
+  },
+  hist_outer: { labels: ['0', '1', '2', '3+'], values: [6, 0, 0, 0] },
+  hist_inner: { labels: ['0', '1', '2', '3+'], values: [6, 0, 0, 0] },
+  ttc: { p50: 1000, p75: 1000, p90: 1000, p95: 1000, count: 2 },
+};
+
+function seedPerformance(window) {
+  seedDashboardData(window, {
+    PROJECTS: [projectRow(PROJECT)],
+    PERFORMANCE: {
+      [PROJECT]: {
+        cards: wireDatum(PERF_CARDS),
+        time_centiles_history: { labels: [], p50: [], p95: [] },
+        one_pass_history: { labels: [], values: [] },
+        escalation_history: { labels: [], values: [] },
+      },
+    },
+    PERFORMANCE_LISTING: wireDatum(1),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['PERFORMANCE', 'PERFORMANCE_LISTING', 'PROJECTS']),
+  });
+}
+
+// The 8px swatch beside the legend label that reads *path*.
+function legendSwatch(panel, path) {
+  const labels = [...panel.querySelectorAll('span')].filter(
+    span => span.textContent === path && span.previousElementSibling?.style.width === '8px',
+  );
+  assert.equal(labels.length, 1, `expected exactly one Completion-paths legend row for "${path}"`);
+  return labels[0].previousElementSibling;
+}
+
+test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths swatch', t => {
+  const harness = openWindow(t);
+  seedPerformance(harness.window);
+  const { container } = harness.mount(harness.window.DF_TABS.PerfTab, { projectFilter: [] });
+  const panel = panelTitled(container, 'Completion paths');
+
+  const swatches = COMPLETION_PATHS.map(path => {
+    const swatch = legendSwatch(panel, path).style.background;
+    assert.notEqual(swatch, '', `the "${path}" slice has no swatch colour`);
+    assert.equal(swatch, styledColor(harness.window, harness.window.DF_CHARTS.PALETTE.paths[path]), path);
+    return swatch;
+  });
+  assert.equal(new Set(swatches).size, COMPLETION_PATHS.length, `two slices share a colour: ${JSON.stringify(swatches)}`);
+});
+
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // React's development build reports every throw a boundary catches on
 // console.error: jsdom's report of the replayed throw (its stack, or
@@ -572,6 +638,45 @@ test('shell.jsx::RenderFailureBoundary renders a healthy child unchanged, with n
   assertSiblingRenders(container);
   assert.deepEqual(harness.consoleErrors, []);
 });
+
+// ── The shell's two Datum readers title a reading with its rule ──
+// The non-fresh reason, when datumView gives one, wins over the rule; the rule
+// fills the fresh case; with neither, the reading carries no title at all.
+
+const RULE = 'R: how this figure is counted';
+const DATUM_READERS = [
+  { name: 'DatumReading', outer: container => container.firstElementChild },
+  { name: 'Pip', outer: container => container.querySelector('.pip') },
+];
+const RULED_DATUMS = [
+  { arm: 'a fresh Datum', datum: wireDatum(5) },
+  { arm: 'a stale Datum', datum: wireDatum(5, { state: 'stale', reason: 'the scheduler stopped answering' }) },
+  { arm: 'a lower_bound Datum', datum: wireDatum(5, { state: 'lower_bound', reason: 'the runs ledger starts later' }) },
+  { arm: 'an unknown Datum', datum: wireDatum(null, { state: 'unknown', reason: 'the map could not be read' }) },
+];
+
+for (const reader of DATUM_READERS) {
+  for (const { arm, datum } of RULED_DATUMS) {
+    test(`shell.jsx::${reader.name} over ${arm} with a rule titles the reading with datumView's reason, else the rule`, t => {
+      const harness = openWindow(t);
+      const { DF_SHELL, DF_DATUM } = harness.window;
+      const { container } = harness.mount(DF_SHELL[reader.name], { datum, rule: RULE });
+
+      const view = DF_DATUM.datumView(datum, { now: Date.now() });
+      const outer = reader.outer(container);
+      assert.equal(outer.title, view.title || RULE);
+      if (datum.state !== 'fresh') assert.notEqual(outer.title, RULE, 'a non-fresh reason must replace the rule');
+      assert.ok(outer.textContent.startsWith(view.text), `the reading must start with datumView's text ${view.text}`);
+    });
+  }
+
+  test(`shell.jsx::${reader.name} over a fresh Datum with no rule carries no title`, t => {
+    const harness = openWindow(t);
+    const { container } = harness.mount(harness.window.DF_SHELL[reader.name], { datum: wireDatum(5) });
+
+    assert.equal(reader.outer(container).hasAttribute('title'), false);
+  });
+}
 
 // ── The page app.jsx bootstraps: each fault stays in its own region ──
 // Every fault lands as a malformed payload a poll could deliver, then App's
@@ -861,6 +966,97 @@ test('tab_escalations.jsx::EscalationSidebar renders no check-owner section with
   assert.equal(nullDialog.innerHTML, absentDialog.innerHTML);
 });
 
+// ── The sidebar's linked-task description (data.js::ON_DEMAND_KEYS.taskProse) ──
+// Task rows carry no prose, so the drawer reads the linked task's description
+// through the on-demand read the Task Detail pane uses, addressed by the uid
+// active_tasks.task_uid builds: `<project>/T-<id>`.
+
+const PROSE_TASK = '7700';
+const PROSE_URL_PREFIX = '/api/v2/dashboard/task/';
+
+function linkedTaskRow(task) {
+  return escalationRow({ id: `esc-${PROSE_TASK}-1`, taskId: PROSE_TASK, summary: 'needs a ruling', project: PROJECT, task });
+}
+
+// Answers the taskProse url for `uid` with `response`, a fetch Response or a
+// promise of one. Returns every url asked for.
+function stubProseFetch(window, uid, response) {
+  return stubFetch(window, { [window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse.url(uid)]: response });
+}
+
+function proseResponse(window, uid, prose) {
+  const { key } = window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse;
+  return { ok: true, status: 200, json: async () => ({ [key(uid)]: prose }) };
+}
+
+const PROSE_UNAVAILABLE = 'The description of this task could not be fetched.';
+
+test("tab_escalations.jsx::EscalationSidebar renders the linked task's description from the taskProse on-demand read", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  const asked = stubProseFetch(window, uid, proseResponse(window, uid, { description: 'why it exists', details: '' }));
+  const row = linkedTaskRow(undefined);
+  assert.equal('description' in row.task.value, false, 'the card itself must carry no description');
+
+  const dialog = openSidebar(harness, row);
+  await settle(window);
+
+  assert.ok(dialog.textContent.includes('why it exists'), dialog.textContent);
+  assert.deepEqual(
+    asked.filter(url => url.startsWith(PROSE_URL_PREFIX)),
+    [window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse.url(uid)],
+  );
+});
+
+test('tab_escalations.jsx::EscalationSidebar requests no taskProse for a card that is a hole', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  const asked = stubProseFetch(window, uid, proseResponse(window, uid, { description: 'why it exists', details: '' }));
+  const row = linkedTaskRow(wireDatum(null, { state: 'unknown', reason: 'the task could not be read' }));
+
+  const dialog = openSidebar(harness, row);
+  await settle(window);
+
+  assert.ok(dialog.textContent.includes('the task could not be read'), dialog.textContent);
+  assert.deepEqual(asked.filter(url => url.startsWith(PROSE_URL_PREFIX)), []);
+});
+
+test("tab_escalations.jsx::EscalationSidebar shows loading… until the linked task's taskProse read answers", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  let answer;
+  stubProseFetch(window, uid, new Promise(resolve => { answer = resolve; }));
+
+  const dialog = openSidebar(harness, linkedTaskRow(undefined));
+  await settle(window);
+  assert.ok(dialog.textContent.includes('loading…'), dialog.textContent);
+
+  answer(proseResponse(window, uid, { description: 'why it exists', details: '' }));
+  await settle(window);
+  assert.ok(dialog.textContent.includes('why it exists'), dialog.textContent);
+  assert.equal(dialog.textContent.includes('loading…'), false, dialog.textContent);
+});
+
+test("tab_escalations.jsx::EscalationSidebar says the linked task's description could not be fetched when its taskProse read fails", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  stubProseFetch(window, uid, { ok: false, status: 503, json: async () => ({}) });
+
+  const dialog = openSidebar(harness, linkedTaskRow(undefined));
+  await settle(window);
+
+  assert.ok(dialog.textContent.includes(PROSE_UNAVAILABLE), dialog.textContent);
+  assert.equal(dialog.textContent.includes('loading…'), false, dialog.textContent);
+});
+
 // ── Decision 8: the Tasks tab's preferences go through persisted_state.js ──
 // A key exists only while its value differs from its default, and a write the
 // browser refuses is reported on console.warn rather than swallowed.
@@ -882,6 +1078,7 @@ function viewButton(window, container, key) {
 function mountTasks(harness) {
   const task = inProgressTask(false);
   seedOneTask(harness.window, task);
+  listFlat(harness.window);
   const handle = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
   assert.ok(graphNode(handle.container, task), 'the seeded task never reached the graph');
   return handle;
@@ -915,7 +1112,8 @@ function fillStorageToQuota(storage) {
 
 test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at its default', t => {
   const harness = openWindow(t);
-  mountTasks(harness);
+  seedOneTask(harness.window, inProgressTask(false));
+  harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
 
   const stored = storedKeys(harness.window);
   assert.deepEqual(TASKS_PREFERENCE_KEYS.filter(key => stored.includes(key)), []);
@@ -924,6 +1122,7 @@ test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at it
 test('tab_tasks.jsx::TasksTab reports a preference it cannot store on console.warn, and the view still flips', t => {
   const harness = openWindow(t);
   const { window } = harness;
+  listFlat(window);
   const refusal = fillStorageToQuota(window.localStorage);
   assert.equal(refusal?.name, 'QuotaExceededError', 'the fill did not reach the storage quota');
   const warnings = [];
@@ -977,15 +1176,17 @@ function groupingButton(container, label) {
   return buttons[0];
 }
 
-test('tab_tasks.jsx::TasksTab stores a project grouped by PRD, and removes the key when it is listed flat again', t => {
+test('tab_tasks.jsx::TasksTab stores a project listed flat, and removes the key when grouped by PRD again', t => {
   const harness = openWindow(t);
   const { window } = harness;
-  const { container } = mountTasks(harness);
-  click(window, groupingButton(container, 'by PRD'));
-  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'prd', 'the by-PRD grouping was not stored');
-
+  seedOneTask(window, inProgressTask(false));
+  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.ok(groupingButton(container, 'by PRD').classList.contains('on'), 'by PRD is not the default grouping');
   click(window, groupingButton(container, 'list'));
-  assert.ok(groupingButton(container, 'list').classList.contains('on'), 'the project did not return to the flat list');
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'flat', 'the flat listing was not stored');
+
+  click(window, groupingButton(container, 'by PRD'));
+  assert.ok(groupingButton(container, 'by PRD').classList.contains('on'), 'the project did not return to the lanes');
   assert.ok(!storedKeys(window).includes('df.tasksGroupByPrd'), 'the grouping is back at its default, yet its key is still stored');
 });
 
@@ -1105,6 +1306,328 @@ for (const { kind, testId, data } of BANNER_CASES) {
     assert.equal(rendered[0].textContent, notices[0].text);
     for (const other of BANNER_CASES.filter(c => c.kind !== kind)) {
       assert.deepEqual([...container.querySelectorAll(`[data-testid="${other.testId}"]`)], [], other.testId);
+    }
+  });
+}
+
+// ── Decision 11: the Task-detail Module locks section (task_row_cells.js::locksCellState, scheduler_utils.jsx::lockChipStateFor) ──
+
+function seedTaskWithScheduler(window, task, scheduler) {
+  seedOneTask(window, task);
+  seedDashboardData(window, { SCHEDULER: scheduler, __receipt: receiptsFor(window.DF_DATA_LOADER, ['SCHEDULER']) });
+}
+
+// The "Module locks" label and the element it heads, or null when the pane
+// draws no such section.
+function moduleLocksSection(detail) {
+  const label = [...detail.querySelectorAll('.section-lbl')].find(lbl => lbl.textContent.startsWith('Module locks'));
+  return label ? { label, body: label.nextElementSibling } : null;
+}
+
+// What the section is asked to draw, as the helpers it calls answer it.
+function expectedLocksCell(window, task) {
+  const D = window.DF_DATA;
+  const { locksCellState, schedulerLocksDatum } = window.DF_TASK_ROW_CELLS;
+  return locksCellState(schedulerLocksDatum(D.SCHEDULER, PROJECT, D.__receipt), window.DF_SCHED_UTILS.buildSchedLockInfo(task, D.SCHEDULER));
+}
+
+function lockChips(root) {
+  return [...root.querySelectorAll('.chip')].filter(chip => [...chip.classList].some(cls => cls.startsWith('lock-')));
+}
+
+test("tab_tasks.jsx::TaskDetail draws the Module locks em-dash with locksCellState's reason for a project the scheduler lists offline", t => {
+  const harness = openWindow(t);
+  const task = inProgressTask(false);
+  seedTaskWithScheduler(harness.window, task, schedulerSnapshot({ offlineProjects: [PROJECT] }));
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const expected = expectedLocksCell(harness.window, task);
+  assert.ok(expected.placeholder, 'locksCellState draws no placeholder for an offline project, so this fixture tests nothing');
+  assert.ok(expected.title, 'locksCellState gives no reason for an offline project, so this fixture tests nothing');
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a project whose locks are unknown');
+  assert.equal(section.label.textContent, 'Module locks', 'an unknown lock set has no count to show');
+  assert.ok(section.body?.matches('span.chip-empty'), 'the unknown arm must draw a span.chip-empty under the label');
+  assert.equal(section.body.textContent, expected.placeholder);
+  assert.equal(section.body.title, expected.title, "the em-dash must carry locksCellState's reason as its title");
+  assert.deepEqual(lockChips(detail), [], 'a project whose locks are unknown must draw no lock chip');
+});
+
+// `task` locks four paths in a measured project, one in each lock class.
+function seedTaskHoldingEveryLockClass(window, task) {
+  const paths = { mine: 'src/mine', taken: 'src/taken', parked: 'src/parked', free: 'src/free' };
+  seedTaskWithScheduler(window, task, schedulerSnapshot({
+    rows: [schedulerLockRow({ project: PROJECT, taskId: task.id, lockSet: Object.values(paths) })],
+    modules: [
+      schedulerModule({ project: PROJECT, path: paths.mine, holder: task.id, holderProject: PROJECT }),
+      schedulerModule({ project: PROJECT, path: paths.taken, holder: '7', holderProject: PROJECT }),
+      schedulerModule({ project: PROJECT, path: paths.parked, parkedBy: '9', parkedOwnerLive: true }),
+    ],
+  }));
+}
+
+test('tab_tasks.jsx::TaskDetail draws each lock chip in the class lockChipStateFor answers, for a project the scheduler measured', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  seedTaskHoldingEveryLockClass(window, task);
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const lockInfo = window.DF_SCHED_UTILS.buildSchedLockInfo(task, window.DF_DATA.SCHEDULER);
+  assert.equal(expectedLocksCell(window, task).placeholder, null, 'locksCellState reads this measured project as unknown');
+  const expected = new Map(lockInfo.lockSet.map(path => [
+    path,
+    window.DF_SCHED_UTILS.lockChipStateFor(lockInfo.moduleByPath.get(path), task.id, PROJECT),
+  ]));
+  assert.equal(new Set([...expected.values()].map(state => state.cls)).size, 4, 'the four paths must cover four lock classes');
+
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a task holding locks');
+  assert.equal(section.label.textContent, `Module locks (${lockInfo.lockSet.length})`);
+  assert.ok(section.body && !section.body.matches('.chip-empty') && !section.body.querySelector('.chip-empty'),
+    'a measured project with locks must draw chips, not the em-dash');
+  for (const [path, { cls, ownerLabel }] of expected) {
+    const chip = section.body.querySelector(`.chip[title="${path}"]`);
+    assert.ok(chip, `no chip titled ${path}`);
+    assert.ok(chip.classList.contains(cls), `the ${path} chip is not ${cls}, the class lockChipStateFor answers`);
+    if (cls === 'lock-taken' || cls === 'lock-parked') {
+      assert.ok(chip.querySelector('.holder')?.textContent.includes(ownerLabel), `the ${path} chip does not name ${ownerLabel}`);
+    }
+  }
+});
+
+// An inline classifier answers as lockChipStateFor does until the two drift, so
+// the public seam is swapped for a sentinel: a chip it did not classify shows.
+test('tab_tasks.jsx::TaskDetail classifies every lock chip through window.DF_SCHED_UTILS.lockChipStateFor, with no classifier of its own', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  seedTaskHoldingEveryLockClass(window, task);
+  const { lockSet } = window.DF_SCHED_UTILS.buildSchedLockInfo(task, window.DF_DATA.SCHEDULER);
+  window.DF_SCHED_UTILS = { ...window.DF_SCHED_UTILS, lockChipStateFor: () => ({ cls: 'lock-probe', ownerLabel: 'probe' }) };
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a task holding locks');
+  const chips = lockChips(section.body);
+  assert.equal(chips.length, lockSet.length, 'the section must draw one chip per locked path');
+  for (const chip of chips) {
+    assert.deepEqual([...chip.classList].filter(cls => cls.startsWith('lock-')), ['lock-probe'],
+      `the ${chip.title} chip was not classified by window.DF_SCHED_UTILS.lockChipStateFor`);
+  }
+});
+
+test('tab_tasks.jsx::TaskDetail draws no Module locks section for a task holding no locks in a project the scheduler measured', t => {
+  const harness = openWindow(t);
+  const task = inProgressTask(false);
+  seedTaskWithScheduler(harness.window, task, schedulerSnapshot());
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task, so the absent section proves nothing');
+
+  assert.equal(expectedLocksCell(harness.window, task).placeholder, null, 'locksCellState reads this measured project as unknown');
+  assert.equal(moduleLocksSection(detail), null, 'a measured project with no locks draws no Module locks section');
+});
+
+// ── The memory-eval section (tab_memory_evals.jsx::MemoryEvalsSection) ──
+
+const MEMORY_EVAL_ID = 'e1-retrieval-health';
+const TRIPWIRE = 'topic-canonical-present';
+
+// The section mounted over `payload`, with every onNavigate call recorded.
+function mountMemoryEvals(t, payload) {
+  const harness = openWindow(t);
+  const { window } = harness;
+  seedDashboardData(window, {
+    MEMORY_EVALS: payload,
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['MEMORY_EVALS']),
+  });
+  const navigations = [];
+  const { container } = harness.mount(window.DF_MEMORY_EVALS.MemoryEvalsSection, {
+    onNavigate: (...args) => navigations.push(args),
+  });
+  return { window, container, navigations };
+}
+
+// The rendered table rows, one per metric row, in payload order.
+function metricRowElements(container, rows) {
+  const trs = [...container.querySelectorAll('tbody tr')];
+  assert.equal(trs.length, rows.length, 'each metric row must render as exactly one table row');
+  return trs;
+}
+
+function escalationLinks(root) {
+  return [...root.querySelectorAll('[data-testid="memory-eval-escalation-link"]')];
+}
+
+// The one span in `tr` that renders verdictBadge(row): its words, its classes,
+// and the evaluator's verdict_detail as its title.
+function renderedBadge(window, tr, row) {
+  const badge = window.DF_MEMORY_EVALS_FMT.verdictBadge(row);
+  const spans = spansDescribedBy(tr, { ...badge, title: row.verdict_detail || '' });
+  assert.equal(spans.length, 1, `${row.metric_id} ${row.item ?? ''}: expected one span reading "${badge.label}"`);
+  return spans[0];
+}
+
+function assertLinksOnly(tr, row) {
+  const links = escalationLinks(tr);
+  if (!row.escalation) {
+    assert.equal(links.length, 0, `${row.metric_id} ${row.item ?? ''} (${row.parity}) renders an escalation link`);
+    return;
+  }
+  assert.equal(links.length, 1, `${row.metric_id} ${row.item ?? ''} (${row.parity}) must render one escalation link`);
+  assert.ok(links[0].textContent.includes(row.escalation.id), links[0].textContent);
+}
+
+test("tab_memory_evals.jsx::MemoryEvalsSection renders each parity state in verdictBadge's words and links only open escalations", t => {
+  const alarmed = memoryEvalEscalation('esc-alarmed');
+  const recovered = memoryEvalEscalation('esc-recovered');
+  const rows = [
+    memoryEvalRow({
+      verdict: 'alarm', verdict_detail: '12/30 against a pooled baseline of 72/90 over 3 run(s).',
+      fingerprint: alarmed.dedupe_fingerprint, escalation: alarmed, parity: 'alarmed_open',
+    }),
+    memoryEvalRow({
+      metric_id: 'dangling-pointers', kind: 'count', rule_kind: 'count',
+      verdict: 'no_alarm', fingerprint: recovered.dedupe_fingerprint, escalation: recovered, parity: 'recovered_open',
+    }),
+    memoryEvalRow({
+      metric_id: 'superseded-above-successor', kind: 'count', rule_kind: 'count',
+      verdict: 'insufficient_data', fingerprint: 'fp-insufficient', parity: 'insufficient_data',
+    }),
+    memoryEvalRow({
+      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-recon-watcher-triage',
+      verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+    }),
+  ];
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)] });
+  const { window, container, navigations } = mountMemoryEvals(t, payload);
+
+  const trs = metricRowElements(container, rows);
+  rows.forEach((row, i) => {
+    const badge = renderedBadge(window, trs[i], row);
+    assertLinksOnly(trs[i], row);
+    if (!row.escalation) assert.ok(!badge.classList.contains('bad'), `${row.parity} renders alarm-shaped: ${badge.className}`);
+  });
+
+  click(window, escalationLinks(trs[0])[0]);
+  assert.equal(navigations.length, 1);
+  const [view, target] = navigations[0];
+  assert.equal(view, 'esc');
+  assert.deepEqual({ ...target }, { queue: payload.escalation_queue, id: alarmed.id });
+});
+
+test('tab_memory_evals.jsx::MemoryEvalsSection under a storm renders one aggregate banner and no per-metric links', t => {
+  const aggregate = memoryEvalEscalation('esc-storm-aggregate');
+  const storm = {
+    triggered: true, alarm_count: 3, aggregate_fingerprint: aggregate.dedupe_fingerprint, escalation: aggregate,
+  };
+  const collapsed = ['canonical-in-top-5', 'dangling-pointers', 'superseded-above-successor'].map(metricId =>
+    memoryEvalRow({ metric_id: metricId, verdict: 'alarm', fingerprint: `fp-${metricId}`, parity: 'storm_collapsed' }),
+  );
+  const grandfathered = memoryEvalRow({
+    metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-recon-watcher-triage',
+    verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+  });
+  const rows = [...collapsed, grandfathered];
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)], storm_escape: storm });
+  const { window, container } = mountMemoryEvals(t, payload);
+
+  const banner = oneByTestId(container, 'memory-eval-storm-banner');
+  assert.ok(banner.textContent.includes(`${storm.alarm_count} alarms`), banner.textContent);
+  const bannerLinks = escalationLinks(banner);
+  assert.equal(bannerLinks.length, 1, 'the banner must link the aggregate escalation');
+  assert.ok(bannerLinks[0].textContent.includes(aggregate.id), bannerLinks[0].textContent);
+
+  const trs = metricRowElements(container, rows);
+  rows.forEach((row, i) => {
+    renderedBadge(window, trs[i], row);
+    assertLinksOnly(trs[i], row);
+    assert.equal(
+      trs[i].textContent.includes('link suppressed — storm aggregate'),
+      row.parity === 'storm_collapsed',
+      `${row.metric_id} (${row.parity}) and the storm-suppression note disagree`,
+    );
+  });
+  assert.equal(escalationLinks(container).length, 1, 'only the banner may link an escalation under a storm');
+});
+
+test("tab_memory_evals.jsx::MemoryEvalsSection renders a tripwire's per-item verdicts as one row per item, each naming its item", t => {
+  const alarmed = memoryEvalEscalation('esc-item-1');
+  const rows = [
+    memoryEvalRow({ verdict: 'no_alarm', fingerprint: 'fp-window', parity: 'clear' }),
+    memoryEvalRow({
+      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-alpha',
+      verdict: 'alarm', fingerprint: alarmed.dedupe_fingerprint, escalation: alarmed, parity: 'alarmed_open',
+    }),
+    memoryEvalRow({
+      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-beta',
+      verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+    }),
+  ];
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)] });
+  const { window, container } = mountMemoryEvals(t, payload);
+
+  const trs = metricRowElements(container, rows);
+  const items = rows.map(row => row.item).filter(Boolean);
+  rows.forEach((row, i) => {
+    const firstCell = trs[i].querySelector('td').textContent;
+    assert.ok(firstCell.includes(row.metric_id), firstCell);
+    for (const item of items) {
+      assert.equal(trs[i].textContent.includes(item), item === row.item, `the ${row.item ?? 'item-less'} row and ${item} disagree`);
+    }
+    if (row.item) assert.ok(firstCell.includes(row.item), `the item is not named beside its metric: ${firstCell}`);
+    renderedBadge(window, trs[i], row);
+    assertLinksOnly(trs[i], row);
+  });
+});
+
+// ── Decision 12: the filed cell (task_row_cells.js::filedCellState) ──
+
+// TaskDetail's 'filed' kv row: its key span and the value span beside it.
+function filedRowOf(detail) {
+  const key = [...detail.querySelectorAll('.kv > span.k')].find(span => span.textContent === 'filed');
+  return { key, value: key?.nextElementSibling };
+}
+
+const FILED_CASES = [
+  {
+    name: 'a recorded filing time',
+    task: () => ({ ...inProgressTask(false), created_at: '2026-11-12T09:10:17.253Z', created_at_source: 'first_event' }),
+    recorded: true,
+  },
+  {
+    name: 'no recorded filing time',
+    task: () => ({ ...inProgressTask(false), created_at: null, created_at_source: null }),
+    recorded: false,
+  },
+];
+
+for (const { name, task: buildTask, recorded } of FILED_CASES) {
+  test(`tab_tasks.jsx::TaskDetail renders the filed row filedCellState describes, for ${name}`, t => {
+    const harness = openWindow(t);
+    const task = buildTask();
+    seedOneTask(harness.window, task);
+    const detail = taskDetailOf(harness, task);
+    assert.ok(detail, 'the detail pane never opened on the task');
+
+    const expected = harness.window.DF_TASK_ROW_CELLS.filedCellState(task);
+    const { key, value } = filedRowOf(detail);
+    assert.ok(key, "TaskDetail renders no 'filed' kv key");
+    assert.equal(value?.textContent, expected.text);
+    assert.equal(value?.title, expected.title);
+    const statusKey = key.previousElementSibling?.previousElementSibling;
+    assert.ok(statusKey?.matches('span.k'), "the 'filed' row does not follow a kv row");
+    assert.equal(statusKey.textContent, 'status', "the 'filed' row is not directly after the status row");
+
+    if (recorded) {
+      assert.notEqual(expected.text, harness.window.DF_DATUM.EM_DASH, 'fixture: the filing time is recorded');
+      assert.ok(
+        !detail.querySelector('.sub').textContent.includes(expected.text),
+        "the filing time is rendered on the .sub line beside fmtAge's unlabelled reading",
+      );
     }
   });
 }

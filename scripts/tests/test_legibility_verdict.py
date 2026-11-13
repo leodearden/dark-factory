@@ -17,6 +17,9 @@ from pathlib import Path
 import codebook
 import pytest
 from legibility import verdict
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _FULL_RAW = {
     "verified": True,
@@ -709,8 +712,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 def test_importing_verdict_fails_on_a_codebook_severity_without_a_meaning() -> None:
     probe = (
         "from legibility import codebook\n"
-        "schema = codebook.V2_SCHEMA['properties']['entries']['items']['properties']\n"
-        "schema['severity']['enum'].append('critical')\n"
+        "codebook.ENTRY_SEVERITIES = (*codebook.ENTRY_SEVERITIES, 'critical')\n"
         "from legibility import verdict\n"
     )
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(

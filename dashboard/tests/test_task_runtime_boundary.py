@@ -82,11 +82,12 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
 
     ``timeout`` is accepted-and-ignored: the unit threads its own per-call
     budget into both reads, so a stub missing the keyword raises TypeError.
+    ``fields`` is ignored too: *tasks* are already shaped.
     """
 
     async def _fake_fetch_tasks(
         client, config, project_root, *,
-        statuses=None, timeout=None,
+        statuses=None, fields=None, timeout=None,
     ):
         rows = list(tasks)
         if statuses is not None:

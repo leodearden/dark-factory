@@ -31,7 +31,10 @@ from shared.jcodemunch_launch import (
     jcodemunch_install_argv,
     jcodemunch_server_config,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_sections import dispatch_stub_body
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _START = '_jcodemunch_server_json="$('
 _END = "\nfi\n"

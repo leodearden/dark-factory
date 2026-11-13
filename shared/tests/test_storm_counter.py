@@ -7,10 +7,7 @@ copies (``reconciliation/harness.py::_record_placeholder_finding_drop``,
 into ``fused_memory.server.storm_counter`` "so a fourth consumer reuses rather
 than re-copies it (INV-5)". ``shared.mcp_markup_middleware`` IS that fourth
 consumer, and it lives in the base layer — ``shared`` may not import
-``fused_memory``, so the class had to come to it. The old module stays as a
-re-export shim, mirroring exactly what task 3688 did to markup_tripwire's
-``MCP_MARKUP_PATTERNS``; ``fused-memory/tests/server/test_storm_counter.py``
-keeps running unedited against that shim, which is what pins the shim honest.
+``fused_memory``, so the class had to come to it.
 
 These assertions are PORTED from that existing coverage rather than invented,
 because the contract is not supposed to change in the move — only the import
@@ -45,34 +42,6 @@ def clock():
 @pytest.fixture
 def counter(clock):
     return StormCounter(time_provider=clock)
-
-
-class TestReExportShim:
-    """The old home is the SAME class object, not a second implementation.
-
-    The re-export contract, in the shape task 3688 established for
-    ``MCP_MARKUP_PATTERNS``: promote to ``shared``, re-export from the old home,
-    public names unchanged. No fused-memory source module imports the shim any
-    more — ``server/markup_tripwire.py`` stopped at task 4458 and
-    ``services/memory_service.py`` imports ``shared.storm_counter`` directly
-    since task 5102 — so what it still serves is its own test suite and the
-    prose that names it.
-
-    This identity is the one thing the OLD suite is uniquely qualified to pin,
-    and it is what makes every contract assertion below cover both import paths
-    at once — ``fused-memory/tests/server/test_storm_counter.py`` re-tests the
-    same contract against the same object today, which is duplication that
-    belongs at the shim, not at the behaviour. Collapsing that suite is out of
-    this task's lock scope.
-
-    Guarded by importorskip so shared's suite stays independent of fused-memory
-    being installed — shared is the base layer and may not require it.
-    """
-
-    def test_the_old_home_re_exports_this_very_class(self):
-        shim = pytest.importorskip('fused_memory.server.storm_counter')
-
-        assert shim.StormCounter is StormCounter
 
 
 class TestThreshold:

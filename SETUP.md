@@ -209,6 +209,10 @@ docker compose up -d falkordb qdrant
   - After setup, the fused-memory unit brings FalkorDB up through
     `scripts/falkordb_aof_gate.py`, which recreates the container only onto a
     current AOF (`OPERATIONS.md` "FalkorDB settings and the recreate gate").
+  - Integration tests, the offline lane and evals write to a second,
+    disposable FalkorDB, `falkordb-scratch` on `127.0.0.1:6380`, which
+    `setup-host.sh` starts, Docker keeps running, and nothing else starts
+    (`OPERATIONS.md` "The scratch FalkorDB").
 - **Qdrant** (vector store for Mem0) on `6333` (HTTP) / `6334` (gRPC).
 
 A third compose service, `fused-mcp`, builds and runs fused-memory itself
@@ -249,12 +253,14 @@ it ran; otherwise re-run the two commands above now that you've written it.)
 - Health check:
 
 ```bash
-curl -sf http://localhost:8002/health && echo healthy
+curl -sf http://127.0.0.1:8002/health && echo healthy
 journalctl --user -u fused-memory -f   # tail logs
 ```
 
 The MCP endpoint itself is `http://127.0.0.1:8002/mcp` (wired into Claude
-Code sessions via each project's `.mcp.json`).
+Code sessions via each project's `.mcp.json`). fused-memory listens on
+loopback only by design, so a connect on the machine's LAN or tailnet
+address is refused; see `OPERATIONS.md` §"Network exposure check".
 
 ## 7. Dashboard + watchdog units
 
@@ -506,9 +512,10 @@ requirement for a working install — skip this section unless you need it.
   remote checkout has checked out, and git refuses to accept a push to a
   checked-out branch by default. The `RemoteRunner(main_branch=...)`
   argument is always populated from `git.main_branch` in production —
-  `merge_lane/drift.py::_build_remote_runners` is the sole production site that
-  constructs a `RemoteRunner`, and it always passes
-  `main_branch=config.git.main_branch` — so this push, and therefore the
+  `verify_hosts.py::_remote_runner` is the sole production site that
+  constructs a `RemoteRunner` (merge verifies reach it through
+  `build_remote_runners`, task verifies through `remote_runner_factory`), and
+  it always passes `main_branch=config.git.main_branch` — so this push, and therefore the
   `updateInstead` requirement, is not optional. `RemoteRunner`'s
   `if self._main_branch:` skip exists only for direct construction with
   `main_branch=None` (tests), which a config-driven dispatch never does.
@@ -897,6 +904,31 @@ verify host, and day-2 operational notes for a live laptop runner, see
 generic wiring and precedence, not environment fingerprints or ongoing
 operational notes, which already live there. For the full config
 hot-reload tier reference, see `OPERATIONS.md`.
+
+### Remote task verifies on the same host
+
+A `verify_runners` host can also run implement-phase task verifies, once the
+dispatching project moves `verify_task_host_policy` off its default `local`
+(task 6670; keys and rollback in `OPERATIONS.md` §"Remote task verifies").
+It is the same host in the same pool: one bench covers both lanes, and the
+merge snapshot's host row names a task holding the host as `task_held_by`.
+Before a project flips its policy:
+
+- **The host's orchestrator must provide `orchestrator verify-task`**, the
+  task-role sibling of `verify-merge` (it verifies on a fresh ephemeral
+  worktree). Under the shim contract above it runs from the gate checkout of
+  the dispatcher's own deployed commit, so it is present whenever the
+  dispatcher has it; a wrapper that ignores `ORCH_GATE_BIN` runs the shared
+  laptop checkout instead, which must then carry the subcommand too.
+- **It needs the dispatching orchestrator's deployed sha, as merge verifies
+  do.** A process that cannot resolve its deployed commit offers no remote
+  host to task verifies, and every one runs locally.
+- **Task-verify scopes share the project's systemd drop-in.** The scope name
+  is `df-verify-<tag>-<uuid>.scope`, and `verify.py::_scope_tag_for` derives
+  `<tag>` from the project root, not the verify role. So a
+  `df-verify-<tag>-.scope.d/` memory drop-in written for the project's merge
+  verifies caps its task-verify scopes as well. Size it for both lanes
+  running at once.
 
 ---
 

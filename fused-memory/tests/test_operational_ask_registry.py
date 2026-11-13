@@ -719,7 +719,7 @@ class TestSeedOperationalAskRegistry:
         candidate = CandidateTask(
             title="Fix null pointer in task_curator batch dedup when candidates list is empty",
             description=(
-                "Add a guard so curate_batch_prepared does not crash on an empty "
+                "Add a guard so curate_prepared does not crash on an empty "
                 "candidates list; add a regression test."
             ),
         )

@@ -11,7 +11,7 @@
 // test. Bump this whenever endpointsFor gains or loses a row; it is
 // deliberately one constant rather than a literal repeated per test, because
 // scattered copies is what went stale when the memory-evals endpoint was added.
-export const EXPECTED_ENDPOINT_COUNT = 15;
+export const EXPECTED_ENDPOINT_COUNT = 16;
 
 // The two shared registry specs.
 export const PLAIN_SPEC = Object.freeze({ kind: 'plain' });

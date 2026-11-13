@@ -51,10 +51,10 @@ a host's contention are separate things to size against.)
 WHERE THE RATIONALE LIVES.  The mechanism is restated here because this is the
 module a failing run points at, but the CANONICAL home -- the derivation of the
 ceiling, the full measurement record, and the escalation references -- is the
-``WHOLE_TREE_SCAN_TEST_TIMEOUT`` comment in ``_orch_helpers.py``.  The ~13
-modules that carry the mark point THERE rather than repeating it, so retuning
-the ceiling or switching ``timeout_method`` is one edit plus this file, not
-fourteen.
+``WHOLE_TREE_SCAN_TEST_TIMEOUT`` comment in
+``shared/src/shared/whole_tree_guard_family.py``.  The modules that carry the
+mark point THERE rather than repeating it, so retuning the ceiling or switching
+``timeout_method`` is one edit plus this file, not one per member.
 """
 from __future__ import annotations
 
@@ -68,15 +68,15 @@ from _orch_helpers import (
     PYPROJECT_DEFAULT_TIMEOUT,
     UNDER_LOAD_HEADROOM_FACTOR,
     VERIFY_CLI_PER_TEST_TIMEOUT,
-    WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
-
-from orchestrator.pytest_markers import (
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TIMEOUT_NAME,
     is_whole_tree_guard_module,
-    module_level_marker_names,
     module_level_timeout_arguments,
 )
+
+from orchestrator.pytest_markers import module_level_marker_names
 
 # This module is ITSELF a member of the family it polices -- the invariant
 # below rglob()s every *.py under this directory and ast.parse()s each one --
@@ -368,10 +368,11 @@ def _scans_whole_tree_py(source: str) -> bool:
 
 
 #: Names that resolve to ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` at import time.  A
-#: bare ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` (the house `from _orch_helpers import`
-#: idiom) and the dotted ``_orch_helpers.WHOLE_TREE_SCAN_TEST_TIMEOUT`` both land
-#: here, since only the trailing name is compared.  The spelling itself is
-#: ``orchestrator.pytest_markers``' -- the same one its family predicate reads.
+#: bare ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` (the house
+#: `from shared.whole_tree_guard_family import` idiom) and a dotted
+#: ``<module>.WHOLE_TREE_SCAN_TEST_TIMEOUT`` both land here, since only the
+#: trailing name is compared.  The spelling itself is
+#: ``shared.whole_tree_guard_family``'s -- the same one its family predicate reads.
 _SANCTIONED_CEILING_NAMES = frozenset({WHOLE_TREE_SCAN_TIMEOUT_NAME})
 
 
@@ -408,7 +409,7 @@ def _module_level_timeout_ceiling(source: str) -> float | None:
     conservative reading is the one that surfaces it.
 
     The seconds expressions come from
-    :func:`orchestrator.pytest_markers.module_level_timeout_arguments` rather
+    :func:`shared.whole_tree_guard_family.module_level_timeout_arguments` rather
     than a fold of this module's own, for the same reason the family invariant
     imports ``module_level_marker_names``: the grammar of a module-level
     ``pytestmark`` (``Assign`` vs ``AnnAssign``, last-assignment-wins,
@@ -645,7 +646,7 @@ def test_ceiling_resolves_the_sanctioned_constant_name() -> None:
     """The house spelling resolves to the constant's real runtime value."""
     source = (
         'import pytest\n'
-        'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+        'from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
         'pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n'
     )
     assert _module_level_timeout_ceiling(source) == float(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -775,161 +776,14 @@ def test_a_synthetic_new_scanner_marked_too_tight_is_an_offender() -> None:
 
 
 # ---------------------------------------------------------------------------
-# orchestrator.pytest_markers.is_whole_tree_guard_module(source) and
-# module_level_timeout_arguments(source) -- inline-fixture unit tests.
-#
-# The ONE family predicate both this guard and verify_plan's task-role guard
-# family enumeration consume. Membership is decided by the NAME the mark is
-# spelled with, never by its value: production cannot import _orch_helpers.
+# Membership of this module itself. The family predicate's own unit tests live
+# with it, in shared/tests/test_whole_tree_guard_family.py.
 # ---------------------------------------------------------------------------
-
-_HOUSE_GUARD_SOURCE = (
-    'import pytest\n'
-    'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
-    'pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n'
-)
-
-
-@pytest.mark.parametrize(
-    'source',
-    [
-        pytest.param(_HOUSE_GUARD_SOURCE, id='house-spelling'),
-        pytest.param(
-            'import pytest\n'
-            'import _orch_helpers\n'
-            'pytestmark = pytest.mark.timeout(_orch_helpers.WHOLE_TREE_SCAN_TEST_TIMEOUT)\n',
-            id='dotted',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
-            'pytestmark = pytest.mark.timeout(timeout=WHOLE_TREE_SCAN_TEST_TIMEOUT)\n',
-            id='keyword',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
-            'pytestmark = [pytest.mark.slow, pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)]\n',
-            id='list-form',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
-            'pytestmark: list = [pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)]\n',
-            id='annotated',
-        ),
-    ],
-)
-def test_guard_family_admits_every_sanctioned_spelling(source: str) -> None:
-    assert is_whole_tree_guard_module(source) is True
-
-
-@pytest.mark.parametrize(
-    'source',
-    [
-        pytest.param(
-            'import pytest\npytestmark = pytest.mark.timeout(30)\n',
-            id='small-literal',
-        ),
-        pytest.param(
-            'import pytest\npytestmark = pytest.mark.timeout(1200)\n',
-            id='literal-equal-to-the-ceiling',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'from somewhere import SOME_OTHER_TIMEOUT\n'
-            'pytestmark = pytest.mark.timeout(SOME_OTHER_TIMEOUT)\n',
-            id='different-constant',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
-            'pytestmark = pytest.mark.timeout()\n',
-            id='zero-arg-timeout',
-        ),
-        pytest.param(
-            '"""Mentions WHOLE_TREE_SCAN_TEST_TIMEOUT in prose only."""\n'
-            'import pytest\n'
-            'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
-            '# pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n'
-            'pytestmark = pytest.mark.slow\n',
-            id='import-comment-docstring-only',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
-            'def f():\n'
-            '    pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n'
-            '    return pytestmark\n',
-            id='function-local-pytestmark',
-        ),
-        pytest.param(
-            _HOUSE_GUARD_SOURCE + 'pytestmark = pytest.mark.slow\n',
-            id='rebound-without-timeout',
-        ),
-        pytest.param(None, id='none'),
-        pytest.param('', id='empty'),
-        pytest.param('def f(:\n', id='syntax-error'),
-        pytest.param(
-            'pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT\n',
-            id='syntax-error-mentioning-the-name',
-        ),
-    ],
-)
-def test_guard_family_rejects_everything_else_without_raising(source: str | None) -> None:
-    assert is_whole_tree_guard_module(source) is False
-
-
-@pytest.mark.parametrize(
-    ('source', 'expected'),
-    [
-        pytest.param('import pytest\npytestmark = pytest.mark.timeout(30)\n', ['30'], id='positional'),
-        pytest.param(
-            'import pytest\npytestmark = pytest.mark.timeout(timeout=30)\n', ['30'], id='keyword',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'pytestmark = [pytest.mark.timeout(300), pytest.mark.timeout(30)]\n',
-            ['300', '30'],
-            id='two-marks-in-element-order',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'pytestmark = [pytest.mark.slow, pytest.mark.timeout(_orch_helpers.X)]\n',
-            ['_orch_helpers.X'],
-            id='non-timeout-siblings-skipped',
-        ),
-        pytest.param(
-            'import pytest\n'
-            'pytestmark = pytest.mark.timeout(30)\n'
-            'pytestmark = pytest.mark.timeout(45)\n',
-            ['45'],
-            id='last-binding-wins',
-        ),
-        pytest.param('import pytest\n', [], id='no-pytestmark'),
-        pytest.param('import pytest\npytestmark = pytest.mark.asyncio\n', [], id='no-timeout'),
-        pytest.param('import pytest\npytestmark = pytest.mark.timeout()\n', [], id='zero-arg'),
-        pytest.param('def f(:\n', [], id='syntax-error'),
-        pytest.param(None, [], id='none'),
-    ],
-)
-def test_module_level_timeout_arguments_reads_the_seconds_expressions(
-    source: str | None, expected: list[str],
-) -> None:
-    arguments = module_level_timeout_arguments(source)
-    assert isinstance(arguments, tuple)
-    assert [ast.unparse(argument) for argument in arguments] == expected
-
-
-def test_module_level_timeout_arguments_returns_the_name_node_unevaluated() -> None:
-    (argument,) = module_level_timeout_arguments(_HOUSE_GUARD_SOURCE)
-    assert isinstance(argument, ast.Name)
-    assert argument.id == 'WHOLE_TREE_SCAN_TEST_TIMEOUT'
 
 
 def test_this_guard_module_is_itself_a_guard_family_member() -> None:
     """The real-name coupling: this module carries the house mark, so renaming
-    the constant on either side -- _orch_helpers or pytest_markers -- reds here."""
+    the constant or its spelling in shared.whole_tree_guard_family reds here."""
     assert is_whole_tree_guard_module(Path(__file__).read_text(encoding='utf-8')) is True
 
 
@@ -946,7 +800,7 @@ def _synthetic_scanner(mark_lines: str) -> str:
         'import ast\n'
         'import pytest\n'
         'from pathlib import Path\n'
-        'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+        'from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
         f'{mark_lines}'
         '\n'
         '_TESTS_DIR = Path(__file__).parent\n'
@@ -1035,7 +889,7 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
 
     The MEMBERSHIP half exists because task 7253 (the gate-5702 ruling) narrowed
     the task-role verify floor to the touched tests plus this family, enumerated
-    by :func:`orchestrator.pytest_markers.is_whole_tree_guard_module`. A scanner
+    by :func:`shared.whole_tree_guard_family.is_whole_tree_guard_module`. A scanner
     outside the family -- marked by a literal, or by another constant -- would
     silently stop running before the merge gate, so membership is not fail-soft.
 
@@ -1055,9 +909,8 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     acts purely as a FLOOR and narrows nothing.
 
     NO SKIP-SELF, deliberately, and stated here because it inverts a convention
-    a reviewer will expect. Five sibling guards
+    a reviewer will expect. Four sibling guards
     (test_prune_chokepoint_guard.py::test_exactly_one_prune_argv_literal_inside_chokepoint,
-    test_event_loop_antipattern_guard.py::test_no_get_event_loop_in_orchestrator_tests,
     and the serial-merge-worker, reachback and lock-release guards) carry a
     ``_THIS_FILE``/``continue``
     skip-self because their forbidden pattern necessarily appears in their own
@@ -1117,7 +970,7 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
             f'{_TESTS_DIR.name}/ lack a module-level timeout mark AT THE FAMILY '
             'CEILING (no mark at all, one pinned lower, or one not spelled via '
             'WHOLE_TREE_SCAN_TEST_TIMEOUT). Add\n\n'
-            '    from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+            '    from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
             '    pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n\n'
             'at module level in each. These modules rglob() every *.py in the '
             'repo and ast.parse() each one; under `-n auto` that has been '

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.task_text_write_guard import text_fp_of

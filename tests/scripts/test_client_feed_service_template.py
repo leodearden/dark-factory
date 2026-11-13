@@ -8,9 +8,13 @@ tests/scripts/test_uv_run_venv_isolation.py; this module pins the rest.
 
 import pathlib
 
+import pytest
 import render_systemd_unit
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import logical_exec_start
 from systemd_unit_parity import parse_unit_directives
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "client-feed.service.template"

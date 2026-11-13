@@ -20,6 +20,7 @@ import httpx
 import openai
 import pytest
 from _fm_helpers import load_script_module
+from _judge_wording_reload import wording_imported_under
 from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -1044,6 +1045,13 @@ def _committed_pairs() -> tuple[bytes, tuple[dict, ...]]:
     return body, tuple(json.loads(line) for line in body.decode('utf-8').splitlines())
 
 
+def _assert_each_arm_names_the_prompt_it_measured(wording: types.ModuleType) -> None:
+    measured = wording.PROMPTS_WHILE_PSI_SHIPPED  # π ran while ψ shipped (task 6151)
+    for row in _committed()['arms']:
+        assert row['wording'] in measured, (row['arm'], row['wording'], sorted(measured))
+        assert row['system_prompt_sha256'] == _sha(measured[row['wording']]), row['arm']
+
+
 class TestCommittedPopulationIsTraceable:
     """The committed π artifacts say which arms ran, how, and over what.
 
@@ -1061,10 +1069,12 @@ class TestCommittedPopulationIsTraceable:
             )
 
     def test_each_arm_names_the_prompt_its_wording_sends(self) -> None:
-        for row in _committed()['arms']:
-            assert row['system_prompt_sha256'] == _sha(
-                _wording().system_prompt(row['wording']),
-            ), row['arm']
+        _assert_each_arm_names_the_prompt_it_measured(_wording())
+
+    def test_each_arm_still_names_its_prompt_when_the_shipped_prompt_moves_on(self) -> None:
+        with wording_imported_under('a shipped prompt other than psi') as wording:
+            assert wording.system_prompt('shipped') == 'a shipped prompt other than psi'
+            _assert_each_arm_names_the_prompt_it_measured(wording)
 
     def test_every_arm_ran_the_whole_run_set(self) -> None:
         n_judge_band = _committed()['population']['n_judge_band']

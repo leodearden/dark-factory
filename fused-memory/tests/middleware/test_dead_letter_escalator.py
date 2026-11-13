@@ -28,6 +28,7 @@ from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import dead_letter_escalator as dle_mod
 from fused_memory.middleware.dead_letter_escalator import emit_dead_letter_escalation
+from fused_memory.services.queued_writes import QueueOperation
 
 pytestmark = pytest.mark.skipif(
     not dle_mod.HAS_ESCALATION,
@@ -72,16 +73,11 @@ def _emit(root, *, project_id=_PROJECT, operation='add_episode',
 class TestImportsCleanlyOnItsOwn:
     """This module must be importable FIRST, before the service layer.
 
-    Regression pin for a real cycle. `_error_class` needs
-    `POST_EXECUTE_DEAD_PREFIX` from `services.durable_queue`; importing that at
-    MODULE scope reaches `services/__init__`, which eagerly imports
-    `MemoryService`, which imports this module back — so whichever of the two
-    loads first finds the other half-initialized. It bit asymmetrically and was
-    therefore easy to miss: most test modules pull in `memory_service` first
-    via some other import and the cycle resolves, but collecting
-    `tests/middleware/` on its own imports this module first and the whole file
-    errors out at collection. The remedy is the deferred import inside
-    `_error_class`, and this is what keeps it deferred.
+    `memory_service` imports this module, and this module imports services
+    leaves (`durable_queue`, `queued_writes`) at module scope. Until task 6635
+    emptied `services/__init__`, which eagerly imported `MemoryService`, that
+    formed a cycle through the package init. This class pins that every entry
+    order still imports cleanly.
 
     A SUBPROCESS is load-bearing: by the time any in-process test runs, both
     modules are long since in `sys.modules`, so an in-process import assertion
@@ -126,10 +122,20 @@ class TestImportsCleanlyOnItsOwn:
         assert proc.returncode == 0, f'stderr:\n{proc.stderr}'
         assert 'ok' in proc.stdout
 
-    def test_deferred_import_still_strips_the_prefix_at_call_time(self):
-        """The deferral must not cost the behaviour it exists to preserve:
-        `_error_class` still reaches the real constant when actually called,
-        escalator-imported-first."""
+    def test_importing_the_durable_queue_first_still_works(self):
+        proc = self._run(
+            'from fused_memory.services.durable_queue import DurableWriteQueue\n'
+            'from fused_memory.middleware.dead_letter_escalator import ('
+            '    emit_dead_letter_escalation,\n)\n'
+            'assert DurableWriteQueue is not None and callable(emit_dead_letter_escalation)\n'
+            'print("ok")\n'
+        )
+        assert proc.returncode == 0, f'stderr:\n{proc.stderr}'
+        assert 'ok' in proc.stdout
+
+    def test_the_escalator_first_still_strips_the_prefix(self):
+        """With the escalator imported first, `_error_class` strips the real
+        POST_EXECUTE_DEAD_PREFIX."""
         proc = self._run(
             'from fused_memory.middleware.dead_letter_escalator import _error_class\n'
             'from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX\n'
@@ -577,6 +583,25 @@ class TestWhatTheCallerWasTold:
     ):
         """A forgotten entry must under-claim, not claim optimistically."""
         _emit(tmp_path, operation='mem0_classify_and_add', write_op_id=None)
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert dle_mod._REPORTED_TO_CALLER_DEFAULT in detail, detail
+
+    @pytest.mark.parametrize(
+        'operation', [QueueOperation.ADD_EPISODE, QueueOperation.ADD_MEMORY_GRAPHITI],
+    )
+    def test_a_claimed_operation_passed_as_the_enum_files_its_claim(self, tmp_path, operation):
+        _emit(tmp_path, operation=operation, write_op_id='W-9')
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert dle_mod._REPORTED_TO_CALLER[operation].text in detail, detail
+        assert dle_mod._REPORTED_TO_CALLER_DEFAULT not in detail, detail
+
+    def test_an_operation_outside_the_vocabulary_falls_back_to_the_neutral_default(
+        self, tmp_path,
+    ):
+        """An undecodable row reports its raw operation string."""
+        _emit(tmp_path, operation='typo_op', write_op_id=None)
         detail = _filed(tmp_path)[0]['detail']
 
         assert dle_mod._REPORTED_TO_CALLER_DEFAULT in detail, detail

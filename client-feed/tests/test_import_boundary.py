@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-FORBIDDEN_ROOTS = frozenset({'orchestrator', 'fused_memory', 'dashboard'})
+FORBIDDEN_ROOTS = frozenset({'orchestrator', 'fused_memory', 'dashboard', 'escalation'})
 ALLOWED_SHARED_MODULES = ('shared.defects', 'shared.project_layout', 'shared.task_metadata')
 VENDORABLE_MODULES = frozenset({'__init__', 'contract', 'fold', 'validate', 'cli'})
 VENDORABLE_ROOTS = frozenset({'pydantic', 'client_feed'}) | frozenset(sys.stdlib_module_names)
