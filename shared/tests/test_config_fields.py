@@ -1,19 +1,24 @@
 """Tests for shared.config_fields: tiers and spellings derived from declared field markers."""
 
+import copy
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Annotated
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from shared.config_fields import (
     ConfigDeclarationError,
+    ConflictingSpellings,
+    DeprecatedSpelling,
     LegacySpelling,
     Reload,
     RestartOnlyRows,
     TableLegacy,
     declared_fields,
     legacy_spellings,
+    pivot_legacy_spellings,
     reloadable_paths,
 )
 
@@ -318,3 +323,133 @@ def test_an_inconsistent_spelling_is_a_declaration_error_naming_the_values(model
         legacy_spellings(model_cls)
     for text in named:
         assert text in str(raised.value)
+
+
+SLOTS_MOVED = DeprecatedSpelling('old_slots', 'admission.slots')
+
+
+@pytest.mark.parametrize(
+    'data',
+    [{'old_slots': 6}, {'old_slots': 6, 'admission': {'slots': 6}}],
+    ids=['old-only', 'old-and-equal-new'],
+)
+def test_a_scalar_spelling_pivots_to_its_new_path_with_one_deprecation(data):
+    assert pivot_legacy_spellings(ScalarSpelled, data) == (
+        {'admission': {'slots': 6}},
+        (SLOTS_MOVED,),
+    )
+
+
+def test_a_scalar_spelling_disagreeing_with_its_new_path_conflicts():
+    with pytest.raises(ConflictingSpellings) as raised:
+        pivot_legacy_spellings(ScalarSpelled, {'old_slots': 6, 'admission': {'slots': 7}})
+    assert (raised.value.old_path, raised.value.new_path) == ('old_slots', 'admission.slots')
+    for text in ('old_slots', 'admission.slots', '6', '7'):
+        assert text in str(raised.value)
+
+
+class UnblockAuto(BaseModel):
+    enabled: bool = False
+
+
+class PivotTable(BaseModel):
+    unblock_auto: UnblockAuto = Field(default_factory=UnblockAuto)
+    roles: Annotated[
+        dict[Role, Row],
+        TableLegacy.knob_major('models', 'model'),
+        TableLegacy(rows={'unblock_auto.model': ('unblock_auto', 'model')}),
+    ] = Field(default_factory=dict)
+
+    @model_validator(mode='before')
+    @classmethod
+    def _pivot_legacy_spellings(cls, data: object) -> object:
+        if isinstance(data, Mapping):
+            pivoted, _ = pivot_legacy_spellings(cls, data)
+            return pivoted
+        return data
+
+
+def test_a_knob_major_block_pivots_into_the_table_and_its_emptied_block_goes():
+    assert pivot_legacy_spellings(PivotTable, {'models': {'architect': 'opus'}}) == (
+        {'roles': {'architect': {'model': 'opus'}}},
+        (DeprecatedSpelling('models.architect', 'roles.architect.model'),),
+    )
+
+
+def test_a_row_map_entry_pivots_into_its_row_and_keeps_the_declared_siblings():
+    assert pivot_legacy_spellings(
+        PivotTable, {'unblock_auto': {'model': 'opus', 'enabled': True}}
+    ) == (
+        {'unblock_auto': {'enabled': True}, 'roles': {'unblock_auto': {'model': 'opus'}}},
+        (DeprecatedSpelling('unblock_auto.model', 'roles.unblock_auto.model'),),
+    )
+
+
+def test_a_declared_container_emptied_by_the_pivot_is_kept():
+    pivoted, _ = pivot_legacy_spellings(PivotTable, {'unblock_auto': {'model': 'opus'}})
+    assert pivoted['unblock_auto'] == {}
+
+
+def test_a_table_spelling_disagreeing_with_its_row_conflicts_naming_both_paths():
+    data = {'models': {'architect': 'opus'}, 'roles': {'architect': {'model': 'sonnet'}}}
+    with pytest.raises(ConflictingSpellings) as raised:
+        pivot_legacy_spellings(PivotTable, data)
+    assert (raised.value.old_path, raised.value.new_path) == (
+        'models.architect',
+        'roles.architect.model',
+    )
+
+
+@pytest.mark.parametrize(
+    ('model_cls', 'data'),
+    [
+        (
+            PivotTable,
+            {'models': {'architect': 'opus'}, 'unblock_auto': {'model': 'opus', 'enabled': True}},
+        ),
+        (ScalarSpelled, {'old_slots': 6, 'admission': {'slots': 6, 'other': [1, 2]}}),
+    ],
+    ids=['table', 'scalar'],
+)
+def test_the_pivot_never_mutates_its_input(model_cls, data):
+    before = copy.deepcopy(data)
+    pivot_legacy_spellings(model_cls, data)
+    assert data == before
+
+
+def test_an_undeclared_key_stays_exactly_where_it_was():
+    pivoted, deprecated = pivot_legacy_spellings(
+        PivotTable,
+        {'models': {'architect': 'opus', 'stranger': 'x'}, 'mystery': {'depth': 1}},
+    )
+    assert pivoted == {
+        'models': {'stranger': 'x'},
+        'mystery': {'depth': 1},
+        'roles': {'architect': {'model': 'opus'}},
+    }
+    assert deprecated == (DeprecatedSpelling('models.architect', 'roles.architect.model'),)
+
+
+@pytest.mark.parametrize(
+    ('model_cls', 'data'),
+    [
+        (ScalarSpelled, {'old_slots': 6, 'admission': 5}),
+        (PivotTable, {'models': 'opus'}),
+    ],
+    ids=['new-path-intermediate-is-a-scalar', 'old-path-intermediate-is-a-scalar'],
+)
+def test_a_key_that_cannot_be_placed_stays_at_its_old_path_unreported(model_cls, data):
+    assert pivot_legacy_spellings(model_cls, data) == (data, ())
+
+
+def test_a_root_before_validator_loads_an_old_spelling_at_its_new_path():
+    loaded = PivotTable.model_validate({'models': {'architect': 'opus'}})
+    assert loaded.roles[Role.ARCHITECT].model == 'opus'
+
+
+def test_a_conflict_inside_the_root_validator_is_a_validation_error_naming_both_paths():
+    data = {'models': {'architect': 'opus'}, 'roles': {'architect': {'model': 'sonnet'}}}
+    with pytest.raises(ValidationError) as raised:
+        PivotTable.model_validate(data)
+    assert 'models.architect' in str(raised.value)
+    assert 'roles.architect.model' in str(raised.value)
