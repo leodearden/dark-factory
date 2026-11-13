@@ -612,12 +612,12 @@ tasks:
           paths: ["fused-memory/src/fused_memory/config/schema.py"]
           expect: present
       - name: "project-policies-reloadable"
-        binding: "built here — config/reload.py::RELOADABLE_FIELDS names reconciliation.project_policies"
+        binding: "built here — config/schema.py: the project_policies field carries the Reload.GREEN marker (S16 C3/D4; S16 β2 9693 deletes config/reload.py first)"
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "'reconciliation\\.project_policies'"
-          paths: ["fused-memory/src/fused_memory/config/reload.py"]
+          pattern: "project_policies: Annotated\\[.*Reload\\.GREEN"
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
           expect: present
       - name: "reconciliation-config-substrate"
         binding: "`grep:fused-memory/src/fused_memory/config/schema.py::ReconciliationConfig` substrate — on main, already keying per-project values by project_id"

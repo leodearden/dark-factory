@@ -568,7 +568,7 @@ tasks:
       kind: grep
       pattern: "record.get\\('status'\\) != 'pending'"
       paths:
-      - fused-memory/src/fused_memory/reconciliation/backlog_policy.py
+      - fused-memory/src/fused_memory/recon_state/backlog_policy.py
       expect: absent
   - name: one-unknown-status-policy
     binding: built here — object readers report the unparseable-record skip count and raw-dict readers name the value, both as unknown_escalation_status, excluded from open and terminal counts

@@ -221,7 +221,7 @@ Closes fk-fbbf580e4e1d. Dep ν (through it ι, θ3, ε, κ2). Read seam Reconcil
 | project-policies-config | built here — config/schema.py::ReconciliationConfig.project_policies (C9) | PASS | grep present `project_policies: dict\[str, ReconProjectPolicy\]` in `fused-memory/src/fused_memory/config/schema.py` |
 | per-project-modules-gone | anti-inversion — per-project Python modules deleted | PASS | path absent: `fused-memory/src/fused_memory/reconciliation/policies/autopilot_video.py` |
 | policy-read-seam | built here — config/schema.py::ReconciliationConfig.policy_for (C9 read seam) | PASS | grep present `def policy_for\(` in `fused-memory/src/fused_memory/config/schema.py` |
-| project-policies-reloadable | built here — config/reload.py::RELOADABLE_FIELDS names reconciliation.project_policies | PASS | grep present `'reconciliation\.project_policies'` in `fused-memory/src/fused_memory/config/reload.py` |
+| project-policies-reloadable | built here — config/schema.py: the project_policies field carries the Reload.GREEN marker (S16 C3/D4; S16 β2 9693 deletes config/reload.py first) | PASS | grep present `project_policies: Annotated\[.*Reload\.GREEN` in `fused-memory/src/fused_memory/config/schema.py` |
 | reconciliation-config-substrate | `grep:fused-memory/src/fused_memory/config/schema.py::ReconciliationConfig` substrate — on main, already keying per-project values by project_id | PASS | — |
 
 ## μ — Run EventJournal writes on one writer thread; EventQueue.enqueue awaits the durable append off the event loop

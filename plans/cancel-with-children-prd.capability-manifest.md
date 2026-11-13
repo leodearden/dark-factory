@@ -14,7 +14,7 @@ today and every `expect: absent` pattern is PRESENT today, so each check gates s
 | β | gate module exists | new file `fused-memory/src/fused_memory/middleware/cancel_children_gate.py` | PASS |
 | β | `get_cancel_children` MCP tool | grep `def get_cancel_children` in `fused-memory/src/fused_memory/server/` | PASS |
 | β | undispositioned refusal | rejection-mechanism; grep `cancel_children_undispositioned`; §6 rows 1, 27 | PASS |
-| β | registry accessor | grep `def known_project_roots` in `reconciliation/backlog_policy.py` | PASS |
+| β | registry accessor | grep `def known_project_roots` in `reconciliation/backlog_policy.py`, `recon_state/backlog_policy.py` | PASS |
 | β | enforce flag hot-reloadable | grep `cancel_children\.enforce` in `fused-memory/src/fused_memory/config/reload.py` | PASS |
 | β | late mode never deadlocks; observe mode allows + journals | manual — §6 rows 28, 31 (real-backend tests) | PASS |
 | γ | backstop module exists | new file `fused-memory/src/fused_memory/reconciliation/cancel_backstop.py` | PASS |
