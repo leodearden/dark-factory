@@ -98,6 +98,9 @@ class ActionState(StrEnum):
 
 
 PENDING_STATES = frozenset({ActionState.PLANNED, ActionState.SKIPPED_CAP})
+#: The states of a heal that applied: an undo marks a heal undone only after it applied,
+#: and keeps the run that applied it and the after-state that run read.
+APPLIED_STATES = frozenset({ActionState.APPLIED, ActionState.UNDONE})
 
 
 class Disposition(StrEnum):
@@ -450,10 +453,11 @@ class ExaminationRecord:
 class CandidateRecord:
     """One examined link of a plan run: its before-state, decision, and what became of it.
 
-    ``action_taken`` is the linked heal's action once it applied, else
-    :data:`NO_ACTION_TAKEN`. ``after_child`` is the child as the applying write's
-    verification read it, the before-state when nothing applied, and ``None`` for
-    an applied heal whose after-state went unrecorded. The verdict fields are
+    ``action_taken`` is the linked heal's action once it applied, even if an undo
+    later took it back, else :data:`NO_ACTION_TAKEN`; ``undone_run_id`` names that
+    undo run. ``after_child`` is the child as the applying write's verification
+    read it, the before-state when nothing applied, and ``None`` for an applied
+    heal whose after-state went unrecorded. The verdict fields are
     joined from the adjudication an adjudicator basis names, and are ``None``
     for any other basis.
     """
@@ -477,6 +481,7 @@ class CandidateRecord:
     reason: str | None = None
     model: str | None = None
     prompt_sha256: str | None = None
+    undone_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -617,6 +622,7 @@ class LinkHealLedger:
         rows = self._conn.execute(
             'SELECT examinations.*, actions.action AS action_value, actions.state AS action_state, '
             'actions.after_child_snapshot_id AS after_child_snapshot_id, '
+            'actions.undone_run_id AS action_undone_run_id, '
             'adjudications.id AS adjudication_id, adjudications.verdict AS adjudicated_verdict, '
             'adjudications.reason AS adjudicated_reason, adjudications.model AS adjudicated_model, '
             'adjudications.prompt_sha256 AS adjudicated_prompt_sha256 FROM examinations '
@@ -631,7 +637,7 @@ class LinkHealLedger:
     def _candidate_record(self, row: sqlite3.Row) -> CandidateRecord:
         before_child = self.read_snapshot(row['child_snapshot_id'])
         parent_snapshot_id = row['parent_snapshot_id']
-        applied = row['action_state'] == ActionState.APPLIED.value
+        applied = row['action_state'] in APPLIED_STATES
         after_child_snapshot_id = row['after_child_snapshot_id']
         if not applied:
             after_child: RecordSnapshot | None = before_child
@@ -664,6 +670,7 @@ class LinkHealLedger:
             reason=row['adjudicated_reason'],
             model=row['adjudicated_model'],
             prompt_sha256=row['adjudicated_prompt_sha256'],
+            undone_run_id=row['action_undone_run_id'],
         )
 
     def _insert_all_planned(self, run_id: str, actions: Sequence[PlannedAction]) -> list[int]:
