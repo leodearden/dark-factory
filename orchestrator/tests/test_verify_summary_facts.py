@@ -156,9 +156,7 @@ class TestTheSummaryCarriesTheRole:
         assert _read_archived_summary(archive_root)['role'] == role
 
     def test_the_archive_writer_defaults_to_merge(self, tmp_path):
-        """'merge' is the DEFAULT, for the local merge-lane call site in
-        ``run_verification``, which passes no role.
-        """
+        """'merge' is the DEFAULT role when the caller passes none."""
         from orchestrator.verify import archive_verify_logs
 
         archive_root = tmp_path / 'archive'
