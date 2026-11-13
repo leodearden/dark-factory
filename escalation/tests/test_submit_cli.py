@@ -212,7 +212,7 @@ class TestSubmitCli:
 
 
 class TestExternalSubmitProducers:
-    @pytest.mark.parametrize('producer', EXTERNAL_SUBMIT_PRODUCERS, ids=lambda p: p.producer)
+    @pytest.mark.parametrize('producer', EXTERNAL_SUBMIT_PRODUCERS, ids=lambda p: p.locator)
     def test_the_producers_whole_call_files_one_pending_l2(
         self, tmp_path: Path, producer: ExternalSubmitProducer,
     ):

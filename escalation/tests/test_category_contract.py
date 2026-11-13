@@ -50,7 +50,7 @@ _AGENT_INSTRUCTED = (
 # submit``, which the census cannot walk. Derived from those producers' whole
 # calls in _external_submit_producers.py, which test_submit_cli.py runs.
 _EXTERNAL_PRODUCERS = tuple(
-    pytest.param(p.category, id=p.producer) for p in EXTERNAL_SUBMIT_PRODUCERS
+    pytest.param(p.category, id=p.locator) for p in EXTERNAL_SUBMIT_PRODUCERS
 )
 
 

@@ -1,7 +1,7 @@
 """The calls other repositories make to ``escalation submit``.
 
 The category census walks only this repository, so each such caller's exact
-call is pinned here as data, named ``<repo>:<path>::<symbol>``.
+call is pinned here as data, located by ``<repo>:<path>::<symbol>``.
 ``test_submit_cli.py`` runs every entry through ``escalation.submit.main``, and
 ``test_category_contract.py`` derives its external-category pins from them.
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class ExternalSubmitProducer:
-    producer: str
+    locator: str
     task: str
     severity: str
     category: str
@@ -39,7 +39,7 @@ _SCP_RUN_DIR = '/home/leo/.local/state/scp-validation/slow-lane/20261109T031700Z
 
 EXTERNAL_SUBMIT_PRODUCERS: tuple[ExternalSubmitProducer, ...] = (
     ExternalSubmitProducer(
-        producer=(
+        locator=(
             'solar-challenge-platform:src/solar_challenge_platform/ci/cadence_alert.py'
             '::EscalationCli.submit_argv'
         ),
