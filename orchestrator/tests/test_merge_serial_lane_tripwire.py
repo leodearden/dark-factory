@@ -20,6 +20,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -698,4 +699,43 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         assert events[0][1]['data']['num_hosts'] == 1
 
         # The fail-open log line appearing IS the proof the hook silently died.
+        assert [r for r in caplog.records if _TRIPWIRE_FAILOPEN_MARK in r.getMessage()] == []
+
+    async def test_bound_is_the_host_count_not_the_speculation_depth(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """K = hosts + 1 (task 8526) leaves the per-host bound at 1.
+
+        Leased verifies are bounded by the allocator's one slot per host, so
+        the tripwire is fed the host count: two hosts, speculation_depth 3.
+        Fed K = 3 it would compute per_host = ceil(3/2) = 2 and the second
+        local verify, the task-5326 leak shape, would go unreported.
+        """
+        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+
+        rec = _RecordingEventStore()
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), event_store=rec, speculation_depth=3,
+        )
+        worker._host_allocator = HostAllocator([SimpleNamespace(name='laptop')])
+        assert worker._host_allocator.host_names == ['local', 'laptop']
+
+        item_a = await _make_merged_item(git_ops, config, '9015')
+        item_b = await _make_merged_item(git_ops, config, '9016')
+        item_c = await _make_merged_item(git_ops, config, '9017')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            worker._inflight_append(self._local_entry(worker, item_a))
+            assert self._tripwire_events(rec) == [], 'one local verify is within bound'
+            worker._inflight_append(
+                self._local_entry(worker, item_b, host='laptop', is_local=False)
+            )
+            assert self._tripwire_events(rec) == [], 'local + remote is the legal pair'
+            worker._inflight_append(self._local_entry(worker, item_c))
+
+        events = self._tripwire_events(rec)
+        assert len(events) == 1, f'the second LOCAL verify must breach; got {events!r}'
+        data = events[0][1]['data']
+        assert data['branch'] == '9017'
+        assert (data['local_inflight'], data['per_host_bound']) == (2, 1)
+        assert (data['merge_ahead_bound'], data['num_hosts']) == (2, 2)
         assert [r for r in caplog.records if _TRIPWIRE_FAILOPEN_MARK in r.getMessage()] == []
