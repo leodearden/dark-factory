@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _external_submit_producers import EXTERNAL_SUBMIT_PRODUCERS, ExternalSubmitProducer
 
 from escalation import submit
 from escalation.queue import EscalationQueue
@@ -208,3 +209,31 @@ class TestSubmitCli:
         assert len(pending) == 1
         assert pending[0].level == 2
         assert pending[0].severity == 'critical'
+
+
+class TestExternalSubmitProducers:
+    @pytest.mark.parametrize('producer', EXTERNAL_SUBMIT_PRODUCERS, ids=lambda p: p.producer)
+    def test_the_producers_whole_call_files_one_pending_l2(
+        self, tmp_path: Path, producer: ExternalSubmitProducer,
+    ):
+        """Another repository's exact `escalation submit` call is accepted unchanged."""
+        rc = submit.main(producer.submit_argv(tmp_path))
+        assert rc == 0
+
+        (filed,) = EscalationQueue(tmp_path).get_pending()
+        assert (filed.status, filed.level) == ('pending', 2)
+        assert (
+            filed.task_id,
+            filed.severity,
+            filed.category,
+            filed.agent_role,
+            filed.summary,
+            filed.detail,
+        ) == (
+            producer.task,
+            producer.severity,
+            producer.category,
+            producer.agent_role,
+            producer.summary,
+            producer.detail,
+        )
