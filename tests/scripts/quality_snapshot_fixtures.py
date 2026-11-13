@@ -67,6 +67,8 @@ GRAPH_FILES: dict[str, str] = {
     'scripts/legibility/y.py': 'Y = 1\n',
 }
 
+RepoChange = Callable[[Path], object]
+
 _COMMITTER = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
 
 
@@ -124,7 +126,7 @@ def diff_chain(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     base_files: dict[str, str],
-    *changes: Any,
+    *changes: RepoChange,
 ) -> list[tuple[dict[str, Any], list[str]]]:
     """Measure the base commit, then each change in turn with --diff against the one before.
 
@@ -133,7 +135,7 @@ def diff_chain(
     """
     root = committed_repo(tmp_path, base_files)
     previous = tmp_path / 's1.json'
-    assert snapshot.main(['--run-id', 'run-1', '--out', str(previous), '--root', str(root)]) == 0
+    assert run_snapshot(root, previous) == 0
     results: list[tuple[dict[str, Any], list[str]]] = [(read_json(previous), [])]
     for number, change in enumerate(changes, start=2):
         change(root)
@@ -151,7 +153,7 @@ def diff_chain(
 
 
 def diff_of(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], base_files: dict[str, str], change: Any
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], base_files: dict[str, str], change: RepoChange
 ) -> list[str]:
     return diff_chain(tmp_path, capsys, base_files, change)[1][1]
 
@@ -165,7 +167,7 @@ def diff_section(diff: list[str], header: str) -> list[str]:
     return diff[start:end]
 
 
-def rewriting(relpath: str, text: str) -> Any:
+def rewriting(relpath: str, text: str) -> RepoChange:
     return lambda root: commit(root, f'rewrite {relpath}', write={relpath: text})
 
 
