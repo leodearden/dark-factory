@@ -7045,6 +7045,25 @@ class TestWorktreeReuseIdentityGuard:
         assert len(quarantined) == 1
         assert (quarantined[0] / 'spline.rs').exists()
 
+    async def test_mismatch_never_stamps_the_live_plan_with_the_earlier_tasks_parking(
+        self, git_ops: GitOps,
+    ):
+        info = await git_ops.create_worktree('recycled-plan')
+        _write_stored_title(info.path, 'Trajectory beta: spline solver')
+        live = TaskArtifacts.for_task(info.path, 'recycled-plan')
+        live.task_root.mkdir(parents=True)
+        live.write_plan({'task_id': 'recycled-plan', 'title': 'Cycle-breaker beta: dedup edges', 'steps': []})
+        plan_before = live.read_plan()
+        assert plan_before is not None
+
+        await git_ops.create_worktree(
+            'recycled-plan', expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        (parking,) = git_ops.quarantine_base.glob('recycled-plan-*')
+        assert json.loads((parking / '.task' / 'plan.json').read_text()) == plan_before
+        assert live.read_plan() == plan_before
+
     async def test_none_expected_title_skips_guard(self, git_ops: GitOps):
         info = await git_ops.create_worktree('reuse-noguard')
         _write_stored_title(info.path, 'Original task')
@@ -7643,6 +7662,69 @@ class TestOrphanWorktreeHelpers:
         assert await git_ops.resolve_branch_sha('task/q-rollback') == tip
         assert await _branches_matching(git_ops, 'task/q-rollback-*') == ''
         assert (info.path / '.git').read_bytes() == gitfile_before
+
+    async def test_a_failed_registered_move_restores_the_branch_checkout(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-held-rollback')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-held-rollback')
+        git_ops.quarantine_base.parent.mkdir(parents=True, exist_ok=True)
+        git_ops.quarantine_base.write_text('not a directory\n')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-held-rollback', 'unit-test')
+
+        assert outcome == NOT_RELOCATED
+        assert info.path.is_dir()
+        assert await _checked_out_ref(info.path) == 'refs/heads/task/q-held-rollback'
+        assert await git_ops.resolve_branch_sha('task/q-held-rollback') == tip
+        assert await _branches_matching(git_ops, 'task/q-held-rollback-*') == ''
+
+    async def test_a_failed_move_whose_branch_cannot_be_renamed_back_names_the_stranded_ref(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ):
+        info = await git_ops.create_worktree('q-stranded')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        tip = await git_ops.resolve_branch_sha('task/q-stranded')
+        await _drop_admin_entry(git_ops, info.path)
+        project_root = git_ops.project_root
+
+        def rename_after_a_rival_takes_the_branch_name(source: object, destination: object) -> None:
+            subprocess.run(['git', 'branch', 'task/q-stranded', 'HEAD'], cwd=project_root, check=True)
+            raise OSError(18, 'Invalid cross-device link')
+
+        monkeypatch.setattr(os, 'rename', rename_after_a_rival_takes_the_branch_name)
+        with caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'):
+            outcome = await git_ops.quarantine_worktree(info.path, 'q-stranded', 'unit-test')
+
+        assert outcome.dest is None
+        assert info.path.is_dir()
+        assert outcome.branch is not None
+        assert outcome.branch.startswith('task/q-stranded-')
+        assert outcome.tip_sha == tip
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha(outcome.branch) == tip
+        assert f'STRANDED on {outcome.branch}' in caplog.text
+        assert outcome.event_data('unit-test')['branch'] == outcome.branch
+
+    async def test_a_parked_branch_that_cannot_be_measured_is_still_reported_moved(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        info = await git_ops.create_worktree('q-unmeasured')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        async def unmeasurable(full_branch: str) -> int | None:
+            raise RuntimeError(f'cannot count {full_branch}')
+
+        monkeypatch.setattr(git_ops, 'commits_beyond_main', unmeasurable)
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-unmeasured', 'unit-test')
+
+        assert outcome.dest is not None
+        assert not info.path.exists()
+        assert outcome.branch == f'task/{outcome.dest.name}'
+        assert outcome.tip_sha is None
+        assert outcome.unique_commit_count is None
 
     async def test_quarantine_relocates_a_registered_worktree_without_the_branch(
         self, git_ops: GitOps,

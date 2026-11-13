@@ -82,7 +82,6 @@ class TestEventPayload:
         parking = tmp_path / 'q'
         outcome = QuarantineOutcome(dest=parking, branch='task/42-X', tip_sha='abc', unique_commit_count=3)
 
-        assert outcome.relocated
         assert outcome.event_data('orphan-reaper') == {
             'reason': 'orphan-reaper',
             'dest': str(parking),
@@ -92,7 +91,6 @@ class TestEventPayload:
         }
 
     def test_not_relocated_carries_the_reason_and_nulls(self):
-        assert not NOT_RELOCATED.relocated
         assert NOT_RELOCATED.event_data('recovery-identity-mismatch') == {
             'reason': 'recovery-identity-mismatch',
             'dest': None,
@@ -248,6 +246,22 @@ class TestRecordQuarantineProvenance:
         assert entry['reason'] == 'recovery-record-divergence'
         assert entry['parking'] == str(parking)
         assert datetime.fromisoformat(entry['quarantined_at']).tzinfo is not None
+
+    def test_a_recycled_id_parking_is_snapshotted_but_never_stamped(
+        self, artifacts: TaskArtifacts, lane, tmp_path,
+    ):
+        parking = tmp_path / 'quarantine' / '42-20261112T000000Z'
+        parking.parent.mkdir()
+        os.rename(lane, parking)
+        live_before = artifacts.artifact_path('plan.json').read_bytes()
+        outcome = QuarantineOutcome(dest=parking, branch='task/42-X', tip_sha='abc', unique_commit_count=3)
+
+        record_quarantine_provenance(lane, '42', outcome, 'recovery-identity-mismatch', recycled_id=True)
+
+        parked_plan = parking / '.task' / 'plan.json'
+        assert not parked_plan.is_symlink()
+        assert parked_plan.read_bytes() == live_before
+        assert artifacts.artifact_path('plan.json').read_bytes() == live_before
 
     def test_not_relocated_writes_nothing(self, artifacts: TaskArtifacts, lane):
         before = artifacts.artifact_path('plan.json').read_bytes()

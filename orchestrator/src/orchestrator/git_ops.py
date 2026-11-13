@@ -2102,6 +2102,22 @@ class BranchResetError(RuntimeError):
         )
 
 
+class _ParkedBranchStranded(RuntimeError):
+    """A quarantine move failed after its branch was renamed aside, and git refused the rename back."""
+
+    def __init__(self, parked_branch: str, move_error: Exception):
+        self.parked_branch = parked_branch
+        super().__init__(
+            f'{move_error}; the branch could not be renamed back, so the work '
+            f'is stranded on {parked_branch}'
+        )
+
+
+def _stranded_branch(error: Exception) -> str | None:
+    """The parked ref a failed quarantine move left its work on, or None when it left none."""
+    return error.parked_branch if isinstance(error, _ParkedBranchStranded) else None
+
+
 class MergeVerifyLeaseHeld(RuntimeError):
     """Raised by :meth:`GitOps.reset_persistent_merge_worktree` when a
     DIFFERENT live process holds the merge-verify lease (task 2315, BUG 1).
@@ -4929,6 +4945,7 @@ class GitOps:
                     )
                     outcome = await self.quarantine_worktree(
                         worktree_path, branch_name, 'reuse-identity-mismatch',
+                        recycled_id=True,
                     )
                     # Relocate (not delete) the foreign sibling .task-meta
                     # root alongside the quarantined worktree — mirrors the
@@ -5289,6 +5306,7 @@ class GitOps:
                 )
                 outcome = await self.quarantine_worktree(
                     worktree_path, branch_name, 'cold-reattach-identity-mismatch',
+                    recycled_id=True,
                 )
                 if outcome.dest is None:
                     # quarantine_worktree never raises — a None dest means
@@ -16417,7 +16435,7 @@ class GitOps:
             return True
 
     async def quarantine_worktree(
-        self, worktree: Path, branch: str, reason: str,
+        self, worktree: Path, branch: str, reason: str, *, recycled_id: bool = False,
     ) -> QuarantineOutcome:
         """Relocate a worktree (and its branch) into the quarantine base.
 
@@ -16436,13 +16454,16 @@ class GitOps:
         A relocation is recorded before this returns
         (``orchestrator/src/orchestrator/quarantine_provenance.py::record_quarantine_provenance``):
         the task's artifacts are copied into the parking, and the live task
-        plan gains a ``_quarantined_from`` entry. It reads the PRE-move
-        *worktree* path, so it runs ahead of any caller relocating a
-        ``.task-meta`` root.
+        plan gains a ``_quarantined_from`` entry unless *recycled_id* says the
+        worktree holds an earlier task's work under an id another task now
+        holds. It reads the PRE-move *worktree* path, so it runs ahead of any
+        caller relocating a ``.task-meta`` root.
 
         Logs a WARNING and returns the parking as a :class:`QuarantineOutcome`,
-        or ``NOT_RELOCATED`` if the relocation could not complete. **Never
-        raises** — callers treat a ``None`` ``dest`` as "left in place".
+        or ``NOT_RELOCATED`` if the relocation could not complete; a failed
+        move whose branch could not be renamed back returns a None ``dest``
+        naming the stranded ``branch``. **Never raises** — callers treat a
+        ``None`` ``dest`` as "left in place".
         """
         bare = bare_queued_branch_id(branch, self.config.branch_prefix)
         parked = f'{bare}-{_utc_stamp()}'
@@ -16456,26 +16477,25 @@ class GitOps:
                 'quarantine_worktree: failed to relocate %s (reason=%s): %s',
                 worktree, reason, e,
             )
-            return NOT_RELOCATED
+            return await self._parked_outcome(None, _stranded_branch(e))
         outcome = await self._parked_outcome(dest_path, parked_branch)
         logger.warning(
             'QUARANTINED worktree %s -> %s (reason=%s, parked branch=%s, '
             'commits beyond main=%s)',
             worktree, dest_path, reason, outcome.branch, outcome.unique_commit_count,
         )
-        record_quarantine_provenance(worktree, bare, outcome, reason)
+        record_quarantine_provenance(worktree, bare, outcome, reason, recycled_id=recycled_id)
         return outcome
 
     async def _relocate_into_quarantine(
         self, worktree: Path, dest: Path, bare: str, parked: str, *, reason: str,
     ) -> str | None:
-        """Move *worktree* to *dest*, and branch ``<prefix><bare>`` to ``<prefix><parked>`` when *worktree* holds it.
+        """Move *worktree* to *dest*, renaming branch ``<prefix><bare>`` to ``<prefix><parked>`` unless ANOTHER registered worktree holds it.
 
-        Otherwise the branch is parked unless ANOTHER registered worktree
-        holds it; the rule is the same whether *worktree* is registered,
-        detached, on another branch, or unregistered.
-
-        Returns the parked full ref, or None when there was no branch to park.
+        The rule is the same whether *worktree* holds the branch, is detached,
+        is on another branch, or is unregistered; WIP is committed only when
+        it holds the branch. Returns the parked full ref, or None when there
+        was no branch to park.
         """
         checkouts = await self._worktree_checkouts()
         held = f'refs/heads/{self.config.branch_prefix}{bare}'
@@ -16483,25 +16503,19 @@ class GitOps:
         held_elsewhere = any(
             ref == held for path, ref in checkouts.items() if path != here
         )
-        if here not in checkouts:
-            return await self._move_with_branch_parked(
-                bare, parked, rename_branch=not held_elsewhere,
-                move=lambda: self._rename_unregistered(worktree, dest, parked),
-            )
-        if checkouts[here] != held:
-            return await self._move_with_branch_parked(
-                bare, parked, rename_branch=not held_elsewhere,
-                move=lambda: self._move_registered_worktree(worktree, dest),
-            )
-        try:
-            await self.commit(worktree, f'chore: quarantine WIP ({reason})')
-        except Exception as e:
-            logger.warning(
-                'quarantine_worktree: WIP commit failed for %s (%s) — '
-                'continuing with relocation: %s', worktree, reason, e,
-            )
-        await self.rename_worktree(worktree, dest, bare, parked)
-        return f'{self.config.branch_prefix}{parked}'
+        if checkouts.get(here) == held:
+            try:
+                await self.commit(worktree, f'chore: quarantine WIP ({reason})')
+            except Exception as e:
+                logger.warning(
+                    'quarantine_worktree: WIP commit failed for %s (%s) — '
+                    'continuing with relocation: %s', worktree, reason, e,
+                )
+        return await self._move_with_branch_parked(
+            bare, parked, rename_branch=not held_elsewhere,
+            move=(lambda: self._move_registered_worktree(worktree, dest)) if here in checkouts
+            else (lambda: self._rename_unregistered(worktree, dest, parked)),
+        )
 
     async def _worktree_checkouts(self) -> dict[Path, str | None]:
         """Every registered worktree's resolved path, mapped to its checked-out ref (None when detached); raises when git cannot list them."""
@@ -16537,32 +16551,37 @@ class GitOps:
     ) -> str | None:
         """Run *move*, renaming branch ``<prefix><bare>`` to ``<prefix><parked>`` first when *rename_branch* and it exists.
 
-        A failed *move* renames the branch back, so the two stay together; a
-        failed rename-back is logged naming the stranded parked ref. Returns
-        the parked full ref, or None when no branch was renamed.
+        A failed *move* renames the branch back, so the two stay together. A
+        failed rename-back is logged naming the stranded parked ref, and
+        raises :class:`_ParkedBranchStranded` carrying it. Returns the parked
+        full ref, or None when no branch was renamed.
         """
         prefix = self.config.branch_prefix
         full_old, full_new = f'{prefix}{bare}', f'{prefix}{parked}'
-        has_branch = rename_branch and await self.resolve_branch_sha(full_old) is not None
-        if has_branch:
-            rc, _, err = await _run(['git', 'branch', '-m', full_old, full_new], cwd=self.project_root)
-            if rc != 0:
-                raise RuntimeError(f'git branch -m {full_old} -> {full_new} failed (rc={rc}): {err}')
+        if not rename_branch or await self.resolve_branch_sha(full_old) is None:
+            await move()
+            return None
+        rc, _, err = await _run(['git', 'branch', '-m', full_old, full_new], cwd=self.project_root)
+        if rc != 0:
+            raise RuntimeError(f'git branch -m {full_old} -> {full_new} failed (rc={rc}): {err}')
         try:
             await move()
-        except BaseException:
-            if has_branch:
-                rc, _, err = await _run(
-                    ['git', 'branch', '-m', full_new, full_old], cwd=self.project_root,
-                )
-                if rc != 0:
-                    logger.error(
-                        'quarantine_worktree: move failed and the branch rename-back '
-                        '%s -> %s failed too (rc=%s): %s — the work is STRANDED on %s',
-                        full_new, full_old, rc, err, full_new,
-                    )
+        except BaseException as move_error:
+            if not await self._rename_branch_back(full_new, full_old) and isinstance(move_error, Exception):
+                raise _ParkedBranchStranded(full_new, move_error) from move_error
             raise
-        return full_new if has_branch else None
+        return full_new
+
+    async def _rename_branch_back(self, parked: str, original: str) -> bool:
+        """Rename *parked* back to *original*; False, logging the work as STRANDED on *parked*, when git refuses."""
+        rc, _, err = await _run(['git', 'branch', '-m', parked, original], cwd=self.project_root)
+        if rc != 0:
+            logger.error(
+                'quarantine_worktree: move failed and the branch rename-back '
+                '%s -> %s failed too (rc=%s): %s — the work is STRANDED on %s',
+                parked, original, rc, err, parked,
+            )
+        return rc == 0
 
     async def _rename_unregistered(self, worktree: Path, dest: Path, parked: str) -> None:
         """Rename a dir ``git worktree move`` refuses (its admin entry is gone) to *dest*.
@@ -16611,8 +16630,8 @@ class GitOps:
         gitfile.write_text(f'gitdir: {Path(common_dir.strip()) / "worktrees" / parked}\n')
         return original
 
-    async def _parked_outcome(self, dest: Path, parked_branch: str | None) -> QuarantineOutcome:
-        """Describe a completed relocation; never raises, so a moved lane is never reported as unmoved."""
+    async def _parked_outcome(self, dest: Path | None, parked_branch: str | None) -> QuarantineOutcome:
+        """Describe where a quarantine left the work; never raises, so a moved lane is never reported as unmoved."""
         if parked_branch is None:
             return QuarantineOutcome(dest=dest)
         try:
@@ -16672,7 +16691,7 @@ class GitOps:
         """Quarantine the registered cold worktree for *branch_name*; its ``dest`` is None only when none is registered."""
         cold = self.worktree_base / branch_name
         if not await self._is_registered_worktree(cold):
-            return QuarantineOutcome(dest=None)
+            return NOT_RELOCATED
         outcome = await self.quarantine_worktree(cold, branch_name, reason)
         if outcome.dest is None:
             raise RuntimeError(f'park_prior_incarnation: could not quarantine {cold}')

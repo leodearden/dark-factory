@@ -11,7 +11,8 @@ parks a lane under ``quarantine_base`` and describes the parking as a
 - a ``_quarantined_from`` back-pointer appended to the live task-root
   plan.json (:func:`stamp_quarantined_from`), which the next dispatch and a
   replanning architect read, and which ``create_plan`` carries forward
-  through :func:`quarantined_from_of`.
+  through :func:`quarantined_from_of`. A parking of an earlier task's work
+  under a recycled id gets no back-pointer: the live plan is not that task's.
 
 Built only on ``orchestrator.artifacts``; git_ops, harness, lane_lifecycle and
 plan_tools import this module, never the other way round.
@@ -54,7 +55,9 @@ class QuarantineOutcome:
     ``<prefix><bare>`` as renamed aside (full ref); None when no branch was
     renamed, because it did not exist or another registered worktree held
     it. It need not be the parking's checkout: a detached or foreign-branch
-    lane moves with its own HEAD. The rule's one home is
+    lane moves with its own HEAD. With a None ``dest``, ``branch`` is set
+    only when the move failed and the branch could not be renamed back: it
+    names the ref the work is stranded on. The rule's one home is
     ``orchestrator/src/orchestrator/git_ops.py::GitOps.quarantine_worktree``.
     ``tip_sha`` and ``unique_commit_count`` describe ``branch``; the count is
     its commits not on main.
@@ -64,10 +67,6 @@ class QuarantineOutcome:
     branch: str | None = None
     tip_sha: str | None = None
     unique_commit_count: int | None = None
-
-    @property
-    def relocated(self) -> bool:
-        return self.dest is not None
 
     def event_data(self, reason: str) -> dict[str, Any]:
         """The ``worktree_quarantined`` event payload for a quarantine done for *reason*."""
@@ -132,12 +131,16 @@ def stamp_quarantined_from(artifacts: TaskArtifacts, stamp: Mapping[str, Any]) -
     return True
 
 
-def record_quarantine_provenance(worktree: Path, task_id: str, outcome: QuarantineOutcome, reason: str) -> None:
+def record_quarantine_provenance(
+    worktree: Path, task_id: str, outcome: QuarantineOutcome, reason: str, *, recycled_id: bool = False,
+) -> None:
     """Snapshot the task's artifacts into the parking, then stamp the live plan. Never raises.
 
     *worktree* is the lane's path BEFORE the move, which is what its lane
     ``.task-meta`` root is named after. The two records are independent: a
-    failed snapshot is logged and the stamp is still attempted.
+    failed snapshot is logged and the stamp is still attempted. A
+    *recycled_id* parking holds an earlier task's work under an id another
+    task now holds, so it is snapshotted but never stamped onto that task's plan.
     """
     if outcome.dest is None:
         return
@@ -151,6 +154,8 @@ def record_quarantine_provenance(worktree: Path, task_id: str, outcome: Quaranti
         snapshot_into_parking(artifacts, parking)
     except Exception:
         logger.warning(_UNRECORDED, 'the artifact snapshot', worktree, task_id, parking, exc_info=True)
+    if recycled_id:
+        return
     try:
         stamp_quarantined_from(artifacts, _stamp_for(outcome, parking, reason))
     except Exception:

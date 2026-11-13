@@ -1496,7 +1496,7 @@ class TestRecoverIdentityGuard:
         await harness._recover_crashed_tasks()
 
         assert '3770' not in harness._recovered_plans
-        quarantine.assert_called_once_with(wt, '3770', 'recovery-identity-mismatch')
+        quarantine.assert_called_once_with(wt, '3770', 'recovery-identity-mismatch', recycled_id=True)
         assert _quarantine_emits(events) == [
             {'task_id': '3770', 'data': outcome.event_data('recovery-identity-mismatch')},
         ]
@@ -1884,7 +1884,7 @@ class TestRecoverCrashedTasksWarmLane:
         # then the durable transition), never cleaned up (that's the
         # terminal-task release branch, a different cell).
         harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane_path, '42', 'recovery-record-divergence',
+            lane_path, '42', 'recovery-record-divergence', recycled_id=False,
         )
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
         record = harness.git_ops._lane_lifecycle.read(lane_path)
@@ -2362,7 +2362,7 @@ class TestRecordDrivenRecovery:
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await harness._recover_crashed_tasks()
 
-        quarantine.assert_called_once_with(lane, '42', 'recovery-record-divergence')
+        quarantine.assert_called_once_with(lane, '42', 'recovery-record-divergence', recycled_id=False)
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
         record = lifecycle.read(lane)
@@ -2420,7 +2420,7 @@ class TestRecordDrivenRecovery:
 
         await harness._recover_crashed_tasks()
 
-        quarantine.assert_awaited_once_with(lane, '42', 'recovery-identity-mismatch')
+        quarantine.assert_awaited_once_with(lane, '42', 'recovery-identity-mismatch', recycled_id=True)
         assert _quarantine_emits(events) == [
             {'task_id': '42', 'data': outcome.event_data('recovery-identity-mismatch')},
         ]
@@ -2526,7 +2526,7 @@ class TestRecordDrivenRecovery:
         await harness._recover_crashed_tasks()
 
         harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane, '42', 'recovery-record-divergence',
+            lane, '42', 'recovery-record-divergence', recycled_id=False,
         )
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 

@@ -1370,7 +1370,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         )
         # Quarantined (relocates the worktree), not cleaned up (a different cell)
         mock_quarantine.assert_called_once_with(
-            lane_entry, '3459', 'recovery-record-divergence',
+            lane_entry, '3459', 'recovery-record-divergence', recycled_id=False,
         )
         mock_cleanup.assert_not_called()
         # Lane must remain FREE (never pinned) and its durable record QUARANTINED
@@ -1383,7 +1383,8 @@ class TestRecoveryTerminalTaskLaneRelease:
 @pytest.mark.asyncio
 class TestRecordDrivenQuarantineProvenance:
     """Task 4845: each record-driven quarantine in recovery parks a resolvable
-    branch and leaves its payload and a back-pointer in the live task plan.
+    branch and emits its payload; it leaves a back-pointer in the live task
+    plan only when the parked work is that task's own.
 
     Real git, real GitOps: the writer (acquire_warm_lane) feeds the reader
     (_recover_crashed_tasks) across a simulated restart, as
@@ -1420,9 +1421,7 @@ class TestRecordDrivenQuarantineProvenance:
 
         return harness, artifacts, events
 
-    async def _assert_provenance(
-        self, harness: Harness, artifacts: TaskArtifacts, events: MagicMock, reason: str,
-    ) -> None:
+    async def _assert_parked(self, harness: Harness, events: MagicMock, reason: str) -> dict:
         (emit,) = [
             call.kwargs for call in events.emit.call_args_list
             if call.args[0] == EventType.worktree_quarantined
@@ -1432,25 +1431,27 @@ class TestRecordDrivenQuarantineProvenance:
         assert data['branch'] is not None
         assert data['tip_sha'] is not None
         assert data['unique_commit_count'] == 1
-        assert artifacts.read_plan()['_quarantined_from'][-1]['branch'] == data['branch']
         assert await harness.git_ops.resolve_branch_sha(data['branch']) == data['tip_sha']
         parked_plan = Path(data['dest']) / '.task' / 'plan.json'
         assert parked_plan.is_file()
         assert not parked_plan.is_symlink()
+        return data
 
-    async def test_identity_mismatch_site_records_provenance(self, tmp_path: Path):
+    async def test_identity_mismatch_site_parks_without_stamping_the_live_plan(self, tmp_path: Path):
         harness, artifacts, events = await self._recover_a_divergent_lane(
             tmp_path, live_title='A different live task', drop_admin_entry=False,
         )
 
-        await self._assert_provenance(harness, artifacts, events, 'recovery-identity-mismatch')
+        await self._assert_parked(harness, events, 'recovery-identity-mismatch')
+        assert '_quarantined_from' not in artifacts.read_plan()
 
     async def test_record_divergence_site_records_provenance(self, tmp_path: Path):
         harness, artifacts, events = await self._recover_a_divergent_lane(
             tmp_path, live_title=None, drop_admin_entry=True,
         )
 
-        await self._assert_provenance(harness, artifacts, events, 'recovery-record-divergence')
+        data = await self._assert_parked(harness, events, 'recovery-record-divergence')
+        assert artifacts.read_plan()['_quarantined_from'][-1]['branch'] == data['branch']
 
 
 # ===========================================================================
