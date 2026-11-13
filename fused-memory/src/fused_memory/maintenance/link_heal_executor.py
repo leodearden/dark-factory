@@ -446,9 +446,7 @@ class FoldedEscapeFiler:
             return
         try:
             from escalation.queue import EscalationQueue
-        except ImportError:  # pragma: no cover — without the package nothing was filed
-            return
-        try:
+
             queue = EscalationQueue(escalation_queue_dir(self._project_root))
             earlier = queue.get_by_task(anchor, status='pending', agent_role=self.AGENT_ROLE)
             for record in earlier:
