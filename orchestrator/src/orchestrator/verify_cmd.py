@@ -2061,12 +2061,12 @@ def worker_count_values(tokens: Sequence[str]) -> list[str]:
 
     THE one decoder of the worker-count spellings: ``-n V``, ``-nV``,
     ``-n=V``, ``--numprocesses V`` and ``--numprocesses=V`` (``_XDIST_N_FLAGS``).
-    argparse applies the LAST, which ``_pins_zero_workers`` reads; the verify
-    load stamp reports the FIRST (``verify.py::_xdist_workers``). The walk
-    pairs every ``_PYTEST_VALUE_FLAGS`` member with its value, as
-    ``_strip_xdist_options`` does, so the ``-n0`` in ``-k -n0`` is never read
-    as a count. An empty attached value (``--numprocesses=``) is a pytest
-    usage error, not a count.
+    argparse applies the LAST; ``applied_worker_count`` is the one reader of
+    that rule, and both ``_pins_zero_workers`` and the verify load stamp
+    (``verify.py::_xdist_workers``) go through it. The walk pairs every
+    ``_PYTEST_VALUE_FLAGS`` member with its value, as ``_strip_xdist_options``
+    does, so the ``-n0`` in ``-k -n0`` is never read as a count. An empty
+    attached value (``--numprocesses=``) is a pytest usage error, not a count.
     """
     values: list[str] = []
     i = 0
@@ -2084,6 +2084,12 @@ def worker_count_values(tokens: Sequence[str]) -> list[str]:
     return values
 
 
+def applied_worker_count(tokens: Sequence[str]) -> str | None:
+    """The worker count argparse applies: the LAST one argv *tokens* names, or None when they name none."""
+    values = worker_count_values(tokens)
+    return values[-1] if values else None
+
+
 def _attached_worker_count(token: str) -> str:
     """The count a one-token spelling (``-nV``, ``-n=V``, ``--numprocesses=V``) attaches, else ``''``."""
     head, sep, value = token.partition('=')
@@ -2096,7 +2102,7 @@ def _attached_worker_count(token: str) -> str:
 
 def _pins_zero_workers(tokens: Sequence[str]) -> bool:
     """True when the LAST xdist worker count in argv *tokens* is ``0``."""
-    return worker_count_values(tokens)[-1:] == ['0']
+    return applied_worker_count(tokens) == '0'
 
 
 def _raw_pytest_pins_zero_workers(raw: str) -> bool:
