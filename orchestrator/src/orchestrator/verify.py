@@ -3687,7 +3687,10 @@ def archive_verify_logs(
     module_prefix: 'str | None' = None,
     role: Literal['merge', 'task'] = 'merge',
 ) -> list[Path]:
-    """Write merge-verify run outputs + summary DIRECTLY to the durable archive.
+    """Write a verify's run outputs + summary DIRECTLY to the durable archive.
+
+    ``role`` (default 'merge') is stamped into the summary;
+    ``verify_runner.RemoteRunner`` passes 'task' for remote task verifies.
 
     Unlike ``_archive_attempt_log`` (which copies files from the worktree's
     ``.task/verify/``), this function writes directly to

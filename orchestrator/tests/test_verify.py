@@ -9854,7 +9854,7 @@ class TestBuildSummaryPayload:
         assert payload['commands'] == []
 
 
-class TestArchiveMergeVerifyLogs:
+class TestArchiveVerifyLogs:
     """Tests for the new archive_verify_logs helper (task 1768).
 
     These tests import the symbol directly and will fail with ImportError /
