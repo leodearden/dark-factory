@@ -4,9 +4,9 @@ orchestrator scheduler and the task curator."""
 from __future__ import annotations
 
 import pytest
-from lock_charter_vectors import _CANONICAL_EXTENSIONLESS, _CANONICAL_EXTENSIONS
 
 from shared.locking import (
+    EXTENSIONLESS_FILENAMES,
     FILE_EXTENSIONS,
     directory_locks,
     files_to_modules,
@@ -18,6 +18,31 @@ from shared.locking import (
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+# ---------------------------------------------------------------------------
+# Drift guard — pins shared.locking.FILE_EXTENSIONS to the canonical vector.
+#
+# Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the allowlist
+# changes.  Also update the verbatim copy in
+# fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND its
+# corresponding _CANONICAL_EXTENSIONS in
+# fused-memory/tests/test_lock_charter_guard.py.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_EXTENSIONS = [
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'csv', 'cts', 'cxx',
+    'diff', 'envrc', 'example', 'example-systemd-config',
+    'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
+    'h', 'hh', 'hpp', 'html',
+    'icns', 'ico',
+    'jq', 'js', 'json', 'jsonc', 'jsonl', 'jsx',
+    'lock', 'log',
+    'manifest', 'md', 'mjs', 'mts',
+    'npmrc', 'png', 'py', 'python-version',
+    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
+    'yaml', 'yml',
+]
 
 # ---------------------------------------------------------------------------
 # Classification corpora — deliberate verbatim duplicates of the corpora in
@@ -32,8 +57,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 # virtual environments and no shared test-support package; a cross-package test
 # import would couple them exactly where the design deliberately does not, and
 # would defeat the point of independent pinning.  Duplication + the two drift
-# guards in tests/repo_guards/test_lock_charter_reify_parity.py is the cheaper
-# and more faithful trade.
+# guards below is the cheaper and more faithful trade.
 #
 # One real tracked path per canonical extension — dark-factory unless the
 # comment says reify.  Enforced by
@@ -146,6 +170,40 @@ _DOTTED_DIRECTORY_PATHS = [
     '.claude',
     '.cargo',
     '.taskmaster',
+]
+
+# ---------------------------------------------------------------------------
+# Extension-less tracked FILES (dark_factory #3248).
+#
+# The second half of the classifier: real tracked files whose final segment
+# carries NO extension at all, so the FILE_EXTENSIONS lookup can never reach
+# them.  Before #3248 every one of these classified as a DIRECTORY, which made
+# `hooks/project-checks` undeclarable in metadata.files (γ rejected it with a
+# LockCharterViolation) and — worse, because it was silent — made a task
+# declaring ONLY such paths strip to an empty charter and fall through to the
+# per-task `task-<id>` synthetic lock, holding no lock on the file it edits.
+#
+# Update _CANONICAL_EXTENSIONLESS AND EXTENSIONLESS_FILENAMES together when the
+# vector changes.  Also update the verbatim copies in
+# fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND
+# fused-memory/tests/test_lock_charter_guard.py.
+#
+# EVIDENCE — `git ls-files -s` over BOTH repos, re-measured 2026-08-09 (and
+# identical to the 2026-07-31 measurement): every tracked path whose final
+# segment contains no '.'.  dark-factory contributes Dockerfile LICENSE
+# pre-commit pre-merge-commit project-checks; reify adds cargo
+# cargo-audit-orphans reference-transaction.  Union = the 8 below.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_EXTENSIONLESS = [
+    'Dockerfile',
+    'LICENSE',
+    'cargo',
+    'cargo-audit-orphans',
+    'pre-commit',
+    'pre-merge-commit',
+    'project-checks',
+    'reference-transaction',
 ]
 
 # One REAL tracked path per canonical extension-less name — dark-factory unless
@@ -393,6 +451,38 @@ class TestIsFilePath:
         )
 
 
+class TestExtensionlessFilenamesDriftGuard:
+    """Pins shared.locking.EXTENSIONLESS_FILENAMES to the canonical vector."""
+
+    def test_matches_canonical_vector(self):
+        assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
+
+    def test_is_frozenset(self):
+        assert isinstance(EXTENSIONLESS_FILENAMES, frozenset)
+
+    def test_members_are_bare_final_segments(self):
+        """Every member must be a non-empty, dot-free, slash-free name.
+
+        Structural invariant, not style policing.  A member is compared against
+        a path's FINAL SEGMENT, so:
+          - a name containing '.' is in the wrong allowlist — its post-dot token
+            belongs in FILE_EXTENSIONS, and putting it here would shadow that
+            lookup with an exact-name match that almost never fires;
+          - a name containing '/' could never equal a final segment, so it would
+            be permanently dead weight that reads as coverage.
+        """
+        for name in sorted(EXTENSIONLESS_FILENAMES):
+            assert isinstance(name, str) and name, f'{name!r} must be a non-empty str'
+            assert '.' not in name, (
+                f'{name!r} contains a dot — a dotted name is an EXTENSION and '
+                f'belongs in FILE_EXTENSIONS, not EXTENSIONLESS_FILENAMES'
+            )
+            assert '/' not in name, (
+                f'{name!r} contains a slash — members are matched against a '
+                f"path's final segment, which can never contain '/'"
+            )
+
+
 class TestExtensionlessFilenames:
     """Extension-less tracked FILES classify as files (dark_factory #3248).
 
@@ -486,3 +576,29 @@ class TestStripDirectoryLocks:
     def test_skips_empty_and_whitespace(self):
         files = ['', '   ', 'src/foo.py']
         assert strip_directory_locks(files) == ['src/foo.py']
+
+
+class TestFileExtensionsDriftGuard:
+    """Pin shared.locking.FILE_EXTENSIONS to the canonical extension vector.
+
+    This is the α-copy drift guard for the shared.locking canonical source.
+    The corresponding γ-copy guard lives in
+    fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
+    and uses the same ``_CANONICAL_EXTENSIONS`` vector.  Both must be updated
+    together whenever the allowlist changes.
+    """
+
+    def test_extension_drift_guard(self):
+        """sorted(FILE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
+
+        Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the
+        allowlist changes.  Also update the verbatim copy in
+        lock_charter_guard.py and its _CANONICAL_EXTENSIONS list.
+        """
+        assert sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
+            f'shared.locking.FILE_EXTENSIONS has drifted from the canonical vector.\n'
+            f'  canonical : {_CANONICAL_EXTENSIONS!r}\n'
+            f'  actual    : {sorted(FILE_EXTENSIONS)!r}\n'
+            f'Update FILE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
+            f'lock_charter_guard.py.'
+        )

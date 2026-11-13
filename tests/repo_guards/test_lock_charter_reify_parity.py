@@ -1,12 +1,12 @@
 """The lock-charter predicate's cross-source tier: shared.locking against reify and the tracked indexes.
 
-Split out of ``shared/tests/test_locking.py`` (task 5654), whose pure
-``shared.locking`` unit tests stay there. Every guard here reads outside
-shared: reify's ``scripts/lock-charter-guard.sh`` emitters, and ``git
-ls-files`` over this checkout and the reify sibling. shared's verify cache key
-covers neither, so they live in this never-cached module. The canonical vectors
-both suites pin come from
-``shared/tests/cross_suite_helpers/lock_charter_vectors.py``.
+Split out of ``shared/tests/test_locking.py`` (task 5654), which keeps the
+pure ``shared.locking`` unit tests, the Tier-1 canonical-vector pins among them.
+The drift guards and sweeps here read outside shared: reify's
+``scripts/lock-charter-guard.sh`` emitters, and ``git ls-files`` over this
+checkout and the reify sibling. shared's verify cache key covers neither, so
+they live in this never-cached module. The other classes test the
+reify-resolution support those guards run on, which lives here with them.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from pathlib import Path
 import pytest
 import shared.reify_checkout as reify_checkout
 import shared.testing_reify_layout as reify_layout
-from lock_charter_vectors import _CANONICAL_EXTENSIONLESS, _CANONICAL_EXTENSIONS
 from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_path
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -832,22 +831,23 @@ class TestReifyGuardVectorNoneGuard:
 
 
 class TestExtensionlessFilenamesDriftGuard:
-    """Pins shared.locking.EXTENSIONLESS_FILENAMES to the canonical vector."""
+    """Tier-2: shared.locking.EXTENSIONLESS_FILENAMES against reify's emitter.
 
-    def test_matches_canonical_vector(self):
-        assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
+    Tier-1 is
+    ``shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard``.
+    """
 
     @pytest.mark.skipif(_REIFY_SKIP_REASON is not None, reason=_REIFY_SKIP_REASON or '')
     def test_extensionless_drift_guard_vs_reify_script(self):
         """Tier-2 (cross-source): this α copy must match reify --list-extensionless.
 
         WHY THIS EXISTS ON THE α SIDE TOO, rather than being left to the γ
-        suite's identical test.  Tier-1 above compares this frozenset against
-        ``_CANONICAL_EXTENSIONLESS``, a literal in THIS file.  An edit that
-        changes both together — the natural way to "add a name" — therefore
-        passes every guard in the shared tree while silently diverging from the
-        γ copy and from bash.  The whole hole was that nothing in this package
-        could observe the other two copies.
+        suite's identical test.  Tier-1 compares this frozenset against
+        ``_CANONICAL_EXTENSIONLESS``, a literal in shared/tests/test_locking.py.
+        An edit that changes both together — the natural way to "add a name" —
+        therefore passes every guard in the shared tree while silently
+        diverging from the γ copy and from bash.  The whole hole was that
+        nothing in this package could observe the other two copies.
 
         With both suites pinned against the same bash emitter the α↔γ agreement
         follows transitively: α == bash here and γ == bash there implies α == γ,
@@ -869,31 +869,6 @@ class TestExtensionlessFilenamesDriftGuard:
             f"and reify's own scripts/lock-charter-guard.sh _EXTLESS, plus "
             f'_CANONICAL_EXTENSIONLESS in both test copies — all five places.'
         )
-
-    def test_is_frozenset(self):
-        assert isinstance(EXTENSIONLESS_FILENAMES, frozenset)
-
-    def test_members_are_bare_final_segments(self):
-        """Every member must be a non-empty, dot-free, slash-free name.
-
-        Structural invariant, not style policing.  A member is compared against
-        a path's FINAL SEGMENT, so:
-          - a name containing '.' is in the wrong allowlist — its post-dot token
-            belongs in FILE_EXTENSIONS, and putting it here would shadow that
-            lookup with an exact-name match that almost never fires;
-          - a name containing '/' could never equal a final segment, so it would
-            be permanently dead weight that reads as coverage.
-        """
-        for name in sorted(EXTENSIONLESS_FILENAMES):
-            assert isinstance(name, str) and name, f'{name!r} must be a non-empty str'
-            assert '.' not in name, (
-                f'{name!r} contains a dot — a dotted name is an EXTENSION and '
-                f'belongs in FILE_EXTENSIONS, not EXTENSIONLESS_FILENAMES'
-            )
-            assert '/' not in name, (
-                f'{name!r} contains a slash — members are matched against a '
-                f"path's final segment, which can never contain '/'"
-            )
 
 
 class TestExtensionlessFilenames:
@@ -1036,29 +1011,10 @@ class TestExtensionlessFilenames:
 
 
 class TestFileExtensionsDriftGuard:
-    """Pin shared.locking.FILE_EXTENSIONS to the canonical extension vector.
+    """Tier-2: shared.locking.FILE_EXTENSIONS against reify's emitter.
 
-    This is the α-copy drift guard for the shared.locking canonical source.
-    The corresponding γ-copy guard lives in
-    fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
-    and uses the same ``_CANONICAL_EXTENSIONS`` vector.  Both must be updated
-    together whenever the allowlist changes.
+    Tier-1 is ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``.
     """
-
-    def test_extension_drift_guard(self):
-        """sorted(FILE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
-
-        Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the
-        allowlist changes.  Also update the verbatim copy in
-        lock_charter_guard.py and its _CANONICAL_EXTENSIONS list.
-        """
-        assert sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
-            f'shared.locking.FILE_EXTENSIONS has drifted from the canonical vector.\n'
-            f'  canonical : {_CANONICAL_EXTENSIONS!r}\n'
-            f'  actual    : {sorted(FILE_EXTENSIONS)!r}\n'
-            f'Update FILE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
-            f'lock_charter_guard.py.'
-        )
 
     @pytest.mark.skipif(_REIFY_SKIP_REASON is not None, reason=_REIFY_SKIP_REASON or '')
     def test_extension_drift_guard_vs_reify_script(self):

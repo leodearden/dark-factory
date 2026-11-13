@@ -38,7 +38,7 @@ agree" forever, while nothing is being compared.
 WHERE THE γ VECTOR COMES FROM, and why it is not the obvious import.  The
 vectors are read from ``shared.locking``, NOT from
 ``fused_memory.middleware.lock_charter_guard``.  Both carry the same canonical
-allowlist and ``tests/repo_guards/test_lock_charter_reify_parity.py::TestFileExtensionsDriftGuard``
+allowlist and ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``
 pins that copy independently, so the two cannot disagree about what
 dark-factory declares — but only ``shared`` is importable from this script's
 gate lane (``uv run --project shared``; ``shared/pyproject.toml`` declares no
