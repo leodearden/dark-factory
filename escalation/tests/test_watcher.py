@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from escalation.models import Escalation
-from escalation.watcher import _emit, _initial_scan, _send_ntfy
+from escalation.watcher import _emit, _initial_scan, ntfy_request
 
 
 @pytest.fixture
@@ -72,40 +72,32 @@ def urgent_escalation() -> Escalation:
     )
 
 
-class TestSendNtfy:
-    """_send_ntfy sends POST with correct headers/body."""
+class TestNtfyRequest:
+    """ntfy_request builds the POST with the correct headers and body."""
 
     def test_blocking_escalation_sends_urgent(self, blocking_escalation: Escalation):
-        with patch('escalation.watcher.urllib.request.urlopen') as mock_urlopen:
-            _send_ntfy('https://ntfy.sh/test-topic', blocking_escalation)
+        req = ntfy_request('https://ntfy.sh/test-topic', blocking_escalation)
 
-            mock_urlopen.assert_called_once()
-            req = mock_urlopen.call_args[0][0]
-
-            assert req.full_url == 'https://ntfy.sh/test-topic'
-            assert req.get_method() == 'POST'
-            assert req.get_header('Title') == '[BLOCKING] Task 42: task_failure'
-            assert req.get_header('Priority') == 'urgent'
-            assert req.get_header('Tags') == 'rotating_light'
-            assert b'Verification attempts exhausted' in req.data
+        assert req.full_url == 'https://ntfy.sh/test-topic'
+        assert req.get_method() == 'POST'
+        assert req.get_header('Title') == '[BLOCKING] Task 42: task_failure'
+        assert req.get_header('Priority') == 'urgent'
+        assert req.get_header('Tags') == 'rotating_light'
+        assert isinstance(req.data, bytes)
+        assert b'Verification attempts exhausted' in req.data
 
     def test_info_escalation_sends_default_priority(self, info_escalation: Escalation):
-        with patch('escalation.watcher.urllib.request.urlopen') as mock_urlopen:
-            _send_ntfy('https://ntfy.sh/test-topic', info_escalation)
+        req = ntfy_request('https://ntfy.sh/test-topic', info_escalation)
 
-            req = mock_urlopen.call_args[0][0]
-
-            assert req.get_header('Title') == '[INFO] Task 42: design_concern'
-            assert req.get_header('Priority') == 'default'
-            assert req.get_header('Tags') == 'information_source'
+        assert req.get_header('Title') == '[INFO] Task 42: design_concern'
+        assert req.get_header('Priority') == 'default'
+        assert req.get_header('Tags') == 'information_source'
 
     def test_body_includes_detail(self, blocking_escalation: Escalation):
-        with patch('escalation.watcher.urllib.request.urlopen') as mock_urlopen:
-            _send_ntfy('https://ntfy.sh/test-topic', blocking_escalation)
+        req = ntfy_request('https://ntfy.sh/test-topic', blocking_escalation)
 
-            req = mock_urlopen.call_args[0][0]
-            body = req.data.decode('utf-8')
-            assert 'tests failed 3 times' in body
+        assert isinstance(req.data, bytes)
+        assert 'tests failed 3 times' in req.data.decode('utf-8')
 
     def test_body_omits_duplicate_detail(self):
         """When detail == summary, don't repeat it."""
@@ -118,32 +110,26 @@ class TestSendNtfy:
             summary='Planning failed',
             detail='Planning failed',
         )
-        with patch('escalation.watcher.urllib.request.urlopen') as mock_urlopen:
-            _send_ntfy('https://ntfy.sh/t', esc)
+        req = ntfy_request('https://ntfy.sh/t', esc)
 
-            body = mock_urlopen.call_args[0][0].data.decode('utf-8')
-            # Should appear once (the summary), not twice
-            assert body == 'Planning failed'
+        assert isinstance(req.data, bytes)
+        assert req.data.decode('utf-8') == 'Planning failed'
 
     def test_critical_escalation_sends_urgent(self, critical_escalation: Escalation):
         """critical severity -> [CRITICAL] title, Priority=urgent, Tags=rotating_light."""
-        with patch('escalation.watcher.urllib.request.urlopen') as mock_urlopen:
-            _send_ntfy('https://ntfy.sh/test-topic', critical_escalation)
+        req = ntfy_request('https://ntfy.sh/test-topic', critical_escalation)
 
-            req = mock_urlopen.call_args[0][0]
-            assert req.get_header('Title') == '[CRITICAL] Task 99: infra_issue'
-            assert req.get_header('Priority') == 'urgent'
-            assert req.get_header('Tags') == 'rotating_light'
+        assert req.get_header('Title') == '[CRITICAL] Task 99: infra_issue'
+        assert req.get_header('Priority') == 'urgent'
+        assert req.get_header('Tags') == 'rotating_light'
 
     def test_urgent_escalation_sends_urgent(self, urgent_escalation: Escalation):
         """urgent severity -> [URGENT] title, Priority=urgent, Tags=rotating_light."""
-        with patch('escalation.watcher.urllib.request.urlopen') as mock_urlopen:
-            _send_ntfy('https://ntfy.sh/test-topic', urgent_escalation)
+        req = ntfy_request('https://ntfy.sh/test-topic', urgent_escalation)
 
-            req = mock_urlopen.call_args[0][0]
-            assert req.get_header('Title') == '[URGENT] Task 99: risk_identified'
-            assert req.get_header('Priority') == 'urgent'
-            assert req.get_header('Tags') == 'rotating_light'
+        assert req.get_header('Title') == '[URGENT] Task 99: risk_identified'
+        assert req.get_header('Priority') == 'urgent'
+        assert req.get_header('Tags') == 'rotating_light'
 
 
 class TestEmitNtfyFailure:
