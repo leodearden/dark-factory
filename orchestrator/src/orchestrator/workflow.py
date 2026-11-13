@@ -4195,9 +4195,7 @@ class TaskWorkflow:
 
         # task 2991: write the durable merge-phase liveness stamp on merge
         # entry, BEFORE _check_scope_invariant, which reuses the returned
-        # metadata. The stamp currently has no in-tree reader, since the
-        # orphan-L0 reaper's merge-phase gate was retired (task 3002).
-        # (Distinct from the in-memory note_merge_phase_entered at the
+        # metadata. (Distinct from the in-memory note_merge_phase_entered at the
         # retry-loop top, which is the self-redeploy coordinator's signal.)
         _entry_metadata = await self._stamp_merge_phase_entered()
 
@@ -4283,9 +4281,7 @@ class TaskWorkflow:
             # alongside the in-memory one above, at the start of every
             # pre-enqueue window: each REQUEUED retry runs after
             # _submit_to_merge_queue discharged the stamp at the enqueue
-            # boundary. The stamp currently has no in-tree reader, since the
-            # orphan-L0 reaper's merge-phase gate was retired (task 3002).
-            # The merge-entry stamp above is KEPT — it must precede
+            # boundary. The merge-entry stamp above is KEPT — it must precede
             # _check_scope_invariant, which reuses its returned metadata — so
             # attempt 1 writes twice: an accepted cost (two cheap best-effort
             # metadata writes, bounded by max_merge_retries+1 per merge entry)
@@ -7561,8 +7557,8 @@ class TaskWorkflow:
         write is SKIPPED (in-memory clear only), because a ``'replace'`` built
         from in-memory-only metadata would delete backend-only keys
         (``memory_hints``, ``_causation_id``) — the #4271 sibling-clobber bug.
-        Skipping leaves a stale stamp, which currently has no in-tree reader,
-        since the orphan-L0 reaper's merge-phase gate was retired (task 3002).
+        Skipping leaves a stale stamp; :meth:`_stamp_merge_phase_entered`
+        says who reads it.
 
         ACCEPTED residual race (review amendment) — ``'replace'`` is NOT
         unconditionally safe once the read succeeded. This is a
@@ -7606,8 +7602,7 @@ class TaskWorkflow:
                 'Task %s: skipping durable merge_phase_liveness clear — could '
                 'not re-read backend metadata, and a replace-mode write built '
                 'from in-memory metadata alone would clobber backend-only keys '
-                '(clearing in-memory only; the stale stamp ages out of the '
-                'reaper grace on its own)',
+                '(clearing in-memory only)',
                 self.task_id,
             )
             self.task['metadata'] = {
@@ -12734,8 +12729,7 @@ class TaskWorkflow:
         # abnormal exits before this point.)
         self.scheduler.clear_merge_phase(self.task_id)
         # Task 2991: discharge the DURABLE merge-phase-liveness stamp at the same
-        # boundary. The stamp currently has no in-tree reader, since the
-        # orphan-L0 reaper's merge-phase gate was retired (task 3002).
+        # boundary.
         await self._clear_merge_phase_entered()
 
         # Soft-cancel hook: detach the workflow waiter instead of cancelling

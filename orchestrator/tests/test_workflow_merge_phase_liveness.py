@@ -1,9 +1,8 @@
 """Durable merge-phase liveness stamp/clear + entry wiring (task 2991).
 
 Task 2991 added a DURABLE ``metadata.merge_phase_liveness =
-{'entered_at': <iso>}`` stamp, written at merge entry, for the orphan-L0
-reaper's merge-phase gate. That reader was retired (task 3002), so the stamp
-currently has no in-tree reader.
+{'entered_at': <iso>}`` stamp, written at merge entry. Who reads it is
+stated once, on ``TaskWorkflow._stamp_merge_phase_entered``.
 
 This module unit-tests the workflow producer side:
 
@@ -279,8 +278,7 @@ class TestClearHelper:
         # get_task raises. Under the old 'merge' mode that fallback was
         # harmless (omitted backend-only keys survived); under 'replace' it
         # would DELETE every backend-only key. So a failed read must SKIP the
-        # durable write entirely, leaving a stale stamp, which currently has
-        # no in-tree reader.
+        # durable write entirely, leaving a stale stamp.
         f = _make(
             metadata={
                 'merge_phase_liveness': dict(_STAMP),
