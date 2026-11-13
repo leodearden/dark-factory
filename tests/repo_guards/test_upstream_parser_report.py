@@ -63,21 +63,20 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-
-# The D5 assertion helper is imported, NOT re-derived: precedent
-# test_toolcall_markup_corpus.py:32 -- it must be the SAME code the
-# hand-authored specimen tests in test_toolcall_markup.py run. Bare import
-# works via conftest's tests/ sys.path insert (the
-# capability_manifest_corpus.py precedent).
-from test_toolcall_markup import assert_repair_invariants
-
 import shared.toolcall_markup as tm
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+# The D5 assertion helper is imported, NOT re-derived: it must be the SAME code
+# the hand-authored specimen tests in shared/tests/test_toolcall_markup.py and
+# the corpus replay in shared/tests/test_toolcall_markup_corpus.py run. Its
+# home is shared/tests/cross_suite_helpers/toolcall_repair_invariants.py, which
+# this directory's conftest inserts onto sys.path.
+from toolcall_repair_invariants import assert_repair_invariants
+
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
-# Mirrors shared/tests/conftest.py:21 rather than inventing a second
-# root-finding scheme.
+# Mirrors tests/repo_guards/conftest.py::REPO_ROOT rather than inventing a
+# second root-finding scheme.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 REPORT_PATH = REPO_ROOT / 'docs' / 'upstream' / 'toolcall-parser-overconsumption.md'

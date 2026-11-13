@@ -52,8 +52,15 @@ MOVED_GUARDS = (
     'test_usage_gate_shutdown_pairing.py',
     'test_wildcard_mcp_scoping_gate.py',
     'test_tree_scan_sharing.py',
-    'TestFileExtensionsDriftGuard',
-    'TestExtensionlessFilenamesDriftGuard',
+    'test_lock_charter_reify_parity.py::TestFileExtensionsDriftGuard',
+    'test_lock_charter_reify_parity.py::TestExtensionlessFilenamesDriftGuard',
+    'test_lock_charter_reify_parity.py::TestExtensionlessFilenames::test_no_canonical_name_is_also_a_directory',
+    'test_lock_charter_reify_parity.py::TestExtensionlessFilenames::test_every_tracked_extensionless_file_is_allowlisted',
+    'test_lock_charter_reify_parity.py::TestReifyCheckoutAdapter',
+    'test_lock_charter_reify_parity.py::TestPlantedLayoutHarnessAdapter',
+    'test_lock_charter_reify_parity.py::TestReifyCheckoutPlantedLayout',
+    'test_lock_charter_reify_parity.py::TestSkipUnlessCheckout',
+    'test_lock_charter_reify_parity.py::TestReifyGuardVectorNoneGuard',
     'TestSingleResetsParserOwnership',
     'TestOwnershipScanUsesTheSharedTree',
     'test_only_allowlisted_modules_import_declared_scope',
@@ -63,7 +70,7 @@ MOVED_GUARDS = (
     'test_no_forbidden_reader_names_declared_scope',
     'TestMergeSubmitStatusEnum::test_exact_vocabulary',
     'TestSubmitPartitions::test_submit_terminal_matches_merge_outcome_status',
-    'TestSpecimenAntiFabrication',
+    'test_upstream_parser_report.py::TestSpecimenAntiFabrication',
     'test_interim_cli_agrees_with_the_committed_fixture',
 )
 
@@ -71,11 +78,17 @@ MOVED_GUARDS = (
 SPLIT_OUT_OF_SHARED = frozenset({
     'TestFileExtensionsDriftGuard',
     'TestExtensionlessFilenamesDriftGuard',
+    'TestExtensionlessFilenames.test_no_canonical_name_is_also_a_directory',
+    'TestExtensionlessFilenames.test_every_tracked_extensionless_file_is_allowlisted',
+    'TestReifyCheckoutAdapter',
+    'TestPlantedLayoutHarnessAdapter',
+    'TestReifyCheckoutPlantedLayout',
+    'TestSkipUnlessCheckout',
+    'TestReifyGuardVectorNoneGuard',
     'TestSingleResetsParserOwnership',
     'TestOwnershipScanUsesTheSharedTree',
     'TestMergeSubmitStatusEnum.test_exact_vocabulary',
     'TestSubmitPartitions.test_submit_terminal_matches_merge_outcome_status',
-    'TestSpecimenAntiFabrication',
     'test_interim_cli_agrees_with_the_committed_fixture',
 })
 
@@ -106,6 +119,7 @@ VACATED_PATHS = (
     'tests/scripts/test_reify_closure_staleness_sweep_retired.py',
     'scripts/tests/test_design_invariants_consistency.py',
     *(f'shared/tests/{name}' for name in FIRST_PARTY_TREE_FAMILY),
+    'shared/tests/test_upstream_parser_report.py',
 )
 
 SHARED_CONFTEST = SHARED_TESTS_DIR / 'conftest.py'
