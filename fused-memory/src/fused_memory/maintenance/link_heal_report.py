@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from fused_memory.maintenance.link_heal import RunCounts
+from fused_memory.maintenance.link_heal_executor import undo_command
 from fused_memory.maintenance.link_heal_ledger import CandidateRecord
 from fused_memory.maintenance.link_heal_store import CreatedWindow
 
@@ -213,7 +214,7 @@ def _markdown(view: SweepRunView, document: Mapping[str, Any]) -> str:
         f'- calibration: {_calibration_line(view.calibration)}',
         f'- Writes: {_writes_line(view)}',
         *([] if view.undo_run_id is None else [
-            f'- Undo: `link_heal.py undo --run {view.undo_run_id}`',
+            f'- Undo: `{undo_command(view.undo_run_id)}`',
         ]),
         f'- records: ledger `{view.ledger_path}`, plan run `{view.plan.run_id}`',
         '',

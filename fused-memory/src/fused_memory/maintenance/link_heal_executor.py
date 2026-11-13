@@ -111,6 +111,15 @@ ADJUDICATOR_ANCHOR = 'link-heal-adjudicator'
 CALIBRATION_ANCHOR = 'link-heal-calibration'
 RUN_REPORT_ANCHOR = 'link-heal-run-report'
 
+#: The link-heal CLI, from the repo root.
+LINK_HEAL_SCRIPT = 'fused-memory/scripts/link_heal.py'
+
+
+def undo_command(run_id: str) -> str:
+    """The one spelling of the command that takes back apply run *run_id*'s heals,
+    as operators are shown it."""
+    return f'{LINK_HEAL_SCRIPT} undo --run {run_id}'
+
 #: A share ceiling judges only a run with at least this many adjudicated pairs.
 SHARE_ESCAPE_MIN_PAIRS = 20
 
@@ -361,8 +370,8 @@ _ESCAPE_ROUTES: Mapping[str, _EscapeRoute] = MappingProxyType({
         suggested_action=(
             'Read the sweep report the detail names (Markdown, with the JSON beside it): '
             'counts by project, decision, verdict and action, and the escapes. To take back '
-            'every heal the run applied, run `fused-memory/scripts/link_heal.py undo '
-            '<undo_run_id>` with the undo id the report gives.'
+            f'every heal the run applied, run `{undo_command("<undo_run_id>")}` with the '
+            'undo id the report gives.'
         ),
         severity='info',
         dedupe=False,
