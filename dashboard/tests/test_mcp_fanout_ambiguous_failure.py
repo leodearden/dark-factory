@@ -46,11 +46,11 @@ def _failing_on_a(exc: BaseException, attempted: list[str]):
     return call
 
 
-@pytest.fixture(autouse=True)
-def _clean_sessions():
-    memory.reset_sessions()
-    yield
-    memory.reset_sessions()
+@pytest.fixture
+def invalidated(monkeypatch) -> list[str]:
+    recorded: list[str] = []
+    monkeypatch.setattr(memory, 'invalidate_session', recorded.append)
+    return recorded
 
 
 @pytest.mark.parametrize(
@@ -64,9 +64,7 @@ def _clean_sessions():
     ],
     ids=['ReadTimeout', 'WriteTimeout', 'HTTPStatusError', 'ValueError', 'TimeoutError'],
 )
-async def test_possibly_delivered_failure_stops_at_the_failing_url(exc):
-    memory._get_session('http://a')
-    assert 'http://a' in memory._sessions
+async def test_possibly_delivered_failure_stops_at_the_failing_url(exc, invalidated):
     attempted: list[str] = []
 
     result = await first_success(
@@ -79,7 +77,7 @@ async def test_possibly_delivered_failure_stops_at_the_failing_url(exc):
     assert error.startswith('http://a: ')
     assert type(exc).__name__ in error
     assert attempted == ['http://a']
-    assert 'http://a' not in memory._sessions
+    assert invalidated == ['http://a']
 
 
 @pytest.mark.parametrize(
@@ -96,6 +94,25 @@ async def test_undelivered_failure_falls_through_to_the_next_url(exc):
     )
 
     assert result == 'http://b-payload'
+    assert attempted == ['http://a', 'http://b']
+
+
+async def test_ambiguous_failure_after_an_undelivered_one_stops_and_names_both():
+    attempted: list[str] = []
+    failures = {'http://a': httpx.ConnectError('refused'), 'http://b': httpx.ReadTimeout('rt')}
+
+    async def call(url: str) -> str:
+        attempted.append(url)
+        if url in failures:
+            raise failures[url]
+        return f'{url}-payload'
+
+    result = await first_success(
+        ['http://a', 'http://b', 'http://c'], call,
+        log_label='test', offline_result=_offline, ambiguous_result=_ambiguous,
+    )
+
+    assert result == {'ambiguous': ['http://a: ConnectError: refused', 'http://b: ReadTimeout: rt']}
     assert attempted == ['http://a', 'http://b']
 
 
