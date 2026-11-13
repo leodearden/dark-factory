@@ -73,13 +73,11 @@ def _emit(root, *, project_id=_PROJECT, operation='add_episode',
 class TestImportsCleanlyOnItsOwn:
     """This module must be importable FIRST, before the service layer.
 
-    Regression pin for a real cycle. This module imports the services layer
-    (`QueueOperation`, `POST_EXECUTE_DEAD_PREFIX`) at module scope, which runs
-    `services/__init__`, which eagerly imports `MemoryService`, which imports
-    this module back while it is half-initialized. That is safe only because
-    `memory_service` imports this MODULE rather than a name from it. It bites
-    asymmetrically: most test modules pull in `memory_service` first, but
-    collecting `tests/middleware/` on its own imports this module first.
+    `memory_service` imports this module, and this module imports services
+    leaves (`durable_queue`, `queued_writes`) at module scope. Until task 6635
+    emptied `services/__init__`, which eagerly imported `MemoryService`, that
+    formed a cycle through the package init. This class pins that every entry
+    order still imports cleanly.
 
     A SUBPROCESS is load-bearing: by the time any in-process test runs, both
     modules are long since in `sys.modules`, so an in-process import assertion
