@@ -218,6 +218,13 @@ class FactGraph:
         )
         return [edge.uuid for edge in edges]
 
+    async def retire(self, uuids: Iterable[str]) -> None:
+        """Set ``invalid_at`` on the edges *uuids*, as graphiti does when it retires a fact."""
+        await self.graph.query(
+            'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids SET e.invalid_at = $retired_at',
+            {'uuids': list(uuids), 'retired_at': SEEDED_AT},
+        )
+
 
 @pytest_asyncio.fixture
 async def seed_facts(scratch, provision) -> Callable[[dict[str, str]], Awaitable[FactGraph]]:
@@ -377,11 +384,35 @@ IDENTIFIER_FACTS = {
 }
 IDENTIFIER_QUERY = 'task 877 context and related decisions'
 
+# Measured on scratch FalkorDB 41800 (task 9542): each outscores long-id on the
+# union, 1.0 against 0.167.
+RETIRED_IDENTIFIER_FACTS = {f'retired-{i}': f'Task 877 retired fact {i}' for i in range(5)}
+
 
 class TestEdgeFulltextRanking:
     @pytest.mark.asyncio
     async def test_an_edge_matching_every_identifier_outranks_prose_edges(self, seed_facts):
         seeded = await seed_facts(IDENTIFIER_FACTS)
+
+        ranking = await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
+
+        assert ranking[0] == 'long-id', ranking
+
+    @pytest.mark.asyncio
+    async def test_retired_edges_are_not_promoted(self, seed_facts):
+        retired = dict(list(RETIRED_IDENTIFIER_FACTS.items())[:2])
+        seeded = await seed_facts({**IDENTIFIER_FACTS, **retired})
+        await seeded.retire(retired)
+
+        ranking = await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
+
+        assert ranking[0] == 'long-id', ranking
+
+    @pytest.mark.asyncio
+    async def test_the_tier_fits_the_leg_on_its_live_edges(self, seed_facts):
+        """Five retired edges and long-id would overflow a 5-row leg; long-id alone fits."""
+        seeded = await seed_facts({**IDENTIFIER_FACTS, **RETIRED_IDENTIFIER_FACTS})
+        await seeded.retire(RETIRED_IDENTIFIER_FACTS)
 
         ranking = await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
 
