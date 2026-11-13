@@ -103,7 +103,9 @@ def _make_e2e_workflow(tmp_path: Path, event_store: EventStore | None) -> TaskWo
 
 
 def _stub_verify_and_review(
-    wf: TaskWorkflow, during_verify: Callable[[], Awaitable[None]] | None = None,
+    wf: TaskWorkflow,
+    monkeypatch: pytest.MonkeyPatch,
+    during_verify: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Verify passes (after awaiting *during_verify*) and review is
     non-blocking with no suggestions; returns the ``(verify, review)`` mocks."""
@@ -119,11 +121,10 @@ def _stub_verify_and_review(
         suggestions=[],
         reviews={'analyst': {}},
     ))
-    stubbed: Any = wf
-    stubbed._verify_debugfix_loop = verify_mock
-    stubbed._review = review_mock
-    stubbed._suggestions_in_scope = lambda s: []
-    stubbed._write_suggestions_to_memory = AsyncMock()
+    monkeypatch.setattr(wf, '_verify_debugfix_loop', verify_mock)
+    monkeypatch.setattr(wf, '_review', review_mock)
+    monkeypatch.setattr(wf, '_suggestions_in_scope', lambda s: [])
+    monkeypatch.setattr(wf, '_write_suggestions_to_memory', AsyncMock())
     return verify_mock, review_mock
 
 
@@ -158,7 +159,7 @@ def _tip_fields(data: dict[str, Any]) -> tuple[object, ...]:
 class TestVerifyGreenCheckpointSkipsVerify:
     @pytest.mark.asyncio
     async def test_durable_green_at_tip_skips_verify_and_suppresses_reemit(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         db_path = tmp_path / 'runs.db'
 
@@ -176,7 +177,7 @@ class TestVerifyGreenCheckpointSkipsVerify:
 
         # Current branch tip matches the durable green's tip → checkpoint hits.
         wf._get_head_commit = AsyncMock(return_value=GREEN_TIP)  # type: ignore[method-assign]
-        verify, _ = _stub_verify_and_review(wf)
+        verify, _ = _stub_verify_and_review(wf, monkeypatch)
 
         outcome = await wf._execute_verify_review_loop()
 
@@ -199,7 +200,7 @@ class TestVerifyGreenCheckpointSkipsVerify:
 class TestVerifyCheckpointTipFetchFailSafe:
     @pytest.mark.asyncio
     async def test_raising_get_head_commit_falls_through_to_normal_verify(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Regression pin (reviewer robustness finding, task 2752 amendment): a
         # HEAD read that RAISES at the checkpoint site (here a missing
@@ -222,7 +223,7 @@ class TestVerifyCheckpointTipFetchFailSafe:
         store_now = EventStore(db_path, run_id='run-now')
         wf = _make_e2e_workflow(tmp_path, store_now)
         wf.worktree = tmp_path / 'missing-worktree'
-        verify, _ = _stub_verify_and_review(wf)
+        verify, _ = _stub_verify_and_review(wf, monkeypatch)
 
         # Must NOT raise despite the checkpoint tip fetch failing.
         outcome = await wf._execute_verify_review_loop()
@@ -240,7 +241,7 @@ class TestVerifyCheckpointTipFetchFailSafe:
 
     @pytest.mark.asyncio
     async def test_raising_post_verify_tip_capture_degrades_to_no_checkpoint_key(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # As test_raising_get_head_commit_falls_through_to_normal_verify, but
         # the checkpoint read succeeds and the worktree is removed during
@@ -254,7 +255,7 @@ class TestVerifyCheckpointTipFetchFailSafe:
         async def remove_repo() -> None:
             shutil.rmtree(repo)
 
-        verify, review = _stub_verify_and_review(wf, during_verify=remove_repo)
+        verify, review = _stub_verify_and_review(wf, monkeypatch, during_verify=remove_repo)
 
         outcome = await wf._execute_verify_review_loop()
 
@@ -269,13 +270,13 @@ class TestVerifyCheckpointTipFetchFailSafe:
 
     @pytest.mark.asyncio
     async def test_raising_tip_capture_without_event_store_does_not_crash(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # As test_raising_get_head_commit_falls_through_to_normal_verify, with no
         # event store: the post-verify capture is the only HEAD read.
         wf = _make_e2e_workflow(tmp_path, None)
         wf.worktree = tmp_path / 'missing-worktree'
-        verify, review = _stub_verify_and_review(wf)
+        verify, review = _stub_verify_and_review(wf, monkeypatch)
 
         outcome = await wf._execute_verify_review_loop()
 
@@ -286,20 +287,22 @@ class TestVerifyCheckpointTipFetchFailSafe:
 
 class TestRedispatchBoundary:
     @pytest.mark.asyncio
-    async def test_redispatch_at_a_recorded_green_tip_skips_verify(self, tmp_path: Path) -> None:
+    async def test_redispatch_at_a_recorded_green_tip_skips_verify(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         db_path = tmp_path / 'runs.db'
         repo = seed_repo(tmp_path / 'repo')
         head = _rev_parse_head(repo)
 
         first, first_store = _dispatch(tmp_path, 'run-1', db_path, repo)
-        first_verify, _ = _stub_verify_and_review(first)
+        first_verify, _ = _stub_verify_and_review(first, monkeypatch)
         assert await first._execute_verify_review_loop() == WorkflowOutcome.DONE
         first_verify.assert_awaited_once()
         [green] = _workflow_verify_rows(first_store)
         assert _tip_fields(green) == (True, head, False, None)
 
         second, second_store = _dispatch(tmp_path, 'run-2', db_path, repo)
-        second_verify, _ = _stub_verify_and_review(second)
+        second_verify, _ = _stub_verify_and_review(second, monkeypatch)
         assert await second._execute_verify_review_loop() == WorkflowOutcome.DONE
 
         second_verify.assert_not_awaited()
@@ -307,7 +310,7 @@ class TestRedispatchBoundary:
 
     @pytest.mark.asyncio
     async def test_redispatch_after_an_unresolved_tip_green_reverifies(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
     ) -> None:
         caplog.set_level(logging.WARNING)
         db_path = tmp_path / 'runs.db'
@@ -317,7 +320,7 @@ class TestRedispatchBoundary:
         ).stdout.strip()
 
         first, first_store = _dispatch(tmp_path, 'run-1', db_path, repo)
-        _stub_verify_and_review(first, during_verify=lambda: make_head_unreadable(repo))
+        _stub_verify_and_review(first, monkeypatch, during_verify=lambda: make_head_unreadable(repo))
         assert await first._execute_verify_review_loop() == WorkflowOutcome.DONE
 
         [green] = _workflow_verify_rows(first_store)
@@ -331,7 +334,7 @@ class TestRedispatchBoundary:
 
         subprocess.run(['git', 'symbolic-ref', 'HEAD', branch_ref], cwd=repo, check=True)
         second, second_store = _dispatch(tmp_path, 'run-2', db_path, repo)
-        second_verify, _ = _stub_verify_and_review(second)
+        second_verify, _ = _stub_verify_and_review(second, monkeypatch)
         assert await second._execute_verify_review_loop() == WorkflowOutcome.DONE
 
         second_verify.assert_awaited_once()
@@ -345,7 +348,7 @@ class TestRedispatchBoundary:
         wf = _make_e2e_workflow(tmp_path, store)
         # No real fixture fails exactly once: checkpoint read, failed first capture, successful retry.
         monkeypatch.setattr(wf, '_get_head_commit', AsyncMock(side_effect=[GREEN_TIP, '', GREEN_TIP]))
-        _stub_verify_and_review(wf)
+        _stub_verify_and_review(wf, monkeypatch)
 
         assert await wf._execute_verify_review_loop() == WorkflowOutcome.DONE
 
