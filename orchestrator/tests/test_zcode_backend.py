@@ -326,12 +326,16 @@ def _mode(path: Path) -> int:
 
 
 OPERATOR_HOME = Path('/home/operator')
+WORKTREE = Path('/srv/worktree')
 
 
-def _run_home(system_prompt: str = 'SYS PROMPT', operator_home: Path = OPERATOR_HOME):
+def _run_home(
+    system_prompt: str = 'SYS PROMPT', operator_home: Path = OPERATOR_HOME,
+    worktree: Path = WORKTREE,
+):
     return zcode_run_home(
         system_prompt=system_prompt, model='glm-5.3', endpoint=ENDPOINT,
-        mcp_config=plan_tools_mcp(), operator_home=operator_home,
+        mcp_config=plan_tools_mcp(), operator_home=operator_home, worktree=worktree,
     )
 
 
@@ -377,6 +381,30 @@ class TestZCodeRunHome:
             root = home.root
             raise RuntimeError('body failed')
         assert not root.exists()
+
+    def test_zcode_runs_in_a_link_to_the_worktree_inside_the_home(self, tmp_path):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        with _run_home(worktree=wt) as home:
+            assert home.workspace.parent == home.root
+            assert home.workspace.is_symlink()
+            assert home.workspace.resolve() == wt.resolve()
+
+    def test_the_home_holds_an_empty_env_file(self):
+        with _run_home() as home:
+            sentinel = home.root / '.env'
+            assert sentinel.is_file()
+            assert not sentinel.is_symlink()
+            assert sentinel.read_text() == ''
+
+    def test_removing_the_home_leaves_the_worktree_in_place(self, tmp_path):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        (wt / 'kept.txt').write_text('kept\n')
+        with _run_home(worktree=wt) as home:
+            root = home.root
+        assert not root.exists()
+        assert (wt / 'kept.txt').read_text() == 'kept\n'
 
 
 class TestZCodeSpawnEnv:
