@@ -44,16 +44,51 @@ MOVED_GUARDS = (
     'TestCheckedInScriptCheckTargets',
     'test_committed_exemplar_sidecar_validates',
     'test_every_checked_in_sidecar_lives_where_its_prd_derives',
+    'test_silent_fallthrough_gate.py::TestWholeTreeGate',
+    'test_silent_fallthrough_gate.py::TestGateSelfIntegrity',
+    'test_config_dir_archival_gate.py',
+    'test_loop_blocking_gate.py',
+    'test_orchestrator_rmtree_gate.py',
+    'test_usage_gate_shutdown_pairing.py',
+    'test_wildcard_mcp_scoping_gate.py',
+    'test_tree_scan_sharing.py',
+)
+
+SHARED_TESTS_DIR = REPO_ROOT / 'shared' / 'tests'
+
+#: The first_party_tree gate family, which moves out of shared/tests whole.
+FIRST_PARTY_TREE_FAMILY = (
+    'test_silent_fallthrough_gate.py',
+    'silent_fallthrough_scan.py',
+    'silent_fallthrough_allowlist.py',
+    'test_config_dir_archival_gate.py',
+    'config_dir_archival_allowlist.py',
+    'test_loop_blocking_gate.py',
+    'loop_blocking_scan.py',
+    'loop_blocking_allowlist.py',
+    'test_orchestrator_rmtree_gate.py',
+    'test_usage_gate_shutdown_pairing.py',
+    'test_wildcard_mcp_scoping_gate.py',
+    'wildcard_mcp_scoping_scan.py',
+    'test_tree_scan_sharing.py',
+    'session_prebuild.py',
+    'test_session_prebuild.py',
 )
 
 #: Repo-relative homes the whole-file moves vacated.
 VACATED_PATHS = (
     'tests/scripts/test_reify_closure_staleness_sweep_retired.py',
     'scripts/tests/test_design_invariants_consistency.py',
+    *(f'shared/tests/{name}' for name in FIRST_PARTY_TREE_FAMILY),
 )
 
+SHARED_CONFTEST = SHARED_TESTS_DIR / 'conftest.py'
 
-SHARED_TESTS_DIR = REPO_ROOT / 'shared' / 'tests'
+#: The whole-first-party-tree parse's session fixture, and the hook that prebuilds it.
+FIRST_PARTY_TREE_PARSE_DEFINITIONS = frozenset({'first_party_tree', 'pytest_collection_finish'})
+
+#: The scanner whose parse reads every first-party source tree.
+FIRST_PARTY_TREE_SCANNER = 'silent_fallthrough_scan'
 
 #: Names a module binds to the repository root.
 REPO_ROOT_NAMES = frozenset({'REPO_ROOT', '_REPO_ROOT', 'ROOT'})
@@ -221,10 +256,50 @@ def test_plans_reads_passes_synthetic_plans_data(source: str) -> None:
     assert plans_reads(source) == [], source
 
 
+def _module_level_function_names(source: str) -> set[str]:
+    return {
+        node.name
+        for node in ast.parse(source).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _absolute_imports(source: str) -> set[str]:
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            imported.add(node.module)
+    return imported
+
+
+def test_shared_conftest_builds_no_first_party_tree() -> None:
+    defined = _module_level_function_names(SHARED_CONFTEST.read_text(encoding='utf-8'))
+    found = sorted(defined & FIRST_PARTY_TREE_PARSE_DEFINITIONS)
+    assert not found, (
+        f'{SHARED_CONFTEST.relative_to(REPO_ROOT)} still defines {found}, so shared '
+        f'still parses the whole first-party tree; that parse belongs in '
+        f'{MODULE_PREFIX}/conftest.py'
+    )
+
+
+def test_no_shared_test_imports_the_first_party_tree_scanner() -> None:
+    importers = [
+        str(path.relative_to(REPO_ROOT))
+        for path in sorted(SHARED_TESTS_DIR.rglob('*.py'))
+        if FIRST_PARTY_TREE_SCANNER in _absolute_imports(path.read_text(encoding='utf-8'))
+    ]
+    assert not importers, (
+        f'these shared/tests files import {FIRST_PARTY_TREE_SCANNER}, the '
+        f'whole-first-party-tree scanner that lives in {MODULE_PREFIX}/: {importers}'
+    )
+
+
 def test_shared_tests_read_no_committed_plans() -> None:
     reads = {
         str(path.relative_to(REPO_ROOT)): found
-        for path in sorted(SHARED_TESTS_DIR.glob('*.py'))
+        for path in sorted(SHARED_TESTS_DIR.rglob('*.py'))
         if (found := plans_reads(path.read_text(encoding='utf-8')))
     }
     assert not reads, (
