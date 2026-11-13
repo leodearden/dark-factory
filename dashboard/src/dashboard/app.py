@@ -885,7 +885,7 @@ async def healthz(request: Request) -> JSONResponse:
     #     kills (plans/dashboard-availability-prd.md task epsilon,
     #     Resolved-decision 1).
     #  3. Task 4789 has since bounded the refresh latch
-    #     (mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0, plus a tracked
+    #     (mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0, plus a tracked
     #     self-healing bypass), so the specific unbounded wedge a restart once
     #     cleared can no longer persist. The residual is a slow or hung MCP
     #     SUBSTRATE, which is not in this process -- restarting the dashboard

@@ -165,7 +165,11 @@ RuntimeStatus = Literal[
 # residual is exactly what this ``wait_for`` layer exists to cap: the two
 # layers are complementary, not redundant (the same two-layer note
 # ``dashboard/src/dashboard/data/task_runtime.py``'s module docstring carries).
-_TASKS_PER_PROJECT_BUDGET = 14.0
+TASKS_PER_PROJECT_BUDGET = 14.0
+"""Shipped per-root deadline of the Tasks tab and census projection; shorter than ``mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS``.
+
+The collectors read it only through ``TASKS_BUDGET.per_project``, copied at import, so patching this name changes nothing: pass ``budget=`` instead.
+"""
 
 # Whole-handler deadline for the entire multi-project aggregation.
 #
@@ -175,7 +179,7 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # structural worst case of roughly ``roots * 3 posts * 10 s`` with no cap at
 # all.
 #
-# DELIBERATELY UNCHANGED at 20.0 while ``_TASKS_PER_PROJECT_BUDGET`` doubled.
+# DELIBERATELY UNCHANGED at 20.0 while ``TASKS_PER_PROJECT_BUDGET`` doubled.
 # The obvious "fix" for a cold render that runs out of budget is to widen this
 # toward ``data.js``'s 30 000 ms abort, and it is the wrong one: the measured
 # payload is ~14 MB, and the 10 s of remaining headroom is what serialises and
@@ -243,7 +247,7 @@ _TASKS_TOTAL_BUDGET = 20.0
 # SAME trailing roots were reported degraded on every render (the journal's
 # repeated ``project pump-web-ui: skipped — the 20.0s Tasks budget was
 # already spent``). At width W the worst case becomes roughly
-# ``ceil(N / W) * _TASKS_PER_PROJECT_BUDGET``.
+# ``ceil(N / W) * TASKS_PER_PROJECT_BUDGET``.
 #
 # WHY BOUNDED rather than a plain unbounded ``gather``: a full fan-out over
 # every root goes against a SINGLE fused-memory server where the requests
@@ -288,7 +292,7 @@ class TasksBudget:
 
 
 TASKS_BUDGET = TasksBudget(
-    per_project=_TASKS_PER_PROJECT_BUDGET,
+    per_project=TASKS_PER_PROJECT_BUDGET,
     total=_TASKS_TOTAL_BUDGET,
     root_concurrency=_TASKS_ROOT_CONCURRENCY,
 )
