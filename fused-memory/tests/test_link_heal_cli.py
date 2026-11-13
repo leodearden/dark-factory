@@ -14,6 +14,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shlex
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +49,7 @@ from fused_memory.maintenance.link_heal_executor import (
     RUN_REPORT_ANCHOR,
     SHARE_STOP,
     RunReport,
+    undo_command,
 )
 from fused_memory.maintenance.link_heal_ledger import (
     LEDGER_FILENAME,
@@ -67,6 +69,7 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'link_heal.py'
+REPO_ROOT = SCRIPT_PATH.parents[2]
 
 cli = load_script_module(SCRIPT_PATH, mod_name='link_heal_cli')
 
@@ -589,6 +592,22 @@ class TestApplyAndUndo:
         assert first['counts']['applied'] == 1
         assert second['counts']['applied'] == 2
         assert harness.mem0.write_count == 3
+
+
+class TestTheUndoCommandOperatorsAreShown:
+    RUN_ID = '0123456789abcdef0123456789abcdef'
+
+    def test_it_names_this_script_from_the_repo_root(self):
+        script, *_arguments = shlex.split(undo_command(self.RUN_ID))
+
+        assert (REPO_ROOT / script).resolve() == SCRIPT_PATH.resolve()
+
+    def test_this_script_parses_it_as_an_undo_of_that_run(self):
+        _script, *arguments = shlex.split(undo_command(self.RUN_ID))
+
+        args = cli.build_parser().parse_args(arguments)
+
+        assert (args.command, args.run) == ('undo', self.RUN_ID)
 
 
 class TestExitCodes:

@@ -20,6 +20,7 @@ from fused_memory.maintenance.link_heal import (
     RunCounts,
     Verdict,
 )
+from fused_memory.maintenance.link_heal_executor import undo_command
 from fused_memory.maintenance.link_heal_ledger import (
     NO_ACTION_TAKEN,
     CandidateRecord,
@@ -274,6 +275,11 @@ class TestMarkdown:
 
     def test_the_undo_command_is_given_when_undo_is_set(self):
         assert f'link_heal.py undo --run {APPLY_RUN}' in _markdown(_view())
+
+    def test_the_undo_command_is_the_one_operators_are_shown(self):
+        view = _view()
+        assert view.undo_run_id is not None
+        assert undo_command(view.undo_run_id) in _markdown(view)
 
     def test_no_undo_command_when_nothing_applied(self):
         view = _view(apply=None, withheld=WritesWithheld.DRY_RUN)

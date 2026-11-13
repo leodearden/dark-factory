@@ -227,6 +227,21 @@ class TestTheLinkHealCalibrationAndRunReportRoutes:
                 'link_heal_run_report', 'info', 1,
             )
 
+    def test_a_run_report_suggests_the_undo_command_operators_are_shown(self, tmp_path):
+        from fused_memory.maintenance.link_heal_executor import (
+            FoldedEscapeFiler,
+            run_report_escape,
+            undo_command,
+        )
+
+        esc_id = FoldedEscapeFiler(str(tmp_path))(
+            run_report_escape({'plan_run_id': 'a1' * 16}, tmp_path / 'report.md'),
+        )
+
+        assert esc_id is not None
+        [record] = _filed(tmp_path)
+        assert undo_command('<undo_run_id>') in record['suggested_action']
+
     def test_the_run_report_category_is_registered(self):
         from escalation.categories import require_registered_category
 
