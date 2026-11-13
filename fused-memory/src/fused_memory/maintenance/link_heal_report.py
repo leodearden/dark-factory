@@ -238,7 +238,11 @@ def _calibration_line(calibration: CalibrationStatus) -> str:
 def _writes_line(view: SweepRunView) -> str:
     apply, withheld = view.apply, view.withheld
     if apply is not None:
-        return f'applied: apply run `{apply.run_id}` applied {apply.counts.applied} heal(s)'
+        applied = f'applied: apply run `{apply.run_id}` applied {apply.counts.applied} heal(s)'
+        withheld_heals = apply.counts.withheld_uncalibrated
+        if not withheld_heals:
+            return applied
+        return f'{applied}, withheld {withheld_heals} heal(s) whose adjudicator is uncalibrated'
     if withheld is not None and withheld.is_dry_run:
         return f'dry-run ({withheld})'
     return f'withheld ({withheld})'

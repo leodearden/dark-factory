@@ -2,11 +2,14 @@
 
 A sweep plans from the link adjudicator's verdicts on the links whose child was
 created since the last complete sweep, staging only the heals it is enabled for,
-then heals what it staged, but only if it may write. This module alone decides
-that. A sweep may write when ``link_heal.writes`` is on, the run is not a dry
-run, and the exact model and prompt version the adjudicator asks under has a
-passing calibration. Every run, writing or not, leaves its records in the ledger,
-one report on disk and one info escalation naming the report.
+then heals what it staged, but only if it may write. This module decides whether
+a sweep attempts writes: it does when ``link_heal.writes`` is on, the run is not
+a dry run, and the exact model and prompt version the adjudicator asks under has
+a passing calibration. At write time,
+``link_heal_executor.py::run_apply`` re-checks that each sweep heal's verdict
+came from an adjudicator with a passing calibration, and withholds any other.
+Every run, writing or not, leaves its records in the ledger, one report on disk
+and one info escalation naming the report.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ from fused_memory.maintenance.link_heal_executor import (
     run_report_escape,
 )
 from fused_memory.maintenance.link_heal_ledger import (
-    CalibrationRow,
+    AdjudicatorCalibration,
     LinkHealLedger,
     RunSource,
     plan_document_path,
@@ -86,14 +89,14 @@ class SweepSettings:
             window_hours=config.sweep_window_hours,
         )
 
-    def withheld(self, calibration: CalibrationRow | None) -> WritesWithheld | None:
-        """Why this sweep may not write, given the adjudicator's latest *calibration*;
+    def withheld(self, calibration: AdjudicatorCalibration) -> WritesWithheld | None:
+        """Why this sweep may not write, given its adjudicator's *calibration*;
         ``None`` when it may."""
         if not self.writes:
             return WritesWithheld.WRITES_OFF
         if self.dry_run:
             return WritesWithheld.DRY_RUN
-        if calibration is None:
+        if calibration.calibration is None:
             return WritesWithheld.UNCALIBRATED
         if not calibration.passed:
             return WritesWithheld.CALIBRATION_FAILED
@@ -180,7 +183,7 @@ async def run_sweep(
         ledger, now=now, since=since, window_hours=settings.window_hours,
         projects=settings.projects,
     )
-    calibration = ledger.latest_calibration(adjudicate.model, adjudicate.prompt_sha256)
+    calibration = ledger.adjudicator_calibration(adjudicate.model, adjudicate.prompt_sha256)
     withheld = settings.withheld(calibration)
     plan = await run_adjudicator_plan(
         adjudicate=adjudicate,
@@ -227,11 +230,12 @@ def _ledger_run(report: RunReport) -> LedgerRun:
 
 
 def _calibration_status(
-    adjudicate: LinkAdjudicator, calibration: CalibrationRow | None,
+    adjudicate: LinkAdjudicator, calibration: AdjudicatorCalibration,
 ) -> CalibrationStatus:
+    latest = calibration.calibration
     return CalibrationStatus(
         model=adjudicate.model,
         prompt_sha256=adjudicate.prompt_sha256,
-        calibration_run_id=None if calibration is None else calibration.run_id,
-        passed=calibration is not None and calibration.passed,
+        calibration_run_id=None if latest is None else latest.run_id,
+        passed=calibration.passed,
     )

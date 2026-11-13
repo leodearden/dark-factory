@@ -95,6 +95,10 @@ class ActionState(StrEnum):
     SKIPPED_CAP = 'skipped_cap'
     FAILED = 'failed'
     UNDONE = 'undone'
+    #: A heal of a calibration-gated run source whose verdict came from an adjudicator
+    #: with no passing calibration. Terminal, so it never blocks a later heal of the
+    #: same pair from being staged afresh.
+    WITHHELD_UNCALIBRATED = 'withheld_uncalibrated'
 
 
 PENDING_STATES = frozenset({ActionState.PLANNED, ActionState.SKIPPED_CAP})
@@ -399,6 +403,32 @@ class CalibrationRow:
     passed: bool
     report: Mapping[str, Any]
     at: str
+
+
+@dataclass(frozen=True)
+class AdjudicatorCalibration:
+    """One adjudicator, *model* asked under *prompt_sha256*, with its newest calibration."""
+
+    model: str
+    prompt_sha256: str | None
+    calibration: CalibrationRow | None
+
+    @property
+    def passed(self) -> bool:
+        """Whether this adjudicator's verdicts may be written: its newest calibration passed."""
+        return self.calibration is not None and self.calibration.passed
+
+    def as_detail(self) -> dict[str, Any]:
+        if self.calibration is None:
+            standing = 'none'
+        else:
+            standing = 'passed' if self.calibration.passed else 'failed'
+        return {
+            'model': self.model,
+            'prompt_sha256': self.prompt_sha256,
+            'calibration': standing,
+            'calibration_run_id': None if self.calibration is None else self.calibration.run_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -944,6 +974,33 @@ class LinkHealLedger:
             (model, prompt_sha256),
         ).fetchone()
         return None if row is None else _calibration_row(row)
+
+    def adjudicator_calibration(
+        self, model: str, prompt_sha256: str | None,
+    ) -> AdjudicatorCalibration:
+        """*model* asked under *prompt_sha256*, with its newest calibration. A verdict
+        with no prompt version has no calibration."""
+        calibration = (
+            None if prompt_sha256 is None else self.latest_calibration(model, prompt_sha256)
+        )
+        return AdjudicatorCalibration(model, prompt_sha256, calibration)
+
+    def basis_calibration(self, heal: ActionRow) -> AdjudicatorCalibration | None:
+        """The adjudicator whose verdict *heal* rests on, with its newest calibration;
+        ``None`` for a heal whose basis is not an adjudication."""
+        planned = heal.planned
+        if planned.basis_source is not BasisSource.ADJUDICATOR:
+            return None
+        row = self._conn.execute(
+            'SELECT model, prompt_sha256 FROM adjudications WHERE id = CAST(? AS INTEGER)',
+            (planned.basis_key,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(
+                f'link-heal action {heal.action_id} rests on adjudication '
+                f'{planned.basis_key!r}, which is not in {self.db_path}',
+            )
+        return self.adjudicator_calibration(row['model'], row['prompt_sha256'])
 
     def record_sweep_window(
         self,

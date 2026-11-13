@@ -29,6 +29,8 @@ from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     COMPLETION_META,
     DF,
+    FAKE_ADJUDICATOR_MODEL,
+    FAKE_PROMPT_SHA256,
     REIFY,
     WITHOUT_LINK_HEAL_PREFIX,
     Answer,
@@ -153,6 +155,20 @@ class Workspace:
         ledger = LinkHealLedger(self.ledger_path)
         try:
             return len(ledger.adjudication_verdicts({run_id}))
+        finally:
+            ledger.close()
+
+    def calibrate_fake_adjudicator(self, *, passed: bool) -> str:
+        """Ledger a calibration of the fake adjudicator's model and prompt; its run id."""
+        self.ledger_dir.mkdir(parents=True, exist_ok=True)
+        ledger = LinkHealLedger(self.ledger_path)
+        try:
+            run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
+            ledger.add_calibration(
+                run_id, model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=FAKE_PROMPT_SHA256,
+                population_sha256='0' * 64, passed=passed, report={'passed': passed},
+            )
+            return run_id
         finally:
             ledger.close()
 
@@ -1346,10 +1362,12 @@ class TestCalibrate:
 class TestTheSweepThroughApplyAndStatus:
     @pytest.mark.asyncio
     async def test_apply_sweep_drains_the_sweeps_pending_heals(self, harness, workspace, capsys):
+        workspace.write_config(link_heal={'writes': True})
         seed_sightings_created(harness, range(100, 102))
         env = sweep_env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
         await sweep(env, workspace, capsys, '--dry-run', '--project', DF)
         assert workspace.pending(RunSource.SWEEP) == 2
+        workspace.calibrate_fake_adjudicator(passed=True)
 
         code, applied = await apply(env, workspace, capsys, '--sweep')
 

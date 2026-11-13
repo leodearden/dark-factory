@@ -22,6 +22,9 @@ approves the exact pending plan by sha lifts both. Any run stops, and
 escalates, after ``write_failure_streak`` consecutive failed heals. An apply
 whose pending heals rest on adjudications that are too often misfile or
 CORRECTS writes nothing and escalates; only raising the ceiling lifts that.
+A heal of a calibration-gated source (the sweep) is written only when the
+adjudicator behind its verdict has a passing calibration; any other is
+withheld, never written, attended or not.
 
 An undo run takes every heal one apply run applied back to its pre-image,
 newest first. Each step is corroborated against the image it expects and
@@ -976,6 +979,30 @@ def _projects(pending: Sequence[ActionRow]) -> list[str]:
     return list(dict.fromkeys(row.planned.project_id for row in pending))
 
 
+#: The run sources whose heals are written only while the adjudicator behind each
+#: heal's verdict has a passing calibration.
+CALIBRATION_GATED_SOURCES = frozenset({RunSource.SWEEP})
+
+
+def _withhold_uncalibrated(
+    pending: Sequence[ActionRow], *, ledger: LinkHealLedger, run_id: str,
+) -> tuple[list[ActionRow], int]:
+    """Withhold, under *run_id*, each heal in *pending* whose verdict came from an
+    adjudicator with no passing calibration; the heals admitted, and how many were withheld."""
+    admitted: list[ActionRow] = []
+    withheld = 0
+    for row in pending:
+        calibration = ledger.basis_calibration(row)
+        if calibration is None or calibration.passed:
+            admitted.append(row)
+            continue
+        ledger.set_outcome(
+            row.action_id, ActionState.WITHHELD_UNCALIBRATED, run_id, calibration.as_detail(),
+        )
+        withheld += 1
+    return admitted, withheld
+
+
 async def run_apply(
     *,
     store: LinkHealStore,
@@ -988,28 +1015,37 @@ async def run_apply(
     """A writing run: heal the pending rows of *source*, oldest first.
 
     Raises :class:`ApprovalMismatch` before any run row when an approved sha
-    is not the pending plan's. When the adjudications behind the pending heals
-    trip a share ceiling, it files each share escape and writes nothing,
-    attended or not.
+    is not the pending plan's. For a source in :data:`CALIBRATION_GATED_SOURCES`
+    it first withholds, attended or not, every heal whose verdict came from an
+    adjudicator with no passing calibration; the share ceilings, the backlog
+    escape and the drain then see only the heals it admitted. When the
+    adjudications behind those trip a share ceiling, it files each share escape
+    and writes nothing, attended or not. ``planned`` counts every pending heal
+    the run took on, withheld ones included.
     """
     pending = ledger.pending_actions(source)
     attended = approved_plan_sha256 is not None
     if approved_plan_sha256 is not None:
         _check_approval(approved_plan_sha256, pending)
     run_id = ledger.start_run(source, writes=True)
-    projects = _projects(pending)
+    admitted, withheld = (
+        _withhold_uncalibrated(pending, ledger=ledger, run_id=run_id)
+        if source in CALIBRATION_GATED_SOURCES
+        else (list(pending), 0)
+    )
+    projects = _projects(admitted)
     refusal = _share_refusal(
-        pending, ledger=ledger, limits=limits, filer=filer, projects=projects,
-        approved_plan_sha256=approved_plan_sha256,
+        admitted, taken_on=pending, withheld_uncalibrated=withheld, ledger=ledger,
+        limits=limits, filer=filer, projects=projects, approved_plan_sha256=approved_plan_sha256,
     )
     if refusal is not None:
         ledger.finish_run(run_id, counts=refusal.as_json())
         return RunReport(run_id=run_id, counts=refusal)
     escaped = () if attended else _file(
-        filer, backlog_escape(len(pending), limits, projects=projects),
+        filer, backlog_escape(len(admitted), limits, projects=projects),
     )
     drain = await _drain(
-        pending, store=store, ledger=ledger, run_id=run_id,
+        admitted, store=store, ledger=ledger, run_id=run_id,
         cap=None if attended else limits.max_actions_per_run,
         streak_limit=limits.write_failure_streak,
     )
@@ -1020,28 +1056,33 @@ async def run_apply(
         ))
     counts = _drain_counts(
         pending, drain, escaped=escaped, approved_plan_sha256=approved_plan_sha256,
+        withheld_uncalibrated=withheld,
     )
     ledger.finish_run(run_id, counts=counts.as_json())
     return RunReport(run_id=run_id, counts=counts)
 
 
 def _share_refusal(
-    pending: Sequence[ActionRow],
+    admitted: Sequence[ActionRow],
     *,
+    taken_on: Sequence[ActionRow],
+    withheld_uncalibrated: int,
     ledger: LinkHealLedger,
     limits: RunLimits,
     filer: EscapeFiler,
     projects: Sequence[str],
     approved_plan_sha256: str | None,
 ) -> RunCounts | None:
-    """File the share escapes the adjudications behind *pending* trip; ``None`` when none does."""
-    escapes = adjudicated_share_escapes(pending, ledger, limits, projects=projects)
+    """File the share escapes the adjudications behind *admitted* trip; ``None`` when
+    none does. *taken_on* is every pending heal the run took on."""
+    escapes = adjudicated_share_escapes(admitted, ledger, limits, projects=projects)
     if not escapes:
         return None
     return RunCounts(
-        planned=len(pending),
-        planned_by_action=Counter(row.planned.action.value for row in pending),
-        not_attempted=len(pending),
+        planned=len(taken_on),
+        planned_by_action=Counter(row.planned.action.value for row in taken_on),
+        not_attempted=len(admitted),
+        withheld_uncalibrated=withheld_uncalibrated,
         escaped=tuple(entry for escape in escapes for entry in _file(filer, escape)),
         stopped_by=SHARE_STOP,
         approved_plan_sha256=approved_plan_sha256,
@@ -1054,6 +1095,7 @@ def _drain_counts(
     *,
     escaped: tuple[Mapping[str, Any], ...] = (),
     approved_plan_sha256: str | None = None,
+    withheld_uncalibrated: int = 0,
 ) -> RunCounts:
     """A writing run's disclosure: the heals it took on, and what became of them."""
     skipped_cap = drain.outcomes[ActionState.SKIPPED_CAP]
@@ -1065,6 +1107,7 @@ def _drain_counts(
         skipped_cap=skipped_cap,
         failed=drain.outcomes[ActionState.FAILED],
         not_attempted=drain.not_attempted,
+        withheld_uncalibrated=withheld_uncalibrated,
         escaped=escaped,
         caps_bit=(CAP_BIT,) if skipped_cap else (),
         stopped_by=drain.stopped_by,
