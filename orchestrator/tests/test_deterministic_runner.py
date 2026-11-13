@@ -5455,9 +5455,9 @@ class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
         assert illegal_escs == []
 
     async def test_pure_gate_path_unchanged(self, tmp_path: Path) -> None:
-        """Parity fence (GREEN before AND after the step-2 fix): the pure-gate
-        (before_done=None) branch is byte-unchanged by this task's guard,
-        which is confined to the before_done-is-not-None deploy path."""
+        """Parity fence (GREEN before AND after the step-2 fix): the task-4048
+        deploy guard leaves the pure-gate (before_done=None) arm untouched; the
+        guard is confined to the before_done-is-not-None deploy path."""
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
@@ -5474,7 +5474,9 @@ class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
         assert scheduler.update_task.call_count == 1
         call = scheduler.update_task.call_args
         assert call.args[0] == '4048'
-        assert set(call.args[1].keys()) == {'gate_escalated_at'}
+        assert set(call.args[1].keys()) == {
+            'gate_escalated_at', 'gate_escalated_preconditions',
+        }
         assert call.args[1]['gate_escalated_at']
         assert call.kwargs.get('metadata_mode') == 'merge'
 

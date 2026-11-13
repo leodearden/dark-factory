@@ -21,7 +21,8 @@ If `metadata.gate_escalated_at` is already set:
 - If a pending escalation still exists for the task → return BLOCKED (B3:
   no second escalation on quiescence).
 - Else (escalation resolved) → drive the task to `done` and return DONE
-  (I2/B4/B11: resume path).
+  (I2/B4/B11: resume path) — except a pure gate that now waits on more
+  than it did when it escalated, which re-files (§3).
 
 If `metadata.before_done_ran_at` is already set (γ):
 - If a pending infra_issue escalation exists → return BLOCKED (B7: reaper
@@ -352,8 +353,10 @@ verdict.  The runner meets it like this (tasks 4065 / 4252):
   `orchestrator-deterministic` keeps level=2 past the server downgrade gate).
   Dedup: if a pending escalation already exists for the task (e.g. from a prior
   crash-safe re-dispatch), filing is skipped to avoid duplicate L2 escalations.
-- Stamp `metadata.gate_escalated_at` (crash-safe: file-before-stamp means a
-  stamp failure re-files rather than silently skipping the gate).
+- Stamp `gate_escalated_at` and `gate_escalated_preconditions` (the local
+  dependency ids, `external_deps` and `milestone` the gate escalated under)
+  in one write (crash-safe: file-before-stamp means a stamp failure re-files
+  rather than silently skipping the gate).
 - Set task status to `blocked`.
 - Return BLOCKED (B2).
 
@@ -363,6 +366,23 @@ verdict.  The runner meets it like this (tasks 4065 / 4252):
 2954). This proves a gate was established and is no longer pending. An
 empty PENDING queue alone is not proof: a LOST escalation would otherwise
 let an operator's re-pend of a stuck task silently bypass the gate.
+
+Between the rungs runs a re-hold check (task 9520). A resolution that held
+the gate behind something new is "not yet", not approval: a watcher that
+finds a gate fired prematurely wires its real precondition and resumes it.
+On 2026-11-12 gates 9424 and 8939 were held behind a new dependency that
+way and closed as `pure gate resolved` the moment it landed, with no human
+step. So on resume
+`orchestrator/src/orchestrator/gate_preconditions.py::gate_held_since_escalation`
+compares what the task waits on now with the `gate_escalated_preconditions`
+record its filing stamped, and the runner re-files a fresh gate escalation
+(`milestone_gate`, or `review_due` for a `trigger_chain` human gate) and
+stays BLOCKED when a local dependency or an `external_deps` entry was
+added, or a present `milestone` differs. The re-file restamps the record,
+so the next resolution with nothing new closes normally. Removing a
+dependency or a milestone never re-fires, because it never extends the
+wait. A gate stamped before task 9520 carries no record and closes as
+before; a record that is present but unreadable fails CLOSED and re-files.
 
 (ii) If `metadata.human_curator_gate` is truthy, then
 `metadata.human_curator_adjudicated_at` must carry a non-empty string (task
@@ -402,7 +422,9 @@ on `category:summary`, so the distinct category gets its own counter
 Ordering matters and is pinned by test: rung (i) runs FIRST. Zero records
 anywhere means the gate was never established, so re-filing the ORIGINAL
 `milestone_gate` is the correct recovery; asking for an adjudication
-stamp on a gate nobody has yet seen would be incoherent.
+stamp on a gate nobody has yet seen would be incoherent. The re-hold check
+runs after rung (i) and before rung (ii), so a re-held curator gate is
+re-asked as the gate, not as an adjudication request.
 
 A curator gate that DOES close carries a specific `done_provenance.note`
 naming the adjudication stamp (plus the gate record via
