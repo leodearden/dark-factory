@@ -7,17 +7,23 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from shared.project_layout import known_project_roots
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.models.scope import (
     KNOWN_PROJECT_ROOTS_ENV,
     Scope,
     build_known_projects_map,
+    configured_known_projects_map,
+    configured_primary_root,
     is_phantom_project_root,
     known_project_roots_from_env,
     read_declared_project_id,
     resolve_project_id,
     resolve_project_id_for_root,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class TestResolveProjectId:
@@ -465,6 +471,105 @@ class TestBuildKnownProjectsMap:
             m for m in self._scope_warnings(caplog) if str(ghost) in m
         ]
         assert len(naming_ghost) == 1
+
+
+class TestConfiguredPrimaryRoot:
+    """configured_primary_root is the one normalisation of
+    taskmaster.project_root that every project-registry consumer uses."""
+
+    def test_no_taskmaster_section_means_no_primary_root(self):
+        assert configured_primary_root(None) == ''
+
+    def test_empty_project_root_means_no_primary_root(self):
+        assert configured_primary_root(TaskmasterConfig(project_root='')) == ''
+
+    def test_tilde_is_expanded_and_resolved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('HOME', str(tmp_path))
+        (tmp_path / 'proj').mkdir()
+        taskmaster = TaskmasterConfig(project_root='~/proj')
+        assert configured_primary_root(taskmaster) == str(
+            (tmp_path / 'proj').resolve()
+        )
+
+    def test_default_dot_denotes_the_process_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert configured_primary_root(TaskmasterConfig()) == str(
+            tmp_path.resolve()
+        )
+
+    def test_relative_root_resolves_against_the_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / 'sub').mkdir()
+        taskmaster = TaskmasterConfig(project_root='sub')
+        assert configured_primary_root(taskmaster) == str(
+            (tmp_path / 'sub').resolve()
+        )
+
+    def test_symlinked_root_resolves_to_its_target(self, tmp_path):
+        target = tmp_path / 'target'
+        target.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(target)
+        taskmaster = TaskmasterConfig(project_root=str(link))
+        assert configured_primary_root(taskmaster) == str(target.resolve())
+
+
+class TestConfiguredKnownProjectsMap:
+    """configured_known_projects_map is the registry every consumer derives
+    from taskmaster.project_root plus KNOWN_PROJECT_ROOTS_ENV."""
+
+    def test_primary_first_then_env_roots(self, tmp_path, monkeypatch):
+        primary = tmp_path / 'Primary-Root'
+        alpha = tmp_path / 'Alpha-Proj'
+        beta = tmp_path / 'beta'
+        for d in (primary, alpha, beta):
+            d.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, f'{alpha},{beta}')
+
+        result = configured_known_projects_map(
+            TaskmasterConfig(project_root=str(primary)),
+        )
+
+        assert result == {
+            'primary_root': str(primary.resolve()),
+            'alpha_proj': str(alpha.resolve()),
+            'beta': str(beta.resolve()),
+        }
+        assert next(iter(result)) == 'primary_root'
+
+    def test_no_taskmaster_section_registers_only_env_roots(
+        self, tmp_path, monkeypatch,
+    ):
+        env_root = tmp_path / 'only-env'
+        env_root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(env_root))
+
+        assert configured_known_projects_map(None) == {
+            'only_env': str(env_root.resolve()),
+        }
+
+    def test_tilde_primary_registers_under_its_resolved_root(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv('HOME', str(tmp_path))
+        monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
+        (tmp_path / 'Home-Proj').mkdir()
+
+        result = configured_known_projects_map(
+            TaskmasterConfig(project_root='~/Home-Proj'),
+        )
+
+        assert result == {'home_proj': str((tmp_path / 'Home-Proj').resolve())}
+
+    def test_default_dot_registers_the_process_cwd(self, tmp_path, monkeypatch):
+        cwd = tmp_path / 'Cwd-Proj'
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
+
+        result = configured_known_projects_map(TaskmasterConfig())
+
+        assert result == {'cwd_proj': str(cwd.resolve())}
 
 
 class TestScopeCanonicalizesProjectId:

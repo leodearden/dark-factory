@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.queue import EscalationQueue
 
+from orchestrator.config import DeterministicConfig
 from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
@@ -417,3 +418,31 @@ class TestDeterministicDispatchDoubleDispatchGuard:
         # Report reflects the runner's outcome (not the benign skip).
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.block_reason == 'deterministic_gate'
+
+
+@pytest.mark.asyncio
+class TestDeterministicSlotReadsTheStallCap:
+    """``deterministic.predicate_recheck_stall_cap`` is green-tier: every slot
+    builds its runner from the live config, so a reload applies from the next
+    dispatch (plans/completion-driven-triggers-prd.md C1)."""
+
+    async def test_each_slot_passes_the_current_cap(self, harness: Harness, tmp_path: Path):
+        assignment = _make_assignment(_det_task(task_id='6387'))
+        harness.scheduler.is_deterministic = MagicMock(return_value=True)
+        harness.scheduler.get_status = AsyncMock(return_value='pending')
+        harness._escalation_queue = EscalationQueue(tmp_path)
+
+        with patch('orchestrator.harness.DeterministicRunner') as mock_dr:
+            mock_runner = MagicMock()
+            mock_runner.run = AsyncMock(return_value=WorkflowOutcome.REQUEUED)
+            mock_dr.return_value = mock_runner
+
+            harness.config.deterministic = DeterministicConfig(predicate_recheck_stall_cap=7)
+            first = await harness._run_deterministic_slot(assignment)
+            harness.config.deterministic = DeterministicConfig(predicate_recheck_stall_cap=3)
+            await harness._run_deterministic_slot(assignment)
+
+        caps = [call.kwargs['predicate_recheck_stall_cap'] for call in mock_dr.call_args_list]
+        assert caps == [7, 3]
+        assert first.outcome == WorkflowOutcome.REQUEUED
+        assert first.block_reason == ''

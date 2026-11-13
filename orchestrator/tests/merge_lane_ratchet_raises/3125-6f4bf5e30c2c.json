@@ -1,0 +1,18 @@
+{
+  "task_id": "3125",
+  "reason": "Task 3125 adds three guards to the unblock_auto dry-run spawn (architect-verdict policy, loop-wide in-flight dedupe, rebase-stable coverage skip). The private_reads rise in test_workflow_dry_run_hook.py comes from regression tests calling TaskWorkflow._mark_blocked/_handle_unactionable_task_report/_handle_false_premise_report, the seam every existing test in that file uses; these are workflow internals, not merge-lane internals. Net-additive guard work, not a failed refactor.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_dry_run_hook.py",
+      "baseline": 14,
+      "current": 24
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6582,
+      "current": 6592
+    }
+  ]
+}

@@ -1,0 +1,875 @@
+######## seat-DECOMPOSE-S4-a8a894a9
+{
+ "stream": "S4",
+ "prd_path": "docs/prds/review-all-control-feedback-as-typed-values-and-provenance-by-type.md",
+ "sidecar_path": "docs/prds/review-all-control-feedback-as-typed-values-and-provenance-by-type.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "α",
+   "task_id": "1149",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-e580d7a6ae4b",
+    "fk-da01ab5cd6cf"
+   ],
+   "depends_on": []
+  },
+  {
+   "label": "β",
+   "task_id": "1152",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-f747bee8e8fe"
+   ],
+   "depends_on": [
+    "1149"
+   ]
+  },
+  {
+   "label": "γ",
+   "task_id": "1154",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-da01ab5cd6cf",
+    "fk-b69767a4cb1a"
+   ],
+   "depends_on": [
+    "1152",
+    "1032",
+    "1102"
+   ]
+  },
+  {
+   "label": "δ1",
+   "task_id": "1155",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-ce84f840bb9a"
+   ],
+   "depends_on": [
+    "1032",
+    "1095",
+    "1096",
+    "1102",
+    "1078"
+   ]
+  },
+  {
+   "label": "δ2",
+   "task_id": "1157",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-b69767a4cb1a"
+   ],
+   "depends_on": [
+    "1154",
+    "1155",
+    "1156",
+    "1102"
+   ]
+  },
+  {
+   "label": "δ3",
+   "task_id": "1156",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-e52195bd8809"
+   ],
+   "depends_on": [
+    "1032",
+    "1102"
+   ]
+  },
+  {
+   "label": "δ4",
+   "task_id": "1159",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-8ad9d25fbf53"
+   ],
+   "depends_on": [
+    "1155",
+    "1156"
+   ]
+  },
+  {
+   "label": "ε",
+   "task_id": "1162",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-e580d7a6ae4b",
+    "fk-ce84f840bb9a"
+   ],
+   "depends_on": [
+    "1154",
+    "1155",
+    "1087"
+   ]
+  },
+  {
+   "label": "ζ",
+   "task_id": "1165",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-25d0a222fdc0"
+   ],
+   "depends_on": [
+    "1162"
+   ]
+  },
+  {
+   "label": "η",
+   "task_id": "1168",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-91529fbf199b",
+    "fk-e417279cb0a8"
+   ],
+   "depends_on": [
+    "1152",
+    "1155",
+    "517"
+   ]
+  },
+  {
+   "label": "θ",
+   "task_id": "1171",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-91529fbf199b"
+   ],
+   "depends_on": [
+    "1168",
+    "517"
+   ]
+  },
+  {
+   "label": "ι",
+   "task_id": "1173",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-9631198c90a2"
+   ],
+   "depends_on": [
+    "1168",
+    "1156",
+    "1082",
+    "517"
+   ]
+  },
+  {
+   "label": "κ",
+   "task_id": "1175",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-cda881131953"
+   ],
+   "depends_on": [
+    "1168",
+    "517"
+   ]
+  },
+  {
+   "label": "λ",
+   "task_id": "1177",
+   "priority": "low",
+   "x_finding_key": [],
+   "depends_on": [
+    "1168",
+    "734"
+   ]
+  },
+  {
+   "label": "μ",
+   "task_id": "1178",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-0f7a21c37011"
+   ],
+   "depends_on": [
+    "1168"
+   ]
+  },
+  {
+   "label": "ν",
+   "task_id": "1181",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-ab5b12dd8a4f"
+   ],
+   "depends_on": [
+    "1071"
+   ]
+  },
+  {
+   "label": "ξ",
+   "task_id": "1183",
+   "priority": "high",
+   "x_finding_key": [],
+   "depends_on": [
+    "1157",
+    "1159",
+    "1165",
+    "1171",
+    "1173",
+    "1175",
+    "1177",
+    "1178",
+    "1181"
+   ]
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "1149",
+  "1152",
+  "1154",
+  "1168",
+  "1171",
+  "1183"
+ ],
+ "commit_planning_result": "success: all 17 ids (1149,1152,1154,1155,1156,1157,1159,1162,1165,1168,1171,1173,1175,1177,1178,1181,1183) flipped deferred->pending; manifest_stamping stamped all 17 labels (α..ξ), missing_labels [], errors [], no action_required; non-manual delivered_checks copied into every producer's metadata (1-5 per task). No polarity violations or warnings. Sidecar stamped on disk and left UNCOMMITTED as the brief says.",
+ "lead_actions": [
+  "add_dependency 511 -> 1168 (S4·η) with a dated note per lead ruling Q1: 511 is re-scoped onto η, and its ruled neutral Mode-2 write (esc-585-7 A) becomes the action of η's RELEASED transition; its failed-submit behaviour is η's SUBMIT_FAILED -> RETRYING(new) row",
+  "cancel 895 with x_acceptance_reason naming S4·γ 1154 (one echo definition; Leo 2026-10-08 constraints carried verbatim in 1154), with the frame half in S4·ε 1162",
+  "cancel 893 with x_acceptance_reason naming S4·ε 1162 (frame reg 4 goes through 2901's row via encode_word)",
+  "cancel 853 with x_acceptance_reason naming S4·η 1168 (one gateway batch per window through apply_window)",
+  "stamp fk-f87240eea84a on task 734: the contract §8 step 1 lookup on tasks.db found NO task carrying this key; 734's metadata has no x_finding_key even though the Mechanical filings table records it as 'filed (curator combined) -> 734'. Leaf λ 1177 carries x_finding_key [] and metadata.x_completes {task: 734, key: fk-f87240eea84a} per ruling Q2",
+  "re-point task 601 (P-Fleet β2a) to depend on S4·ι 1173 and drop its duplicate 'outcomes carry provenance' / loop-submit edit (PRD §7)",
+  "optional: task 930 (encode_feedback reg-5 inf/NaN refusal) falls out of S4·ε 1162's encode_word frame slots; link it or cancel it naming 1162 if the lead agrees (it is not listed in the PRD)",
+  "add to the 'Supersedes done tasks' line: fk-9631198c90a2 -> 597 (search_tasks hit at 0.603; 597 is done and wired only the consumer end; ι 1173 re-files the producer end)",
+  "commit the stamped sidecar (git commit --only docs/prds/review-all-control-feedback-as-typed-values-and-provenance-by-type.capability-manifest.yaml)",
+  "append the S4 FILED row to the program doc"
+ ],
+ "cross_reference_lines": [
+  "FILED row: | S4 | `docs/prds/review-all-control-feedback-as-typed-values-and-provenance-by-type.md` | 1149 (α), 1152 (β), 1154 (γ), 1155 (δ1), 1157 (δ2), 1156 (δ3), 1159 (δ4), 1162 (ε), 1165 (ζ), 1168 (η), 1171 (θ), 1173 (ι), 1175 (κ), 1177 (λ), 1178 (μ), 1181 (ν), 1183 (ξ) | `fk-0f7a21c37011`, `fk-25d0a222fdc0`, `fk-8ad9d25fbf53`, `fk-91529fbf199b`, `fk-9631198c90a2`, `fk-ab5b12dd8a4f`, `fk-b69767a4cb1a`, `fk-cda881131953`, `fk-ce84f840bb9a`, `fk-da01ab5cd6cf`, `fk-e417279cb0a8`, `fk-e52195bd8809`, `fk-e580d7a6ae4b`, `fk-f747bee8e8fe` (fk-622d8c567ff0 on 1032, fk-7896a9bf9939 on 1034, fk-f87240eea84a on 734 with λ x_completes) | none | 1149, 1152, 1154, 1168, 1171, 1183 | 511 -> 1168 edge and 853/893/895 cancels left to the lead; 734 needs the key stamped |",
+  "S23-γ depends on S4-δ2 = 1157 (ActuationView.from_metric_rows requires all six ControlMetric members, including setpoint_as_commanded)",
+  "S3-β2/ω vs S4-δ3 = 1156: ops reads the command log through control/command_log.py::read_command_log(session, ...); whichever lands second adapts",
+  "S10 runner leaves depend on S4-ι = 1173 and S4-κ = 1175; PlanStaleness lives in S4-θ = 1171; the S10 SkipReason enum gains NO_CONTROL_ENDPOINT (string landed by 1175)",
+  "S20-γ depends on S4-η 1168, ι 1173, λ 1177, μ 1178",
+  "S26-κ (517): 517's signal no longer asserts that submitted commands carry CommandProvenance.window_at; S4-ι 1173's B6 asserts it. η/θ/ι/κ (1168/1171/1173/1175) depend on 517",
+  "S24-α 1071 -> S4-ν 1181 only; no reverse edge (S24 revised Q2)",
+  "S25-ε 1080: file contention only on simulator/device_end.py; no edge",
+  "S7: κ 1175 uses default_fleet's predicate and S7 swaps in occupant(session, home, at); no edge",
+  "Program row S4: add fk-ce84f840bb9a; upstream deps S26, S9, S24 (ν only)"
+ ],
+ "notes": "17 leaves filed with planning_mode=True and task_kind=normal. Each carries source=review-all, x_finding_run, prd_path, the Greek prd_task_label, user_observable_signal, consumer_ref, grammar_confirmed and file-level files. The batch has 61 dependency edges (36 inside the batch, 19 to upstream tasks) plus 6 edges on gate 1065. Checks before filing: (1) every grep and path delivered_check in the sidecar was run against main 5fa0dfd, and all of them fail today as they should (none vacuous). (2) Contract §8 step 1 (json_each on tasks.db) found only 1032 (fk-622d8c567ff0) and 1034 (fk-7896a9bf9939); none of S4's other 15 keys, including fk-f87240eea84a, sits on any task. (3) Step 2, search_tasks at 0.6 or above for all 17 leaves: the only hits were 597 (done, 0.603, against ι; superseded, see lead_actions) and 571 (cancelled, 0.62, against κ). No leaf was a duplicate. Following the PRD, fk-ce84f840bb9a is stamped on both δ1 1155 (row stamp, per the lead's instruction) and ε 1162 (the wall-clock-read half). ξ has no finding keys because it is the integration gate. G7 was advisory only: docs/legibility/design-invariants.md is not on main (S27-α 1066 is pending), so the PRD's advisory walk stands with no waivers. Freshness: git diff 207d800..main touches no src, tests or migrations. Pre-existing tasks 511, 1032, 734, 853, 893, 895 and 601 were not modified. No memory was written and the program doc was not edited."
+}
+######## seat-DECOMPOSE-S13-ad7ded6f
+{
+ "stream": "S13",
+ "prd_path": "docs/prds/review-all-consent-purpose-catalogue-and-gate-decide.md",
+ "sidecar_path": "docs/prds/review-all-consent-purpose-catalogue-and-gate-decide.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "α",
+   "task_id": "1192",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-4cc553a4ea6f",
+    "fk-a10ea6217225",
+    "fk-be6b977957ce",
+    "fk-628ac7f86df6"
+   ],
+   "depends_on": []
+  },
+  {
+   "label": "β",
+   "task_id": "1193",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-acec2b429476",
+    "fk-a10ea6217225"
+   ],
+   "depends_on": [
+    "1192"
+   ]
+  },
+  {
+   "label": "γ1",
+   "task_id": "1194",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-4cc553a4ea6f",
+    "fk-a10ea6217225"
+   ],
+   "depends_on": [
+    "1192"
+   ]
+  },
+  {
+   "label": "γ2",
+   "task_id": "493",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-796ca07a0b4d",
+    "fk-4cc553a4ea6f",
+    "fk-a10ea6217225"
+   ],
+   "depends_on": [
+    "1192"
+   ]
+  },
+  {
+   "label": "γ3",
+   "task_id": "1195",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-1f653708a862",
+    "fk-4cc553a4ea6f",
+    "fk-a10ea6217225"
+   ],
+   "depends_on": [
+    "1192",
+    "1174"
+   ]
+  },
+  {
+   "label": "δ1",
+   "task_id": "1196",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-8a853da6a191"
+   ],
+   "depends_on": [
+    "1192",
+    "1193",
+    "1078",
+    "1087",
+    "1089"
+   ]
+  },
+  {
+   "label": "δ2",
+   "task_id": "1197",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-8a853da6a191"
+   ],
+   "depends_on": [
+    "1196",
+    "1095",
+    "1098",
+    "1096"
+   ]
+  },
+  {
+   "label": "ε",
+   "task_id": "1198",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-9f40abc979b9"
+   ],
+   "depends_on": [
+    "1193"
+   ]
+  },
+  {
+   "label": "ζ",
+   "task_id": "1199",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-08ae391b9c3b"
+   ],
+   "depends_on": [
+    "1196"
+   ]
+  },
+  {
+   "label": "η",
+   "task_id": "1200",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-a10ea6217225",
+    "fk-acec2b429476",
+    "fk-4cc553a4ea6f"
+   ],
+   "depends_on": [
+    "1193",
+    "1194",
+    "493",
+    "1195",
+    "1196",
+    "1066"
+   ]
+  },
+  {
+   "label": "θ",
+   "task_id": "1201",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-21cfdda2e0b0"
+   ],
+   "depends_on": []
+  },
+  {
+   "label": "582 (re-scoped in place, out of plan, no prd_task_label, no S13 key)",
+   "task_id": "582",
+   "priority": "high",
+   "x_finding_key": [],
+   "depends_on": [
+    "1192",
+    "1193"
+   ]
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "1192",
+  "1193"
+ ],
+ "commit_planning_result": "success: 1192,1193,1194,1195,1196,1197,1198,1199,1200,582 deferred->pending; 493 no_op (already pending). The sidecar was stamped for all 10 labels (α..η) with no missing labels and no errors; delivered_checks were copied onto 1192(8), 1193(9), 1194(3), 493(7), 1195(4), 1196(5), 1198(2), 1199(2), 1200(2), and 1197 has manual-only checks. One non-blocking polarity warning: η/1200 'every-consumer-decides' is absent_overbroad. The 10 matches it reports sit in files that β/γ1/γ2 remove, and η depends on all three, so this is expected. Not in the batch: 1201 θ (stays deferred for the lead) and 1065.",
+ "lead_actions": [
+  "Cancel 1201 (S13·θ) with metadata.x_acceptance_reason: 'The measured three-group partition (ports+standing / guard+cache / rate-limited reporter) is acyclic and its reporter state is read only through its own methods; the synthesis found no heuristic-13 symptom, so the module stays whole (S13 remedy). The placement-axis half of the finding is routed to S5 (task 1191).' submit_task returned a routing_intent_warning (no_code_label) on it, which is harmless because it is never dispatched.",
+  "Cancel 592 with x_acceptance_reason 'subsumed by S13·β (task 1193) — POST /consent no longer accepts expiry (R13 purpose-only, extra=forbid)' (PRD §7).",
+  "583: cancel naming S5-ε 1174, per the S5 decompose ruling. S13·γ3 (1195) is already wired to 1174, not to 583.",
+  "Append coordination notes and add edges on the P-Member tasks: 617 -> 1192 (δ1a builds terms versions on consent/purposes.py; if versions carry categories, REQUIRED_SCOPE is computed inside the module, no categories_for second name). 618 -> 1193 (δ1b adds terms_version to the purpose-only body and keeps extra='forbid'). 619 -> 1198 and 619 -> 1197 (δ2b keeps ε's row lock and δ2's stored vocabulary without EXPIRED). 620 -> 1196 (renewals_due keys on effective_status: EXPIRED, or EXPIRING = ACTIVE now but EXPIRED at now+lead; C8 resolved by R13).",
+  "Overlap to watch: 617 (P-Member δ1a, 'lawful-basis catalogue + basis branch in ConsentGate.check') already depends on 582, and its scope largely repeats re-scoped 582. Leo or the lead should decide whether 582 or 617 owns the basis branch, together with the esc-582-5 cbs_billing basis conflict (A1 vs ruling 2026-09-29).",
+  "Task 972 (pending, low; GateConsentChecker reports NO_CONSENT for unplaced devices, spawned from 582) contends with 1195 and 582 on consent/enforcement.py. It assumes 582's basis branch. No edge was added; consider 972 -> 582.",
+  "Briefing (interactive on main, after 1197 lands): review/briefing.yaml identity-consent key decision 'ConsentStatus.EXPIRED is NEVER stored' becomes 'stored ConsentStatus has no EXPIRED; liveness is EffectiveConsentStatus from effective_status'.",
+  "Optional: add a dated AMENDED note to docs/prds/consent-data-protection.md row 'All three gate surfaces', pointing at S13 PRD §0.11 (require_consent deleted by 1192).",
+  "PRD text drift to correct before committing the sidecar: §5 G3 rows and §7 still say δ1 is held on S26, δ2 is held on S9, and γ3 depends on 583. They are now wired: δ1 -> 1078/1087/1089, δ2 -> 1095/1098/1096, γ3 -> 1174 (S5-ε). The sidecar's three OPEN upstream bindings were rewritten to PASS naming these ids.",
+  "Commit the stamped sidecar (git commit --only docs/prds/review-all-consent-purpose-catalogue-and-gate-decide.capability-manifest.yaml). The PRD .md also shows an uncommitted edit that did not come from this seat (§7 582 row and §16 Q1/Q2 rewording); review it and commit it with the sidecar or separately."
+ ],
+ "cross_reference_lines": [
+  "FILED row S13: 1192 (alpha), 1193 (beta), 1194 (gamma1), 493 (gamma2, amended in place; priority low->medium), 1195 (gamma3), 1196 (delta1), 1197 (delta2), 1198 (epsilon), 1199 (zeta), 1200 (eta, INV-3 enforcing test), 1201 (theta, acceptance record, deferred for lead cancel) | keys fk-a10ea6217225, fk-acec2b429476, fk-4cc553a4ea6f, fk-796ca07a0b4d, fk-1f653708a862, fk-8a853da6a191, fk-9f40abc979b9, fk-be6b977957ce, fk-628ac7f86df6, fk-08ae391b9c3b, fk-21cfdda2e0b0 (split half on 1201; placement half on S5 1191) | held: none | gate deps 1192, 1193 | 582 re-scoped in place to lawful basis + GET /consent/purposes, deps 1192+1193, flipped pending; 968 -> 1193 edge added.",
+  "S5: S13-gamma3 (1195) depends on S5-epsilon (1174); 583's no-loss disposition is subsumed there.",
+  "S26: delta1 (1196) depends on 1078, 1087, 1089. Whichever of 1089 and 1196 lands second finds _strip_tz already gone (the delta1 absent check stays satisfied).",
+  "S9: delta2 (1197) depends on 1095, 1098, 1096 and converts consent_status per S9's convention (enum_column, convert-when-touched).",
+  "S27: INV-3 enforcing test = tests/integration/test_consent_catalogue_boundary.py (task 1200, which depends on 1066 and flips INV-3 to enforced). INV-10: 1192 removes the consent/gate.py and consent/store.py plan.json pointers and deletes their ALLOWLIST entries if 1069 has landed.",
+  "S10: after 1194, the optimiser consent step is ConsentGate.decide and cannot raise a store fault; BatchOutcome's reason set includes check_failed; 516 keeps identity/SoC isolation (contention only).",
+  "S1/S2: billing's ConsentDecide seam = ConsentGate.decide (493). SkipReason absorbs consent_check_failed beside consent_denied; decide never commits or rolls back.",
+  "S7: consent-router role table rebases on 1193/1196 edits to api/routers/consent.py; enforcement._active_customer_id is left for S7.",
+  "S11: generated portal types replace S13's hand edits (EffectiveConsentStatus, GrantRequest {purpose, customer_id?}, ConsentStateOut.as_of); ConsentScreen's me prop (1199) is the first MeResponse pass-down.",
+  "S25: runtime/seed.py consent grants go through consent.store.record_grant over a tuple of purposes (1193).",
+  "S18: 1192 removes consent->auth/fastapi/db.session (same stratum, no allowlist entry)."
+ ],
+ "notes": "Generic mode: no project overlay under .claude/skills/prd/, and docs/legibility/design-invariants.md is not on main yet, so G7 is advisory per PRD §14. Freshness: git diff 207d800..HEAD over every S13 source path is empty. Every sidecar grep delivered_check was run against main first and all have correct polarity (each one fails now and flips when its producer lands). The schema was validated with dark-factory shared.capability_manifest. Contract §8 step 1 (json_each over x_finding_key) found only 1191 (S5·ν, fk-21cfdda2e0b0 placement half). 493 had no stamped key before this pass, and fk-796ca07a0b4d is now on it. Step 2 (search_tasks ≥ 0.6): no duplicates. Near-matches were read: 582 (re-scoped), 590/46/440 (done), 516 (S10, contention only), 972 (contention, listed). S5-ε exists as 1174, so γ3 is wired, not held. No held leaves. Ordering safeguard: 493 got its dependency on 1192 before its description was replaced, so it was never dispatchable with the new scope. 582's old details line 'Do not dispatch as written' remains above the appended 2026-10-14 re-scope note. Nothing committed; no memory written; the program doc and other PRDs were not edited."
+}
+######## seat-DECOMPOSE-S10-a35f42d8
+{
+ "stream": "S10",
+ "prd_path": "docs/prds/review-all-planner-boundary-contracts.md",
+ "sidecar_path": "docs/prds/review-all-planner-boundary-contracts.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "α",
+   "task_id": "1202",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-81b3980217eb"
+   ],
+   "depends_on": [
+    "1082",
+    "517",
+    "899"
+   ]
+  },
+  {
+   "label": "β",
+   "task_id": "1203",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-c0ef97acd037"
+   ],
+   "depends_on": [
+    "517",
+    "1171"
+   ]
+  },
+  {
+   "label": "γ",
+   "task_id": "1204",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-58fff4d62d5a"
+   ],
+   "depends_on": [
+    "1173",
+    "1175"
+   ]
+  },
+  {
+   "label": "δ",
+   "task_id": "516",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-6de37ba38543"
+   ],
+   "depends_on": [
+    "207",
+    "1204",
+    "517",
+    "1194"
+   ]
+  },
+  {
+   "label": "ε",
+   "task_id": "1205",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-cf71c63d7303",
+    "fk-e3c5dde1f18b",
+    "fk-d202a5c83e5f"
+   ],
+   "depends_on": [
+    "516",
+    "1204",
+    "1142",
+    "1097",
+    "1066",
+    "517",
+    "S1 builder leaf (held; not yet wired)"
+   ]
+  },
+  {
+   "label": "ζ",
+   "task_id": "1206",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-3f39f0deb462"
+   ],
+   "depends_on": [
+    "1205"
+   ]
+  },
+  {
+   "label": "η",
+   "task_id": "1207",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-826944df8276",
+    "fk-78897b9985f1"
+   ],
+   "depends_on": [
+    "1202",
+    "1203",
+    "1206"
+   ]
+  },
+  {
+   "label": "θ",
+   "task_id": "1020",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-160bca1a028e",
+    "fk-643fb20ec130"
+   ],
+   "depends_on": [
+    "1203",
+    "516",
+    "1171",
+    "517"
+   ]
+  },
+  {
+   "label": "ι",
+   "task_id": "1208",
+   "priority": "low",
+   "x_finding_key": [],
+   "depends_on": []
+  },
+  {
+   "label": "acceptance record (cancelled)",
+   "task_id": "1210",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-d7b318454411",
+    "fk-b7d697ff03ef",
+    "fk-62f3e4afcf3f"
+   ],
+   "depends_on": []
+  }
+ ],
+ "held_leaves": [
+  {
+   "label": "ε",
+   "task_id": "1205",
+   "x_seam_wait": {
+    "stream": "S1",
+    "contract": "BillingConfig.from_governed_finance(store, at, *, base) as-of with a logged default (C2)"
+   }
+  }
+ ],
+ "gate_dependencies_added": [
+  "1203",
+  "516",
+  "1205"
+ ],
+ "commit_planning_result": "commit_planning(1202,1203,1204,516,1206,1207,1020,1208 -> pending) success: 6 flipped deferred->pending, 516 and 1020 no_op (already pending, amended in place). manifest_stamping stamped α β γ δ ζ η θ ι, missing_labels [], errors []. Mechanical delivered_checks were copied to the tasks: 1202=4, 1203=4, 1204=4, 516=2, 1206=4, 1207=5, 1020=1, 1208=3. ε (1205) was left out of the commit and stays deferred with task_id null in the sidecar. Acceptance record 1210 was cancelled through its own commit_planning(target_status=cancelled). The sidecar is stamped on disk and not committed.",
+ "lead_actions": [
+  "add_dependency 601 -> 1205 (S10·ε) with a dated note: ε delivers 601's per-window finance read and deletes the current_finance call and the restart notes. 601 wraps that read in its last-good state machine, and WindowGovernance.finance is retyped from OptimiserFinanceConfig to the builder's value.",
+  "add_dependency 602 -> 1203 (S10·β): the standing floor is computed over GovernedBattery, and to_setpoint has no governed_* parameters (PRD §7).",
+  "add_dependency 603 -> 1204 (S10·γ): a restore-only outcome that keeps a skip reason adds its row to the §9.3 BatchOutcome table in the same change (PRD §7).",
+  "Task 699: stamp fk-643fb20ec130 (the device-encoder half) and append a dated note carrying the device-neutral DispatchIntent and control-owned encoder proposal (lead ruling S10 Q1). 1020 carries the same key for the prose half only, recorded in metadata.x_finding_key_partial.",
+  "Task 899 (pending; branch task/899 has 5 commits, worktree locked, runtime phase DONE, so probably waiting to merge): step 2 matched it at 0.61. It was not cancelled because it is nearly landed. S10·α (1202) now depends on it. Append a coordination note to 899 saying α replaces the two-Series Forecast and folds its require_shared_index / require_slot_grid into require_forecast_shape.",
+  "Tasks 516 and 1020 have stale worktrees and plans from before the amendment: .worktrees/516 and .worktrees/1020, plus .worktrees/.task-meta/{516,1020}/plan.json, both in EXECUTE phase with no commits and no claimant. Discard or reset them before re-dispatch so an architect does not reuse the old scope. The details of both tasks already say any pre-2026-10-14 plan is superseded.",
+  "At S1 decompose: add_dependency 1205 -> S1's governed-finance builder leaf (S1-epsilon, the amended task 267), then commit_planning 1205 on its own and re-stamp and commit the sidecar. That copies ε's mechanical checks (per-window-builder-read, optimiser-finance-config-deleted, open-row-and-literals-retired, freshness-prose-retired, inv5-second-enforcer). Flip ε's builder-production-caller binding from OPEN to PASS naming S1's task id.",
+  "Commit the stamped sidecar with git commit --only docs/prds/review-all-planner-boundary-contracts.capability-manifest.yaml.",
+  "Tasks 420 and 859 need no action: the program doc says they already carry the pointer-ownership note, and S10 α/γ/δ/η remove the seven optimiser pointers; forecast/__init__.py stays with 1085.",
+  "Mechanical-filings bookkeeping: fk-6de37ba38543 is now stamped on 516; it was the step-2 match and was not stamped before."
+ ],
+ "cross_reference_lines": [
+  "FILED row S10 | docs/prds/review-all-planner-boundary-contracts.md | 1202 (alpha), 1203 (beta), 1204 (gamma), 516 (delta, amended in place; priority medium->high), 1205 (epsilon, held on S1), 1206 (zeta), 1207 (eta), 1020 (theta, amended in place), 1208 (iota), 1210 (acceptance record, cancelled, names 1208) | fk-81b3980217eb, fk-c0ef97acd037, fk-58fff4d62d5a, fk-6de37ba38543, fk-cf71c63d7303, fk-e3c5dde1f18b, fk-d202a5c83e5f, fk-3f39f0deb462, fk-826944df8276, fk-78897b9985f1, fk-160bca1a028e, fk-643fb20ec130 (prose half; encoder half on 699), fk-d7b318454411, fk-b7d697ff03ef, fk-62f3e4afcf3f (accepted on 1210 -> MPC PRD via 1208) | 1205 (epsilon) x_seam_wait S1 governed-finance builder | 1203, 516, 1205 | 516 and 1020 amended in place; 1202 -> 899 edge (in-flight Forecast index work); gamma and delta wired, not held (S4 1173/1175 and S13 1194 filed)",
+  "S1: S10-epsilon (1205) is held on S1's governed-finance builder leaf (C2). S1 decompose adds 1205 -> that leaf, commits 1205 and re-stamps the S10 sidecar. The builder keeps the four §9.5 properties: as-of the instant passed, a logged default, store errors propagate, and to_finance_config is billing's projection.",
+  "S13: S10-delta (516) depends on S13-gamma1 (1194); wired, not held.",
+  "S4: S10-gamma (1204) depends on S4-iota (1173) and S4-kappa (1175); S10-beta (1203) and S10-theta (1020) depend on S4-theta (1171).",
+  "S26: S10-alpha (1202) depends on S26-beta (1082) and S26-kappa (517); beta, delta (516), epsilon and theta also depend on 517.",
+  "S21: S10-epsilon (1205) depends on S21-zeta (1142) and deletes the optimiser/service.py allowlist row in tests/config/test_open_row_reads.py.",
+  "S18: S10-epsilon (1205) depends on S18-alpha (1097) and inserts the optimiser stratum above ingestion/billing in docs/package-strata.toml in the commit that adds the optimiser->billing edge.",
+  "S27: S10-epsilon (1205) depends on S27-alpha (1066) and sets INV-5's second enforcer to tests/optimiser/test_finance_as_of.py::test_future_dated_finance_prices_the_window_as_of_its_start. S10 alpha/gamma/delta/eta remove the .task/plan.json pointers and the rationale-pointer ALLOWLIST entries for forecast/base.py, forecast/persistence.py, runner.py, backtest.py, forecast/cache.py and forecast/weather_api.py.",
+  "S20: no edge. S10-epsilon adapts build_optimiser_batch's composition call site (runtime/roles/dispatch.py if S20 has landed, else control/service.py) to build_optimiser_batch(store, optimiser_interval). BatchOutcome satisfies PlannedOutcome structurally.",
+  "S17: no edge. Finance bounds stay in config/contract.py (S17-gamma, task 1129); S10 restates none.",
+  "S25: no edge. Task 1085 keeps optimiser/forecast/__init__.py and the 'NOT edited' lines.",
+  "S16/S7: contention on optimiser/identity.py (resolve); the second to land adapts.",
+  "P-Fleet: 601 -> 1205, 602 -> 1203, 603 -> 1204 (lead to add)."
+ ],
+ "notes": "Contract §8 step 1 (json_each over tasks.db) found only 1020 carrying fk-160bca1a028e; 516 did not carry fk-6de37ba38543 and now does. Step 2 (search_tasks >= 0.6, then get_task) matched 899 at 0.61 to alpha: in flight, so wired as a dependency rather than cancelled. 295 at 0.61 is billing's SkipReason, unrelated. 601 and 515 at 0.61 to epsilon: 515 is done, 601 is the consumer. Nothing matched beta, zeta or iota. S13 gamma1 already existed as task 1194 (deferred), so delta is wired to it, not held. Before filing I ran every grep/path delivered_check against main. Eight substrate checks were already green there and would have failed the commit_planning polarity gate, so I converted them to kind: manual with the evidence in the reason: beta battery-as-of-wired, delta savepoint-substrate, delta tick-read-back, epsilon builder-and-projection-exist, zeta library-bill-core, eta committed-actual-fixtures, iota mpc-prd-exists, and epsilon allowlist-row-deleted (vacuous_absent because tests/config/test_open_row_reads.py does not exist yet; S21-zeta's own test enforces it). Nine OPEN bindings whose upstream producers are now filed became PASS naming the producer task ids. The only OPEN binding left is epsilon builder-production-caller (S1). All sidecar verdicts are PASS or OPEN. G7: docs/legibility/design-invariants.md is not on main yet (S27-alpha, 1066), so the PRD's §16 walk stays advisory with no waivers. Task id 1209 was taken by a concurrent filer, so the acceptance record is 1210. Freshness check from 363f63c to main: only validation/drills/dropped_readings.py changed (a FleetShard argument added to read_dispatch_liveness), which does not affect gamma's import change. The PRD and the program doc were not edited, nothing was committed, and no memory was written."
+}
+######## seat-DECOMPOSE-S1-aa365ef0
+{
+ "stream": "S1",
+ "prd_path": "docs/prds/review-all-billing-engine-evidence-module-and-typed-facts.md",
+ "sidecar_path": "docs/prds/review-all-billing-engine-evidence-module-and-typed-facts.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "α",
+   "task_id": "194",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-1bb43508339e",
+    "fk-64412055963f",
+    "fk-e7daee7b0dd3"
+   ],
+   "depends_on": [
+    "380",
+    "1070",
+    "1105",
+    "1122",
+    "1089",
+    "298"
+   ]
+  },
+  {
+   "label": "β",
+   "task_id": "1209",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-1bb43508339e"
+   ],
+   "depends_on": [
+    "194",
+    "298",
+    "1070"
+   ]
+  },
+  {
+   "label": "ε",
+   "task_id": "267",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-41e7dcec9005",
+    "fk-9b045b843bb9"
+   ],
+   "depends_on": [
+    "1070",
+    "1129"
+   ]
+  },
+  {
+   "label": "θ",
+   "task_id": "1211",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-d6ff2d37d1b6",
+    "fk-1bb43508339e"
+   ],
+   "depends_on": [
+    "194",
+    "1209",
+    "267",
+    "1070"
+   ]
+  },
+  {
+   "label": "ζ1",
+   "task_id": "365",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-c83dadec1029"
+   ],
+   "depends_on": [
+    "1211",
+    "1070"
+   ]
+  },
+  {
+   "label": "ζ2",
+   "task_id": "519",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-20c980862d3f",
+    "fk-2d01f78f6b61",
+    "fk-c83dadec1029"
+   ],
+   "depends_on": [
+    "365",
+    "1070"
+   ]
+  },
+  {
+   "label": "ζ3",
+   "task_id": "1212",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-20c980862d3f"
+   ],
+   "depends_on": [
+    "519",
+    "1213",
+    "1096",
+    "1070"
+   ]
+  },
+  {
+   "label": "ζ4",
+   "task_id": "422",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-d67ab731252e"
+   ],
+   "depends_on": [
+    "686",
+    "365",
+    "1136",
+    "1070"
+   ]
+  },
+  {
+   "label": "δ",
+   "task_id": "555",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-9215f3d84973"
+   ],
+   "depends_on": [
+    "365",
+    "267",
+    "1070"
+   ]
+  },
+  {
+   "label": "η",
+   "task_id": "1213",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-7e9b8580c07d"
+   ],
+   "depends_on": [
+    "1211",
+    "1070"
+   ]
+  },
+  {
+   "label": "κ",
+   "task_id": "1214",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-2426a5a9c9f7"
+   ],
+   "depends_on": [
+    "1211",
+    "493",
+    "1147",
+    "1070"
+   ]
+  },
+  {
+   "label": "γ",
+   "task_id": "1215",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-93399e158742"
+   ],
+   "depends_on": [
+    "1083",
+    "221",
+    "1022"
+   ]
+  },
+  {
+   "label": "ι",
+   "task_id": "1216",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-9b045b843bb9"
+   ],
+   "depends_on": [
+    "555"
+   ]
+  },
+  {
+   "label": "λ",
+   "task_id": "1217",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-1bb43508339e"
+   ],
+   "depends_on": [
+    "194",
+    "1209",
+    "267",
+    "1211",
+    "365",
+    "519",
+    "1212",
+    "422",
+    "555",
+    "1213",
+    "1214",
+    "1215",
+    "1216"
+   ]
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "194",
+  "1209",
+  "267",
+  "1211",
+  "365",
+  "519",
+  "1212",
+  "422",
+  "555",
+  "1213",
+  "1217"
+ ],
+ "commit_planning_result": "success. 8 new leaves moved deferred->pending (1209, 1211, 1212, 1213, 1214, 1215, 1216, 1217). 6 adopted tasks were already pending, so their flip was a no-op (194, 267, 365, 519, 422, 555). manifest_stamping stamped all 14 labels with missing_labels [] and errors []. No polarity rejection. delivered_checks were copied to all 14 tasks. Before filing, every grep/path delivered_check was run against main and each one currently fails (none vacuous). The stamped sidecar is left uncommitted in the working tree.",
+ "lead_actions": [
+  "Cancel task 192 with x_acceptance_reason naming S1·δ = task 555 (PricedSpan structural register pairing).",
+  "Cancel task 329 with x_acceptance_reason naming S1·ζ2 = task 519 (roster <=> period_to_bill agreement re-rosters a skipped CLOSED final period).",
+  "add_dependency 521 -> 555 (S1·δ) with a dated note: 521 reads the rates a statement was priced at from price_plan's PricedSegment.finance (PRD D7).",
+  "Note on task 221: S1·γ (1215) depends on 221; γ unifies the 'observed' predicate and the expected half-hour grid that assess_coverage and _band_weights share.",
+  "Notes on tasks 462 and 350: S1·θ (1211) decomposes run_billing into named steps; 462's classify-at-_persist and 350's sub-£1 carry edit the persist and period steps; whichever lands second adapts.",
+  "Decide task 280 (pending, low; branch task/280 has no commits). It logs the governed no-row fallback and pins the governed VAT overlay, and S1·ε (267) delivers both (D6 WARNING, D7 VAT-at-governed-rate test). Suggest cancelling with x_acceptance_reason naming 267. Found at contract §8 step 2.",
+  "Decide task 879 (pending, low, depends on 350). It would split BillingService from the Statement value layer, which contradicts PRD D1 (P1 and P4 stay in statement.py; P2/P3 move to meter_evidence/segment_registers). Suggest cancelling naming 194 + 1209 + 1211. Found at contract §8 step 2.",
+  "Task 298 (pending, in merge phase; task/298 already adds billing/segment_registers.py as module functions with REGISTER_METRICS kept there). The seat added edges 194 -> 298 and 1209 -> 298. β reshapes 298's module into SegmentRegisterReader, and α moves REGISTER_METRICS into register_read.py. If 298 is cancelled instead, remove both edges; β then does the extraction itself.",
+  "Task 228 (pending, low; billing_service_for wiring factory, items 1-2) overlaps S3·β3 (1147, the one billing_service constructor). This is S3's call; S1·κ builds on 1147.",
+  "Task 342 (pending, low; surface undated CLOSED accounts) is adjacent to ζ1/ζ2, because an undated CLOSED account is not_supplied under supply_span. Coordination note only, no edge.",
+  "Briefing (interactive on main, briefing-tracking convention): once 555 (δ) lands, retire the review/briefing.yaml known gap 'single-period FinanceConfig'. review/briefing.yaml was removed from 555's files.",
+  "Commit the stamped sidecar with git commit --only docs/prds/review-all-billing-engine-evidence-module-and-typed-facts.capability-manifest.yaml."
+ ],
+ "cross_reference_lines": [
+  "FILED row: | S1 | `docs/prds/review-all-billing-engine-evidence-module-and-typed-facts.md` | 194 (α, adopted in place), 1209 (β), 267 (ε, adopted in place; rescoped to keep from_governed_finance per C2), 1211 (θ, 194 work item 2), 365 (ζ1, adopted in place), 519 (ζ2, adopted in place), 1212 (ζ3), 422 (ζ4, adopted in place), 555 (δ, adopted in place), 1213 (η), 1214 (κ, billing half of fk-2426a5a9c9f7), 1215 (γ), 1216 (ι), 1217 (λ, integration gate) | `fk-1bb43508339e`, `fk-d6ff2d37d1b6`, `fk-9215f3d84973`, `fk-20c980862d3f`, `fk-c83dadec1029`, `fk-d67ab731252e`, `fk-2d01f78f6b61`, `fk-9b045b843bb9`, `fk-e7daee7b0dd3`, `fk-64412055963f`, `fk-7e9b8580c07d`, `fk-41e7dcec9005`, `fk-2426a5a9c9f7`, `fk-93399e158742` (fk-1fd8711fd212 stays on 1024, fk-18414152e578 on 1022) | none | 194, 1209, 267, 1211, 365, 519, 1212, 422, 555, 1213, 1217 | 192 -> 555 and 329 -> 519 cancellations are the lead's; edges 194/1209 -> 298 added (298 in merge phase extracts segment_registers); ζ3 -> 1096 (chain_head); S6-θ (1180) contention only, no edge; 521 -> 555 edge and notes on 221/462/350 are the lead's. |",
+  "S10: the finance-as-of leaf (S10-epsilon, held x_seam_wait S1) is released onto task 267 (S1·ε). It calls BillingConfig.from_governed_finance(store, at, base=BillingConfig()).",
+  "S16: its leaf that retypes PricedSegment.tariff and removes the pointer fallback / no_tariff-tariff_not_found fork depends on task 555 (S1·δ).",
+  "S7: supply_dates/occupancy leaves depend on task 422 (S1·ζ4) and 1136 (S17·ε). They build on supply_span, supplied() (365), window_after and SUPPLY_MOVES (422).",
+  "S2: statement.py leaves depend on 1211 (θ), 1212 (ζ3) and 1214 (κ). SkipReason folds not_supplied and no_property; S2 makes the persist-or-read-the-winner step flush-only.",
+  "S12: billing readers call statement_of_record.statements_of / statement_for_period / statements_overlapping (task 1213); contention only.",
+  "S27: Appendix A row billing/statement.py (plan.json pointer) is removed by task 194 (S1·α).",
+  "Seam row 'billing/config.py governed-finance builder': S1 lands the definition in task 267 (C2, Q3); S10 owns the optimiser call."
+ ],
+ "notes": "The PRD's 14 leaves map to 6 adopted tasks (194, 267, 555, 365, 519, 422; all were pending, so each was amended in place) and 8 new tasks (1209, 1211-1217). Each adopted task had its title and description replaced with the leaf scope and priority raised to the PRD level: 194 low->high, 267 low->high, 555 low->high, 365 medium->high, 519 medium->high, 422 stays high. Metadata was merged (source=review-all, x_adopted_from, x_finding_key, x_finding_run, prd_path, prd_task_label, file-level files, user_observable_signal, consumer_ref), and a dated supersession note was appended to details. 194 and 267 had no x_finding_key before; their keys are now stamped. 365's complexity:simple was cleared. Contract §8 step 1 (tasks.db json_each over all 16 keys) found only 1022, 1024 and 1174. Step 2 (search_tasks >= 0.6, read with get_task) found 298, 879, 280, 228 and 342, all listed under lead_actions; no new leaf duplicates a live task. Brief versus program doc: the S6 amendment says S1 statement.py leaves depend on S6-θ, but the brief says contention only unless the PRD names an edge, and PRD §7 names none. No 1180 edge was added; θ and γ carry a settlement_basis contention note instead. 1070 is wired on every leaf that edits statement.py (α β ε θ ζ1 ζ2 ζ3 ζ4 δ η κ), not only α and ε. Task id 1210 was taken by another session between the β and θ submits. No memory written, no program doc or other PRD edited, nothing committed."
+}

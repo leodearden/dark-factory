@@ -1,11 +1,11 @@
 """A fully-capped park must be VISIBLE, not silent (task 4945).
 
-THE GAP THIS CLOSES, named by the code itself. ``orchestrator/evals/
-runner.py`` documents that ``cap_wait_sanity_secs`` is consulted at exactly
-one place — ``_check_cap_wait``, in the cap-hit branch AFTER an invocation
-returned — so "the unbounded ``_open.wait()`` above is out of its reach",
-and filed making a fully-capped park visible as a follow-up. This is that
-follow-up.
+THE GAP THIS CLOSES. ``orchestrator/evals/runner.py`` documented that
+``cap_wait_sanity_secs`` was consulted only in the cap-hit branch AFTER an
+invocation returned, so the gate's fully-capped park was out of its reach,
+and filed making that park visible as a follow-up. This is that follow-up.
+Task 4002 has since bounded the park too; ``test_park_free_invocation.py``
+pins that.
 
 MEASURED BEFORE THE FIX: ``UsageGate.before_invoke`` logged
 ``'All accounts capped — waiting for any to reopen'`` exactly ONCE at INFO
@@ -50,6 +50,7 @@ import pytest
 from _usage_gate_test_helpers import make_gate
 
 from shared import usage_gate as usage_gate_mod
+from shared.invocation_outcome import AuthFailed, CapHit
 
 LOGGER_NAME = 'shared.usage_gate'
 
@@ -423,6 +424,32 @@ class TestAllCappedParkIsVisible:
             f'{[p for _, p in _park_records(caplog)]!r}'
         )
 
+    async def test_the_heartbeat_names_which_accounts_are_capped_and_which_auth_failed(
+        self, caplog, fast_heartbeat
+    ) -> None:
+        """A capped account waits on a reset; an auth-failed one never reopens
+        without an operator. Counted together they read the same."""
+        gate = make_gate(['a', 'b'], auth_reprobe_enabled=False)
+        try:
+            async with gate.invoke_slot() as slot:
+                slot.report(CapHit(
+                    resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap',
+                ))
+            async with gate.invoke_slot() as slot:
+                slot.report(AuthFailed(status=401))
+            assert gate.is_paused, 'fixture must actually be parked'
+            fast_heartbeat(0.02)
+
+            await _park_for(gate, 0.1)
+        finally:
+            await gate.shutdown()
+
+        records = _park_records(caplog)
+        assert records, 'no heartbeat emitted — cannot assert what it names'
+        _, payload = records[0]
+        assert payload.get('capped_accounts') == ['a'], payload
+        assert payload.get('auth_failed_accounts') == ['b'], payload
+
     async def test_the_heartbeat_survives_a_non_serialisable_reset_time(
         self, caplog, fast_heartbeat, monkeypatch
     ) -> None:
@@ -495,6 +522,36 @@ class TestAnAbandonedParkIsNotInherited:
             'inherited the abandoned park\'s start time. A pool frozen for '
             'zero seconds would be reported as frozen for as long as some '
             'earlier, unrelated park happened to last'
+        )
+
+    async def test_a_park_that_ends_at_its_deadline_does_not_poison_the_next_one(
+        self, caplog, fast_heartbeat
+    ) -> None:
+        """A bounded park ends by raising, which no lease-serving clear reaches."""
+        interval = fast_heartbeat(0.05)
+        gate = _all_capped_gate()
+
+        with pytest.raises(usage_gate_mod.PoolFrozen):
+            await asyncio.wait_for(
+                gate.before_invoke(max_wait_secs=interval * 2.4), _PARK_VALVE_SECS,
+            )
+        assert _park_records(caplog), (
+            'the bounded park logged nothing, so this test cannot show that its '
+            'clock was or was not inherited'
+        )
+
+        caplog.clear()
+        await _park_for(gate, interval * 1.5)
+
+        records = _park_records(caplog)
+        assert records, (
+            'the next park emitted no heartbeat: the park that ended at its '
+            "deadline left `_park_last_logged_at` set and throttled it"
+        )
+        first_elapsed = records[0][1]['elapsed_s']
+        assert first_elapsed < interval, (
+            f'the next park opened at elapsed_s={first_elapsed!r}, inherited from '
+            'a park that had already ended at its deadline'
         )
 
     async def test_a_cancelled_sibling_does_not_reset_a_live_park(

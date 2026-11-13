@@ -1,0 +1,18 @@
+{
+  "task_id": "4496",
+  "reason": "Kill-switch coverage at the four harness.py landing-evidence sites (task 4496 review fix 1): two new tests in test_harness_already_landed_gate_wiring.py drive Harness._already_landed_dispatch_gate and observe Harness._mark_in_progress_done, which have no public entry point (+3 private_reads). They pin that an operator-disabled delivered_checks.enabled stops the differential rescue now that validate_landing_evidence takes a caller-supplied checks_enabled keyword.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_already_landed_gate_wiring.py",
+      "baseline": 291,
+      "current": 294
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6437,
+      "current": 6440
+    }
+  ]
+}

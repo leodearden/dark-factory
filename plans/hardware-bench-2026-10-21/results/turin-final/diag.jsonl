@@ -1,0 +1,8 @@
+{"probe": "py_collect_split", "rep": 1, "wall_s": 15.55, "user_s": 15.96, "sys_s": 0.36, "host_load1": 64.32}
+{"probe": "py_collect_split", "rep": 2, "wall_s": 15.77, "user_s": 16.38, "sys_s": 0.38, "host_load1": 62.12}
+{"probe": "py_collect_split", "rep": 3, "wall_s": 16.15, "user_s": 16.85, "sys_s": 0.38, "host_load1": 60.70}
+{"probe": "interp_loop", "rep": 1, "wall_s": 0.80, "user_s": 0.80, "sys_s": 0.00, "host_load1": 60.70}
+{"probe": "interp_loop", "rep": 2, "wall_s": 0.83, "user_s": 0.83, "sys_s": 0.00, "host_load1": 60.70}
+{"probe": "interp_loop", "rep": 3, "wall_s": 0.82, "user_s": 0.82, "sys_s": 0.00, "host_load1": 60.70}
+{"probe": "interp_loop", "rep": 4, "wall_s": 0.81, "user_s": 0.81, "sys_s": 0.00, "host_load1": 60.57}
+{"probe": "interp_loop", "rep": 5, "wall_s": 0.82, "user_s": 0.81, "sys_s": 0.00, "host_load1": 60.57}

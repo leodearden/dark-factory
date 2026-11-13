@@ -18,13 +18,14 @@ tasks:
         dependency edge plus alpha's boundary test parsing the committed exemplars
         once present
   - name: escalation-reader-reused-not-forked
-    binding: INV-5 — the recon-queue read reuses load_queue_escalations (wired into
-      the production Escalations endpoint at dashboard/src/dashboard/data/escalations.py:207-215
-      via build_escalation_queues); alpha adds a call site, never a second reader
+    binding: INV-5 — the recon-queue read reuses the dashboard's one escalation reader,
+      dashboard.data.escalation_corpus (the production Escalations route reads through
+      the same acquire_corpus; task 6224 moved memory_evals.py onto it from the retired
+      load_queue_escalations); alpha adds a call site, never a second reader
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: load_queue_escalations
+      pattern: from dashboard.data.escalation_corpus import
       paths:
       - dashboard/src/dashboard/data/memory_evals.py
       expect: present
@@ -138,3 +139,5 @@ tasks:
       paths:
       - dashboard/tests/
       expect: present
+signal_leaves:
+- gamma

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -107,87 +108,18 @@ def test_iso_formats_the_spelling_the_events_table_stores():
     )
 
 
-# ---------------------------------------------------------------------------
-# Fixture builder — DDL copied verbatim from event_store.py::_SCHEMA.
-#
-# The house convention (scripts/tests/test_audit_wiped_metadata_files.py,
-# test_analyze_speculation_depth.py) is to inline the DDL and build the DB in
-# tmp_path rather than check a binary .db into git: a "known answer" has to be
-# legible to a reviewer, and a blob makes the input to every asserted number
-# unreviewable in a diff.
-# ---------------------------------------------------------------------------
-
-_EVENTS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL,
-    duration_ms INTEGER
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_run  ON events(run_id);
-CREATE INDEX IF NOT EXISTS idx_events_task ON events(run_id, task_id);
-CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
-CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(timestamp);
-"""
-
-
-def _make_runs_db(
-    tmp_path: Path, events: list[dict[str, Any]], name: str = 'runs.db'
-) -> Path:
-    """Build a temp runs.db mirroring the live events schema and insert *events*.
-
-    Each event dict may carry: ``event_type`` (required), ``task_id``,
-    ``run_id``, ``timestamp``, ``phase``, ``role``, ``data``, ``cost_usd`` and
-    ``duration_ms``. ``data`` is passed through VERBATIM when it is a str or
-    None — so a test can inject malformed JSON or a NULL payload — and
-    json-encoded otherwise. Rows are inserted in list order, so *events* order
-    IS ascending ``id`` order.
-    """
-    db_path = tmp_path / name
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(_EVENTS_SCHEMA)
-        for i, event in enumerate(events):
-            data = event.get('data')
-            if data is not None and not isinstance(data, str):
-                data = json.dumps(data)
-            task_id = event.get('task_id')
-            conn.execute(
-                'INSERT INTO events (timestamp, run_id, task_id, event_type, '
-                'phase, role, data, cost_usd, duration_ms) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                (
-                    event.get('timestamp', f'2026-08-11T00:00:{i:02d}+00:00'),
-                    event.get('run_id', 'run-1'),
-                    None if task_id is None else str(task_id),
-                    event['event_type'],
-                    event.get('phase'),
-                    event.get('role'),
-                    data,
-                    event.get('cost_usd'),
-                    event.get('duration_ms'),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
+# runs.db is built in tmp_path by conftest's `make_runs_db`, never checked in
+# as a binary blob, so every asserted number's input stays legible in a diff.
 
 
 def _make_project_root(
-    tmp_path: Path, name: str, events: list[dict[str, Any]]
+    make_runs_db: Callable[..., Path], tmp_path: Path, name: str,
+    events: list[dict[str, Any]],
 ) -> Path:
     """Materialise a synthetic project root holding data/orchestrator/runs.db."""
     root = tmp_path / name
     (root / 'data' / 'orchestrator').mkdir(parents=True)
-    _make_runs_db(root / 'data' / 'orchestrator', events)
+    make_runs_db(events, directory=root / 'data' / 'orchestrator')
     return root
 
 
@@ -375,47 +307,12 @@ def corpus_b() -> list[dict[str, Any]]:
 
 
 @pytest.fixture
-def corpus_roots(tmp_path):
+def corpus_roots(tmp_path, make_runs_db):
     """Two synthetic project roots, A and B, each with its own runs.db."""
     return (
-        _make_project_root(tmp_path, 'proj_a', corpus_a()),
-        _make_project_root(tmp_path, 'proj_b', corpus_b()),
+        _make_project_root(make_runs_db, tmp_path, 'proj_a', corpus_a()),
+        _make_project_root(make_runs_db, tmp_path, 'proj_b', corpus_b()),
     )
-
-
-# ---------------------------------------------------------------------------
-# Fixture-builder self-checks — every later assertion rests on these producing
-# live-shaped rows.
-# ---------------------------------------------------------------------------
-
-
-def test_make_runs_db_inserts_rows_in_list_order_with_ascending_ids(tmp_path):
-    db = _make_runs_db(tmp_path, [
-        {'event_type': 'merge_verify', 'task_id': 1, 'timestamp': _ts(11, 1)},
-        {'event_type': 'merge_verify', 'task_id': 2, 'timestamp': _ts(11, 2)},
-        {'event_type': 'merge_verify', 'task_id': 3, 'timestamp': _ts(11, 3)},
-    ])
-    conn = sqlite3.connect(db)
-    try:
-        rows = conn.execute('SELECT id, task_id FROM events ORDER BY id').fetchall()
-    finally:
-        conn.close()
-    assert [r[1] for r in rows] == ['1', '2', '3']
-    assert [r[0] for r in rows] == sorted(r[0] for r in rows)
-
-
-def test_make_runs_db_passes_data_through_verbatim_for_str_and_none(tmp_path):
-    db = _make_runs_db(tmp_path, [
-        {'event_type': 'merge_verify', 'data': '{not json'},
-        {'event_type': 'merge_verify', 'data': None},
-        {'event_type': 'merge_verify', 'data': {'runner': 'local'}},
-    ])
-    conn = sqlite3.connect(db)
-    try:
-        rows = [r[0] for r in conn.execute('SELECT data FROM events ORDER BY id')]
-    finally:
-        conn.close()
-    assert rows == ['{not json', None, '{"runner": "local"}']
 
 
 # ---------------------------------------------------------------------------
@@ -423,8 +320,8 @@ def test_make_runs_db_passes_data_through_verbatim_for_str_and_none(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_connect_ro_opens_readable_and_refuses_writes(tmp_path):
-    db = _make_runs_db(tmp_path, [{'event_type': 'merge_verify'}])
+def test_connect_ro_opens_readable_and_refuses_writes(make_runs_db):
+    db = make_runs_db([{'event_type': 'merge_verify'}])
     conn = mlt._connect_ro(db)
     try:
         assert conn.execute('SELECT COUNT(*) FROM events').fetchone()[0] == 1
@@ -444,8 +341,8 @@ def test_connect_ro_refuses_a_missing_database(tmp_path):
         mlt._connect_ro(tmp_path / 'nope.db')
 
 
-def test_load_events_returns_only_in_window_rows_of_the_requested_type(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_returns_only_in_window_rows_of_the_requested_type(make_runs_db):
+    db = make_runs_db([
         # Before lo.
         {'event_type': 'merge_verify', 'task_id': 'early', 'timestamp': _ts(10, 11),
          'data': {'runner': 'local'}},
@@ -474,8 +371,8 @@ def test_load_events_returns_only_in_window_rows_of_the_requested_type(tmp_path)
                        'data': {'runner': 'local'}}
 
 
-def test_load_events_degrades_malformed_and_null_data_to_empty_dict(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_degrades_malformed_and_null_data_to_empty_dict(make_runs_db):
+    db = make_runs_db([
         {'event_type': 'merge_verify', 'task_id': 'bad', 'timestamp': _ts(12, 1),
          'data': '{not json'},
         {'event_type': 'merge_verify', 'task_id': 'null', 'timestamp': _ts(12, 2),
@@ -495,8 +392,8 @@ def test_load_events_degrades_malformed_and_null_data_to_empty_dict(tmp_path):
     assert [r['data'] for r in rows] == [{}, {}, {}, {'runner': 'local'}]
 
 
-def test_load_events_returns_empty_list_when_nothing_matches(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_returns_empty_list_when_nothing_matches(make_runs_db):
+    db = make_runs_db([
         {'event_type': 'merge_verify', 'timestamp': _ts(12, 1), 'data': {}},
     ])
     conn = mlt._connect_ro(db)
@@ -2665,3 +2562,188 @@ def test_main_defaults_to_the_main_checkout_when_no_project_root_is_given(capsys
     has_store = runs_db(main_checkout).is_file()
     assert code == (0 if has_store else 1)
     assert (payload['projects'][str(main_checkout)]['error'] is None) is has_store
+
+
+# ---------------------------------------------------------------------------
+# Lane policy signals (--policy) — merge-lane-policy PRD D10, task 8523.
+#
+# KNOWN ANSWERS for _policy_fixture():
+#   runner_reason  prefer_remote_free 2, remote_busy 1, (unknown) 1 (pre-α row)
+#   base_relation  main 1, stacked 1, (unknown) 2 (a null and a pre-α row)
+#   cancelled      n 4; cascade 2, shutdown 1, operator_halt 1;
+#                  elapsed (1.8M + 3.6M + 5.4M) ms = 3.0 h (one row has none);
+#                  fraction p50 over [0.5, 1.5] = 1.0 (two rows are null)
+#   voided         n 4, 2 with item_commit; head_failed 2, gate_rebased 1,
+#                  (unknown) 1 (pre-α row with no killer)
+#   queue_to_land  done rows [10, 30, 20] -> p50 20.0, p90 28.0, min 10, max 30;
+#                  1 done row without the key; a blocked row's 999 is excluded
+# ---------------------------------------------------------------------------
+
+
+def _vp(task_id, minute, **facts) -> dict[str, Any]:
+    return _v(task_id, 4, minute, 60_000, **facts)
+
+
+def _vc(task_id, minute, cause, elapsed_ms, fraction) -> dict[str, Any]:
+    return {'timestamp': _ts(11, 5, minute), 'task_id': task_id,
+            'data': {'cause': cause, 'elapsed_ms': elapsed_ms,
+                     'fraction': fraction, 'host': 'laptop'}}
+
+
+def _vk(task_id, minute, site, item_commit) -> dict[str, Any]:
+    void = _vv(task_id, minute, 'dispatch')
+    void['data'].update(
+        killer={'site': site, 'task_id': 'A'}, item_commit=item_commit,
+    )
+    return void
+
+
+def _fq(task_id, minute, state='done', **queue_to_land) -> dict[str, Any]:
+    finalized = _f(task_id, 6, minute, state)
+    finalized['data'].update(queue_to_land)
+    return finalized
+
+
+def _policy_fixture():
+    verify = [
+        _vp('T1', 0, runner_reason='prefer_remote_free', base_relation='main'),
+        _vp('T2', 1, runner_reason='prefer_remote_free', base_relation='stacked'),
+        _vp('T3', 2, runner_reason='remote_busy', base_relation=None),
+        _vp('T4', 3),
+    ]
+    cancelled = [
+        _vc('T2', 0, 'cascade', 1_800_000, 0.5),
+        _vc('T3', 1, 'cascade', 3_600_000, None),
+        _vc('T4', 2, 'shutdown', 5_400_000, 1.5),
+        _vc('T5', 3, 'operator_halt', None, None),
+    ]
+    voided = [
+        _vk('T2', 0, 'head_failed', 'c2'),
+        _vk('T3', 1, 'head_failed', 'c3'),
+        _vk('T4', 2, 'gate_rebased', None),
+        _vv('T5', 3, 'adoption'),
+    ]
+    finalized = [
+        _fq('T1', 0, queue_to_land_secs=10.0),
+        _fq('T2', 1, queue_to_land_secs=30.0),
+        _fq('T3', 2, queue_to_land_secs=20.0),
+        _fq('T4', 3),
+        _fq('T5', 4, 'blocked', queue_to_land_secs=999.0),
+    ]
+    return verify, cancelled, voided, finalized
+
+
+def _policy_result():
+    return mlt.compute_policy_signals(*_policy_fixture())
+
+
+def test_policy_tallies_runner_reason_with_pre_alpha_rows_as_unknown():
+    tally = _policy_result()['runner_reason']
+    assert tally['counts'] == {
+        'prefer_remote_free': 2, 'remote_busy': 1, mlt.UNKNOWN: 1,
+    }
+    assert tally['total'] == 4
+
+
+def test_policy_tallies_base_relation_with_null_and_missing_as_unknown():
+    assert _policy_result()['base_relation']['counts'] == {
+        'main': 1, 'stacked': 1, mlt.UNKNOWN: 2,
+    }
+
+
+def test_policy_summarises_cancelled_verifies():
+    cancelled = _policy_result()['cancelled']
+    assert cancelled['n'] == 4
+    assert cancelled['causes']['counts'] == {
+        'cascade': 2, 'shutdown': 1, 'operator_halt': 1,
+    }
+    assert cancelled['elapsed_hours'] == pytest.approx(3.0)
+    assert cancelled['fraction_p50'] == pytest.approx(1.0)
+
+
+def test_policy_summarises_void_provenance():
+    voided = _policy_result()['voided']
+    assert voided['n'] == 4
+    assert voided['n_with_item_commit'] == 2
+    assert voided['killer_sites']['counts'] == {
+        'head_failed': 2, 'gate_rebased': 1, mlt.UNKNOWN: 1,
+    }
+
+
+def test_policy_queue_to_land_is_over_done_rows_only_and_counts_missing():
+    queue_to_land = _policy_result()['queue_to_land']
+    assert queue_to_land['p50'] == pytest.approx(20.0)
+    assert queue_to_land['p90'] == pytest.approx(28.0)
+    assert (queue_to_land['min'], queue_to_land['max']) == (10.0, 30.0)
+    assert queue_to_land['n'] == 3
+    assert queue_to_land['n_missing'] == 1
+
+
+def test_policy_is_none_shaped_not_zero_on_an_empty_window():
+    empty = mlt.compute_policy_signals([], [], [], [])
+    assert empty['cancelled']['n'] == 0
+    assert empty['cancelled']['fraction_p50'] is None
+    assert empty['queue_to_land']['p50'] is None
+    assert empty['runner_reason']['total'] == 0
+
+
+def _policy_events() -> list[dict[str, Any]]:
+    verify, cancelled, voided, finalized = _policy_fixture()
+    typed = [
+        ('merge_verify', verify), ('merge_verify_cancelled', cancelled),
+        ('verdict_voided', voided), ('merge_finalized', finalized),
+    ]
+    return [
+        {'event_type': event_type, **event}
+        for event_type, events in typed
+        for event in events
+    ]
+
+
+@pytest.fixture
+def policy_root(tmp_path, make_runs_db) -> Path:
+    return _make_project_root(make_runs_db, tmp_path, 'policy', _policy_events())
+
+
+def test_collect_project_adds_policy_signals_only_when_asked(policy_root):
+    default = mlt.collect_project(policy_root, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert 'policy_signals' not in default['sections']
+
+    policy = mlt.collect_project(
+        policy_root, CORPUS_LO_DT, CORPUS_HI_DT, policy=True,
+    )['sections']['policy_signals']
+    assert policy == _policy_result()
+    assert policy['cancelled']['n'] == 4
+
+
+def test_format_report_renders_the_policy_section_under_its_window(policy_root):
+    bundle = mlt.collect_project(policy_root, CORPUS_LO_DT, CORPUS_HI_DT, policy=True)
+    report = mlt.format_report([bundle])
+    [header] = [
+        line for line in report.splitlines()
+        if line.startswith('-- lane policy signals  [')
+    ]
+    assert CORPUS_WINDOW_LABEL in header
+    for rendered in (
+        'prefer_remote_free 2', 'stacked 1', 'cascade 2', 'head_failed 2',
+        'p50 20.0', 'p90 28.0',
+    ):
+        assert rendered in report, rendered
+
+
+def test_main_policy_flag_prints_the_section_and_json_carries_it(capsys, policy_root):
+    argv = ['--policy', '--project-root', str(policy_root), '--window', CORPUS_WINDOW]
+    code, out, _ = _run(capsys, *argv)
+    assert code == 0
+    assert mlt.SECTION_TITLES['policy_signals'] in out
+
+    _, raw, _ = _run(capsys, *argv, '--json')
+    sections = json.loads(raw)['projects'][str(policy_root)]['sections']
+    assert sections['policy_signals']['voided']['n_with_item_commit'] == 2
+
+
+def test_main_policy_section_is_off_by_default(capsys, policy_root):
+    _, out, _ = _run(
+        capsys, '--project-root', str(policy_root), '--window', CORPUS_WINDOW,
+    )
+    assert 'lane policy signals' not in out

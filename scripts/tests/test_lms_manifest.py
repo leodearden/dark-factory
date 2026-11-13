@@ -19,6 +19,9 @@ from pathlib import Path
 import lms_manifest
 import pytest
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _COMMITTED_MANIFEST = (
     Path(__file__).resolve().parents[1] / 'local-model-serving' / 'arms.yaml'

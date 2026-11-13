@@ -29,10 +29,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.memory_metadata import ParentHasChildrenError
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import DescendantScan
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Doomed duplicate and its surviving replacement — both canonical 36-char UUIDs.
 DOOMED = '2531b4d8-1111-4aaa-8bbb-000000000001'

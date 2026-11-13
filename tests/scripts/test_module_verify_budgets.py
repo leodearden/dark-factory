@@ -57,9 +57,11 @@ see drift between. This file now imports ``min_budget``,
 ``FAMILY_PUBLISHER_PATHS``, ``FAMILY_READER_PATH`` and ``published_pairs`` from
 ``module_budget_family`` — a non-test sibling, on the ``setup_host_sections`` /
 ``systemd_unit_invariants`` precedent already established in this directory —
-and takes its setup from the ``root_config`` / ``discover_module_configs`` /
-``executed_for_touched`` fixtures in ``tests/scripts/conftest.py``. Every guard
-in the family still fails entirely on its own.
+reads ``RULED_BUDGET_CENSUS`` and ``ORCHESTRATOR_BUDGET_CENSUS`` from the non-test
+``verify_budget_census_records`` (task 6172), and takes its setup from the
+``root_config`` / ``discover_module_configs`` / ``executed_for_touched``
+fixtures in ``tests/scripts/conftest.py``. Every guard in the family still
+fails entirely on its own.
 
 The SECOND half named the wrong remedy for a real hazard. The
 ``ORCH_CONFIG_PATH`` anchor IS load-bearing exactly as described, and its
@@ -108,10 +110,11 @@ import os
 import pathlib
 import textwrap
 from collections.abc import Callable
-from typing import NamedTuple
 
 import pytest
+import verify_budget_census_records as census_records
 import yaml
+from git_listing import listed_files
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
     FAMILY_READER_PATH,
@@ -120,8 +123,16 @@ from module_budget_family import (
     published_pairs,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_plan import FileKind, classify_file
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    is_whole_tree_guard_module,
+    min_leg_budget_for_family,
+)
 
 from orchestrator import verify
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -160,19 +171,16 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # all. Everything else — the run-by-run figures each is drawn from — is in the
 # owning yaml.
 #
-#   fused-memory  (i) NO GREEN RUN EXISTS. All six runs are rc=1 on the
-#                 PRE-EXISTING failure escalation esc-3473-1 records, red at
-#                 base main 5a7770d239 before this task touched anything. The
-#                 sizing rule says "worst across recorded GREEN runs"; here it
-#                 is applied to RED runs, on the grounds that the failure is one
-#                 fast assertion in a suite that ran to COMPLETION (no -x) and
-#                 adds no measurable wall-clock. An assumption with an error bar,
-#                 not a clean measurement; the 2.6x multiple absorbs it.
-#                 (ii) The ONLY in-scope module under pytest-xdist (addopts =
-#                 "-n auto --dist loadgroup -m 'not integration'"). W is an XDIST
-#                 figure, so a future change to -n or to the dist mode
-#                 INVALIDATES it rather than merely shifting it — RE-MEASURE, do
-#                 not scale.
+#   fused-memory  W is the max of a PRODUCTION CENSUS of task-role verify
+#                 legs, not a hand run of test_command, and that max is a GREEN
+#                 run (task 7882). It is an `-n 8` figure: task legs run with
+#                 the `-n` cap verify appends from
+#                 dark-factory-orchestrator.yaml::verify_admission_pytest_n,
+#                 not with addopts' `-n auto`. A change to that knob, or to
+#                 addopts' `-n` or dist mode, INVALIDATES it rather than merely
+#                 shifting it — RE-MEASURE, do not scale. The census command
+#                 and its figures live in fused-memory/orchestrator.yaml's
+#                 provenance block, their single home.
 #
 #   dashboard     NO PRIOR FIGURE OF ANY KIND existed for this suite (task 3062
 #                 attempt-2 timed out before dashboard's segment started), so
@@ -239,7 +247,9 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 other six, named here so the divergence reads as a decision
 #                 rather than an arithmetic slip.
 #                 ORCHESTRATOR_BUDGET_CENSUS.regime / regime_since carry the
-#                 scope, and its comment block lists all three regimes found.
+#                 scope, and its comment block in
+#                 tests/scripts/verify_budget_census_records.py lists all
+#                 three regimes found.
 #                 THE CORPUS IS EPHEMERAL, which bounds what any re-measure
 #                 can recover: it is `.worktrees/*/.task/verify/*.summary.json`
 #                 and worktrees are reset. MEASURED 2026-09-16 — re-running
@@ -267,27 +277,29 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 below are exercised for this module like every other — only
 #                 (b) and (c) are excepted.
 #
-# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE, save two entries. The concurrent
-# arm of the sweep was a 6-WAY wave (the six modules this task closed) for
-# every entry EXCEPT `shared`, whose W was RE-MEASURED under a real NINE-WAY
-# gather (task 5131, see its entry above) — production's own gather width.
-# Production's ``verify.run_full_verification`` gathers over EVERY registered
-# module config — nine today, including the dominant `orchestrator` segment —
-# so for the five 6-way entries the measured wave remains a LOWER BOUND on the
+# ONE METHODOLOGICAL LIMIT ON FOUR ENTRIES. The concurrent arm of the task-3473
+# sweep was a 6-WAY wave, and four entries still come from it: escalation,
+# dashboard, sampler and cockpit. `shared` was RE-MEASURED under a real
+# NINE-WAY gather (task 5131, see its entry above) — production's own gather
+# width. Production's ``verify.run_full_verification`` gathers over EVERY
+# registered module config — nine today, including the dominant `orchestrator`
+# segment — so for those four the measured wave remains a LOWER BOUND on the
 # fully-concurrent cost, not a reproduction of it. See the same note in each
-# of those five yamls' provenance blocks for what bounds the gap; shared's own
+# of those four yamls' provenance blocks for what bounds the gap; shared's own
 # provenance block records the nine-way gather directly, so no such note
-# applies there. Nor does it apply to `orchestrator`, whose figure did not come
-# from that sweep AT ALL — it is a fleet census of production verify runs (see
-# its entry above), so the 6-way/9-way distinction is simply not the axis its
-# error bar lies on.
+# applies there. Nor does it apply to `orchestrator` or `fused-memory`, whose
+# figures did not come from that sweep AT ALL — each is a fleet census of
+# production verify runs (see their entries above), so the 6-way/9-way
+# distinction is not the axis their error bars lie on — nor to `client-feed`,
+# measured separately by task 6966.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 296.88,
     'escalation': 354.56,
-    'fused-memory': 439.80,
+    'fused-memory': 1695.0841336008161,
     'dashboard': 653.54,
     'sampler': 22.49,
     'cockpit': 130.50,
+    'client-feed': 7.88,
     # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
     # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing
     # regime's worst GREEN full-suite run.
@@ -388,98 +400,6 @@ RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
 CENSUS_FLOOR_REFUSAL_CEILING = 7200
 
 
-class BudgetCensus(NamedTuple):
-    """One module's verify-duration census, frozen with its own provenance.
-
-    THE POINT OF THE SHAPE. The prose entry in
-    ``RULED_INTERIM_BUDGET_EXCEPTIONS`` could say "7200 is an operator
-    estimate" and nothing could check it. These fields are asserted against, so
-    the excepted branch stops asserting prose and starts asserting a
-    DERIVATION.
-
-    ``census_command`` and ``measured_at`` are not decoration: they are what
-    make the next figure a REPEAT rather than a re-derivation, which is exactly
-    what ``MEASURED_MODULE_SUITE_WORST_SECS``' own provenance block demands.
-    Re-measure by re-running that command, and replace the whole record.
-
-    ``regime``/``regime_since`` exist because a bare trailing window is WRONG
-    here, and provably so. A 14-day window from 2026-09-14 reaches back to
-    08-31 and straddles the retired 3-slot / 3600-ceiling regime, whose max was
-    4991s -> a floor of 7500, which trips the refusal ceiling above on evidence
-    from a configuration that no longer exists. D17's rule says "under the
-    PREVAILING config", so the window is
-    ``intersection(trailing-14d, prevailing regime)`` and the assertion
-    ``window_start >= regime_since`` holds it there. That assertion goes INERT
-    on its own once 14 days of prevailing-regime data exist, which is the point
-    — it narrows the window only while narrowing is needed, and says why.
-    """
-
-    window_start: str
-    window_end: str
-    regime: str
-    regime_since: str
-    n: int
-    p50: float
-    p90: float
-    max_secs: float
-    timed_out: int
-    census_command: str
-    measured_at: str
-
-
-# MEASURED 2026-09-14 by the verbatim command below, over the PREVAILING
-# config regime. RE-MEASURE BY REPEATING THAT COMMAND and replacing this whole
-# record, so the next figure is a repeat rather than a re-derivation.
-#
-# THE THREE REGIMES THE CENSUS FOUND, which is why this one is scoped:
-#   pre-2026-09-03          n=26  p50=1551  p90=2385  max=3225   t/o=1   floor 4900
-#   09-03 .. 09-12T08       n=26  p50=3090  p90=4223  max=4991   t/o=14  floor 7500
-#   since 09-12T08 (THIS)   n=14  p50=3275  p90=3685  max=4626   t/o=0   floor 7000
-# The middle regime corroborates the segmentation on its own evidence: 14
-# timeouts against this regime's 0, which is the distress commit 36c4c71eb4
-# relieved by raising the ceiling 3600 -> 7200.
-#
-# DIVERGENCE FROM D17's STATED FIGURES, recorded rather than smoothed over.
-# The ruling expected max=3753 -> floor 5700. Measured max is 4626 -> floor
-# 7000, because a green run landed at 2026-09-14T09:35 (task 3541) after the
-# ruling was written, making 3753 the second-highest. n/p50/p90 all match the
-# ruling's shape. Consequence filed as esc-3353-15: headroom against the
-# refusal ceiling is 174s of floor (7000 vs 7200), i.e. a single green run
-# above 4800s trips assertion (3) above. That is the ruling's INTENDED
-# behaviour — the finding surfaces instead of the budget silently rising — so
-# when it fires, read it as the escalate branch working.
-#
-# EVERY IN-WINDOW RUN IS UNSTAMPED. Deliverable 1 of this task adds the host
-# load stamp; it had not merged when this was measured, so all 14 records
-# carry no load reading and the census's load bands are all empty. The figures
-# here are therefore durations under UNKNOWN host load — which is precisely the
-# gap D1 closes for the next re-measure.
-ORCHESTRATOR_BUDGET_CENSUS = BudgetCensus(
-    window_start='2026-09-12T08:00:00+00:00',
-    window_end='2026-09-15T00:00:00+00:00',
-    regime='prevailing config since the 3600 -> 7200 fleet-ceiling raise',
-    regime_since='2026-09-12T08:00:00+00:00',
-    n=14,
-    p50=3274.9211449669992,
-    p90=3684.5928532374005,
-    max_secs=4626.166946739017,
-    timed_out=0,
-    census_command=(
-        'uv run --project shared python scripts/verify_budget_census.py '
-        '--root /home/leo/src/dark-factory --module orchestrator '
-        '--label test --role task '
-        '--window 2026-09-12T08:00:00+00:00..2026-09-15T00:00:00+00:00'
-    ),
-    measured_at='2026-09-14',
-)
-
-# Keyed by prefix, like every other justification dict here, so the
-# parametrized branch below stays total rather than special-casing one name.
-RULED_BUDGET_CENSUS: dict[str, BudgetCensus] = {
-    'orchestrator': ORCHESTRATOR_BUDGET_CENSUS,
-}
-
-
 # RULED_COLD_BUDGET_DECLARATIONS: keyed by prefix so the justification lives at
 # the definition site, exactly like RULED_INTERIM_BUDGET_EXCEPTIONS above and
 # MODULE_BUDGET_EXCLUSIONS below. A module listed here DECLARES its own
@@ -524,6 +444,7 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'dashboard': 'dashboard/src/dashboard/__init__.py',
     'sampler': 'sampler/src/sampler/__init__.py',
     'cockpit': 'cockpit/src/cockpit/__init__.py',
+    'client-feed': 'client-feed/src/client_feed/__init__.py',
     'orchestrator': 'orchestrator/src/orchestrator/__init__.py',
 }
 
@@ -684,7 +605,7 @@ def test_module_carries_its_own_measured_verify_budget(
         # something. root_warm is operator-tunable and currently sits ON this
         # module's ruled figure; the floor that actually holds the budget up
         # is the measurement assertion below, not this one.
-        census = RULED_BUDGET_CENSUS[prefix]
+        census = census_records.RULED_BUDGET_CENSUS[prefix]
 
         # (4) THE WINDOW IS REGIME-SCOPED. Asserted BEFORE the derivation it
         # feeds, because a straddling window makes every figure below describe
@@ -1848,6 +1769,44 @@ def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
     )
 
 
+def test_the_ruled_census_is_the_shared_record_the_fleet_table_reads() -> None:
+    """The ruled table's entry IS the record the fleet table reads, not a re-literalised copy.
+
+    Task 6172. ``verify_budget_census_records.py::RULED_BUDGET_CENSUS`` and
+    ``test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS`` both consume
+    task 3353's orchestrator census through ``ORCHESTRATOR_BUDGET_CENSUS``.
+    Asserted by IDENTITY rather than equality: a second ``BudgetCensus(...)``
+    literal inside the table, carrying equal values today, is exactly the drift
+    a single home exists to prevent, and equality would pass it.
+    """
+    ruled = census_records.RULED_BUDGET_CENSUS['orchestrator']
+    assert ruled is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
+        "tests/scripts/verify_budget_census_records.py::RULED_BUDGET_CENSUS"
+        "['orchestrator'] is not the record at "
+        'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS '
+        '(task 6172). That record is the single home the fleet table also reads; '
+        'reference it, never copy it'
+    )
+
+
+def test_the_ruled_census_table_and_the_ruled_exceptions_name_the_same_modules() -> None:
+    """The census report and this gate pick the D17 modules from one key set.
+
+    Task 7929.
+    """
+    census_keys = set(census_records.RULED_BUDGET_CENSUS)
+    exception_keys = set(RULED_INTERIM_BUDGET_EXCEPTIONS)
+    assert census_keys == exception_keys, (
+        'tests/scripts/verify_budget_census_records.py::RULED_BUDGET_CENSUS and '
+        'tests/scripts/test_module_verify_budgets.py::RULED_INTERIM_BUDGET_EXCEPTIONS '
+        f'name different modules: {sorted(census_keys ^ exception_keys)} (task 7929). '
+        'scripts/verify_budget_census.py decides which modules get the D17 census '
+        'floor from RULED_BUDGET_CENSUS, while this gate branches on '
+        'RULED_INTERIM_BUDGET_EXCEPTIONS, so the census report would state one '
+        'floor while the gate enforces another'
+    )
+
+
 class TestCensusBudgetFloor:
     """`census_budget_floor` — the family's ONE spelling of D17's derivation.
 
@@ -1926,3 +1885,72 @@ class TestCensusBudgetFloor:
         import module_budget_family as family  # noqa: PLC0415
 
         assert family.HELPER_NAME == 'min_budget'
+
+
+FAMILY_RUNNING_LEGS_FLOOR = frozenset(
+    {'orchestrator', 'fused-memory', 'shared', 'scripts', 'tests/scripts'},
+)
+
+
+def _source_or_none(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _leg_tree_holds_a_member(prefix: str) -> bool:
+    return any(
+        classify_file(path.as_posix(), None) is FileKind.COLLECTABLE_TEST
+        and is_whole_tree_guard_module(_source_or_none(path))
+        for path in listed_files(REPO_ROOT, f'{prefix}/*.py')
+    )
+
+
+def test_every_leg_running_the_family_outlasts_its_ceiling(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """A whole-tree guard member's per-test ceiling must be able to fire before verify kills its leg.
+
+    A leg whose tracked tree holds a collectable member must budget at least
+    ``min_leg_budget_for_family(W)``, whichever run collects the member (task-role family
+    or merge-gate suite), W being its recorded worst green run: a hang starting as late
+    as W must still reach WHOLE_TREE_SCAN_TEST_TIMEOUT, or it surfaces as a retried,
+    unattributed infra_timeout (task 8402). It lives here because this file alone holds
+    every leg's budget and W.
+    Scope: registered module legs only; the repo-root fallback chain and
+    merge_gate_history_test_command are not checked (task 9396).
+    """
+    published = published_pairs()
+    family_running: set[str] = set()
+    failures: list[str] = []
+    for prefix, module_config in sorted(discover_module_configs().items()):
+        if not _leg_tree_holds_a_member(prefix):
+            continue
+        family_running.add(prefix)
+        budget = module_config.verify_command_timeout_secs
+        worst = MEASURED_MODULE_SUITE_WORST_SECS.get(prefix)
+        if worst is None and prefix in published:
+            worst = published[prefix].worst
+        floor = None if worst is None else min_leg_budget_for_family(worst)
+        if budget is None or floor is None or budget < floor:
+            failures.append(
+                f'{prefix}: verify_command_timeout_secs={budget}, W={worst}, '
+                f'WHOLE_TREE_SCAN_TEST_TIMEOUT={WHOLE_TREE_SCAN_TEST_TIMEOUT}, '
+                f'min_leg_budget_for_family(W)={floor}'
+            )
+
+    missing = FAMILY_RUNNING_LEGS_FLOOR - family_running
+    assert not missing, (
+        f'no whole-tree guard member found under {sorted(missing)}: the family scan '
+        f'has regressed, and the budget check below would pass vacuously. '
+        f'Family-running legs found: {sorted(family_running)}'
+    )
+    assert not failures, (
+        'every leg running a whole-tree guard family member must budget at least '
+        'min_leg_budget_for_family(W), so the per-test ceiling fires before verify '
+        'kills the leg. Raise the leg budget to the derived floor; never lower the '
+        'ceiling, whose floor is '
+        'orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.\n'
+        + '\n'.join(failures)
+    )

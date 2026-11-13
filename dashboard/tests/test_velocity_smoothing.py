@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import json
 import pathlib
-import shutil
 import subprocess
 
-import pytest
+from _dashboard_helpers import node_path
 
 CHARTS_PATH = str(
     pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/charts.jsx'
@@ -54,17 +53,10 @@ process.stdout.write(JSON.stringify(sandbox.__result) + '\n');
 """
 
 
-def _node():
-    path = shutil.which('node')
-    if not path:
-        pytest.skip('node not available')
-    return path
-
-
 def _eval_charts_fn(fn_name, *args):
     """Call window.DF_CHARTS[fn_name](*args) in a node vm and return decoded result."""
     result = subprocess.run(
-        [_node(), '-e', _DRIVER, CHARTS_PATH, fn_name, json.dumps(list(args))],
+        [node_path(), '-e', _DRIVER, CHARTS_PATH, fn_name, json.dumps(list(args))],
         capture_output=True,
         text=True,
         check=True,
@@ -75,7 +67,7 @@ def _eval_charts_fn(fn_name, *args):
 def _get_charts_const(const_name):
     """Read window.DF_CHARTS[const_name] in a node vm and return decoded value."""
     result = subprocess.run(
-        [_node(), '-e', _DRIVER, CHARTS_PATH, const_name],
+        [node_path(), '-e', _DRIVER, CHARTS_PATH, const_name],
         capture_output=True,
         text=True,
         check=True,

@@ -1,0 +1,18 @@
+{
+  "task_id": "5107",
+  "reason": "Net-additive regression tests (task 5107): TestMergerBoundary gains two fail-safe reporting cases (empty-output invocation failure reports kind/subtype/evidence/suggested_action; empty-output no-disposition has no dangling colon). They drive the real _invoke through TaskWorkflow._resolve_and_resubmit and read the _mark_blocked/_submit_to_merge_queue mocks, the same seam every existing TestMergerBoundary test uses; the method has no public entry short of run(). Workflow internals, not merge-lane internals.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_verdict_servers_integration_gate.py",
+      "baseline": 32,
+      "current": 40
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6492,
+      "current": 6500
+    }
+  ]
+}

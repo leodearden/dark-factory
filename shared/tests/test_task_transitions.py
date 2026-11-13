@@ -43,8 +43,8 @@ import pytest
 
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import (
-    _OUTCOME_ALLOWED,
     TRANSITIONS,
+    WORKFLOW_OUTCOMES,
     ActorClass,
     derive_actor_class,
     is_legal_transition,
@@ -520,12 +520,15 @@ class TestOutcomeAllowsStatus:
         assert outcome_allows_status(stub, 'done') is True
 
     def test_recognized_outcome_keys_match_mirrored_workflow_outcomes(self):
-        # Internal consistency only: pins the module's _OUTCOME_ALLOWED keys
+        # Internal consistency only: pins the module's WORKFLOW_OUTCOMES
         # against this test's own _WORKFLOW_OUTCOME_VALUES mirror. Both are
         # hand-maintained copies of orchestrator.workflow.WorkflowOutcome, so
         # this catches module-vs-test drift, not drift from the real enum
         # (shared/ cannot import orchestrator to check that directly).
-        assert set(_OUTCOME_ALLOWED.keys()) == _WORKFLOW_OUTCOME_VALUES
+        assert WORKFLOW_OUTCOMES == _WORKFLOW_OUTCOME_VALUES
+
+    def test_workflow_outcomes_is_a_frozenset(self):
+        assert isinstance(WORKFLOW_OUTCOMES, frozenset)
 
     def test_unknown_outcome_raises(self):
         with pytest.raises(ValueError):
@@ -547,11 +550,12 @@ _EXPECTED_PUBLIC_API = {
     'TRANSITIONS',
     'is_legal_transition',
     'outcome_allows_status',
+    'WORKFLOW_OUTCOMES',
 }
 
 
 class TestModuleContract:
-    def test_all_is_exactly_the_five_names(self):
+    def test_all_is_exactly_the_public_api(self):
         import shared.task_transitions as tt
 
         assert hasattr(tt, '__all__')

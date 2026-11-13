@@ -5,14 +5,18 @@ share), the previous run as census-state.json records it, and the commit
 the run reads (``as_of_sha``). Contract: plans/census-incremental-prd.md
 §4.2.
 
-Stdlib-only; imports nothing from census.py.
+Imports only the stdlib and the stdlib-plus-safe_io state modules
+(census_state, state_docs); nothing from census.py.
 """
 from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
+from typing import assert_never
+
+from legibility import census_state, state_docs
 
 
 @dataclass(frozen=True)
@@ -25,23 +29,19 @@ class PriorCensus:
     as_of_sha: str | None = None
 
 
-def _state_text(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
-def prior_census(status: str, state: dict | None) -> PriorCensus:
-    """Read :func:`census_trigger.load_census_state`'s result, which has
-    already validated ``last_census_at``."""
-    if status != "ok" or state is None:
-        return PriorCensus()
-    last_census_at = _state_text(state.get("last_census_at"))
-    return PriorCensus(
-        last_census_at=(
-            datetime.fromisoformat(last_census_at).date() if last_census_at else None
-        ),
-        run_id=_state_text(state.get("last_census_run_id")),
-        as_of_sha=_state_text(state.get("last_census_as_of_sha")),
-    )
+def prior_census(read: state_docs.StateRead[census_state.CensusState]) -> PriorCensus:
+    """The previous run as :func:`census_state.load` read it."""
+    match read:
+        case state_docs.Ok(value=state):
+            return PriorCensus(
+                last_census_at=state.last_census_at,
+                run_id=state.last_census_run_id,
+                as_of_sha=state.last_census_as_of_sha,
+            )
+        case state_docs.Missing() | state_docs.Malformed():
+            return PriorCensus()
+        case _:
+            assert_never(read)
 
 
 @dataclass(frozen=True)

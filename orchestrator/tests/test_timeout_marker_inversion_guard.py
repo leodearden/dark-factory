@@ -2,9 +2,10 @@
 
 THE RULE, in one line: a marker at ``DELIBERATE_TIGHT_BOUND_CEILING < N <
 VERIFY_CLI_PER_TEST_TIMEOUT`` is too large to read as a deliberate tight bound
-and still sits below the budget verify passes, so the loosening its author
-meant for a slow test silently TIGHTENS the verify run that gates their merge,
-because a pytest-timeout marker is a two-way override and never a floor.
+and still sits below the budget verify passes, so under verify it grants LESS
+than no marker at all -- a slow test's opt-out inverted into a clamp on the
+run that gates the merge, because a pytest-timeout marker is a two-way
+override and never a floor.
 
 The derivation -- the ``pytest_timeout._get_item_settings`` precedence it
 follows from and the three regimes the two budgets carve out -- has ONE home:
@@ -21,10 +22,9 @@ the judgement with its messages (``judge_inversion_band``) live in
 ``shared.testing_timeout_markers``.  This module instantiates them for
 ``orchestrator/tests`` with an empty allowlist and adds the orchestrator-only
 pins: the sanctioned-name mirrors, the deep-gate and deep-landing spellings,
-and the spawn budgets.  fused-memory and shared instantiate the same guard in
-their own ``tests/test_timeout_marker_inversion_guard.py``.  tests/,
-scripts/tests and escalation remain unguarded: follow-up ticket
-tkt_0RVDQ4R6X8T1H3EAEG855VPGCT.
+and the spawn budgets.  fused-memory, shared and escalation instantiate the
+same guard in their own ``tests/test_timeout_marker_inversion_guard.py``, and
+tests/scripts and scripts/tests do too, in their own directory (task 6338).
 
 WHAT THIS DOES NOT DUPLICATE.  test_whole_tree_scan_timeout_guard.py polices a
 per-FILE family invariant using MODULE-LEVEL marks only; test_marker_
@@ -61,7 +61,6 @@ from _orch_helpers import (
     ORCH_DIR,
     PYPROJECT_DEFAULT_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
-    WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 from shared.testing_timeout_markers import (
@@ -75,6 +74,10 @@ from shared.testing_timeout_markers import (
     scan_python_tree,
     timeout_marker_sites,
     verify_cli_timeout,
+)
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    WHOLE_TREE_SCAN_TIMEOUT_NAME,
 )
 
 # This module is ITSELF a whole-tree AST scanner -- it rglob()s every *.py
@@ -148,9 +151,9 @@ _SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
 #: Names a ``pytest.mark.timeout(...)`` argument may resolve to, and the
 #: seconds each one carries.  A literal MAP rather than an import, because none
 #: of the three is importable from ``_orch_helpers``: two are defined
-#: FILE-LOCALLY in the modules that use them --
-#: ``HEAVY_BARRIER_TEST_TIMEOUT = 540``
-#: (test_merge_queue_concurrent_verify.py) and ``PYTEST_TIMEOUT = 960``
+#: outside it -- ``HEAVY_BARRIER_TEST_TIMEOUT = 540`` in the shared support
+#: module orchestrator/tests/_merge_worker_drive.py, and, FILE-LOCALLY,
+#: ``PYTEST_TIMEOUT = 960``
 #: (test_warm_lane_bash_suite.py -- test_pytest_marker_deselection.py's
 #: identical line is inside a string FIXTURE, so it is not a binding, which
 #: :class:`TestSanctionedNameMirrors` measures rather than assumes).
@@ -173,13 +176,18 @@ _SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
 #: definition out of the tree and fails if the two disagree.  This map is a
 #: cache of those definitions, never a claim about them.
 _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
-    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 1200.0,
+    WHOLE_TREE_SCAN_TIMEOUT_NAME: float(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     'HEAVY_BARRIER_TEST_TIMEOUT': 540.0,
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
     'DEEP_GATE_SCENE_TEST_TIMEOUT': float(DEEP_GATE_SCENE_TEST_TIMEOUT),
     'DEEP_LANDING_SCENE_TEST_TIMEOUT': float(DEEP_LANDING_SCENE_TEST_TIMEOUT),
 }
+
+#: The sanctioned names defined OUTSIDE this directory.  Each entry above is
+#: imported from its one home, so it cannot drift from it, and no binding
+#: under :data:`_TESTS_DIR` exists for :class:`TestSanctionedNameMirrors` to find.
+_SANCTIONED_NAMES_DEFINED_ELSEWHERE = frozenset({WHOLE_TREE_SCAN_TIMEOUT_NAME})
 
 
 def _parse(source: str) -> ast.Module | None:
@@ -521,12 +529,19 @@ def _sanctioned_bindings_in(tree: ast.Module, module: str) -> list[_Binding]:
 class TestVerifyCliBudgetConstant:
     """``VERIFY_CLI_PER_TEST_TIMEOUT`` -- the budget the whole guard is built on.
 
-    Pinned here for the same reason ``PYPROJECT_DEFAULT_TIMEOUT`` is pinned by
-    test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants: a shared
-    timeout constant that merely *claims* in a comment to mirror a config file
-    is drift-prone, and the executable link is what makes the claim true.  This
-    class is that shape one anchor over -- it reads the REAL
-    orchestrator/orchestrator.yaml at runtime instead of citing a line number.
+    A MIRROR PIN, deliberately loud on a retune.  The sweep reads its band from
+    the yaml, and :func:`test_the_verify_budget_is_configured` checks that band
+    is non-empty; neither needs this constant.  What the pin protects is the
+    CONSTANT's honesty, which other checks rest on: the
+    ``faulthandler_timeout`` bound in TestTimeoutConstants, the deep-scene
+    ``test_the_timeout_never_inverts_the_verify_budget`` floors, and every
+    marker that spells the name.
+
+    Its red is deliberate.  On an upward retune the sweep goes red anyway, over
+    every site spelling this name, and its remedy names the spelling those
+    sites already use; this is the one red test whose message names the fix.
+    The ``--timeout`` lives in a tracked merge-verify config whose own verify
+    runs this test, so a retune moves the constant in the same commit.
     """
 
     def test_the_inversion_band_is_non_empty(self) -> None:
@@ -539,14 +554,9 @@ class TestVerifyCliBudgetConstant:
         not because nothing does.  Asserted rather than assumed: the upper edge
         mirrors a config file that moves independently.
 
-        THIS EXACT COLLAPSE HAPPENED ONCE (2026-09-12, commit 64e24b547f), back
-        when the lower edge mirrored the ini default and that default was
-        raised 60 -> 300 fleet-wide.  That default has since moved AGAIN, to 540
-        (2026-09-17, task 5442, this time derived from measurement rather than
-        picked) -- so had the edge stayed a mirror it would now sit ABOVE the
-        upper one and invert the band rather than merely emptying it.  See
-        shared/src/shared/testing_timeout_markers.py::DELIBERATE_TIGHT_BOUND_CEILING
-        for why the edge is a literal.
+        The lower edge once mirrored the ini default and collapsed with it
+        (64e24b547f); why it is now a literal:
+        shared/src/shared/testing_timeout_markers.py::DELIBERATE_TIGHT_BOUND_CEILING.
         """
         assert DELIBERATE_TIGHT_BOUND_CEILING < VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING}, '
@@ -559,15 +569,14 @@ class TestVerifyCliBudgetConstant:
     def test_constant_mirrors_the_real_verify_test_command(self) -> None:
         """``VERIFY_CLI_PER_TEST_TIMEOUT`` must equal the ``--timeout`` verify really passes.
 
-        THE DRIFT PIN.  The constant is deliberately a literal ``300`` rather
-        than an expression over ``PYPROJECT_DEFAULT_TIMEOUT`` (see its comment
-        in _orch_helpers.py), which means nothing about the Python source keeps
-        it honest.  THIS test is what does: it re-reads
-        ``orchestrator/orchestrator.yaml``'s ``test_command`` and extracts the
-        ``--timeout`` token that pytest-timeout will actually see as
-        ``config._env_timeout``.  If an operator retunes that flag, the band's
-        upper edge moves with it and this fails loudly instead of leaving the
-        guard silently policing a budget nobody passes any more.
+        THE DRIFT PIN.  The constant is deliberately a literal, which means
+        nothing about the Python source keeps it honest.  THIS test is what
+        does: it re-reads ``orchestrator/orchestrator.yaml``'s ``test_command``
+        and extracts the ``--timeout`` token that pytest-timeout will actually
+        see as ``config._env_timeout``.  If an operator retunes that flag, the
+        sweep's band moves with it, because the sweep reads the yaml; what goes
+        stale is the CONSTANT, and every marker and assertion built on it.
+        This fails loudly so the constant moves too.
         """
         test_command = _verify_test_command()
 
@@ -584,11 +593,12 @@ class TestVerifyCliBudgetConstant:
         assert configured == VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}) no '
             f'longer mirrors --timeout={configured} in {_ORCH_YAML}. Update the '
-            'constant in orchestrator/tests/_orch_helpers.py -- the inversion '
-            'band this module polices is (DELIBERATE_TIGHT_BOUND_CEILING, '
-            'VERIFY_CLI_PER_TEST_TIMEOUT), so a stale upper edge either lets a '
-            'genuinely-inverting marker through or manufactures false '
-            'offenders.'
+            'constant in orchestrator/tests/_orch_helpers.py. Until then every '
+            'marker spelled VERIFY_CLI_PER_TEST_TIMEOUT is judged at the stale '
+            "value against the yaml's budget, so a raise reports them all as "
+            'offenders, and the assertions built on the constant check a '
+            'budget verify no longer passes. Why this red is deliberate: '
+            "TestVerifyCliBudgetConstant's docstring."
         )
 
 
@@ -603,8 +613,9 @@ class TestSanctionedNameMirrors:
     the sweep stays green over a live inversion.
 
     THE CASE this closes:
-    ``HEAVY_BARRIER_TEST_TIMEOUT`` (test_merge_queue_concurrent_verify.py) is
-    defined file-locally -- lower it by hand from 540 to 225 and every site
+    ``HEAVY_BARRIER_TEST_TIMEOUT`` is defined in the shared support module
+    orchestrator/tests/_merge_worker_drive.py, not in ``_orch_helpers`` --
+    lower it by hand from 540 to 225 and every site
     marked with it really pins 225s while this map still answers 540.  And
     because ``timeout_marker_sites`` matches on the TRAILING
     name only, a NEW file-local ``PYTEST_TIMEOUT = 120`` anywhere under this
@@ -657,7 +668,9 @@ class TestSanctionedNameMirrors:
         empty binding list.
         """
         defined = {binding.name for binding in _tree_scan().bindings}
-        undefined = sorted(set(_SANCTIONED_TIMEOUT_NAMES) - defined)
+        undefined = sorted(
+            set(_SANCTIONED_TIMEOUT_NAMES) - _SANCTIONED_NAMES_DEFINED_ELSEWHERE - defined
+        )
 
         assert not undefined, (
             f'_SANCTIONED_TIMEOUT_NAMES mirrors {undefined}, which no longer '
@@ -2068,13 +2081,21 @@ def _verdict() -> InversionVerdict:
     )
 
 
+def test_the_verify_budget_is_configured() -> None:
+    """The yaml's own ``--timeout`` must leave the band non-empty, read from the
+    yaml and never from ``VERIFY_CLI_PER_TEST_TIMEOUT``.
+    """
+    failure = _verdict().budget_failure
+    assert failure is None, failure
+
+
 def test_no_timeout_marker_sits_in_the_inversion_band() -> None:
     """No marker anywhere under this directory may sit in the inversion band.
 
     A marker at ``DELIBERATE_TIGHT_BOUND_CEILING < N <
     VERIFY_CLI_PER_TEST_TIMEOUT`` is too large to read as a deliberate tight
-    bound, so it was written to give a slow test room -- and it silently
-    becomes a TIGHTENING under verify's CLI budget.  Under
+    bound, yet grants less than verify's budget would with no marker at all.
+    Under
     ``timeout_method = "thread"`` a breach is not a red test: pytest-timeout
     ``os._exit()``s the xdist worker, ``--max-worker-restart=0`` declines to
     replace it, and the session is truncated with the blame landing on

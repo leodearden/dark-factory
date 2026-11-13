@@ -1,16 +1,18 @@
-"""μ methodology report layer in evals/report.py (task 2478).
+"""μ methodology report layer in evals/composite_report.py (task 2478).
 
 Pure-function tests over λ's ``build_composite_report``-shaped dict:
   step-13/14  select_survivors (top-K config names per role_under_test)
   step-15/16  build_methodology_report / format_methodology_report (nested stages)
 
-Every test is hermetic: it constructs the composite-report dict directly (the
-only fields select_survivors consumes are ``configs[].config`` /
-``role_under_test`` / ``composite``) — no EvalResult, no I/O, no LLM.
+Every test is hermetic. The ranking tests construct the composite-report dict
+directly (the only fields select_survivors consumes are ``configs[].config`` /
+``role_under_test`` / ``composite``); the boundary tests at the end build cells
+into a tmp ResultStore and read them back through the real report. No LLM.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
@@ -60,7 +62,7 @@ def _report(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 class TestSelectSurvivors:
     def test_top_k_per_role_ranked_by_descending_composite(self):
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('impl-a', 'implementer', 0.90),
@@ -79,7 +81,7 @@ class TestSelectSurvivors:
         }
 
     def test_ties_broken_deterministically_by_config_name(self):
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         # Equal composites → deterministic ascending config-name tiebreak, so the
         # alphabetically-first name outranks. Rows given out of order to prove the
@@ -98,7 +100,7 @@ class TestSelectSurvivors:
         }
 
     def test_fewer_than_k_rows_returns_all_present(self):
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([_row('impl-a', 'implementer', 0.9)])
 
@@ -108,7 +110,7 @@ class TestSelectSurvivors:
         }
 
     def test_role_with_no_rows_returns_empty_list(self):
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([_row('impl-a', 'implementer', 0.9)])
 
@@ -118,7 +120,7 @@ class TestSelectSurvivors:
         assert survivors['implementer'] == ['impl-a']
 
     def test_only_requested_roles_are_returned(self):
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('impl-a', 'implementer', 0.9),
@@ -141,7 +143,7 @@ class TestSelectSurvivors:
         composites tie, the meaningful secondary signal is ``plan_quality``, so
         the alphabetically-FIRST row must LOSE when its plan_quality is lower.
         """
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('arch-fable-high', 'architect', 0.0, plan_quality=0.40),
@@ -162,7 +164,7 @@ class TestSelectSurvivors:
         Fixing the composite alone would leave the same alphabet-decides-it trap
         armed for the next pair of genuinely-tied real composites.
         """
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('arch-a', 'architect', 0.94, plan_quality=0.70),
@@ -180,7 +182,7 @@ class TestSelectSurvivors:
         that genuinely scored zero and then win the alphabetical tiebreak —
         promoting the candidate we know least about.
         """
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             # Alphabetically first, but nothing about it was measurable.
@@ -198,7 +200,7 @@ class TestSelectSurvivors:
         }
 
     def test_missing_plan_quality_sorts_after_an_equal_composite_row(self):
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('arch-a', 'architect', 0.50, plan_quality=None),
@@ -214,7 +216,7 @@ class TestSelectSurvivors:
     def test_workflow_rows_keep_todays_exact_ordering(self):
         """Regression: implementer rows carry no plan_quality, so the added axis
         is inert for them and the existing surface stays byte-stable."""
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('zeta', 'implementer', 0.90),
@@ -244,7 +246,7 @@ class TestSelectSurvivors:
         every axis that carries signal — makes ``plan_rate`` the axis that
         should decide here.
         """
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             # Alphabetically FIRST, and the LESS reliable of the two.
@@ -269,7 +271,7 @@ class TestSelectSurvivors:
         config that genuinely never planned, and a bare ``or 1.0`` would let it
         win outright.
         """
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('arch-aaa', 'architect', 0.50, plan_quality=0.50,
@@ -295,7 +297,7 @@ class TestSelectSurvivors:
         third time for the same failing cells, so a strictly better planner must
         still win despite a worse plan_rate.
         """
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('arch-reliable', 'architect', 0.50, plan_quality=0.40,
@@ -310,7 +312,7 @@ class TestSelectSurvivors:
 
     def test_plan_rate_never_outranks_composite(self):
         """…and likewise below the primary axis."""
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('arch-reliable', 'architect', 0.50, plan_quality=0.90,
@@ -326,7 +328,7 @@ class TestSelectSurvivors:
     def test_workflow_rows_are_inert_under_the_new_axis(self):
         """Regression: an implementer row carries no plan_rate, so the added
         axis changes nothing about today's workflow ordering."""
-        from orchestrator.evals.report import select_survivors
+        from orchestrator.evals.composite_report import select_survivors
 
         report = _report([
             _row('zeta', 'implementer', 0.90, plan_rate=None),
@@ -366,7 +368,7 @@ def _res(task_id: str, config: str, role: str, composite_score: float):
 
 class TestMethodologyReport:
     def test_build_nests_three_stages_plus_survivors_winner_price(self):
-        from orchestrator.evals.report import build_methodology_report
+        from orchestrator.evals.composite_report import build_methodology_report
 
         ofat = [
             _res('fix1', 'impl-a', 'implementer', 0.9),
@@ -398,7 +400,7 @@ class TestMethodologyReport:
         assert report['price_table'] == price_table
 
     def test_build_is_deterministic_modulo_generated_at(self):
-        from orchestrator.evals.report import build_methodology_report
+        from orchestrator.evals.composite_report import build_methodology_report
 
         def _mk():
             return build_methodology_report(
@@ -415,7 +417,7 @@ class TestMethodologyReport:
         assert r1 == r2
 
     def test_format_renders_stages_header_and_price(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.composite_report import (
             build_methodology_report,
             format_methodology_report,
         )
@@ -442,7 +444,7 @@ class TestMethodologyReport:
         assert 'price table:' in text
 
     def test_format_is_byte_stable_across_wall_clock(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.composite_report import (
             build_methodology_report,
             format_methodology_report,
         )
@@ -461,3 +463,94 @@ class TestMethodologyReport:
         # byte-identically: format renders no wall-clock, sorts rows/sections,
         # and fixes float precision.
         assert format_methodology_report(_mk()) == format_methodology_report(_mk())
+
+
+# ---------------------------------------------------------------------------
+# task 6738 — a cell persisted before roles were stamped on every cell carries no
+# role_under_test; it loads as an implementer cell, so the survivor gate sees it.
+# ---------------------------------------------------------------------------
+
+class TestSurvivorGateOverLegacyCells:
+    def test_roleless_cells_survive_as_implementers(self, tmp_path: Path):
+        from orchestrator.evals.composite_report import build_composite_report, select_survivors
+        from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+        from orchestrator.evals.results import EvalResult, ResultStore
+
+        store = ResultStore(tmp_path / 'results')
+
+        def save(config: str, run_id: str, metrics: dict[str, Any]) -> None:
+            store.save(EvalResult(
+                task_id='df_task_1', config_name=config, outcome='done',
+                metrics=metrics, worktree_path='/fake/wt', run_id=run_id,
+            ))
+
+        for run_id in ('r1', 'r2'):
+            legacy = EvalMetrics(
+                tests_pass=True, composite_score=0.8, cost_usd=2.0,
+                workflow_duration_ms=900_000, plan_steps=3,
+            ).to_dict()
+            del legacy['role_under_test']
+            save('claude-sonnet-max', run_id, legacy)
+        save('architect-opus-high', 'r3', EvalMetrics(
+            role_under_test=RoleUnderTest.ARCHITECT, plan_quality=0.7, plan_steps=4,
+            cost_usd=0.3, workflow_duration_ms=60_000, terminal_kind='planned',
+        ).to_dict())
+
+        survivors = select_survivors(
+            build_composite_report(store.load_all()),
+            top_k=3, roles=['implementer', 'architect'],
+        )
+
+        assert survivors == {
+            'implementer': ['claude-sonnet-max'],
+            'architect': ['architect-opus-high'],
+        }
+
+
+# ---------------------------------------------------------------------------
+# task 6738 — role readers read an enum-valued role (a cell from the new
+# producers, or any cell after load) exactly as they read its string value.
+# ---------------------------------------------------------------------------
+
+class TestRoleReadersAcceptTheEnum:
+    def test_enum_roles_select_what_their_values_select(self):
+        from orchestrator.evals.composite_report import select_survivors
+        from orchestrator.evals.metrics import RoleUnderTest
+
+        report = _report([
+            _row('impl-a', 'implementer', 0.9),
+            _row('impl-b', RoleUnderTest.IMPLEMENTER, 0.7),
+            _row('impl-c', 'implementer', 0.5),
+            _row('arch-a', RoleUnderTest.ARCHITECT, 0.4, plan_quality=0.8),
+            _row('arch-b', 'architect', 0.3, plan_quality=0.6),
+        ])
+
+        by_enum = select_survivors(
+            report, top_k=2, roles=(RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT),
+        )
+        by_value = select_survivors(report, top_k=2, roles=['implementer', 'architect'])
+
+        assert by_enum == by_value == {
+            'implementer': ['impl-a', 'impl-b'],
+            'architect': ['arch-a', 'arch-b'],
+        }
+
+    def test_select_judge_results_keeps_only_judge_cells(self):
+        from orchestrator.evals.judge_pilot import select_judge_results
+        from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+        from orchestrator.evals.results import EvalResult
+
+        def cell(config: str, role: RoleUnderTest) -> EvalResult:
+            return EvalResult(
+                task_id='df_task_1', config_name=config, outcome='done',
+                metrics=EvalMetrics(role_under_test=role).to_dict(), worktree_path='/fake/wt',
+            )
+
+        judge = cell('judge-haiku', RoleUnderTest.JUDGE)
+        cells = [
+            cell('claude-sonnet-max', RoleUnderTest.IMPLEMENTER),
+            judge,
+            cell('architect-opus-max+claude-sonnet-max', RoleUnderTest.END_TO_END),
+        ]
+
+        assert select_judge_results(cells) == [judge]

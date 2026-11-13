@@ -19,7 +19,7 @@ from _fm_helpers import (
     make_zero_byte_task_store,
 )
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'correct_found_on_main_backlog.py'
 
@@ -918,7 +918,7 @@ class TestRunTargetStorePreflight:
             project_root=str(tmp_path), config=None, ref='main', apply=apply,
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(args)
 
         assert constructions == []
@@ -929,7 +929,7 @@ class TestRunTargetStorePreflight:
             project_root=str(tmp_path), config=None, ref='main', apply=False,
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(args)
 
         assert not (tmp_path / '.taskmaster').exists()
@@ -945,7 +945,7 @@ class TestRunTargetStorePreflight:
             project_root=str(tmp_path), config=None, ref='main', apply=False,
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(args)
 
         assert constructions == []
@@ -964,7 +964,7 @@ class TestRunTargetStorePreflight:
             project_root=str(tmp_path), config=None, ref='main', apply=True,
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(args)
 
         assert _mod._apply_exit_code({'errors': 0, 'reopen_failed': []}) == 0

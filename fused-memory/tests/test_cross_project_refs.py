@@ -304,7 +304,8 @@ class TestTaskColonMentionsCreateAmbiguity:
     def test_word_glued_colon_lookalikes_are_not_bare_mentions(self):
         """'subtask: 2500' is NOT a bare mention of task 2500, mirroring
         TestAmbiguousRefs::test_word_glued_task_lookalikes_are_not_bare_mentions
-        and _TASK_NODE_NAME_PATTERN's documented refusal to match 'subtask 5'.
+        and parse_node_name's refusal of 'subtask 5', whose anchored rule
+        needs the task word to open the name.
 
         This is the regression guard for the new colon pattern's lookbehind:
         without it, 'tasks?\\s*:\\s*\\d+' would match the 'task: 2500' substring
@@ -407,10 +408,10 @@ class TestKnownProjectIdsAllowlist:
         disable cross-project detection entirely on a registry misconfigured
         with project ROOTS where project IDs were expected.
 
-        Enforces ``canonical_labels._canonical_allowlist``'s stated contract
-        ("one bad entry never disables the whole allowlist") at the public API,
-        and mirrors ``validate_known_project_id``'s permissive falsy-registry
-        mode.
+        Enforces at the public API that scan_content skips a path-shaped entry
+        rather than disabling the whole allowlist, and narrows only when a
+        usable entry is left. Mirrors ``validate_known_project_id``'s
+        permissive falsy-registry mode.
         """
         scan = find_cross_project_task_refs(
             'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from orchestrator.git_ops import GitOps
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 StatusCheck = Callable[[list[str]], Awaitable[Mapping[str, str]]]
 RedriveMember = Callable[[str, bool, str | None], Awaitable[None]]

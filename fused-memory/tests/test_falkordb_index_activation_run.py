@@ -28,8 +28,12 @@ from shared.memory_eval_metrics import (
     parse_metric_series,
     serialize_metric_series,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.eval import retrieval_probe
 from fused_memory.reconciliation.index_health import summarize_index_health
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 RUN_ROOT = REPO_ROOT / 'plans' / 'falkordb-index-activation-run'
@@ -245,7 +249,7 @@ class TestTheE1SecondaryIsAValidM1Artifact:
 
     def test_the_briefing_task_semantic_item_is_adjudicated(self):
         series = load_metric_series(_e1_run()[0])
-        (tripwire,) = [m for m in series.metrics if m.metric_id == _e1().METRIC_TOPIC_CANONICAL_PRESENT]
+        (tripwire,) = [m for m in series.metrics if m.metric_id == retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT]
 
         assert BRIEFING_TASK_SEMANTIC_ITEM in {item.item_key for item in tripwire.items or []}
 

@@ -50,6 +50,9 @@ from shared.decision_pairing import (
     detect_mispairing,
     scan_design_decisions,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Specimens, paraphrased from live victim plans.

@@ -10,6 +10,7 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import ClassificationFallback, MemoryCategory
 from fused_memory.models.memory import ClassificationResult
 from fused_memory.routing.json_extract import extract_json
+from fused_memory.routing.openai_client import LazyOpenAIClient
 
 logger = logging.getLogger(__name__)
 
@@ -57,22 +58,20 @@ Respond as JSON:
 
 
 class WriteClassifier:
-    """Classifies content into a MemoryCategory for write routing."""
+    """Classifies content into a MemoryCategory for write routing.
+
+    An injected ``openai_client`` is owned by the classifier: ``close()`` releases it.
+    """
 
     def __init__(
         self, config: FusedMemoryConfig, *, openai_client: AsyncOpenAI | None = None,
     ):
         self.config = config
-        self._openai_client: AsyncOpenAI | None = openai_client
+        self._openai = LazyOpenAIClient(config, openai_client)
 
-    def _get_openai_client(self) -> AsyncOpenAI:
-        if self._openai_client is None:
-            cfg = self.config.llm
-            api_key = None
-            if cfg.providers.openai:
-                api_key = cfg.providers.openai.api_key
-            self._openai_client = AsyncOpenAI(api_key=api_key)
-        return self._openai_client
+    async def close(self) -> None:
+        """Release the AsyncOpenAI this classifier holds, built or injected."""
+        await self._openai.close()
 
     async def classify(self, content: str) -> ClassificationResult:
         """Classify content — heuristic first, LLM fallback."""
@@ -130,7 +129,7 @@ class WriteClassifier:
 
     async def _llm_classify(self, content: str) -> ClassificationResult:
         """Use LLM for classification."""
-        client = self._get_openai_client()
+        client = self._openai.get()
         try:
             response = await client.chat.completions.create(
                 model=self.config.llm.model,

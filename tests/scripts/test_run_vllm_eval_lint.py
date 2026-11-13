@@ -7,6 +7,11 @@ sys.path manipulation (runpod_toolkit, orchestrator.evals.configs, etc.).
 import ast
 import pathlib
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 SCRIPT = pathlib.Path(__file__).parents[2] / "scripts" / "run_vllm_eval.py"
 
 

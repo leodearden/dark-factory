@@ -34,11 +34,16 @@ Three independent early-return gates in :func:`check`:
    evidence for (task 3751) and an in-progress task whose only "live"
    signals are a lingering worktree registration and that same lock is
    downgraded when no fresh per-task signal corroborates it (task 2964 —
-   see :func:`check`'s Gate 2 paragraph). Those four inputs are exactly the
-   tuple ``reconciliation/live_workflow_section.py``'s
+   see :func:`check`'s Gate 2 paragraph). Those four renderer-shared inputs
+   are exactly the tuple ``reconciliation/live_workflow_section.py``'s
    ``render_live_workflow_section`` passes, which is the invariant task
-   2964 exists to establish: this gate and the render-time Live-Workflow
-   Signals section must never disagree about the same task.
+   2964 exists to establish: the render-time Live-Workflow Signals section
+   must never call a task not-live while this gate rejects writes to it.
+   Gate 2 adds one Gate-2-only input (task 8330): ``dependency_statuses``,
+   read by :func:`read_dependency_statuses`, feeds the detector's rule 6. The
+   remaining disagreement therefore runs one way only: the renderer can
+   over-report such a task as live, never under-report it. Parity is task
+   8385.
 3. ``snapshot_token is not None`` AND it disagrees with ``live_status``
    (op-agnostic) -> ``ReconStaleSnapshotRejected``.
 
@@ -57,23 +62,26 @@ function that always runs its gates when called.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
+    is_unclaimed_awaiting_dependency,
     is_workflow_live_for_task,
 )
 from fused_memory.services.orchestrator_detector import orchestrator_started_at
+from fused_memory.utils.task_dependency_ids import task_dependency_ids
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +286,50 @@ def _reject(
 
 
 # ---------------------------------------------------------------------------
+# read_dependency_statuses() (task 8330)
+# ---------------------------------------------------------------------------
+
+
+class DependencyStatusReader(Protocol):
+    """The slice of ``TaskBackendProtocol`` that :func:`read_dependency_statuses` needs."""
+
+    async def get_statuses_raw(
+        self, project_root: str, tag: str | None = None, ids: list[str] | None = None,
+    ) -> dict[str, str]: ...
+
+
+async def read_dependency_statuses(
+    reader: DependencyStatusReader,
+    task_snapshot: object,
+    *,
+    project_root: str,
+    tag: str | None,
+) -> Mapping[str, str] | None:
+    """Read the statuses of *task_snapshot*'s dependencies for :func:`check`'s Gate 2.
+
+    One batch read, and none at all for a non-dict snapshot or a task with no
+    dependency ids. Returns ``None`` in those cases and, logged at WARNING,
+    when the read raises; ``None`` leaves detector rule 6 inert, so a failure
+    fails safe toward live.
+    """
+    if not isinstance(task_snapshot, dict):
+        return None
+    dep_ids = task_dependency_ids(task_snapshot)
+    if not dep_ids:
+        return None
+    try:
+        return await reader.get_statuses_raw(project_root, tag=tag, ids=dep_ids)
+    except Exception:
+        logger.warning(
+            'recon_write_policy.read_dependency_statuses: dependency status read failed '
+            'for task_id=%s; rule 6 stays inert (fail-safe toward live)',
+            task_snapshot.get('id'),
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # check()
 # ---------------------------------------------------------------------------
 
@@ -294,6 +346,7 @@ async def check(
     is_annotation_clear: bool = False,
     task_metadata: object = None,
     task_snapshot: object = None,
+    dependency_statuses: Mapping[str, str] | None = None,
 ) -> Verdict:
     """Decide whether a recon-stage caller may perform *op* on *task_id*.
 
@@ -339,10 +392,11 @@ async def check(
     the caller already holds it. It is OPTIONAL and defaults to ``None``, in
     which case the derived ``task_kind=None`` / ``pure_gate=False``
     reproduce the prior behavior EXACTLY — every caller that does not pass
-    it is unaffected. It is coerced once via :func:`_coerce_metadata_dict`
-    (dict or JSON-object string; anything else — invalid JSON, a list, a
-    number — degrades to ``None``), so a malformed blob fails safe TOWARD
-    live rather than raising. The coercion happens only inside the
+    it is unaffected. It is resolved once through
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`
+    (anything unreadable — invalid JSON, a list, a number — reads as empty
+    and is logged), so a malformed blob fails safe TOWARD live rather than
+    raising. The coercion happens only inside the
     ``set_task_status`` branch, so no other gate pays for it. Two detector
     inputs are derived from it:
 
@@ -391,8 +445,9 @@ async def check(
     it, for two reasons: (1) corroboration reads TOP-LEVEL
     ``claimant_run_id``/``heartbeat_at``, which a ``metadata`` payload
     structurally cannot supply; (2) ``task_metadata``'s task-3751 contract
-    deliberately accepts a JSON-object *string* and is coerced by
-    :func:`_coerce_metadata_dict` — a contract a task dict does not satisfy
+    deliberately accepts a JSON-object *string* and is resolved by
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict` — a
+    contract a task dict does not satisfy
     and which this task leaves completely untouched. The two are expected
     to come from ONE snapshot (``task_interceptor`` passes the same
     ``before`` dict it already read ``live_status`` and ``task_metadata``
@@ -420,6 +475,13 @@ async def check(
     the write is still rejected. ``None`` and ``False`` are therefore NOT
     interchangeable here. Only an explicit ``False`` — the caller positively
     found no fresh per-task signal — changes this gate's verdict.
+
+    ``dependency_statuses`` (task 8330) is the ``{dep_id: status}`` map of the
+    task's dependencies, normally from :func:`read_dependency_statuses`. With
+    ``task_snapshot`` it feeds :func:`is_unclaimed_awaiting_dependency`, whose
+    verdict is forwarded as ``unclaimed_awaiting_dependency`` and keys
+    detector rule 6, which drops the bare lock for a task the scheduler will
+    not dispatch. An absent or unreadable map leaves the rule inert.
 
     Gate 3 (stale snapshot, op-agnostic, checked last): ``snapshot_token is
     not None`` AND it disagrees with ``live_status`` ->
@@ -458,12 +520,12 @@ async def check(
 
     if op == 'set_task_status':
         # Derived inside this branch only — no other gate pays for the
-        # coercion. `_coerce_metadata_dict` yields None for anything that is
-        # not a dict / JSON-object string, so a malformed or absent blob
+        # coercion. `raw_metadata_dict` reads anything that is not a dict /
+        # JSON-object string as empty, so a malformed or absent blob
         # degrades to task_kind=None / pure_gate=False: fail-safe TOWARD
         # live. See this function's Gate 2 docstring paragraph for what the
-        # two derived values unlock (detector rules 2/3/5).
-        parsed_metadata = _coerce_metadata_dict(task_metadata)
+        # two derived values unlock (detector rules 2/3/5/6).
+        parsed_metadata = raw_metadata_dict(task_metadata, source='recon_write_policy.check')
         # Per-task corroboration (task 2964). Computed inside this branch only,
         # and only for an in-progress task — see _corroboration_verdict and this
         # function's Gate 2 docstring paragraph. It performs two blocking on-disk
@@ -482,8 +544,11 @@ async def check(
             task_id,
             project_root,
             status=live_status,
-            task_kind=(parsed_metadata or {}).get('task_kind'),
+            task_kind=parsed_metadata.get('task_kind'),
             pure_gate=is_pure_gate_metadata(parsed_metadata),
+            unclaimed_awaiting_dependency=is_unclaimed_awaiting_dependency(
+                task_snapshot, dependency_statuses,
+            ),
             corroborated=corroborated,
         ):
             return _reject(
@@ -547,28 +612,6 @@ async def check(
 # ---------------------------------------------------------------------------
 
 
-def _coerce_metadata_dict(metadata: object) -> dict | None:
-    """Coerce an ``update_task``-style ``metadata`` payload to a ``dict``.
-
-    Shared coercion idiom (factored out of :func:`extract_snapshot_token`,
-    task 2684) mirroring ``_reject_done_provenance_in_update_metadata``'s
-    inline coercion in ``task_interceptor.py``. A ``dict`` passes through
-    unchanged; a ``str`` is parsed via ``json.loads`` and kept only if the
-    result is itself a ``dict``. Anything else — including a JSON string
-    that parses to a non-dict (e.g. a list), invalid JSON, or a non-str/dict
-    value such as ``None`` or ``42`` — returns ``None``.
-    """
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        try:
-            loaded = json.loads(metadata)
-        except (ValueError, TypeError):
-            return None
-        return loaded if isinstance(loaded, dict) else None
-    return None
-
-
 def _corroboration_verdict(
     task_id: str,
     project_root: str,
@@ -593,8 +636,8 @@ def _corroboration_verdict(
     corroborates the workflow, ``False`` when none does.
 
     The two on-disk reads are per-project constants for this call, each wrapped
-    fail-safe to ``None``: ``read_scheduler_state`` (which already returns an
-    empty skeleton for an absent/invalid file) and ``orchestrator_started_at``
+    fail-safe to ``None``: ``read_scheduler_state`` (which already returns
+    ``SchedulerStateSnapshot.empty()`` for an absent/invalid file) and ``orchestrator_started_at``
     (the restart boundary parsed from the lock's ``started <ISO>`` token). Both
     are blocking, which is why :func:`check` dispatches this function through
     ``asyncio.to_thread`` (task 3778). It deliberately stays SYNCHRONOUS: an
@@ -611,7 +654,7 @@ def _corroboration_verdict(
         return None
 
     try:
-        scheduler_state: dict | None = read_scheduler_state(Path(project_root))
+        scheduler_state: SchedulerStateSnapshot | None = read_scheduler_state(Path(project_root))
     except Exception:
         scheduler_state = None
     try:
@@ -641,7 +684,8 @@ def _corroboration_verdict(
 def extract_snapshot_token(metadata: object) -> str | None:
     """Extract the snapshot status token from ``update_task``'s ``metadata`` kwarg.
 
-    Coerces *metadata* via :func:`_coerce_metadata_dict`. Returns the value
+    Resolves *metadata* through
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`. Returns the value
     of the first :data:`SNAPSHOT_TOKEN_KEYS` entry present, when that value
     is itself a non-empty ``str``. Returns ``None`` when *metadata* is not a
     dict / JSON-object string, contains neither key, or the first present
@@ -649,9 +693,7 @@ def extract_snapshot_token(metadata: object) -> str | None:
     bool) — such values are treated as an absent token rather than coerced
     via ``str()``, so they can never spuriously disagree with a live status.
     """
-    parsed = _coerce_metadata_dict(metadata)
-    if parsed is None:
-        return None
+    parsed = raw_metadata_dict(metadata, source='recon_write_policy.extract_snapshot_token')
     for key in SNAPSHOT_TOKEN_KEYS:
         if key in parsed:
             val = parsed[key]
@@ -691,8 +733,9 @@ def _pure_terminal_annotation_merge(update_kwargs: dict) -> dict | None:
         load-bearing keys; ``additive`` cannot overwrite/clear the target key
         (scalar-collision old-wins) — only ``merge`` both preserves other keys
         and overwrites the target.
-    (c) ``update_kwargs['metadata']`` coerces (via :func:`_coerce_metadata_dict`)
-        to a non-empty ``dict`` — the dict returned on success.
+    (c) ``update_kwargs['metadata']`` resolves (via
+        :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`) to a
+        non-empty ``dict`` — the dict returned on success.
     """
     if any(
         key not in _ANNOTATION_CLEAR_ALLOWED_KWARGS and value is not None
@@ -706,7 +749,9 @@ def _pure_terminal_annotation_merge(update_kwargs: dict) -> dict | None:
     if not is_merge_mode:
         return None
 
-    parsed = _coerce_metadata_dict(update_kwargs.get('metadata'))
+    parsed = raw_metadata_dict(
+        update_kwargs.get('metadata'), source='recon_write_policy.terminal_annotation_merge'
+    )
     if not parsed:
         return None
 

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "session_slug": "fixture-s3-author",
+  "title": "prd:fixture S3",
+  "role": "prd",
+  "project": "fixture",
+  "task_id": null,
+  "escalation_id": null,
+  "prompt": "Read /review-all-fixture/home/briefs/S3.author.md and follow it as your brief.",
+  "cwd": "/review-all-fixture/project",
+  "launcher_pid": 4242,
+  "start_ts": "2026-10-19T10:00:00Z",
+  "status": "running",
+  "exit_code": null,
+  "result_file": "sessions/checkpoint-running/result.md",
+  "transcript_path": null,
+  "parent_session_id": null,
+  "spawn_mode": "child",
+  "display": null,
+  "question": null,
+  "claude_session_id": null,
+  "claude_owner_pid": null
+}

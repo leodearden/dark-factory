@@ -11,8 +11,11 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.review_suggestions.prior_round import build_resettled_adjudicator_prompt
 
 
 def user_record(content, **flags) -> dict:
@@ -236,6 +239,20 @@ def recon_run_review_text() -> str:
     )
 
 
+def _briefing_assembler(tmp_path) -> BriefingAssembler:
+    """A throwaway assembler over *tmp_path*, for the prompt builders that
+    touch no I/O and no config."""
+    return BriefingAssembler(OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    ))
+
+
 def merger_prompt(tmp_path) -> str:
     """The real text ``BriefingAssembler.build_merger_prompt`` injects
     (orchestrator/src/orchestrator/agents/briefing.py), built by calling the
@@ -245,16 +262,144 @@ def merger_prompt(tmp_path) -> str:
 
     The builder is async and touches no I/O and no config, so a throwaway
     assembler over *tmp_path* and a plain ``asyncio.run`` suffice."""
-    assembler = BriefingAssembler(OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    ))
-    return asyncio.run(assembler.build_merger_prompt(
+    return asyncio.run(_briefing_assembler(tmp_path).build_merger_prompt(
         conflicts='<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs',
         task_intent='Rescope the briefing memory block.',
     ))
+
+
+def steward_continuation_prompt(
+    tmp_path,
+    *,
+    summary: str = (
+        "Suffix item needs rebase onto frozen-prefix tip: branch '5099' has a "
+        'real rebase conflict'
+    ),
+) -> str:
+    """The real text
+    ``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_steward_continuation_prompt``
+    sends when a live steward session is resumed for a new escalation,
+    built by calling that builder rather than restating its f-string, so a
+    rewording turns the lockstep tests red instead of silently letting the
+    prompt back into the gold section. The task and escalation are shaped
+    after reify session 77fb6617 record 289; *summary* is the escalation's
+    free text, where a real one may carry signal literals."""
+    task = {
+        'id': '5099',
+        'title': 'ai-native-editing η: user GUI slider/edit-box durable source write-back (INV-GUI-3)',
+    }
+    escalation = {
+        'id': 'esc-5099-12',
+        'category': 'merge_ff_failed',
+        'severity': 'blocking',
+        'summary': summary,
+        'suggested_action': 'investigate_and_retry',
+    }
+    return asyncio.run(
+        _briefing_assembler(tmp_path).build_steward_continuation_prompt(task, escalation),
+    )
+
+
+CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD = (
+    '`77fb6617`: a "# New Escalation for Task 5099" payload ending "Handle this '
+    'escalation, then call `resolve_issue`". why does that render as a user correction?'
+)
+"""A human turn quoting the census §1.9 sighting of the steward continuation
+prompt. The quote stops before 'with a summary', exactly as the census does,
+so it is dialogue and stays gold."""
+
+
+def prior_round_adjudicator_prompt(
+    *,
+    description: str = 'The retry loop never backs off between attempts.',
+) -> str:
+    """The real text
+    ``orchestrator/src/orchestrator/review_suggestions/prior_round.py::build_resettled_adjudicator_prompt``
+    sends the prior-round adjudicator, built by calling that builder so a
+    rewording of its opening sentence turns the lockstep tests red. Shaped
+    after census sightings 16e1a37b / 22669850 / f1f8ce95 record 3;
+    *description* is review free text, where a real one may carry signal
+    literals."""
+    current = [{
+        'location': 'orchestrator/src/orchestrator/merge_lane/gates.py',
+        'category': 'correctness',
+        'description': description,
+        'suggested_fix': 'Sleep with exponential backoff between attempts.',
+    }]
+    prior = [{
+        'location': 'orchestrator/src/orchestrator/merge_lane/gates.py',
+        'category': 'correctness',
+        'description': 'Retries hide the gate latency.',
+        'suggested_fix': 'Move the retries into the caller.',
+    }]
+    return build_resettled_adjudicator_prompt(current, prior)
+
+
+def pre_5356_replan_prompt(
+    issue: str = 'The lease is released before the verify finishes.',
+) -> str:
+    """The RETIRED replan prompt as archived transcripts hold it, restated
+    and abridged from session 2880c011 record 3 rather than built: task 5356
+    (commit 8321b68278) removed its builder, and today's
+    ``BriefingAssembler.build_replan_prompt`` opens with the task preamble.
+    *issue* is review free text."""
+    return (
+        'The implementation was reviewed and blocking issues were found.\n\n'
+        '# Review Feedback — Blocking Issues\n\n'
+        '## [reviewer_comprehensive] correctness\n'
+        '**Location:** orchestrator/src/orchestrator/merge_lane/worker.py\n'
+        f'**Issue:** {issue}\n'
+        '**Suggested fix:** Hold the lease until the verify returns.\n\n\n'
+        '# Current Plan\n\n'
+        '```json\n{"task_id": "3490", "steps": []}\n```\n\n'
+        '# Action\n\n'
+        'Update the plan to address the blocking issues. You may add new steps '
+        'to the `steps` array, but do NOT remove or reorder existing steps. Set '
+        'new steps to status "pending". Write the updated plan to '
+        '`.task/plan.json`.\n'
+    )
+
+
+WATCHER_ROTATION_PROMPT = (
+    'You are running as an autonomous escalation watcher.\n'
+    'Rotation limits (injected by supervisor):\n'
+    '  ROTATION_ESCALATIONS=50\n'
+    '  ROTATION_HOURS=4.0\n'
+    '\n'
+    'When you have handled ROTATION_ESCALATIONS escalations or 4.0 hours have '
+    'elapsed since startup, emit your digest as the final message and exit cleanly.\n'
+    '\n'
+    'Project root: /home/leo/src/reify\n'
+    'Escalation queue: /home/leo/src/reify/data/escalations\n'
+    f'\n{WATCHER_REARM_OUTCOME_GUIDANCE}'
+)
+"""The rotation prompt
+``orchestrator/src/orchestrator/harness.py::Harness._run_watcher_rotation``
+composes, restated and abridged with the values sighted in reify 4aaf48b0
+record 2: it omits the ``tooling_root_block`` the harness inserts after the
+'Escalation queue:' line. The opener is restated because the harness builds it
+inline; follow-up agent-followup-7441 (tkt_0RW5QBHZMRJ9JGM2BW1DHGM1KN) gives it
+a pure builder to call instead. The outcome guidance is the real constant,
+spliced as the harness does."""
+
+
+HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT = (
+    pytest.param(
+        'the adjudicator keeps suppressing my fix — why does it think the concern '
+        'was resolved in a prior round?',
+        id='adjudicator',
+    ),
+    pytest.param(
+        'the implementation was reviewed twice and the blocking issues it found '
+        'were stale, please re-check',
+        id='replan',
+    ),
+    pytest.param(
+        'why is the autonomous escalation watcher re-arming twice per rotation?',
+        id='watcher',
+    ),
+)
+"""Human turns that name the adjudicator, replan and watcher prompts without
+carrying their opening sentences, so they stay dialogue. Each is a
+``pytest.param`` carrying its own id, ready to parametrize a single ``text``
+argument."""

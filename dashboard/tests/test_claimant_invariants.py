@@ -17,6 +17,7 @@ from _tasks_db_fixture import task_row, write_tasks_db
 from dashboard.data.claimant_invariants import HygieneTier, TerminalTier
 from dashboard.data.db import DbPool
 from dashboard.data.root_invariants import RootInvariants, ScanStatus, scan_root_invariants
+from dashboard.project_labels import ProjectLabels
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
 FRESH = (NOW - timedelta(minutes=1)).isoformat()
@@ -38,7 +39,7 @@ async def _scan_file(root: Path, db_path: Path) -> dict[str, Any]:
         )
     finally:
         await pool.close_all()
-    return record.to_wire()
+    return record.to_wire(ProjectLabels.of_roots(()))
 
 
 async def _scan(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -198,7 +199,7 @@ async def test_b2_absent_db_is_blind_not_clean(tmp_path):
     record = await scan_root_invariants(
         root, db_path, None, now=NOW, pending_escalations=None
     )
-    wire = record.to_wire()
+    wire = record.to_wire(ProjectLabels.of_roots(()))
     _assert_blind(wire)
     assert str(db_path) in wire['error']
     assert 'not found' in wire['error']
@@ -211,7 +212,7 @@ async def test_b2_present_but_unopened_db_is_blind_with_distinct_wording(tmp_pat
     record = await scan_root_invariants(
         root, db_path, None, now=NOW, pending_escalations=None
     )
-    wire = record.to_wire()
+    wire = record.to_wire(ProjectLabels.of_roots(()))
     _assert_blind(wire)
     assert str(db_path) in wire['error']
     assert 'could not be opened read-only' in wire['error']
@@ -256,7 +257,7 @@ async def test_b2_a_pooled_connection_closed_under_the_scan_is_blind_not_raised(
     record = await scan_root_invariants(
         root, db_path, conn, now=NOW, pending_escalations=None
     )
-    wire = record.to_wire()
+    wire = record.to_wire(ProjectLabels.of_roots(()))
     _assert_blind(wire)
     assert wire['error'].startswith('ValueError: ')
     assert wire['rows_scanned'] is None

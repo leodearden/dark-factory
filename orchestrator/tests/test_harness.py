@@ -14,13 +14,16 @@ Asserts that:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from escalation.models import Escalation
+from _orch_helpers import wait_responsive
+from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator import delivered_check_owner
 from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
@@ -43,6 +46,13 @@ def _install_mock_escalation_queue(harness: Harness) -> MagicMock:
     mock_queue.make_id.return_value = 'esc-test-external-1'
     harness._escalation_queue = mock_queue
     return mock_queue
+
+
+def _delivered_check_callback(harness: Harness) -> Callable[..., Awaitable[None]]:
+    """The wired ``on_delivered_check_block`` callback, asserted installed."""
+    callback = harness.scheduler._callbacks.on_delivered_check_block
+    assert callback is not None
+    return callback
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +204,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -211,8 +220,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -242,35 +250,49 @@ class TestHarnessDeliveredCheckBlockWiring:
 
     @pytest.mark.asyncio
     async def test_callback_deduplicates_on_open_l2(self, tmp_path: Path) -> None:
-        """Second invocation with an open L2 must NOT submit a duplicate escalation."""
+        """Second invocation with an open L2 must NOT submit a duplicate escalation,
+        and must not pay for the owner's sidecar read either."""
         harness = _make_harness(tmp_path)
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
+        owner: DeliveredCheckOwner = {
+            'task_id': '5',
+            'check_name': 'cap',
+            'sidecar': {'path': 'docs/x.capability-manifest.yaml', 'on_main': 'unverified'},
+        }
+        verified: list[DeliveredCheckOwner] = []
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
+        def _record_verify(owner_arg: DeliveredCheckOwner, **_kwargs) -> DeliveredCheckOwner:
+            verified.append(owner_arg)
+            return owner_arg
 
-        # First call — no open L2 yet → submits
-        mock_queue.get_by_task.return_value = []
-        await harness.scheduler._callbacks.on_delivered_check_block(
-            '42',
-            summary=self._SUMMARY,
-            detail='detail',
-            category='dependency_capability',
-        )
+        callback = _delivered_check_callback(harness)
+        with patch.object(delivered_check_owner, 'verify_check_owner', _record_verify):
+            # First call — no open L2 yet → submits
+            mock_queue.get_by_task.return_value = []
+            await callback(
+                '42',
+                summary=self._SUMMARY,
+                detail='detail',
+                category='dependency_capability',
+                owner=owner,
+            )
 
-        # Second call — an open L2 now exists → must NOT submit again
-        mock_queue.get_by_task.return_value = [MagicMock()]
-        await harness.scheduler._callbacks.on_delivered_check_block(
-            '42',
-            summary=self._SUMMARY,
-            detail='detail',
-            category='dependency_capability',
-        )
+            # Second call — an open L2 now exists → must NOT submit again
+            mock_queue.get_by_task.return_value = [MagicMock()]
+            await callback(
+                '42',
+                summary=self._SUMMARY,
+                detail='detail',
+                category='dependency_capability',
+                owner=owner,
+            )
 
         assert mock_queue.submit.call_count == 1, (
             f'Should deduplicate: submit called {mock_queue.submit.call_count} times '
             f'(expected exactly 1)'
         )
+        assert verified == [owner], 'the deduped call must not read the owner sidecar'
         # Dedupe must be scoped to level=2 + agent_role — NOT the broad
         # has_open_l1 the external-dep filer uses (that would mask/be masked
         # by an unrelated open L1/L2 for the same task).
@@ -286,12 +308,61 @@ class TestHarnessDeliveredCheckBlockWiring:
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
         # Must not raise even without a queue.
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '99',
             summary=self._SUMMARY,
             detail='detail',
             category='dependency_capability',
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_records_and_renders_the_check_owner(self, tmp_path: Path) -> None:
+        """Called with the failed descriptor and the owner (sidecar None, so
+        no git read), the filed record carries the owner as data and the
+        owner block in its detail."""
+        harness = _make_harness(tmp_path)
+        mock_queue = _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+        owner: DeliveredCheckOwner = {'task_id': '5', 'check_name': 'cap', 'sidecar': None}
+
+        await _delivered_check_callback(harness)(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+            check={'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['x.py']},
+            owner=owner,
+        )
+
+        submitted: Escalation = mock_queue.submit.call_args.args[0]
+        assert submitted.delivered_check_owner == owner
+        assert 'Check owner: task 5' in submitted.detail
+        assert submitted.detail.splitlines()[-1].endswith(
+            'set task 42 back to pending once the check passes on main.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_call_keeps_the_re_pend_recipe_without_an_owner(
+        self, tmp_path: Path
+    ) -> None:
+        """A caller that predates the owner kwargs still gets Resolved-6's
+        manual re-pend recipe, and the record carries no owner."""
+        harness = _make_harness(tmp_path)
+        mock_queue = _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+
+        await _delivered_check_callback(harness)(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+        )
+
+        submitted: Escalation = mock_queue.submit.call_args.args[0]
+        assert submitted.delivered_check_owner is None
+        assert submitted.detail == (
+            'detail\nBlocked dependents are NOT auto-re-pended — set task 42 back to '
+            'pending once the check passes on main.'
         )
 
 
@@ -312,11 +383,11 @@ class TestHarnessMergeLivenessGuard:
     """
 
     @pytest.mark.asyncio
-    async def test_cold_9000_now_starts_cleanly(self, tmp_path: Path) -> None:
-        """cold_timeout=9000 (refused by old model) must start cleanly under heartbeat model.
+    async def test_cold_9000_now_constructs_cleanly(self, tmp_path: Path) -> None:
+        """cold_timeout=9000 (refused by old model) must construct cleanly under heartbeat model.
 
         Old model: worst_case = 1 × 9000 = 9000 ≥ 8100 → refused.
-        Heartbeat model: worst_case = 600 < 8100 → safe → worker starts.
+        Heartbeat model: worst_case = 600 < 8100 → safe → worker constructed.
         """
         config = OrchestratorConfig(
             project_root=tmp_path,
@@ -324,51 +395,24 @@ class TestHarnessMergeLivenessGuard:
         )
         harness = Harness(config)
 
-        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
-            pass
+        # Must NOT raise MergeLivenessConfigError under heartbeat model
+        await harness._start_merge_worker()
 
-        with patch(
-            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
-            _noop_run,
-        ):
-            # Must NOT raise MergeLivenessConfigError under heartbeat model
-            await harness._start_merge_worker()
-
-        try:
-            assert harness._merge_worker_task is not None
-        finally:
-            await harness._stop_merge_worker()
+        assert harness._merge_worker is not None
 
     @pytest.mark.asyncio
-    async def test_in_budget_config_starts_worker(self, tmp_path: Path) -> None:
-        """Default/in-budget config (cold_timeout=7200 default, bound=1) must NOT raise.
-
-        Patch SpeculativeMergeWorker.run to a no-op coroutine so the asyncio
-        task doesn't run indefinitely and the test tears down cleanly.
-        """
+    async def test_in_budget_config_constructs_worker(self, tmp_path: Path) -> None:
+        """Default/in-budget config (cold_timeout=7200 default, bound=1) must NOT raise."""
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
 
-        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
-            pass
+        # Must NOT raise MergeLivenessConfigError
+        await harness._start_merge_worker()
 
-        with patch(
-            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
-            _noop_run,
-        ):
-            # Must NOT raise MergeLivenessConfigError
-            await harness._start_merge_worker()
-
-        try:
-            # Worker task was created and will have completed (no-op)
-            assert harness._merge_worker_task is not None
-        finally:
-            # Explicit teardown: stop the worker and await the task so the test
-            # cannot leave dangling asyncio tasks or open resources.
-            await harness._stop_merge_worker()
+        assert harness._merge_worker is not None
 
     @pytest.mark.asyncio
-    async def test_crash_config_starts_worker(self, tmp_path: Path) -> None:
+    async def test_crash_config_constructs_worker(self, tmp_path: Path) -> None:
         """K=2 config (one enabled runner) + cold_timeout=7200 must NOT raise.
 
         Regression-lock: stays green under BOTH the old per-host model
@@ -377,7 +421,9 @@ class TestHarnessMergeLivenessGuard:
         = 600 < 8100 → safe).  Guards against a future refactor accidentally
         re-coupling K to the liveness check.
         """
-        r1 = VerifyRunnerConfig(name='r1', ssh_host='h1.local', git_remote='remote1')
+        r1 = VerifyRunnerConfig(
+            name='r1', ssh_host='h1.local', git_remote='remote1', df_checkout_path='/df',
+        )
         config = OrchestratorConfig(
             project_root=tmp_path,
             verify_runners=[r1],                           # → K = 1 + 1 = 2
@@ -385,20 +431,10 @@ class TestHarnessMergeLivenessGuard:
         )
         harness = Harness(config)
 
-        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
-            pass
+        # Must NOT raise MergeLivenessConfigError under either model
+        await harness._start_merge_worker()
 
-        with patch(
-            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
-            _noop_run,
-        ):
-            # Must NOT raise MergeLivenessConfigError under either model
-            await harness._start_merge_worker()
-
-        try:
-            assert harness._merge_worker_task is not None
-        finally:
-            await harness._stop_merge_worker()
+        assert harness._merge_worker is not None
 
     @pytest.mark.asyncio
     async def test_over_budget_via_low_tolerance_raises(self, tmp_path: Path) -> None:
@@ -421,7 +457,7 @@ class TestHarnessMergeLivenessGuard:
 
 
 class TestHarnessMergeVerifySurvivorBarrierWiring:
-    """Harness._start_merge_worker must invoke the startup survivor barrier
+    """Harness._launch_merge_worker_loop must invoke the startup survivor barrier
     (GitOps.reap_merge_verify_survivors) ONCE, BEFORE the merge-worker loop is
     scheduled — so a previous run's orphaned verify subtree under _merge-verify
     is reaped before the worker's first reset_persistent_merge_worktree can
@@ -454,9 +490,10 @@ class TestHarnessMergeVerifySurvivorBarrierWiring:
 
         try:
             with patch(
-                'orchestrator.merge_queue.SpeculativeMergeWorker.run', _noop_run,
+                'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run', _noop_run,
             ):
                 await harness._start_merge_worker()
+                await harness._launch_merge_worker_loop()
                 await asyncio.wait_for(worker_started.wait(), timeout=5)
 
             reap_mock.assert_awaited_once()
@@ -464,37 +501,39 @@ class TestHarnessMergeVerifySurvivorBarrierWiring:
                 'the survivor barrier must run to completion BEFORE the merge '
                 f'worker loop starts; got order {call_order}'
             )
-            assert harness._merge_worker_task is not None
         finally:
             await harness._stop_merge_worker()
 
     @pytest.mark.asyncio
     async def test_barrier_failure_is_fail_open(self, tmp_path: Path) -> None:
-        """A raising barrier must NOT propagate — the worker still starts.
+        """A raising barrier must NOT propagate — the worker loop still launches.
 
         Mirrors the enforce_merge_liveness_margin generic-except precedent: the
         barrier is best-effort, so a failure is logged and swallowed rather than
-        aborting merge-worker startup.
+        aborting the merge-worker launch.
         """
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
 
         reap_mock = AsyncMock(side_effect=RuntimeError('scan blew up'))
         harness.git_ops.reap_merge_verify_survivors = reap_mock  # type: ignore[method-assign]
+        worker_started = asyncio.Event()
 
         async def _noop_run(self_w):  # type: ignore[no-untyped-def]
-            pass
+            worker_started.set()
 
         try:
             with patch(
-                'orchestrator.merge_queue.SpeculativeMergeWorker.run', _noop_run,
+                'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run', _noop_run,
             ):
-                # Must NOT raise despite the barrier raising.
                 await harness._start_merge_worker()
+                # Must NOT raise despite the barrier raising.
+                await harness._launch_merge_worker_loop()
+                await wait_responsive(
+                    worker_started.wait(),
+                    label='the merge-worker loop launches despite a failing barrier',
+                )
 
             reap_mock.assert_awaited_once()
-            assert harness._merge_worker_task is not None, (
-                'a fail-open barrier must still create the merge-worker task'
-            )
         finally:
             await harness._stop_merge_worker()

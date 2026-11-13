@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
 from fused_memory.middleware.execution_class_guard import execution_class_error
@@ -31,6 +32,8 @@ from fused_memory.reconciliation.predicate_contradiction import (
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # --- Shared fixtures for the builder tests ---------------------------------- #
 _CONTRADICTION = (

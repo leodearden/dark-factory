@@ -1,8 +1,10 @@
 """Escalation classification helpers.
 
-Single site (INV-5) for three related but distinct classification concerns.
+Single site (INV-5) for five related but distinct classification concerns.
 The first two are described in plans/escalation-lifecycle-dashboard-prd.md
-Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8:
+Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8; the
+fourth in that PRD's D2; the fifth has no design doc, and its docstring is its
+contract:
 
 - ``classify_resolver_tier`` — maps a ``resolved_by`` attribution string to a
   coarse resolver *tier* (human / cascade / auto-watcher / steward /
@@ -15,6 +17,11 @@ Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8:
 - ``info_l0_mechanical_class`` — which mechanical info-L0 class a record
   belongs to, if any: a registered filer role (``INFO_L0_MECHANICAL_ROLES``)
   or the discriminated done-step-commit orphan (``is_done_step_commit_orphan``).
+- ``is_harness_filed`` — whether a record was filed by the harness (the bare
+  ``HARNESS_ROLE`` or a sentinel-prefixed role) rather than by an agent.
+- ``closed_by_non_sweep_resolver`` — whether a record was closed by something
+  that carries a finding (an agent, a human, a cascade) rather than by an
+  automated sweep.
 
 All helpers are pure functions with no I/O — callers (queue.py, server.py,
 and future dashboard aggregators) import them rather than re-deriving the
@@ -25,13 +32,18 @@ from __future__ import annotations
 
 from collections.abc import Set as AbstractSet
 
-from escalation.models import Escalation
+from escalation.authority import COORDINATOR_IDENTITY
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 
 # Resolver→tier classification table (plans/escalation-lifecycle-dashboard-prd.md
 # Contract Seam 1). Exact-membership frozensets for the tiers whose
 # resolved_by values are fixed literals; 'cascade' and 'steward' are matched
 # by prefix/suffix instead since they're parameterised by escalation id / task id.
-_HUMAN_RESOLVERS: frozenset[str] = frozenset({'interactive', 'escalation-watcher'})
+# The coordinator is a human sitting, so its closes count in the human tier
+# (plans/decision-stream-prd.md §3 decision 3).
+_HUMAN_RESOLVERS: frozenset[str] = frozenset({
+    'interactive', 'escalation-watcher', COORDINATOR_IDENTITY,
+})
 _AUTO_WATCHER_RESOLVERS: frozenset[str] = frozenset(
     {'escalation-watcher-auto', 'orchestrator-escalation-watcher-auto'}
 )
@@ -103,6 +115,23 @@ def effective_benign(record: Escalation) -> tuple[str | None, str]:
     )
 
 
+def closed_by_non_sweep_resolver(record: Escalation) -> bool:
+    """Is *record* terminal, and closed by a resolver outside the reaper-sweep tier?
+
+    An agent, a human, a cascade or another non-sweep actor decided it. Both
+    terminal states count, because ``resolve_issue``'s ``close_only`` and
+    ``abandon`` actions dismiss rather than resolve.
+
+    A steward's hand-off dismissal (``resolved_by='steward'``, filed with an
+    L1) also passes, though it hands the record to a human rather than
+    resolving it: the stamp is shared with the back-fill of an unattributed
+    agent close, so the predicate cannot tell the two apart.
+    """
+    if record.status not in ('resolved', 'dismissed'):
+        return False
+    return classify_resolver_tier(record.resolved_by) != 'reaper-sweep'
+
+
 def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None:
     """Return the per-path benign default for *resolved_by*, or None.
 
@@ -128,10 +157,19 @@ INFO_L0_MECHANICAL_ROLES: frozenset[str] = frozenset({
     'orchestrator-no-landings-breaker',
     'orchestrator-warm-base-hard-down',
     'orchestrator-verify-host-monitor',
-    'orchestrator-offline-lane',
 })
 
 DONE_STEP_COMMIT_ORPHAN_CLASS = 'done-step-commit-orphan'
+
+# The bare role in-process harness code files under (workflow, merge worker,
+# exit contract); sentinel-prefixed roles are the rest of the harness namespace.
+HARNESS_ROLE = 'orchestrator'
+
+
+def is_harness_filed(record: Escalation) -> bool:
+    """Was *record* filed by the harness rather than by an agent?"""
+    role = record.agent_role or ''
+    return role == HARNESS_ROLE or role.startswith(HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
 def is_done_step_commit_orphan(esc: Escalation) -> bool:
@@ -149,7 +187,7 @@ def is_done_step_commit_orphan(esc: Escalation) -> bool:
     changes, unlike a fragile summary-substring match.
     """
     return (
-        esc.agent_role == 'orchestrator'
+        esc.agent_role == HARNESS_ROLE
         and esc.category == 'infra_issue'
         and esc.suggested_action == 'verify_wip_reconciliation'
     )

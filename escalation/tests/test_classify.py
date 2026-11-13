@@ -8,16 +8,19 @@ from __future__ import annotations
 import pytest
 from _info_l0_records import done_step_tripwire, info_l0_note, info_scope_divergence
 
+from escalation.authority import COORDINATOR_IDENTITY
 from escalation.classify import (
     DONE_STEP_COMMIT_ORPHAN_CLASS,
     INFO_L0_MECHANICAL_ROLES,
     classify_resolver_tier,
+    closed_by_non_sweep_resolver,
     default_resolution_class_for_resolver,
     effective_benign,
     info_l0_mechanical_class,
     is_done_step_commit_orphan,
+    is_harness_filed,
 )
-from escalation.models import Escalation
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 
 
 def _make_escalation(
@@ -25,6 +28,7 @@ def _make_escalation(
     *,
     status: str = 'pending',
     resolution_class: str | None = None,
+    resolved_by: str | None = None,
 ) -> Escalation:
     esc = Escalation(
         id=esc_id,
@@ -36,6 +40,7 @@ def _make_escalation(
     )
     esc.status = status
     esc.resolution_class = resolution_class
+    esc.resolved_by = resolved_by
     return esc
 
 
@@ -45,6 +50,10 @@ class TestClassifyResolverTierHuman:
     def test_interactive_is_human(self):
         """resolved_by='interactive' classifies as 'human'."""
         assert classify_resolver_tier('interactive') == 'human'
+
+    def test_coordinator_identity_is_human(self):
+        """A sitting's closes count in the human tier (PRD decision-stream §3 decision 3)."""
+        assert classify_resolver_tier(COORDINATOR_IDENTITY) == 'human'
 
     def test_escalation_watcher_is_human(self):
         """resolved_by='escalation-watcher' (exact) classifies as 'human'."""
@@ -200,6 +209,44 @@ class TestDefaultResolutionClassForResolver:
         assert default_resolution_class_for_resolver('random-role') is None
 
 
+class TestClosedByNonSweepResolver:
+    """closed_by_non_sweep_resolver(record): terminal, and closed outside the reaper-sweep tier."""
+
+    def test_pending_record_is_never_closed(self):
+        """A pending record is not closed, whatever its resolved_by stamp says."""
+        record = _make_escalation(status='pending', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is False
+
+    def test_steward_resolved_counts(self):
+        record = _make_escalation(status='resolved', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_steward_dismissed_counts(self):
+        """resolve_issue's close_only and abandon actions dismiss rather than resolve."""
+        record = _make_escalation(status='dismissed', resolved_by='claude-task-42-steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_steward_hand_off_dismissal_counts(self):
+        """The steward's give-up dismissal shares the 'steward' stamp with an
+        attributed agent close, so the predicate cannot exclude it."""
+        record = _make_escalation(status='dismissed', resolved_by='steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_human_resolved_counts(self):
+        record = _make_escalation(status='resolved', resolved_by='interactive')
+        assert closed_by_non_sweep_resolver(record) is True
+
+    def test_unattributed_close_counts(self):
+        """An agent close the steward has not yet attributed lands in tier 'unknown'."""
+        record = _make_escalation(status='resolved', resolved_by=None)
+        assert closed_by_non_sweep_resolver(record) is True
+
+    @pytest.mark.parametrize('resolved_by', ['auto-dismissed', 'harness-orphan-reaper'])
+    def test_reaper_sweep_dismissal_does_not_count(self, resolved_by):
+        record = _make_escalation(status='dismissed', resolved_by=resolved_by)
+        assert closed_by_non_sweep_resolver(record) is False
+
+
 # ---------------------------------------------------------------------------
 # Mechanical info-L0 classes (plans/info-l0-disposition-router-prd.md D8)
 # ---------------------------------------------------------------------------
@@ -214,6 +261,10 @@ class TestInfoL0MechanicalRoles:
         """The aggregate sentinel is keyed per class key, so the discriminated
         class must not collide with a role-keyed one."""
         assert DONE_STEP_COMMIT_ORPHAN_CLASS not in INFO_L0_MECHANICAL_ROLES
+
+    def test_the_lane_role_is_not_registered(self):
+        """The lane's records are not closed as status-info; a missing role routes loudly to the curator."""
+        assert 'orchestrator-offline-lane' not in INFO_L0_MECHANICAL_ROLES
 
 
 class TestIsDoneStepCommitOrphan:
@@ -264,3 +315,54 @@ class TestInfoL0MechanicalClass:
         rather than close silently as status-info.
         """
         assert info_l0_mechanical_class(info_scope_divergence()) is None
+
+
+class TestIsHarnessFiled:
+    """Whether a record was filed by the harness rather than by an agent."""
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            pytest.param(
+                info_l0_note(
+                    agent_role='orchestrator',
+                    category='infra_issue',
+                    suggested_action='investigate_log_corruption',
+                ),
+                id='corruption',
+            ),
+            pytest.param(
+                info_l0_note(agent_role='orchestrator', category='review_suggestions'),
+                id='suggestions-fallback',
+            ),
+            pytest.param(done_step_tripwire(), id='done-step-tripwire'),
+            pytest.param(info_l0_note(agent_role='orchestrator-workflow'), id='orchestrator-prefixed'),
+            pytest.param(info_l0_note(agent_role='harness-orphan-reaper'), id='harness-prefixed'),
+        ],
+    )
+    def test_a_harness_filing_shape_is_harness_filed(self, record: Escalation):
+        assert is_harness_filed(record) is True
+
+    @pytest.mark.parametrize('role', sorted(INFO_L0_MECHANICAL_ROLES))
+    def test_every_mechanical_role_is_harness_filed(self, role: str):
+        assert is_harness_filed(info_l0_note(agent_role=role)) is True
+
+    @pytest.mark.parametrize('prefix', HARNESS_SENTINEL_ROLE_PREFIXES)
+    def test_every_sentinel_prefix_is_harness_filed(self, prefix: str):
+        assert is_harness_filed(info_l0_note(agent_role=prefix + 'anything')) is True
+
+    @pytest.mark.parametrize(
+        'role',
+        [
+            'implementer',
+            'architect',
+            'debugger',
+            'deep_reviewer',
+            'reviewer_comprehensive',
+            'steward',
+            'orchestrators',
+            '',
+        ],
+    )
+    def test_an_agent_role_is_not_harness_filed(self, role: str):
+        assert is_harness_filed(info_l0_note(agent_role=role)) is False

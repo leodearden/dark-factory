@@ -12,16 +12,21 @@ These tests pin the read surface (``reconciliation_halt`` on ``get_status`` and
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from reconciliation.harness_fixtures import (
+    make_harness,
+    make_harness_config,
+    open_event_buffer,
+    open_journal,
+)
 from test_backlog_policy import _seed_buffered, _StubQueue
 
-from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
-from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import ReconciliationHarness
-from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.server.tools import create_mcp_server
 
@@ -53,51 +58,41 @@ def _make_status_mock_service():
     return svc
 
 
-async def _make_harness(tmp_path, *, backlog_policy=None, event_buffer=None, **cfg):
-    """Build a REAL ReconciliationHarness (real journal + event buffer).
+@contextlib.asynccontextmanager
+async def _open_harness(
+    tmp_path, *, backlog_policy=None, event_buffer=None, **cfg,
+) -> AsyncIterator[ReconciliationHarness]:
+    """A REAL ReconciliationHarness with its judge on, over a real journal.
 
-    Mirrors test_queue_stats_tool.py's fixture. Returns
-    ``(harness, journal, buffer)``; the caller closes journal/buffer.
+    Opens its own event buffer unless the caller passes one it already seeded.
     """
     project_root = tmp_path / 'proj_root'
     project_root.mkdir(exist_ok=True)
 
-    buf = event_buffer
-    owns_buf = buf is None
-    if owns_buf:
-        buf = EventBuffer(db_path=tmp_path / 'hv_eb.db', buffer_size_threshold=100)
-        await buf.initialize()
-    journal = ReconciliationJournal(tmp_path / 'hv_journal')
-    await journal.initialize()
-
-    config = FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            enabled=True,
-            judge_enabled=True,
-            explore_codebase_root='/tmp/test',
-            agent_llm_provider='anthropic',
-            agent_llm_model='claude-sonnet-4-20250514',
-            **cfg,
+    async with contextlib.AsyncExitStack() as stores:
+        if event_buffer is None:
+            event_buffer = await stores.enter_async_context(
+                open_event_buffer(tmp_path / 'hv_eb.db', buffer_size_threshold=100),
+            )
+        journal = await stores.enter_async_context(open_journal(tmp_path / 'hv_journal'))
+        harness = make_harness(
+            journal=journal,
+            event_buffer=event_buffer,
+            memory_service=AsyncMock(),
+            taskmaster=AsyncMock(),
+            config=make_harness_config(judge_enabled=True, **cfg),
+            backlog_policy=backlog_policy,
+            known_projects={'proj': str(project_root)},
         )
-    )
-    harness = ReconciliationHarness(
-        memory_service=AsyncMock(),
-        taskmaster=AsyncMock(),
-        journal=journal,
-        event_buffer=buf,
-        config=config,
-        backlog_policy=backlog_policy,
-        known_projects={'proj': str(project_root)},
-    )
-    assert harness.judge is not None
-    return harness, journal, buf if owns_buf else None
+        assert harness.judge is not None
+        yield harness
 
 
 def _judge(harness: ReconciliationHarness) -> Judge:
     """Narrow ``harness.judge`` (declared ``Judge | None``) to the live judge.
 
-    ``_make_harness`` builds every harness with ``judge_enabled=True`` and
-    asserts the judge is wired, but that narrowing does not survive the return,
+    ``_open_harness`` builds every harness with ``judge_enabled=True`` and
+    asserts the judge is wired, but that narrowing does not survive the yield,
     so reaching through ``harness.judge`` at a call site trips pyright's
     reportOptionalMemberAccess. Go through here instead.
     """
@@ -118,8 +113,7 @@ class TestGetStatusReconciliationHalt:
 
     @pytest.mark.asyncio
     async def test_halted_project_reports_reason_and_times(self, tmp_path):
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
 
             server = create_mcp_server(
@@ -140,17 +134,12 @@ class TestGetStatusReconciliationHalt:
             # the durable-write-queue subsystem and conflating the two is the
             # exact 2920 mis-triage.
             assert 'reconciliation_halt' not in result['queue']
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_non_halted_project_still_sees_the_fleet(self, tmp_path):
         """Asking about a healthy project must still surface that ANOTHER
         project is halted — nobody knew to go looking last time."""
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
 
             server = create_mcp_server(
@@ -165,10 +154,6 @@ class TestGetStatusReconciliationHalt:
             assert halt['halt_reason'] is None
             assert halt['halted_at'] is None
             assert halt['halted_projects'] == ['proj']
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_hyphen_spelled_project_id_finds_the_canonical_halt(self, tmp_path):
@@ -180,8 +165,7 @@ class TestGetStatusReconciliationHalt:
         self-contradicting false negative lands on precisely the question this
         feature exists to answer — and hyphen spellings are in live use.
         """
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('some_proj', reason=_REAL_REASON)
 
             server = create_mcp_server(
@@ -196,17 +180,12 @@ class TestGetStatusReconciliationHalt:
             assert halt['halt_reason'] == _REAL_REASON
             assert halt['project_id'] == 'some_proj'  # the key it was found under
             assert halt['halted_projects'] == ['some_proj']
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_error_shaped_status_is_not_enriched(self, tmp_path):
         """Never graft stats onto an error payload — the same rule the
         dead-letters enrichment and get_queue_stats already follow."""
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             svc = _make_status_mock_service()
             svc.get_status = AsyncMock(return_value={
@@ -221,17 +200,12 @@ class TestGetStatusReconciliationHalt:
 
             assert result['error_type'] == 'ConnectionError'
             assert 'reconciliation_halt' not in result
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_global_call_lists_halted_projects_without_per_project_claim(
         self, tmp_path,
     ):
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
 
             server = create_mcp_server(
@@ -244,10 +218,6 @@ class TestGetStatusReconciliationHalt:
             # No project was named, so no per-project claim is made at all.
             assert 'halted' not in halt
             assert 'halt_reason' not in halt
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_absent_when_no_harness_wired(self):
@@ -261,8 +231,7 @@ class TestGetStatusReconciliationHalt:
 
     @pytest.mark.asyncio
     async def test_absent_when_harness_has_no_judge(self, tmp_path):
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             harness.judge = None
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
@@ -271,10 +240,6 @@ class TestGetStatusReconciliationHalt:
                 'get_status', {'project_id': 'proj'},
             )
             assert 'reconciliation_halt' not in result
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
 
 # ── deliverable (A): get_queue_stats answers both questions in one probe ────
@@ -290,10 +255,9 @@ class TestGetQueueStatsReconciliationHalt:
 
     @pytest.mark.asyncio
     async def test_backlog_and_halt_in_one_call(self, tmp_path):
-        buf = EventBuffer(db_path=tmp_path / 'hv_qs_eb.db', buffer_size_threshold=100)
-        await buf.initialize()
-        journal = None
-        try:
+        async with open_event_buffer(
+            tmp_path / 'hv_qs_eb.db', buffer_size_threshold=100,
+        ) as buf:
             await _seed_buffered(buf, 'proj', n=5)
             policy = BacklogPolicy(
                 buf,
@@ -301,30 +265,26 @@ class TestGetQueueStatsReconciliationHalt:
                 lambda _: False,
                 hard_limit=500,
             )
-            harness, journal, _ = await _make_harness(
+            async with _open_harness(
                 tmp_path, backlog_policy=policy, event_buffer=buf,
-            )
-            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
+            ) as harness:
+                await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
 
-            server = create_mcp_server(
-                _make_status_mock_service(),
-                reconciliation_harness=harness,
-                backlog_policy=policy,
-            )
-            result = await server._tool_manager.call_tool(
-                'get_queue_stats', {'project_id': 'proj'},
-            )
+                server = create_mcp_server(
+                    _make_status_mock_service(),
+                    reconciliation_harness=harness,
+                    backlog_policy=policy,
+                )
+                result = await server._tool_manager.call_tool(
+                    'get_queue_stats', {'project_id': 'proj'},
+                )
 
-            # One probe, both answers.
-            assert result['reconciliation_backlog'] == 14  # 5 buffered + 7 + 2
-            halt = result['reconciliation_halt']
-            assert halt['halted'] is True
-            assert halt['halt_reason'] == _REAL_REASON
-            assert halt['halted_projects'] == ['proj']
-        finally:
-            if journal:
-                await journal.close()
-            await buf.close()
+                # One probe, both answers.
+                assert result['reconciliation_backlog'] == 14  # 5 buffered + 7 + 2
+                halt = result['reconciliation_halt']
+                assert halt['halted'] is True
+                assert halt['halt_reason'] == _REAL_REASON
+                assert halt['halted_projects'] == ['proj']
 
     @pytest.mark.asyncio
     async def test_big_backlog_with_no_halt_is_the_capacity_case(self, tmp_path):
@@ -333,10 +293,9 @@ class TestGetQueueStatsReconciliationHalt:
         3049), whose remedy is the opposite of unhalting. Mirrors
         ``test_backlog_and_halt_in_one_call`` exactly but for the halt.
         """
-        buf = EventBuffer(db_path=tmp_path / 'hv_qs_cap_eb.db', buffer_size_threshold=100)
-        await buf.initialize()
-        journal = None
-        try:
+        async with open_event_buffer(
+            tmp_path / 'hv_qs_cap_eb.db', buffer_size_threshold=100,
+        ) as buf:
             await _seed_buffered(buf, 'proj', n=5)
             policy = BacklogPolicy(
                 buf,
@@ -344,39 +303,34 @@ class TestGetQueueStatsReconciliationHalt:
                 lambda _: False,
                 hard_limit=500,
             )
-            harness, journal, _ = await _make_harness(
+            async with _open_harness(
                 tmp_path, backlog_policy=policy, event_buffer=buf,
-            )
-            # Deliberately NO _apply_halt — this is the cannot-keep-up case.
+            ) as harness:
+                # Deliberately NO _apply_halt — this is the cannot-keep-up case.
 
-            server = create_mcp_server(
-                _make_status_mock_service(),
-                reconciliation_harness=harness,
-                backlog_policy=policy,
-            )
-            result = await server._tool_manager.call_tool(
-                'get_queue_stats', {'project_id': 'proj'},
-            )
+                server = create_mcp_server(
+                    _make_status_mock_service(),
+                    reconciliation_harness=harness,
+                    backlog_policy=policy,
+                )
+                result = await server._tool_manager.call_tool(
+                    'get_queue_stats', {'project_id': 'proj'},
+                )
 
-            # One probe, both answers — backlog is real, but nothing is halted.
-            assert result['reconciliation_backlog'] == 14  # 5 buffered + 7 + 2
-            assert result['reconciliation_backlog'] > 0
-            halt = result['reconciliation_halt']
-            assert halt['halted'] is False
-            assert halt['halt_reason'] is None
-            assert halt['halted_projects'] == []
-        finally:
-            if journal:
-                await journal.close()
-            await buf.close()
+                # One probe, both answers — backlog is real, but nothing is halted.
+                assert result['reconciliation_backlog'] == 14  # 5 buffered + 7 + 2
+                assert result['reconciliation_backlog'] > 0
+                halt = result['reconciliation_halt']
+                assert halt['halted'] is False
+                assert halt['halt_reason'] is None
+                assert halt['halted_projects'] == []
 
     @pytest.mark.asyncio
     async def test_halt_field_appears_without_a_backlog_policy(self, tmp_path):
         """The two fields are gated INDEPENDENTLY: reconciliation_halt needs
         only a wired harness, so it shows up even where reconciliation_backlog
         cannot (no backlog policy). Pins the docstring's contract."""
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
             )
@@ -386,10 +340,6 @@ class TestGetQueueStatsReconciliationHalt:
             assert 'reconciliation_backlog' not in result
             assert result['reconciliation_halt']['halted'] is False
             assert result['reconciliation_halt']['halt_reason'] is None
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_absent_when_no_harness_wired(self):
@@ -408,18 +358,13 @@ class TestGetQueueStatsReconciliationHalt:
     @pytest.mark.asyncio
     async def test_global_call_shape_unchanged(self, tmp_path):
         """Per-project only, mirroring reconciliation_backlog's gating."""
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
             )
             result = await server._tool_manager.call_tool('get_queue_stats', {})
             assert 'reconciliation_halt' not in result
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
 
 # ── deliverable (B): trigger_reconciliation stops lying under halt ──────────
@@ -452,8 +397,7 @@ class TestTriggerReconciliationUnderHalt:
     async def test_halted_with_live_cooldown_reports_halted_and_requests_nothing(
         self, tmp_path,
     ):
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             interceptor = _make_interceptor()
             server = create_mcp_server(
@@ -477,10 +421,6 @@ class TestTriggerReconciliationUnderHalt:
             assert 'unhalt_reconciliation' in result['remedy']
             # Nothing was requested, so nothing may be promised.
             interceptor.buffer.request_trigger.assert_not_awaited()
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_expired_cooldown_with_auto_unhalt_forwards_the_trigger(
@@ -489,10 +429,9 @@ class TestTriggerReconciliationUnderHalt:
         """The mirror-image lie is also forbidden: with auto-unhalt enabled and
         the cooldown expired, the next tick unhalts and then RUNS the cycle, so
         a manual trigger genuinely is consumed. Say 'halted', but forward it."""
-        harness, journal, buf = await _make_harness(
+        async with _open_harness(
             tmp_path, auto_unhalt_after_cooldown=True,
-        )
-        try:
+        ) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             _expire_cooldown(_judge(harness))
             interceptor = _make_interceptor()
@@ -511,10 +450,6 @@ class TestTriggerReconciliationUnderHalt:
             assert result['trigger_requested'] is True
             interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
             assert 'auto' in result['message'].lower()
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_expired_cooldown_without_auto_unhalt_requests_nothing(
@@ -522,10 +457,9 @@ class TestTriggerReconciliationUnderHalt:
     ):
         """Cooldown expiry alone does not clear a halt when auto-unhalt is off —
         the project stays halted until someone acts."""
-        harness, journal, buf = await _make_harness(
+        async with _open_harness(
             tmp_path, auto_unhalt_after_cooldown=False,
-        )
-        try:
+        ) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             _expire_cooldown(_judge(harness))
             interceptor = _make_interceptor()
@@ -544,15 +478,10 @@ class TestTriggerReconciliationUnderHalt:
             assert result['trigger_requested'] is False
             assert 'unhalt_reconciliation' in result['remedy']
             interceptor.buffer.request_trigger.assert_not_awaited()
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_not_halted_keeps_legacy_requested_behaviour(self, tmp_path):
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             interceptor = _make_interceptor()
             server = create_mcp_server(
                 _make_status_mock_service(),
@@ -567,10 +496,6 @@ class TestTriggerReconciliationUnderHalt:
             assert result['status'] == 'requested'
             assert result['project_id'] == 'proj'
             interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_no_harness_wired_keeps_legacy_behaviour(self):
@@ -589,8 +514,7 @@ class TestTriggerReconciliationUnderHalt:
 
     @pytest.mark.asyncio
     async def test_harness_without_judge_keeps_legacy_behaviour(self, tmp_path):
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             harness.judge = None
             interceptor = _make_interceptor()
             server = create_mcp_server(
@@ -605,10 +529,6 @@ class TestTriggerReconciliationUnderHalt:
 
             assert result['status'] == 'requested'
             interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_taskmaster_unconfigured_still_returns_configuration_error(
@@ -616,8 +536,7 @@ class TestTriggerReconciliationUnderHalt:
     ):
         """The config check runs before the halt check — a halted project with
         no Taskmaster still reports the config failure, not a halt."""
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
@@ -628,10 +547,6 @@ class TestTriggerReconciliationUnderHalt:
             )
 
             assert result['error_type'] == 'ConfigurationError'
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
 
 # ── one auto-resume predicate, shared by the loop and the tool ──────────────
@@ -654,10 +569,9 @@ class TestAutoResumePredicateIsShared:
     async def test_tool_matches_harness_predicate_across_the_matrix(
         self, tmp_path, auto_unhalt, cooldown_expired,
     ):
-        harness, journal, buf = await _make_harness(
+        async with _open_harness(
             tmp_path, auto_unhalt_after_cooldown=auto_unhalt,
-        )
-        try:
+        ) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             if cooldown_expired:
                 _expire_cooldown(_judge(harness))
@@ -680,10 +594,6 @@ class TestAutoResumePredicateIsShared:
                 interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
             else:
                 interceptor.buffer.request_trigger.assert_not_awaited()
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_tool_delegates_rather_than_re_deriving_the_rule(self, tmp_path):
@@ -694,10 +604,9 @@ class TestAutoResumePredicateIsShared:
         This fails the moment someone re-inlines the predicate at the MCP
         boundary — which is the drift the amendment exists to prevent.
         """
-        harness, journal, buf = await _make_harness(
+        async with _open_harness(
             tmp_path, auto_unhalt_after_cooldown=False,
-        )
-        try:
+        ) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             assert _judge(harness).cooldown_expired('proj') is False
             harness.auto_resume_pending = MagicMock(return_value=True)  # type: ignore[method-assign]
@@ -717,18 +626,13 @@ class TestAutoResumePredicateIsShared:
             assert result['cooldown_expired'] is False
             assert result['trigger_requested'] is True
             interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_project_loop_consults_the_same_predicate(self, tmp_path):
         """The other half of the pin: the loop's halt branch must go through
         ``auto_resume_pending`` too, so the tool's answer is the loop's answer.
         """
-        harness, journal, buf = await _make_harness(tmp_path)
-        try:
+        async with _open_harness(tmp_path) as harness:
             await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             spy = MagicMock(return_value=False)  # → skip path, loop returns
             harness.auto_resume_pending = spy  # type: ignore[method-assign]
@@ -743,34 +647,20 @@ class TestAutoResumePredicateIsShared:
 
             spy.assert_called_once_with('proj')
             harness._notify_judge_halt.assert_awaited_once()
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_predicate_is_false_without_a_judge(self, tmp_path):
-        harness, journal, buf = await _make_harness(
+        async with _open_harness(
             tmp_path, auto_unhalt_after_cooldown=True,
-        )
-        try:
+        ) as harness:
             harness.judge = None
             assert harness.auto_resume_pending('proj') is False
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()
 
     @pytest.mark.asyncio
     async def test_predicate_is_false_for_an_unhalted_project(self, tmp_path):
         """"Pending auto-resume" is not "healthy" — a project that was never
         halted has nothing to resume."""
-        harness, journal, buf = await _make_harness(
+        async with _open_harness(
             tmp_path, auto_unhalt_after_cooldown=True,
-        )
-        try:
+        ) as harness:
             assert harness.auto_resume_pending('proj') is False
-        finally:
-            await journal.close()
-            if buf:
-                await buf.close()

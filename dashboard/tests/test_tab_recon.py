@@ -14,7 +14,7 @@ executably by dashboard/tests/js/recon_status.test.mjs. What THAT suite
 structurally cannot see is whether app.jsx and tabs.jsx actually CALL it, or
 whether they quietly go on restating status literals of their own. That is
 what this module asserts — the same division test_tab_tasks_status_counts.py
-documents for task_status_counts.js. The stylesheet half of the contract
+documents for task_snapshot.js. The stylesheet half of the contract
 (TestBadgeTonesAreStyled) lives here for the same reason: styles.css is
 reachable from the test client and not from a node process.
 
@@ -33,7 +33,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 # The store's vocabulary plus the two spellings it has never written. Any
 # `status === '<one of these>'` left in the recon UI means a call site is

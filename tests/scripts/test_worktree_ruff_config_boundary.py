@@ -50,6 +50,9 @@ from pathlib import Path
 
 import pytest
 from orchestrator.verify import _RUFF_SETTINGS_PATH_PREFIX
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _MEMBER_SELECT = '["E", "F", "UP", "B", "SIM", "I"]'
 

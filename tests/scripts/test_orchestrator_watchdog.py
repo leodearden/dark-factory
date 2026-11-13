@@ -3,10 +3,10 @@
 The watchdog module has a hyphenated filename so it cannot be imported via
 ``import orchestrator_watchdog``.  We use importlib to load it by file path.
 
-No live systemd runtime is needed — all subprocess.run calls are monkeypatched,
-except in test_unit_parity_verdict_runs_the_real_checker_and_reads_its_tag,
-which runs the real dashboard unit-parity checker under a tmp HOME (still no
-systemd).
+No live systemd runtime is needed. Most tests monkeypatch subprocess.run; the
+few that run a real process (the watchdog executed directly, or
+restart-all-orchestrators.sh against a fake systemctl) point it at tmp state
+and never reach systemd.
 """
 
 import ast
@@ -22,7 +22,10 @@ import sys
 import time
 import types
 
+import _watchdog_crash_loop as crash_loop
 import pytest
+from fake_uv import argv_flag, recorded_argvs, write_fake_uv
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Importable by name only because tests/scripts/conftest.py puts this
 # directory on sys.path, which pytest's --import-mode=importlib deliberately
@@ -50,12 +53,15 @@ from df_pytest_isolation import (  # noqa: E402
     load_scaled_grace,
     read_drain_poll_trace,
     read_leaked_pid,
+    read_proc_state,
     run_in_new_session,
     run_in_new_session_until,
     synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _load_watchdog() -> types.ModuleType:
@@ -68,10 +74,37 @@ def _load_watchdog() -> types.ModuleType:
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _isolate_crash_loop_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Point the crash-loop detector and the per-unit revive clocks at tmp_path.
+
+    REPO_DIR is the live checkout, so without this every main() test would
+    write the live restart-rate state and stamp live revive clocks, and a test
+    that left main() on its real status reader could page through real uv.
+    test_boundary7_liveness_during_window_does_not_stamp_clock patches
+    time.time to 2e9: a revive clock it stamped in the live tree would be
+    future-dated and suppress real revives for years. The satellite reads
+    these per call, and the watchdog reads its clock dir at module exec, which
+    _load_watchdog re-runs per test, so both follow this setenv.
+    """
+    root = tmp_path / "crash-loop"
+    monkeypatch.setenv("ORCH_RESTART_RATE_STATE", str(root / "watchdog-restart-rate.json"))
+    monkeypatch.setenv("ORCH_CRASH_LOOP_QUEUE_DIR", str(root / "escalations"))
+    monkeypatch.setenv("ORCH_LIVENESS_RESTART_CLOCK_DIR", str(root / "liveness-restart"))
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(root / "no-such-uv"))
+
+
+def _healthy_restart_status(_unit: str) -> crash_loop.UnitRestartStatus:
+    """main()'s NRestarts/Result reader for tests about something else: no systemd, healthy."""
+    return crash_loop.UnitRestartStatus(n_restarts=0, result="success")
+
+
 def _neutralize_fleet_clock_gates(
     wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stub ALL THREE of staleness_pass's fleet coordination gates to "not blocking".
+    """Stub ALL FOUR of staleness_pass's fleet coordination gates to "not blocking".
 
     For the many staleness_pass tests that are about something else entirely
     (enumeration, per-unit probes, delegation, exception isolation) and just
@@ -86,13 +119,15 @@ def _neutralize_fleet_clock_gates(
     is a hollow pass or a machine-state-dependent flake rather than a hard
     error) nothing flags it. Each gate added to the pass has so far meant
     another sweep across every such test — task 2396 added the min-interval
-    stub, task 4754 the head-start stub, task 4755 the in-flight lease stub —
-    so the list lives in ONE place and the next gate is a one-line edit here.
+    stub, task 4754 the head-start stub, task 4755 the in-flight lease stub,
+    task 7198 the module-removal waiver stub — so the list lives in ONE place
+    and the next gate is a one-line edit here.
 
-    Scoped to staleness_pass's OWN gate prefix, which is what "all three" means
+    Scoped to staleness_pass's OWN gate prefix, which is what "all four" means
     here: _count_head_start_skip_lines and _head_start_skip_line_emitted_at
     hold the head-start gate OPEN, so the pass returns before ever reaching the
-    lease read and neither needs this helper's third line.
+    lease read and neither needs this helper's third line (they stub the
+    waiver themselves, since a held gate is exactly when it is probed).
 
     Deliberately NOT used by the acceptance tests that must exercise the real
     file reads — test_staleness_head_start_anchored_on_fleet_min_interval_
@@ -114,6 +149,10 @@ def _neutralize_fleet_clock_gates(
     # once again immediately before delegating, to close the read-then-act
     # window), so an unstubbed test reads live machine state twice.
     monkeypatch.setattr(wdog, "_live_fleet_lease", lambda: None)
+    # task 7198: the module-removal waiver probes live systemd unit start times
+    # and runs git against the hardcoded REPO_DIR, on any tick where a clock
+    # gate holds.
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
 
 def _neutralize_fm_clock_gates(
@@ -140,23 +179,6 @@ def _neutralize_fm_clock_gates(
     """
     monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
-
-
-def _isolate_unit_parity(
-    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> pathlib.Path:
-    """Point the dashboard unit-parity clock at a tmp file and return it.
-
-    Same hazard as _neutralize_fleet_clock_gates: UNIT_PARITY_CLOCK_PATH
-    resolves off the hardcoded REPO_DIR, so a test that lets unit_parity_pass
-    run for real without this would read — and, because the pass stamps on
-    every attempt, WRITE — the main checkout's live clock. Redirects rather
-    than stubs, so the tests that use it exercise the real clock read and
-    stamp.
-    """
-    clock = tmp_path / "last_unit_parity_check.json"
-    monkeypatch.setattr(wdog, "UNIT_PARITY_CLOCK_PATH", str(clock))
-    return clock
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +789,7 @@ def test_main_restarts_only_failed_probe(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"Expected only df unit restarted, got: {restarted}"
@@ -798,7 +820,7 @@ def test_main_logs_each_action(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(log_messages) >= 1, "Expected at least one log() call for the restarted unit"
     # At least one message must mention the unit being restarted
@@ -837,7 +859,7 @@ def test_main_isolates_per_unit_failure(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "log", fake_log)
 
     # Must not raise
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert "orchestrator-reify.service" in restarted, (
         "reify unit must still be processed even if df probe raised"
@@ -869,7 +891,7 @@ def test_main_skips_probe_in_grace_window(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert probed == [], (
         f"probe_port must not be called inside the grace window; was called for ports: {probed}"
@@ -905,7 +927,7 @@ def test_main_probes_after_grace_window(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(probed) == len(wdog.WATCHED), (
         f"All watched ports must be probed when outside grace window; probed: {probed}"
@@ -944,7 +966,7 @@ def test_main_grace_window_skipped_when_elapsed_is_none(
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(probed) == len(wdog.WATCHED), (
         f"When elapsed is None, all watched ports must be probed; probed: {probed}"
@@ -1055,7 +1077,7 @@ def test_main_skips_disabled_unit_entirely(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     # df is disabled → skipped (port 8102 never probed)
     assert 8102 not in probed, (
@@ -1192,7 +1214,7 @@ def test_main_revives_dead_enabled_unit_whose_port_still_listens(
     wdog = _load_watchdog()
     restarted = _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: dead_state)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [u for _p, u in wdog.WATCHED], (
         f"every enabled unit reporting ActiveState={dead_state!r} while its port "
@@ -1221,7 +1243,7 @@ def test_main_does_not_revive_a_unit_in_a_transitional_active_state(
         wdog, monkeypatch, active_state=lambda _u: transitional_state
     )
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], (
         f"ActiveState={transitional_state!r} while the port listens must not "
@@ -1252,7 +1274,7 @@ def test_main_does_not_query_active_state_when_the_port_is_down(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], f"the down-port unit must still be revived; got {restarted}"
     assert queried == [], (
@@ -1271,7 +1293,7 @@ def test_main_log_line_names_the_active_state_signal(monkeypatch: pytest.MonkeyP
     _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: "failed")
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     restart_lines = [m for m in logged if "restarting" in m]
     assert restart_lines, f"expected at least one 'restarting' log line: {logged}"
@@ -1297,11 +1319,534 @@ def test_main_port_down_log_line_is_unchanged(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: None)
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert (
         f"{_DF_UNIT} escalation port {_DF_PORT} not listening; restarting" in logged
     ), logged
+
+
+# ---------------------------------------------------------------------------
+# main() crash-loop detector (task 8270)
+#
+# main() samples every WATCHED unit's NRestarts/Result before any liveness
+# gate, so the startup grace window that blinded the watchdog to the
+# 2026-10-26 loop cannot hide a crash loop, and a disabled unit is still
+# sampled. The detector itself is tested in
+# tests/scripts/test_watchdog_crash_loop.py; these pin its wiring into main().
+# ---------------------------------------------------------------------------
+
+_SHOW_RESTARTS_ARGV_TAIL = "--property=NRestarts,Result"
+
+
+def _restart_rate_state() -> dict:
+    return json.loads(pathlib.Path(os.environ["ORCH_RESTART_RATE_STATE"]).read_text())
+
+
+def _fake_show(stdout: str = "", returncode: int = 0, raises: BaseException | None = None):
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+    return fake_run, calls
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["Result=start-limit-hit\nNRestarts=7\n", "NRestarts=7\nResult=start-limit-hit\n"],
+)
+def test_unit_restart_status_parses_by_key_in_either_order(
+    monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    """systemd prints Result before NRestarts whatever the --property order."""
+    wdog = _load_watchdog()
+    fake_run, calls = _fake_show(stdout)
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+
+    status = wdog._unit_restart_status(_DF_UNIT)
+
+    assert status == wdog.UnitRestartStatus(n_restarts=7, result="start-limit-hit")
+    assert calls == [["systemctl", "--user", "show", _DF_UNIT, _SHOW_RESTARTS_ARGV_TAIL]]
+
+
+@pytest.mark.parametrize(
+    ("fake", "expected"),
+    [
+        (_fake_show("Result=success\nNRestarts=3\n", returncode=1)[0], (None, None)),
+        (_fake_show(raises=FileNotFoundError("systemctl"))[0], (None, None)),
+        (
+            _fake_show(raises=subprocess.TimeoutExpired(["systemctl"], 5))[0],
+            (None, None),
+        ),
+        (_fake_show("Result=success\nNRestarts=lots\n")[0], (None, "success")),
+        (_fake_show("Result=\nNRestarts=4\n")[0], (4, None)),
+    ],
+    ids=["nonzero-rc", "no-systemctl", "timeout", "bad-nrestarts", "empty-result"],
+)
+def test_unit_restart_status_fails_soft(
+    monkeypatch: pytest.MonkeyPatch, fake, expected: tuple[int | None, str | None]
+) -> None:
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog.subprocess, "run", fake)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    status = wdog._unit_restart_status(_DF_UNIT)
+
+    assert (status.n_restarts, status.result) == expected
+
+
+def _recording_restart_status_reader():
+    """A healthy main() reader that records each unit it is asked about; return (reads, reader)."""
+    reads: list[str] = []
+
+    def reader(unit: str) -> crash_loop.UnitRestartStatus:
+        reads.append(unit)
+        return _healthy_restart_status(unit)
+
+    return reads, reader
+
+
+def test_main_samples_every_unit_inside_the_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wdog = _load_watchdog()
+    reads, reader = _recording_restart_status_reader()
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: pytest.fail("inside grace"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main(read_status=reader)
+
+    units = [u for _p, u in wdog.WATCHED]
+    assert reads == units
+    state = _restart_rate_state()
+    assert {u: len(state[u]["samples"]) for u in units} == dict.fromkeys(units, 1)
+
+
+def test_main_samples_a_disabled_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    wdog = _load_watchdog()
+    reads, reader = _recording_restart_status_reader()
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: pytest.fail("disabled"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main(read_status=reader)
+
+    assert reads == [u for _p, u in wdog.WATCHED]
+
+
+def test_main_pages_a_restart_burst_once_per_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    uv, record = write_fake_uv(tmp_path)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+    state_path = pathlib.Path(os.environ["ORCH_RESTART_RATE_STATE"])
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({_DF_UNIT: {"samples": [[int(time.time()) - 600, 0]]}})
+    )
+    _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: "active")
+    burst = wdog.UnitRestartStatus(n_restarts=5, result="success")
+    healthy = wdog.UnitRestartStatus(n_restarts=0, result="success")
+    def read_status(unit: str) -> crash_loop.UnitRestartStatus:
+        return burst if unit == _DF_UNIT else healthy
+
+    wdog.main(read_status=read_status)
+
+    calls = recorded_argvs(record)
+    assert len(calls) == 1
+    assert argv_flag(calls[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
+    assert argv_flag(calls[0], "--severity") == "critical"
+
+    wdog.main(read_status=read_status)
+
+    assert len(recorded_argvs(record)) == 1
+
+
+# ---------------------------------------------------------------------------
+# start-limit-hit is honoured (task 8270)
+#
+# A unit systemd gave up on (Result=start-limit-hit) is left down for a human
+# with its crash-loop page open: main() runs neither reset-failed nor restart
+# on it, whichever dead signal fired. Every other Result still revives.
+# ---------------------------------------------------------------------------
+
+_MUTATING_SYSTEMCTL_VERBS = frozenset({"reset-failed", "restart", "start", "stop"})
+
+
+def _wire_start_limit(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    *,
+    result: str,
+    port_up: bool,
+    active_state: str = "active",
+    now: float | None = None,
+) -> tuple[list[list[str]], list[str], str]:
+    """Drive main() for the df unit alone through a recording subprocess.run.
+
+    Returns (every argv run, every log line, the uv path the page runs).
+    restart_unit is left REAL, so a revive shows up as systemctl argv. *now*
+    defaults to the start of a SKIP_LOG_INTERVAL_SECS emit slot.
+    """
+    tick = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 if now is None else now
+    monkeypatch.setattr(wdog.time, "time", lambda: tick)
+    uv = str(tmp_path / "fake-uv")
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", uv)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        stdout = ""
+        if _SHOW_RESTARTS_ARGV_TAIL in argv:
+            stdout = f"Result={result}\nNRestarts=10\n"
+        elif "ActiveState" in argv:
+            stdout = f"{active_state}\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "WATCHED", [(_DF_PORT, _DF_UNIT)])
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: port_up)
+    monkeypatch.setattr(wdog, "log", logged.append)
+    return calls, logged, uv
+
+
+def _systemctl_mutations(calls: list[list[str]]) -> list[list[str]]:
+    return [
+        argv
+        for argv in calls
+        if argv[:1] == ["systemctl"] and _MUTATING_SYSTEMCTL_VERBS & set(argv)
+    ]
+
+
+def _pages(calls: list[list[str]], uv: str) -> list[list[str]]:
+    return [argv for argv in calls if argv[:1] == [uv]]
+
+
+def test_main_leaves_a_start_limit_hit_unit_down_and_pages_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    calls, logged, uv = _wire_start_limit(
+        wdog, monkeypatch, tmp_path, result="start-limit-hit", port_up=False
+    )
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    pages = _pages(calls, uv)
+    assert len(pages) == 1
+    assert argv_flag(pages[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
+    assert any(_DF_UNIT in m and "leaving it down" in m for m in logged), logged
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    assert len(_pages(calls, uv)) == 1
+
+
+def test_the_start_limit_hit_hold_line_is_journalled_only_in_the_skip_log_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A unit can sit in start-limit-hit for days; one line per 60s tick would flood the journal."""
+    wdog = _load_watchdog()
+    calls, logged, _uv = _wire_start_limit(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        result="start-limit-hit",
+        port_up=False,
+        now=wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    assert not any("leaving it down" in m for m in logged), logged
+
+
+def test_main_does_not_revive_a_start_limit_hit_unit_whose_socket_still_listens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_start_limit(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        result="start-limit-hit",
+        port_up=True,
+        active_state="failed",
+    )
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda _u: pytest.fail("start-limit-hit must hold the revive")
+    )
+
+    wdog.main()
+
+
+def test_main_still_revives_a_unit_that_failed_with_any_other_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_start_limit(wdog, monkeypatch, tmp_path, result="exit-code", port_up=False)
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "restart_unit", restarted.append)
+
+    wdog.main()
+
+    assert restarted == [_DF_UNIT]
+
+
+# ---------------------------------------------------------------------------
+# per-unit liveness revive min-interval (task 8270)
+#
+# A liveness revive is capped to one per ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS
+# per unit, on a per-unit clock that is its own family: no deploy clock gates
+# it and it stamps none. Both dead signals share the one cap. The autouse
+# _isolate_crash_loop_state fixture puts the clock dir under tmp_path.
+# ---------------------------------------------------------------------------
+
+_CAP_T = 1_900_000_000.0
+_REIFY_PORT, _REIFY_UNIT = 8100, "orchestrator-reify.service"
+
+
+def _wire_revive_cap(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    *,
+    down_ports: set[int],
+    active_state: str = "active",
+    watched: list[tuple[int, str]] | None = None,
+) -> tuple[list[str], list[str], dict[str, float]]:
+    """Drive main() on a settable clock; return (restarted, logged, clock).
+
+    *down_ports* and clock["now"] may be changed between ticks.
+    """
+    restarted: list[str] = []
+    logged: list[str] = []
+    clock = {"now": _CAP_T}
+    monkeypatch.setattr(wdog, "WATCHED", watched or [(_DF_PORT, _DF_UNIT)])
+    monkeypatch.setattr(wdog.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "no-lease.json"))
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port not in down_ports)
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: active_state)
+    monkeypatch.setattr(wdog, "restart_unit", restarted.append)
+    monkeypatch.setattr(wdog, "log", logged.append)
+    return restarted, logged, clock
+
+
+def _revive_clock_file(unit: str) -> pathlib.Path:
+    return pathlib.Path(os.environ["ORCH_LIVENESS_RESTART_CLOCK_DIR"]) / f"{unit}.json"
+
+
+def test_liveness_revive_is_capped_to_one_per_interval_per_unit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    fleet_clock = tmp_path / "fleet-clock.json"
+    fleet_body = json.dumps({"ts": _CAP_T - 3600, "iso": "sentinel"})
+    fleet_clock.write_text(fleet_body)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(fleet_clock))
+    restarted, logged, clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+    clock["now"] = _CAP_T + 600
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT]
+    capped = [m for m in logged if _DF_UNIT in m and "capped" in m]
+    assert capped, logged
+    assert "900s" in capped[-1]
+    assert "300s remain" in capped[-1]
+
+    clock["now"] = _CAP_T + 901
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT, _DF_UNIT]
+    assert fleet_clock.read_text() == fleet_body
+
+
+def test_liveness_revive_cap_is_per_unit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    down: set[int] = {_DF_PORT}
+    restarted, _logged, clock = _wire_revive_cap(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        down_ports=down,
+        watched=[(_DF_PORT, _DF_UNIT), (_REIFY_PORT, _REIFY_UNIT)],
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+    down.add(_REIFY_PORT)
+    clock["now"] = _CAP_T + 60
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT, _REIFY_UNIT]
+
+
+def test_liveness_revive_cap_is_shared_by_both_dead_signals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    down: set[int] = set()
+    restarted, _logged, clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports=down, active_state="failed"
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+    assert restarted == [_DF_UNIT]
+    assert _revive_clock_file(_DF_UNIT).exists()
+
+    clock["now"] = _CAP_T + 60
+    wdog.main(read_status=_healthy_restart_status)
+    down.add(_DF_PORT)
+    clock["now"] = _CAP_T + 120
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT]
+
+
+def test_liveness_revive_cap_is_armed_even_when_the_restart_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _restarted, logged, clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
+    )
+    attempts: list[str] = []
+
+    def raising_restart(unit: str) -> None:
+        attempts.append(unit)
+        raise OSError("systemctl exploded")
+
+    monkeypatch.setattr(wdog, "restart_unit", raising_restart)
+
+    wdog.main(read_status=_healthy_restart_status)
+    clock["now"] = _CAP_T + 60
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert attempts == [_DF_UNIT]
+    assert any("watchdog error" in m and "systemctl exploded" in m for m in logged), logged
+
+
+def test_an_unarmable_revive_cap_is_logged_loudly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("ORCH_LIVENESS_RESTART_CLOCK_DIR", str(blocker / "liveness-restart"))
+    wdog = _load_watchdog()
+    restarted, logged, _clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT]
+    assert any(_DF_UNIT in m and "could NOT be armed" in m for m in logged), logged
+
+
+def test_liveness_revive_clock_is_a_per_unit_stamp_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_revive_cap(wdog, monkeypatch, tmp_path, down_ports={_DF_PORT})
+
+    wdog.main(read_status=_healthy_restart_status)
+
+    body = json.loads(_revive_clock_file(_DF_UNIT).read_text())
+    assert body["ts"] == int(_CAP_T)
+    assert isinstance(body["iso"], str)
+    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [(None, 900), ("60", 60), ("15m", 900), ("0", 0)]
+)
+def test_liveness_revive_min_interval_knob(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: int
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS", raising=False)
+    else:
+        monkeypatch.setenv("ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS", raw)
+    interval = _load_watchdog().ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS
+    assert interval == expected
+
+
+def test_a_zero_revive_min_interval_disables_the_cap_without_reading_a_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    monkeypatch.setenv("ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS", "0")
+    wdog = _load_watchdog()
+    restarted, _logged, clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
+    )
+    monkeypatch.setattr(
+        wdog, "read_clock_epoch", lambda *_a: pytest.fail("a disabled cap reads no clock")
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+    clock["now"] = _CAP_T + 1
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT, _DF_UNIT]
+
+
+def test_liveness_revive_clock_dir_is_its_own_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No other watchdog state file sits where a unit's revive clock is written (I5).
+
+    Compared at their defaults: the session redirects the deploy clocks to tmp
+    paths, which would make the comparison vacuous.
+    """
+    for var in (
+        "ORCH_LIVENESS_RESTART_CLOCK_DIR",
+        "ORCH_RESTART_RATE_STATE",
+        "ORCH_FLEET_DEPLOY_CLOCK",
+        "ORCH_FLEET_LEASE",
+        "FM_DEPLOY_CLOCK",
+        "FM_LIVENESS_RESTART_CLOCK",
+        "FM_LIVENESS_STREAK",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    wdog = _load_watchdog()
+
+    clock_dir = wdog.ORCH_LIVENESS_RESTART_CLOCK_DIR
+    assert clock_dir == os.path.join(wdog.REPO_DIR, "data", "orchestrator", "liveness-restart")
+    revive_clocks = {
+        wdog._orch_liveness_restart_clock_path(unit) for _port, unit in wdog.WATCHED
+    }
+    assert len(revive_clocks) == len(wdog.WATCHED)
+    assert revive_clocks.isdisjoint(
+        {
+            wdog.FLEET_DEPLOY_CLOCK_PATH,
+            wdog.FLEET_LEASE_PATH,
+            wdog.FM_DEPLOY_CLOCK_PATH,
+            wdog.FM_LIVENESS_RESTART_CLOCK_PATH,
+            wdog.FM_LIVENESS_STREAK_PATH,
+            crash_loop.restart_rate_state_path(wdog.REPO_DIR),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1772,10 +2317,10 @@ def test_staleness_grace_secs_malformed_env_falls_back(monkeypatch: pytest.Monke
 
 
 def test_orch_restart_min_interval_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ORCH_RESTART_MIN_INTERVAL_SECS defaults to 28800 (8h) with no env override."""
+    """ORCH_RESTART_MIN_INTERVAL_SECS defaults to 259200 (72h) with no env override."""
     monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
     wdog = _load_watchdog()
-    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 259200
 
 
 def test_orch_restart_min_interval_secs_matches_config_default(
@@ -1786,20 +2331,29 @@ def test_orch_restart_min_interval_secs_matches_config_default(
     The watchdog is a stdlib-only systemd oneshot that cannot import the
     orchestrator package at runtime, so ORCH_RESTART_MIN_INTERVAL_SECS's
     default is a hardcoded mirror of
-    OrchestratorConfig.orchestrator_restart_min_interval_secs (28800.0, task
-    2371). This drift test — mirroring
-    tests/scripts/test_orchestrator_restart_config_drift.py — pins the two
-    together so a future config.py change doesn't silently diverge from the
-    watchdog's copy (Open-Q1).
+    OrchestratorConfig.orchestrator_restart_min_interval_secs (259200.0 since
+    Leo's 2026-10-19 72h ruling; task 2371 introduced it). This drift test —
+    mirroring tests/scripts/test_orchestrator_restart_config_drift.py — pins
+    the two together so a future config.py change doesn't silently diverge
+    from the watchdog's copy (Open-Q1).
+
+    Two readings, both pinned: the field's CODE default, which the mirror
+    claims to copy, and the value this repo's committed
+    dark-factory-orchestrator.yaml resolves to, which is what the
+    merge-landed coordinator sharing the watchdog's fleet clock actually runs
+    with. The yaml sets the key explicitly, so the second reading alone no
+    longer sees the code default.
     """
     from orchestrator.config import OrchestratorConfig
 
+    field_default = OrchestratorConfig.model_fields["orchestrator_restart_min_interval_secs"].default
     monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
     # Anchor ORCH_CONFIG_PATH to this worktree's own committed config so the
     # comparison is deterministic regardless of the ambient shell env (which
     # may point ORCH_CONFIG_PATH at a different checkout).
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     wdog = _load_watchdog()
+    assert pytest.approx(field_default) == wdog.ORCH_RESTART_MIN_INTERVAL_SECS
     assert pytest.approx(
         OrchestratorConfig().orchestrator_restart_min_interval_secs
     ) == wdog.ORCH_RESTART_MIN_INTERVAL_SECS
@@ -2045,14 +2599,14 @@ def test_restart_orchestrator_unit_default_matches_across_tiers() -> None:
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A malformed ORCH_RESTART_MIN_INTERVAL_SECS env value falls back to 28800.
+    """A malformed ORCH_RESTART_MIN_INTERVAL_SECS env value falls back to 259200.
 
     A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
     mirroring STALENESS_GRACE_SECS's malformed-env test above.
     """
     monkeypatch.setenv("ORCH_RESTART_MIN_INTERVAL_SECS", "not-an-int")
     wdog = _load_watchdog()
-    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 259200
 
 
 def test_read_last_fleet_deploy_epoch_happy_path(
@@ -2210,7 +2764,7 @@ def test_within_fleet_staleness_head_start_false_when_clock_absent(
 ) -> None:
     """False when the fleet clock is missing/corrupt/unreadable.
 
-    The fail-OPEN direction inherited from _within_min_interval: with no
+    The fail-OPEN direction inherited from within_min_interval: with no
     readable clock there is no window-open instant to measure a head start
     from, so the head start must not apply. Failing the other way would let
     one unreadable file silence the fleet staleness backstop forever.
@@ -2229,7 +2783,7 @@ def test_within_fleet_staleness_head_start_false_when_both_caps_disabled(
     """False WITHOUT reading the clock when the summed cap is <=0.
 
     Both ORCH_RESTART_MIN_INTERVAL_SECS and STALENESS_GRACE_SECS at 0 sum to
-    0, which _within_min_interval short-circuits before touching the reader —
+    0, which within_min_interval short-circuits before touching the reader —
     a disabled head start must not depend on a readable file.
     """
     wdog = _load_watchdog()
@@ -2255,7 +2809,7 @@ def test_within_fleet_staleness_head_start_holds_grace_when_only_the_cap_is_disa
 
     The REALISTIC disabled-cap configuration an operator produces, as distinct
     from test_within_fleet_staleness_head_start_false_when_both_caps_disabled
-    above (which zeroes BOTH knobs and so only exercises _within_min_interval's
+    above (which zeroes BOTH knobs and so only exercises within_min_interval's
     <=0 short-circuit).
 
     With the cap at 0 the summed cap is STALENESS_GRACE_SECS (1800 > 0), so
@@ -2782,6 +3336,7 @@ def test_staleness_pass_skips_when_within_fleet_deploy_min_interval(
     log_messages: list[str] = []
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog.time, "time", lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0)
     monkeypatch.setattr(
         wdog,
@@ -2824,6 +3379,7 @@ def test_staleness_pass_suppresses_skip_log_outside_log_bucket(
     log_messages: list[str] = []
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     # Halfway into the bucket — well outside the logging slot near its start.
     monkeypatch.setattr(
         wdog.time,
@@ -2870,6 +3426,7 @@ def test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     # Halfway into the bucket — well outside the logging slot near its start.
     monkeypatch.setattr(
         wdog.time,
@@ -2928,6 +3485,7 @@ def _count_head_start_skip_lines(
     tier = "fm" if pass_fn_name.startswith("fused_memory") else "fleet"
     monkeypatch.setattr(wdog, f"_within_{tier}_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, f"_within_{tier}_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
 
     now = {"t": window_start + tick_phase}
@@ -2950,6 +3508,7 @@ def _head_start_skip_line_emitted_at(
     log_messages: list[str] = []
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
     monkeypatch.setattr(wdog.time, "time", lambda: when)
     wdog.staleness_pass()
@@ -3152,6 +3711,7 @@ def test_staleness_head_start_anchored_on_fleet_min_interval_expiry_real_clock_f
             json.dumps({"ts": now - age_secs, "iso": "2026-08-26T00:00:00+00:00"})
         )
         monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+        monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
         recorded_calls: list[list[str]] = []
         log_messages: list[str] = []
@@ -3213,7 +3773,7 @@ def test_staleness_pass_head_start_fails_open_on_unreadable_fleet_clock(
     fleet staleness backstop PERMANENTLY and INVISIBLY: with no readable
     stamp there is no window-open instant, so a gate that answered "still
     inside the head start" would answer that on every tick forever. That is
-    the exact direction scripts/orchestrator-watchdog.py::_within_min_interval
+    the exact direction scripts/_watchdog_state.py::within_min_interval
     documents itself as failing away from, and routing the new gate through it
     is what makes this true by construction rather than by re-derivation.
 
@@ -3261,7 +3821,7 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
 
     main() still restarts a port-down unit via restart_unit even when
     _within_fleet_deploy_min_interval() would report True (inside the 8h
-    fleet-deploy window) — liveness is uncapped, non-clock-gated, and
+    fleet-deploy window) — liveness is not deploy-clock-gated and
     non-stamping; brokenness is not a scheduled deploy.
     """
     wdog = _load_watchdog()
@@ -3278,7 +3838,7 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"main() must still restart a port-down unit even when the fleet-deploy "
@@ -3325,7 +3885,7 @@ def test_main_liveness_unaffected_by_fleet_redeploy_lease_for_other_units(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"a live lease that names no unit yet must suppress liveness for NO "
@@ -4115,6 +4675,68 @@ def test_report_extended_columns_stay_read_only(
 
 
 # ---------------------------------------------------------------------------
+# RESTARTS column (task 8270)
+#
+# NRestarts/Result per running unit, one whitespace-free token immediately
+# left of VERDICT, so the whitespace-positional readers above keep their
+# indices (tokens[-4:] is still VERDICT/DEPLOY-AGE/MERGE-IDLE/WOULD-DEFER).
+# ---------------------------------------------------------------------------
+
+
+def test_report_restarts_column_sits_left_of_verdict_and_stays_read_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wdog = _load_watchdog()
+    commit_epoch = 1_800_000_000
+    looping = synthetic_unit("restarts-looping")
+    stuck = synthetic_unit("restarts-stuck")
+    unreadable = synthetic_unit("restarts-unreadable")
+    restart_answers = {
+        looping: "Result=success\nNRestarts=3\n",
+        stuck: "Result=start-limit-hit\nNRestarts=10\n",
+    }
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(
+                f"{u} loaded active running desc\n" for u in (looping, stuck, unreadable)
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"] and _SHOW_RESTARTS_ARGV_TAIL in cmd:
+            unit = cmd[3]
+            if unit not in restart_answers:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such unit")
+            return subprocess.CompletedProcess(cmd, 0, stdout=restart_answers[unit], stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{commit_epoch + 100}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = wdog.report()
+
+    assert exit_code == 0, "staleness alone decides the exit code"
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.startswith("UNIT"))
+    assert "RESTARTS" in header
+    assert header.index("RESTARTS") < header.index("VERDICT")
+    rows = {line.split()[0]: line.split() for line in lines if line.split()[:1]}
+    expected = {looping: "3/success", stuck: "10/start-limit-hit", unreadable: "?/?"}
+    for unit, restarts in expected.items():
+        tokens = rows[unit]
+        assert tokens[-4] == "fresh", tokens
+        assert tokens[-5] == restarts, tokens
+    systemctl_verbs = {c[2] for c in recorded_calls if c[:1] == ["systemctl"]}
+    assert systemctl_verbs <= {"list-units", "show"}, systemctl_verbs
+
+
+# ---------------------------------------------------------------------------
 # _cli tests
 # ---------------------------------------------------------------------------
 
@@ -4131,12 +4753,17 @@ def test_cli_report_flag_routes_to_report_only(monkeypatch: pytest.MonkeyPatch) 
     # ss/urllib I/O. raising=False: tolerates the attribute not existing yet
     # (pre-B4-impl) so this test can be written before the impl lands.
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
-    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
+    parity_args: list[tuple[object, ...]] = []
+    monkeypatch.setattr(wdog, "print_unit_parity", lambda *a: parity_args.append(a))
 
     exit_code = wdog._cli(["--report"])
 
     assert calls == ["report"], f"Expected only report() called, got {calls}"
     assert exit_code == 0
+    assert parity_args == [(wdog.REPO_DIR, wdog.log)], (
+        "the --report parity row must check the watchdog's own checkout and "
+        f"write to its journal sink, got {parity_args}"
+    )
 
 
 def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4153,7 +4780,7 @@ def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPat
     # No-op the fused-memory liveness row (B4) — see comment in
     # test_cli_report_flag_routes_to_report_only above.
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
-    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "print_unit_parity", lambda *_: None)
 
     assert wdog._cli(["--report"]) == 1
 
@@ -4173,9 +4800,13 @@ def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
     )
-    monkeypatch.setattr(
-        wdog, "unit_parity_pass", lambda: calls.append("unit_parity_pass"), raising=False
-    )
+    parity_args: list[tuple[object, ...]] = []
+
+    def _record_unit_parity_pass(*args: object) -> None:
+        calls.append("unit_parity_pass")
+        parity_args.append(args)
+
+    monkeypatch.setattr(wdog, "unit_parity_pass", _record_unit_parity_pass)
 
     wdog._cli([])
 
@@ -4188,6 +4819,10 @@ def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPat
     ], (
         "Expected liveness passes, then both staleness passes, then the purely "
         f"observational dashboard unit-parity pass LAST, got {calls}"
+    )
+    assert parity_args == [(wdog.REPO_DIR, wdog.log)], (
+        "the timer-path parity pass must check the watchdog's own checkout and "
+        f"write to its journal sink, got {parity_args}"
     )
 
 
@@ -4206,7 +4841,7 @@ def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> Non
         wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
     )
     monkeypatch.setattr(
-        wdog, "unit_parity_pass", lambda: calls.append("unit_parity_pass"), raising=False
+        wdog, "unit_parity_pass", lambda *_: calls.append("unit_parity_pass")
     )
 
     # Must not raise
@@ -4221,6 +4856,28 @@ def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> Non
     ]
 
 
+def test_watchdog_runs_as_a_directly_executed_script(tmp_path: pathlib.Path) -> None:
+    """systemd's ExecStart runs the file directly, so its flat-sibling imports resolve from the script's own directory, which pytest's conftest insertion otherwise masks."""
+    clock_file = tmp_path / "fm.json"
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONSAFEPATH")
+    }
+    env["FM_DEPLOY_CLOCK"] = str(clock_file)
+
+    result = subprocess.run(
+        [sys.executable, str(WATCHDOG_PATH), "--stamp-fm-deploy-clock"],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"direct execution failed: {result.stderr}"
+    body = json.loads(clock_file.read_text())
+    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
+
+
 def test_cli_report_does_not_run_fm_staleness_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     """--report must NOT invoke fused_memory_staleness_pass() (I7 at the CLI
     boundary): the fm staleness backstop runs on the timer path only, never in
@@ -4229,7 +4886,7 @@ def test_cli_report_does_not_run_fm_staleness_pass(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(wdog, "report", lambda: 0)
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
-    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "print_unit_parity", lambda *_: None)
     monkeypatch.setattr(
         wdog,
         "fused_memory_staleness_pass",
@@ -4249,7 +4906,7 @@ def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     # No-op the fused-memory liveness row (B4) — see comment in
     # test_cli_report_flag_routes_to_report_only above.
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
-    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "print_unit_parity", lambda *_: None)
 
     exit_code = wdog._cli()
 
@@ -4301,10 +4958,11 @@ def test_boundary1_staleness_inside_window_real_clock_file(
     wdog = _load_watchdog()
 
     now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
-    clock_ts = now - 2 * 3600  # ~2h ago -- well inside the 28800s default window
+    clock_ts = now - 2 * 3600  # ~2h ago -- well inside the 259200s default window
     clock_file = tmp_path / "clock.json"
     clock_file.write_text(json.dumps({"ts": clock_ts, "iso": "2026-07-16T00:00:00+00:00"}))
     monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace, if ever reached
     unit = "orchestrator-know-live.service"
@@ -4370,6 +5028,7 @@ _BOUNDARY_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 import json
 import os
 import sys
+import tempfile
 import time
 
 STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
@@ -4381,8 +5040,17 @@ def _load():
 
 
 def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
+    fd, tmp_name = tempfile.mkstemp(dir=os.path.dirname(STATE_PATH) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_name, STATE_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _observe_lease(args):
@@ -5297,7 +5965,7 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
     """Scenario 7 (I5) -- liveness during the 8h window, non-stamping: with
     a REAL on-disk fleet-deploy clock dated ~1h ago (inside the window,
     sentinel {ts, iso}), main() still immediately revives a port-down unit
-    (liveness is uncapped and not clock-gated) AND the clock file is left
+    (liveness is not deploy-clock-gated) AND the clock file is left
     byte-identical afterward -- a single wedged-unit revive must never
     advance the fleet-wide deploy clock. Extends
     test_main_liveness_unaffected_by_fleet_deploy_gate above (which
@@ -5325,7 +5993,7 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"main() must immediately revive a port-down unit even inside the "
@@ -5524,12 +6192,12 @@ def test_boundary10_recover_pending_merges_link_seam() -> None:
     recovery function the drain gate's crash-safety story depends on is
     present and callable.
 
-    Uses pytest.importorskip("orchestrator.merge_queue_store") so the
+    Uses pytest.importorskip("orchestrator.merge_lane.queue_store") so the
     otherwise stdlib-only watchdog suite still collects and passes in a
     minimal env where the orchestrator package/venv is not importable.
     """
-    pytest.importorskip("orchestrator.merge_queue_store")
-    from orchestrator.merge_queue_store import recover_pending_merges
+    pytest.importorskip("orchestrator.merge_lane.queue_store")
+    from orchestrator.merge_lane.queue_store import recover_pending_merges
 
     assert callable(recover_pending_merges), (
         "the drain gate's force-restart-mid-merge path (scenario 5) relies "
@@ -6450,7 +7118,7 @@ def test_cli_report_includes_fused_memory_row(
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
     # The dashboard unit-parity row would otherwise run the real checker.
-    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "print_unit_parity", lambda *_: None)
 
     exit_code = wdog._cli(["--report"])
 
@@ -7056,92 +7724,21 @@ def test_stamp_and_read_fm_deploy_clock_roundtrip(
 
 
 # ---------------------------------------------------------------------------
-# task 4823: the clock stamp carries its own provenance
+# task 4823: the fm deploy clock's stamp carries provenance in its own right.
 #
-# The watchdog is the SECOND of the two clock writers (restart-all-orchestrators.sh
-# is the first) and it owns three clocks through one _stamp_clock primitive.
-# These pin this writer's half of the contract;
-# df_pytest_isolation.py::deploy_clock_change_report states what the provenance
-# is for and what it buys.
-#
-# Every key is named through the df_pytest_isolation constants rather than a
-# literal of this file's own: that is what makes these drift pins rather than
-# tautologies, since the guard reads the keys IT defines and neither tier can
-# import the other (the watchdog is stdlib-only, and df_pytest_isolation is
-# stdlib+pytest-only because every subproject conftest imports it).
+# The stamp_clock primitive's half of the contract, and why every key is named
+# through the df_pytest_isolation constants, is pinned in
+# tests/scripts/test_watchdog_state.py.
 # ---------------------------------------------------------------------------
 
 # A stand-in for a real uuid4().hex; the shape a live session actually stamps.
 _SESSION_TOKEN_SENTINEL = "3f9c1a8b2d7e4f60a5b3c1d9e7f50246"
 
 
-def test_stamp_clock_records_its_writer_and_the_ambient_session_token(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A test-spawned stamp is TAGGED as test-spawned.
-
-    The token is read from the ambient environment at write time, which is what
-    lets a suite-wide guard attribute a write it did not make itself: every
-    spawner in this repo builds its child env from dict(os.environ), so
-    descendants inherit it for free.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _SESSION_TOKEN_SENTINEL)
-    clock_file = tmp_path / "clock.json"
-
-    assert wdog._stamp_clock(str(clock_file)) is True
-
-    body = json.loads(clock_file.read_text())
-    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
-    assert body[CLOCK_PROVENANCE_SESSION_KEY] == _SESSION_TOKEN_SENTINEL
-
-
-def test_stamp_clock_records_an_empty_token_outside_a_pytest_session(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """The shape every GENUINE deploy writes — and the guard's one forgiving input.
-
-    ALWAYS present, never omitted: an empty string is the positive statement "no
-    pytest session was an ancestor of this write", whereas a missing key is
-    indistinguishable from a pre-4823 writer and correctly keeps failing closed.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.delenv(PYTEST_SESSION_TOKEN_ENV, raising=False)
-    clock_file = tmp_path / "clock.json"
-
-    wdog._stamp_clock(str(clock_file))
-
-    body = json.loads(clock_file.read_text())
-    assert CLOCK_PROVENANCE_SESSION_KEY in body, (
-        f"the key must be PRESENT and empty, not omitted; got {body!r}"
-    )
-    assert body[CLOCK_PROVENANCE_SESSION_KEY] == ""
-    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
-
-
-def test_stamp_clock_keeps_ts_and_iso_readable(tmp_path: pathlib.Path) -> None:
-    """The additive-schema guarantee the three readers depend on.
-
-    Every reader extracts `ts` and nothing else, so the two new keys must be
-    inert to all of them. Asserted through the real reader rather than by
-    eyeballing the body: a schema change that broke _read_clock_epoch would
-    disarm all three min-interval caps at once.
-    """
-    wdog = _load_watchdog()
-    clock_file = tmp_path / "clock.json"
-
-    wdog._stamp_clock(str(clock_file))
-
-    epoch = wdog._read_clock_epoch(str(clock_file), "test clock")
-    assert epoch is not None
-    assert epoch == pytest.approx(time.time(), abs=60)
-    assert isinstance(json.loads(clock_file.read_text())["iso"], str)
-
-
 def test_the_fm_deploy_clock_stamp_carries_provenance(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """The fm clock covered EXPLICITLY, not by inheritance from _stamp_clock.
+    """The fm clock covered EXPLICITLY, not by inheritance from stamp_clock.
 
     It is the second PROTECTED_DEPLOY_CLOCK_RELPATHS entry and the one the
     measured 2026-08-28 incidents actually pointed at — the genuine event there
@@ -7282,7 +7879,7 @@ def test_within_fm_staleness_head_start_false_when_clock_absent(
 ) -> None:
     """False when fm's clock is missing/corrupt/unreadable.
 
-    The fail-OPEN direction inherited from _within_min_interval: with no
+    The fail-OPEN direction inherited from within_min_interval: with no
     readable fm clock there is no window-open instant to measure a head start
     from, so the head start must not apply. Failing the other way would let
     one unreadable file silence the fm staleness backstop forever.
@@ -7301,7 +7898,7 @@ def test_within_fm_staleness_head_start_false_when_both_caps_disabled(
     """False WITHOUT reading fm's clock when the summed cap is <=0.
 
     Both FM_RESTART_MIN_INTERVAL_SECS and STALENESS_GRACE_SECS at 0 sum to 0,
-    which _within_min_interval short-circuits before touching the reader — a
+    which within_min_interval short-circuits before touching the reader — a
     disabled head start must not depend on a readable file.
     """
     wdog = _load_watchdog()
@@ -8046,7 +8643,7 @@ def test_a_fleet_probe_error_does_not_abort_the_tick(monkeypatch: pytest.MonkeyP
     # Stubbed, not run: the real pass would stamp the main checkout's parity
     # clock and hand the checker's argv to the _registration_run fake below.
     monkeypatch.setattr(
-        wdog, "unit_parity_pass", lambda: reached.append("unit_parity_pass"), raising=False
+        wdog, "unit_parity_pass", lambda *_: reached.append("unit_parity_pass")
     )
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
@@ -8658,7 +9255,7 @@ def test_fm_staleness_pass_head_start_fails_open_on_unreadable_fm_clock(
     PERMANENTLY and INVISIBLY, because with no readable stamp there is no
     window-open instant and the gate would answer "still inside the head start"
     on every tick forever. That is the direction
-    scripts/orchestrator-watchdog.py::_within_min_interval documents itself as
+    scripts/_watchdog_state.py::within_min_interval documents itself as
     failing away from.
 
     Neither fm clock gate is monkeypatched, so both evaluate the real
@@ -9174,208 +9771,10 @@ def test_fm_liveness_restart_min_interval_exceeds_worst_observed_lifetime(
 
 
 # ---------------------------------------------------------------------------
-# Part D: shared persistence helpers _atomic_write_json / _read_json_state
-# (task 3764)
-#
-# This task adds THREE more persisted-state writers/readers to a file that
-# already had two (_stamp_fm_deploy_clock / _read_last_fm_deploy_epoch).
-# Without extraction the ~20-line makedirs/mkstemp/os.replace/unlink-on-error
-# dance would be copy-pasted a third and fourth time. The extraction is
-# behaviour-preserving; the existing Part C deploy-clock suite is its
-# regression net, re-asserted explicitly at the bottom of this section.
+# Part D: the fm deploy clock still round-trips through the shared state
+# primitives (task 3764). The primitives' own contract tests live in
+# tests/scripts/test_watchdog_state.py.
 # ---------------------------------------------------------------------------
-
-
-def test_atomic_write_json_writes_body_and_creates_parent_dir(
-    tmp_path: pathlib.Path,
-) -> None:
-    """_atomic_write_json writes the JSON body, creating a missing parent dir.
-
-    Asserted against the REAL on-disk file (parsed back), never a mock.
-    """
-    wdog = _load_watchdog()
-    target = tmp_path / "deep" / "nested" / "state.json"
-    assert not target.parent.exists()
-
-    wdog._atomic_write_json(str(target), {"count": 2, "verdict": "wedged"})
-
-    assert target.exists(), "the write must create the target file and its parent dir"
-    assert json.loads(target.read_text()) == {"count": 2, "verdict": "wedged"}
-
-
-def test_atomic_write_json_leaves_no_stray_temp_file(tmp_path: pathlib.Path) -> None:
-    """A successful _atomic_write_json leaves ONLY the target file behind.
-
-    The write goes via tempfile.mkstemp + os.replace; the temp file must be
-    renamed away, not left accumulating in data/fused-memory/ on every tick.
-    """
-    wdog = _load_watchdog()
-    target = tmp_path / "state.json"
-
-    wdog._atomic_write_json(str(target), {"ts": 1})
-
-    survivors = sorted(p.name for p in tmp_path.iterdir())
-    assert survivors == ["state.json"], f"stray temp file(s) left behind: {survivors}"
-
-
-def test_atomic_write_json_fail_soft_on_replace_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A failed rename is logged and swallowed, and the temp file is unlinked.
-
-    Fail-soft: a persistence hiccup must never crash the oneshot watchdog.
-    """
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-
-    def boom(_src, _dst):  # noqa: ANN001
-        raise OSError("cross-device link")
-
-    monkeypatch.setattr(wdog.os, "replace", boom)
-    target = tmp_path / "state.json"
-
-    # Must not raise.
-    wdog._atomic_write_json(str(target), {"ts": 1})
-
-    assert not target.exists(), "a failed write must not leave a partial target"
-    assert list(tmp_path.iterdir()) == [], (
-        f"the temp file must be unlinked on failure: "
-        f"{sorted(p.name for p in tmp_path.iterdir())}"
-    )
-    assert logged, "a swallowed write failure must be logged, not silent"
-
-
-def test_atomic_write_json_fail_soft_on_unwritable_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """An unwritable target directory is logged and swallowed, not raised."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-
-    locked = tmp_path / "locked"
-    locked.mkdir()
-    locked.chmod(0o500)  # r-x: cannot create the temp file inside
-    try:
-        # Must not raise.
-        wdog._atomic_write_json(str(locked / "state.json"), {"ts": 1})
-    finally:
-        locked.chmod(0o700)
-
-    assert not (locked / "state.json").exists()
-    assert logged, "a swallowed write failure must be logged, not silent"
-
-
-def test_atomic_write_json_reports_whether_the_write_landed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """The writer returns True only after the rename succeeded, False otherwise.
-
-    Fail-soft is not the same as fail-safe: one caller
-    (_stamp_fm_liveness_restart_clock) ARMS a cap, so it must be able to tell
-    a landed write from a swallowed failure rather than assume the former.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(wdog, "log", lambda _m: None)
-
-    assert wdog._atomic_write_json(str(tmp_path / "ok.json"), {"ts": 1}) is True
-
-    def boom(_src, _dst):  # noqa: ANN001
-        raise OSError("cross-device link")
-
-    monkeypatch.setattr(wdog.os, "replace", boom)
-    assert wdog._atomic_write_json(str(tmp_path / "bad.json"), {"ts": 1}) is False
-
-
-def test_read_json_state_returns_parsed_dict(tmp_path: pathlib.Path) -> None:
-    """_read_json_state parses a well-formed file into a dict."""
-    wdog = _load_watchdog()
-    target = tmp_path / "state.json"
-    target.write_text('{"ts": 1783000000, "iso": "2026-08-06T00:00:00+00:00"}')
-
-    assert wdog._read_json_state(str(target)) == {
-        "ts": 1783000000,
-        "iso": "2026-08-06T00:00:00+00:00",
-    }
-
-
-def test_read_json_state_missing_file_returns_none_silently(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A missing file yields None with NO log line.
-
-    "The state does not exist yet" is the normal case on a fresh checkout — it
-    is not a degradation and must not spam the journal every tick.
-    """
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-
-    assert wdog._read_json_state(str(tmp_path / "absent.json")) is None
-    assert logged == [], f"a missing state file must not log: {logged}"
-
-
-def test_read_json_state_corrupt_json_returns_none_and_logs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A truncated/corrupt body yields None (fail-open) AND a log line."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-    target = tmp_path / "corrupt.json"
-    target.write_text('{"ts": 178300')  # truncated / partially written
-
-    assert wdog._read_json_state(str(target)) is None
-    assert logged, "a corrupt state file is a real degradation and must be logged"
-
-
-def test_read_json_state_non_object_body_returns_none_and_logs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A well-formed but NON-OBJECT body yields None AND a log line.
-
-    ``[1, 2]`` / ``"hello"`` parse fine but carry no state, so every caller
-    loses its clock or streak — indistinguishable in consequence from a
-    corrupt file, and therefore a genuine degradation that must leave journal
-    evidence. Before the task-3764 extraction this case raised TypeError on
-    ``raw["ts"]`` inside _read_last_fm_deploy_epoch and WAS logged; a silent
-    None here would make the fm deploy backstop and the liveness restart cap
-    both vanish with nothing in the journal to explain it.
-    """
-    wdog = _load_watchdog()
-    for body in ("[1, 2]", '"hello"', "null", "3"):
-        logged: list[str] = []
-        monkeypatch.setattr(wdog, "log", lambda m, sink=logged: sink.append(m))
-        target = tmp_path / "nonobject.json"
-        target.write_text(body)
-
-        assert wdog._read_json_state(str(target)) is None, (
-            f"a non-object body must yield None: {body!r}"
-        )
-        assert logged, f"a non-object state body must be logged: {body!r}"
-        assert any(str(target) in m for m in logged), (
-            f"the log line must name the offending path: {logged!r}"
-        )
-
-
-def test_read_json_state_oserror_returns_none_and_logs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A non-FileNotFoundError OSError yields None (fail-open) AND a log line."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-    target = tmp_path / "state.json"
-    target.write_text('{"ts": 1}')
-    target.chmod(0o000)
-    try:
-        result = wdog._read_json_state(str(target))
-    finally:
-        target.chmod(0o600)
-
-    assert result is None
-    assert logged, "an unreadable state file must be logged, not silently ignored"
 
 
 def test_fm_deploy_clock_still_roundtrips_through_shared_helpers(
@@ -9401,107 +9800,6 @@ def test_fm_deploy_clock_still_roundtrips_through_shared_helpers(
     assert "ts" in body and "iso" in body, f"clock body must still carry ts+iso: {body}"
     assert wdog._read_last_fm_deploy_epoch() == pytest.approx(1783000000.0)
     assert isinstance(wdog._read_last_fm_deploy_epoch(), float)
-
-
-# ---------------------------------------------------------------------------
-# Part D: shared CLOCK-layer primitives (task 3764 amendment)
-#
-# _read_clock_epoch / _stamp_clock / _within_min_interval sit one level above
-# the JSON primitives and are now the SINGLE definition behind all eight clock
-# wrappers (fleet-deploy, fm-deploy, fm-liveness-restart). The wrappers' own
-# suites (Part A/C/D) are the behavioural regression net; these pin the
-# primitives' contracts directly so a drift between the three fail-open
-# contracts is caught at the source rather than in triplicate.
-# ---------------------------------------------------------------------------
-
-
-def test_read_clock_epoch_roundtrips_a_stamped_clock(tmp_path: pathlib.Path) -> None:
-    """_stamp_clock writes {ts, iso}; _read_clock_epoch reads it back as float."""
-    wdog = _load_watchdog()
-    clock = tmp_path / "nested" / "clock.json"
-    assert not clock.parent.exists(), "the stamp must create the parent dir"
-
-    wdog._stamp_clock(str(clock))
-
-    body = json.loads(clock.read_text())
-    assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
-    epoch = wdog._read_clock_epoch(str(clock), "test clock")
-    assert isinstance(epoch, float)
-    assert epoch == pytest.approx(float(body["ts"]))
-
-
-def test_read_clock_epoch_missing_file_returns_none_silently(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """An absent clock is the normal 'never stamped' case: None, and no log spam."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-
-    assert wdog._read_clock_epoch(str(tmp_path / "absent.json"), "test clock") is None
-    assert logged == [], f"a never-stamped clock must not log every tick: {logged!r}"
-
-
-def test_read_clock_epoch_unusable_ts_returns_none_and_names_the_clock(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A body with a missing/unusable `ts` fails open to None AND names the label.
-
-    The label is the whole reason it is a parameter: with three clocks now
-    sharing one reader, a journal line that did not say WHICH clock degraded
-    would be useless to an operator.
-    """
-    wdog = _load_watchdog()
-    for body in ('{"iso": "2026-08-06T00:00:00+00:00"}', '{"ts": "not-a-number"}'):
-        logged: list[str] = []
-        monkeypatch.setattr(wdog, "log", lambda m, sink=logged: sink.append(m))
-        clock = tmp_path / "clock.json"
-        clock.write_text(body)
-
-        assert wdog._read_clock_epoch(str(clock), "fm-deploy clock") is None
-        assert any("fm-deploy clock" in m for m in logged), (
-            f"the log line must name the degraded clock: {logged!r}"
-        )
-
-
-def test_within_min_interval_uses_the_reader_it_is_given(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The gate compares now - reader() against secs, honouring the passed reader.
-
-    Taking the READER rather than a path is what keeps each wrapper's named
-    epoch function the single seam tests substitute at — a wrapper can never
-    silently bypass its own reader.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)
-
-    assert wdog._within_min_interval(3600, lambda: 1_000_000.0) is True
-    assert wdog._within_min_interval(60, lambda: 1_000_000.0) is False
-
-
-def test_within_min_interval_disabled_does_not_read_the_clock() -> None:
-    """secs<=0 disables the cap outright — the reader is not even called.
-
-    A disabled cap must not depend on a readable file.
-    """
-    wdog = _load_watchdog()
-
-    def boom() -> float:
-        pytest.fail("a disabled min-interval must not read its clock")
-
-    assert wdog._within_min_interval(0, boom) is False
-    assert wdog._within_min_interval(-1, boom) is False
-
-
-def test_within_min_interval_absent_clock_is_outside_the_window() -> None:
-    """A None epoch counts as OUTSIDE the window (fail toward acting).
-
-    Failing the other way would let one unreadable file suppress every future
-    restart indefinitely.
-    """
-    wdog = _load_watchdog()
-    assert wdog._within_min_interval(3600, lambda: None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -9959,7 +10257,7 @@ def test_record_fm_liveness_failure_persists_across_module_instances(
 # is clamped "unlike the two knobs below": their "<=0 means 'disable the cap' —
 # a safe direction, since a disabled cap only removes a restriction on an
 # already-justified restart". That claim held for
-# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS (_within_min_interval returns False on
+# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS (within_min_interval returns False on
 # secs<=0 without even reading the clock) and was FALSE for the max-age knob:
 # _record_fm_liveness_failure tests `(now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS`,
 # so at 0 the comparison is true for essentially every prior entry, EVERY streak
@@ -10209,7 +10507,7 @@ def test_liveness_pass_unarmable_cap_is_logged_distinguishably(
     defaults) indefinitely — strictly worse flapping than the one-per-hour
     bound this layer promises. Nothing else reconstructs this clock (unlike
     the fm deploy clock, which self-heals from ActiveEnterTimestamp), so one
-    `_atomic_write_json:` line buried among healthy ticks is not enough
+    `atomic_write_json:` line buried among healthy ticks is not enough
     signal.
     """
     wdog = _load_watchdog()
@@ -10247,7 +10545,7 @@ def test_liveness_pass_unarmable_cap_is_logged_distinguishably(
     assert any("unbounded" in m for m in unarmed), (
         f"the line must state the consequence, not just the failure: {unarmed!r}"
     )
-    routine = [m for m in logged if m.startswith("_atomic_write_json:")]
+    routine = [m for m in logged if m.startswith("atomic_write_json:")]
     assert routine and unarmed != routine, (
         "the high-signal line must be distinguishable from the routine "
         f"persistence hiccup line: {logged!r}"
@@ -10971,7 +11269,7 @@ def test_cli_continues_past_a_liveness_persistence_failure(
         wdog, "fused_memory_staleness_pass", lambda: calls.append("fm_staleness_pass")
     )
     monkeypatch.setattr(
-        wdog, "unit_parity_pass", lambda: calls.append("unit_parity_pass"), raising=False
+        wdog, "unit_parity_pass", lambda *_: calls.append("unit_parity_pass")
     )
     _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
 
@@ -11220,7 +11518,7 @@ def test_cli_report_exit_code_unchanged_by_the_new_fields(
     )
     monkeypatch.setattr(wdog, "report", lambda: 1)
     # The dashboard unit-parity row would otherwise run the real checker.
-    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "print_unit_parity", lambda *_: None)
 
     assert wdog._cli(["--report"]) == 1
     assert "2/" in capsys.readouterr().out
@@ -11253,7 +11551,11 @@ def _reliably_dead_pid() -> int:
     """A pid that has exited AND been reaped, so it names no live process."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
-    assert wait_pid_gone(proc.pid), f"pid {proc.pid} outlived its own reaping"
+    state = read_proc_state(proc.pid)
+    assert state is None, (
+        f"pid {proc.pid} still has a /proc entry {state} after proc.wait() reaped it; "
+        "os.kill(pid, 0), which the lease liveness check uses, would read it as alive"
+    )
     return proc.pid
 
 
@@ -11772,7 +12074,7 @@ def test_staleness_pass_still_delegates_exactly_once_when_nothing_changes(
 # code=killed status=9/KILL.
 #
 # The suppression is scoped to the lease's current_unit and NOTHING else. I5 —
-# liveness stays uncapped, non-clock-gated and non-stamping, because brokenness
+# liveness stays not deploy-clock-gated and non-stamping, because brokenness
 # is not a scheduled deploy — must survive for every other unit. A blanket
 # liveness disable during a sweep is explicitly forbidden.
 #
@@ -11824,7 +12126,7 @@ def test_main_skips_the_liveness_restart_of_the_unit_the_sweep_is_restarting(
     logged: list[str] = []
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], (
         f"a unit the in-flight sweep is restarting must not also be restarted "
@@ -11859,7 +12161,7 @@ def test_main_still_restarts_a_different_unit_while_a_sweep_holds_the_lease(
     )
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], (
         f"liveness must stay intact for every unit the sweep is not touching; "
@@ -11885,7 +12187,7 @@ def test_main_restarts_the_unit_when_the_lease_is_not_live(
     _write_lease(wdog, monkeypatch, tmp_path, body)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], (
         f"a {why} lease must not suppress a liveness restart; got {restarted}"
@@ -11901,7 +12203,7 @@ def test_main_liveness_is_byte_identical_when_no_lease_file_exists(
     monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], f"no lease means no suppression; got {restarted}"
 
@@ -11926,7 +12228,7 @@ def test_main_does_not_read_the_lease_when_every_probe_is_up(
     monkeypatch.setattr(wdog, "_live_fleet_lease", _counting_read)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], "sanity: no probe failed, so nothing may restart"
     assert reads == [], (
@@ -12211,9 +12513,10 @@ def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPa
 
     Modelled on test_orch_restart_min_interval_secs_matches_config_default
     above. The bound is what makes a SIGKILLed sweep cost at most one delayed
-    window, and its 14400s value is DERIVED (worst legitimate sweep ~= 13,300s),
-    not chosen — so a tier drifting off it is a silent correctness change, not
-    a cosmetic one.
+    window, and a --drain sweep is fitted under its 14400s value (at
+    scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS) —
+    so a tier drifting off it is a silent correctness change, not a cosmetic
+    one.
 
     Two statements, because there are exactly two tiers that READ the value:
     the coordinator via OrchestratorConfig and the watchdog via its own env
@@ -12442,685 +12745,65 @@ def test_report_distinguishes_a_future_dated_lease_from_a_live_one(
     assert "live" not in future_line, future_line
 
 
-# ---------------------------------------------------------------------------
-# Dashboard unit-parity backstop (task 4883)
-#
-# A read-only, hourly-throttled run of scripts/check_dashboard_unit_parity.py
-# on the already-armed watchdog tick, so the parity gate runs without anyone
-# having to run setup-host.sh. No live systemd, no real checker, no real clock:
-# subprocess.run is faked, and every test that lets unit_parity_pass run for
-# real redirects its clock through _isolate_unit_parity.
-# ---------------------------------------------------------------------------
-
-_DRIFT_REPORT = (
-    "[dashboard_unit_parity] [drift] 1 directive(s) differ between repo and "
-    "installed units:\n"
-    "[dashboard_unit_parity]   dark-factory-dashboard.service [Service] "
-    "SuccessExitStatus\n"
-)
-
-
-def _checker_run(
-    calls: list[list[str]],
-    *,
-    returncode: int = 0,
-    stdout: str = "",
-    stderr: str = "",
-    raises: BaseException | None = None,
-):
-    """A subprocess.run fake that records every argv and answers like the checker."""
-
-    def fake_run(argv, **_kwargs):  # noqa: ANN001, ANN003
-        calls.append(list(argv))
-        if raises is not None:
-            raise raises
-        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
-
-    return fake_run
-
-
-@pytest.mark.parametrize(
-    ("returncode", "verdict"), [(0, "parity"), (1, "drift"), (2, "absent")]
-)
-def test_unit_parity_verdict_classifies_the_checkers_exit_code(
-    monkeypatch: pytest.MonkeyPatch, returncode: int, verdict: str
-) -> None:
-    """0/1/2 map to the checker's own parity/drift/absent vocabulary.
-
-    The codes map only once the checker's tag shows it actually reported (see
-    test_unit_parity_verdict_without_the_checkers_tag_is_unknown); this input
-    is tagged. The combined stdout/stderr comes back with the verdict because
-    that text is how an operator learns WHICH directive drifted.
-    """
-    wdog = _load_watchdog()
-    calls: list[list[str]] = []
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        _checker_run(
-            calls, returncode=returncode, stdout=_DRIFT_REPORT, stderr="checker stderr line"
-        ),
-    )
-
-    got_verdict, report = wdog.unit_parity_verdict()
-
-    assert got_verdict == verdict
-    assert isinstance(got_verdict, wdog.UnitParityVerdict), (
-        f"verdicts are a closed type so a misspelled comparison fails pyright: {got_verdict!r}"
-    )
-    assert "SuccessExitStatus" in report, f"stdout must reach the report: {report!r}"
-    assert "checker stderr line" in report, f"stderr must reach the report: {report!r}"
-
-
-def test_unit_parity_verdict_runs_the_checker_against_the_repo(
+def test_report_code_sha_column_shows_each_units_deployed_sha_and_flags(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The checker is pointed at REPO_DIR and left to choose its installed dir.
-
-    --installed-dir is deliberately NOT passed: the checker's own default is
-    the one setup-host.sh gates against, and re-deriving it here would be a
-    second copy of it.
-    """
-    wdog = _load_watchdog()
-    calls: list[list[str]] = []
-    monkeypatch.setattr(subprocess, "run", _checker_run(calls))
-
-    wdog.unit_parity_verdict()
-
-    assert len(calls) == 1, calls
-    (argv,) = calls
-    assert any(arg.endswith("check_dashboard_unit_parity.py") for arg in argv), argv
-    assert "--repo-root" in argv, argv
-    assert argv[argv.index("--repo-root") + 1] == wdog.REPO_DIR, argv
-    assert "--installed-dir" not in argv, argv
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        FileNotFoundError(2, "No such file or directory", "python3"),
-        PermissionError(13, "Permission denied"),
-        subprocess.TimeoutExpired(cmd="check_dashboard_unit_parity.py", timeout=30),
-    ],
-    ids=["not-found", "permission", "timeout"],
-)
-def test_unit_parity_verdict_tooling_failure_is_unknown_and_never_raises(
-    monkeypatch: pytest.MonkeyPatch, error: BaseException
-) -> None:
-    """A checker that cannot run is 'unknown', never an exception.
-
-    Same never-raises contract as probe_port and log(): a tooling failure in
-    an observational pass must not abort the tick it runs on.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(subprocess, "run", _checker_run([], raises=error))
-
-    verdict, _report = wdog.unit_parity_verdict()
-
-    assert verdict == "unknown"
-
-
-def test_unit_parity_verdict_unexpected_exit_code_is_unknown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A TAGGED exit code outside 0/1/2 is not a parity claim, and says which code it was."""
-    wdog = _load_watchdog()
-    monkeypatch.setattr(
-        subprocess, "run", _checker_run([], returncode=7, stdout="[dashboard_unit_parity] boom")
-    )
-
-    verdict, report = wdog.unit_parity_verdict()
-
-    assert verdict == "unknown"
-    assert "7" in report, f"the report must name the unexpected exit code: {report!r}"
-
-
-# Real failure shapes that carry NO [dashboard_unit_parity] tag, so the checker
-# never reported. Exit 2 is also python3's can't-open-file status and
-# argparse's usage-error status, and an uncaught traceback exits 1.
-_UNTAGGED_CHECKER_OUTPUTS = [
-    pytest.param(
-        2,
-        "",
-        "python3: can't open file '/nonexistent/check_dashboard_unit_parity.py': "
-        "[Errno 2] No such file or directory",
-        id="cant-open",
-    ),
-    pytest.param(
-        2,
-        "",
-        "usage: check_dashboard_unit_parity.py [-h] [--installed-dir INSTALLED_DIR]\n"
-        "check_dashboard_unit_parity.py: error: unrecognized arguments: --repo-root /x",
-        id="argparse-reject",
-    ),
-    pytest.param(
-        1,
-        "",
-        "Traceback (most recent call last):\n"
-        '  File "check_dashboard_unit_parity.py", line 1, in <module>\n'
-        "ValueError: boom",
-        id="traceback",
-    ),
-    pytest.param(0, "", "", id="silent-zero"),
-]
-
-
-@pytest.mark.parametrize(("returncode", "stdout", "stderr"), _UNTAGGED_CHECKER_OUTPUTS)
-def test_unit_parity_verdict_without_the_checkers_tag_is_unknown(
-    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str, stderr: str
-) -> None:
-    """No tag, no verdict — whatever the exit code says.
-
-    Trusting the code alone turns a moved checker or a renamed --repo-root
-    into a permanently silent 'absent', and a crash into a WARNING drift.
-    'silent-zero' proves the tag outranks even a parity-looking 0, which is
-    scripts/setup-host.sh::_parity_verdict's own rule.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        _checker_run([], returncode=returncode, stdout=stdout, stderr=stderr),
-    )
-
-    verdict, report = wdog.unit_parity_verdict()
-
-    assert verdict == "unknown", report
-    assert stderr in report, f"the captured stderr must reach the report: {report!r}"
-    assert f"exit {returncode}" in report, f"the report must name the exit status: {report!r}"
-
-
-def test_unit_parity_verdict_runs_the_real_checker_and_reads_its_tag(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """CONTRACT LOCK: the real checker, run the way the watchdog runs it, reports.
-
-    The one test here that does not fake subprocess.run. Every other one
-    would stay green through a renamed or moved checker, a renamed
-    --repo-root, or a changed tag, while the hourly pass went quiet.
-
-    REPO_DIR is redirected to this checkout because its hardcoded default
-    would run MAIN's checker, not the code under test; the script path is
-    re-derived from the constant's own relative path so a rename still
-    fails. HOME points at an empty tmp dir, so the checker's default installed
-    dir holds no units and the real ones are never read, while the production
-    argv stays intact. 'absent' is then the only correct answer, and getting
-    it proves the script runs at that path, accepts --repo-root, and prints
-    the tag the watchdog searches for.
-    """
-    wdog = _load_watchdog()
-    rel = os.path.relpath(wdog.DASHBOARD_PARITY_SCRIPT, wdog.REPO_DIR)
-    assert (REPO_ROOT / rel).is_file(), (
-        f"DASHBOARD_PARITY_SCRIPT names {rel}, which this checkout does not have"
-    )
-    monkeypatch.setattr(wdog, "REPO_DIR", str(REPO_ROOT))
-    monkeypatch.setattr(wdog, "DASHBOARD_PARITY_SCRIPT", str(REPO_ROOT / rel))
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    verdict, report = wdog.unit_parity_verdict()
-
-    assert verdict == "absent", f"expected 'absent' from an empty installed dir: {report!r}"
-
-
-def _pass_log_lines(
-    wdog: types.ModuleType,
-    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     tmp_path: pathlib.Path,
-    verdict: str,
-    report: str = "REPORT-TEXT naming [Service] SuccessExitStatus",
-) -> list[str]:
-    """Run unit_parity_pass once against a stubbed *verdict*; return what it logged."""
-    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    lines: list[str] = []
-    monkeypatch.setattr(wdog, "log", lines.append)
-    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: (verdict, report))
-    wdog.unit_parity_pass()
-    return lines
-
-
-def test_unit_parity_pass_warns_once_on_drift_with_the_checkers_report(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """Drift is the one verdict an operator must act on, so it is the one WARNING."""
-    wdog = _load_watchdog()
+    """Task 6565 D1: CODE-SHA sits beside START and is read from the unit's heartbeat.
 
-    lines = _pass_log_lines(wdog, monkeypatch, tmp_path, "drift")
-
-    assert len(lines) == 1, lines
-    (line,) = lines
-    assert "WARNING" in line, line
-    assert "unit parity" in line, line
-    assert "REPORT-TEXT naming [Service] SuccessExitStatus" in line, line
-
-
-@pytest.mark.parametrize("tag", ["[drift]", "[override]", "[vanished]"])
-def test_unit_parity_pass_warning_headline_names_every_exit_1_case(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, tag: str
-) -> None:
-    """The checker exits 1 for three findings, so the headline must not name only one.
-
-    A drop-in override or a vanished committed unit is not a directive diff,
-    and a headline asserting drift would send the operator to the wrong fix.
-    End to end through a faked checker, so it is the real verdict that reaches
-    the headline.
+    ``?`` marks an indeterminate sha and ``*`` a dirty wire path; a heartbeat
+    without the block (a pre-6565 unit) or with a null block reads ``none``,
+    and a unit with no heartbeat file reads ``none`` too.
     """
     wdog = _load_watchdog()
-    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    lines: list[str] = []
-    monkeypatch.setattr(wdog, "log", lines.append)
-    report = f"[dashboard_unit_parity] {tag} finding\n"
-    monkeypatch.setattr(subprocess, "run", _checker_run([], returncode=1, stdout=report))
-
-    wdog.unit_parity_pass()
-
-    assert len(lines) == 1, lines
-    headline = lines[0].split("\n", 1)[0]
-    assert "WARNING" in headline, headline
-    assert tag in headline, f"the headline must name the {tag} case: {headline!r}"
-
-
-@pytest.mark.parametrize("verdict", ["parity", "absent"])
-def test_unit_parity_pass_is_silent_on_parity_and_absent(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, verdict: str
-) -> None:
-    """Parity needs no line, and neither does 'absent'.
-
-    Exit 2 means the dashboard units are not installed on this host, which
-    setup-host.sh already treats as benign. Warning on it would make every
-    checkout on a host without the dashboard permanently noisy.
-    """
-    wdog = _load_watchdog()
-
-    assert _pass_log_lines(wdog, monkeypatch, tmp_path, verdict) == []
-
-
-def test_unit_parity_pass_reports_a_broken_checker_without_a_warning(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """'unknown' gets one line, worded apart from drift.
-
-    A gate that could not run must be distinguishable from a green one, but it
-    is a tooling problem rather than a parity claim, so it is not a WARNING.
-    """
-    wdog = _load_watchdog()
-
-    lines = _pass_log_lines(wdog, monkeypatch, tmp_path, "unknown", report="PermissionError")
-
-    assert len(lines) == 1, lines
-    (line,) = lines
-    assert "WARNING" not in line, line
-    assert "unit parity" in line, line
-    assert "PermissionError" in line, line
-
-
-@pytest.mark.parametrize(
-    ("returncode", "stdout", "stderr"),
-    [p for p in _UNTAGGED_CHECKER_OUTPUTS if p.id in {"cant-open", "traceback"}],
-)
-def test_unit_parity_pass_reports_an_untagged_exit_instead_of_trusting_its_code(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-    returncode: int,
-    stdout: str,
-    stderr: str,
-) -> None:
-    """End to end through the pass: a checker that never reported is one plain line.
-
-    Not a stubbed verdict — subprocess.run is faked, so the regression is
-    locked where the hourly pass actually reads it. Trusting the code alone,
-    a moved checker (rc=2) logged nothing at all, and a crash (rc=1) logged a
-    WARNING that the installed units had drifted.
-    """
-    wdog = _load_watchdog()
-    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    lines: list[str] = []
-    monkeypatch.setattr(wdog, "log", lines.append)
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        _checker_run([], returncode=returncode, stdout=stdout, stderr=stderr),
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    clean, flagged, old, missing = (
+        synthetic_unit(n) for n in ("clean", "flagged", "old", "missing")
     )
+    units = [clean, flagged, old, missing]
 
-    wdog.unit_parity_pass()
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{commit_epoch + 100}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
 
-    assert len(lines) == 1, lines
-    (line,) = lines
-    assert "WARNING" not in line, line
-    assert "unit parity" in line, line
-    assert stderr in line, line
-
-
-def test_unit_parity_pass_never_raises(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """An unexpected failure inside the pass is logged, never raised out of the tick."""
-    wdog = _load_watchdog()
-    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    lines: list[str] = []
-    monkeypatch.setattr(wdog, "log", lines.append)
-
-    def boom() -> tuple[str, str]:
-        raise RuntimeError("unexpected parity failure")
-
-    monkeypatch.setattr(wdog, "unit_parity_verdict", boom)
-
-    wdog.unit_parity_pass()
-
-    assert any("unexpected parity failure" in line for line in lines), lines
-
-
-def test_unit_parity_pass_issues_no_mutating_systemd_call(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """READ-ONLY: the pass detects drift and never acts on it.
-
-    log() runs for real here, so every subprocess the pass spawns — the
-    checker and the journal write alike — reaches the recorder.
-    """
-    wdog = _load_watchdog()
-    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    calls: list[list[str]] = []
-    monkeypatch.setattr(
-        subprocess, "run", _checker_run(calls, returncode=1, stdout=_DRIFT_REPORT)
-    )
-
-    wdog.unit_parity_pass()
-
-    assert any(
-        arg.endswith("check_dashboard_unit_parity.py") for argv in calls for arg in argv
-    ), f"sanity: the checker must have run: {calls}"
-    mutating = [argv for argv in calls if argv and argv[0] in {"systemctl", "systemd-run"}]
-    assert mutating == [], mutating
-
-
-def _count_checker_runs(
-    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, verdict: str = "parity"
-) -> list[str]:
-    """Stub the verdict with a recorder; return the list each run appends to."""
-    runs: list[str] = []
-
-    def fake_verdict() -> tuple[str, str]:
-        runs.append(verdict)
-        return verdict, ""
-
-    monkeypatch.setattr(wdog, "unit_parity_verdict", fake_verdict)
-    monkeypatch.setattr(wdog, "log", lambda _m: None)
-    return runs
-
-
-def test_unit_parity_pass_skips_inside_the_min_interval(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A fresh stamp holds the checker off: ~1440 ticks/day must not mean ~1440 runs."""
-    wdog = _load_watchdog()
-    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    clock.write_text(json.dumps({"ts": int(time.time())}))
-    runs = _count_checker_runs(wdog, monkeypatch)
-
-    wdog.unit_parity_pass()
-
-    assert runs == []
-
-
-def test_unit_parity_pass_runs_and_stamps_when_the_clock_is_absent(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """No clock yet means the check is due: it runs once and stamps the clock."""
-    wdog = _load_watchdog()
-    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    runs = _count_checker_runs(wdog, monkeypatch)
-
-    wdog.unit_parity_pass()
-
-    assert len(runs) == 1, runs
-    assert clock.exists(), "the pass must stamp its clock"
-    assert abs(json.loads(clock.read_text())["ts"] - time.time()) < 60
-
-
-def test_unit_parity_pass_stamps_on_attempt_even_when_the_checker_cannot_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """The stamp is written on ATTEMPT, not on success.
-
-    Otherwise a persistently broken checker would re-run, and re-log, on every
-    one of the ~1440 ticks a day.
-    """
-    wdog = _load_watchdog()
-    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    runs = _count_checker_runs(wdog, monkeypatch, verdict="unknown")
-
-    wdog.unit_parity_pass()
-    wdog.unit_parity_pass()
-
-    assert clock.exists(), "an 'unknown' verdict must still stamp the clock"
-    assert len(runs) == 1, f"the second tick must be held off by the stamp: {runs}"
-
-
-def test_unit_parity_pass_fails_open_on_a_corrupt_clock(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A corrupt clock body lets the check RUN — the _read_clock_epoch contract.
-
-    Failing the other way would let one unreadable file silence the gate for
-    good.
-    """
-    wdog = _load_watchdog()
-    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    clock.write_text("{not json")
-    runs = _count_checker_runs(wdog, monkeypatch)
-
-    wdog.unit_parity_pass()
-
-    assert len(runs) == 1, runs
-
-
-def test_unit_parity_min_interval_of_zero_disables_the_gate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """<=0 disables the throttle, the shared _within_min_interval contract."""
-    wdog = _load_watchdog()
-    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    clock.write_text(json.dumps({"ts": int(time.time())}))
-    monkeypatch.setattr(wdog, "UNIT_PARITY_MIN_INTERVAL_SECS", 0)
-    runs = _count_checker_runs(wdog, monkeypatch)
-
-    wdog.unit_parity_pass()
-
-    assert len(runs) == 1, runs
-
-
-def test_unit_parity_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The parity clock is its OWN file under REPO_DIR/data/orchestrator/.
-
-    Distinct from every deploy and restart clock, so a redeploy never resets
-    the parity cadence and a parity check never moves a deploy gate.
-    """
-    monkeypatch.delenv("ORCH_UNIT_PARITY_CLOCK", raising=False)
-    wdog = _load_watchdog()
-
-    assert os.path.join(
-        wdog.REPO_DIR, "data", "orchestrator", "last_unit_parity_check.json"
-    ) == wdog.UNIT_PARITY_CLOCK_PATH
-    assert wdog.UNIT_PARITY_CLOCK_PATH not in {
-        wdog.FLEET_DEPLOY_CLOCK_PATH,
-        wdog.FM_DEPLOY_CLOCK_PATH,
-        wdog.FM_LIVENESS_RESTART_CLOCK_PATH,
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent_clock.json"))
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+    base = {"merge_idle": True, "depth": 0, "queue_empty": True, "ts_epoch": now - 5}
+    blocks = {
+        clean: {"sha": "1" * 40, "indeterminate": False, "dirty_wire_path": False},
+        flagged: {"sha": "2" * 40, "indeterminate": True, "dirty_wire_path": True},
     }
+    for unit in (clean, flagged):
+        (fleet_dir / f"{unit}.json").write_text(
+            json.dumps({"unit": unit, **base, "deployed_sha": blocks[unit]})
+        )
+    (fleet_dir / f"{old}.json").write_text(json.dumps({"unit": old, **base}))
 
-
-def test_unit_parity_knobs_honor_their_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ORCH_UNIT_PARITY_CLOCK and ORCH_UNIT_PARITY_MIN_INTERVAL_SECS are read at import."""
-    monkeypatch.setenv("ORCH_UNIT_PARITY_CLOCK", "/tmp/custom_unit_parity_clock.json")
-    monkeypatch.setenv("ORCH_UNIT_PARITY_MIN_INTERVAL_SECS", "120")
-    wdog = _load_watchdog()
-
-    assert wdog.UNIT_PARITY_CLOCK_PATH == "/tmp/custom_unit_parity_clock.json"
-    assert wdog.UNIT_PARITY_MIN_INTERVAL_SECS == 120
-
-
-def test_unit_parity_min_interval_falls_back_on_a_malformed_env_value(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A typo'd interval falls back to the hourly default rather than crashing the oneshot."""
-    monkeypatch.setenv("ORCH_UNIT_PARITY_MIN_INTERVAL_SECS", "hourly")
-    wdog = _load_watchdog()
-
-    assert wdog.UNIT_PARITY_MIN_INTERVAL_SECS == 3600
-
-
-# ---------------------------------------------------------------------------
-# The dashboard unit-parity --report row (task 4883)
-#
-# The operator's "right now" view of the same check unit_parity_pass runs
-# hourly: never clock-gated, never writes a clock, never alters --report's
-# exit code. The checker itself is always faked.
-# ---------------------------------------------------------------------------
-
-
-def _parity_row(out: str) -> str:
-    """Return the single dashboard unit-parity row from --report output."""
-    rows = [line for line in out.splitlines() if line.startswith("dashboard unit parity")]
-    assert len(rows) == 1, f"expected exactly one parity row, got {rows!r} in {out!r}"
-    return rows[0]
-
-
-def _row_verdict(row: str) -> str:
-    """Return the verdict field of a parity row: between the first ':' and the first '|'.
-
-    Asserting ``"parity" in row`` is vacuous, because the row's label,
-    ``dashboard unit parity``, always contains the word.
-    """
-    return row.split(":", 1)[1].split("|", 1)[0].strip()
-
-
-@pytest.mark.parametrize("verdict", ["parity", "drift", "absent", "unknown"])
-def test_print_unit_parity_prints_one_labelled_row(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], verdict: str
-) -> None:
-    """One row, in the fm row's ``LABEL: value | LABEL: value`` shape."""
-    wdog = _load_watchdog()
-    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: (verdict, ""))
-
-    wdog._print_unit_parity()
-
-    row = _parity_row(capsys.readouterr().out)
-    assert _row_verdict(row) == verdict, row
-    assert " | " in row, f"the row must keep --report's LABEL: value | LABEL: value shape: {row!r}"
-
-
-def test_print_unit_parity_shows_the_drifted_directive(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """On drift the checker's report follows the row, naming the directive.
-
-    The operator must see WHICH directive drifted without a second command.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: ("drift", _DRIFT_REPORT))
-
-    wdog._print_unit_parity()
+    wdog.report()
 
     out = capsys.readouterr().out
-    assert "drift" in _parity_row(out)
-    assert "SuccessExitStatus" in out, out
-
-
-def test_print_unit_parity_is_not_clock_gated_and_writes_no_clock(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """--report answers RIGHT NOW, and leaves the timer path's cadence alone.
-
-    A fresh stamp would hold unit_parity_pass off; it must not hold the row
-    off. And a read-only doctor invocation must not move the clock, or running
-    --report would itself change when the next hourly check happens.
-    """
-    wdog = _load_watchdog()
-    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
-    clock.write_text(json.dumps({"ts": int(time.time()), "iso": "fresh"}) + "\n")
-    before = clock.read_bytes()
-    calls: list[list[str]] = []
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        _checker_run(
-            calls,
-            returncode=0,
-            stdout="[dashboard_unit_parity] [ok] parity — 3 unit(s) match their committed copies.",
-        ),
-    )
-
-    wdog._print_unit_parity()
-
-    checker_runs = [
-        argv for argv in calls if any(a.endswith("check_dashboard_unit_parity.py") for a in argv)
-    ]
-    assert len(checker_runs) == 1, f"the row must run the checker despite a fresh stamp: {calls}"
-    assert clock.read_bytes() == before, "--report must never write the parity clock"
-    assert _row_verdict(_parity_row(capsys.readouterr().out)) == "parity"
-
-
-@pytest.mark.parametrize("report_rc", [0, 1])
-def test_cli_report_exit_code_is_unchanged_by_a_drifted_parity_row(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], report_rc: int
-) -> None:
-    """The parity row is informational: --report returns report()'s OWN code.
-
-    A drifted dashboard unit must not silently change what --report's exit
-    code means to its existing callers.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(wdog, "report", lambda: report_rc)
-    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None)
-    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: ("drift", _DRIFT_REPORT))
-
-    assert wdog._cli(["--report"]) == report_rc
-    assert "drift" in _parity_row(capsys.readouterr().out)
-
-
-def test_cli_report_runs_no_mutating_pass_including_unit_parity(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """--report never runs a timer-path pass — unit_parity_pass included.
-
-    That pass STAMPS a clock, so running it under --report would break the
-    read-only doctor contract even though the check itself is read-only.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(wdog, "report", lambda: 0)
-    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None)
-    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: ("parity", ""))
-    for name in (
-        "main",
-        "fused_memory_liveness_pass",
-        "staleness_pass",
-        "fused_memory_staleness_pass",
-        "unit_parity_pass",
-    ):
-        monkeypatch.setattr(
-            wdog,
-            name,
-            lambda name=name: pytest.fail(f"{name}() must not run under --report"),
-        )
-
-    assert wdog._cli(["--report"]) == 0
-    assert _row_verdict(_parity_row(capsys.readouterr().out)) == "parity"
-
-
-def test_print_unit_parity_degrades_to_unknown_on_an_unexpected_failure(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A failure inside the verdict costs this row its verdict, not --report its run."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", logged.append)
-    monkeypatch.setattr(wdog, "report", lambda: 0)
-    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None)
-
-    def boom() -> tuple[str, str]:
-        raise RuntimeError("parity checker exploded")
-
-    monkeypatch.setattr(wdog, "unit_parity_verdict", boom)
-
-    assert wdog._cli(["--report"]) == 0
-    assert "unknown" in _parity_row(capsys.readouterr().out)
-    assert any("parity checker exploded" in line for line in logged), logged
+    header = next(line for line in out.splitlines() if line.startswith("UNIT"))
+    assert header.index("START") < header.index("CODE-SHA") < header.index("NEWEST")
+    rows = [line.split() for line in out.splitlines()]
+    # START renders as three tokens ("YYYY-MM-DD HH:MM:SS UTC"), so CODE-SHA is the fifth.
+    code_sha = {row[0]: row[4] for row in rows if row and row[0] in units}
+    assert code_sha == {
+        clean: "1" * 12,
+        flagged: "2" * 12 + "?*",
+        old: "none",
+        missing: "none",
+    }

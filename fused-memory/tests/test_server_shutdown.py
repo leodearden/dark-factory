@@ -1,4 +1,39 @@
-"""Tests for the _graceful_shutdown helper in fused_memory.server.main."""
+"""Tests for the _graceful_shutdown helper in fused_memory.server.main.
+
+Tool-call durations, for sizing
+fused-memory/src/fused_memory/config/schema.py::ServerConfig.graceful_shutdown_timeout
+(task 9493). Window 2026-11-09..12. Source: Claude Code client transcripts,
+tool_use -> tool_result per mcp__fused-memory__<tool>. The server log names no
+tool and carries no request id, so it cannot be paired per tool. Counted: the
+50 sessions whose Read/Grep/Glob median was <= 1 s (1152 calls); the other
+sessions' transcripts add 20-40 s of client overhead per call. Seconds, an
+upper bound where a turn ran several tools.
+
+    tool                          n     p50     p90     max
+    get_task                    306    0.40    3.14   70.82
+    search_tasks                150    1.06   12.98   60.82
+    add_memory                   29    5.30   27.74   53.27
+    find_tasks_by_metadata      324    0.87   12.43   43.61
+    search                        3   19.47   38.64   43.43
+    get_statuses                 35    0.31    7.00   37.04
+    scan_memory_content           1   22.61   22.61   22.61
+    update_task                 170    0.28    1.27   20.58
+    commit_planning               2   12.73   18.50   19.94
+    get_dead_letters              1   18.58   18.58   18.58
+    get_tasks                     5   10.86   16.63   18.21
+    add_dependency               26    0.14   13.76   14.73
+    set_task_status              55    0.41    2.66   14.06
+    submit_task                  22    0.14    6.29   12.61
+    count_memories_by_metadata   12    0.91    1.34    1.66
+    all other tools              11    0.20    0.37    0.46
+
+The drain stays 10 s because 10 s + _FORCE_EXIT_BUDGET 75 s must stay under
+TimeoutStopSec=90 (TestShutdownBudgetArithmetic); the review-all shutdown-sequence
+work (plans/review-all-dark_factory-20261008.md) lengthens it once it frees room.
+Over 40 restarts (2026-11-09..12) a repeat SIGTERM landed at most 1.542 s after
+the first; that sizes
+fused-memory/src/fused_memory/server/main.py::_OPERATOR_STOP_REPEAT_WINDOW_SECS.
+"""
 
 import asyncio
 import contextlib
@@ -6,8 +41,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.main import _build_uvicorn_config, _graceful_shutdown, _run_shielded
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _parse_timeout_stop_sec(unit_file_path: Path) -> float:
@@ -840,6 +878,15 @@ class TestShutdownBudgetArithmetic:
         default_timeout = ServerConfig().graceful_shutdown_timeout
         assert default_timeout + main_mod._FORCE_EXIT_BUDGET < main_mod._SYSTEMD_TIMEOUT_STOP_SECS
 
+    def test_repeat_stop_window_stays_below_the_drain(self):
+        """A window reaching the drain would ignore a deliberate second signal
+        for the whole drain, removing the force-exit escape hatch."""
+        import fused_memory.server.main as main_mod
+        from fused_memory.config.schema import ServerConfig
+
+        default_timeout = ServerConfig().graceful_shutdown_timeout
+        assert default_timeout > main_mod._OPERATOR_STOP_REPEAT_WINDOW_SECS
+
     def test_schema_mirror_constants_match_main(self):
         """ServerConfig._validate_graceful_shutdown_timeout_budget duplicates
         _FORCE_EXIT_BUDGET/_SYSTEMD_TIMEOUT_STOP_SECS as private
@@ -877,21 +924,26 @@ class TestShutdownBudgetArithmetic:
             "force-exit-before-SIGKILL invariant stays honest."
         )
 
-    def test_memory_close_step_budget_dominates_bounded_close(self):
+    def test_memory_close_step_budget_dominates_bounded_close(self, mock_config):
         """Task 2701 documented basis: the memory_service.close step budget must
         exceed the flat per-step default AND dominate the worst-case bounded
-        close (6 sub-closes each ≤ _SUBCLOSE_TIMEOUT), while the force-exit and
-        systemd constants stay UNCHANGED so the schema.py _MIRROR_* guard and the
+        close (every sub-close's budget, summed by
+        MemoryService.close_budget_secs), while the force-exit and systemd
+        constants stay UNCHANGED so the schema.py _MIRROR_* guard and the
         systemd-template parity test both remain valid.
         """
         import fused_memory.server.main as main_mod
-        from fused_memory.services import memory_service as ms_mod
+        from fused_memory.services.memory_service import MemoryService
 
         # Enlarged relative to the flat per-step default.
         assert main_mod._MEMORY_CLOSE_STEP_TIMEOUT > main_mod._CLEANUP_STEP_TIMEOUT
-        # Dominates the worst-case bounded close: 6 sub-closes each capped at
-        # _SUBCLOSE_TIMEOUT run sequentially inside the one step.
-        assert main_mod._MEMORY_CLOSE_STEP_TIMEOUT >= 6 * ms_mod._SUBCLOSE_TIMEOUT
+        # Dominates the worst-case bounded close: every sub-close's budget,
+        # summed by MemoryService.close_budget_secs, runs sequentially inside
+        # the one step.
+        assert (
+            MemoryService(mock_config).close_budget_secs()
+            <= main_mod._MEMORY_CLOSE_STEP_TIMEOUT
+        )
 
         # Illustrative worst-case step sum with the resized memory-close budget
         # still fits within the force-exit budget: five flat 5s steps

@@ -17,7 +17,6 @@ import dataclasses
 import json
 import logging
 import os
-import shutil
 from pathlib import Path
 
 import pytest
@@ -29,6 +28,7 @@ from legibility.session_runner import (
     StageSpec,
 )
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_NEAR_CAP_MESSAGES
+from shared.cli_invoke import resolve_claude_binary
 from shared.config_models import UsageCapConfig
 
 from shared import usage_gate
@@ -142,20 +142,8 @@ _CAPPED = {'is_error': True, 'rc': 1, 'result': REAL_CLI_CAP_HIT_MESSAGES[2]}
 """Strictly a cap, and its "resets in 3 hours" parses to a FUTURE reset, so the
 gate's own reset sweep cannot reopen the account mid-test."""
 _NEAR_CAP = {'is_error': True, 'rc': 1, 'result': REAL_CLI_NEAR_CAP_MESSAGES[0]}
-_EXIT_ZERO_BANNER = {'result': REAL_CLI_CAP_HIT_MESSAGES[2]}
-"""The CLI declining to answer WITHOUT failing: the banner as an rc-0,
-``is_error`` false reply (task 5637's route)."""
 _PLAIN_VERDICT = '{"matches": [], "candidates": []}'
 
-
-def _is_json_object(reply):
-    try:
-        return isinstance(json.loads(reply), dict)
-    except ValueError:
-        return False
-
-
-_JSON_STAGE = dataclasses.replace(_CLASSIFIER_STAGE, is_usable_reply=_is_json_object)
 
 _P, _Q = 'max-p', 'max-q'
 
@@ -331,11 +319,8 @@ def test_an_ordinary_failure_names_the_label_account_subtype_and_both_streams(
     assert len(fake_claude_cli.calls()) == 1, 'an ordinary failure does not fail over'
 
 
-@pytest.mark.parametrize(
-    'stage', [_CLASSIFIER_STAGE, _JSON_STAGE], ids=['every-reply-usable', 'json-reply-usable'],
-)
 def test_a_successful_verdict_quoting_a_cap_banner_is_a_verdict(
-    fake_claude_cli, pool_roster, sentinel_login, stage,
+    fake_claude_cli, pool_roster, sentinel_login,
 ):
     """The task-5691 shape: this codebook is full of usage-limit clusters, so a
     verdict QUOTING a banner must come back as the verdict it is."""
@@ -347,7 +332,7 @@ def test_a_successful_verdict_quoting_a_cap_banner_is_a_verdict(
         'candidates': [],
     })
     [reply], gate = _run(
-        fake_claude_cli, pool_roster, {_P: {'result': verdict}}, _P, _Q, stage=stage,
+        fake_claude_cli, pool_roster, {_P: {'result': verdict}}, _P, _Q,
     )
 
     assert reply == verdict
@@ -356,29 +341,13 @@ def test_a_successful_verdict_quoting_a_cap_banner_is_a_verdict(
     assert gate.soonest_resets_at is None
 
 
-def test_an_exit_zero_banner_the_stage_cannot_use_rotates_and_completes_next_door(
-    fake_claude_cli, pool_roster, sentinel_login,
-):
-    """Task 5637's route: a banner that arrives as an ordinary reply is offered
-    to the gate because the stage cannot use it, so the account is capped and
-    the SAME call completes on the next one instead of the next call landing
-    on a still-AVAILABLE capped account."""
-    [reply], gate = _run(
-        fake_claude_cli, pool_roster, {_P: _EXIT_ZERO_BANNER}, _P, _Q, stage=_JSON_STAGE,
-    )
-
-    assert reply == _PLAIN_VERDICT
-    assert _tokens_called(fake_claude_cli) == [pool_roster.token(_P), pool_roster.token(_Q)]
-    assert gate.active_account_name == _Q
-
-
 def test_a_missing_claude_binary_is_a_loud_failure_naming_the_cwd(
     pool_roster, sentinel_login, tmp_path, monkeypatch,
 ):
     empty_bin = tmp_path / 'empty-bin'
     empty_bin.mkdir()
     monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
-    assert shutil.which('claude') is None, 'the premise: no claude is reachable'
+    assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
     project = tmp_path / 'project'
     project.mkdir()
     accounts_file, env_file = pool_roster(_P)

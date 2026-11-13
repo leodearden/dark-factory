@@ -28,6 +28,9 @@ import pytest
 from linked_worktree_copy import linked_worktree_copy, probe_env
 from reclaim_orphaned_worktrees import PARKING_ROOT_NAME
 from shared.project_layout import escalation_queue_dir, runs_db, tasks_db
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

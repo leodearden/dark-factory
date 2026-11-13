@@ -28,6 +28,9 @@ from shared.process_identity import (
     command_name,
     liveness,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _LIVE_BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
 _FORGED_BOOT_ID = '00000000-0000-0000-0000-000000000000'

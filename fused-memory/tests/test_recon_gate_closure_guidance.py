@@ -34,6 +34,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId
@@ -50,6 +51,8 @@ from fused_memory.reconciliation.prompts.stage2 import (
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The orchestrator's escalation queue — a DIFFERENT store from the
 # reconciliation one that recon stages are wired to.  Declared here so the

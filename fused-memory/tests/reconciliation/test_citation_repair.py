@@ -1409,14 +1409,12 @@ class TestRepairLiveRunRefusalAndDryRun:
 _STATUS_VERDICTS: dict[RunStatus, str] = {
     # In flight by its own row.
     RunStatus.running: 'refused',
-    # RESUMABLE, not finished — the specifically dangerous one.
-    # ``journal.get_interrupted_runs()`` is literally
-    # ``SELECT * FROM runs WHERE status = 'interrupted'``, so this is the ONE
-    # status the startup adopt-and-resume pass re-claims. The resumed cycle sets
-    # ``status = running`` IN MEMORY ONLY (harness's own comment: "The row is
-    # 'interrupted' on disk") and then rewrites the whole ``stage_reports`` blob
-    # from its loaded copy at each stage boundary — so a repair applied after
-    # that load reports success and is then silently overwritten.
+    # Legacy, not yet settled (task 5514). Nothing writes it any more, but the
+    # startup sweep ``harness.py::ReconciliationHarness._recover_legacy_interrupted_runs``
+    # selects exactly these rows (``journal.get_interrupted_runs()`` is
+    # ``SELECT * FROM runs WHERE status = 'interrupted'``) and converts each to
+    # ``failed`` with a wholesale ``stage_reports`` write from its loaded copy —
+    # so a repair applied before that conversion would be silently overwritten.
     RunStatus.interrupted: 'refused',
     # Genuinely terminal: the ``get_interrupted_runs`` query above never selects
     # these, and nothing else re-adopts a run, so no writer can clobber a repair.

@@ -34,12 +34,16 @@ in-progress and claims that module.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
+import os
 import types
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
-from _fm_helpers import load_script_module
+from _fm_helpers import lease_isolated_monkeypatch, load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -58,22 +62,21 @@ FIXTURES_DIR = Path(__file__).parent / 'fixtures'
 #: or hand-edited into the report artifacts: every measured cell comes from a
 #: real run, or renders as the no-measurement em dash.
 #:
-#: sha256 of the five committed E2 fixtures at the anchor commit.  These are
-#: the inputs `materialize_arm` is deterministic over, so a fetch cache dumped
-#: against them is replayable exactly as long as they hash to these values.
+#: sha256 of the byte-pinned E2 fixtures (`digest_pinned_fixtures`) at the
+#: anchor commit, so a fetch cache dumped against them is replayable exactly
+#: as long as they hash to these values.  The topic registry is not here: it
+#: is anchored by the per-shape corpus fingerprint instead, in
+#: `TestMeasurementAnchor::test_the_committed_fixtures_still_materialize_the_cached_corpus`.
 #: Asserted here rather than only inside the cache so a fixture edit that
 #: silently invalidates the committed cache fails a PURE test in the merge
 #: lane, not a live run nobody reruns.
 ANCHOR_COMMIT = 'ff303320c7c3d90b093076965992dac246db062a'
 
+COMMITTED_FETCH_CACHE = FIXTURES_DIR / 'e2_fetch_cache.json'
+
 ANCHOR_FIXTURE_SHA256: dict[str, str] = {
     'write_triage_calibration.jsonl':
         'fa5958f3634ace98b846ac398cdfe28f2e105a746f0348fe48fb5ed08cd03fe3',
-    # Re-pinned by task 4856 (E1-only briefing re-key) without a re-dump: E2
-    # reads only the curator_gate subset (`load_registry_topics`), which
-    # compares equal before and after that edit.
-    'memory_eval_topic_registry.json':
-        'ca17d33fd91708d4124d5c0cec1b30d5d6636c7a874fcf562f47f0574d717bb4',
     'e2_arm_claims.jsonl':
         '0b09c7de1c30c38570543f1705f01c5b4ac5970618f64545facb486e6991c257',
     'e2_query_set.jsonl':
@@ -89,8 +92,8 @@ def _load_module() -> types.ModuleType:
     The module is registered in sys.modules under its bare name so that
     @dataclass and other reflection-based decorators work correctly (they
     call sys.modules.get(cls.__module__)).  That key is SHARED with
-    ``test_bake_off_storage_shape.py`` and with the script-side
-    ``read_transform_selection._load_script``, which is what makes reuse —
+    ``test_bake_off_storage_shape.py`` and with
+    ``read_transform_selection.bake_off()``, which is what makes reuse —
     rather than an unconditional re-exec — the correct behaviour here.
 
     A named seam rather than a direct call at each use site, so the
@@ -122,9 +125,9 @@ class TestTheScriptIsLoadedOnceNotReExecuted:
 
     An unconditional re-exec mints a SECOND module object under the same
     ``sys.modules`` key, and whichever loader ran last wins.  The concrete
-    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
-    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
-    serves whichever object a test module last registered under
+    hazard: ``read_transform_selection.bake_off()`` loads that key through
+    ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``, so
+    it serves whichever object a test module last registered under
     ``'bake_off_storage_shape'``.  Three test modules register that key, and
     ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto --dist
     loadgroup"``, so collection order is not stable.
@@ -145,16 +148,17 @@ class TestTheScriptIsLoadedOnceNotReExecuted:
 class TestMeasurementAnchor:
     """The committed fetch cache is only replayable against THESE fixtures.
 
-    `materialize_arm` is deterministic over the five committed fixtures, and
-    the fetch cache stores `(shape, query_id) -> [(record_id, score)]` keyed
-    on the uuid5 `record_id` those fixtures derive.  Edit a fixture and the
-    cache still LOADS — it just describes a corpus that no longer exists, and
-    the replayed report would publish a stale ranking as a fresh measurement.
+    The fetch cache stores `(shape, query_id) -> [(record_id, score)]` keyed
+    on the uuid5 `record_id` the committed fixtures derive.  Edit a fixture
+    and the cache still LOADS — it just describes a corpus or a query set
+    that no longer exists, and the replayed report would publish a stale
+    ranking as a fresh measurement.
 
     This is the cheap, pure, merge-lane half of that guard: it fails the
     moment a fixture moves, in a test that actually runs, instead of only
-    inside a live run nobody reruns.  The expensive half — the per-shape
-    corpus fingerprint carried in the dump — is step-3.
+    inside a live run nobody reruns.  `ANCHOR_FIXTURE_SHA256` pins the
+    byte-pinned fixtures; the topic registry is pinned by recomputing every
+    shape's corpus fingerprint against the one the committed cache carries.
     """
 
     @pytest.mark.parametrize('name', sorted(ANCHOR_FIXTURE_SHA256))
@@ -173,16 +177,66 @@ class TestMeasurementAnchor:
         )
 
     def test_anchor_covers_every_fixture_the_bake_off_defaults_to(self) -> None:
-        """No fixture may drift out of the anchor's coverage unnoticed."""
+        """No fixture may drift out of the anchor's coverage unnoticed.
+
+        The registry is the one default fixture the corpus-fingerprint anchor
+        covers instead, so excluding a second one is a visible decision.
+        """
         mod = _mod()
-        defaults = [
-            mod.DEFAULT_ALPHA_FIXTURE_PATH,
-            mod.DEFAULT_REGISTRY_PATH,
-            mod.DEFAULT_ARM_CLAIMS_PATH,
-            mod.DEFAULT_QUERY_SET_PATH,
-            mod.DEFAULT_DISTRACTOR_SLAB_PATH,
-        ]
-        assert {Path(p).name for p in defaults} == set(ANCHOR_FIXTURE_SHA256)
+        pinned = {Path(p).name for p in mod.digest_pinned_fixtures()}
+        defaults = {
+            Path(p).name for p in (
+                mod.DEFAULT_ALPHA_FIXTURE_PATH,
+                mod.DEFAULT_REGISTRY_PATH,
+                mod.DEFAULT_ARM_CLAIMS_PATH,
+                mod.DEFAULT_QUERY_SET_PATH,
+                mod.DEFAULT_DISTRACTOR_SLAB_PATH,
+            )
+        }
+        assert pinned == set(ANCHOR_FIXTURE_SHA256)
+        assert defaults - pinned == {mod.DEFAULT_REGISTRY_PATH.name}
+
+    def test_the_committed_fixtures_still_materialize_the_cached_corpus(
+        self,
+    ) -> None:
+        mod = _mod()
+        corpus = _committed_corpus_inputs()
+        mod.cross_validate_fixtures(
+            clusters=corpus.clusters, topics=corpus.topics,
+            claims=corpus.claims, queries=mod.load_query_set(),
+        )
+        cached = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))[
+            'provenance']['corpus_fingerprints']
+
+        drifted = []
+        for shape in mod.ARM_SHAPES:
+            local = mod.corpus_fingerprint(mod.materialize_arm(
+                shape, corpus.clusters, corpus.claims, corpus.topics,
+                corpus.distractors,
+            ))
+            if local != cached[shape]:
+                drifted.append(
+                    f'{shape}: cached {cached[shape][:16]}, local {local[:16]}',
+                )
+        assert not drifted, (
+            f'the committed fixtures no longer materialize the corpus '
+            f'{COMMITTED_FETCH_CACHE.name} was dumped against '
+            f'({"; ".join(drifted)}). Re-run the seeding pass with '
+            f'--dump-fetches — do NOT edit the cached fingerprint.'
+        )
+
+    def test_the_committed_cache_pins_exactly_the_digest_pinned_fixtures(
+        self,
+    ) -> None:
+        mod = _mod()
+        committed = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))
+        assert {
+            row['path']: row['sha256']
+            for row in committed['provenance']['fixtures']
+        } == {
+            row['path']: row['sha256']
+            for row in mod.fixture_digests(mod.digest_pinned_fixtures())
+        }
 
 
 # ===========================================================================
@@ -644,7 +698,7 @@ class TestFetchCacheProvenance:
         # not say WHICH arm drifted.
         assert prints['c_peers'] != prints['status_quo']
 
-    def test_carries_the_five_fixture_sha256s(self, tmp_path):
+    def test_carries_a_sha256_for_each_given_fixture(self, tmp_path):
         """`fixture_provenance` stamps the last-touching COMMIT, which does not
         change when a fixture is edited in the working tree. The cache needs a
         content hash, so it carries both semantics rather than conflating them."""
@@ -658,7 +712,7 @@ class TestFetchCacheProvenance:
 
         doc = json.loads(path.read_text(encoding='utf-8'))
         digests = {row['path']: row['sha256'] for row in doc['provenance']['fixtures']}
-        assert len(digests) == 5
+        assert len(digests) == len(ANCHOR_FIXTURE_SHA256)
         for name, expected in ANCHOR_FIXTURE_SHA256.items():
             key = next(p for p in digests if p.endswith(name))
             assert digests[key] == expected
@@ -1070,6 +1124,82 @@ class TestTheFixtureDigestsAreVerifiedNotMerelyRecorded:
         assert mod.load_fetches(path, {'c_peers': seeded})
 
 
+class _CorpusInputs(NamedTuple):
+    clusters: Mapping[str, Any]
+    topics: Mapping[str, Any]
+    claims: tuple[Any, ...]
+    distractors: tuple[Any, ...]
+
+
+@functools.cache
+def _committed_corpus_inputs() -> _CorpusInputs:
+    """The committed default fixtures `materialize_arm` reads, loaded once.
+
+    Through the public loaders, so a corpus anchored here is exactly the one
+    a default run materializes.  Frozen because it is cached: a test that
+    tried to edit it would otherwise change what every later test reads.
+    """
+    mod = _mod()
+    return _CorpusInputs(
+        clusters=types.MappingProxyType(mod.load_calibration_clusters()),
+        topics=types.MappingProxyType(mod.load_registry_topics()),
+        claims=tuple(mod.load_arm_claims()),
+        distractors=tuple(mod.load_distractor_slab()),
+    )
+
+
+def _write_registry(path: Path, registry: dict) -> None:
+    """Write *registry* back in the committed file's own format, so the bytes
+    move only where an edit moved them."""
+    path.write_text(
+        json.dumps(registry, indent=2, sort_keys=True, ensure_ascii=False) + '\n',
+        encoding='utf-8',
+    )
+
+
+class TestTheRegistryIsPinnedByTheCorpusNotItsBytes:
+    """The topic registry leaves the byte-pinned set, so prove that is not a
+    hole: a curator_gate edit E2 actually reads still refuses replay."""
+
+    def test_a_curator_gate_topic_edit_still_refuses_replay(self, tmp_path):
+        mod = _mod()
+        corpus = _committed_corpus_inputs()
+        records = mod.materialize_arm(
+            'c_peers', corpus.clusters, corpus.claims, corpus.topics,
+            corpus.distractors,
+        )
+        path = tmp_path / 'cache.json'
+        mod.dump_fetches(
+            path,
+            {'c_peers': _fetched(
+                {'q1': [(records[0], 0.9), (records[1], 0.4)]}, {},
+            )},
+            provenance=_provenance(mod, {'c_peers': records}),
+        )
+
+        registry = _fixture_copy(tmp_path, mod.DEFAULT_REGISTRY_PATH.name)
+        doc = json.loads(registry.read_text(encoding='utf-8'))
+        claimed_clusters = {claim.cluster_id for claim in corpus.claims}
+        entry = next(
+            e for e in doc['entries']
+            if e.get('derived_from') == 'curator_gate'
+            and e['provenance']['cluster_id'] in claimed_clusters
+        )
+        entry['topic'] = f'{entry["topic"]}-renamed'
+        _write_registry(registry, doc)
+        edited = mod.materialize_arm(
+            'c_peers', corpus.clusters, corpus.claims,
+            mod.load_registry_topics(registry), corpus.distractors,
+        )
+
+        # The premise: no record id moved, so the cached rankings still join
+        # and the corpus fingerprint is the only thing standing.
+        assert {r.record_id for r in edited} == {r.record_id for r in records}
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(path, {'c_peers': _seeded('c_peers', edited)})
+        assert 'c_peers' in str(excinfo.value)
+
+
 # ===========================================================================
 # step-5 — the CLI wiring, exercised WITHOUT a network
 # ===========================================================================
@@ -1114,22 +1244,13 @@ def _driver_config() -> _FakeConfig:
     )
 
 
-class _FakeInstance:
-    def __init__(self):
-        self.db = _types.SimpleNamespace(add_history=None)
-
-
 class _FakeMem0:
     """Records every backend call, which is the whole point on the replay path."""
 
     def __init__(self):
         self.added: list[tuple[str, str]] = []
         self.searches: list[tuple[str, str, int]] = []
-        self.instances: dict[str, _FakeInstance] = {}
         self._stored: dict[str, list[dict]] = {}
-
-    async def _get_instance(self, scope):
-        return self.instances.setdefault(scope.project_id, _FakeInstance())
 
     async def add(self, content, scope, metadata=None):
         await asyncio.sleep(0)
@@ -1216,6 +1337,95 @@ def _argv(tmp_path, name: str, *extra: str) -> list[str]:
     ]
 
 
+#: Every class that reads `cli_legs` carries this group AND
+#: `@pytest.mark.timeout(540)`.  The group puts them on one xdist worker, so
+#: the three legs, and the warm-up the process's first `main()` pays, are paid
+#: once rather than once per worker `--dist loadgroup` scatters them to.  The
+#: timeout covers whichever reader requests `cli_legs` first on that worker,
+#: which records all three legs: the first in collection order in a full-file
+#: run, but any of them under `-k` or a node-id selection; and
+#: `test_a_replay_survives_a_registry_edit_e2_does_not_read` runs two legs of
+#: its own under it.  It overrides verify's --timeout=300, sized per
+#: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+_ON_THE_RECORDING_WORKER = pytest.mark.xdist_group('bake_off_fetch_cache_recorded_legs')
+
+
+@dataclasses.dataclass(frozen=True)
+class _CliLegs:
+    """Three doubled `main()` legs over one cache: plain, live (dumping), replay."""
+
+    plain_report: str
+    live_report: str
+    replay_report: str
+    cache_text: str
+    cache_path: Path
+    replay_services_constructed: int
+    replay_drop_calls: tuple[tuple[str, ...], ...]
+    replay_cache_reads: tuple[str, ...]
+    lease_dirs: tuple[Path, ...]
+
+
+def _record_cli_legs(directory: Path) -> _CliLegs:
+    mod = _mod()
+    cache = directory / 'cache.json'
+    reaper = mod.load_cleanup_script()
+    with lease_isolated_monkeypatch(reaper, directory / 'leases') as (mp, lease_dirs):
+        _install_driver_doubles(mp)
+        assert mod.main(_argv(directory, 'plain')) == 0
+
+        _install_driver_doubles(mp)
+        assert mod.main(_argv(directory, 'live', '--dump-fetches', str(cache))) == 0
+
+        # The counter goes in AFTER the live leg: only the REPLAY's parses
+        # are being measured.
+        drops = _install_driver_doubles(mp)
+        reads = _count_cache_reads(mp, mod)
+        assert mod.main(_argv(directory, 'replay', '--replay-fetches', str(cache))) == 0
+        replay_services_constructed = len(_FakeMemoryService.instances)
+        replay_drop_calls = tuple(tuple(call) for call in drops.calls)
+
+    def report(name: str) -> str:
+        return (directory / f'{name}.json').read_text(encoding='utf-8')
+
+    return _CliLegs(
+        plain_report=report('plain'),
+        live_report=report('live'),
+        replay_report=report('replay'),
+        cache_text=cache.read_text(encoding='utf-8'),
+        cache_path=cache,
+        replay_services_constructed=replay_services_constructed,
+        replay_drop_calls=replay_drop_calls,
+        replay_cache_reads=tuple(reads),
+        lease_dirs=tuple(lease_dirs),
+    )
+
+
+@pytest.fixture(scope='module')
+def cli_legs(tmp_path_factory) -> _CliLegs:
+    """The three legs, recorded once per module; every field is immutable."""
+    return _record_cli_legs(tmp_path_factory.mktemp('cli-legs'))
+
+
+@pytest.mark.timeout(540)
+@_ON_THE_RECORDING_WORKER
+class TestTheRecordedLegs:
+    """The recorded legs the CLI tests read are safe to share."""
+
+    def test_they_held_their_leases_in_a_private_directory_never_the_machine_global_one(
+        self, cli_legs, tmp_path_factory,
+    ):
+        """`cli_legs` is set up BEFORE the autouse, function-scoped `lease_dir`
+        fixture, so a recording that did not isolate its own leases would hold
+        them in the directory the live 6-hourly cron reads."""
+        reaper = _mod().load_cleanup_script()
+        basetemp = tmp_path_factory.getbasetemp()
+
+        assert cli_legs.lease_dirs, 'the recording took no lease to locate'
+        for lease_dir in cli_legs.lease_dirs:
+            assert lease_dir != reaper.DEFAULT_LEASE_DIR
+            assert lease_dir.is_relative_to(basetemp), lease_dir
+
+
 class TestFetchCacheCliDefaults:
     """Both flags default to None, so `TestBuildParser` in the E2 module —
     which asserts defaults BY ATTRIBUTE, not flag-set exhaustiveness — keeps
@@ -1243,41 +1453,24 @@ class TestFetchCacheCliDefaults:
         assert '--replay-fetches' in message
 
 
+@pytest.mark.timeout(540)
+@_ON_THE_RECORDING_WORKER
 class TestDumpFetchesFlag:
     """`--dump-fetches` is additive: it writes the cache and changes nothing."""
 
-    def test_a_dumping_run_writes_the_cache_and_the_identical_report(
-        self, tmp_path, monkeypatch,
-    ):
-        mod = _mod()
-        cache = tmp_path / 'cache.json'
+    def test_a_dumping_run_writes_the_cache_and_the_identical_report(self, cli_legs):
+        plain = json.loads(cli_legs.plain_report)
+        dumped = json.loads(cli_legs.live_report)
 
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'plain')) == 0
-        plain = json.loads((tmp_path / 'plain.json').read_text(encoding='utf-8'))
-
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(
-            tmp_path, 'dumped', '--dump-fetches', str(cache),
-        )) == 0
-        dumped = json.loads((tmp_path / 'dumped.json').read_text(encoding='utf-8'))
-
-        assert cache.exists()
+        assert cli_legs.cache_path.exists()
         # The measurement is untouched by the act of recording it.
         assert dumped['arms'] == plain['arms']
         assert dumped['audit_recall'] == plain['audit_recall']
 
-    def test_the_dump_covers_every_shape_and_carries_its_fingerprint(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_the_dump_covers_every_shape_and_carries_its_fingerprint(self, cli_legs):
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(
-            tmp_path, 'dumped', '--dump-fetches', str(cache),
-        )) == 0
 
-        doc = json.loads(cache.read_text(encoding='utf-8'))
+        doc = json.loads(cli_legs.cache_text)
         # A default run is probe-ON, so the dump covers the three read arms
         # PLUS one pass per regrowth mode -- each seeded over its own injected
         # corpus, so each needs its own fingerprint or a replay could silently
@@ -1292,45 +1485,52 @@ class TestDumpFetchesFlag:
         assert isinstance(doc['provenance']['guard_threshold'], float)
 
 
-# Each test runs the bake-off twice (dump, then replay); this overrides verify's
-# --timeout=300. Sized per plans/pytest-per-test-timeout-measurement-2026-09-17.md:
-# 8x the worst measured wall clock, never below the pyproject default.
+def _reword_an_e1_only_entry(registry: dict) -> None:
+    """The task-4856 shape of edit: an entry E2 never loads."""
+    entry = next(
+        e for e in registry['entries'] if e.get('derived_from') != 'curator_gate'
+    )
+    entry['phrasings'][0]['text'] += ' (reworded)'
+
+
+def _rekey_a_curator_gate_canonical(registry: dict) -> None:
+    """The task-6094 shape of edit: a curator_gate entry's canonical moves,
+    its topic and cluster id do not."""
+    entry = next(
+        e for e in registry['entries'] if e.get('derived_from') == 'curator_gate'
+    )
+    new_hash = '0123456789abcdef'
+    assert entry['canonical']['content_hash'] != new_hash
+    entry['canonical']['content_hash'] = new_hash
+    entry['canonical']['last_known_id'] = '00000000-0000-4000-8000-000000006092'
+    for pair in entry['supersedes_pairs']:
+        pair['successor_hash'] = new_hash
+
+
+def _recorded_cache_in(tmp_path: Path, cli_legs: _CliLegs) -> Path:
+    """A private copy of the recorded live leg's cache, for a test to mutate."""
+    cache = tmp_path / 'cache.json'
+    cache.write_text(cli_legs.cache_text, encoding='utf-8')
+    return cache
+
+
 @pytest.mark.timeout(540)
+@_ON_THE_RECORDING_WORKER
 class TestReplayFetchesFlag:
     """`--replay-fetches` must touch NOTHING. Not fewer calls — none."""
 
-    def _dump_then_replay(self, mod, tmp_path, monkeypatch):
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
-        live = json.loads((tmp_path / 'live.json').read_text(encoding='utf-8'))
-
-        drops = _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(
-            tmp_path, 'replay', '--replay-fetches', str(cache),
-        )) == 0
-        replayed = json.loads((tmp_path / 'replay.json').read_text(encoding='utf-8'))
-        return live, replayed, drops
-
-    def test_a_replayed_run_makes_zero_backend_calls(
-        self, tmp_path, monkeypatch,
-    ):
-        mod = _mod()
-        _, _, drops = self._dump_then_replay(mod, tmp_path, monkeypatch)
-
+    def test_a_replayed_run_makes_zero_backend_calls(self, cli_legs):
         # No MemoryService was even CONSTRUCTED — so no durable write queue
         # was recovered, no config was deep-copied and repointed, and no
         # embedder was resolved.
-        assert _FakeMemoryService.instances == []
+        assert cli_legs.replay_services_constructed == 0
         # And no collection was created or dropped: a replay that reaped
         # collections could destroy a concurrent live run's arms.
-        assert drops.calls == []
+        assert cli_legs.replay_drop_calls == ()
 
-    def test_the_replayed_measurement_is_identical_to_the_live_one(
-        self, tmp_path, monkeypatch,
-    ):
-        mod = _mod()
-        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+    def test_the_replayed_measurement_is_identical_to_the_live_one(self, cli_legs):
+        live = json.loads(cli_legs.live_report)
+        replayed = json.loads(cli_legs.replay_report)
 
         assert replayed['arms'] == live['arms']
         assert replayed['audit_recall'] == live['audit_recall']
@@ -1340,7 +1540,7 @@ class TestReplayFetchesFlag:
             assert replayed['protocol'][key] == live['protocol'][key], key
 
     def test_the_replayed_regrowth_block_and_its_descriptor_agree_with_live(
-        self, tmp_path, monkeypatch,
+        self, cli_legs,
     ):
         """`_replay_bake_off` claims the block "must come out byte-identical
         to the live one" — asserted here rather than left as a docstring.
@@ -1353,17 +1553,15 @@ class TestReplayFetchesFlag:
         probe coverage, which is the ONE thing this descriptor exists to
         state outright.
         """
-        mod = _mod()
-        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+        live = json.loads(cli_legs.live_report)
+        replayed = json.loads(cli_legs.replay_report)
 
         assert live['regrowth'] is not None
         assert replayed['regrowth'] == live['regrowth']
         for key in ('regrowth_probed', 'regrowth_injections_measured'):
             assert replayed['protocol'][key] == live['protocol'][key], key
 
-    def test_the_replayed_report_discloses_that_it_was_replayed(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_the_replayed_report_discloses_that_it_was_replayed(self, cli_legs):
         """The ONE way a replayed report must differ from a live one.
 
         Every measured cell is identical — that is the point of the cache —
@@ -1372,24 +1570,22 @@ class TestReplayFetchesFlag:
         because a replay created none: reporting the names it *would* have
         used would be exactly the kind of unmeasured number this task forbids.
         """
-        mod = _mod()
-        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+        live = json.loads(cli_legs.live_report)
+        replayed = json.loads(cli_legs.replay_report)
 
         assert live['protocol']['replayed_from'] is None
         assert live['protocol']['collections']
 
-        assert replayed['protocol']['replayed_from'] == str(tmp_path / 'cache.json')
+        assert replayed['protocol']['replayed_from'] == str(cli_legs.cache_path)
         assert replayed['protocol']['collections'] == []
 
     def test_a_replay_against_drifted_fixtures_exits_nonzero(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, cli_legs,
     ):
         """The refusal has to survive the CLI, not just the loader: a stale
         cache that exits 0 has published a stale ranking as a measurement."""
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        cache = _recorded_cache_in(tmp_path, cli_legs)
 
         doc = json.loads(cache.read_text(encoding='utf-8'))
         doc['provenance']['corpus_fingerprints']['c_peers'] = 'deadbeef' * 8
@@ -1403,7 +1599,7 @@ class TestReplayFetchesFlag:
         assert not (tmp_path / 'replay.json').exists()
 
     def test_a_replay_against_an_edited_query_set_exits_nonzero(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, cli_legs,
     ):
         """The digest guard, wired rather than merely available.
 
@@ -1413,9 +1609,7 @@ class TestReplayFetchesFlag:
         longer in the tree.
         """
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        cache = _recorded_cache_in(tmp_path, cli_legs)
 
         doc = json.loads(cache.read_text(encoding='utf-8'))
         row = next(
@@ -1430,6 +1624,52 @@ class TestReplayFetchesFlag:
             tmp_path, 'replay', '--replay-fetches', str(cache),
         )) != 0
         assert not (tmp_path / 'replay.json').exists()
+
+    @pytest.mark.parametrize(
+        'edit', [_reword_an_e1_only_entry, _rekey_a_curator_gate_canonical],
+        ids=lambda edit: edit.__name__,
+    )
+    def test_a_replay_survives_a_registry_edit_e2_does_not_read(
+        self, tmp_path, monkeypatch, edit,
+    ):
+        """E1 owns the registry, so its edits must not invalidate E2's cache
+        unless they move what E2 materializes (pinned by the converse in
+        `TestTheRegistryIsPinnedByTheCorpusNotItsBytes`)."""
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        registry = _fixture_copy(tmp_path, mod.DEFAULT_REGISTRY_PATH.name)
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'live', '--registry', str(registry),
+            '--dump-fetches', str(cache),
+        )) == 0
+        live = json.loads((tmp_path / 'live.json').read_text(encoding='utf-8'))
+        dumped = json.loads(cache.read_text(encoding='utf-8'))
+        assert [
+            row for row in dumped['provenance']['fixtures']
+            if row['path'].endswith(registry.name)
+        ] == []
+
+        sha_before = hashlib.sha256(registry.read_bytes()).hexdigest()
+        topics_before = {
+            cid: t.topic for cid, t in mod.load_registry_topics(registry).items()
+        }
+        doc = json.loads(registry.read_text(encoding='utf-8'))
+        edit(doc)
+        _write_registry(registry, doc)
+        # The premise: the bytes moved, the slugs E2 reads did not.
+        assert hashlib.sha256(registry.read_bytes()).hexdigest() != sha_before
+        assert {
+            cid: t.topic for cid, t in mod.load_registry_topics(registry).items()
+        } == topics_before
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--registry', str(registry),
+            '--replay-fetches', str(cache),
+        )) == 0
+        replayed = json.loads((tmp_path / 'replay.json').read_text(encoding='utf-8'))
+        assert replayed['arms'] == live['arms']
 
     @staticmethod
     def _delete_probe_cluster(cache, shape_keys) -> str:
@@ -1447,7 +1687,7 @@ class TestReplayFetchesFlag:
         return cluster_id
 
     def test_a_replay_against_a_cache_missing_a_probe_cluster_exits_three(
-        self, tmp_path, monkeypatch, capsys,
+        self, tmp_path, monkeypatch, capsys, cli_legs,
     ):
         """Exactly 3, and NAMED — not merely "something raised".
 
@@ -1458,12 +1698,9 @@ class TestReplayFetchesFlag:
         the cache nor how to re-dump it.
         """
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        cache = _recorded_cache_in(tmp_path, cli_legs)
 
         cluster_id = self._delete_probe_cluster(cache, list(mod.ARM_SHAPES))
-        capsys.readouterr()
 
         _install_driver_doubles(monkeypatch)
         assert mod.main(_argv(
@@ -1476,7 +1713,7 @@ class TestReplayFetchesFlag:
         assert not (tmp_path / 'replay.json').exists()
 
     def test_a_replay_whose_regrowth_pass_is_missing_a_probe_cluster_exits_three(
-        self, tmp_path, monkeypatch, capsys,
+        self, tmp_path, monkeypatch, capsys, cli_legs,
     ):
         """The regrowth pass needs its OWN coverage.
 
@@ -1487,14 +1724,11 @@ class TestReplayFetchesFlag:
         wires only the first call site fail here instead of looking complete.
         """
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        cache = _recorded_cache_in(tmp_path, cli_legs)
 
         cluster_id = self._delete_probe_cluster(
             cache, [mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES],
         )
-        capsys.readouterr()
 
         _install_driver_doubles(monkeypatch)
         assert mod.main(_argv(
@@ -1505,27 +1739,14 @@ class TestReplayFetchesFlag:
         assert cluster_id in message
         assert not (tmp_path / 'replay.json').exists()
 
-    def test_a_replay_reads_the_cache_document_exactly_once(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_a_replay_reads_the_cache_document_exactly_once(self, cli_legs):
         """EXACTLY once, not "fewer than before".
 
         A `<= 2` assertion would still pass a fix that removed only one of
         the redundant reads, and the point of the item is that the 32k-line
         document is decoded once and threaded.
         """
-        mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
-
-        # The counter goes in AFTER the live leg: only the REPLAY's parses
-        # are being measured.
-        _install_driver_doubles(monkeypatch)
-        reads = _count_cache_reads(monkeypatch, mod)
-        assert mod.main(_argv(
-            tmp_path, 'replay', '--replay-fetches', str(cache),
-        )) == 0
+        reads = cli_legs.replay_cache_reads
         assert len(reads) == 1, reads
 
 
@@ -1542,10 +1763,6 @@ class TestReplayFetchesFlag:
 # Markers PER-TEST, never a module `pytestmark`: `addopts = -m 'not
 # integration'` would otherwise deselect every pure test in this file from
 # the merge lane along with this one.
-
-import os  # noqa: E402
-
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 
 class _RefusesToBeConstructed:

@@ -3,18 +3,24 @@
 Sibling of `test_roles_tool_call_rejection.py` (tasks 4273 + 4578) — same
 shape, same provenance kind: a legibility-census finding about a wasted
 agent turn, turned into a named prompt constant spliced into a
-machine-derived set of roles. Provenance (the two-turn `Edit` ->
-`replace_all({})` trace, codebook entry `entry-cand-20260827-23`, founding
-session 7dae04c6-f0a5-400d-b199-8932d65a8790) and the full "what is/isn't
-addressed" and "discrimination, not duplication" rationale are recorded
-once, next to the constant they constrain, in the comment block above
-`orchestrator/src/orchestrator/agents/roles.py::ERROR_REMEDY_HINT_GUIDANCE`
-— not re-derived here. Short version: census 2026-08-31 §1.1
-(`plans/confusion-census-2026-08-31.md`), task 4964.
+machine-derived set of roles: census 2026-08-31 §1.1
+(`plans/confusion-census-2026-08-31.md`), task 4964. An `Edit` call failed
+with a multi-match error whose remedy clause said to set `replace_all` to
+true, and the next turn called a bare `replace_all` as if it were a tool.
+
+SCOPE. `Edit`'s multi-match error text is emitted by the harness, upstream of
+this repository, so only the agent's RESPONSE to it is in scope.
+
+THE EDITING RULE. The census did not establish that `replace_all: true` was
+the right fix for that edit, so the prose presents both remedies as chosen on
+intent and never says that setting the parameter is always right.
+
+The trace, its codebook entry and the founding session live in task 4964's
+commits, not here.
 
 THIS IS A SEPARATE MODULE, not a fourth bullet added to
 `test_roles_tool_call_rejection.py` the way task 4578 shared that module,
-because (per the roles.py comment block cited above, and this task's
+because (per the finding above, and this task's
 design decision of the same name) the finding is a DIFFERENT error class:
 a well-formed `Edit` call that parsed fine and failed on CONTENT, printing
 a remedy, rather than one of `InputValidationError`'s
@@ -40,11 +46,11 @@ from __future__ import annotations
 
 from _role_splice_contract import assert_opens_own_section
 
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     ERROR_REMEDY_HINT_GUIDANCE,
-    ROLES,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
+from orchestrator.agents.roles import ROLES
 
 
 def test_error_remedy_hint_guidance_is_nonempty() -> None:

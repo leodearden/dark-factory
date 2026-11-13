@@ -245,7 +245,7 @@ def stub_mcp_fanout_probe(monkeypatch):
     added has its own acceptance module (``test_healthz_data_plane.py``). Two
     reasons this stub is required rather than merely tidy:
 
-    * HERMETICITY — the real probe issues ``fetch_tasks`` against
+    * HERMETICITY — the real probe issues a task read against
       ``config.fused_memory_urls``, which defaults to ``http://localhost:8002``.
       On a developer machine that server is frequently RUNNING, so without this
       the module's assertions would depend on live infrastructure.
@@ -434,7 +434,7 @@ def test_healthz_data_plane_budget_is_structurally_deliverable(tmp_path):
     )
 
     # (d) A probe younger than the outstanding limit reports 'probing'; it
-    # must outlive one healthy whole-tree read, or a cold-but-healthy fetch
+    # must outlive one healthy task read, or a cold-but-healthy fetch
     # is reported as a wedge.
     assert (
         app_module._MCP_PROBE_OUTSTANDING_LIMIT >= tasks_module.DEFAULT_WHOLE_OPERATION_BUDGET
@@ -442,7 +442,7 @@ def test_healthz_data_plane_budget_is_structurally_deliverable(tmp_path):
         f'_MCP_PROBE_OUTSTANDING_LIMIT ({app_module._MCP_PROBE_OUTSTANDING_LIMIT}) '
         f'is below tasks.DEFAULT_WHOLE_OPERATION_BUDGET '
         f'({tasks_module.DEFAULT_WHOLE_OPERATION_BUDGET}), the bound on one '
-        'healthy whole-tree fetch_tasks. The invariant is limit >= budget: a '
+        'healthy task read. The invariant is limit >= budget: a '
         'probe still inside that budget has demonstrated nothing, so reporting '
         "it as 'timeout' would call a cold but healthy read a wedge."
     )

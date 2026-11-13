@@ -2,8 +2,7 @@
 
 Several guards across the fleet exist to say "never do this again" — a capped
 escalation the steward must stop re-adopting, a train that derailed once and
-must not re-form, a red offline-lane run whose fix task is already open, a
-resurrected task that must not re-claim an age bonus it did not earn.  Each
+must not re-form, a resurrected task that must not re-claim an age bonus it did not earn.  Each
 held that memory in process RAM while the fleet redeploys every ~8-15h, so
 each was really "never do this again *until the next redeploy*": a permanent
 verdict decayed into a per-redeploy one, and the thing the guard was supposed
@@ -29,12 +28,12 @@ collection ABCs so the guards keep the vocabulary they already speak:
 
 * :class:`PersistentSet` — a ``MutableSet`` of keys ("this happened").
 * :class:`PersistentMap` — a ``MutableMapping`` of key -> JSON value
-  ("this happened N times", "this fingerprint owns that task id").
+  ("this happened N times", "this command's held episode record").
 
 Every entry carries a ``ttl`` supplied by the guard that owns it.  That value
 is an upper bound rather than a tuning dial — it asserts "this state must not
 outlive its subject", and each guard's subject (an escalation record, a task's
-residency in the merge queue, an open fix task, a resurrected task's pending
+residency in the merge queue, a held lane episode, a resurrected task's pending
 window) has a lifetime its own module already knows, which is why the number
 lives next to the guard and not in this one.  Expiry is applied on read, on
 load and on flush, so an aged-out guard genuinely re-arms and the sidecar's
@@ -357,8 +356,7 @@ class PersistentSet(MutableSet[str]):
     """A restart-durable set of keys.
 
     Backs the guards whose whole state is "this key happened": a capped
-    escalation id, a derailed task id, a fingerprint whose blocker was already
-    promoted.
+    escalation id, a derailed task id.
 
     ``add`` is idempotent in the strong sense — re-adding a key that is
     already present neither refreshes its TTL nor writes to disk — so a caller
@@ -438,9 +436,10 @@ class PersistentSet(MutableSet[str]):
 class PersistentMap(MutableMapping[str, Any]):
     """A restart-durable map of key -> JSON-serialisable value.
 
-    Backs the guards that count ("this escalation has burnt N attempts",
-    "this fingerprint has advanced N times") or that remember an association
-    ("this fingerprint's open fix task is that id").
+    Backs the guards that count ("this escalation has burnt N attempts") or that remember a
+    record: ``orchestrator/src/orchestrator/offline_lane_episode_state.py::
+    EpisodeStore`` keeps one ``CommandRecord`` per lane command, with an
+    ``EPISODE_RETENTION`` TTL.
 
     Unlike :class:`PersistentSet`'s ``add``, ``__setitem__`` ALWAYS refreshes
     the timestamp: a counter that is still being bumped has a subject that is

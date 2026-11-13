@@ -102,12 +102,13 @@ def _assert_matches_golden(name: str, produced: bytes, scratch: Path) -> None:
 async def _produce_plan_bytes(worktree: Path) -> bytes:
     worktree.mkdir()
     artifacts = TaskArtifacts(worktree)
+    artifacts.task_root.mkdir(parents=True)
     server = plan_tools.create_server(artifacts)
     async with Client(server) as client:
         for tool, arguments in GOLDEN_PLAN_CALLS:
             result = await client.call_tool(tool, arguments)
             assert result.data['status'] == 'ok', f'{tool} refused: {result.data!r}'
-    return (artifacts.root / 'plan.json').read_bytes()
+    return artifacts.artifact_path('plan.json').read_bytes()
 
 
 def test_lane_state_golden_is_lane_record_to_json(tmp_path):

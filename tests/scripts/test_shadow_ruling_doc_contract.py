@@ -12,8 +12,10 @@ SCOPE — STRUCTURE ONLY, NEVER PROSE. Adopting the task-4095 precedent by name
 of guidance in both documents stays free to be rewritten, reordered or deleted.
 What is held is only that a payload literal the skill presents is one the parser
 accepts, and that a slug the policy document enumerates is one the code knows.
-Nothing about the SHADOW vocabularies is hand-copied here — they are read off the
-same frozensets the codec validates against.
+Nothing about the SHADOW vocabularies is hand-copied here. The class list is read
+off ``escalation/src/escalation/authority.py::POLICY_TABLE``, the one enumeration
+of policy classes, and the action and gate lists off the frozensets the codec
+validates against.
 
 THE ``scope-not-delivered`` HALF guards a different failure. That standing
 policy (Leo, 2026-09-21, resolving esc-4811-3) is a policy statement with NO
@@ -53,6 +55,7 @@ import re
 
 import pytest
 import verify_command_invariants as vci
+from escalation.authority import POLICY_TABLE
 from escalation.shadow_ruling import (
     FIRST_TRANCHE_CLASSES,
     HUMAN_FOREVER_GATES,
@@ -63,6 +66,9 @@ from escalation.shadow_ruling import (
     main,
     parse_shadow_ruling,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Resolved by walking up from THIS file, never from cwd: the suite is run from
 # the repo root by its module config and from `tests/scripts/` by hand.
@@ -339,6 +345,21 @@ def test_documented_slugs_equal_the_live_vocabulary(heading: str, expected: froz
         f"have drifted.\n"
         f"  documented but unknown to the code: {sorted(documented - expected)}\n"
         f"  known to the code but undocumented: {sorted(expected - documented)}"
+    )
+
+
+def test_first_tranche_classes_are_exactly_the_policy_table_slugs():
+    """The documented class list is read off POLICY_TABLE through
+    `FIRST_TRANCHE_CLASSES`, so that frozenset must be the table's slugs and
+    nothing else (plans/decision-stream-prd.md §5.1: the table is the only
+    enumeration)."""
+    table = frozenset(row.policy_class for row in POLICY_TABLE)
+
+    assert table == FIRST_TRANCHE_CLASSES, (
+        f"escalation.shadow_ruling.FIRST_TRANCHE_CLASSES and "
+        f"escalation.authority.POLICY_TABLE have drifted.\n"
+        f"  stampable but not a table row: {sorted(FIRST_TRANCHE_CLASSES - table)}\n"
+        f"  a table row but not stampable: {sorted(table - FIRST_TRANCHE_CLASSES)}"
     )
 
 

@@ -27,11 +27,7 @@ from typing import Any
 import pytest
 from shared.prompt_artifact import ArtifactProvenance, PromptSpec, compose_prompt
 
-from orchestrator.evals.prompt_opt import LoopResult, Scorer, run_optimization_loop
-from orchestrator.evals.prompt_opt.engine import LoopResult as _EngineLoopResult
-from orchestrator.evals.prompt_opt.engine import (
-    run_optimization_loop as _engine_run_optimization_loop,
-)
+from orchestrator.evals.prompt_opt.engine import LoopResult, run_optimization_loop
 
 EXECUTOR_MODEL = 'exec-x'
 OPTIMIZER_MODEL = 'frontier-y'
@@ -209,13 +205,6 @@ class TestRunOptimizationLoopDryRun:
         # still starts with the contract byte-for-byte ---
         composed = compose_prompt(spec.contract, result.final_heuristics)
         assert composed.startswith(spec.contract)
-
-    def test_public_api_importable_from_package_top_level(self) -> None:
-        # Importing at module level above already proves this; assert
-        # identity with the submodule's originals for good measure.
-        assert run_optimization_loop is _engine_run_optimization_loop
-        assert LoopResult is _EngineLoopResult
-        assert isinstance(Scorer, type)
 
 
 class TestRunOptimizationLoopRejectsWorseCandidate:

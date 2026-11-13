@@ -83,7 +83,7 @@ Half of that is now done, and the split is deliberate:
     MEASURED behaviours, so a divergent copy is the expensive kind of
     drift. Its negative-case owner stays HERE (the four-case parametrized
     test at the bottom of this file), mirroring how
-    test_dashboard_service_template.py owns assert_restart_backoff_
+    test_dashboard_unit_restart_policy.py owns assert_restart_backoff_
     effective's guard.
   - ALSO MOVED — `UNIT_DIR` (now `INSTALLED_UNIT_DIR`),
     `_require_installed_unit` (now `require_installed_unit`, parameterized
@@ -124,6 +124,7 @@ import shutil
 import subprocess
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     CANONICAL_CONFIG_BASENAME,
     INSTALLED_UNIT_DIR,
@@ -135,6 +136,8 @@ from systemd_unit_invariants import (
     restart_directive,
     systemctl_user_show,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UNIT_BASENAME = "orchestrator-know-live.service"
 INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME

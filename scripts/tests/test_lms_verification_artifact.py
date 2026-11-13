@@ -55,6 +55,9 @@ import lms_vram
 import pytest
 from lms_healthcheck import LATENCY_CAVEAT, REPORT_SCHEMA_VERSION, HealthReport
 from lms_manifest import load_arms
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _LMS_DIR = Path(__file__).resolve().parents[1] / 'local-model-serving'
 ARTIFACT_PATH = _LMS_DIR / 'verification' / 'health-report.json'

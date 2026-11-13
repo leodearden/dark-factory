@@ -22,6 +22,8 @@ const { plainDatum } = window.DF_DATUM;
 const {
   resolutionSegments, corpusAgeCaption, openInHistoryOver, windowedEscPerDone,
 } = window.DF_ESCALATION_VIEWS;
+// Regime markers placed on a date-label axis, drawn by charts.jsx::MarkedChart.
+const { dateLabelMarks } = window.DF_CHART_MARKS;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
 const { usePersistedState, useOpenSet } = createPersistedHooks(React);
@@ -109,55 +111,6 @@ function sliceWeeklyByWindow(weeklyObj, generatedAt, win) {
   return out;
 }
 
-// ── Regime-marker overlay ──
-//
-// charts.jsx's primitives (LineChart/StackedAreaChart) plot points at evenly
-// spaced x (index-based) with fixed padding padL=38/padR=12, and have no
-// vertical-marker support — charts.jsx is not modified (see design
-// decisions). RegimeMarkers renders vertical lines + labels as an
-// absolutely-positioned overlay keyed off the same `labels` array the chart
-// itself renders, so the two line up regardless of the chart's
-// ResizeObserver-driven width.
-const _CHART_PAD_L = 38, _CHART_PAD_R = 12;
-
-function RegimeMarkers({ labels, markers }) {
-  if (!markers || markers.length === 0 || !labels || labels.length < 2) return null;
-  const n = labels.length;
-  return (
-    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
-      {markers.map((m, i) => {
-        const idx = labels.indexOf(m.date);
-        if (idx === -1) return null;
-        const frac = idx / (n - 1);
-        const left = `calc(${_CHART_PAD_L}px + ${frac} * (100% - ${_CHART_PAD_L + _CHART_PAD_R}px))`;
-        return (
-          <div key={i} style={{ position: 'absolute', left, top: 0, bottom: 20 }}>
-            <div style={{ height: '100%', borderLeft: '1px dashed var(--fg-3)' }} />
-            <span style={{
-              position: 'absolute', top: 0, left: 3, fontSize: 9, color: 'var(--fg-3)',
-              whiteSpace: 'nowrap', transform: 'translateY(-2px)',
-            }}>{m.label}</span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// TimeChart wraps a chart primitive with the RegimeMarkers overlay. Every
-// time-axis chart in the panels below (Origin's filings StackedAreaChart,
-// the Lifespan ECDF, Workflow's churn/esc-per-done LineCharts) renders
-// through this wrapper so regime markers appear consistently everywhere
-// without charts.jsx itself needing marker support.
-function TimeChart({ labels, markers, children }) {
-  return (
-    <div style={{ position: 'relative' }}>
-      {children}
-      <RegimeMarkers labels={labels} markers={markers} />
-    </div>
-  );
-}
-
 // ── Origin panel ──
 //
 // Top-N-by-source filings/day (long tail folded into an 'other' stack) + a
@@ -222,9 +175,9 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
         Origin — filings by source
       </div>
       {stacks.length > 0 && (
-        <TimeChart labels={dates} markers={regimeMarkers}>
-          <C.StackedAreaChart stacks={stacks} labels={dates} snapMax={C.niceCountMax} formatX={fmtDateTime} />
-        </TimeChart>
+        <C.MarkedChart marks={dateLabelMarks(dates, regimeMarkers)}>
+          <C.StackedAreaChart stacks={stacks} labels={dates} countAxis formatX={fmtDateTime} />
+        </C.MarkedChart>
       )}
       <table className="tbl" style={{ marginTop: 10 }}>
         <thead>
@@ -308,8 +261,8 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
   const gridLabels = grid.map(fmtUptime);
 
   // Vertical 6h (21600s) freshness marker — the grid index whose threshold
-  // lands nearest 21600, rendered via the same overlay technique as
-  // RegimeMarkers/TimeChart (a synthetic single-marker array).
+  // lands nearest 21600, drawn by the same overlay as the regime markers (a
+  // synthetic single-marker array).
   const BREACH_SECS = 21600;
   let breachIdx = 0;
   for (let i = 1; i < grid.length; i++) {
@@ -368,9 +321,9 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
           <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>
             Resolution-time ECDF by resolver tier (log-x; dashed line = 6h freshness)
           </div>
-          <TimeChart labels={gridLabels} markers={breachMarker}>
+          <C.MarkedChart marks={dateLabelMarks(gridLabels, breachMarker)}>
             <C.LineChart series={series} labels={gridLabels} formatY={v => `${Math.round(v * 100)}%`} formatX={v => v} />
-          </TimeChart>
+          </C.MarkedChart>
         </>
       )}
       {lifespan.samples_downsampled && (
@@ -515,15 +468,14 @@ function WorkflowPanel({ project, workflow, terminal, win, generatedAt, regimeMa
       {churnDates.length > 0 && (
         <>
           <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Churn — same-task re-filings within 24h</div>
-          <TimeChart labels={churnDates} markers={regimeMarkers}>
+          <C.MarkedChart marks={dateLabelMarks(churnDates, regimeMarkers)}>
             <C.LineChart
               series={[{ key: 'churn', color: C.PALETTE.bad, values: churnDates.map(d => churnDaily[d] || 0) }]}
               labels={churnDates}
-              formatY={C.formatCountTick}
-              snapMax={C.niceCountMax}
+              countAxis
               formatX={fmtDateTime}
             />
-          </TimeChart>
+          </C.MarkedChart>
         </>
       )}
       {epdDates.length > 0 && (
@@ -531,13 +483,13 @@ function WorkflowPanel({ project, workflow, terminal, win, generatedAt, regimeMa
           <div style={{ fontSize: 10, color: 'var(--fg-3)', margin: '10px 0 4px' }}>
             Escalations filed per task done{escPerDone.ratio === null && ` — ${escPerDone.absentReason}`}
           </div>
-          <TimeChart labels={epdDates} markers={regimeMarkers}>
+          <C.MarkedChart marks={dateLabelMarks(epdDates, regimeMarkers)}>
             <C.LineChart
               series={[{ key: 'ratio', color: C.PALETTE.accent, values: escPerDoneDaily.map(row => row.ratio) }]}
               labels={epdDates}
               formatX={fmtDateTime}
             />
-          </TimeChart>
+          </C.MarkedChart>
         </>
       )}
       {/* ζ lifecycle flow diagram / mini-Sankey — origin → level → tier →
@@ -562,7 +514,7 @@ function EscalationAnalyticsTab({ projectFilter }) {
 
   const [openMap, toggle] = useOpenSet(projectIds, true, 'df.open.escanalytics');
   const [win, setWin] = usePersistedState('df.escanalytics.window', '28d');
-  // Shared across every project's date-axis charts via TimeChart (Origin's
+  // Shared across every project's date-axis charts via MarkedChart (Origin's
   // filings chart, Workflow's churn/esc-per-done charts) — regime markers
   // are a single cross-project timeline, not per-project data. Lifespan's
   // only chart is the threshold-axis ECDF, so it doesn't consume these.

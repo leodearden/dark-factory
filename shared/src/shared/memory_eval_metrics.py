@@ -85,6 +85,7 @@ __all__ = [
     'TripwireItem',
     'canonical_json_text',
     'eval_dir',
+    'format_stamp',
     'load_metric_series',
     'load_series_window',
     'metrics_artifact_path',
@@ -93,6 +94,7 @@ __all__ = [
     'report_artifact_path',
     'run_stamp',
     'serialize_metric_series',
+    'stamp_datetime',
     'validate_metric_series',
     'validate_stamp',
     'write_metric_series',
@@ -182,6 +184,19 @@ def validate_stamp(stamp: str, *, what: str) -> str:
             'nothing to signal which.'
         )
     return stamp
+
+
+def stamp_datetime(stamp: str) -> datetime:
+    """Inverse of :func:`run_stamp`, beside :data:`_STAMP_FORMAT` so the format has one home."""
+    validate_stamp(stamp, what='stamp')
+    return datetime.strptime(stamp, _STAMP_FORMAT).replace(tzinfo=UTC)
+
+
+def format_stamp(moment: datetime) -> str:
+    """*moment* as a run stamp, truncated to the second: :func:`stamp_datetime`'s forward half."""
+    if moment.tzinfo is None:
+        raise ValueError(f'a run stamp needs a timezone-aware moment: {moment!r}')
+    return moment.astimezone(UTC).strftime(_STAMP_FORMAT)
 
 
 def _is_whole(value: float) -> bool:
@@ -457,7 +472,7 @@ def run_stamp(*, env_var: str = RUN_STAMP_ENV_VAR) -> str:
     override = os.environ.get(env_var)
     if override:
         return validate_stamp(override, what=f'${env_var}')
-    return datetime.now(UTC).strftime(_STAMP_FORMAT)
+    return format_stamp(datetime.now(UTC))
 
 
 def eval_dir(root: str | Path, eval_id: str) -> Path:

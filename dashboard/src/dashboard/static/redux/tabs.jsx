@@ -1,5 +1,5 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
-const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS, formatCountTick, niceCountMax } = window.DF_CHARTS;
+const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = window.DF_CHARTS;
 const { Glyph: GL, ProjectGroup, Pip, DatumReading, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
@@ -26,14 +26,13 @@ const { plainDatum, derivedDatum, servedDatum, datumView } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
-const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
-// data.js's one copy of the on-demand terminal window's key.
-const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
+const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProjects, createTerminalWindowHooks, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
+  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, projectDepth,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
 // PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
@@ -42,6 +41,8 @@ const { useState: uS } = React;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
 const { usePersistedState, useOpenSet } = createPersistedHooks(React);
+// OrchTab requests and lists terminal windows through task_snapshot.js's hook.
+const { useTerminalWindows } = createTerminalWindowHooks(React, window.DF_DATA_LOADER);
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
 // endpoint-granular until PRD leaf beta puts a served Datum on the wire, and the
@@ -135,10 +136,10 @@ const onePassPct = cards => cards.paths.find(x => x.path === 'one-pass')?.pct ??
 const sumOf = xs => xs.reduce((s, x) => s + x, 0);
 const pathTotal = cards => sumOf(cards.paths.map(x => x.count));
 
-// A PerfTab panel head reading the project's cards Datum, so the chart under it
+// A panel head reading the Datum its chart draws, so the chart under it
 // carries the same age badge and reason as the pips. A hole draws no chart.
-function CardsPanelHead({ title, cards, reading }) {
-  return <div className="panel-head"><span className="title">{title}</span><span className="meta"><DatumReading datum={cards} format={reading} /></span></div>;
+function DatumPanelHead({ title, datum, reading }) {
+  return <div className="panel-head"><span className="title">{title}</span><span className="meta"><DatumReading datum={datum} format={reading} /></span></div>;
 }
 
 // ── Deps + locks chip lists ──
@@ -251,6 +252,8 @@ function OrchTab({ projectFilter, search }) {
     const cur = getFilter(pid);
     setFilterMap({ ...filterMap, [pid]: { ...cur, [key]: !cur[key] } });
   };
+  const wanted = terminalSelectingProjects(matches.map(o => ({ project: o.project, filter: getFilter(o.pid) })));
+  const terminalWindowOf = useTerminalWindows(DF, wanted);
 
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
@@ -264,7 +267,7 @@ function OrchTab({ projectFilter, search }) {
       {matches.map(o => {
         const census = projectCensus(DF, o.project);
         const filter = getFilter(o.pid);
-        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
+        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), terminalWindowOf(o.project), filter);
         const filtered = rows.filter(matchesSearch);
 
         const summary = (
@@ -516,7 +519,7 @@ function PerfTab({ projectFilter }) {
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-4 panel">
-                  <CardsPanelHead title="Completion paths" cards={cards} reading={c => `${pathTotal(c)} tasks`} />
+                  <DatumPanelHead title="Completion paths" datum={cards} reading={c => `${pathTotal(c)} tasks`} />
                   {block && <div className="panel-body" style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
                     <DN data={block.paths.map(x => ({ label: x.path, value: x.count, color: CP.paths[x.path] }))} size={120} thickness={20} centerValue={String(pathTotal(block))} centerLabel="tasks" />
                     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -593,11 +596,11 @@ function PerfTab({ projectFilter }) {
                 </div>
 
                 <div className="col-span-6 panel">
-                  <CardsPanelHead title="Review cycles · outer loop" cards={cards} reading={c => `${sumOf(c.hist_outer.values)} done`} />
+                  <DatumPanelHead title="Review cycles · outer loop" datum={cards} reading={c => `${sumOf(c.hist_outer.values)} done`} />
                   {block && <div className="panel-body"><BC labels={block.hist_outer.labels} values={block.hist_outer.values} height={140} /></div>}
                 </div>
                 <div className="col-span-6 panel">
-                  <CardsPanelHead title="Verify attempts · inner loop" cards={cards} reading={c => `${sumOf(c.hist_inner.values)} done`} />
+                  <DatumPanelHead title="Verify attempts · inner loop" datum={cards} reading={c => `${sumOf(c.hist_inner.values)} done`} />
                   {block && <div className="panel-body"><BC labels={block.hist_inner.labels} values={block.hist_inner.values} height={140} color={CP.info} /></div>}
                 </div>
               </div>
@@ -646,7 +649,7 @@ function MemoryTab({ projectFilter, onNavigate }) {
             <LC labels={DF.MEMORY_OPS.labels} series={[
               { values: DF.MEMORY_OPS.reads, color: CP.accent },
               { values: DF.MEMORY_OPS.writes, color: CP.ok },
-            ]} height={240} formatY={formatCountTick} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
+            ]} height={240} countAxis formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       </div>
@@ -829,7 +832,7 @@ function ReconTab({ projectFilter, search }) {
         </div>
         <div className="panel-body flush">
           <table className="tbl">
-            <thead><tr><th>Run</th><th>Project</th><th>Trigger</th><th>Type</th><th>Status</th><th className="num">Events</th><th className="num">Duration</th><th>When</th><th className="num">Journal</th></tr></thead>
+            <thead><tr><th>Run</th><th>Project</th><th>Trigger</th><th>Type</th><th>Status</th><th className="num">Events</th><th className="num">Duration</th><th>When</th></tr></thead>
             <tbody>
               {runs.map(rn => (
                 <tr key={rn.id}>
@@ -841,7 +844,6 @@ function ReconTab({ projectFilter, search }) {
                   <td className="num">{rn.events_processed ?? rn.events ?? 0}</td>
                   <td className="num">{rn.duration_seconds != null ? `${rn.duration_seconds.toFixed(1)}s` : '—'}</td>
                   <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(rn.started_at)}</td>
-                  <td className="num"><span className="badge accent">{rn.journal_entry_count ?? 0}</span></td>
                 </tr>
               ))}
             </tbody>
@@ -875,32 +877,15 @@ function MergeTab({ projectFilter }) {
   const projIds = projects.map(([pid]) => pid);
   const [openMap, toggle, setAll] = useOpenSet(projIds, true, 'df.open.merge');
   const allOpen = projIds.every(p => openMap[p]);
-  const totals = projects.reduce((acc, [_, d]) => ({
-    count: acc.count + sumOf(d.outcomes.values),
-  }), { count: 0 });
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
-        // Aggregate the per-project queue-depth time-series by index. Different
-        // projects can have different bucket counts; we line them up at the
-        // tail so the most-recent buckets stay aligned.
-        const allDepths = projects.map(([, d]) => d.depth?.values || []);
-        const maxLen = allDepths.reduce((m, a) => Math.max(m, a.length), 0);
-        const aggDepth = Array.from({ length: maxLen }, (_, i) =>
-          allDepths.reduce((s, a) => {
-            const off = a.length - maxLen;
-            const val = a[i + off];
-            return s + (val || 0);
-          }, 0),
-        );
-        // Worst-case p95 across projects (max — informative for SLO).
-        const p95s = projects.map(([, d]) => d.latency?.p95).filter(v => v != null && v > 0);
-        const p95 = p95s.length ? Math.max(...p95s) : null;
         const speculative = speculativeOver(DF, projIds);
+        const worst = worstP95Over(DF, projIds);
         return (
           <div className="col-span-12 grid cols-4">
-            <ST label="Merges (window)" datum={plainDatum(totals.count, EP.mergeQueue)}
-                history={aggDepth} sparkColor={CP.accent} />
+            <ST label="Merges (window)" datum={attemptsOver(DF, projIds)}
+                history={attemptsHistory(DF, projIds)} sparkColor={CP.accent} />
             <ST label="In queue now" datum={inQueueOver(DF, projIds)}
                 history={inQueueHistory(DF, projIds).slice(-30)} sparkColor={CP.warn} />
             <ST label="Speculative hit rate"
@@ -908,8 +893,8 @@ function MergeTab({ projectFilter }) {
                 hint={datumView(speculative).isHole ? undefined : `${speculative.value.hit_count}/${speculative.value.total} attempts`}
                 history={[]} sparkColor={CP.ok} />
             <ST label="p95 latency · worst project"
-                datum={derivedDatum(p95, EP.mergeQueue, 'no merges in this window')} format={fmtMs}
-                hint={p95s.length ? `${p95s.length} projects` : 'no merges'}
+                datum={worst} format={w => fmtMs(w.p95_ms)}
+                hint={datumView(worst).isHole ? undefined : `${worst.value.timed_projects} projects`}
                 history={[]} sparkColor={CP.warn} />
           </div>
         );
@@ -920,12 +905,16 @@ function MergeTab({ projectFilter }) {
       {projects.map(([pid, d]) => {
         const speculative = projectSpeculative(DF, pid);
         const windowTotal = recentTotal(DF, pid);
+        const attempts = projectAttempts(DF, pid);
+        const depth = projectDepth(DF, pid);
+        const depthSeries = depth.value;
+        const tried = attempts.value;
         const summary = (
           <>
             <HaltPill halt={d.halt} />
-            <Pip datum={plainDatum(sumOf(d.outcomes.values), EP.mergeQueue)} color={CP.accent} label="attempts" />
+            <Pip datum={attempts} color={CP.accent} format={attemptCount} label="attempts" />
             <Pip datum={projectInQueue(DF, pid)} color={CP.warn} label="queued" />
-            <Pip datum={plainDatum(d.latency.p50, EP.mergeQueue)} color={CP.ok} format={fmtMs} label="p50" />
+            <Pip datum={attempts} color={CP.ok} format={a => fmtMs(a.latency.p50)} label="p50" />
             <span style={{ color: 'var(--fg-3)' }}>· <DatumReading datum={speculative} format={hitRateText} /> spec hit</span>
           </>
         );
@@ -934,31 +923,34 @@ function MergeTab({ projectFilter }) {
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
-                  <div className="panel-head"><span className="title">Merge attempts · 15-min buckets</span></div>
-                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatY={formatCountTick} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} /></div>
+                  <DatumPanelHead title={`Merge attempts · ${depthBucketCaption(depthSeries)}`} datum={depth}
+                      reading={series => `peak ${Math.max(0, ...series.values)}/bucket`} />
+                  {depthSeries && <div className="panel-body"><LC labels={depthSeries.labels.map(String)} series={[{ values: depthSeries.values, color: CP.accent }]} height={180} countAxis formatX={window.DF_SHELL.fmtDateTime} /></div>}
                 </div>
 
                 <div className="col-span-5 panel">
-                  <div className="panel-head"><span className="title">Outcomes</span></div>
-                  <div className="panel-body" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <DN data={d.outcomes.labels.map((l, i) => ({ label: l, value: d.outcomes.values[i], color: (d.outcomes.colors || [])[i] || CP.accent }))} size={120} thickness={18} centerValue={d.outcomes.values.reduce((s,v)=>s+v,0)} centerLabel="merges" />
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5, flex: 1 }}>
-                      {d.outcomes.labels.map((l, i) => (
-                        <div key={l} style={{ display: 'grid', gridTemplateColumns: '8px 1fr auto', gap: 6, alignItems: 'center', fontSize: 11 }}>
-                          <span style={{ width: 8, height: 8, background: (d.outcomes.colors || [])[i] || CP.accent, borderRadius: 2 }}></span>
-                          <span style={{ color: 'var(--fg-2)' }}>{l}</span>
-                          <span className="mono">{d.outcomes.values[i]}</span>
-                        </div>
-                      ))}
+                  <DatumPanelHead title="Outcomes" datum={attempts} reading={a => `${attemptCount(a)} merges`} />
+                  {tried && (
+                    <div className="panel-body" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <DN data={tried.outcomes.labels.map((l, i) => ({ label: l, value: tried.outcomes.values[i], color: tried.outcomes.colors[i] || CP.accent }))} size={120} thickness={18} centerValue={attemptCount(tried)} centerLabel="merges" />
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, flex: 1 }}>
+                        {tried.outcomes.labels.map((l, i) => (
+                          <div key={l} style={{ display: 'grid', gridTemplateColumns: '8px 1fr auto', gap: 6, alignItems: 'center', fontSize: 11 }}>
+                            <span style={{ width: 8, height: 8, background: tried.outcomes.colors[i] || CP.accent, borderRadius: 2 }}></span>
+                            <span style={{ color: 'var(--fg-2)' }}>{l}</span>
+                            <span className="mono">{tried.outcomes.values[i]}</span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </div>
 
                 <div className="col-span-6 panel">
-                  <div className="panel-head"><span className="title">Latency centiles</span><span className="meta">{latencyCaption(d.latency)}</span></div>
+                  <div className="panel-head"><span className="title">Latency centiles</span><span className="meta">{tried ? latencyCaption(tried.latency) : ''}</span></div>
                   <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
-                    {[['p50',d.latency.p50],['p95',d.latency.p95],['p99',d.latency.p99],['mean',d.latency.mean_ms]].map(([l,v]) => (
-                      <div key={l}><div className="mono" style={{ fontSize: 18 }}>{fmtMs(v)}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{l}</div></div>
+                    {[['p50', 'p50'], ['p95', 'p95'], ['p99', 'p99'], ['mean', 'mean_ms']].map(([l, key]) => (
+                      <div key={l}><div className="mono" style={{ fontSize: 18 }}><DatumReading datum={attempts} format={a => fmtMs(a.latency[key])} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{l}</div></div>
                     ))}
                   </div>
                 </div>
@@ -1278,7 +1270,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                 <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
               ))}
             </div>
-            <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
+            <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} countAxis formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       )}
@@ -1343,7 +1335,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                     {/* Bands must be indexed by THIS project's own snapshot row: b.labels is
                         the sorted union across all projects (redux_api.py shape_burndown), so
                         pairing it with pb.* both overruns and index-shifts them. */}
-                    <SA labels={pb.labels} stacks={burndownStacks(pb, CP)} height={220} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
+                    <SA labels={pb.labels} stacks={burndownStacks(pb, CP)} height={220} countAxis formatX={window.DF_SHELL.fmtDateTime} />
                   </div>
                 </div>
 

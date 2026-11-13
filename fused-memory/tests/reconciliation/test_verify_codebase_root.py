@@ -23,11 +23,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _git_root_helper import make_git_root
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationVerdict
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, elision_marker
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,15 +57,12 @@ def _mock_agent_loop():
     patcher = patch('fused_memory.reconciliation.verify.AgentLoop')
     mock_cls = patcher.start()
     instance = AsyncMock()
-    instance.run = AsyncMock(return_value=(
-        {
-            'verdict': 'inconclusive',
-            'confidence': 0.5,
-            'evidence': [],
-            'summary': 'nothing conclusive',
-        },
-        [],
-    ))
+    instance.run = AsyncMock(return_value={
+        'verdict': 'inconclusive',
+        'confidence': 0.5,
+        'evidence': [],
+        'summary': 'nothing conclusive',
+    })
     mock_cls.return_value = instance
     return patcher, mock_cls, instance
 
@@ -151,8 +151,8 @@ async def test_prompt_names_the_per_call_root(tmp_path):
 async def test_agent_cwd_is_the_per_call_root(tmp_path):
     """The agent runs IN the caller's root, not the global explore root.
 
-    Task 1989's rationale, re-pointed: the cwd's auto-loaded CLAUDE.md is the
-    agent's main passive codebase signal, so it must be the TARGET project's.
+    The cwd is the root the CLI confines its read tools to, so it must be the
+    TARGET project's.
     """
     root_a = make_git_root(tmp_path, 'root_a')
     config = _config()

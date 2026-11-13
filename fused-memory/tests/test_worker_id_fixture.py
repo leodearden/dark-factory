@@ -25,6 +25,9 @@ from typing import Any
 
 import pytest
 from _fm_helpers import resolve_xdist_worker_id
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _FUSED_MEMORY_DIR = Path(__file__).resolve().parents[1]
 _CONTRACT_NODE_ID = 'tests/test_worker_id_fixture.py::test_worker_id_matches_xdist_semantics'
@@ -77,11 +80,6 @@ def test_worker_id_matches_xdist_semantics(worker_id, pytestconfig):
     assert worker_id == expected
 
 
-# `timeout(180)` is load-bearing, not padding: this project's ini sets
-# `timeout = 60` with `timeout_method = "thread"`, and pytest-timeout's thread
-# handler ends in `os._exit(1)` — firing it under `-n auto --dist loadgroup`
-# kills the whole xdist worker.  Measured wall for the nested run is ~13s.
-@pytest.mark.timeout(180)
 def test_worker_id_survives_the_lanes_serial_confirm_rerun():
     """A nested pytest under the lane's exact confirm-re-run flags must succeed.
 

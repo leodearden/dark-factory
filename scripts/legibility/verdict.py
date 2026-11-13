@@ -15,9 +15,7 @@ from pathlib import Path
 
 from legibility import codebook, filing_policy
 
-SEVERITIES: tuple[str, ...] = tuple(
-    codebook.V2_SCHEMA["properties"]["entries"]["items"]["properties"]["severity"]["enum"]
-)
+SEVERITIES: tuple[str, ...] = codebook.ENTRY_SEVERITIES
 DEFAULT_SEVERITY = "medium"
 KIND_TAG = "kind:confusion"
 

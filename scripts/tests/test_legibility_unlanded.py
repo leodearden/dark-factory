@@ -17,6 +17,9 @@ from pathlib import Path
 
 import pytest
 from legibility import trickle_state, unlanded
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CODEBOOK = 'docs/legibility/confusion-codebook.yaml'
 _CENSUS_STATE = 'docs/legibility/census-state.json'

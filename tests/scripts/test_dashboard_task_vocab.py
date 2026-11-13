@@ -16,8 +16,12 @@ import pathlib
 import re
 
 import gen_dashboard_task_vocab
+import pytest
 from dashboard.data import census
 from shared.task_statuses import TaskStatus
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

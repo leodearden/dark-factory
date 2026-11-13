@@ -38,6 +38,7 @@ from orchestrator.evals.reviewer_trial.corpus import CorpusDiff
 from orchestrator.evals.reviewer_trial.runner import _run_single_reviewer
 from orchestrator.evals.reviewer_trial.variants import VARIANT_A
 from orchestrator.evals.snapshots import get_diff
+from orchestrator.review_payload import Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -259,10 +260,7 @@ def load_scope(path: Path) -> set[str]:
 
 def recompute_composite_from_metrics(metrics_dict: dict) -> float:
     """Rebuild an EvalMetrics from the patched dict and call compute_composite."""
-    known = set(EvalMetrics.__dataclass_fields__)
-    filtered = {k: v for k, v in metrics_dict.items() if k in known}
-    m = EvalMetrics(**filtered)
-    return compute_composite(m)
+    return compute_composite(EvalMetrics.from_dict(metrics_dict))
 
 
 def _with_rereview(result: dict, blocking: int, suggestions: int) -> dict:
@@ -313,14 +311,13 @@ async def rereview_one(
     except Exception as e:
         return RereviewOutcome.error(cand.run_id, f'reviewer raised: {e}')
 
-    if review is None or review.get('verdict') == 'ERROR':
+    if review is None or review.verdict is Verdict.ERROR:
         return RereviewOutcome.error(
             cand.run_id, 'reviewer returned no parseable result',
         )
 
-    issues = review.get('issues') or []
-    blocking = sum(1 for i in issues if i.get('severity') == 'blocking')
-    suggestions = sum(1 for i in issues if i.get('severity') == 'suggestion')
+    blocking = len(review.blocking_issues)
+    suggestions = len(review.suggestions)
 
     # 3. Dump the raw review JSON (atomic).
     raw_path = (
@@ -331,7 +328,7 @@ async def rereview_one(
         'config_name': cand.config_name,
         'run_id': cand.run_id,
         'reviewer': name,
-        'review': review,
+        'review': review.to_record(),
         'cost_usd': cost,
         'timestamp': datetime.now(tz=UTC).isoformat(),
         'base_commit': cand.base_commit,

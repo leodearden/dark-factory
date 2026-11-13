@@ -1,0 +1,18 @@
+{
+  "task_id": "6615",
+  "reason": "Net-additive bug fix (task 6615): a corrupt plan.lock owner_pid (10**20 / JSON true) used to escape TaskGroundTruth as OverflowError or read as a phantom live claimant, crash-looping startup step 2d. The regression test test_corrupt_owner_pid_reads_as_no_claimant_and_reverts drives the real Harness._reconcile_stranded_in_progress like its sibling sweep tests already do (+1 private read); the sweep has no public entry point.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_reconcile_stranded.py",
+      "baseline": 185,
+      "current": 186
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6422,
+      "current": 6423
+    }
+  ]
+}

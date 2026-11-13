@@ -1,15 +1,18 @@
-"""Shared queued-branch-name normalizer — canonical_queued_branch_name.
+"""Shared queued-branch-name normalizers — canonical_queued_branch_name and bare_queued_branch_id.
 
-Provides :func:`canonical_queued_branch_name`, the single source of truth
-for "prepend the queue's branch prefix onto a branch name unless it is
-already present". Relocated out of orchestrator/git_ops.py so escalation's
-server.py — which cannot import orchestrator — can consume it statically
-(escalation already imports ``shared`` directly, e.g. ``shared.timestamps``).
+The single home of both directions of the queued-branch prefix rule:
+:func:`canonical_queued_branch_name` yields the full ref ("prepend the
+queue's branch prefix unless already present") and
+:func:`bare_queued_branch_id` yields the bare id every merge-lane producer
+keys its records by. Relocated out of orchestrator/git_ops.py so
+escalation's server.py — which cannot import orchestrator — can consume
+them statically (escalation already imports ``shared`` directly, e.g.
+``shared.timestamps``).
 """
 
 from __future__ import annotations
 
-__all__ = ['canonical_queued_branch_name']
+__all__ = ['bare_queued_branch_id', 'canonical_queued_branch_name']
 
 
 def canonical_queued_branch_name(branch: str, branch_prefix: str) -> str:
@@ -29,3 +32,8 @@ def canonical_queued_branch_name(branch: str, branch_prefix: str) -> str:
     rule is not duplicated with divergent fidelity across sites.
     """
     return branch if branch.startswith(branch_prefix) else f'{branch_prefix}{branch}'
+
+
+def bare_queued_branch_id(branch: str, branch_prefix: str) -> str:
+    """Return the bare id a queued branch is keyed by: the strip of its canonical full ref, the form every merge-lane producer writes."""
+    return canonical_queued_branch_name(branch, branch_prefix).removeprefix(branch_prefix)

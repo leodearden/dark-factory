@@ -12,6 +12,8 @@ description = "Fused Memory MCP Server — unified Graphiti + Mem0 memory system
 requires-python = ">=3.11,<4"
 dependencies = [
     "graphiti-core[falkordb]>=0.28.1",
+    # hiredis C reply parser for FalkorDB: tests/test_redis_hiredis_parser.py (task 9308)
+    "redis[hiredis]>=7.4.0",
     "mem0ai>=1.0.10",
     "mcp>=1.9.4",
     "pydantic>=2.7",
@@ -28,19 +30,24 @@ dark-factory-shared = { workspace = true }
 escalation = { workspace = true }
 
 [tool.pytest.ini_options]
-markers = ["integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'"]
+markers = [
+    "integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'",
+    "reads_git_history: the test reads the checkout's git history (log, merge-base, rev-list, describe), so a byte-identical tree under a new parent can verify differently; re-run alone on the merge gate's same-tree path by merge_gate_history_test_command. Not deselected by default.",
+]
 pythonpath = ["src", "../orchestrator/src"]
 asyncio_mode = "strict"
-# --max-worker-restart=0 (task 5114) is required of every thread-method config
-# (timeout_method below), as in orchestrator/pyproject.toml. The reason, and an
+# --max-worker-restart=0 (task 5114) stays under signal, as in
+# orchestrator/pyproject.toml, for the worker deaths a timeout no longer causes.
+# The reason, the recorded set that pins it (RESTART_DISABLED_CONFIGS), and an
 # executable reproduction of the unattributed INTERNALERROR abort that permitted
 # restarts produce, live in tests/scripts/test_xdist_worker_restart_policy.py.
 addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not integration'"
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns, and why this
 # is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
-# starved of CPU on a loaded 32-core host trips it and — under thread mode
-# plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself).
+# starved of CPU on a loaded 32-core host trips it; under signal it reds
+# itself, where thread mode plus --max-worker-restart=0 used to red a SHIFTING
+# VICTIM).
 # 420 is DERIVED FROM MEASUREMENT — worst unmarked per-test wall clock under
 # real fleet load x the 8x headroom factor — and no longer judgement-picked.
 # This suite's repo-wide scans in tests/test_check_bare_magicmock_config.py
@@ -51,22 +58,15 @@ addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not integration'"
 # In-band markers (60 < N < verify --timeout) are rejected by
 # tests/test_timeout_marker_inversion_guard.py; see
 # shared/src/shared/testing_timeout_markers.py.
-# thread method is RETAINED. Its original premise, that signal is incompatible
-# with pytest-xdist workers, is falsified by
-# tests/scripts/test_timeout_method_policy.py, where the signal-vs-thread trade
-# lives.
-# IMPORTANT — thread method *kills the worker*: pytest-timeout's thread
-# handler ends with os._exit(1), taking the whole xdist worker with it. Under
-# --max-worker-restart=0 (addopts above) that death is reported as ONE FAILED
-# on a named test and the session stops dispatching, so its tally is partial.
-# Tests with a real-time budget approaching 300s MUST set
-# @pytest.mark.timeout(N) to opt up rather than cost the run its tally. Fix the
-# mock (shared.testing.make_gate_mock) rather than leaning on this cap to
-# recover from hangs.
-# thread method is UNCHANGED by every change of the value, deliberately:
-# a raise attacks the trigger, not the two safety mechanisms.
+# timeout_method: signal, decided on measurement by task 6354. The trade and
+# its measurement live in tests/scripts/test_timeout_method_policy.py. A breach
+# fails the one test, with its traceback, and the worker lives on, so the tally
+# stays complete. Tests with a real-time budget approaching 300s should still
+# opt up with @pytest.mark.timeout(N) rather than risk a false red at the cap.
+# Fix the mock (shared.testing.make_gate_mock) rather than leaning on this cap
+# to recover from hangs.
 timeout = 420
-timeout_method = "thread"
+timeout_method = "signal"
 
 [tool.pyright]
 include = ["src", "tests", "scripts"]
@@ -107,7 +107,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
-    "pytest-xdist>=3.5.0",
+    "pytest-xdist>=3.6.0",
     "ruff>=0.7.1",
     "escalation",
 ]

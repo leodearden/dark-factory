@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/lib_live_refs.sh — Shared live-reference /proc scanner for the warm-lane pool.
 #
-# Sourced by (both consumers, one definition — G7 no-lockstep-duplication):
+# Sourced by (three consumers, one definition — G7 no-lockstep-duplication):
 #   scripts/warm-lane-gc.sh        — the ε reclaim PRIMITIVE. Calls
 #       live_ref_present per lane (Pass 1) and per orphan (Pass 2), immediately
 #       before the reset/remove, while that entry's flock is already held. Every
@@ -12,6 +12,10 @@
 #   scripts/warm-lane-gc-sweep.sh  — the δ periodic backstop. Calls
 #       live_referenced_paths ONCE per sweep for the whole batch of dead-PID
 #       .reseed-trash candidates (_reap_stale_trash, task 5326).
+#   scripts/thin-warm-lane.sh      — release-thin. Calls live_ref_present
+#       ONCE per invocation (its T4 gate), under the held T3 <lane>.lock flock
+#       and immediately before its `rm -rf <lane>/target` (task 5307,
+#       README Delta 17).
 #
 # FUNCTIONS (defined when sourced):
 #   live_referenced_paths RP...
@@ -23,14 +27,15 @@
 #       referenced by a live process; 1 otherwise. Short-circuits: the cheaper
 #       verdict wins, see below.
 #
-# MEASURED COST (this host, 2026-07-28: 1159 live processes, 11527 fd/cwd
-# symlinks, 93 entries under the warm-lane worktrees dir):
-#   cwd/fd pass (find+awk over /proc) ...... ~1.5s   — unavoidable for a
-#                                                     candidate that turns out
-#                                                     NOT to be referenced
-#   mmap pass  (grep over /proc/*/maps) .... ~0.38s
-#   one live_ref_present call .............. ~1.9s (both passes) /
-#                                            ~1.5s (cwd-or-fd hit, short-circuit)
+# MEASURED COST (this host, 2026-11-01: ~1.5-1.7k live processes, ~18.9k fd/cwd
+# symlinks, loadavg ~90-97 on 32 cores; ranges over back-to-back samples):
+#   cwd/fd pass (find+awk over /proc/<pid>/{cwd,fd}) .. 0.42-0.88s — unavoidable
+#                                                       for a candidate that turns
+#                                                       out NOT to be referenced
+#   mmap pass  (grep over /proc/*/maps) ............... 0.04-0.33s
+#   one negative live_ref_present (both passes) ....... 0.57-1.37s
+# A cwd-or-fd hit skips the mmap pass. The depth-3 `find /proc` walk the cwd/fd
+# pass replaced (task 8089) measured 0.90-1.38s in the same samples.
 # The awk early-exit only fires once EVERY candidate is accounted for, so a
 # free (about-to-be-reclaimed) candidate always pays the full walk — and that
 # is precisely the verdict that must be fresh. See the "cost reversal" note in
@@ -71,9 +76,9 @@ _REIFY_LIB_LIVE_REFS_SH_SOURCED=1
 # fail-open verdict is the lesser failure.
 #
 # O(1) by construction — ONE readlink plus one readdir of /proc. The stronger
-# probe (run the fd/cwd walk and confirm it saw this process's own cwd) would
-# cost a full ~1.5s walk per process, i.e. it would pay the very cost the
-# short-circuit in live_ref_present exists to cut. What this catches: /proc
+# probe (run the fd/cwd pass and confirm it saw this process's own cwd) would
+# cost a full fd/cwd pass per process (see MEASURED COST), i.e. it would pay the
+# very cost the short-circuit in live_ref_present exists to cut. What this catches: /proc
 # absent/unmounted, and a hidepid= mount that leaves us seeing only ourselves.
 # What it does NOT catch: a partially-unreadable /proc (some entries denied),
 # which still degrades the verdict silently.
@@ -101,23 +106,28 @@ _live_refs_env_probe() {
 }
 
 # _live_refs_scan_fdcwd RP... — the cwd + open-fd HALF of the scan. Split out of
-# live_referenced_paths (task 5572 review) with its logic byte-identical, purely
-# so live_ref_present can take a verdict from this pass alone and skip the mmap
-# pass on a hit. Not a public entry point: callers want live_referenced_paths or
-# live_ref_present, which run both halves.
+# live_referenced_paths (task 5572 review) purely so live_ref_present can take a
+# verdict from this pass alone and skip the mmap pass on a hit; its producer was
+# since narrowed by task 8089 (README Delta 15). Not a public entry point:
+# callers want live_referenced_paths or live_ref_present, which run both halves.
 _live_refs_scan_fdcwd() {
     [ $# -gt 0 ] || return 0
 
-    # cwd + open-fd references: one find pass prints every process's cwd and
-    # open-fd symlink TARGETS (%l = the kernel-canonical target — no per-fd
-    # fork). awk loads the candidate realpaths as input records (the NR==FNR
-    # two-file trick — avoids `-v`'s backslash-escape processing on data), then
-    # for each target prints any candidate it equals or is a "$cand/" descendant
-    # of (string compare, so arbitrary path characters are safe), each candidate
-    # at most once, exiting early once every candidate is accounted for.
-    # /proc/<pid>/task is pruned to skip the per-thread symlink duplicates.
-    find /proc -maxdepth 3 -path '*/task' -prune -o -type l \
-            \( -name cwd -o -path '*/fd/*' \) -printf '%l\n' 2>/dev/null \
+    # cwd + open-fd references: find prints every process's cwd and open-fd
+    # symlink TARGETS (%l = the kernel-canonical target — no per-fd fork). It is
+    # handed exactly /proc/<pid>/cwd (reported as itself, depth 0) and
+    # /proc/<pid>/fd (its entries, depth 1) as STARTING POINTS, so nothing else
+    # under /proc is read (task 8089). xargs keeps the pid list out of a single
+    # argv (no E2BIG fail-open on a huge host); `sh -c 'exec find "$@" ...'`
+    # puts the paths BEFORE find's expression, where a bare `xargs find` would
+    # append them after it and find would print nothing. awk loads the
+    # candidate realpaths as input records (the NR==FNR two-file trick — avoids
+    # `-v`'s backslash-escape processing on data), then for each target prints
+    # any candidate it equals or is a "$cand/" descendant of (string compare, so
+    # arbitrary path characters are safe), each candidate at most once, exiting
+    # early once every candidate is accounted for.
+    { printf '%s\0' /proc/[0-9]*/cwd /proc/[0-9]*/fd \
+          | xargs -0 sh -c 'exec find "$@" -maxdepth 1 -type l -printf "%l\n"' sh; } 2>/dev/null \
         | awk '
             NR==FNR { if ($0 != "") cand[++n] = $0; next }
             {
@@ -132,9 +142,9 @@ _live_refs_scan_fdcwd() {
 
 # _live_refs_scan_maps RP... — the mmap HALF of the scan. Same split rationale
 # as _live_refs_scan_fdcwd; logic byte-identical to the inline version it
-# replaces. Measurably the CHEAPER of the two passes (~0.38s vs ~1.5s here), but
-# it is run SECOND because the reference shape this gate exists to catch — a
-# live cargo/rustc build inside <lane>/target — always holds a cwd and open fds
+# replaces. Run SECOND, whichever pass is cheaper on the host (see MEASURED
+# COST), because the reference shape this gate exists to catch — a live
+# cargo/rustc build inside <lane>/target — always holds a cwd and open fds
 # there, so the fd/cwd pass is the one far likelier to short-circuit first.
 _live_refs_scan_maps() {
     [ $# -gt 0 ] || return 0
@@ -193,8 +203,8 @@ live_referenced_paths() {
 # process (cwd / open fd / mmap); 1 otherwise.
 #
 # SHORT-CIRCUITS on the cwd/fd pass (task 5572 review): a single yes/no verdict
-# does not need the mmap pass once the cheaper-to-hit one has already answered
-# "yes", which cuts a live candidate's cost from ~1.9s to ~1.5s here. A NEGATIVE
+# does not need the mmap pass once the likelier-to-hit one has already answered
+# "yes", so a live candidate skips the mmap pass's cost. A NEGATIVE
 # verdict still pays both passes — unavoidably, since "not referenced" is only
 # established by exhausting every reference kind, and that negative is exactly
 # the verdict that authorises the reset.

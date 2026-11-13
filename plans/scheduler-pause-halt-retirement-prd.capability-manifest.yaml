@@ -404,3 +404,5 @@ tasks:
       kind: manual
       reason: the test files already exist; κ's deliverable is the §7 suite passing
         in ONE run, which is a test outcome rather than a pattern
+signal_leaves:
+- κ

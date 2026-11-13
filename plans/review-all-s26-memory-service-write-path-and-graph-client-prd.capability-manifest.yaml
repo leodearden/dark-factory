@@ -1,0 +1,772 @@
+prd: plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md
+schema_version: 1
+signal_leaves: ["π"]
+tasks:
+  - label: "α"
+    task_id: 9143
+    title: "Typed queued-write values and a QueueOperation enum beside durable_queue"
+    note: "Closes fk-1215aacfa626, fk-bdc0427c8971. No out-of-batch deps: 6362, 6369 (a555a1ecac deleted the self-identity seam) and 7650 are done."
+    capabilities:
+      - name: "queue-operation-enum"
+        binding: "producer (α) — fm/services/queued_writes.py::QueueOperation"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class QueueOperation"
+          paths: ["fused-memory/src/fused_memory/services/queued_writes.py"]
+          expect: present
+      - name: "queue-decode-error-permanent"
+        binding: "producer (α) — fm/services/queued_writes.py::QueueDecodeError; DurableWriteQueue._classify_failure makes it permanent by type"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class QueueDecodeError"
+          paths: ["fused-memory/src/fused_memory/services/queued_writes.py"]
+          expect: present
+      - name: "no-second-payload-parse"
+        binding: "anti-inversion — DurableWriteQueue._process_item decodes once; the FRESH-parse comment goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "A FRESH parse"
+          paths: ["fused-memory/src/fused_memory/services/durable_queue.py"]
+          expect: absent
+      - name: "no-dispatcher-fall-through"
+        binding: "anti-inversion — _execute_durable_write is a type table; an undecodable row dead-letters"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_execute_graphiti_write\\(operation, payload\\)"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+  - label: "β"
+    task_id: 9147
+    title: "add_memory reports Graphiti as queued, not written"
+    note: "Closes fk-b30cc4fa2899. Depends on α. Task 7650 (done) shipped the Mem0-only mem0_write_state; β adds stores_queued and no second predicate (D3)."
+    capabilities:
+      - name: "stores-queued-list"
+        binding: "producer (β) — fm/models/memory.py::AddMemoryResponse.stores_queued"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "stores_queued"
+          paths: ["fused-memory/src/fused_memory/models/memory.py"]
+          expect: present
+      - name: "no-report-as-written"
+        binding: "anti-inversion — the Graphiti leg no longer appends to stores_written at enqueue"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "report as written"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "mem0-reading-exists"
+        binding: "substrate — fm/models/memory.py::AddMemoryResponse.mem0_write_state (task 7650, 789efc6ad6), the one Mem0 reading β leaves unchanged"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def mem0_write_state"
+          paths: ["fused-memory/src/fused_memory/models/memory.py"]
+          expect: present
+  - label: "γ0"
+    task_id: 9151
+    title: "Every operator entry point constructs MemoryService through maintenance/_utils.py::maintenance_service"
+    note: "Carries fk-017442f273d2 (operator half). S26-4 ruled A. Depends on β and θ2. Absorbs task 6835 (task_family_census CLI opens ServiceOpen.READS)."
+    capabilities:
+      - name: "scripts-construct-through-the-factory"
+        binding: "anti-inversion — no script constructs MemoryService directly, receiver-qualified spellings included (29 lines in 29 files, measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "(=|return) *([A-Za-z_]+\\.)?MemoryService\\("
+          paths: ["fused-memory/scripts/", "scripts/"]
+          expect: absent
+      - name: "no-injected-service-default"
+        binding: "anti-inversion — memory_eval_write_after_miss.py::open_memory's service=MemoryService default goes (1 line, measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "= MemoryService,"
+          paths: ["fused-memory/scripts/", "scripts/"]
+          expect: absent
+      - name: "one-opening-enum"
+        binding: "producer (γ0) — fm/maintenance/_utils.py::ServiceOpen (FULL, READS, NONE)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ServiceOpen"
+          paths: ["fused-memory/src/fused_memory/maintenance/_utils.py"]
+          expect: present
+      - name: "read-only-and-lean-openings"
+        binding: "producer (γ0) — READS for the two eval scripts and task_family_census's CLI; NONE for scripts/check_consolidation_closure.py (boundary row 5c)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behaviour of the opening modes; asserted by boundary row 5c and the scripts' own tests"
+      - name: "factory-exists"
+        binding: "substrate — fm/maintenance/_utils.py::maintenance_service"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def maintenance_service"
+          paths: ["fused-memory/src/fused_memory/maintenance/_utils.py"]
+          expect: present
+  - label: "γ"
+    task_id: 9158
+    title: "MemoryService constructed with its collaborators; an explicit start() after wiring"
+    note: "Closes fk-017442f273d2. Depends on γ0 and θ. Absorbs task 8660 (planned_registry= keyword replaces set_planned_registry)."
+    capabilities:
+      - name: "explicit-start"
+        binding: "producer (γ) — MemoryService.start and DurableWriteQueue.start"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def start\\(self\\)"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py", "fused-memory/src/fused_memory/services/durable_queue.py"]
+          expect: present
+      - name: "no-journal-none-guard"
+        binding: "anti-inversion — the journal is a required constructor collaborator (25 guards, measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "if self\\._write_journal"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "setters-gone"
+        binding: "anti-inversion — set_write_journal deleted with the other late setters (set_event_buffer is the one kept)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def set_write_journal"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "one-test-factory"
+        binding: "producer (γ) — fused-memory/tests/conftest.py::build_memory_service"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def build_memory_service"
+          paths: ["fused-memory/tests/conftest.py"]
+          expect: present
+      - name: "no-worker-before-start"
+        binding: "producer (γ) — _ensure_workers is a no-op until start(); enqueue/replay before start only persist (boundary rows 5, 5b)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behaviour asserted by boundary rows 5 and 5b, not a tree property"
+  - label: "δ"
+    task_id: 9161
+    title: "One journaled_op context manager for every Layer-1 write"
+    note: "Closes fk-d37d63bf0d11. Depends on γ. S26-5 ruled B; S26-2 set its home: services/journaled_ops.py, never write_journal.py. Edges requested: 6636 depends on δ; 6293 reaches δ through ν (last in-batch editor of durable_queue.py)."
+    capabilities:
+      - name: "journaled-op-context-manager"
+        binding: "producer (δ) — MemoryService._journaled_op"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _journaled_op"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: present
+      - name: "journaled-op-free-function"
+        binding: "producer (δ) — services/journaled_ops.py::journaled_op, the one Layer-1 choke point maintenance also wraps (S26-5 B, home per S26-2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def journaled_op"
+          paths: ["fused-memory/src/fused_memory/services/journaled_ops.py"]
+          expect: present
+      - name: "no-success-sentinel"
+        binding: "anti-inversion — the 9 `success = True` sentinels go with the finally blocks"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "success = True$"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "log-write-op-never-raises"
+        binding: "substrate — fm/services/write_journal.py::WriteJournal.log_write_op docstring"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "never raises"
+          paths: ["fused-memory/src/fused_memory/services/write_journal.py"]
+          expect: present
+  - label: "ε"
+    task_id: 9168
+    title: "EpisodeIdentityReconciler owns the nine identity passes behind run()"
+    note: "Closes fk-abc3487a3528 and fk-ec3de5b6cf2b (task 6601, cancelled into ε); carries fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb with ρ, τ, υ. Depends on λ. High: dependency of gate 6698."
+    capabilities:
+      - name: "reconciler-class"
+        binding: "producer (ε) — fm/services/episode_identity.py::EpisodeIdentityReconciler.run"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class EpisodeIdentityReconciler"
+          paths: ["fused-memory/src/fused_memory/services/episode_identity.py"]
+          expect: present
+      - name: "chain-left-memory-service"
+        binding: "anti-inversion — _reconcile_episode_identity and its passes no longer live in memory_service.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _reconcile_episode_identity"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "repair-outcome-enum"
+        binding: "producer (ε) — RepairOutcome StrEnum (task 6601, fk-ec3de5b6cf2b)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RepairOutcome"
+          paths: ["fused-memory/src/fused_memory/services/episode_identity.py"]
+          expect: present
+      - name: "tests-drive-run"
+        binding: "Tests stance — test_memory_service.py and test_referent_verification.py no longer reference the verify pass by private name"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_verify_episode_referents"
+          paths: ["fused-memory/tests/test_memory_service.py", "fused-memory/tests/test_referent_verification.py"]
+          expect: absent
+      - name: "run-requires-lock"
+        binding: "rejection-mechanism (D8) — run() raises IdentityLockNotHeld unless the caller holds identity_lock; ε lands after λ, so ε owns the check and boundary row 10"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class IdentityLockNotHeld"
+          paths: ["fused-memory/src/fused_memory/services/episode_identity.py"]
+          expect: present
+      - name: "streak-primitive"
+        binding: "substrate — shared/src/shared/streak.py::KeyedStreaks"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class KeyedStreaks"
+          paths: ["shared/src/shared/streak.py"]
+          expect: present
+  - label: "ζ"
+    task_id: 9172
+    title: "The verify pass as four methods; its narration rehomed"
+    note: "Closes fk-41eaf65cc4d0. Depends on ε. The memory_service.py leaf-narration deletions are η's."
+    capabilities:
+      - name: "verify-pass-split"
+        binding: "producer (ζ) — EpisodeIdentityReconciler._walk_edge_endpoints, one of the four successors of _verify_episode_referents"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _walk_edge_endpoints"
+          paths: ["fused-memory/src/fused_memory/services/episode_identity.py"]
+          expect: present
+      - name: "complexity-reduced"
+        binding: "complexipy: the four successors each ≤ 25; module max ≤ 45 (the untouched _invalidate_stale_superseded_ttl_edges)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a complexipy measurement recorded in the task record, not a tree grep"
+      - name: "verify-narration-gone"
+        binding: "Comments stance — no leaf narration in episode_identity.py"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "episode_identity.py does not exist at authoring, so an absent-grep on it passes vacuously; judged in review"
+  - label: "η"
+    task_id: 9174
+    title: "search as fan-out / fuse-and-filter / pin / journal; the pin a pure function in topic_anchor"
+    note: "Closes fk-eb0d5fea9a52. Depends on ε. Also deletes the leaf-iota narration left in memory_service.py."
+    capabilities:
+      - name: "pure-pin-function"
+        binding: "producer (η) — fm/services/topic_anchor.py::apply_topic_anchor"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def apply_topic_anchor"
+          paths: ["fused-memory/src/fused_memory/services/topic_anchor.py"]
+          expect: present
+      - name: "no-private-anchor-import"
+        binding: "anti-inversion — memory_service no longer imports topic_anchor's underscore constants"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_ANCHOR_SCROLL_LIMIT"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "leaf-narration-gone-from-service"
+        binding: "Comments stance — no `leaf iota` narration in memory_service.py (18 lines, measured at e634cfe658; ε moves 12, η deletes 6)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "leaf iota"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "search-complexity"
+        binding: "complexipy: search ≤ 15, each step ≤ 25 (search is 81 at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a complexipy measurement recorded in the task record"
+  - label: "θ"
+    task_id: 9179
+    title: "GraphAccess protocol with bounded egress; GraphitiBackend takes it at construction"
+    note: "Closes fk-90f6fbb5daa0 and the backend half of fk-9430031679c4. Depends on 6631 and 6823 (out of batch; S26-6 ruled B); 6233 landed; 6369 done. High: dependency of gate 6698."
+    capabilities:
+      - name: "graph-access-protocol"
+        binding: "producer (θ) — fm/backends/graph_access.py::GraphAccess / FalkorGraphAccess"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class GraphAccess"
+          paths: ["fused-memory/src/fused_memory/backends/graph_access.py"]
+          expect: present
+      - name: "graph-access-accessor"
+        binding: "producer (θ) — GraphitiBackend.graph_access, the public path from a backend to its provider (scripts, cross_graph_move)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def graph_access"
+          paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
+          expect: present
+      - name: "no-graph-for"
+        binding: "anti-inversion — the one _get_graph reach lives in the provider; _graph_for is a shim over graph_access until θ2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_get_graph"
+          paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
+          expect: absent
+      - name: "with-driver-seam"
+        binding: "substrate — GraphitiBackend.with_driver (task 6233, d064e0181d)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def with_driver"
+          paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
+          expect: present
+      - name: "named-timeout-primitive"
+        binding: "substrate — fm/backends/timeout_budget.py::await_within"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def await_within"
+          paths: ["fused-memory/src/fused_memory/backends/timeout_budget.py"]
+          expect: present
+      - name: "socket-timeout-reachable"
+        binding: "substrate — falkordb.asyncio.FalkorDB.__init__(socket_timeout=) and graphiti_core FalkorDriver.__init__(falkor_db=), signatures read from the root .venv 2026-11-01; clone reuses self.client"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "third-party signatures in the venv; not a repo-tree grep"
+      - name: "read-only-imports-downward"
+        binding: "anti-inversion — falkor_read_only.py stops importing _paged_ro_query from graphiti_client"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_paged_ro_query"
+          paths: ["fused-memory/src/fused_memory/backends/falkor_read_only.py"]
+          expect: absent
+  - label: "θ2"
+    task_id: 9183
+    title: "Operator scripts and their tests onto GraphitiBackend.graph_access"
+    note: "Carries fk-9430031679c4 (scripts half). Depends on θ. γ0 and ι depend on θ2. Also moves test_reindex.py's 4 patch.object(backend, '_graph_for') sites, which cannot outlive the shim it deletes."
+    capabilities:
+      - name: "graph-for-shim-gone"
+        binding: "anti-inversion — GraphitiBackend._graph_for deleted once no script calls it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _graph_for"
+          paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
+          expect: absent
+      - name: "scripts-on-public-provider"
+        binding: "anti-inversion — no script calls _graph_for or _require_falkor_client (≈20 code sites in 7 scripts, measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\._graph_for\\(|\\._require_falkor_client\\("
+          paths: ["fused-memory/scripts/"]
+          expect: absent
+      - name: "no-graph-for-replacement-in-tests"
+        binding: "Tests stance — the 65 `._graph_for = ` assignments (5 script-test files) and test_reindex.py's 4 patch.object sites gone with the shim, measured at 38a200d213"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\._graph_for = |patch\\.object\\([^)]*_graph_for"
+          paths: ["fused-memory/tests/"]
+          expect: absent
+  - label: "ι"
+    task_id: 9185
+    title: "Tests on the public graph seam, cluster 1 (the heavy files)"
+    note: "Carries fk-9430031679c4 (test half). Depends on θ2 and ε. Task 7781 cancelled into ι/κ."
+    capabilities:
+      - name: "no-driver-stub-in-heavy-files"
+        binding: "Tests stance — the _driver._get_graph stubs in ι's seven files gone (160 lines at 38a200d213); the `._graph_for` replacements are θ2's"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_driver\\._get_graph"
+          paths: ["fused-memory/tests/test_reindex.py", "fused-memory/tests/test_cross_graph_move.py", "fused-memory/tests/test_refresh_entity_summary.py", "fused-memory/tests/test_write_time_identity.py", "fused-memory/tests/test_merge_entities.py", "fused-memory/tests/test_delete_entity.py", "fused-memory/tests/_fm_helpers.py"]
+          expect: absent
+      - name: "fake-provider-in-conftest"
+        binding: "producer (θ) — fused-memory/tests/conftest.py::FakeGraphAccess; upstream of ι"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class FakeGraphAccess"
+          paths: ["fused-memory/tests/conftest.py"]
+          expect: present
+  - label: "κ"
+    task_id: 9189
+    title: "Tests on the public graph seam, cluster 2 (the long tail)"
+    note: "Carries fk-9430031679c4 (test half). Depends on ι and η. Rewrites conftest::make_graph_driver's docstring."
+    capabilities:
+      - name: "no-driver-stub-in-tests"
+        binding: "Tests stance — 241 `_driver._get_graph` stubs gone (27 files, measured at e634cfe658), conftest docstring included"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_driver\\._get_graph"
+          paths: ["fused-memory/tests/"]
+          expect: absent
+      - name: "remaining-private-reads-owned"
+        binding: "INV-12 — any kept private read carries a # debt: owner; judged by the inline-suppression ratchet"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "judged by scripts/inline_suppressions.py --check on the merged tree"
+  - label: "λ"
+    task_id: 9194
+    title: "The identity lock as a public context manager held by every in-process identity mutator"
+    note: "Closes fk-9804ecc4567d (in-process half; the out-of-process half is gate σ). S26-7 ruled C. Depends on θ and δ. High: dependency of gate 6698. σ depends on λ only."
+    capabilities:
+      - name: "public-identity-lock"
+        binding: "producer (λ) — GraphitiBackend.identity_lock"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def identity_lock\\("
+          paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
+          expect: present
+      - name: "no-private-lock-reach"
+        binding: "anti-inversion — no service module composes _identity_lock_for (memory_service.py today; graph_mutations.py after τ)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "graphiti\\._identity_lock_for"
+          paths: ["fused-memory/src/fused_memory/services/"]
+          expect: absent
+      - name: "lock-busy-structured"
+        binding: "rejection-mechanism — IdentityLockBusy observed firing in boundary row 14"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class IdentityLockBusy"
+          paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
+          expect: present
+      - name: "lock-wait-bounded-by-config"
+        binding: "producer (λ) — identity_lock.acquire_timeout_seconds, default in the schema only (INV-7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "acquire_timeout_seconds"
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
+          expect: present
+      - name: "reentry-refused"
+        binding: "rejection-mechanism (S26-7 C) — IdentityLockReentry observed firing in boundary rows 10b and 10c"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class IdentityLockReentry"
+          paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
+          expect: present
+  - label: "σ"
+    task_id: 9198
+    title: "Human design session: cross-process identity exclusion between the fused-memory server and operator scripts"
+    note: "S26-3 ruled D as an interactive /spawn /team --fable session; deterministic pure gate (task_kind=deterministic, always_escalates=true, no before_done); carries fk-9804ecc4567d (out-of-process half). Depends on λ only (lead ruling); absorbs 6293's design question (6293 depends on σ); 6730 must not depend on σ. High: dependency of gate 6698. Brief: plans/fm-cross-process-identity-exclusion-session-brief.md (PRD Appendix A; the lead commits it in the wave-2 commit, before filing — lead ruling 2026-11-10)."
+    capabilities:
+      - name: "public-lock-to-design-on"
+        binding: "producer: λ (GraphitiBackend.identity_lock, IdentityLockBusy) upstream"
+        verdict: PASS
+      - name: "session-prd-committed"
+        binding: "the session answers the brief's eight questions with Leo and commits a PRD through /prd; the gate resumes with its path; its two-process test is that PRD's signal"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a human design sitting; closed by resume with done_provenance deterministic-gate citing the escalation"
+  - label: "μ"
+    task_id: 9203
+    title: "Backends private; the sweeps' read surface; every graph mutation through the service"
+    note: "Closes fk-6e50b22357f2 (src half). Depends on ξ."
+    capabilities:
+      - name: "backends-private"
+        binding: "anti-inversion — every MemoryService backend reference is self._graphiti / self._mem0 (87 lines, measured at e634cfe658)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "self\\.(graphiti|mem0)([^A-Za-z0-9_]|$)"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "sweep-deletes-through-service"
+        binding: "anti-inversion — the degenerate sweep calls delete_entity; delete_entity_node becomes the private _detach_delete_entity_node"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\.delete_entity_node\\(|def delete_entity_node"
+          paths: ["fused-memory/src/fused_memory/reconciliation/", "fused-memory/src/fused_memory/backends/graphiti_client.py"]
+          expect: absent
+      - name: "journaled-remove-edges"
+        binding: "producer (μ) — MemoryService.remove_edges (a one-line delegate to GraphMutations after τ)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def remove_edges"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py", "fused-memory/src/fused_memory/services/graph_mutations.py"]
+          expect: present
+      - name: "reach-through-guard"
+        binding: "INV-10 — boundary row 16's AST scan flags a seeded fixture module"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "guard quality is judged by its own fixture test"
+  - label: "ν"
+    task_id: 9208
+    title: "Scripts stop reaching through MemoryService's backends"
+    note: "Closes fk-6e50b22357f2 (scripts half). S26-1 ruled A. Depends on μ. 6293 depends on ν and σ; 6950 depends on υ (ρ/τ/υ edit five of its files after ν)."
+    capabilities:
+      - name: "no-private-qdrant-reach"
+        binding: "anti-inversion — the 3 _get_async_qdrant calls, the SLF001 suppression and the 2 prose mentions go"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_get_async_qdrant"
+          paths: ["fused-memory/scripts/"]
+          expect: absent
+      - name: "conformance-rule"
+        binding: "INV-10 — test_store_mutation_conformance.py's new rule passes the tree and flags its fixture"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "guard quality is judged by its own fixture test"
+  - label: "ξ"
+    task_id: 9215
+    title: "One home for a RELATES_TO edge's stored meaning: the active predicate and the relocation rule"
+    note: "Closes fk-265caf7191a5, fk-62af616b8470. Depends on ζ, η, κ. Tasks 6680 and 5612 cancelled into ξ (S26-6 ruled B). High: dependency of gate 6698."
+    capabilities:
+      - name: "relates-to-schema-home"
+        binding: "producer (ξ) — fm/backends/relates_to_schema.py::relocation_set_clause, RELOCATION_REASSERTED_PROPERTIES, ACTIVE_EDGE_PREDICATE, edge_is_active"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def relocation_set_clause"
+          paths: ["fused-memory/src/fused_memory/backends/relates_to_schema.py"]
+          expect: present
+      - name: "cross-graph-allowlist-gone"
+        binding: "anti-inversion — cross_graph_move imports the one home (6680's parameter-map form, OQ-1 ruled (b))"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_CARRIED_EDGE_PROPERTIES"
+          paths: ["fused-memory/src/fused_memory/maintenance/cross_graph_move.py"]
+          expect: absent
+      - name: "python-mirror-gone"
+        binding: "anti-inversion — memory_service._edge_is_retired replaced by the shared predicate"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _edge_is_retired"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "test-tuple-gone"
+        binding: "INV-10 — the parity test executes relocation; the hand-kept tuple goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_COPIED_PROPS"
+          paths: ["fused-memory/tests/test_reassign_edge.py"]
+          expect: absent
+      - name: "set-plus-properties-preserves-types"
+        binding: "substrate — lead's live probe 2026-11-02 (FalkorDB 4.18.0, scratch graphs deleted): in-graph SET new += properties(old) keeps String/List/Integer/Float/Boolean/Vectorf32 and the vector index returns the new edge; vecf32() errors on a Vectorf32; a parameter-map vector arrives as List. OQ-1 ruled (b)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "live-server behaviour measured once by the probe; boundary row 17's integration tier re-asserts it at dimension 1536"
+      - name: "cross-graph-embedding-reasserted"
+        binding: "producer (ξ) — cross_graph_move strips fact_embedding from $props and re-asserts it from the byte-exact --compact tokens (_embedding_set_clause) under the CROSS_GRAPH_EMBEDDING_REASSERT rule; value-equal at float32, Vectorf32, indexed (row 17)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cross_graph_embedding_reassert\\("
+          paths: ["fused-memory/src/fused_memory/maintenance/cross_graph_move.py"]
+          expect: present
+  - label: "ο"
+    task_id: 9238
+    title: "canonical_labels' five patterns from one grammar"
+    note: "Closes fk-352d7b3fcad4. No deps. Edge requested: 6826 depends on ο; 4235 and 4479 cancelled as landed by 4850."
+    capabilities:
+      - name: "shared-number-fragment"
+        binding: "producer (ο) — the digit-capture fragment spelled once"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_NUMBER = "
+          paths: ["fused-memory/src/fused_memory/utils/canonical_labels.py"]
+          expect: present
+      - name: "task-word-shared"
+        binding: "substrate — _TASK_WORD (task 4850)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_TASK_WORD = "
+          paths: ["fused-memory/src/fused_memory/utils/canonical_labels.py"]
+          expect: present
+      - name: "precision-fixtures-unchanged"
+        binding: "the parametrised precision suites pass with identical verdicts; is_task_vocabulary_qualifier('Task') stays False"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural suite outcome, not a tree grep"
+  - label: "ρ"
+    task_id: 9243
+    title: "Move the write-metadata policy and store-codec helpers out of memory_service.py"
+    note: "S26-2 (Leo). Carries fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb. Depends on ν. Module names confirmed by the lead 2026-11-10 (t7)."
+    capabilities:
+      - name: "policy-module"
+        binding: "producer (ρ) — fm/services/memory_metadata_policy.py::apply_memory_metadata_validation (public)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^(async )?def apply_memory_metadata_validation\\b"
+          paths: ["fused-memory/src/fused_memory/services/memory_metadata_policy.py"]
+          expect: present
+      - name: "policy-left-the-service"
+        binding: "anti-inversion — the write-metadata policy no longer lives in memory_service.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^(async )?def _apply_memory_metadata_validation\\b"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "store-records-module"
+        binding: "producer (ρ) — fm/services/store_records.py::MEM0_CONTENT_KEYS, mem0_content, metadata_row_text and the codec/error helpers"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^MEM0_CONTENT_KEYS = "
+          paths: ["fused-memory/src/fused_memory/services/store_records.py"]
+          expect: present
+      - name: "no-private-codec-import"
+        binding: "anti-inversion — server/grouped_read.py imports the public name, not memory_service's private"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "memory_service import _MEM0_CONTENT_KEYS"
+          paths: ["fused-memory/src/fused_memory/server/grouped_read.py"]
+          expect: absent
+  - label: "τ"
+    task_id: 9245
+    title: "Extract GraphMutations over a shared journaled-operations module"
+    note: "S26-2 (Leo). Carries fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb. Depends on ρ. MemoryService keeps one-line public delegates. 6730's ensure_entity_node code lands here."
+    capabilities:
+      - name: "graph-mutations-collaborator"
+        binding: "producer (τ) — fm/services/graph_mutations.py::GraphMutations"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class GraphMutations"
+          paths: ["fused-memory/src/fused_memory/services/graph_mutations.py"]
+          expect: present
+      - name: "backend-call-wrapper-shared"
+        binding: "producer (τ) — fm/services/journaled_ops.py::journaled_backend_call (moved from MemoryService._journaled_backend_call)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def journaled_backend_call"
+          paths: ["fused-memory/src/fused_memory/services/journaled_ops.py"]
+          expect: present
+      - name: "graph-mutators-left-the-service"
+        binding: "anti-inversion — the graph mutators' bodies leave memory_service.py (anchored on the merge helper, which has no delegate)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _expire_standing_decisions_for_merge"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "service-wrapper-gone"
+        binding: "anti-inversion — MemoryService._journaled_backend_call goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _journaled_backend_call"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "delegates-behave-identically"
+        binding: "boundary row 22: each public graph mutator gives identical results and write_ops rows through MemoryService and through GraphMutations"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behaviour asserted by boundary row 22, not a tree property"
+  - label: "υ"
+    task_id: 9247
+    title: "Extract MemoryMutations"
+    note: "S26-2 (Leo). Carries fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb. Depends on ρ (ruled) and τ (same file). Out of batch: 6730 and 6950 depend on υ."
+    capabilities:
+      - name: "memory-mutations-collaborator"
+        binding: "producer (υ) — fm/services/memory_mutations.py::MemoryMutations"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class MemoryMutations"
+          paths: ["fused-memory/src/fused_memory/services/memory_mutations.py"]
+          expect: present
+      - name: "memory-mutators-left-the-service"
+        binding: "anti-inversion — the metadata-delta helper (no delegate) leaves memory_service.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _apply_metadata_delta"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: absent
+      - name: "mem0-reads-beside-the-codec"
+        binding: "producer (υ) — fm/services/store_records.py::get_memory_by_id (with count_memories_by_metadata, get_memories_by_metadata); the service delegates"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def get_memory_by_id"
+          paths: ["fused-memory/src/fused_memory/services/store_records.py"]
+          expect: present
+  - label: "π"
+    task_id: 9250
+    title: "Integration gate: the write path end to end, and the re-measurement"
+    note: "Signal leaf; closes no key. Depends on υ and ο (υ is the tail of the merged service, graph and test chains)."
+    capabilities:
+      - name: "end-to-end-test-exists"
+        binding: "producer (π) — fused-memory/tests/test_write_path_end_to_end.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/test_write_path_end_to_end.py"]
+          expect: present
+      - name: "rows-from-the-real-producer"
+        binding: "INV-13 — the queue worker under start() writes the rows the test reads"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "asserted inside the test; not a tree property"
+      - name: "post-state-measurement-recorded"
+        binding: "heuristic 14 / complexity pair over memory_service.py and every module split from it, recorded in the task record and appended to the PRD"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a measurement, recorded, not a grep"
+  - label: "φ"
+    task_id: 9252
+    title: "Follow-up: the read-path split and a prose pass over memory_service.py"
+    note: "S26-2 (Leo) follow-up. Carries fk-da5b47d0493a. Low. Depends on π; re-measures first and may close with the measurement recorded."
+    capabilities:
+      - name: "post-state-to-start-from"
+        binding: "producer: π (the recorded post-state measurement) upstream"
+        verdict: PASS
+      - name: "read-path-decided"
+        binding: "the re-measurement recorded; on the split path a reader collaborator with service delegates and memory_service.py below 3,000 lines"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the outcome depends on the re-measurement; judged in review"

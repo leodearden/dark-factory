@@ -474,3 +474,5 @@ tasks:
       kind: manual
       reason: the task is the check suite; its signal is the merge-verify-green boundary
         matrix
+signal_leaves:
+- λ

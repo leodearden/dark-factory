@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json as _json
 from dataclasses import dataclass
+from os.path import commonprefix
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,6 +23,7 @@ from _orch_helpers import (
     pydantic_spec,
 )
 from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
+from shared.elision import elision_marker
 from shared.task_submit import SubmitOutcome, parse_submit_task_result
 
 from orchestrator.config import OrchestratorConfig
@@ -59,6 +61,7 @@ def _make(
     seen_redo_costs: list[float] | None = None,
     files: list[str] | None = None,
     metadata_backend: FakeMetadataBackend | None = None,
+    title: str = 'Document foo',
 ) -> _Fixture:
     if auto_eval_phases is None:
         auto_eval_phases = {'plan', 'execute', 'verify', 'review'}
@@ -154,7 +157,7 @@ def _make(
         task_id='orig-task',
         task={
             'id': 'orig-task',
-            'title': 'Document foo',
+            'title': title,
             'description': 'd',
             'priority': 'medium',
             'metadata': metadata,
@@ -400,6 +403,38 @@ async def test_dispatches_redo_on_block(tmp_path: Path):
     assert data['optimistic_path'] == 'simple_task'
 
     assert 'redo-1' in f.harness._auto_eval_redo_task_ids
+
+
+async def _redo_submit_args(f: _Fixture) -> dict:
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+    [submit_args] = [args for tool, args in f.submit_calls if tool == 'submit_task']
+    return submit_args
+
+
+@pytest.mark.asyncio
+async def test_a_long_original_title_is_clipped_at_a_word_with_a_counted_marker(tmp_path: Path):
+    long = ('Fix the widget renderer so it ' * 12).strip()
+    f = _make(project_root=tmp_path / 'proj', title=long)
+
+    submit_args = await _redo_submit_args(f)
+
+    title = submit_args['title']
+    full = f'[auto-eval redo] {long}'
+    head = commonprefix([title, full])
+    assert len(title) <= 200
+    assert title == head + elision_marker(len(full) - len(head))
+    assert full[len(head)].isspace()
+    assert long in submit_args['description']
+
+
+@pytest.mark.asyncio
+async def test_the_redo_description_names_the_original_title(tmp_path: Path):
+    f = _make(project_root=tmp_path / 'proj')
+
+    submit_args = await _redo_submit_args(f)
+
+    assert submit_args['title'] == '[auto-eval redo] Document foo'
+    assert 'Original title: Document foo' in submit_args['description']
 
 
 @pytest.mark.asyncio

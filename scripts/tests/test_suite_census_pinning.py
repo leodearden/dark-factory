@@ -160,6 +160,28 @@ def test_prose_through_a_dotted_import(line):
     assert 'one sighting per' in line
 '''
 
+LEDGER = "_x = 1\nNOTE = 'a ledger line records one sighting per confusion'\n"
+
+BARE_TEST = '''\
+from unittest.mock import patch
+
+import ledger
+import lms_ctl
+
+
+def test_bare_string_patch():
+    with patch('ledger._x'):
+        pass
+
+
+def test_bare_object_patch(monkeypatch):
+    monkeypatch.setattr(lms_ctl, '_c', 2)
+
+
+def test_prose_through_a_bare_import(line):
+    assert 'one sighting per' in line
+'''
+
 
 @pytest.fixture(scope='module')
 def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
@@ -174,7 +196,7 @@ def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
         'pkgb/tests/fixtures/broken.py': 'def broken(:\n',
         'scripts/tool.py': '_y = 1\n',
         'scripts/wait-for-port.py': '_z = 1\n',
-        'scripts/legibility/ledger.py': "_x = 1\nNOTE = 'a ledger line records one sighting per confusion'\n",
+        'scripts/legibility/ledger.py': LEDGER,
         'scripts/tests/test_scripts.py': SCRIPTS_TEST,
         'tests/test_top.py': 'def test_top():\n    pass\n',
         'hooks/tests/test_h.py': 'def test_h():\n    pass\n',
@@ -258,12 +280,9 @@ class TestCensus:
 
 
 class TestFirstPartyIsTheDomain:
-    def test_scripts_is_the_import_root_so_legibility_modules_are_dotted(self, scripts):
+    def test_a_legibility_attribute_patched_through_both_names_is_one_target(self, scripts):
         assert scripts.distinct_private_targets == frozenset({'legibility.ledger._x', 'tool._y'})
-        assert scripts.tests_with_private_patch == 3
-
-    def test_a_bare_legibility_module_name_is_the_disclosed_undercount(self, scripts):
-        assert 'ledger._x' not in scripts.distinct_private_targets
+        assert scripts.tests_with_private_patch == 4
 
     def test_a_member_namespace_package_without_init_is_first_party(self, pkgb):
         assert pkgb.distinct_private_targets == frozenset({'nsb.state._s'})
@@ -282,6 +301,50 @@ class TestFirstPartyIsTheDomain:
         })
         with pytest.raises(MetricsError, match=r'\[tool\.uv\.workspace\]\.members'):
             pinning.measure_python_tree(tree)
+
+
+@pytest.fixture(scope='module')
+def bare_scripts(tmp_path_factory: pytest.TempPathFactory) -> pinning.PackageRow:
+    """The scripts row of a tree whose tests reach the extra import roots by bare name only."""
+    root = git_tree(tmp_path_factory.mktemp('bare'), {
+        'pyproject.toml': '[tool.uv.workspace]\nmembers = ["pkga"]\n',
+        'pkga/src/pkga/__init__.py': '',
+        'scripts/legibility/ledger.py': LEDGER,
+        'scripts/local-model-serving/lms_ctl.py': '_c = 1\n',
+        'scripts/tests/test_bare.py': BARE_TEST,
+    })
+    (row,) = [row for row in pinning.measure_python_tree(root).rows if row.package == 'scripts']
+    return row
+
+
+class TestExtraImportRoots:
+    def test_a_bare_name_is_first_party_for_string_and_object_patches(self, bare_scripts):
+        # The object form reaches a hyphen-directory module through its bare import.
+        assert bare_scripts.tests_with_private_patch == 2
+        # Each is spelled through its file's first importable name.
+        assert bare_scripts.distinct_private_targets == frozenset(
+            {'legibility.ledger._x', 'lms_ctl._c'}
+        )
+
+    def test_a_prose_constant_counts_through_a_bare_import(self, bare_scripts):
+        assert (bare_scripts.prose_assertion_sites, bare_scripts.tests_with_prose_assertion) == (
+            1,
+            1,
+        )
+
+    def test_two_source_files_sharing_an_import_name_are_refused_naming_both(self, tmp_path):
+        tree = git_tree(tmp_path, {
+            'pyproject.toml': '[tool.uv.workspace]\nmembers = ["pkga"]\n',
+            'pkga/src/pkga/__init__.py': '',
+            'scripts/ledger.py': '_x = 1\n',
+            'scripts/legibility/ledger.py': '_x = 2\n',
+        })
+        with pytest.raises(MetricsError) as refused:
+            pinning.measure_python_tree(tree)
+        message = str(refused.value)
+        assert "'ledger' names" in message
+        assert 'scripts/ledger.py' in message
+        assert 'scripts/legibility/ledger.py' in message
 
 
 def test_render_has_one_row_per_package_plus_totals_and_names_the_unreadable(census):

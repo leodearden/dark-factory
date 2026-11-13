@@ -1,0 +1,5 @@
+{"stream": "S27", "prd_path": "docs/prds/review-all-design-invariants-document.md", "sidecar_path": "docs/prds/review-all-design-invariants-document.capability-manifest.yaml",
+ "filed": [{"label": "alpha", "task_id": "1066", "priority": "medium", "x_finding_key": [], "depends_on": []}, {"label": "beta", "task_id": "1069", "priority": "medium", "x_finding_key": [], "depends_on": ["1066"]}],
+ "held_leaves": [], "gate_dependencies_added": [], "commit_planning_result": "1066, 1069 pending; sidecar stamped",
+ "lead_rulings": ["420/859 kept as the pointer-removal vehicles with a dated note (option a); not cancelled.", "Ownership of optimiser/ pointers: PRD Appendix A wins (S10 owns the seven optimiser files; S25-zeta still removes the one in optimiser/forecast/__init__.py as it empties that docstring); 1069 seeds owners from a fresh measurement."],
+ "notes": "held leaves elsewhere resolve x_seam_wait S27 -> 1066: S9-alpha, S18-alpha; every enforcing-test leaf depends on 1066."}

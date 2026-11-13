@@ -7,6 +7,9 @@ import re
 import pytest
 import verify_command_invariants as vci
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 HOOK_PATH = REPO_ROOT / "hooks" / "project-checks"
@@ -26,6 +29,14 @@ def _hook_magicmock_test_dirs(hook_text: str) -> list[str]:
 
 
 def _gate_magicmock_test_dirs(lint_command: str) -> list[str]:
+    """The magicmock leg's positional targets; ``path_anchor`` because the leg names its checker by path.
+
+    No ``value_flags``, and for this checker that is exact rather than an
+    accepted gap: ``fused-memory/scripts/_lint_cli.py::run_cli`` declares only
+    the positional ``paths``, so the leg holds no flag value to come back as a
+    phantom target, and an undeclared option fails the gate itself. If
+    ``run_cli`` gains a value-taking option, pass a set naming it here.
+    """
     label = "dark-factory-orchestrator.yaml lint_command (task 6308)"
     segment = vci.required_segment(lint_command, _MAGICMOCK_CHECKER, label=label)
     return vci.positional_targets(segment, _MAGICMOCK_CHECKER, path_anchor=True, label=label)

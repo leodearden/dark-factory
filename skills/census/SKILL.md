@@ -18,9 +18,17 @@ What a finding must carry (key, area, anchor, tags, severity, disposition), what
 
 Statements marked *(until Ln)* describe today's code and change when that leaf of `plans/census-incremental-prd.md` lands. The final section lists what changes.
 
-Normally the census runs unattended. Each nightly trickle run ends by evaluating `census_trigger.decide_for_project` and, on FIRE, launches `census.py` with the caps from `legibility.yaml` `census.trickle_caps`. Run it by hand only in these two cases:
+Normally the census runs unattended. Each nightly trickle run ends by evaluating `census_trigger.decide_for_project` and, on FIRE, launches `census.py` with the caps from `legibility.yaml` `census.trickle_caps`. The trigger fires on either of two conditions, and on neither inside the floor:
 
-1. **Attended first census.** A first census can auto-fire. When `docs/legibility/census-state.json` is missing, `decide_for_project` anchors `last_census_at` on the earliest codebook date and exempts the floor. Condition (c), the novelty spike, needs no anchor. It counts candidates whose `first_seen` falls in the last 72 h against a threshold of 4, and a running trickle exceeds that on almost every night *(until L8a)*. So a project's first census fires unattended within a night or two of its trickle producing candidates. That run is capped by `trickle_caps` but files tickets for real. Run the first census by hand, before installing the trickle timer, when you want it bounded and reviewed (`--dry-run-filing`). A project with no trickle data and no codebook does not fire.
+- **(a) Completion:** the weighted completion of the tasks the previous run filed under `x_finding_run` (contract §11), read with one `scripts/check_run_completion.py` check against `census.completion_threshold_pct` (default 70). With no previous run id, or a previous run that filed nothing, completion is N/A.
+- **(b) Novelty:** a novelty spike relative to its trailing baseline.
+- **Floor:** the minimum transcript window, measured from the session watermark. It never fires a census by itself, and elapsed time alone fires nothing. The tasks-landed condition and the 10-day `max_interval_days` backstop are retired, the backstop by decision (Leo, 2026-10-05). A `legibility.yaml` still carrying a retired key loads, and the key is ignored with one deprecation warning.
+
+When the completion check fails on 3 consecutive nightly evaluations (any exit but 0, 75, or 2 for a run that filed nothing), the trickle files one `escalate_info` for the project. If that post does not land, it is retried on each later night until one does. Until the check answers again, the census can fire on the novelty spike alone. The next exit 0 or 75 resets the streak; a night with nothing to check carries it.
+
+Run it by hand only in these two cases:
+
+1. **Attended first census.** A first census can auto-fire. A never-censused project has no previous run id, so completion is N/A. Its floor is measured from the earliest codebook date, and once that floor has passed it fires on a novelty spike. That run is capped by `trickle_caps` but files tickets for real. Run the first census by hand, before installing the trickle timer, when you want it bounded and reviewed (`--dry-run-filing`). A project with no trickle data and no codebook never fires, so running it by hand is the only way it gets a census.
 2. **Ad-hoc forced census.** Run one when you want fresh sightings now, regardless of the trigger's verdict, for example right after a remediation wave.
 
 Both cases run the same command and the same checklists. Only the reason differs, so this is one skill.
@@ -37,7 +45,7 @@ Both cases run the same command and the same checklists. Only the reason differs
    ```bash
    PYTHONPATH=<factory checkout>/scripts uv run --directory <factory checkout>/shared python <factory checkout>/scripts/legibility/census_trigger.py evaluate --project-root <target-root>
    ```
-   It prints FIRE or NO-FIRE and one reason line per condition: days since the last census, tasks landed, the 72 h candidate count, and the floor. It makes one read-only `get_statuses` call.
+   `--config <path>` names a non-default `legibility.yaml`. As with the census, a config whose `project_root` is not `<target-root>` is refused with exit 1. It prints a `config:` line naming the `legibility.yaml` it loaded and the validated thresholds, then FIRE or NO-FIRE and one reason line each for completion (the share of the previous run's filed tasks landed, against 0.70, or a named N/A), the novelty spike and the floor. It runs one read-only `scripts/check_run_completion.py` check and makes no `get_statuses` call.
 3. **Headroom.** The run probes this itself (`preflight_headroom`, one trickle-model call, which defers the whole run when the account pool is capped), and probes again before verification. Mining uses `census_miner` (Sonnet), verification `census_verify` (Sonnet) and synthesis `census_synthesis` (Fable). Avoid starting an uncapped census while other heavy work holds the pool.
 
 ## Running
@@ -96,11 +104,7 @@ Watch for the final line:
 3. **Check `docs/legibility/census-state.json` advanced:**
    - `last_census_at` is this run's **date**, `YYYY-MM-DD` (date-only, not a timestamp).
    - `last_census_report` names the new report (written as an absolute path *(until L1)*).
-   - `last_census_done_count` *(until L8b)* is three-valued:
-     - an integer matching the project's done-task count: correct.
-     - `0` on a project that has done tasks: wrong. The `get_statuses` call failed and a fabricated baseline was persisted (task 3291). Repair it with a dated `get_statuses` readback and investigate the endpoint.
-     - `0` on a project with no done tasks: legitimate.
-     - `null`: the count was unobservable. The run stands, and the tasks-landed condition fails safe until the next successful census.
+   - `last_census_run_id` names this run. It is what the next trigger's completion arm reads.
 4. **If you ran `--dry-run-filing`,** file the payload JSON by hand. A later census will not re-file it, because those confusions now code as matches and the window has moved.
 
 ## Anchor seeding — when an equivalent manual survey already exists
@@ -110,14 +114,15 @@ To have the trigger treat an earlier hand-run legibility survey as the first cen
 ```json
 {
   "last_census_at": "<survey-date>",
-  "last_census_report": "<repo-relative path to the survey report>",
-  "last_census_done_count": <done-task count at survey time, from get_statuses>
+  "last_census_report": "<repo-relative path to the survey report>"
 }
 ```
 
-`last_census_at` may be a date or an ISO datetime (`datetime.fromisoformat`). `last_census_done_count` *(until L8b)* must be an **unquoted non-negative JSON integer**, or `null` if no readback is possible. `census_trigger.compute_tasks_landed` validates rather than coerces it, so a bad value fails that condition safe and logs a warning naming the value. Every threshold in `legibility.yaml`'s `census:` block must likewise be an unquoted non-negative integer. `CensusConfig.from_mapping` falls back per field and names each rejected value in one warning.
+`last_census_at` may be a date or an ISO datetime, which is read as its UTC date. Add `"last_census_run_id": "<run id>"` only when the survey filed its tasks under `x_finding_run=<run id>`; without it, completion is N/A and the census fires on a novelty spike alone.
 
-Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/agent-legibility-survey-2026-07-13.md`, with `last_census_done_count: 2321`. Use this only when an equivalent survey really exists.
+Every threshold in `legibility.yaml`'s `census:` block must be an **unquoted integer**: `completion_threshold_pct` in 1..100, the others non-negative (the `saturation` and `adjudication` similarities are unquoted numbers in 0..1). A malformed `census:` value fails `config.load_config` naming the field and value: the trickle records a failed night, its error naming the field and value, and `census_trigger.py evaluate` exits 1. A retired key (`max_interval_days`, `tasks_landed_threshold`, `tasks_landed_min_days`) is ignored, with one warning naming it and the file it is in.
+
+Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/agent-legibility-survey-2026-07-13.md`. Use this only when an equivalent survey really exists.
 
 ## What changes when `plans/census-incremental-prd.md` lands
 
@@ -125,8 +130,6 @@ Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/
   - The trickle and the census record every coded session in a host-local ledger. The census skips ledgered and zero-signal sessions, and a capped run's unmined sessions are picked up by the next run, so rolling `last_census_at` back is no longer needed.
   - `census-state.json` gains `last_census_run_id`, `last_census_as_of_sha` and `session_watermark`, and `last_census_report` becomes repo-relative. Check the ledger with `session_ledger.py stats --project-id <id>`.
 - **L8a:** The novelty spike becomes relative to its trailing baseline, and the floor is measured from the session watermark, so the trigger stops firing every night.
-- **L8b:** The tasks-landed condition, the 10-day `max_interval_days` backstop and `last_census_done_count` are retired; the backstop is dropped by decision (Leo, 2026-10-05), and a `legibility.yaml` still carrying the key is ignored with one deprecation warning. The trigger fires on the weighted completion of the tasks the previous run filed (contract §11), or on a relative novelty spike, and either only once the floor has passed. The floor is the minimum transcript window, measured from the session watermark; it never fires a census by itself. The anchor-seeding JSON then needs only `last_census_at` and `last_census_report`.
-  - **A first census, without the backstop:** a never-censused project has no previous run id, so completion is N/A. Its floor is measured from the earliest codebook date, and once that floor has passed it fires only on a novelty spike. Otherwise it fires only when run by hand, which is also the only way a project with no trickle data gets a census.
 - **L2, L3:**
   - Verdicts carry anchor, tags, severity with a reason, and route.
   - Entries carry `finding_key`/`finding_area`/`finding_anchor`/`finding_tags`, and the report gains `## Findings` in the contract §1 shape.

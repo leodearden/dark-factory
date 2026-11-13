@@ -32759,10 +32759,6 @@
         "sha256": "fa5958f3634ace98b846ac398cdfe28f2e105a746f0348fe48fb5ed08cd03fe3"
       },
       {
-        "path": "fused-memory/tests/fixtures/memory_eval_topic_registry.json",
-        "sha256": "ca17d33fd91708d4124d5c0cec1b30d5d6636c7a874fcf562f47f0574d717bb4"
-      },
-      {
         "path": "fused-memory/tests/fixtures/e2_arm_claims.jsonl",
         "sha256": "0b09c7de1c30c38570543f1705f01c5b4ac5970618f64545facb486e6991c257"
       },

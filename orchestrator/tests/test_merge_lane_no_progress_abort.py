@@ -141,19 +141,6 @@ class TestTerminalReason:
 
         assert early.terminal_reason() == late.terminal_reason()
 
-    def test_reason_avoids_the_review_category_substrings(self):
-        """orchestrator/src/orchestrator/workflow.py::TaskWorkflow infers the review category by substring.
-
-        Its blocked fall-through files 'verification failed' as
-        post_merge_verify and 'ff' or 'advanced' as merge_ff_failed; anything
-        else is merge_error, which is what a no-progress cap-out is.
-        """
-        for abort in _every_lease_variant(strike=3):
-            reason = abort.terminal_reason().lower()
-            assert 'ff' not in reason
-            assert 'advanced' not in reason
-            assert 'verification failed' not in reason
-
 
 class TestInvariant:
     def test_a_zero_strike_is_rejected(self):

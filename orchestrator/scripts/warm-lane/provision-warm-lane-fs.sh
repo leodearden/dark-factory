@@ -440,7 +440,7 @@ _classify_img() {
         _IMG_CLASS="indeterminate"
     fi
 
-    if printf '%s' "$_IMG_STDERR" | grep -qiE 'permission denied|not permitted'; then
+    if grep -qiE 'permission denied|not permitted' <<<"$_IMG_STDERR"; then
         if $SUDO true 2>/dev/null; then
             local sudo_rc=0
             local sudo_errfile

@@ -9,16 +9,23 @@ double of ``SpeculativeMergeWorker`` exposing only the lane's real interface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
-from test_merge_deferred_recovery import ParkedScheduler, _abandoned_records
+from test_merge_deferred_recovery import (
+    ParkedScheduler,
+    _abandoned_records,
+    single_request,
+    submit_single,
+)
 from test_reconcile_stranded import _bind_queue
 
 from orchestrator.harness import Harness
-from orchestrator.merge_lane import MemberRedriveOutcome, SpeculativeMergeWorker
+from orchestrator.merge_lane import InFlightMergeRegistry, MemberRedriveOutcome, MergeOutcome
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 
 @pytest.fixture
@@ -47,6 +54,11 @@ def _parked_lane() -> MagicMock:
 def _bind_lane(harness: Harness, lane: SpeculativeMergeWorker | None) -> None:
     """The suite's one write of the harness's private merge-worker slot."""
     harness._merge_worker = lane
+
+
+def _shared_registry(harness: Harness) -> InFlightMergeRegistry:
+    """The suite's one read of the harness's shared in-flight merge registry."""
+    return harness._merge_inflight_registry
 
 
 async def _recover(harness: Harness) -> None:
@@ -131,3 +143,29 @@ class TestStrandedReconcilePassWiring:
         ]
         assert _abandoned_records(queue, 'x') == [(0, 'info')]
         assert sched.statuses == {'x': ['merge-deferred']}
+
+    async def test_a_live_single_in_the_shared_registry_holds_the_member(
+        self, harness: Harness, sched: ParkedScheduler, tmp_path: Path,
+    ) -> None:
+        await sched.park('x')
+        queue = _bind_queue(harness, tmp_path / 'esc')
+        lane = _parked_lane()
+        _bind_lane(harness, lane)
+        req = single_request(harness.config, 'x')
+        await submit_single(_shared_registry(harness), req)
+
+        await _stranded_reconcile_pass(harness)
+        await _stranded_reconcile_pass(harness)
+
+        lane.redrive_abandoned_members.assert_not_awaited()
+        assert sched.statuses == {'x': ['merge-deferred']}
+        assert queue.get_pending() == []
+
+        req.result.set_result(MergeOutcome('blocked', reason='main is red'))
+        await asyncio.sleep(0)
+        await _stranded_reconcile_pass(harness)
+        await _stranded_reconcile_pass(harness)
+
+        assert lane.redrive_abandoned_members.await_args_list == [
+            call(ANY, ['x'], strip_unlanded_base=True),
+        ]

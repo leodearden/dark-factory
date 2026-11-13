@@ -61,16 +61,20 @@ import importlib
 import importlib.util
 import logging
 import os
+import re
 import shlex
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from orchestrator.systemd_inspect import _empty_baseline_fresh, inspect_systemd_unit
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
@@ -98,6 +102,18 @@ silently drift apart (task 3404).
 # speculative): ``escalation.__main__`` -> ``escalation.submit`` ->
 # ``escalation.queue`` -> ``shared.timestamps`` -> ``shared/__init__.py``.
 _SUBMIT_CHILD_PACKAGES: tuple[str, ...] = ('escalation', 'shared')
+
+# The portable environment variable name (POSIX shell ``name``) every
+# ``RestartPlan.env`` key must match. The detached path relies on it: it
+# renders each entry as an unquoted ``KEY=`` shell assignment.
+_PORTABLE_ENV_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+
+def _systemd_execstart_literal(text: str) -> str:
+    """systemd expands ``${NAME}`` and ``$$`` inside an ExecStart argv element,
+    even within shell single quotes. Doubling every ``$`` makes systemd hand
+    /bin/sh the original text."""
+    return text.replace('$', '$$')
 
 
 def _submit_child_pythonpath() -> str:
@@ -429,6 +445,11 @@ class RestartPlan:
     stat-checked here (would race / force hermetic tests to create real
     files) — a missing script surfaces at runtime as exit-127, escalated by
     the RP-4 on-failure wrapper.
+
+    ``env`` holds the extra environment variables the restart script
+    receives, and every ``execute()`` path delivers them to the script alone.
+    It is stored as a read-only copy, so the ``__post_init__`` checks hold for
+    the plan's whole life.
     """
 
     script: Path
@@ -440,6 +461,7 @@ class RestartPlan:
     verify: FreshPidVerify | None
     transient_unit: str | None = None
     on_active_secs: int = 60
+    env: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.cwd.is_absolute():
@@ -449,6 +471,23 @@ class RestartPlan:
             )
         if not self.script.is_absolute():
             object.__setattr__(self, 'script', self.cwd / self.script)
+        object.__setattr__(self, 'env', MappingProxyType(dict(self.env)))
+        self._check_env()
+
+    def _check_env(self) -> None:
+        """Refuse an ``env`` key that is not a portable variable name, so every
+        spawn path accepts exactly the same keys."""
+        for key in self.env:
+            if not _PORTABLE_ENV_NAME.fullmatch(key):
+                raise ValueError(
+                    f'RestartPlan.env keys must be portable environment variable '
+                    f'names matching {_PORTABLE_ENV_NAME.pattern}; got {key!r}'
+                )
+
+    def _child_environ(self) -> dict[str, str] | None:
+        """``env`` overlaid on ``os.environ``, or None (full inherit) when empty: the
+        rule of ``orchestrator/src/orchestrator/before_done_script.py::run_script``."""
+        return {**os.environ, **self.env} if self.env else None
 
     async def execute(self, *, runner=None, inspector=None) -> RestartOutcome:
         """Run this restart plan, honoring RP-1..5.
@@ -654,6 +693,7 @@ class RestartPlan:
         proc = await runner(
             str(self.script), *self.args,
             cwd=str(self.cwd),
+            env=self._child_environ(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -832,9 +872,25 @@ class RestartPlan:
         for how the value is built, and :meth:`EscalationSpec.to_submit_argv`
         for the OTHER leg of the child's importability (interpreter identity,
         which PYTHONPATH cannot cover).
+
+        The plan's own ``env`` is scoped to the payload command, NOT the unit:
+        each entry is a ``KEY=<quoted value>`` shell assignment prefixing the
+        script, so the RP-4 submit child sees none of it and keeps only the
+        user manager's environment plus its own PYTHONPATH. ``_check_env``'s
+        name rule is what makes the unquoted ``KEY=`` a valid assignment.
+        Values are also escaped for systemd's ExecStart ``$`` expansion
+        (:func:`_systemd_execstart_literal`), so they reach the script
+        byte-for-byte.
         """
         on_active_secs = max(int(self.on_active_secs), 5)
-        payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
+        env_assignments = [
+            f'{key}={_systemd_execstart_literal(shlex.quote(value))}'
+            for key, value in self.env.items()
+        ]
+        payload = ' '.join([
+            *env_assignments,
+            *(shlex.quote(p) for p in [str(self.script), *self.args]),
+        ])
         if self.on_failure_escalation is not None:
             _warn_if_submit_module_unimportable(self.transient_unit)
             on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
@@ -974,6 +1030,7 @@ class RestartPlan:
         await runner(
             str(self.script), *self.args,
             cwd=str(self.cwd),
+            env=self._child_environ(),
             start_new_session=True,
         )
         return RestartOutcome(disposition=RestartDisposition.SCHEDULED)

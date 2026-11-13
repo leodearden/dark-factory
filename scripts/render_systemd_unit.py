@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Render a systemd unit, PRESERVING this host's local Environment= values.
 
-TWO UNITS, ONE RENDERER, selected by ``--unit`` off the ``UNITS`` registry
-below: dark-factory-dashboard.service (task 4793) and fused-memory.service
-(task 4796). The preservation core here was already unit-neutral — only the
-operator-facing log tag and the preserve set were dashboard-specific — so the
-second unit is a registry entry rather than a forked near-copy.
+ONE RENDERER FOR EVERY UNIT IN THE ``UNITS`` REGISTRY below, selected by
+``--unit``: dark-factory-dashboard.service (task 4793), fused-memory.service
+(task 4796), and client-feed@.service (task 6974), which declares no
+Environment= policy and so preserves nothing. The preservation core here was
+already unit-neutral — only the operator-facing log tag and the preserve set
+were dashboard-specific — so each further unit is a registry entry rather than
+a forked near-copy.
 
 THE FILE WAS RENAMED OFF ITS DASHBOARD-ERA NAME (task 4990), once it also
 rendered fused-memory.service (task 4796) — a module named
@@ -138,22 +140,23 @@ def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class UnitRenderSpec:
-    """Everything about rendering ONE unit that is not shared by both.
+    """Everything about rendering ONE unit that is not shared by every unit.
 
     The preservation mechanism (``render_template`` / ``preserved_values`` /
     ``_environment_token`` / ``apply_preserved``) is unit-neutral: it is
     parameterised by ``names``, which ``render_unit`` reads off a spec, and
     --template/--output are CLI flags. What is unit-specific is the log tag and
     the policy family whose host-local ENV_POLICY rows are the preserve set (why
-    each row is so: plans/review-all-s25-scripts-instruments-prd.md D5). Adding
-    a third unit is therefore a registry entry, not a fork.
+    each row is so: plans/review-all-s25-scripts-instruments-prd.md D5). A
+    family of None is a unit with no Environment= policy, which preserves
+    nothing. Adding a unit is therefore a registry entry, not a fork.
 
     FROZEN: a spec mutated per invocation would make "which names does this host
     preserve?" depend on argument-parsing order.
     """
 
     log_tag: str
-    family: systemd_unit_parity.UnitFamily
+    family: systemd_unit_parity.UnitFamily | None
 
     # The committed template this unit is rendered FROM, REPO-RELATIVE. It is
     # what makes the registry self-describing rather than a bare tag/preserve-set
@@ -182,13 +185,15 @@ class UnitRenderSpec:
     @property
     def host_local_environment(self) -> tuple[str, ...]:
         """The names this unit preserves: ENV_POLICY's host-local rows for its family."""
+        if self.family is None:
+            return ()
         return systemd_unit_parity.ENV_POLICY.host_local_names(self.family)
 
 
 # The registry --unit selects from. Keys are the operator-facing unit NAMES as
 # setup-host.sh spells them on the command line.
 #
-# THE TAGS MUST STAY DISTINCT. Both units are rendered by this same script in
+# THE TAGS MUST STAY DISTINCT. Every unit is rendered by this same script in
 # the same bring-up run, and setup-host.sh routes an operator to a report BY TAG
 # — a shared tag would attribute the fused-memory unit's preserved/skipped lines
 # to the dashboard, on the unit where mis-attribution costs the most.
@@ -202,6 +207,11 @@ UNITS: "dict[str, UnitRenderSpec]" = {
         log_tag="fused_memory_unit_render",
         family=systemd_unit_parity.UnitFamily.FUSED_MEMORY,
         template="scripts/fused-memory.service.template",
+    ),
+    "client-feed": UnitRenderSpec(
+        log_tag="client_feed_unit_render",
+        family=None,
+        template="scripts/client-feed.service.template",
     ),
 }
 
@@ -425,7 +435,7 @@ def _log(message: str, *, stream=None, log_tag: str = LOG_TAG) -> None:
     and same reason as check_dashboard_unit_parity._log.
 
     *log_tag* IS THREADED, NOT GLOBAL (task 4796). Since one script now renders
-    two units, the tag varies per invocation — but rebinding the module-global
+    several units, the tag varies per invocation — but rebinding the module-global
     ``LOG_TAG`` from ``main`` would make every call site's output depend on
     argument-parsing order, invisibly at the call site, and would leak across an
     in-process second call (which is exactly how this module's suite invokes the
@@ -484,7 +494,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             "Render a dark-factory systemd unit from its template, preserving "
             "host-local Environment= values already present in --output. "
             "--unit selects WHICH unit (and therefore which values are "
-            "host-local): dark-factory-dashboard.service or fused-memory.service."
+            "host-local): dark-factory-dashboard.service, fused-memory.service "
+            "or client-feed@.service."
         )
     )
     parser.add_argument(

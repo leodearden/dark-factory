@@ -19,7 +19,10 @@ import json
 from _recon_prompt_write_scope import tool_listing
 
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
-from fused_memory.reconciliation.preservation_specimen_guard import preservation_mem0_filters
+from fused_memory.reconciliation.preservation_specimen_guard import (
+    PRESERVED_SPECIMEN_COMPONENTS_KEY,
+    preservation_mem0_filters,
+)
 from fused_memory.reconciliation.prompts.stage1 import (
     PRESERVED_SPECIMEN_CORROBORATION_HEADING,
     STAGE1_SYSTEM_PROMPT,
@@ -60,3 +63,7 @@ def test_section_names_the_reader() -> None:
 
 def test_section_renders_the_guards_filter() -> None:
     assert json.dumps(preservation_mem0_filters('<id>')) in _section()
+
+
+def test_section_names_the_composite_annotation_key() -> None:
+    assert PRESERVED_SPECIMEN_COMPONENTS_KEY in _section()

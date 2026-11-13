@@ -22,6 +22,7 @@ from shared.phantom_verdict import (
     has_unparseable_marker,
     is_phantom_verdict_row,
 )
+from shared.streak import KeyedStreaks
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -79,7 +80,6 @@ JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
             'items': {
                 'type': 'object',
                 'properties': {
-                    'entry_id': {'type': ['string', 'null']},
                     'issue': {'type': 'string'},
                     'severity': {'type': 'string', 'enum': _VERDICT_SEVERITY_VALUES},
                     'recommendation': {'type': 'string'},
@@ -262,11 +262,13 @@ class Judge:
         self._halted_projects: set[str] = set()
         self._halt_cooldown_until: dict[str, datetime] = {}
         self._unhalt_grace_remaining: dict[str, int] = {}
-        # Per-project count of CONSECUTIVE judge transport/infra failures
-        # (JudgeInfraError). Incremented on each infra failure, reset on any
-        # successful transport or once a judge-unreachable halt fires. Bounds
-        # the phantom-halt blast radius (task 2947 ask a).
-        self._consecutive_infra_failures: dict[str, int] = {}
+        # Per-project runs of CONSECUTIVE judge transport/infra failures
+        # (JudgeInfraError), reset on any successful transport or once a
+        # judge-unreachable halt fires. Bounds the phantom-halt blast radius
+        # (task 2947 ask a).
+        self._infra_failures: KeyedStreaks[str] = KeyedStreaks(
+            threshold=config.judge_infra_max_consecutive_failures,
+        )
         # Last halt reason per project (task 2947 ask b), so the harness can
         # thread the REAL reason into the on_judge_halt escalation instead of a
         # hardcoded generic string. Set in _apply_halt, cleared in unhalt.
@@ -330,7 +332,6 @@ class Judge:
                 logger.warning(f'Judge: project {run.project_id} is halted, skipping review')
                 return None
 
-            entries = await self.journal.get_entries(run_id)
             combined_actions = await self.journal.get_run_actions_combined(run_id)
             recent_verdicts = await self.journal.get_recent_verdicts(
                 run.project_id, limit=10
@@ -346,7 +347,7 @@ class Judge:
                 since=datetime.now(UTC) - timedelta(hours=trend_window_hours),
             )
 
-            prompt = self._build_review_prompt(run, entries, recent_verdicts, combined_actions)
+            prompt = self._build_review_prompt(run, recent_verdicts, combined_actions)
             try:
                 response_text = await self._call_llm(prompt)
             except JudgeInfraError as err:
@@ -365,7 +366,7 @@ class Judge:
             # that carried NO usable verdict is not "successful transport" for this
             # purpose — it raises JudgeInfraError above and is diverted before this
             # line, so it correctly keeps counting toward the streak.
-            self._consecutive_infra_failures.pop(run.project_id, None)
+            self._infra_failures.success(run.project_id)
 
             verdict = self._parse_verdict(response_text, run_id)
 
@@ -445,7 +446,7 @@ class Judge:
         - below ``config.judge_infra_max_consecutive_failures``: log a structured
           warning and return None — no verdict is stamped and no halt fires, so a
           transient outage (e.g. an account-cap storm) is given room to recover.
-        - at/above the threshold: reset the counter (so a post-halt recovery
+        - at the threshold: reset the streak (so a post-halt recovery
           starts clean) and, when ``halt_on_judge_serious`` is set, apply a
           TRUTHFUL 'judge-unreachable' halt — which routes the existing
           infra_issue escalation via the harness. Gated on the same master switch
@@ -455,11 +456,11 @@ class Judge:
         infra streak is reset elsewhere on any successful transport (see
         review_run), so only genuinely-consecutive failures reach the threshold.
         """
-        count = self._consecutive_infra_failures.get(project_id, 0) + 1
-        self._consecutive_infra_failures[project_id] = count
+        step = self._infra_failures.failure(project_id)
+        count = step.count
         threshold = self.config.judge_infra_max_consecutive_failures
 
-        if count < threshold:
+        if not step.fired:
             logger.warning(
                 'reconciliation.judge_infra_failure',
                 extra={
@@ -481,7 +482,7 @@ class Judge:
 
         # Threshold reached: reset the streak so a later recovery starts clean,
         # then (if enabled) halt truthfully.
-        self._consecutive_infra_failures.pop(project_id, None)
+        self._infra_failures.forget((project_id,))
         if self.config.halt_on_judge_serious:
             reason = (
                 f'judge-unreachable halt: reconciliation judge outage '
@@ -501,24 +502,13 @@ class Judge:
             )
         return None
 
-    def _build_review_prompt(self, run, entries, recent_verdicts,
+    def _build_review_prompt(self, run, recent_verdicts,
                              combined_actions: list[dict] | None = None) -> str:
         # recent_verdicts is intentionally NOT fed into the LLM prompt.
         # _check_error_trends handles systemic-pattern detection in code; exposing the
         # history here caused a feedback loop where the LLM generated 'systemic_trend'
         # findings whenever prior verdicts were non-ok, keeping the streak alive.
         del recent_verdicts
-
-        entry_summaries = []
-        for e in entries:
-            entry_summaries.append({
-                'id': e.id,
-                'operation': e.operation,
-                'target_system': e.target_system,
-                'reasoning': e.reasoning,
-                'has_before': e.before_state is not None,
-                'has_after': e.after_state is not None,
-            })
 
         stage_reports = {}
         for stage_id, report in run.stage_reports.items():
@@ -538,7 +528,7 @@ class Judge:
         action_summaries = [
             {
                 'operation': a.get('operation', a.get('action_type', '?')),
-                'target': a.get('target', a.get('target_system', '?')),
+                'target': a.get('target', '?'),
                 'source': a.get('source', '?'),
                 'created_at': a.get('created_at', '?'),
             }
@@ -561,9 +551,6 @@ class Judge:
 ### MCP Actions ({len(action_summaries)} total)
 {json.dumps(action_summaries, indent=2, default=str)}
 
-### Journal Entries ({len(entries)} total)
-{json.dumps(entry_summaries, indent=2, default=str)}
-
 Review this run and provide your verdict as JSON.
 """
 
@@ -581,26 +568,26 @@ Review this run and provide your verdict as JSON.
         elif self.config.judge_llm_provider == 'anthropic':
             import anthropic
 
-            client = anthropic.AsyncAnthropic()
-            response = await client.messages.create(
-                model=self.config.judge_llm_model,
-                max_tokens=4096,
-                system=JUDGE_SYSTEM_PROMPT,
-                messages=[{'role': 'user', 'content': prompt}],
-            )
+            async with anthropic.AsyncAnthropic() as client:
+                response = await client.messages.create(
+                    model=self.config.judge_llm_model,
+                    max_tokens=4096,
+                    system=JUDGE_SYSTEM_PROMPT,
+                    messages=[{'role': 'user', 'content': prompt}],
+                )
             text_blocks = [b for b in response.content if b.type == 'text']
             return text_blocks[0].text if text_blocks else ''
         else:
             from openai import AsyncOpenAI
 
-            client = AsyncOpenAI()
-            response = await client.chat.completions.create(
-                model=self.config.judge_llm_model,
-                messages=[
-                    {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
-                    {'role': 'user', 'content': prompt},
-                ],
-            )
+            async with AsyncOpenAI() as client:
+                response = await client.chat.completions.create(
+                    model=self.config.judge_llm_model,
+                    messages=[
+                        {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
+                        {'role': 'user', 'content': prompt},
+                    ],
+                )
             return response.choices[0].message.content or ''
 
     async def _call_judge_cli(self, prompt: str) -> dict | str:
@@ -743,7 +730,7 @@ Review this run and provide your verdict as JSON.
             # review_run's ``except JudgeInfraError`` -> _handle_infra_failure
             # diversion wraps ONLY the ``await self._call_llm(prompt)`` call.
             # _parse_verdict runs OUTSIDE that inner try, and AFTER the infra
-            # streak has already been popped — so a JudgeInfraError raised from
+            # streak has already been reset — so a JudgeInfraError raised from
             # there would fall through to the broad ``except Exception`` and
             # vanish as a silent None with no infra accounting at all (no
             # verdict, no halt, no signal — the claude_cli mirror of the

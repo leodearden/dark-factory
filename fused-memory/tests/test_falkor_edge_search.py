@@ -96,9 +96,6 @@ FALLBACK_LEGS: dict[str, SearchLeg] = {
     'get_embeddings_for_communities': lambda driver: search_utils.get_embeddings_for_communities(
         driver, []
     ),
-    'node_bfs_search': lambda driver: search_utils.node_bfs_search(
-        driver, ['origin'], SearchFilters(), 2, ['g']
-    ),
     'node_distance_reranker': lambda driver: search_utils.node_distance_reranker(
         driver, ['a', 'b'], 'center'
     ),
@@ -152,6 +149,17 @@ CANNED_EDGE_RECORD: dict[str, Any] = {
     'expired_at': None,
     'valid_at': None,
     'invalid_at': None,
+    'attributes': {},
+}
+
+# One row shaped like graphiti's FalkorDB node projection (get_entity_node_return_query).
+CANNED_NODE_RECORD: dict[str, Any] = {
+    'uuid': 'node-uuid',
+    'name': 'alpha node',
+    'group_id': 'g',
+    'created_at': '2026-10-03T00:00:00+00:00',
+    'summary': '',
+    'labels': ['Entity'],
     'attributes': {},
 }
 
@@ -343,6 +351,94 @@ class TestEdgeBfsSearch:
             'edge-uuid',
             'source-uuid',
             'target-uuid',
+        )
+
+
+class TestNodeBfsSearch:
+    @staticmethod
+    async def _search(
+        origins: Sequence[str] | None = ('origin-entity', 'origin-episode'),
+        depth: int = 3,
+        search_filter: SearchFilters | None = None,
+        group_ids: Sequence[str] | None = ('g',),
+    ) -> tuple[list[Any], list[IssuedQuery]]:
+        driver, issued = hardened_driver([CANNED_NODE_RECORD])
+        nodes = await search_utils.node_bfs_search(
+            driver,
+            None if origins is None else list(origins),
+            search_filter or SearchFilters(),
+            depth,
+            None if group_ids is None else list(group_ids),
+            20,
+        )
+        return nodes, issued
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('origins', 'depth'),
+        [(None, 3), ([], 3), (['origin-entity'], 0)],
+        ids=['no-origins', 'empty-origins', 'zero-depth'],
+    )
+    async def test_no_reachable_nodes_issues_nothing(
+        self, origins: list[str] | None, depth: int
+    ) -> None:
+        """graphiti's contract: no origins or depth < 1 means no results and no query."""
+        nodes, issued = await self._search(origins, depth)
+
+        assert nodes == []
+        assert issued == []
+
+    @pytest.mark.asyncio
+    async def test_origins_are_not_looked_up_one_row_at_a_time(self) -> None:
+        """Stock unwinds the origin list into an unlabeled ``{uuid:}`` match, which FalkorDB plans as a scan re-run per origin."""
+        _, issued = await self._search()
+
+        (query,) = issued
+        assert 'UNWIND $bfs_origin_node_uuids' not in query.cypher
+        assert '(origin {' not in query.cypher
+
+    @pytest.mark.asyncio
+    async def test_forwards_graphiti_params(self) -> None:
+        _, issued = await self._search()
+
+        (query,) = issued
+        assert query.params['bfs_origin_node_uuids'] == ['origin-entity', 'origin-episode']
+        assert query.params['limit'] == 20
+        assert query.params['group_ids'] == ['g']
+        assert '*1..3' in query.cypher
+
+    @pytest.mark.asyncio
+    async def test_group_filter_is_omitted_without_group_ids(self) -> None:
+        _, issued = await self._search(group_ids=None)
+
+        assert 'group_ids' not in issued[0].params
+
+    @pytest.mark.asyncio
+    async def test_every_origin_label_leg_applies_the_node_predicates(self) -> None:
+        """A leg missing one returns its own unfiltered nodes, which only the live parity tests see."""
+        _, issued = await self._search(search_filter=SearchFilters(node_labels=['Preference']))
+
+        (query,) = issued
+        legs = ('MATCH (origin:Entity)', 'MATCH (origin:Episodic)')
+        assert all(leg in query.cypher for leg in legs)
+        for predicate in (
+            'origin.uuid IN $bfs_origin_node_uuids',
+            'n.group_id = origin.group_id',
+            'origin.group_id IN $group_ids',
+            'n:Preference',
+        ):
+            assert query.cypher.count(predicate) == len(legs), predicate
+
+    @pytest.mark.asyncio
+    async def test_parses_records_into_entity_nodes(self) -> None:
+        nodes, _ = await self._search()
+
+        (node,) = nodes
+        assert (node.uuid, node.name, node.group_id, node.labels) == (
+            'node-uuid',
+            'alpha node',
+            'g',
+            ['Entity'],
         )
 
 

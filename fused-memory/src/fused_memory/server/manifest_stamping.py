@@ -83,6 +83,7 @@ from shared.capability_manifest import (
     DeliveredCheckMeta,
     ManifestTask,
     parse_capability_manifest,
+    sidecar_path,
 )
 from shared.delivered_check_polarity import GATE_REF, lint_delivered_checks
 from shared.safe_io import atomic_write_text
@@ -91,8 +92,6 @@ from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 from fused_memory.server.manifest_sidecar_text import SidecarStampRefused, stamp_task_ids
 
 logger = logging.getLogger(__name__)
-
-_SIDECAR_SUFFIX = '.capability-manifest.yaml'
 
 #: Serializes every sidecar read-modify-write in this process. The on-disk
 #: steps run in worker threads, where two concurrent commit_planning calls on
@@ -249,9 +248,9 @@ async def _stamp_capability_manifests_impl(
     #    labeled, near-miss key, or unlabeled. The BINDING admission —
     #    truthy prd_path AND truthy prd_task_label — is unchanged, because
     #    scripts/audit_manifest_descriptor_drift.py::_manifest_binding
-    #    mirrors it. The sidecar path is derived STRICTLY via regex
-    #    substitution — drift-immune vs the historically drifting .md
-    #    filename.
+    #    mirrors it. The sidecar path is derived from prd_path via
+    #    shared.capability_manifest.sidecar_path, the one home of that rule —
+    #    drift-immune vs the historically drifting .md filename.
     prd_bound = _prd_bound_tasks(ids, tasks_data)
     if not prd_bound:
         return None
@@ -515,7 +514,7 @@ def _prd_bound_tasks(ids: list[str], tasks_data: list[Any]) -> list[_PrdBoundTas
         meta = task.get('metadata') if isinstance(task, dict) else None
         if not isinstance(meta, dict) or not meta.get('prd_path'):
             continue
-        rel = re.sub(r'\.md$', '', meta['prd_path']) + _SIDECAR_SUFFIX
+        rel = sidecar_path(meta['prd_path'])
         label = meta.get('prd_task_label')
         if label:
             prd_bound.append(_PrdBoundTask(tid, rel, label=label))

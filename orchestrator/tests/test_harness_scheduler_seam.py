@@ -51,6 +51,7 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness, TaskReport
+from orchestrator.pause_policy import PauseClass
 from orchestrator.run_store import RunStore
 from orchestrator.workflow import WorkflowOutcome
 
@@ -168,6 +169,10 @@ class TestConstructedWithCallbacks:
         await asyncio.sleep(0)
 
         mock_run_store.save_scheduler_pause.assert_called_once()
+        assert (
+            mock_run_store.save_scheduler_pause.call_args.kwargs['pause_class']
+            is PauseClass.PARK_STOP
+        )
 
 
 # ---------------------------------------------------------------------------

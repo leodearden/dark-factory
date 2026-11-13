@@ -11,6 +11,9 @@ marker, so the merge lane's default selection runs them.
 
 from functools import cache
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
 from arm_harness._lme_artifacts import REPO_ROOT, committed_run_dir, git
 from fused_memory.arm_harness.embedding_preregistration import (
     DECIDING_CONFIGURATION,
@@ -30,6 +33,8 @@ from fused_memory.arm_harness.screening import (
     load_screening_verdict,
 )
 from fused_memory.arm_harness.slate import load_embedding_slate
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LLM_RECORD = 'plans/local-memory-models-eval-decision-llm.md'
 EMBEDDING_RECORD = 'plans/local-memory-models-eval-decision-embedding.md'

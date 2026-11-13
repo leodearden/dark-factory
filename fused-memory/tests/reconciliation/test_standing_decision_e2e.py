@@ -48,6 +48,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation import cli_stage_runner
@@ -61,6 +62,8 @@ from fused_memory.reconciliation.standing_decision_constants import (
 )
 from fused_memory.server.recon_report import ReconReportState
 from reconciliation.consolidator_fixtures import make_consolidator, make_scope
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: The migration under certification. ``scripts/`` is not a package, so it is
 #: loaded through the shared helper — the same module object
@@ -339,7 +342,7 @@ async def run_one_cycle(ledger, items_flagged: list[dict]) -> tuple[StageReport,
         dedup_seen.append(list(kwargs.get('flags', [])))
         return kwargs.get('flags', [])
 
-    module = 'fused_memory.reconciliation.stages.memory_consolidator'
+    module = 'fused_memory.reconciliation.stage1_flag_chain'
     with (
         patch.object(
             BaseStage, 'run', new=AsyncMock(return_value=make_base_report(items_flagged))

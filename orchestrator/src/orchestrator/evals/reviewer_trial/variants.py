@@ -6,15 +6,12 @@ the production baseline (5x sonnet specialists).
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from orchestrator.agents.roles import (
-    _READ_ONLY_TOOLS,
-    _REVIEWER_PROMPT_HARNESS_VERSION,
-    _VERDICT_TOOLS,
-    AgentRole,
-    build_reviewer_prompt_spec,
-)
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.roles import AgentRole, build_reviewer_role
 
 # ---------------------------------------------------------------------------
 # Spec + config types
@@ -42,48 +39,50 @@ class VariantConfig:
     name: str
     description: str
     reviewers: list[ReviewerSpec] = field(default_factory=list)
+    briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY
+
+
+def with_briefing(variant: VariantConfig, briefing: ReviewBriefing) -> VariantConfig:
+    """*variant*'s panel briefed by the *briefing* generation, named for it unless diff-only."""
+    if briefing is ReviewBriefing.DIFF_ONLY:
+        return variant
+    return dataclasses.replace(variant, name=f'{variant.name}_{briefing.value}', briefing=briefing)
+
+
+def campaign_arms(
+    variants: Sequence[VariantConfig], briefings: Sequence[ReviewBriefing],
+) -> list[VariantConfig]:
+    """Every variant under every briefing, variant-major, so the first variant's first briefing leads."""
+    return [with_briefing(variant, briefing) for variant in variants for briefing in briefings]
 
 
 # ---------------------------------------------------------------------------
-# Trial reviewer role builder — built from the SAME reviewer PromptSpec as
-# production (roles.build_reviewer_prompt_spec: frozen CONTRACT + editable
-# HEURISTICS, composed), so the trial reviewer's prompt AND verdict-tools
-# transport match the live path exactly (task 2493 trial-parity decision:
-# prompt parity forces transport parity, since the post-2484 CONTRACT tells
-# the agent to CALL submit_review_verdict rather than emit JSON/prose — an
-# output-schema-only capture would leave a prompt-parity reviewer with no
-# way to emit). Replaces the drifted, pre-2484 _REVIEWER_SYSTEM_TEMPLATE.
+# Trial reviewer role builder
 # ---------------------------------------------------------------------------
 
 _JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
 
 
-def build_trial_reviewer_role(spec_in: ReviewerSpec) -> AgentRole:
-    """Build an AgentRole for a trial reviewer.
+def build_trial_reviewer_role(
+    spec_in: ReviewerSpec, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+) -> AgentRole:
+    """The production ``reviewer_<name>`` role of the *briefing* generation, set up for a trial.
 
-    Builds from the same reviewer ``PromptSpec`` as production
-    (``roles.build_reviewer_prompt_spec``), so the trial reviewer's system
-    prompt and live verdict-tools transport match production exactly.
-    ``role.name`` is ``reviewer_{spec_in.name}`` (not ``trial_``-prefixed)
-    because the verdict-tools server's ``reviewer == --verdict-role``
-    identity check validates the emitted verdict's ``reviewer`` field
-    against ``role.name``, and the frozen CONTRACT instructs the agent to
-    emit ``reviewer_{name}``. Model/budget are still per-spec overridable;
-    effort is consumed directly from ``spec_in.effort`` by the trial runner
-    (AgentRole has no effort field).
+    The system prompt, verdict-tools transport, harness version and
+    ``reviewer_<name>`` identity are production's, so the trial measures the
+    prompt production dispatches; the verdict-tools server checks the emitted
+    ``reviewer`` field against ``role.name``. The trial adds jcodemunch to the
+    read-only tools and takes model and budget from the spec; the runner
+    passes ``spec_in.effort`` itself, since AgentRole has no effort field.
     """
-    spec = build_reviewer_prompt_spec(spec_in.name, spec_in.specialization)
-    return AgentRole(
-        name=f'reviewer_{spec_in.name}',
-        system_prompt=spec.in_code_constant,
-        allowed_tools=[*_READ_ONLY_TOOLS, *_VERDICT_TOOLS, *_JCODEMUNCH_TOOLS],
+    role = build_reviewer_role(spec_in.name, spec_in.specialization, briefing)
+    return dataclasses.replace(
+        role,
+        allowed_tools=[*role.allowed_tools, *_JCODEMUNCH_TOOLS],
         disallowed_tools=['Edit', 'Write'],
         default_model=spec_in.model,
         default_budget=spec_in.budget,
         default_max_turns=30,
-        mcp_families=frozenset({'verdict_tools'}),
-        prompt_spec=spec,
-        prompt_harness_version=_REVIEWER_PROMPT_HARNESS_VERSION,
     )
 
 

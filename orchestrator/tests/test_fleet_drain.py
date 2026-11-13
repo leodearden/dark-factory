@@ -10,6 +10,7 @@ three event outcomes are pinned through the module's public functions.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,6 @@ from orchestrator.fleet_drain import (
     drain_request_path,
     evaluate_drain_request,
     read_drain_request,
-    sweep_alive,
 )
 
 UNIT = 'orchestrator-dark-factory.service'
@@ -189,13 +189,20 @@ class TestEvaluateDrainRequest:
         assert DrainIdentity.from_environ({}, max_age_secs=60.0).invocation_id == ''
 
 
-class TestSweepAlive:
-    def test_this_process_is_alive(self) -> None:
-        import os
-        assert sweep_alive(os.getpid()) is True
+class TestDefaultSweepLiveness:
+    """With no ``pid_alive=`` injected, the sweep pid is judged on the real syscall."""
 
-    def test_a_pid_beyond_the_kernel_range_is_dead(self) -> None:
-        assert sweep_alive(2**62) is False
+    def _default_verdict(self, tmp_path: Path, sweep_pid: int):
+        read = read_drain_request(_write_request(tmp_path, _request_fields(sweep_pid=sweep_pid)))
+        return evaluate_drain_request(read, IDENTITY, now=REQUESTED_TS + 1.0)
+
+    def test_a_live_sweep_is_honoured(self, tmp_path: Path) -> None:
+        verdict = self._default_verdict(tmp_path, os.getpid())
+        assert verdict is not None and verdict.honoured
+
+    def test_a_sweep_pid_beyond_pid_t_is_refused_as_dead(self, tmp_path: Path) -> None:
+        verdict = self._default_verdict(tmp_path, 2**62)
+        assert verdict is not None and verdict.refused is DrainRefusal.SWEEP_DEAD
 
 
 class TestDrainEventTracker:

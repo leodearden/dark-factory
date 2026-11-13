@@ -20,21 +20,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Set as AbstractSet
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import redis.exceptions
 from _falkor_index_doubles import (
     EMPTY_KEY_ERROR,
+    LIVE_HEADER,
+    TRAP_PRESENT,
     StatefulGraph,
     rows_for,
     statements_read,
     statements_written,
 )
 from shared.testing_virtual_clock import virtual_clock_test
-from test_falkor_indices import _TRAP_PRESENT, LIVE_HEADER
 
-from fused_memory.backends.falkor_indices import expected_index_set, plan_index_statements
+from fused_memory.backends.falkor_indices import (
+    IndexSpec,
+    expected_index_set,
+    plan_index_statements,
+)
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
@@ -42,7 +48,7 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
 _LOGGER = 'fused_memory.backends.graphiti_client'
 
 
-def _plan_for(present: set) -> list[str]:
+def _plan_for(present: AbstractSet[IndexSpec]) -> list[str]:
     """The statements β issues against a graph that already carries *present*."""
     return [statement for statement, _specs in plan_index_statements(expected_index_set() - present)]
 
@@ -109,12 +115,12 @@ class TestStartupSweep:
         self, mock_config, make_backend, make_graph_mock,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg_a', 'reg_absent'})
-        graphs = {'reg_a': make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)}
+        graphs = {'reg_a': make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)}
         _route(backend, graphs, ['unreg_probe', 'reg_a', 'default_db'])
 
         await backend.provision_registered_graphs()
 
-        assert statements_written(graphs['reg_a']) == _plan_for(_TRAP_PRESENT)
+        assert statements_written(graphs['reg_a']) == _plan_for(TRAP_PRESENT)
         # A registered but ABSENT graph is left to its first write (D6); an
         # unregistered one is never touched, whatever its name looks like (D5).
         assert _requested_graphs(backend) == {'reg_a'}
@@ -128,14 +134,14 @@ class TestStartupSweep:
         broken.ro_query = AsyncMock(side_effect=redis.exceptions.ConnectionError('down'))
         graphs = {
             'reg_a': broken,
-            'reg_b': make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER),
+            'reg_b': make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER),
         }
         _route(backend, graphs, ['reg_a', 'reg_b'])
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
             await backend.provision_registered_graphs()
 
-        assert statements_written(graphs['reg_b']) == _plan_for(_TRAP_PRESENT)
+        assert statements_written(graphs['reg_b']) == _plan_for(TRAP_PRESENT)
         assert any(
             r.name == _LOGGER and r.levelno == logging.WARNING and 'reg_a' in r.getMessage()
             for r in caplog.records
@@ -175,7 +181,7 @@ class TestStartupSweep:
         self, mock_config, make_backend, make_graph_mock,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg_a'})
-        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         healthy_read = graph.ro_query.side_effect('CALL db.indexes()')
         graph.ro_query.side_effect = [redis.exceptions.ConnectionError('blip'), healthy_read]
         _route(backend, {'reg_a': graph}, ['reg_a'])
@@ -184,7 +190,7 @@ class TestStartupSweep:
         assert statements_written(graph) == []
 
         await backend.provision_registered_graphs()
-        assert statements_written(graph) == _plan_for(_TRAP_PRESENT)
+        assert statements_written(graph) == _plan_for(TRAP_PRESENT)
 
     @pytest.mark.asyncio
     async def test_a_returned_run_is_cached_even_with_per_statement_failures(
@@ -192,8 +198,8 @@ class TestStartupSweep:
     ):
         """β already WARNs per rejected statement; δ's detector owns the gap (INV-4)."""
         backend = make_backend(mock_config, registered_graph_ids={'reg_a'})
-        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
-        doomed = _plan_for(_TRAP_PRESENT)[0]
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
+        doomed = _plan_for(TRAP_PRESENT)[0]
 
         async def _query(statement, *args, **kwargs):
             if statement == doomed:
@@ -216,14 +222,14 @@ class TestStartupSweep:
     ):
         """INV-3: the in-process cache skips only redundant WORK."""
         backend = make_backend(mock_config, registered_graph_ids={'reg_a'})
-        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         _route(backend, {'reg_a': graph}, ['reg_a'])
 
         await backend.provision_registered_graphs()
         reads, writes = list(statements_read(graph)), list(statements_written(graph))
         await backend.provision_registered_graphs()
 
-        assert writes == _plan_for(_TRAP_PRESENT)
+        assert writes == _plan_for(TRAP_PRESENT)
         assert statements_read(graph) == reads
         assert statements_written(graph) == writes
 
@@ -303,7 +309,7 @@ class TestFirstWriteProvisioning:
         self, mock_config, make_backend, make_graph_mock,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
-        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         events = self._wire(backend, graph, listing=['unreg'])
 
         await self._write(backend, group_id='unreg')
@@ -317,12 +323,12 @@ class TestFirstWriteProvisioning:
         self, mock_config, make_backend,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
-        graph = StatefulGraph(_TRAP_PRESENT)
+        graph = StatefulGraph(TRAP_PRESENT)
         self._wire(backend, graph, listing=['reg'])
 
         await asyncio.gather(self._write(backend), self._write(backend))
 
-        assert graph.issued == _plan_for(_TRAP_PRESENT)
+        assert graph.issued == _plan_for(TRAP_PRESENT)
 
     @pytest.mark.asyncio
     async def test_first_write_under_the_callers_identity_lock_does_not_deadlock(
@@ -330,13 +336,13 @@ class TestFirstWriteProvisioning:
     ):
         """The ``MemoryService._execute_graphiti_write`` shape: the caller already holds it."""
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
-        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         events = self._wire(backend, graph, listing=['reg'])
 
         async with backend._identity_lock_for('reg'):
             await asyncio.wait_for(self._write(backend), 5)
 
-        assert events == _plan_for(_TRAP_PRESENT) + ['upstream']
+        assert events == _plan_for(TRAP_PRESENT) + ['upstream']
 
     @pytest.mark.asyncio
     async def test_a_provisioning_failure_never_fails_the_write_and_is_retried(
@@ -376,7 +382,7 @@ class TestFirstWriteProvisioning:
         config.queue.write_timeout_seconds = 0.5
         write_budget = config.queue.write_timeout_seconds
         backend = make_backend(config, registered_graph_ids={'reg'})
-        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         healthy_read = graph.ro_query.side_effect
         never = asyncio.Event()
         reads = 0
@@ -398,14 +404,14 @@ class TestFirstWriteProvisioning:
         assert events == ['upstream'], 'the write must proceed past a hung provisioning read'
 
         await asyncio.wait_for(self._write(backend), write_budget)
-        assert events == ['upstream', *_plan_for(_TRAP_PRESENT), 'upstream']
+        assert events == ['upstream', *_plan_for(TRAP_PRESENT), 'upstream']
 
     @pytest.mark.asyncio
     async def test_later_writes_skip_provisioning_once_cached(
         self, mock_config, make_backend, make_graph_mock,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
-        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         self._wire(backend, graph, listing=['reg'])
 
         await self._write(backend)
@@ -413,7 +419,7 @@ class TestFirstWriteProvisioning:
         await self._write(backend)
 
         assert statements_read(graph) == ['CALL db.indexes()']
-        assert statements_written(graph) == _plan_for(_TRAP_PRESENT)
+        assert statements_written(graph) == _plan_for(TRAP_PRESENT)
 
     @pytest.mark.asyncio
     async def test_ensure_entity_node_on_a_registered_absent_graph_provisions_before_its_resolve_read(

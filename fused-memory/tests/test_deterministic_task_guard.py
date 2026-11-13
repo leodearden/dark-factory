@@ -12,12 +12,29 @@ import logging
 import os
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
 )
 
-_DTG_LOGGER = 'fused_memory.middleware.deterministic_task_guard'
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=deterministic_task_guard'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
+
+def _install_executable(root, relpath='scripts/deploy.sh'):
+    script = root / relpath
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text('#!/bin/sh\nexit 0\n')
+    os.chmod(script, 0o755)
+    return script
 
 # ---------------------------------------------------------------------------
 # Step-1: invariant matrix tests (no filesystem)
@@ -323,6 +340,81 @@ class TestDeterministicTaskErrorBeforeDoneStructural:
         assert result is None
 
 
+class TestDeterministicTaskErrorBeforeDoneCwd:
+    """before_done.cwd: a string or absent, and never where a relative script resolves."""
+
+    @pytest.fixture
+    def project_root(self, tmp_path):
+        root = tmp_path / 'project'
+        root.mkdir()
+        return root
+
+    @pytest.fixture
+    def elsewhere(self, tmp_path):
+        outside = tmp_path / 'elsewhere'
+        outside.mkdir()
+        return outside
+
+    @staticmethod
+    def _submit(project_root, **before_done):
+        return deterministic_task_error(
+            'deterministic',
+            {'before_done': {'script': 'scripts/deploy.sh', 'timeout_secs': 60, **before_done}},
+            str(project_root),
+        )
+
+    @pytest.mark.parametrize(
+        'cwd',
+        [5, True, ['scripts'], {'dir': 'x'}, 0, False, []],
+        ids=['int', 'true', 'list', 'dict', 'zero', 'false', 'empty-list'],
+    )
+    def test_non_string_cwd_rejects(self, project_root, cwd):
+        _install_executable(project_root)
+
+        result = self._submit(project_root, cwd=cwd)
+
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'cwd' in result['error']
+
+    @pytest.mark.parametrize('cwd', [None, ''], ids=['none', 'empty'])
+    def test_absent_or_empty_cwd_accepts(self, project_root, cwd):
+        _install_executable(project_root)
+
+        assert self._submit(project_root, cwd=cwd) is None
+
+    @staticmethod
+    def _cwd_form(project_root, elsewhere, form):
+        """The cwd string to submit and the directory it names."""
+        if form == 'absolute':
+            return str(elsewhere), elsewhere
+        sub = project_root / 'sub'
+        sub.mkdir()
+        return 'sub', sub
+
+    @pytest.mark.parametrize('form', ['absolute', 'relative'])
+    def test_relative_script_with_cwd_is_validated_under_project_root(
+        self, project_root, elsewhere, form,
+    ):
+        cwd, _ = self._cwd_form(project_root, elsewhere, form)
+        _install_executable(project_root)
+
+        assert self._submit(project_root, cwd=cwd) is None
+
+    @pytest.mark.parametrize('form', ['absolute', 'relative'])
+    def test_relative_script_present_only_under_cwd_is_refused(
+        self, project_root, elsewhere, form,
+    ):
+        cwd, cwd_dir = self._cwd_form(project_root, elsewhere, form)
+        _install_executable(cwd_dir)
+
+        result = self._submit(project_root, cwd=cwd)
+
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'does not exist under project_root' in result['error']
+
+
 # ---------------------------------------------------------------------------
 # Step-5: inject_task_kind tests
 # ---------------------------------------------------------------------------
@@ -399,49 +491,28 @@ class TestInjectTaskKind:
         sensible fallback for an unparseable string.
         """
         inject_task_kind = self._import_inject()
-        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = inject_task_kind('not valid json!!!', 'normal')
         assert result == {'task_kind': 'normal'}
-        warns = [
-            r for r in caplog.records
-            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert len(_discard_lines(caplog)) == 1
 
     def test_non_dict_json_value_warns_schema_warning_census_token(self, caplog):
         """A syntactically valid JSON value that isn't an object (a bare list)
         is also a whole-metadata discard and must warn identically."""
         inject_task_kind = self._import_inject()
-        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = inject_task_kind('[1,2,3]', 'normal')
         assert result == {'task_kind': 'normal'}
-        warns = [
-            r for r in caplog.records
-            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert len(_discard_lines(caplog)) == 1
 
     def test_valid_dict_metadata_emits_no_warning(self, caplog):
         """A well-formed dict is not a discard: no schema_warning WARNING, and
         curator-internal extras (spawned_from) survive alongside task_kind."""
         inject_task_kind = self._import_inject()
-        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = inject_task_kind({'foo': 'bar', 'spawned_from': 'x'}, 'deterministic')
         assert result == {'foo': 'bar', 'spawned_from': 'x', 'task_kind': 'deterministic'}
-        warns = [
-            r for r in caplog.records
-            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'valid dict metadata must not emit a WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert _discard_lines(caplog) == []
 
     def test_empty_string_metadata_no_warning(self, caplog):
         """Amendment: an empty-string metadata is benign-absent, not a discard.
@@ -451,17 +522,22 @@ class TestInjectTaskKind:
         emitting a task_metadata.schema_warning census line.
         """
         inject_task_kind = self._import_inject()
-        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = inject_task_kind('', 'normal')
         assert result == {'task_kind': 'normal'}
-        warns = [
-            r for r in caplog.records
-            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'empty-string metadata must not emit a WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert _discard_lines(caplog) == []
+
+
+class TestDeterministicTaskErrorUnreadableMetadata:
+    """Unreadable metadata reads as empty under the shared wire rule, and is logged."""
+
+    @pytest.mark.parametrize('metadata', ['{not json', 42], ids=repr)
+    def test_unreadable_metadata_breaks_no_invariant_and_logs_one_census_line(
+        self, metadata, caplog
+    ):
+        with caplog.at_level(logging.WARNING):
+            assert deterministic_task_error('normal', metadata, '/proj') is None
+        assert len(_discard_lines(caplog)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -607,9 +683,7 @@ def _predicate_carrier(tmp_path, recurrence=None):
     X_OK. Pass *recurrence* to attach one; omit it for the no-recurrence
     control rows.
     """
-    script = tmp_path / 'run.sh'
-    script.write_text('#!/bin/sh\nexit 0\n')
-    os.chmod(script, 0o755)
+    _install_executable(tmp_path, 'run.sh')
     meta = {
         'before_done': {'kind': 'predicate', 'script': 'run.sh', 'timeout_secs': 60},
         'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
@@ -871,10 +945,7 @@ class TestDeterministicTaskErrorPredicateBeforeDone:
     @staticmethod
     def _make_script(tmp_path, name='check.sh'):
         """tmp_path executable-script fixture, mirroring the before_done-structural tests."""
-        script = tmp_path / name
-        script.write_text('#!/bin/sh\nexit 0\n')
-        os.chmod(script, 0o755)
-        return script.name
+        return _install_executable(tmp_path, name).name
 
     # -- rejections ----------------------------------------------------
 

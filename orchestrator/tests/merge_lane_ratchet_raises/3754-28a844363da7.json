@@ -1,0 +1,12 @@
+{
+  "task_id": "3754",
+  "reason": "Net-additive bug-fix coverage (task 3754): new test_workflow_resume_attribution.py drives TaskWorkflow's resume-after-escalation path end-to-end (joined-resolution attribution, '## The Issue' population, full-set stop-the-line guard) through the same workflow seams test_workflow_escalated_steward_stall.py already uses (_steward_factory, _ensure_steward_started, _wait_for_resolution, _execute_verify_review_loop, _invoke): +8 private reads in a new file, no existing file regressed.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6422,
+      "current": 6430
+    }
+  ]
+}

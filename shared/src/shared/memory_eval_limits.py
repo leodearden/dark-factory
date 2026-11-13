@@ -47,7 +47,7 @@ around ``n = 1030``, and nothing in the M1 schema bounds a proportion's ``n``.
 
 Stdlib only — ``math.lgamma``/``math.exp``, no scipy or numpy (neither is a
 dependency of ``dark-factory-shared``, following the stdlib-only precedent of
-``orchestrator/src/orchestrator/evals/report.py``).
+``orchestrator/src/orchestrator/evals/stats.py``).
 """
 
 from __future__ import annotations

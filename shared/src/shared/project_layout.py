@@ -14,6 +14,7 @@ __all__ = [
     'KNOWN_PROJECT_ROOTS_ENV',
     'CheckoutRootError',
     'StrPath',
+    'agent_transcripts_dir',
     'default_project_root',
     'escalation_queue_dir',
     'known_project_roots',
@@ -21,6 +22,7 @@ __all__ = [
     'orchestrator_data_dir',
     'park_eviction_requests_db',
     'runs_db',
+    'scheduler_eligibility_db',
     'scheduler_overrides_db',
     'scheduler_state_json',
     'tasks_db',
@@ -40,6 +42,10 @@ def orchestrator_data_dir(root: StrPath) -> Path:
     return Path(root) / 'data' / 'orchestrator'
 
 
+def agent_transcripts_dir(root: StrPath) -> Path:
+    return orchestrator_data_dir(root) / 'agent-transcripts'
+
+
 def runs_db(root: StrPath) -> Path:
     return orchestrator_data_dir(root) / 'runs.db'
 
@@ -54,6 +60,10 @@ def scheduler_overrides_db(root: StrPath) -> Path:
 
 def park_eviction_requests_db(root: StrPath) -> Path:
     return orchestrator_data_dir(root) / 'park_eviction_requests.db'
+
+
+def scheduler_eligibility_db(root: StrPath) -> Path:
+    return orchestrator_data_dir(root) / 'scheduler_eligibility.db'
 
 
 def tasks_db(root: StrPath) -> Path:

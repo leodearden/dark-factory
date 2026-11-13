@@ -47,6 +47,12 @@
 # carry the evidence of the shortfall, were written anyway. Both exit codes are
 # narrated instead, so exiting 0 never means the failure is invisible.
 #
+# The ONE exception is a refusal to START: when the shared uv resolver cannot
+# be loaded or uv cannot be resolved, the wrapper exits 127 (the code a bare
+# missing uv gives) before either half runs. That is a configuration fault
+# that would fail every night identically with nothing measured, so a failed
+# unit is the signal it needs. Once the halves run, the wrapper exits 0.
+#
 # RUNS UNDER THE SERVICE ENV (sourced .env + CONFIG_PATH / PROJECT_ROOT /
 # FALKORDB_URI roots) and under `uv run` so `fused_memory.*` imports resolve --
 # mirrors scripts/fused-memory-flag-marker-sweep.sh and the
@@ -62,6 +68,11 @@
 # similarly overridable so tests can point it at a tmp dir with no `.env` (a
 # no-op source). CENSUS_COMMIT=0 skips the artifact commit, for an ad-hoc
 # operator run that should leave the checkout alone.
+#
+# For a half whose *_CMD seam is unset, uv is resolved to an absolute path by
+# scripts/lib/resolve_uv.sh::require_uv_bin (that lib holds the ladder and the
+# boot-catch-up cause), after the .env source so a UV_BIN or PATH set there is
+# honored. A set seam bypasses resolution.
 #
 # `set -e` is deliberately NOT set: both halves are allowed to fail and are
 # graded explicitly below.
@@ -92,6 +103,11 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
       GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE \
       GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 
+case "${BASH_SOURCE[0]}" in */*) _self_dir="${BASH_SOURCE[0]%/*}" ;; *) _self_dir=. ;; esac
+_uv_lib="$_self_dir/lib/resolve_uv.sh"
+# shellcheck source=lib/resolve_uv.sh
+source "$_uv_lib" || { echo "${0##*/}: ERROR: cannot load the shared uv resolver $_uv_lib -- refusing to guess which uv to run." >&2; exit 127; }
+
 REPO="${REPO:-/home/leo/src/dark-factory}"
 FM="$REPO/fused-memory"
 
@@ -108,9 +124,15 @@ export FALKORDB_URI="${FALKORDB_URI:-redis://localhost:6379}"
 CENSUS_TOP_N="${CENSUS_TOP_N:-400}"
 
 # shellcheck disable=SC2206
-CENSUS_CMD=(${COVERAGE_CENSUS_CMD:-uv run --frozen --project "$FM" python})
+CENSUS_CMD=(${COVERAGE_CENSUS_CMD:-})
 # shellcheck disable=SC2206
-STAMP_CMD=(${RETRO_STAMP_CMD:-uv run --frozen --project "$FM" python})
+STAMP_CMD=(${RETRO_STAMP_CMD:-})
+if [ "${#CENSUS_CMD[@]}" -eq 0 ] || [ "${#STAMP_CMD[@]}" -eq 0 ]; then
+    UV_RESOLVED="$(require_uv_bin)" || exit $?
+    UV_PYTHON=("$UV_RESOLVED" run --frozen --project "$FM" python)
+    [ "${#CENSUS_CMD[@]}" -eq 0 ] && CENSUS_CMD=("${UV_PYTHON[@]}")
+    [ "${#STAMP_CMD[@]}" -eq 0 ] && STAMP_CMD=("${UV_PYTHON[@]}")
+fi
 
 echo "memory-metadata-coverage-census: censusing $REPO (top-n $CENSUS_TOP_N)"
 "${CENSUS_CMD[@]}" "$FM/scripts/census_memory_metadata.py" --top-n "$CENSUS_TOP_N"
@@ -245,7 +267,8 @@ fi
 # commit=0, which is exactly what made "declined" and "committed" ambiguous
 # in the journal before this field existed.
 echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc commit=$commit_rc commit-step=$commit_step)"
-# Always 0 — a recurring systemd oneshot that exits non-zero enters `failed`
+# Always 0 once the halves have run (the pre-flight 127 is the header's one
+# exception) — a recurring systemd oneshot that exits non-zero enters `failed`
 # state and STAYS there, silently ending the append-only trend this job
 # exists to build (see the header, and scripts/fused-memory-flag-marker-sweep.sh).
 # That is a strictly worse outcome than the one missed nightly row a refusal

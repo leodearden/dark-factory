@@ -28,7 +28,7 @@ import dataclasses
 from typing import Any
 from unittest.mock import MagicMock
 
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     InflightEntry,
     MergeOutcome,
     SpeculativeMergeWorker,

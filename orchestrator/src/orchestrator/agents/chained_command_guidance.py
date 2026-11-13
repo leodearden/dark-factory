@@ -1,9 +1,8 @@
 """Role-prompt guidance: reading the one exit status of a chained `Bash` call.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `CHAINED_COMMAND_STATUS_GUIDANCE` into every role holding unqualified
-`Bash`. It is a leaf module, imported downward by roles.py, only so that
-already oversized file does not grow further.
+`Bash`. It is a leaf module, imported downward by harness_guidance.py.
 
 A call whose steps are joined with `&&` or `;` reports one status, the last-run
 command's, and `&&` stops at the first step that exits non-zero.

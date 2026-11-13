@@ -14,8 +14,9 @@ NOTHING HERE IMPORTS ``fused_memory.backends.sqlite_task_backend``, and that is
 deliberate rather than an oversight. It hard-imports ``aiosqlite``, which the
 ``uv run --project shared`` environment this suite runs under does not carry —
 a ``ModuleNotFoundError`` shape the confusion codebook records at least five
-separate times. Asserting against ``_SCHEMA_SQL`` would also test the wrong
-property: the tool must be right about a store it has never seen.
+separate times. Asserting against ``shared.task_store_schema.TASK_STORE_DDL``
+would also test the wrong property: the tool must be right about a store it
+has never seen.
 
 COVERAGE — the two chains that run this directory (see
 ``scripts/tests/test_task_db_scan.py``'s docstring for the near-homograph trap
@@ -35,15 +36,20 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _task_db_scan import connect_ro
+from shared.tasks_db_readonly import connect_ro
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from tasks_db_schema import (
     EXIT_OK,
     EXIT_UNREADABLE,
     MainCheckoutUnresolved,
+    columns_outside,
     introspect,
+    introspect_ddl,
     main,
     resolve_live_db_path,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Git fixtures. Real repositories rather than a stubbed `git worktree list`:
@@ -370,6 +376,114 @@ def test_a_column_with_no_declared_type_is_reported_as_unconstrained(tmp_path):
 
     assert loose.declared_type == ""
     assert loose.python_type is None
+
+
+# ---------------------------------------------------------------------------
+# introspect_ddl(ddl) -> tuple[Table, ...]
+# columns_outside(candidate, reference) -> ((table, Column), ...)
+#
+# Arbitrary inline DDLs only: the properties are "a DDL is reported exactly as
+# a store built from it is" and "every candidate column the reference does not
+# declare identically is reported", whatever the schema.
+# ---------------------------------------------------------------------------
+
+def _pair_ddl(note: str = "note TEXT", primary_key: str = "left_id, right_id") -> str:
+    return f"""
+    CREATE TABLE pair (
+        left_id  INTEGER NOT NULL,
+        right_id INTEGER NOT NULL,
+        {note},
+        PRIMARY KEY ({primary_key})
+    );
+    """
+
+
+def _column(tables, table_name: str, column_name: str):
+    (column,) = (
+        column
+        for table in tables
+        if table.name == table_name
+        for column in table.columns
+        if column.name == column_name
+    )
+    return column
+
+
+def test_introspect_ddl_reports_what_introspect_reports_for_a_store_built_from_that_ddl(
+    tmp_path,
+):
+    ddl = _pair_ddl() + "CREATE TABLE loose (anything);"
+    built = tmp_path / "built.db"
+    builder = sqlite3.connect(built)
+    try:
+        builder.executescript(ddl)
+    finally:
+        builder.close()
+    conn = connect_ro(built)
+    try:
+        expected = introspect(conn)
+    finally:
+        conn.close()
+
+    assert introspect_ddl(ddl) == expected
+
+
+def test_columns_outside_an_identical_schema_is_empty():
+    assert columns_outside(introspect_ddl(_pair_ddl()), introspect_ddl(_pair_ddl())) == ()
+
+
+def test_columns_outside_a_superset_schema_is_empty():
+    reference = introspect_ddl(
+        _pair_ddl(note="note TEXT, added INTEGER") + "CREATE TABLE reference_only (x TEXT);"
+    )
+
+    assert columns_outside(introspect_ddl(_pair_ddl()), reference) == ()
+
+
+@pytest.mark.parametrize(
+    ("candidate_note", "reference_note"),
+    [
+        ("note TEXT", "remark TEXT"),
+        ("note TEXT", "note INTEGER"),
+        ("note TEXT NOT NULL", "note TEXT"),
+        ("note TEXT", "note TEXT NOT NULL"),
+    ],
+    ids=["renamed", "retyped", "not-null-only-in-candidate", "not-null-only-in-reference"],
+)
+def test_columns_outside_reports_the_candidate_column_the_reference_declares_differently(
+    candidate_note, reference_note
+):
+    candidate = introspect_ddl(_pair_ddl(note=candidate_note))
+    reference = introspect_ddl(_pair_ddl(note=reference_note))
+
+    assert columns_outside(candidate, reference) == (("pair", _column(candidate, "pair", "note")),)
+
+
+def test_columns_outside_reports_columns_at_a_different_primary_key_position():
+    candidate = introspect_ddl(_pair_ddl())
+    reference = introspect_ddl(_pair_ddl(primary_key="right_id, left_id"))
+
+    assert columns_outside(candidate, reference) == (
+        ("pair", _column(candidate, "pair", "left_id")),
+        ("pair", _column(candidate, "pair", "right_id")),
+    )
+
+
+def test_columns_outside_reports_every_column_of_a_table_the_reference_lacks_in_declaration_order():
+    candidate = introspect_ddl(
+        _pair_ddl() + "CREATE TABLE orphan (zeta TEXT, alpha INTEGER, mid REAL);"
+    )
+
+    outside = columns_outside(candidate, introspect_ddl(_pair_ddl()))
+
+    assert [(table, column.name) for table, column in outside] == [
+        ("orphan", "zeta"),
+        ("orphan", "alpha"),
+        ("orphan", "mid"),
+    ]
+    assert [column for _table, column in outside] == [
+        _column(candidate, "orphan", name) for name in ("zeta", "alpha", "mid")
+    ]
 
 
 # ---------------------------------------------------------------------------

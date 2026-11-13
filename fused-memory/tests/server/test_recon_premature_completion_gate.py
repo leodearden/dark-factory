@@ -18,8 +18,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Frames task 5252 as complete in present tense ("has landed", "now enforces").
 _COMPLETION_CONTENT = 'task 5252 has landed and now enforces the manifest gate'

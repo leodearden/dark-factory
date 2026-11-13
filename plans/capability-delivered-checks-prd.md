@@ -161,6 +161,7 @@ Recon/escalation-filed tasks are covered separately by `premise_lint`
 ```yaml
 prd: plans/<slug>-prd.md        # repo-relative; MUST equal the batch's metadata.prd_path
 schema_version: 1
+signal_leaves: ["α"]           # OPTIONAL (added 2026-10-10) — labels of the block(s) whose completion delivers the PRD's goal signal; see plans/dashboard-prd-lanes-prd.md §5.2
 tasks:
   - label: "α"                  # matches metadata.prd_task_label
     task_id: null               # int | null; stamped by commit_planning — never author-supplied
@@ -196,6 +197,9 @@ rejected; `kind` ∈ {grep, script, manual}; `grep` requires
 `pattern` + `expect`, forbids `script`; `script` requires `script` +
 `timeout_secs`, forbids `pattern`/`expect`; `manual` forbids all check fields.
 Malformed docs → structured `ValidationError` naming the entry.
+(2026-10-10, plans/dashboard-prd-lanes-prd.md §5.2) `signal_leaves` optional;
+when present, non-empty and every entry a label of this doc's `tasks` — an
+unknown label or `[]` is rejected, naming the label.
 
 ### Producer-task metadata (stamped by γ)
 

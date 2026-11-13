@@ -5,17 +5,30 @@ import json
 import logging
 import types
 from datetime import UTC, datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from _fm_helpers import _make_rate_limit_error
 from _mem0_record_shapes import mem0_record
 from _qdrant_responses import missing_collection_404
+from _queued_write_fixtures import (
+    enqueued,
+    envelope,
+    episode_write,
+    graphiti_memory_write,
+    mem0_fact,
+    queued,
+)
 from qdrant_client.http.exceptions import UnexpectedResponse
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, escalation_queue_dir
 
+from fused_memory.backends.falkor_server_settings import FalkorServerSettings
+from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware import dead_letter_escalator
+from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.scope import Scope
+from fused_memory.models.scope import Scope, resolve_project_id_for_root
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
@@ -24,6 +37,14 @@ from fused_memory.services.memory_service import (
     _serialize_temporal,
     metadata_row_text,
 )
+from fused_memory.services.queued_writes import (
+    QueueCallback,
+    QueuedEpisodeWrite,
+    QueuedGraphitiMemoryWrite,
+    QueuedMem0Add,
+    QueuedMem0Fact,
+)
+from fused_memory.services.write_journal import Mem0IntentStatus
 from fused_memory.utils.referent_verification import ReferentStats
 
 # A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
@@ -48,12 +69,26 @@ DEFAULT_POINT_PAYLOAD = {
 }
 
 
+_MATCHING_SERVER_SETTINGS = FalkorServerSettings(
+    expected_graph_timeout_ms=30000, graph_timeout_ms=30000, appendonly='yes',
+)
+
+
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
+    return _mocked_service(mock_config)
+
+
+def _mocked_service(config) -> MemoryService:
+    """Build a MemoryService over *config* with mocked backends.
+
+    The ``service`` fixture's body, callable from a test body so a test can
+    set the environment BEFORE the service is constructed.
+    """
     from _fm_helpers import install_identity_mocks
 
-    svc = MemoryService(mock_config)
+    svc = MemoryService(config)
     # Mock backends
     svc.graphiti = MagicMock()
     svc.graphiti.search = AsyncMock(return_value=[])
@@ -70,6 +105,7 @@ def service(mock_config):
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    svc.graphiti.read_server_settings = AsyncMock(return_value=_MATCHING_SERVER_SETTINGS)
     install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
@@ -118,6 +154,16 @@ def service(mock_config):
     svc.durable_queue.replay_dead = AsyncMock(return_value=0)
     svc.durable_queue.close = AsyncMock()
     return svc
+
+
+def _mem0_add_journal() -> MagicMock:
+    """A write-journal double covering every call add_memory's Mem0 leg makes."""
+    journal = MagicMock()
+    journal.log_write_op = AsyncMock()
+    journal.log_backend_op = AsyncMock()
+    journal.log_mem0_intent = AsyncMock()
+    journal.resolve_mem0_intent = AsyncMock()
+    return journal
 
 
 class TestScope:
@@ -173,8 +219,8 @@ class TestAddMemory:
         assert SourceStore.mem0 in result.stores_written
         # Graphiti still goes through the durable queue; Mem0 is now a direct call
         assert service.durable_queue.enqueue.call_count == 1
-        ops = [c[1]['operation'] for c in service.durable_queue.enqueue.call_args_list]
-        assert ops == ['add_memory_graphiti']
+        values = [value for value, _ in enqueued(service.durable_queue.enqueue)]
+        assert [type(v) for v in values] == [QueuedGraphitiMemoryWrite]
         service.mem0.add.assert_called_once()
 
     @pytest.mark.asyncio
@@ -389,8 +435,9 @@ class TestAddMemory:
         """task 1974: a mem0.add call that returns {'results': []} WITHOUT
         raising is a silent dedup/no-op drop — the exact failure mode that
         made Stage 2's cycle_summary write go fully absent with no trace.
-        It must be logged as a WARNING even though add_memory() itself does
-        not raise and behavior (response/stores_written/journal) is unchanged.
+        add_memory() still does not raise, but the drop is no longer silent:
+        it is logged as a WARNING, and the response does not claim mem0 as
+        written.
         """
         service.mem0.add = AsyncMock(return_value={'results': []})
 
@@ -407,13 +454,12 @@ class TestAddMemory:
                 causation_id='run-x',
             )
 
-        # Behavior must be UNCHANGED — this is observability-only.
         assert result.memory_ids == [], (
             f'Expected memory_ids=[] for an empty mem0 result, got {result.memory_ids!r}'
         )
-        assert SourceStore.mem0 in result.stores_written, (
-            'stores_written must still include mem0 — the write was attempted '
-            'and did not raise; only the returned ids are empty.'
+        assert SourceStore.mem0 not in result.stores_written, (
+            'stores_written must not claim mem0 when Mem0 returned no id — '
+            'nothing was written.'
         )
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -468,6 +514,8 @@ class TestAddMemory:
         non-actionable log line for a legitimate infer-driven no-op."""
         monkeypatch.setattr(memory_service, '_MEM0_ADD_INFER_PINNED_FALSE', False)
         service.mem0.add = AsyncMock(return_value={'results': []})
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             result = await service.add_memory(
@@ -482,14 +530,112 @@ class TestAddMemory:
                 causation_id='run-x',
             )
 
-        # Behavior (response/stores_written) is unaffected by the gate.
+        # Nothing was written whatever the pin, so mem0 is never claimed. With
+        # the pin lifted a zero-id return is a legitimate no-op: no anomaly is
+        # reported and the intent completes.
         assert result.memory_ids == []
-        assert SourceStore.mem0 in result.stores_written
+        assert SourceStore.mem0 not in result.stores_written
+        assert 'empty_result' not in result.message
+        mock_journal.resolve_mem0_intent.assert_awaited_once_with(
+            ANY, Mem0IntentStatus.COMPLETED
+        )
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records == [], (
             f'Expected no WARNING once the infer=False pin no longer holds, got: '
             f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            'backend_mock_kwargs',
+            'expected_stores',
+            'expected_message_suffix',
+            'expected_journal_error',
+        ),
+        [
+            pytest.param(
+                {'return_value': {'results': [{'id': 'mem0-1'}]}},
+                [SourceStore.mem0],
+                '',
+                None,
+                id='landed',
+            ),
+            pytest.param(
+                {'side_effect': RuntimeError('qdrant down')},
+                [],
+                ' [mem0_error: qdrant down]',
+                'qdrant down',
+                id='raised',
+            ),
+            pytest.param(
+                {'return_value': {'results': []}},
+                [],
+                ' [empty_result: mem0 add returned zero memory_ids]',
+                'empty_result: mem0 add returned zero memory_ids',
+                id='zero_ids',
+            ),
+        ],
+    )
+    async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
+        self,
+        service,
+        backend_mock_kwargs,
+        expected_stores,
+        expected_message_suffix,
+        expected_journal_error,
+    ):
+        """add_memory says mem0 was written — in the response, the journal and
+        the message — only when Mem0 actually returned an id, and names every
+        failure, a silent zero-id drop included."""
+        service.mem0.add = AsyncMock(**backend_mock_kwargs)
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='cycle summary',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            causation_id='c1',
+        )
+
+        expected_store_values = [s.value for s in expected_stores]
+        assert result.stores_written == expected_stores
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == expected_store_values
+        assert journal_kwargs['success'] is (expected_journal_error is None)
+        assert journal_kwargs['error'] == expected_journal_error
+        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
+
+    @pytest.mark.asyncio
+    async def test_dual_write_zero_ids_claims_graphiti_alone_and_names_the_drop(
+        self, service
+    ):
+        """A landed Graphiti leg does not mask a zero-id Mem0 leg: the write
+        claims graphiti alone, and the journal and the message both name the
+        Mem0 drop."""
+        service.mem0.add = AsyncMock(return_value={'results': []})
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            dual_write=True,
+            causation_id='c1',
+        )
+
+        service.durable_queue.enqueue.assert_awaited_once()
+        assert result.stores_written == [SourceStore.graphiti]
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == ['graphiti']
+        assert journal_kwargs['success'] is False
+        assert journal_kwargs['error'] == 'empty_result: mem0 add returned zero memory_ids'
+        assert result.message == (
+            "Memory queued for ['graphiti'] "
+            '[empty_result: mem0 add returned zero memory_ids]'
         )
 
 
@@ -809,30 +955,10 @@ class TestAddEpisode:
         assert result.status == 'queued'
         assert result.episode_id is not None
         service.durable_queue.enqueue.assert_called_once()
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        assert call_kwargs['callback_type'] == 'dual_write_episode'
-        assert call_kwargs['payload']['project_id'] == 'test'
-
-    @pytest.mark.asyncio
-    async def test_enqueue_payload_omits_uuid(self, service):
-        """The enqueue payload must NOT carry 'uuid' (task 3561).
-
-        Inverted from the old contract ("payload must include 'uuid' matching
-        the returned episode_id"), which was fatal: graphiti_core reads a
-        caller-supplied uuid as "LOAD this existing episode", so a
-        freshly-minted one is unconditionally NodeNotFoundError. The uuid is
-        minted by graphiti_core and read back off result.episode.uuid.
-        """
-        await service.add_episode(
-            content='User discussed auth changes',
-            project_id='test',
-        )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
-        assert 'uuid' not in payload, (
-            "Payload must not carry 'uuid' — graphiti_core would try to LOAD "
-            f'that node and raise NodeNotFoundError; got {payload.get("uuid")!r}'
-        )
+        [(value, callback)] = enqueued(service.durable_queue.enqueue)
+        assert isinstance(value, QueuedEpisodeWrite)
+        assert callback == QueueCallback.DUAL_WRITE_EPISODE
+        assert value.envelope.project_id == 'test'
 
 
 class TestExecuteGraphitiWrite:
@@ -846,9 +972,9 @@ class TestExecuteGraphitiWrite:
         "LOAD this existing episode" and raises NodeNotFoundError.
         """
         await service.add_episode(content='test content', project_id='test')
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        [(value, _)] = enqueued(service.durable_queue.enqueue)
 
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(value)
         service.graphiti.add_episode.assert_called_once()
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('uuid') is None
@@ -863,7 +989,7 @@ class TestExecuteGraphitiWrite:
             'group_id': 'test',
             'source_description': '',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
         service.graphiti.add_episode.assert_called_once()
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('uuid') is None
@@ -871,53 +997,52 @@ class TestExecuteGraphitiWrite:
 
 class TestDurableWriteDispatcher:
     @pytest.mark.asyncio
-    async def test_routes_graphiti_operations(self, service):
-        """add_episode and add_memory_graphiti route to _execute_graphiti_write."""
-        payload = {
-            'name': 'test', 'content': 'test', 'source': 'text',
-            'group_id': 'test', 'source_description': '',
-        }
-        await service._execute_durable_write('add_episode', dict(payload))
+    async def test_routes_episode_write_to_graphiti(self, service):
+        await service._execute_durable_write(episode_write())
+        service.graphiti.add_episode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_routes_graphiti_memory_write_to_graphiti(self, service):
+        await service._execute_durable_write(graphiti_memory_write())
         service.graphiti.add_episode.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_routes_mem0_add(self, service):
-        """mem0_add operation routes to _execute_mem0_write."""
-        payload = {
-            'content': 'Always use type hints',
-            'metadata': {'category': 'preferences_and_norms'},
-            'project_id': 'test',
-        }
-        await service._execute_durable_write('mem0_add', payload)
+        await service._execute_durable_write(
+            QueuedMem0Add(
+                envelope=envelope(),
+                content='Always use type hints',
+                metadata={'category': 'preferences_and_norms'},
+            )
+        )
         service.mem0.add.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_mem0_add_queue_operation_still_dispatches(self, service):
-        """Backward-compat: in-flight 'mem0_add' queue items must still drain.
-
-        The add_memory() path no longer enqueues 'mem0_add', but items
-        written to the queue before this fix must still execute correctly
-        so no data is lost on restart.
-        """
-        payload = {
-            'content': 'Legacy queued content',
-            'metadata': {'category': 'preferences_and_norms'},
-            'project_id': 'test',
-            'agent_id': 'legacy-agent',
-        }
-        await service._execute_durable_write('mem0_add', payload)
-        service.mem0.add.assert_called_once()
+    async def test_routes_mem0_fact_to_classify_and_add(self, service):
+        service._execute_mem0_classify_and_add = AsyncMock()
+        fact = mem0_fact(fact_text='Always format with black')
+        await service._execute_durable_write(fact)
+        service._execute_mem0_classify_and_add.assert_awaited_once_with(fact)
 
     @pytest.mark.asyncio
-    async def test_routes_mem0_classify_and_add(self, service):
-        """mem0_classify_and_add routes to _execute_mem0_classify_and_add."""
-        payload = {
-            'fact_text': 'Always format with black',
-            'project_id': 'test',
-        }
-        # classifier will route this — may or may not call mem0.add depending on
-        # heuristic classification. Just verify no error.
-        await service._execute_durable_write('mem0_classify_and_add', payload)
+    async def test_a_value_outside_the_union_raises_at_dispatch(self, service):
+        class NotAQueuedWrite:
+            def __repr__(self) -> str:
+                return 'NotAQueuedWrite()'
+
+        with pytest.raises(AssertionError, match='NotAQueuedWrite'):
+            await service._execute_durable_write(NotAQueuedWrite())
+        service.graphiti.add_episode.assert_not_called()
+        service.mem0.add.assert_not_called()
+
+
+def _enqueued_facts(enqueue_mock: AsyncMock) -> list[QueuedMem0Fact]:
+    facts = []
+    for value, callback in enqueued(enqueue_mock):
+        assert isinstance(value, QueuedMem0Fact)
+        assert callback is None
+        facts.append(value)
+    return facts
 
 
 class TestDualWriteCallback:
@@ -930,19 +1055,20 @@ class TestDualWriteCallback:
             MockEdge(fact='Redis uses port 6379'),
             MockEdge(fact='Auth service depends on Redis'),
         ])
-        payload = {
-            'project_id': 'test',
-            'agent_id': 'test-agent',
-            '_causation_id': 'caus-1',
-        }
-        await service._dual_write_callback('dual_write_episode', result, payload)
+        episode = episode_write(
+            envelope=envelope(agent_id='test-agent', causation_id='caus-1'),
+            unverified_claim=True,
+        )
+        await service._dual_write_callback(episode, result)
 
         service.durable_queue.enqueue_batch.assert_called_once()
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
-        assert len(batch) == 2
-        assert all(item['operation'] == 'mem0_classify_and_add' for item in batch)
-        assert all(item['group_id'] == 'mem0_test' for item in batch)
-        assert batch[0]['payload']['fact_text'] == 'Redis uses port 6379'
+        facts = _enqueued_facts(service.durable_queue.enqueue_batch)
+        assert len(facts) == 2
+        assert all(fact.envelope.group_id == 'mem0_test' for fact in facts)
+        assert all(fact.envelope.causation_id == 'caus-1' for fact in facts)
+        assert all(fact.envelope.agent_id == 'test-agent' for fact in facts)
+        assert all(fact.unverified_claim for fact in facts)
+        assert facts[0].fact_text == 'Redis uses port 6379'
 
     @pytest.mark.asyncio
     async def test_callback_no_edges_is_noop(self, service):
@@ -950,13 +1076,13 @@ class TestDualWriteCallback:
         from _fm_helpers import MockAddEpisodeResult
 
         result = MockAddEpisodeResult(entity_edges=[])
-        await service._dual_write_callback('dual_write_episode', result, {'project_id': 'test'})
+        await service._dual_write_callback(episode_write(), result)
         service.durable_queue.enqueue_batch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_callback_none_result_is_noop(self, service):
         """None result → no enqueue."""
-        await service._dual_write_callback('dual_write_episode', None, {'project_id': 'test'})
+        await service._dual_write_callback(episode_write(), None)
         service.durable_queue.enqueue_batch.assert_not_called()
 
 
@@ -971,16 +1097,13 @@ class TestDualWriteCallbackTemporalContext:
         result = MockAddEpisodeResult(entity_edges=[
             MockEdge(fact='CostStore extends AgentResult'),
         ])
-        payload = {
-            'project_id': 'test',
-            'temporal_context': 'planning',
-        }
-        await service._dual_write_callback('dual_write_episode', result, payload)
+        await service._dual_write_callback(
+            episode_write(temporal_context='planning'), result
+        )
 
         service.durable_queue.enqueue_batch.assert_called_once()
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
-        assert len(batch) == 1
-        assert batch[0]['payload']['temporal_context'] == 'planning'
+        [fact] = _enqueued_facts(service.durable_queue.enqueue_batch)
+        assert fact.temporal_context == 'planning'
 
     @pytest.mark.asyncio
     async def test_no_temporal_context_absent_from_batch(self, service):
@@ -990,17 +1113,11 @@ class TestDualWriteCallbackTemporalContext:
         result = MockAddEpisodeResult(entity_edges=[
             MockEdge(fact='Auth depends on Redis'),
         ])
-        payload = {
-            'project_id': 'test',
-            # no temporal_context
-        }
-        await service._dual_write_callback('dual_write_episode', result, payload)
+        await service._dual_write_callback(episode_write(), result)
 
         service.durable_queue.enqueue_batch.assert_called_once()
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
-        assert len(batch) == 1
-        # temporal_context is absent or None — not 'planning'
-        assert batch[0]['payload'].get('temporal_context') is None
+        [fact] = _enqueued_facts(service.durable_queue.enqueue_batch)
+        assert fact.temporal_context is None
 
 
 class TestExecuteMem0ClassifyAndAddPlanningMetadata:
@@ -1024,7 +1141,7 @@ class TestExecuteMem0ClassifyAndAddPlanningMetadata:
             'project_id': 'test',
             'temporal_context': 'planning',
         }
-        await service._execute_mem0_classify_and_add(payload)
+        await service._execute_mem0_classify_and_add(queued('mem0_classify_and_add', payload))
 
         # Unconditional assertion — classifier is forced to Mem0 so this must be called
         service.mem0.add.assert_called_once()
@@ -1052,7 +1169,7 @@ class TestExecuteMem0ClassifyAndAddPlanningMetadata:
             'project_id': 'test',
             # no temporal_context
         }
-        await service._execute_mem0_classify_and_add(payload)
+        await service._execute_mem0_classify_and_add(queued('mem0_classify_and_add', payload))
 
         # Unconditional assertion — classifier is forced to Mem0 so this must be called
         service.mem0.add.assert_called_once()
@@ -1080,7 +1197,7 @@ class TestExecuteMem0ClassifyAndAddPlanningMetadata:
             'project_id': 'test',
             'temporal_context': 'planning',
         }
-        await service._execute_mem0_classify_and_add(payload)
+        await service._execute_mem0_classify_and_add(queued('mem0_classify_and_add', payload))
 
         service.mem0.add.assert_called_once()
         call_kwargs = service.mem0.add.call_args[1]
@@ -1101,9 +1218,13 @@ class TestReplayFromStore:
         count = await service.replay_from_store(source_project_id='reify')
         assert count == 2  # empty one skipped
         service.durable_queue.enqueue_batch.assert_called_once()
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        batch = enqueued(service.durable_queue.enqueue_batch)
         assert len(batch) == 2
-        assert batch[0]['group_id'] == 'reify'
+        for value, callback in batch:
+            assert isinstance(value, QueuedGraphitiMemoryWrite)
+            assert callback == QueueCallback.REFRESH_ENTITY_SUMMARIES
+            assert value.envelope.project_id == value.envelope.group_id == 'reify'
+            assert value.envelope.write_op_id is None
 
 
 class TestSearch:
@@ -2836,12 +2957,130 @@ class TestUpdateMemoryStormCounter:
 
         assert isinstance(service._mem0_update_storm_escalator, Mem0UpdateStormEscalator)
 
-    def test_set_known_projects_reaches_the_escalator(self, service):
-        """The registry snapshot must arrive where project_root resolution happens."""
-        service.set_known_projects({'dark_factory': '/home/leo/src/dark-factory'})
-        assert service._mem0_update_storm_escalator._known_projects == {
-            'dark_factory': '/home/leo/src/dark-factory',
-        }
+
+@pytest.mark.skipif(
+    not storm_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestUpdateMemoryStormFilesIntoTheProjectQueue:
+    """An update_memory burst lands as a record in the right project's queue.
+
+    Drives the REAL escalator into real queue files under tmp_path through the
+    public surface, so it fails whichever link breaks: the registry seed, its
+    forwarding to the escalator, or the project_id -> root resolution.
+    """
+
+    AGENT = 'recon-stage-memory_consolidator'
+
+    @staticmethod
+    def _filed(root):
+        queue_files = sorted(escalation_queue_dir(root).glob('esc-*.json'))
+        return [json.loads(path.read_text()) for path in queue_files]
+
+    async def _amend(self, service, project_id, times):
+        for _ in range(times):
+            await service.update_memory(
+                memory_id='point-1', project_id=project_id,
+                content='amended text', reason='consolidation',
+                agent_id=self.AGENT,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_never_wired_service_files_into_an_env_registered_root(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The alarm defends itself: startup wiring is not its only registry source."""
+        root = tmp_path / 'storm_proj'
+        root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+
+        await self._amend(service, resolve_project_id_for_root(root), times=3)
+
+        filed = self._filed(root)
+        assert len(filed) == 1, filed
+        assert filed[0]['category'] == 'mem0_in_place_update_storm'
+        assert self.AGENT in filed[0]['summary']
+
+    @pytest.mark.asyncio
+    async def test_startup_wiring_replaces_the_env_seed(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The startup snapshot wins over the seed, and the setter reaches the escalator."""
+        root_env = tmp_path / 'seeded' / 'storm_proj'
+        root_env.mkdir(parents=True)
+        root_wired = tmp_path / 'wired'
+        root_wired.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root_env))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        project_id = resolve_project_id_for_root(root_env)
+
+        service.set_known_projects({project_id: str(root_wired)})
+        await self._amend(service, project_id, times=3)
+
+        assert len(self._filed(root_wired)) == 1
+        assert self._filed(root_env) == []
+
+    @pytest.mark.asyncio
+    async def test_the_seed_never_consults_taskmaster_project_root(
+        self, mock_config, tmp_path, caplog,
+    ):
+        """taskmaster.project_root defaults to '.', so seeding from it would misfile.
+
+        With no env registry the burst must be logged and filed nowhere, even
+        into a real directory the config names.
+        """
+        primary = tmp_path / 'primary_proj'
+        primary.mkdir()
+        mock_config.taskmaster = TaskmasterConfig(project_root=str(primary))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        project_id = resolve_project_id_for_root(primary)
+
+        with caplog.at_level(logging.WARNING, logger=storm_mod.__name__):
+            await self._amend(service, project_id, times=3)
+
+        assert self._filed(primary) == []
+        assert any(
+            record.name == storm_mod.__name__
+            and record.levelno == logging.WARNING
+            and project_id in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_one_agent_amending_in_two_projects_files_a_per_project_count(
+        self, mock_config, tmp_path,
+    ):
+        """A recon stage id carries no project, so one agent amends in many.
+
+        The count filed into a project's queue must be reproducible from that
+        project's own journal rows, never pooled across projects.
+        """
+        root_a = tmp_path / 'a'
+        root_b = tmp_path / 'b'
+        root_a.mkdir()
+        root_b.mkdir()
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        service.set_known_projects({'proj_a': str(root_a), 'proj_b': str(root_b)})
+
+        await self._amend(service, 'proj_a', times=2)
+        await self._amend(service, 'proj_b', times=2)
+
+        assert self._filed(root_a) == []
+        assert self._filed(root_b) == []
+
+        await self._amend(service, 'proj_b', times=1)
+
+        filed = self._filed(root_b)
+        assert len(filed) == 1, filed
+        assert 'count=3' in filed[0]['detail'].splitlines()
+        assert 'proj_b' in filed[0]['summary']
+        assert self._filed(root_a) == []
+        assert service.mem0_update_storm_tracked_agents == frozenset({self.AGENT})
 
 
 class TestUpdateEdgeVerification:
@@ -3051,6 +3290,48 @@ class TestClose:
         mock_journal.close.assert_called_once()
         mock_buffer.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_close_closes_router_and_classifier(self, service):
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+        service.router.close = AsyncMock()
+        service.classifier.close = AsyncMock()
+
+        await service.close()
+
+        service.router.close.assert_awaited_once()
+        service.classifier.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_durable_flush_closes_run_before_sdk_pool_releases(self, service):
+        service._write_journal = MagicMock()
+        service._event_buffer = MagicMock()
+        service.planned_episode_registry = MagicMock()
+        order: list[str] = []
+        for label, resource in (
+            ('durable_queue', service.durable_queue),
+            ('graphiti', service.graphiti),
+            ('mem0', service.mem0),
+            ('write_journal', service._write_journal),
+            ('event_buffer', service._event_buffer),
+            ('planned_episode_registry', service.planned_episode_registry),
+            ('classifier', service.classifier),
+            ('router', service.router),
+        ):
+            resource.close = AsyncMock(side_effect=lambda label=label: order.append(label))
+
+        await service.close()
+
+        assert sorted(order) == sorted(
+            [
+                'durable_queue', 'graphiti', 'mem0', 'write_journal',
+                'event_buffer', 'planned_episode_registry', 'classifier', 'router',
+            ]
+        )
+        for durable in ('write_journal', 'event_buffer', 'planned_episode_registry'):
+            for pool in ('classifier', 'router'):
+                assert order.index(durable) < order.index(pool), order
+
 
 # The logger MemoryService.close() reports sub-close failures on. Single-sourced
 # so the caplog LEVEL scope (`at_level(logger=...)`) and the record FILTER below
@@ -3186,9 +3467,10 @@ class TestCloseBoundsSlowSubclose:
     shutdown budget or starve the durable-flush closes that follow it."""
 
     def _wire_resources(self, service):
-        """Wire all six sub-resources with AsyncMock close() methods and
-        return a name->mock mapping (mirrors
-        TestCloseLogsExceptions._make_resource_mocks)."""
+        """Wire the six storage sub-resources with AsyncMock close() methods
+        and return a name->mock mapping (mirrors
+        TestCloseLogsExceptions._make_resource_mocks). The classifier and
+        router SDK-pool releases are left real."""
         service.graphiti.close = AsyncMock()
         service.mem0.close = AsyncMock()
 
@@ -3333,6 +3615,35 @@ class TestCloseBoundsSlowSubclose:
         resources['durable_queue'].close.assert_awaited_once()
         for name in ('_write_journal', '_event_buffer', 'planned_episode_registry'):
             resources[name].close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hung_sdk_pool_release_is_bounded_below_the_backend_budget(
+        self, service, caplog
+    ):
+        """An SDK connection-pool release only drops local idle sockets, so its
+        real budget is far tighter than a storage backend's: a hung classifier
+        release lets close() return inside 2.0s with no timeout monkeypatched,
+        and the router release after it still runs."""
+        resources = self._wire_resources(service)
+        service.router.close = AsyncMock()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        service.classifier.close = AsyncMock(side_effect=_hang)
+
+        with caplog.at_level(logging.WARNING, logger=_CLOSE_LOGGER):
+            await asyncio.wait_for(service.close(), timeout=2.0)
+
+        service.router.close.assert_awaited_once()
+        for resource in resources.values():
+            resource.close.assert_awaited_once()
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == _CLOSE_LOGGER
+        ]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert 'classifier' in warnings[0].getMessage()
 
 
 class TestGraphitiBackendRemoveEdge:
@@ -4065,6 +4376,49 @@ class TestGetEntity:
         assert 'e-invalid' not in {e['uuid'] for e in result['edges']}, (
             'FUZZY branch must drop invalidated edges to match the EXACT/topological '
             'branch (task 2726)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_branch_keeps_restored_edges(self, service):
+        """FUZZY branch keeps a restored edge — ``invalid_at`` None, ``expired_at``
+        set — while still dropping a superseded one (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature; graphiti_core never sets ``expired_at`` without
+        ``invalid_at``.  So ``expired_at`` alone marks a RESTORED fact, not a
+        retired one, and dropping it would hide exactly what the hooks restored.
+        """
+        from _fm_helpers import MockEdge, MockNode
+
+        # Empty exact-name result forces the FUZZY fallback.  search_nodes and
+        # search are awaited concurrently through gather_or_raise, so both must
+        # be stubbed or the gather raises.
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Svc', uuid='n1')]
+        )
+        retired = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Svc valid fact', uuid='e-valid', invalid_at=None, expired_at=None),
+            MockEdge(
+                fact='Svc superseded fact',
+                uuid='e-superseded',
+                invalid_at=retired,
+                expired_at=retired,
+            ),
+            MockEdge(
+                fact='Svc restored fact',
+                uuid='e-restored',
+                invalid_at=None,
+                expired_at=retired,
+            ),
+        ])
+
+        result = await service.get_entity('Svc', project_id='test')
+
+        assert [e['uuid'] for e in result['edges']] == ['e-valid', 'e-restored'], (
+            'FUZZY branch must drop the superseded edge (invalid_at set) and keep '
+            'the restored one (invalid_at None, expired_at set) — esc-4714-9'
         )
 
     # ------------------------------------------------------------------
@@ -6024,7 +6378,7 @@ class TestExecuteGraphitiWriteWithDedup:
             'group_id': 'test',
             'source_description': '',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         # dedup must have removed the second edge
         service.graphiti.bulk_remove_edges.assert_called_once()
@@ -6046,7 +6400,7 @@ class TestExecuteGraphitiWriteWithDedup:
             'group_id': 'test',
             'source_description': '',
         }
-        result = await service._execute_graphiti_write('add_episode', payload)
+        result = await service._execute_graphiti_write(queued('add_episode', payload))
 
         # Should return None without crashing
         assert result is None
@@ -6088,7 +6442,7 @@ class TestExecuteGraphitiWriteWithDedup:
             'group_id': 'test',
             'source_description': '',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         # The restore hook must have cleared the false invalidation
         service.graphiti.update_edge.assert_called_once_with(
@@ -6117,7 +6471,7 @@ class TestExecuteGraphitiWriteWithDedup:
             'group_id': 'test',
             'source_description': '',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         service._dedup_episode_nodes.assert_awaited_once()
         assert service._dedup_episode_nodes.call_args == ((mock_result,), {'group_id': 'test'})
@@ -6145,7 +6499,7 @@ class TestExecuteGraphitiWriteWithDedup:
             'group_id': 'test',
             'source_description': '',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         service._normalize_task_node_names.assert_awaited_once()
         assert service._normalize_task_node_names.call_args == ((mock_result,), {'group_id': 'test'})
@@ -6179,7 +6533,7 @@ class TestExecuteGraphitiWriteWithDedup:
             'group_id': 'test',
             'source_description': '',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         call_order = [call[0] for call in manager.mock_calls]
         assert '_dedup_episode_nodes' in call_order and '_normalize_task_node_names' in call_order
@@ -6213,7 +6567,7 @@ class TestExecuteGraphitiWriteWithDedup:
             'group_id': 'test',
             'source_description': '',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         service._restore_falsely_superseded_sibling_edges.assert_awaited_once()
         assert service._restore_falsely_superseded_sibling_edges.call_args == (
@@ -6296,7 +6650,7 @@ class TestWriteTimeIdentityGate:
             'group_id': 'test',
             'source_description': '',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         assert observed_locked.get('add_episode') is True, 'lock must be held during add_episode'
         assert observed_locked.get('reconcile') is True, (
@@ -6367,8 +6721,8 @@ class TestWriteTimeIdentityGate:
             }
 
         results = await asyncio.gather(
-            service._execute_graphiti_write('add_episode', make_payload('a')),
-            service._execute_graphiti_write('add_episode', make_payload('b')),
+            service._execute_graphiti_write(queued('add_episode', make_payload('a'))),
+            service._execute_graphiti_write(queued('add_episode', make_payload('b'))),
             return_exceptions=True,
         )
 
@@ -6398,7 +6752,7 @@ class TestWriteTimeIdentityGate:
                 'agent_id': 'agent-1',
                 'metadata': {},
             }
-            result = await asyncio.wait_for(service._execute_mem0_write(payload), timeout=1.0)
+            result = await asyncio.wait_for(service._execute_mem0_write(queued('mem0_add', payload)), timeout=1.0)
         finally:
             lock.release()
 
@@ -6431,15 +6785,10 @@ class TestDualWriteCallbackEdgesField:
             MockEdge(fact='Redis stores sessions', uuid='e2'),
         ]
 
-        payload = {
-            'project_id': 'test',
-            'agent_id': 'test-agent',
-            '_causation_id': 'caus-1',
-        }
-        await service._dual_write_callback('dual_write_episode', result, payload)
+        await service._dual_write_callback(episode_write(), result)
 
         service.durable_queue.enqueue_batch.assert_called_once()
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        batch = enqueued(service.durable_queue.enqueue_batch)
         assert len(batch) == 2, (
             '_dual_write_callback must read from result.edges (got 2 edges) '
             f'but found {len(batch)} items — it may still be reading entity_edges'
@@ -6539,13 +6888,9 @@ class TestDualWriteCallbackRefreshesSummaries:
                 target_node_uuid='redis',
             ),
         ])
-        payload = {
-            'project_id': 'test',
-            'group_id': 'test',
-            'agent_id': 'a',
-            '_causation_id': 'c',
-        }
-        await service._dual_write_callback('dual_write_episode', result, payload)
+        await service._dual_write_callback(
+            episode_write(envelope=envelope(agent_id='a', causation_id='c')), result
+        )
 
         service.durable_queue.enqueue_batch.assert_called_once()
 
@@ -6577,10 +6922,9 @@ class TestRefreshSummariesCallback:
         result = MockAddEpisodeResult(edges=[
             MockEdge(fact='x', source_node_uuid='e1', target_node_uuid='e2'),
         ])
-        payload = {'group_id': 'proj'}
-
         await service._refresh_summaries_callback(
-            'refresh_entity_summaries', result, payload
+            graphiti_memory_write(envelope=envelope(project_id='proj', group_id='proj')),
+            result,
         )
 
         assert service.graphiti.refresh_entity_summary.await_count == 2, (
@@ -6601,7 +6945,8 @@ class TestRefreshSummariesCallback:
         service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
 
         await service._refresh_summaries_callback(
-            'refresh_entity_summaries', None, {'group_id': 'proj'}
+            graphiti_memory_write(envelope=envelope(project_id='proj', group_id='proj')),
+            None,
         )
 
         service.graphiti.refresh_entity_summary.assert_not_called()
@@ -6610,7 +6955,7 @@ class TestRefreshSummariesCallback:
 
 class TestAddMemoryGraphitiRefreshWiring:
     """step-09/10: the add_memory_graphiti enqueue must carry
-    callback_type='refresh_entity_summaries' so ingestion-time edge
+    QueueCallback.REFRESH_ENTITY_SUMMARIES so ingestion-time edge
     resolution on this path also triggers a post-write summary refresh."""
 
     @pytest.mark.asyncio
@@ -6622,22 +6967,19 @@ class TestAddMemoryGraphitiRefreshWiring:
         )
 
         graphiti_calls = [
-            c for c in service.durable_queue.enqueue.call_args_list
-            if c.kwargs.get('operation') == 'add_memory_graphiti'
+            (value, callback)
+            for value, callback in enqueued(service.durable_queue.enqueue)
+            if isinstance(value, QueuedGraphitiMemoryWrite)
         ]
         assert len(graphiti_calls) == 1, (
             f'Expected exactly 1 add_memory_graphiti enqueue, got {len(graphiti_calls)}'
         )
-        assert graphiti_calls[0].kwargs.get('callback_type') == 'refresh_entity_summaries', (
-            'add_memory_graphiti enqueue must carry callback_type=refresh_entity_summaries '
-            f'so its ingestion-time edge resolution triggers a refresh; got '
-            f'{graphiti_calls[0].kwargs.get("callback_type")!r}'
-        )
+        assert graphiti_calls[0][1] == QueueCallback.REFRESH_ENTITY_SUMMARIES
 
 
 class TestReplayFromStoreRefreshWiring:
     """step-11/12: replay_from_store's add_memory_graphiti batch items must
-    carry callback_type='refresh_entity_summaries' so bulk re-ingestion also
+    carry QueueCallback.REFRESH_ENTITY_SUMMARIES so bulk re-ingestion also
     triggers a post-write summary refresh."""
 
     @pytest.mark.asyncio
@@ -6651,14 +6993,13 @@ class TestReplayFromStoreRefreshWiring:
         await service.replay_from_store('test')
 
         service.durable_queue.enqueue_batch.assert_called_once()
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
-        graphiti_items = [item for item in batch if item['operation'] == 'add_memory_graphiti']
+        batch = enqueued(service.durable_queue.enqueue_batch)
+        graphiti_items = [
+            callback for value, callback in batch
+            if isinstance(value, QueuedGraphitiMemoryWrite)
+        ]
         assert graphiti_items, 'Expected at least one add_memory_graphiti batch item'
-        for item in graphiti_items:
-            assert item.get('callback_type') == 'refresh_entity_summaries', (
-                'replay_from_store add_memory_graphiti batch items must carry '
-                f'callback_type=refresh_entity_summaries; got {item.get("callback_type")!r}'
-            )
+        assert set(graphiti_items) == {QueueCallback.REFRESH_ENTITY_SUMMARIES}
 
 
 class TestExecuteGraphitiWritePlanningRegistration:
@@ -6692,7 +7033,7 @@ class TestExecuteGraphitiWritePlanningRegistration:
             'source_description': '[temporal:planning] plan',
             'temporal_context': 'planning',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         mock_registry.register.assert_called_once_with('real-uuid', 'myproject')
 
@@ -6711,7 +7052,7 @@ class TestExecuteGraphitiWritePlanningRegistration:
             'group_id': 'myproject',
             'source_description': 'normal',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         mock_registry.register.assert_not_called()
 
@@ -6731,7 +7072,7 @@ class TestExecuteGraphitiWritePlanningRegistration:
             'source_description': 'current',
             'temporal_context': 'current',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
         mock_registry.register.assert_not_called()
 
@@ -6751,7 +7092,7 @@ class TestExecuteGraphitiWritePlanningRegistration:
             'temporal_context': 'planning',
         }
         # Should not raise
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
 
     @pytest.mark.asyncio
     async def test_empty_group_id_skips_registration(self, service):
@@ -6765,17 +7106,13 @@ class TestExecuteGraphitiWritePlanningRegistration:
         mock_registry.register = AsyncMock()
         service.planned_episode_registry = mock_registry
 
-        # Payload with temporal_context='planning' but group_id is empty string
-        payload = {
-            'uuid': 'episode-empty-group',
-            'name': 'episode_emptygroup',
-            'content': 'PRD content with empty group_id',
-            'source': 'text',
-            'group_id': '',  # Empty — falsy group_id
-            'source_description': '[temporal:planning] plan',
-            'temporal_context': 'planning',
-        }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(
+            episode_write(
+                envelope=envelope(group_id=''),
+                temporal_context='planning',
+                source_description='[temporal:planning] plan',
+            )
+        )
 
         # Registration must be skipped — not called with empty group_id
         mock_registry.register.assert_not_called()
@@ -7630,6 +7967,63 @@ class TestSearchGraphitiInvalidatedFiltering:
             'RRF scores must be strictly decreasing in rank order'
         )
 
+    @pytest.mark.asyncio
+    async def test_restored_edge_with_expired_at_alone_is_returned(self, service):
+        """A restored edge — ``invalid_at`` None, ``expired_at`` set — surfaces
+        (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature, and graphiti_core never sets ``expired_at``
+        without ``invalid_at``, so ``expired_at`` alone marks a restored fact.
+        Three edges go in: one fully active, one superseded via ``invalid_at``
+        (task 312), and one restored.  The active and restored facts come back,
+        ranked contiguously over the survivors.
+        """
+        from _fm_helpers import MockEdge
+
+        from fused_memory.models.scope import Scope
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_retired = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Current fact',
+                uuid='edge-active',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Superseded fact',
+                uuid='edge-invalid-at',
+                valid_at=dt_valid,
+                invalid_at=dt_retired,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Restored fact',
+                uuid='edge-restored',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=dt_retired,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        assert [r.id for r in results] == ['edge-active', 'edge-restored'], (
+            'the superseded edge must be dropped (task 312) and the restored '
+            'edge kept: expired_at alone does not retire an edge (esc-4714-9)'
+        )
+        assert [r.content for r in results] == ['Current fact', 'Restored fact']
+
+        assert [r.metadata['store_rank'] for r in results] == [1, 2], (
+            'store_rank must be contiguous over survivors — the dropped '
+            'superseded edge must not consume a rank'
+        )
+
 
 class TestSearchRrfMerge:
     """Task 3658: MemoryService.search merges the two stores by RRF, not by precedence.
@@ -7871,6 +8265,33 @@ class TestGetStatusScoping:
         )
 
 
+class TestGetStatusSurfacesFalkorServerSettings:
+    """`get_status()['graphiti']['server_settings']` carries the live FalkorDB settings (task 6848)."""
+
+    @pytest.mark.asyncio
+    async def test_a_reset_timeout_is_visible_in_get_status(self, service):
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        reset = FalkorServerSettings(
+            expected_graph_timeout_ms=30000, graph_timeout_ms=1000, appendonly='no',
+        )
+        service.graphiti.read_server_settings = AsyncMock(return_value=reset)
+
+        result = await service.get_status()
+
+        assert result['graphiti']['server_settings'] == reset.to_status()
+        assert result['graphiti']['server_settings']['ok'] is False
+
+    @pytest.mark.asyncio
+    async def test_server_settings_are_reported_even_when_graph_listing_fails(self, service):
+        service.graphiti.list_graphs = AsyncMock(side_effect=ConnectionError('down'))
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        result = await service.get_status()
+
+        assert result['graphiti']['connected'] is False
+        assert result['graphiti']['server_settings'] == _MATCHING_SERVER_SETTINGS.to_status()
+
 class TestGetStatusSurfacesDeadByOperation:
     """`get_status()['queue']` must carry the per-operation dead breakdown.
 
@@ -7884,11 +8305,11 @@ class TestGetStatusSurfacesDeadByOperation:
     @pytest.mark.asyncio
     async def test_queue_section_carries_dead_by_operation(self, service, tmp_path):
         """A dead `add_episode` shows up attributed, scoped to the project."""
-        from _fm_helpers import poll_until
+        from _fm_polling import poll_until
 
         from fused_memory.services.durable_queue import DurableWriteQueue
 
-        async def always_fail(op, payload):
+        async def always_fail(value):
             raise RuntimeError('forced fail')
 
         queue = DurableWriteQueue(
@@ -7907,8 +8328,11 @@ class TestGetStatusSurfacesDeadByOperation:
 
         try:
             await queue.enqueue(
-                group_id='proj1', operation='add_episode',
-                payload={'content': 'ep', 'group_id': 'proj1', 'name': 'ep'},
+                episode_write(
+                    envelope=envelope(project_id='proj1', group_id='proj1'),
+                    content='ep',
+                    name='ep',
+                )
             )
 
             async def _has_a_dead_row():
@@ -10447,160 +10871,6 @@ class TestGraphitiBackendGetEdgeInvalidAt:
             await backend.get_edge_invalid_at('missing-edge-uuid', group_id='test')
 
 
-# ---------------------------------------------------------------------------
-# Step 1: TRACK B.1 backend clear_invalid_at RED tests
-# ---------------------------------------------------------------------------
-
-class TestGraphitiBackendUpdateEdgeClearInvalidAt:
-    """Backend update_edge must accept clear_invalid_at=True and set edge.invalid_at = None."""
-
-    def _make_backend_and_edge(self, mock_config, make_graph_mock):
-        """Set up a GraphitiBackend with mock driver/client, an awaitable graph, and a mock edge.
-
-        Returns (backend, mock_edge, graph) — ``graph`` is the same object
-        ``backend._graph_for(...)`` resolves to, so tests can assert on the
-        explicit direct-Cypher clear write (task 1940) issued via
-        ``graph.query(...)``.
-        """
-        from fused_memory.backends.graphiti_client import GraphitiBackend
-
-        backend = GraphitiBackend(mock_config)
-        mock_driver = MagicMock()
-        mock_cloned_driver = MagicMock()
-        mock_driver.clone = MagicMock(return_value=mock_cloned_driver)
-        backend._driver = mock_driver
-        backend.client = MagicMock()
-
-        graph = make_graph_mock([])
-        mock_driver._get_graph = MagicMock(return_value=graph)
-
-        mock_edge = AsyncMock()
-        mock_edge.source_node_uuid = 'src-uuid'
-        mock_edge.target_node_uuid = 'tgt-uuid'
-        mock_edge.uuid = 'e-1'
-        mock_edge.fact = 'original fact'
-        mock_edge.invalid_at = datetime(2026, 1, 1, tzinfo=UTC)
-        mock_edge.save = AsyncMock()
-        mock_edge.generate_embedding = AsyncMock()
-        backend.refresh_entity_summary = AsyncMock(return_value={})
-        return backend, mock_edge, graph
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_alone_sets_none(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True with no fact/invalid_at clears edge.invalid_at and calls save."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-            assert mock_edge.invalid_at is None, (
-                'clear_invalid_at=True must set edge.invalid_at to None'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_with_fact_updates_both(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True combined with fact updates fact AND clears invalid_at."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
-            assert mock_edge.fact == 'new fact', (
-                'fact must be updated when fact is provided'
-            )
-            assert mock_edge.invalid_at is None, (
-                'invalid_at must be cleared when clear_invalid_at=True'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_takes_precedence_over_invalid_at(self, mock_config, make_graph_mock):
-        """When both invalid_at and clear_invalid_at=True are given, clear wins."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        ts = datetime(2026, 6, 1, tzinfo=UTC)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge(
-                'e-1', group_id='proj', invalid_at=ts, clear_invalid_at=True
-            )
-            assert mock_edge.invalid_at is None, (
-                'clear_invalid_at=True must take precedence: invalid_at ends up None'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_issues_explicit_null_cypher(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True must issue an explicit direct-Cypher NULL write.
-
-        graphiti-core's FalkorDB map-based ``edge.save()`` does not reliably
-        clear a null-valued property, so update_edge must force the clear via
-        an explicit ``SET e.invalid_at = NULL`` Cypher write (task 1940).
-        """
-        from _fm_helpers import extract_cypher, extract_params
-
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-
-        graph.query.assert_awaited_once()
-        cypher = extract_cypher(graph.query.call_args)
-        params = extract_params(graph.query.call_args)
-        assert 'RELATES_TO' in cypher
-        assert 'SET' in cypher
-        assert 'invalid_at' in cypher
-        assert 'NULL' in cypher
-        assert params == {'uuid': 'e-1'}
-
-    @pytest.mark.asyncio
-    async def test_fact_plus_clear_still_issues_explicit_clear(self, mock_config, make_graph_mock):
-        """The explicit clear Cypher must fire even when fact is also supplied."""
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
-
-        graph.query.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_explicit_clear_precedes_summary_refresh(self, mock_config, make_graph_mock):
-        """The explicit clear Cypher must be awaited BEFORE the endpoint summary refresh runs.
-
-        Otherwise refresh_entity_summary's get_valid_edges_for_node query (which
-        filters ``WHERE e.invalid_at IS NULL``) would run before the clear lands
-        and exclude the just-restored edge from the rebuilt summary.
-        """
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        observed_await_counts = []
-
-        async def _fake_refresh(node_uuid, *, group_id):
-            observed_await_counts.append(graph.query.await_count)
-            return {}
-
-        backend.refresh_entity_summary = AsyncMock(side_effect=_fake_refresh)
-
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-
-        assert observed_await_counts, 'refresh_entity_summary was never called'
-        assert all(count > 0 for count in observed_await_counts), (
-            'explicit clear Cypher must be awaited before summary refresh; '
-            f'observed graph.query.await_count at refresh time: {observed_await_counts}'
-        )
-
-
 class TestScanMemoryContent:
     """MemoryService.scan_memory_content delegates to mem0.scan_payload_text.
 
@@ -12113,7 +12383,7 @@ def _mm_configure_project_root(svc, root):
 
     REQUIRED SETUP for the storm cases, not decoration — do not delete it.
     The shared ``mock_config`` fixture (``tests/conftest.py:184``) leaves
-    ``taskmaster=None``, so ``_memory_metadata_project_root()`` returns ``''``
+    ``taskmaster=None``, so ``configured_primary_root`` returns ``''``
     and ``_apply_memory_metadata_validation`` takes its documented
     "no project queue to file into — census only, do not escalate" branch.
     Without this install the storm escape is UNREACHABLE under the fixture:
@@ -12511,6 +12781,30 @@ class TestMemoryMetadataValidationAtSeam:
         assert project_id == 'dark_factory'
         assert agent_id == 'claude-drifter'
         assert keys == ['drifting_key']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_storm_escalation_root_is_the_registry_normalised_root(
+        self, mock_config, entry_point, tmp_path
+    ):
+        """The storm escalation files under the same root the project registry holds."""
+        target = tmp_path / 'Target-Proj'
+        target.mkdir()
+        link = tmp_path / 'Link-Proj'
+        link.symlink_to(target)
+        mock_config.taskmaster = TaskmasterConfig(project_root=str(link))
+        mock_config.memory_metadata.unknown_key_storm_threshold = 1
+        service = _mocked_service(mock_config)
+        filed = []
+
+        def _fake_filer(project_root, *, project_id, agent_id, keys):
+            filed.append(project_root)
+            return 'esc-memory-metadata-unknown-key-storm-1'
+
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation', _fake_filer):
+            await _mm_write(service, entry_point, metadata={'drifting_key': 1})
+
+        assert filed == [str(target.resolve())]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
@@ -13550,6 +13844,34 @@ class TestCanonicalClaimChangeOnTheUpdatePath:
         filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
         assert filters == {'topic': 'other-topic', 'canonical': True}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('held', [1, 1.0, 'true'])
+    async def test_a_non_bool_canonical_pre_image_is_not_a_held_claim(
+        self, service, held
+    ):
+        """A pre-image whose canonical is not the bool True does not hold the
+        claim under the strict meaning, so patching it to True ACQUIRES the
+        claim and must be probed.
+
+        Guard 3's tuple equality `(1, t) == (True, t)` let int and float
+        pre-images skip the probe; 'true' is the companion row.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': held})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'canonical': True},
+            )
+
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        service.mem0.count_by_metadata.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
+
 
 class TestParentIdLivenessAtSeam:
     """Write-time `metadata.parent_id` LIVENESS (task 3197, leaf δ).
@@ -14576,7 +14898,7 @@ class TestDeadLetterAlarmWiring:
 
         emitted = []
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation',
+            dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *a, **kw: emitted.append((a, kw)),
         )
         service.set_known_projects({'somewhere_else': '/root/elsewhere'})
@@ -14584,7 +14906,8 @@ class TestDeadLetterAlarmWiring:
         event = DeadLetterEvent(
             item_id=3, group_id='orphan', operation='add_episode', attempts=5,
             error='RuntimeError: boom', write_op_id='W1',
-            payload={'content': 'x'}, post_execute=False,
+            value=episode_write(content='x'), raw_payload='{"content": "x"}',
+            post_execute=False,
         )
         with caplog.at_level(logging.WARNING, logger=memory_service.__name__):
             await service._report_queue_dead_letter(event)
@@ -14605,7 +14928,7 @@ class TestDeadLetterAlarmWiring:
 
         calls = []
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation',
+            dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *a, **kw: calls.append((a, kw)),
         )
         service.set_known_projects({'proj1': '/root/proj1'})
@@ -14622,7 +14945,8 @@ class TestDeadLetterAlarmWiring:
         event = DeadLetterEvent(
             item_id=3, group_id='proj1', operation='add_episode', attempts=5,
             error='RuntimeError: boom', write_op_id='W1',
-            payload={'content': 'lost content'}, post_execute=False,
+            value=episode_write(content='lost content', correlation_id='corr-1'),
+            raw_payload='{"content": "lost content"}', post_execute=False,
         )
         await service._report_queue_dead_letter(event)
 
@@ -14637,7 +14961,8 @@ class TestDeadLetterAlarmWiring:
         assert kwargs['write_op_id'] == 'W1'
         assert kwargs['post_execute'] is False
         assert kwargs['content_preview'] == 'lost content'
-        assert memory_service.emit_dead_letter_escalation in threads, (
+        assert kwargs['caller_reference'] == 'corr-1'
+        assert dead_letter_escalator.emit_dead_letter_escalation in threads, (
             'the blocking escalation write must not run on the event loop'
         )
 
@@ -14652,14 +14977,14 @@ class TestDeadLetterAlarmWiring:
             raise OSError('escalation queue is on fire')
 
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation', _explode
+            dead_letter_escalator, 'emit_dead_letter_escalation', _explode
         )
         service.set_known_projects({'proj1': '/root/proj1'})
 
         event = DeadLetterEvent(
             item_id=3, group_id='proj1', operation='add_episode', attempts=5,
             error='RuntimeError: boom', write_op_id=None,
-            payload=None, post_execute=False,
+            value=None, raw_payload='', post_execute=False,
         )
         with caplog.at_level(logging.ERROR, logger=memory_service.__name__):
             await service._report_queue_dead_letter(event)
@@ -14668,13 +14993,13 @@ class TestDeadLetterAlarmWiring:
 
     @pytest.mark.asyncio
     async def test_a_missing_payload_still_files(self, service, monkeypatch):
-        """`payload` is None when the queue row would not parse; the alarm is
-        needed MORE in that case, not less."""
+        """`value` is None when the queue row would not decode; the alarm is
+        needed MORE in that case, not less, and the preview is the raw row text."""
         from fused_memory.services.durable_queue import DeadLetterEvent
 
         calls = []
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation',
+            dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *a, **kw: calls.append((a, kw)),
         )
         service.set_known_projects({'proj1': '/root/proj1'})
@@ -14683,13 +15008,37 @@ class TestDeadLetterAlarmWiring:
             item_id=3, group_id='mem0_proj1',
             operation='mem0_classify_and_add', attempts=5,
             error='RuntimeError: boom', write_op_id=None,
-            payload=None, post_execute=False,
+            value=None, raw_payload='not json {', post_execute=False,
         )
         await service._report_queue_dead_letter(event)
 
         assert len(calls) == 1, calls
         assert calls[0][1]['project_id'] == 'proj1'
-        assert calls[0][1]['content_preview'] == ''
+        assert calls[0][1]['content_preview'] == 'not json {'
+        assert calls[0][1]['caller_reference'] is None
+
+    @pytest.mark.asyncio
+    async def test_a_mem0_fact_previews_its_fact_text(self, service, monkeypatch):
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        calls = []
+        monkeypatch.setattr(
+            dead_letter_escalator, 'emit_dead_letter_escalation',
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='mem0_proj1',
+            operation='mem0_classify_and_add', attempts=5,
+            error='RuntimeError: boom', write_op_id=None,
+            value=mem0_fact(fact_text='Redis uses port 6379'),
+            raw_payload='{}', post_execute=False,
+        )
+        await service._report_queue_dead_letter(event)
+
+        assert calls[0][1]['content_preview'] == 'Redis uses port 6379'
+        assert calls[0][1]['caller_reference'] is None
 
 
 class TestReferentScanNarrowsWithTheProjectRegistry:
@@ -14714,12 +15063,15 @@ class TestReferentScanNarrowsWithTheProjectRegistry:
 
     @staticmethod
     def _enqueued_refs(service) -> list[dict]:
-        return service.durable_queue.enqueue.call_args[1]['payload']['referents']['refs']
+        [(value, _)] = enqueued(service.durable_queue.enqueue)
+        assert isinstance(value, QueuedEpisodeWrite | QueuedGraphitiMemoryWrite)
+        return value.referents.to_wire()['refs']
 
     @staticmethod
     def _batched_refs(service) -> list[dict]:
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
-        return batch[0]['payload']['referents']['refs']
+        value, _ = enqueued(service.durable_queue.enqueue_batch)[0]
+        assert isinstance(value, QueuedGraphitiMemoryWrite)
+        return value.referents.to_wire()['refs']
 
     @pytest.mark.asyncio
     async def test_add_memory_narrows_with_a_populated_registry(self, service):
@@ -14736,6 +15088,22 @@ class TestReferentScanNarrowsWithTheProjectRegistry:
             content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
         )
         assert self._enqueued_refs(service) == [self.EVIL_REF]
+
+    @pytest.mark.asyncio
+    async def test_a_never_wired_service_narrows_with_an_env_registered_root(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The constructor's env seed reaches this consumer, not only the storm alarm."""
+        root = tmp_path / 'reify'
+        root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root))
+        service = _mocked_service(mock_config)
+
+        await service.add_memory(
+            content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
+        )
+
+        assert self._enqueued_refs(service) == []
 
     @pytest.mark.asyncio
     async def test_add_memory_preserves_a_genuine_in_registry_foreign_ref(self, service):
@@ -14795,13 +15163,14 @@ class TestSetKnownProjectsLogsTheWireUp:
     """One INFO line per wire-up, naming whether referent narrowing is ACTIVE.
 
     `set_known_projects` is the single injection point every caller goes
-    through (`server/main.py` plus tests), so a future second caller cannot
-    bypass the report by wiring the registry somewhere else.
+    through (the constructor's env seed, `server/main.py` and tests), so a
+    future second caller cannot bypass the report by wiring the registry
+    somewhere else.
 
     The PERMISSIVE arm is logged too, and is the one an operator most needs:
-    `MemoryService` is constructed before `build_known_projects_map` runs, so
-    an empty registry is a real and easily-missed window — and while it lasts,
-    every producer scan silently stays permissive.
+    with DASHBOARD_KNOWN_PROJECT_ROOTS unset the constructor's seed is empty
+    until startup wiring, so an empty registry is a real and easily-missed
+    window — and while it lasts, every producer scan silently stays permissive.
     """
 
     @staticmethod

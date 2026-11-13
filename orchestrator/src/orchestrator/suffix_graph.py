@@ -1,41 +1,41 @@
 """Suffix-conflict graph and bounce-state tracker (MQ-refactor task δ=1988).
 
-Extracted verbatim from :mod:`orchestrator.merge_queue`: the two-layer
-suffix-conflict machinery — ``SuffixConflictGraph`` (the immutable
-conflict-graph dataclass) and ``EMPTY_SUFFIX_CONFLICT_GRAPH`` (its sentinel
-empty instance) — plus a NEW :class:`SuffixConflictTracker` class that owns
-the state (``graph`` / ``signature`` / ``last_known_main_sha`` /
+Extracted verbatim from the merge-lane worker (:mod:`orchestrator.merge_lane.worker`):
+the two-layer suffix-conflict machinery — ``SuffixConflictGraph`` (the
+immutable conflict-graph dataclass) and ``EMPTY_SUFFIX_CONFLICT_GRAPH`` (its
+sentinel empty instance) — plus a NEW :class:`SuffixConflictTracker` class
+that owns the state (``graph`` / ``signature`` / ``last_known_main_sha`` /
 ``bounce_registry``) and logic (``recompute()`` /
 ``bounce_conflicting_suffix_items()``) that previously lived directly on
-``SpeculativeMergeWorker``.  ``merge_queue`` re-exports all three names
-through a top-level shim so existing importers
-(``from orchestrator.merge_queue import X``, etc.) keep working unchanged.
+``SpeculativeMergeWorker``.  The pre-package alias module that also
+re-exported them is gone (task 5037).  This module is a lane component kept
+outside the package.
 
-``SpeculativeMergeWorker`` delegates to a ``SuffixConflictTracker`` instance
-(``self._suffix_tracker``) via thin property/method wrappers that preserve
-the worker's original attribute names (``_suffix_conflict_graph``,
-``_suffix_conflict_signature``, ``_last_known_main_sha``,
-``_bounce_registry``) and method signatures
-(``recompute_suffix_conflict_graph()``, ``_bounce_conflicting_suffix_items()``)
-so the existing conflict-graph and bounce test suites keep passing with zero
-churn.  The tracker itself never holds a worker reference: GitOps access,
-lane-buffer access, and frozen-prefix reads are injected as narrow
-*re-reading* callables (``git_ops``, ``lane_buffers``, ``frozen_prefix``,
-``frozen_prefix_tip``) that look up the caller's live attribute on every
-call — not a value or bound method captured once at construction — so the
-tracker is unit-testable standalone AND stays correct if the caller later
-reassigns e.g. ``worker._git_ops`` (amend: reviewer
+``orchestrator.merge_lane.intake_buffers::MergeIntake`` owns the one
+``SuffixConflictTracker`` instance, beside the lane buffers it reads, and
+exposes its state as read properties (``suffix_conflict_graph``,
+``suffix_conflict_signature``, ``last_known_main_sha``, ``bounce_registry``)
+and two thin async methods (``recompute_suffix_conflict_graph()``,
+``bounce_conflicting_suffix_items()``).  The tracker itself never holds a
+worker reference: GitOps access, lane-buffer access, frozen-prefix reads, and
+lifecycle retirement are injected as narrow *re-reading* callables
+(``git_ops``, ``lane_buffers``, ``frozen_requests``, ``frozen_prefix_tip``,
+``retire_item``) that look up the caller's live attribute on every call — not
+a value or bound method captured once at construction — so the tracker is
+unit-testable standalone AND stays correct if the caller later reassigns e.g.
+``worker._git_ops`` (amend: reviewer
 robustness_stale_reference / consistency, task δ=1988).
 
-A moved method that reads a merge_queue-resident constant (``MERGE_LANES``,
-``MERGE_BOUNCE_CAP``, ``NEEDS_REBASE_REASON_PREFIX``) — these stay in
-``merge_queue.py`` and are NOT moved — resolves it through a function-local
-(deferred) import from :mod:`orchestrator.merge_queue` rather than a
-top-level import.  This mirrors the reach-back convention established by
-:mod:`orchestrator.merge_liveness` / :mod:`orchestrator.merge_drift` and
-keeps this module free of any top-level import of ``merge_queue`` (which
-would deadlock module load, since merge_queue's shim needs this module
-fully defined first).
+A moved method that reads a worker-resident constant (``MERGE_BOUNCE_CAP``,
+``NEEDS_REBASE_REASON_PREFIX``, which stay in ``merge_lane/worker.py``)
+resolves it through a function-local (deferred) import from
+:mod:`orchestrator.merge_lane.worker` rather than a top-level import.  This
+mirrors the reach-back convention of :mod:`orchestrator.merge_lane.liveness` /
+:mod:`orchestrator.merge_lane.drift` and keeps this module free of any
+top-level import of the worker (which would deadlock module load, since the
+worker imports this module at module level and needs it fully defined first).
+``MERGE_LANES`` is imported at the top from :mod:`orchestrator.merge_lane.intake`,
+which loads neither the worker nor this module.
 """
 
 from __future__ import annotations
@@ -45,10 +45,13 @@ import dataclasses
 import functools
 import logging
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 
-from orchestrator.git_ops import GitOps
-from orchestrator.merge_types import (
+from orchestrator.git_ops import ConflictProbe, GitOps
+from orchestrator.merge_lane.intake import MERGE_LANES
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
+from orchestrator.merge_lane.types import (
     GroupMergeRequest,
     MergeBounceRegistry,
     MergeOutcome,
@@ -56,7 +59,7 @@ from orchestrator.merge_types import (
 )
 from orchestrator.overlap_footprint import Footprint, get_overlap_detector
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,6 +104,19 @@ class SuffixConflictGraph:
     conflicts_with_main: frozenset[str]
     """Request IDs that conflict with the current main tip."""
 
+    conflict_evidence: Mapping[str, ConflictEvidence] = dataclasses.field(
+        default_factory=lambda: MappingProxyType({}),
+    )
+    """What the frozen-tip probe saw for each rid in ``conflicts_with_main``
+    (task 7302); a rid whose probe failed open has no entry."""
+
+    def __post_init__(self) -> None:
+        stray = sorted(set(self.conflict_evidence) - self.conflicts_with_main)
+        if stray:
+            raise ValueError(
+                f'conflict_evidence names rids not in conflicts_with_main: {stray}'
+            )
+
     def textual_neighbors(self, rid: str) -> frozenset[str]:
         """Return the set of request_ids connected to *rid* via textual_edges."""
         return frozenset(
@@ -144,34 +160,36 @@ EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
 
 
 @functools.lru_cache(maxsize=1)
-def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
-    """Resolve MERGE_LANES / MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
+def _worker_constants() -> tuple[int, str]:
+    """Resolve MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
 
-    These three constants stay in ``merge_queue.py`` (not moved — see module
-    docstring).  The function-local (deferred) import is required to avoid
-    deadlocking merge_queue's re-export shim, but that constraint only binds
-    at *module import time*; by the time :meth:`SuffixConflictTracker.recompute`
-    or :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items` actually
-    run (the merge-acquire hot path), both modules are already fully loaded.
-    Memoizing the lookup here means those hot-path calls pay for the
-    sys.modules dict lookup + attribute rebind once, not on every call
-    (amend: reviewer performance).
+    Both stay in ``merge_lane/worker.py`` (see module docstring).  The
+    function-local (deferred) import is required to avoid deadlocking the
+    worker's own module load, but that constraint only binds at *module import
+    time*; by the time :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items`
+    or its escalation path actually run (the merge-acquire hot path), both
+    modules are already fully loaded.  Memoizing the lookup here means those
+    hot-path calls pay for the sys.modules dict lookup + attribute rebind once,
+    not on every call (amend: reviewer performance).
     """
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         MERGE_BOUNCE_CAP,
-        MERGE_LANES,
         NEEDS_REBASE_REASON_PREFIX,
     )
-    return MERGE_LANES, MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX
+    return MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX
 
 
 class SuffixConflictTracker:
     """Owns the two-layer suffix-conflict state + logic (task δ=1988).
 
-    Constructed with four narrow accessor callables — ``git_ops``,
-    ``lane_buffers``, ``frozen_prefix``, ``frozen_prefix_tip`` — instead of a
-    worker reference, so the tracker is fully unit-testable without a
-    :class:`SpeculativeMergeWorker`.  All four are captured as callables (not
+    Constructed with six narrow accessor callables — ``git_ops``,
+    ``lane_buffers``, ``frozen_requests``, ``frozen_prefix_tip``,
+    ``retire_item``, ``is_reserved`` — instead of a worker reference, so the
+    tracker is fully unit-testable without a :class:`SpeculativeMergeWorker`.
+    ``retire_item`` is required: a request diverted out of its lane must leave
+    the caller's lifecycle registry too. ``is_reserved`` names the requests a
+    deep chain holds for its tip verify, which the bounce leaves alone.  All
+    six are captured as callables (not
     their values, and not a bound-method snapshot) so the tracker always
     re-reads the caller's live state at call time, including a
     :class:`~orchestrator.git_ops.GitOps` reassigned on the caller *after*
@@ -194,13 +212,17 @@ class SuffixConflictTracker:
         *,
         git_ops: Callable[[], GitOps],
         lane_buffers: Callable[[], dict[str, collections.deque[MergeRequest]]],
-        frozen_prefix: Callable[[], tuple[str, ...]],
+        frozen_requests: Callable[[], tuple[MergeRequest, ...]],
         frozen_prefix_tip: Callable[[str], str],
+        retire_item: Callable[[str], None],
+        is_reserved: Callable[[str], bool],
     ) -> None:
         self._git_ops = git_ops
+        self._is_reserved = is_reserved
         self._lane_buffers = lane_buffers
-        self._frozen_prefix = frozen_prefix
+        self._frozen_requests = frozen_requests
         self._frozen_prefix_tip = frozen_prefix_tip
+        self._retire_item = retire_item
         self.graph: SuffixConflictGraph = EMPTY_SUFFIX_CONFLICT_GRAPH
         self.signature: tuple[tuple[str, ...], str] | None = None
         self.last_known_main_sha: str | None = None
@@ -208,8 +230,11 @@ class SuffixConflictTracker:
         self._escalations_issued: int = 0
         self._incarnation: str = secrets.token_hex(4)
 
-    def _escalate(self, req: MergeRequest, detail: str) -> int:
-        """Divert *req* out of its lane and resolve it blocked; return the ordinal.
+    def _escalate(
+        self, lane: str, req: MergeRequest, detail: str, evidence: ConflictEvidence | None,
+    ) -> int:
+        """Divert *req* out of *lane*, retire it from the caller's lifecycle
+        registry, and resolve it blocked; return the ordinal.
 
         Its reason never repeats, not even across a restart (guard and why:
         ``orchestrator/tests/test_merge_queue_bounce.py::TestBounceEscalationsNeverFeedTheThrashLadder``).
@@ -220,11 +245,12 @@ class SuffixConflictTracker:
         item that never lands.  Accepted: the steward resolves it, and if the
         frozen item fails, the branch requeues without prejudice.
         """
-        _, _, NEEDS_REBASE_REASON_PREFIX = _merge_queue_constants()
+        _, NEEDS_REBASE_REASON_PREFIX = _worker_constants()
         self._escalations_issued += 1
         ordinal = self._escalations_issued
         branch = req.branch.bare_id
-        self._lane_buffers()[req.lane].remove(req)
+        self._lane_buffers()[lane].remove(req)
+        self._retire_item(req.request_id)
         self.bounce_registry.clear(branch)  # fresh slate on resubmission
         outcome = MergeOutcome(
             status='blocked',
@@ -232,6 +258,8 @@ class SuffixConflictTracker:
                 f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} {detail} '
                 f'(bounce escalation #{ordinal} of tracker {self._incarnation})'
             ),
+            block_category=MergeBlockCategory.MERGE_NEEDS_REBASE,
+            conflict_evidence=evidence,
         )
         if not req.result.done():
             req.result.set_result(outcome)
@@ -270,15 +298,13 @@ class SuffixConflictTracker:
         This method is async (forks git subprocesses) while snapshot() stays
         synchronous and cheap (reads the stored graph; no await).
         """
-        # Deferred reach-back, memoized after the first call — see
-        # _merge_queue_constants() (amend: reviewer performance).
-        MERGE_LANES, _, _ = _merge_queue_constants()
-
         # ── 1. Build ordered suffix list ──────────────────────────────────────
         # ε=1890 defensive exclusion: frozen items (currently verifying) must
         # never appear as suffix-graph nodes — the frozen/suffix partition is
         # invariant (§5.3). Compute the frozen-rid set once, then filter.
-        frozen_rids: frozenset[str] = frozenset(self._frozen_prefix())
+        frozen_rids: frozenset[str] = frozenset(
+            req.request_id for req in self._frozen_requests()
+        )
         suffix: list[MergeRequest] = []
         for lane in MERGE_LANES:  # high → normal
             for req in self._lane_buffers()[lane]:  # FIFO within each lane
@@ -406,7 +432,8 @@ class SuffixConflictTracker:
         # so a genuine textual conflict without a footprint edge is possible).
         # Memoize results by frozenset({head_a, head_b}) within this recompute
         # so a pair is probed at most once even when re-ordered.
-        _probe_cache: dict[frozenset[str], bool] = {}
+        # None = the probe raised; treated as a conflict (fail-open).
+        _probe_cache: dict[frozenset[str], ConflictProbe | None] = {}
         textual_edges: set[frozenset[str]] = set()
 
         # Build once — invariant across all footprint-edge iterations (O(n) vs O(E·n)).
@@ -426,11 +453,10 @@ class SuffixConflictTracker:
                 continue
             cache_key = frozenset({head_i, head_j})
             if cache_key in _probe_cache:
-                has_conflict = _probe_cache[cache_key]
+                pair_probe = _probe_cache[cache_key]
             else:
                 try:
-                    probe = await self._git_ops().merge_tree_conflicts(head_i, head_j)
-                    has_conflict = not probe.clean
+                    pair_probe = await self._git_ops().merge_tree_conflicts(head_i, head_j)
                 except Exception:
                     logger.warning(
                         'recompute_suffix_conflict_graph: merge_tree_conflicts raised '
@@ -438,10 +464,10 @@ class SuffixConflictTracker:
                         suffix[i_idx].request_id, suffix[j_idx].request_id,
                         exc_info=True,
                     )
-                    has_conflict = True
+                    pair_probe = None
                     _any_probe_error = True
-                _probe_cache[cache_key] = has_conflict
-            if has_conflict:
+                _probe_cache[cache_key] = pair_probe
+            if pair_probe is None or not pair_probe.clean:
                 textual_edges.add(fp_edge)
 
         # ── 7. Probe each suffix item vs the frozen-prefix tip (η=1892) ──────────
@@ -457,8 +483,12 @@ class SuffixConflictTracker:
         # bounce before it consumes a verify slot.
         # The _probe_cache is keyed by frozenset({probe_base, head}) so that any
         # pair already probed in the textual-edge step reuses its cached result.
+        # The frozen prefix moves while the steps above await git, so the
+        # counterparts are read together with the tip they describe.
+        counterparts = tuple(req.task_id for req in self._frozen_requests())
         probe_base = self._frozen_prefix_tip(main_sha)
         conflicts_with_main: set[str] = set()
+        evidence: dict[str, ConflictEvidence] = {}
         for k, req in enumerate(suffix):
             head = heads[k]
             if head is None:
@@ -468,11 +498,10 @@ class SuffixConflictTracker:
                 continue
             cache_key = frozenset({probe_base, head})
             if cache_key in _probe_cache:
-                has_main_conflict = _probe_cache[cache_key]
+                tip_probe = _probe_cache[cache_key]
             else:
                 try:
-                    probe = await self._git_ops().merge_tree_conflicts(probe_base, head)
-                    has_main_conflict = not probe.clean
+                    tip_probe = await self._git_ops().merge_tree_conflicts(probe_base, head)
                 except Exception:
                     logger.warning(
                         'recompute_suffix_conflict_graph: merge_tree_conflicts(frozen_tip, %s) '
@@ -480,11 +509,17 @@ class SuffixConflictTracker:
                         head, req.request_id,
                         exc_info=True,
                     )
-                    has_main_conflict = True
+                    tip_probe = None
                     _any_probe_error = True
-                _probe_cache[cache_key] = has_main_conflict
-            if has_main_conflict:
+                _probe_cache[cache_key] = tip_probe
+            if tip_probe is None:
                 conflicts_with_main.add(req.request_id)
+            elif not tip_probe.clean:
+                conflicts_with_main.add(req.request_id)
+                evidence[req.request_id] = ConflictEvidence(
+                    conflicted_paths=tuple(tip_probe.conflicted_paths),
+                    counterpart_task_ids=counterparts,
+                )
 
         # ── 8. Store ──────────────────────────────────────────────────────────
         self.graph = SuffixConflictGraph(
@@ -492,6 +527,7 @@ class SuffixConflictTracker:
             textual_edges=frozenset(textual_edges),
             footprint_edges=frozenset(footprint_edges),
             conflicts_with_main=frozenset(conflicts_with_main),
+            conflict_evidence=MappingProxyType(evidence),
         )
         # Only cache the debounce signature when every probe succeeded.  A
         # transient error leaves the signature un-stored so the next tick
@@ -506,7 +542,7 @@ class SuffixConflictTracker:
         For each request_id in ``graph.conflicts_with_main``:
 
         1. Skip :class:`GroupMergeRequest` items (trains keep their existing
-           TRAIN_REBASE_CONFLICT path).
+           TRAIN_REBASE_CONFLICT path), and requests a deep chain reserves.
         2. Emit a structured ``needs_rebase`` log line.
         3. Bump the bounce registry; if the count exceeds :data:`MERGE_BOUNCE_CAP`
            → escalate via :meth:`_escalate` (ordinal-bearing reason) WITHOUT
@@ -523,15 +559,15 @@ class SuffixConflictTracker:
         rebased item from being re-bounced off a stale graph).
 
         Called by :meth:`SpeculativeMergeWorker._acquire_next_request`
-        immediately after :meth:`recompute` and before ``_pop_next_pickable()``,
+        immediately after :meth:`recompute` and before ``MergeIntake.pop_next_pickable()``,
         so bounced/escalated items are diverted before consuming a verify slot.
 
         Fail-open: if ``get_main_sha()`` raises, log a warning and return
         without touching any item.
         """
         # Deferred reach-back, memoized after the first call — see
-        # _merge_queue_constants() (amend: reviewer performance).
-        MERGE_LANES, MERGE_BOUNCE_CAP, _ = _merge_queue_constants()
+        # _worker_constants() (amend: reviewer performance).
+        MERGE_BOUNCE_CAP, _ = _worker_constants()
 
         if not self.graph.conflicts_with_main:
             return  # nothing to bounce — leave signature intact
@@ -559,20 +595,26 @@ class SuffixConflictTracker:
 
         frozen_tip = self._frozen_prefix_tip(main_sha)
 
-        # Build a rid → MergeRequest index over all lane buffers.
-        rid_to_req: dict[str, MergeRequest] = {}
+        # Build a rid → (lane, MergeRequest) index over all lane buffers,
+        # keyed by the lane each request was FOUND in.
+        rid_to_req: dict[str, tuple[str, MergeRequest]] = {}
         for lane in MERGE_LANES:
             for req in self._lane_buffers()[lane]:
-                rid_to_req[req.request_id] = req
+                rid_to_req[req.request_id] = (lane, req)
 
         _any_bounced = False
 
         for rid in self.graph.conflicts_with_main:
-            req = rid_to_req.get(rid)
-            if req is None:
+            found = rid_to_req.get(rid)
+            if found is None:
                 continue  # item already gone (escalated or removed)
+            lane, req = found
             if isinstance(req, GroupMergeRequest):
                 continue  # trains keep their own TRAIN_REBASE_CONFLICT path
+            if self._is_reserved(rid):
+                # A deep chain's link (task 7720): its tree is under a tip
+                # verify, and the walk lands its built merge commit, not its branch.
+                continue
 
             branch = req.branch.bare_id
             logger.info(
@@ -587,7 +629,8 @@ class SuffixConflictTracker:
             if count > MERGE_BOUNCE_CAP:
                 # Cap exceeded — escalate WITHOUT rebasing.
                 ordinal = self._escalate(
-                    req, f'bounce cap exceeded (count={count}, cap={MERGE_BOUNCE_CAP})',
+                    lane, req, f'bounce cap exceeded (count={count}, cap={MERGE_BOUNCE_CAP})',
+                    self.graph.conflict_evidence.get(rid),
                 )
                 logger.warning(
                     '_bounce_conflicting_suffix_items: cap exceeded task_id=%s '
@@ -603,7 +646,7 @@ class SuffixConflictTracker:
                 # Future and merge_first_enqueued_at are untouched.
                 #
                 # Downstream path note (design_double_rebase): the next call to
-                # _pop_next_pickable() may pick this item for dispatch.  The
+                # MergeIntake.pop_next_pickable() may pick this item for dispatch.  The
                 # dispatch loop calls merge_to_main() which performs a
                 # ``git merge --no-ff`` — NOT another rebase — so there is no
                 # double-rebase hazard.  If actual_main has advanced past
@@ -620,7 +663,8 @@ class SuffixConflictTracker:
             else:
                 # Real conflict — remove from lane buffer and escalate.
                 ordinal = self._escalate(
-                    req, f'has a real rebase conflict onto frozen tip {frozen_tip!r}',
+                    lane, req, f'has a real rebase conflict onto frozen tip {frozen_tip!r}',
+                    self.graph.conflict_evidence.get(rid),
                 )
                 logger.warning(
                     '_bounce_conflicting_suffix_items: rebase conflict task_id=%s '

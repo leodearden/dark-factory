@@ -344,14 +344,14 @@ class TestExecuteVerifyReviewLoopZeroOutputRouting:
 
 
 class TestCaptureZeroOutputEvidence:
-    """_capture_zero_output_evidence writes a JSON evidence file under artifacts.root.
+    """_capture_zero_output_evidence writes a JSON evidence file under the task root.
 
     Fails RED because _capture_zero_output_evidence does not exist yet (step-10
     will implement it).
     """
 
     def test_evidence_file_created_under_artifacts_root(self, tmp_path: Path):
-        """Evidence JSON file is written at artifacts.root/zero_output_evidence-iter{N}.json.
+        """Evidence JSON file is written at zero_output_evidence_path(N).
 
         Builds a workflow with a real TaskConfigDir containing sentinel files, calls
         _capture_zero_output_evidence, and asserts the file exists and contains the
@@ -362,7 +362,7 @@ class TestCaptureZeroOutputEvidence:
         assert wf.artifacts is not None
 
         # Build a real TaskConfigDir with sentinel files
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         sentinel_a = config_dir.path / 'sentinel_a.txt'
         sentinel_a.write_text('hello')
         sentinel_b = config_dir.path / 'sentinel_b.json'
@@ -384,7 +384,7 @@ class TestCaptureZeroOutputEvidence:
         iteration = 3
         wf._capture_zero_output_evidence(result, iteration)  # type: ignore[attr-defined]
 
-        evidence_path = wf.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+        evidence_path = wf.artifacts.zero_output_evidence_path(iteration)
         assert evidence_path.exists(), (
             f'Expected evidence file at {evidence_path} but it does not exist'
         )
@@ -434,7 +434,7 @@ class TestCleanupConfigDir:
         """When _preserve_config_dir=True, _cleanup_config_dir() must NOT delete the dir."""
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         sentinel = config_dir.path / 'keep_me.txt'
         sentinel.write_text('preserve test')
         wf._config_dir = config_dir  # type: ignore[attr-defined]
@@ -452,7 +452,7 @@ class TestCleanupConfigDir:
         """When _preserve_config_dir=False, _cleanup_config_dir() deletes the dir."""
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         sentinel = config_dir.path / 'remove_me.txt'
         sentinel.write_text('cleanup test')
         wf._config_dir = config_dir  # type: ignore[attr-defined]
@@ -500,7 +500,7 @@ class TestRecycleConfigDir:
         """
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
-        old_config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        old_config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         sentinel = old_config_dir.path / 'old_sentinel.txt'
         sentinel.write_text('stale session state')
         old_path = old_config_dir.path
@@ -615,7 +615,7 @@ class TestCaptureEvidenceLoopWiring:
     ):
         """With threshold=2, two zero-output timeouts must produce two distinct
         evidence files (zero_output_evidence-iter1.json and iter2.json) under
-        artifacts.root.
+        the task root.
 
         Evidence files are created before the circuit breaker trips so that even
         the sub-threshold timeout (iteration 1) leaves a forensic record.
@@ -628,8 +628,8 @@ class TestCaptureEvidenceLoopWiring:
         )
         _stub_iteration_helpers(wf, _zero_output_agent_result())
         # Wire up a real TaskConfigDir so _capture_zero_output_evidence can write
-        from shared.config_dir import TaskConfigDir as _TCD
-        wf._config_dir = _TCD(wf.task_id, base_dir=wf.artifacts.root)  # type: ignore[attr-defined]
+        assert wf.artifacts is not None
+        wf._config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
 
         outcome = await wf._execute_iterations()
 
@@ -637,15 +637,15 @@ class TestCaptureEvidenceLoopWiring:
         assert wf.artifacts is not None
 
         # Two iterations ran (threshold=2), so two evidence files must exist.
-        iter1_path = wf.artifacts.root / 'zero_output_evidence-iter1.json'
-        iter2_path = wf.artifacts.root / 'zero_output_evidence-iter2.json'
+        iter1_path = wf.artifacts.zero_output_evidence_path(1)
+        iter2_path = wf.artifacts.zero_output_evidence_path(2)
         assert iter1_path.exists(), (
             f'Evidence file for iteration 1 missing: {iter1_path}\n'
-            f'artifacts.root contents: {list(wf.artifacts.root.iterdir())}'
+            f'task root contents: {list(wf.artifacts.task_root.iterdir())}'
         )
         assert iter2_path.exists(), (
             f'Evidence file for iteration 2 missing: {iter2_path}\n'
-            f'artifacts.root contents: {list(wf.artifacts.root.iterdir())}'
+            f'task root contents: {list(wf.artifacts.task_root.iterdir())}'
         )
 
         # Each file must contain valid JSON with iteration numbers matching
@@ -698,7 +698,7 @@ class TestCaptureZeroOutputEvidenceEnriched:
         assert wf.artifacts is not None
 
         # Build a real TaskConfigDir so _capture_zero_output_evidence can list it
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         wf._config_dir = config_dir  # type: ignore[attr-defined]
 
         # Write a JSONL transcript using the REAL nested CLI schema.
@@ -755,7 +755,7 @@ class TestCaptureZeroOutputEvidenceEnriched:
         iteration = 2
         wf._capture_zero_output_evidence(result, iteration)  # type: ignore[attr-defined]
 
-        evidence_path = wf.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+        evidence_path = wf.artifacts.zero_output_evidence_path(iteration)
         assert evidence_path.exists(), f'Expected evidence file at {evidence_path}'
 
         data = json.loads(evidence_path.read_text())

@@ -25,6 +25,8 @@ from fused_memory.config.schema import ConsolidationAutoConfig
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.server.consolidation import (
     ProposalLimits,
+    ProposalShapeCode,
+    proposal_shape_codes,
     validate_consolidate_args,
     validate_proposal_args,
 )
@@ -796,3 +798,103 @@ def test_proposal_limits_from_config_maps_the_three_leaves():
     config = ConsolidationAutoConfig(claim_max_chars=150, member_min=3, member_max=9)
 
     assert ProposalLimits.from_config(config) == ProposalLimits(150, 3, 9)
+
+
+# ---------------------------------------------------------------------------
+# proposal_shape_codes: the structured classifier beside the one validator
+# (task 5240, PRD B7). An aged ledger row is re-checked by the executor, which
+# needs a code, not prose.
+# ---------------------------------------------------------------------------
+
+_SHAPE_CASES = {
+    'valid': ({}, ()),
+    'too_many_members': (
+        {'member_ids': _ids(21)},
+        (ProposalShapeCode.MEMBER_COUNT_OUT_OF_RANGE,),
+    ),
+    'too_few_members': (
+        {'member_ids': _ids(1)},
+        (ProposalShapeCode.MEMBER_COUNT_OUT_OF_RANGE,),
+    ),
+    'bad_slug': ({'topic': 'Not A Slug'}, (ProposalShapeCode.INVALID_SLUG,)),
+    'index_label_claim': (
+        {'claim': 'INDEX — foo bar baz qux quux corge grault garply'},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'two_line_claim': (
+        {'claim': _OK + '\nand a second line of text'},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'over_long_claim': (
+        {'claim': _OK + ' extra' * 40},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'correction_banner_claim': (
+        {'claim': '[CORRECTION 2026-07-01] ' + _OK},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'five_word_claim': (
+        {'claim': 'Stage one keeps reproposing clusters'},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'blank_claim': ({'claim': '   '}, (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,)),
+    'non_string_claim': ({'claim': 42}, (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,)),
+    'over_long_rationale': (
+        {'rationale': 'x' * 2001},
+        (ProposalShapeCode.PROPOSAL_SHAPE_INVALID,),
+    ),
+    'invalid_category': (
+        {'category': 'not_a_category'},
+        (ProposalShapeCode.PROPOSAL_SHAPE_INVALID,),
+    ),
+    'non_uuid_member': (
+        {'member_ids': [*_ids(4), '873889a1']},
+        (ProposalShapeCode.PROPOSAL_SHAPE_INVALID,),
+    ),
+    'several_offenders': (
+        {
+            'member_ids': _ids(21),
+            'topic': 'Not A Slug',
+            'claim': 'INDEX — foo bar baz qux quux corge grault garply',
+        },
+        (
+            ProposalShapeCode.MEMBER_COUNT_OUT_OF_RANGE,
+            ProposalShapeCode.INVALID_SLUG,
+            ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,
+        ),
+    ),
+}
+
+
+def _shape_codes(**overrides):
+    return proposal_shape_codes(**{**_PROPOSAL_ARGS, **overrides})
+
+
+class TestProposalShapeCodes:
+    def test_the_code_vocabulary(self):
+        assert [c.value for c in ProposalShapeCode] == [
+            'member_count_out_of_range',
+            'invalid_slug',
+            'claim_not_index_shaped',
+            'proposal_shape_invalid',
+        ]
+
+    @pytest.mark.parametrize('case', list(_SHAPE_CASES))
+    def test_each_case_yields_its_codes(self, case):
+        overrides, expected = _SHAPE_CASES[case]
+        assert _shape_codes(**overrides) == expected
+
+    @pytest.mark.parametrize('case', list(_SHAPE_CASES))
+    def test_the_classifier_agrees_with_the_validator_on_whether_to_refuse(self, case):
+        overrides, _ = _SHAPE_CASES[case]
+        err, _members = _propose(**overrides)
+        assert bool(_shape_codes(**overrides)) == (err is not None)
+
+    def test_the_limits_passed_in_are_the_limits_applied(self):
+        wide = ProposalLimits(claim_max_chars=200, member_min=2, member_max=25)
+        assert _shape_codes(member_ids=_ids(21), limits=wide) == ()
+
+    def test_codes_are_returned_as_a_tuple_of_enum_members(self):
+        codes = _shape_codes(topic='Not A Slug')
+        assert isinstance(codes, tuple)
+        assert all(isinstance(c, ProposalShapeCode) for c in codes)

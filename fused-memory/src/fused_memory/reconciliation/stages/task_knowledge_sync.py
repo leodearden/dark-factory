@@ -18,12 +18,15 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
+from shared.elision import elide_at_word
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+
 from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
 )
 from fused_memory.middleware.task_creation_journal import read_run_creation_outcomes
-from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -35,11 +38,14 @@ from fused_memory.reconciliation.blocked_gate_audit_section import (
     render_blocked_gate_audit_section,
 )
 from fused_memory.reconciliation.capped_task_list import render_capped_task_list
+from fused_memory.reconciliation.citation_verifier import STAGE_STAT_PREFIX
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
+from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_citations
+from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
     _content_fingerprint,
     _normalize_content_description,
@@ -51,10 +57,12 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_snapshot_stat_edge_findings,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
+from fused_memory.reconciliation.known_projects_section import render_known_projects_section
 from fused_memory.reconciliation.live_workflow_section import (
     render_live_workflow_section,
 )
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_foreign_kind_record,
     is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
@@ -105,6 +113,7 @@ from fused_memory.reconciliation.task_filter import (
     render_retained_done_tasks,
     select_done_since_boundary,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.utils.async_utils import gather_collect
 
 try:
@@ -1191,13 +1200,7 @@ class _TasklessRetirement(NamedTuple):
     marker_kind: str
 
     def permits(self, metadata, created_at: datetime, now: datetime) -> bool:
-        # The kind arm mirrors
-        # fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason (task 5286);
-        # == rather than set membership, so an unhashable kind cannot raise.
-        if not isinstance(metadata, dict):
-            return False
-        kind = metadata.get('kind')
-        if kind is not None and kind != self.marker_kind:
+        if not isinstance(metadata, dict) or is_foreign_kind_record(metadata, self.marker_kind):
             return False
         return created_at < now - timedelta(days=self.max_age_days)
 
@@ -1236,6 +1239,41 @@ def _closure_permits_retirement(
     )
 
 
+def _warn_retained_by_kind(
+    log_name: str,
+    source: str,
+    *,
+    cohort: str,
+    count: int,
+    kinds: set[str],
+    disposition: str,
+    project_id: str,
+    run_id: str,
+) -> None:
+    """Emit one aggregate WARNING for a *cohort* of records a sweep kept.
+
+    Carries the distinct *kinds* because they are the actionable part: they
+    name the vocabulary the pool filter collided with. Fail-safe: it never
+    raises into the sweep and never alters the sweep's count.
+    """
+    try:
+        logger.warning(
+            'reconciliation.%s: RETAINED %d %s (kinds=%s) matched by this %s pool '
+            'filter — %s Per-record ids are logged at DEBUG.',
+            log_name, count, cohort, ','.join(sorted(kinds)) or '<none>', source,
+            disposition,
+            extra={'project_id': project_id, 'run_id': run_id, 'log_name': log_name},
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation.%s: %s diagnostic raised; skipping (fail-safe, does '
+            'not affect the sweep count).',
+            log_name, cohort,
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+
 async def _sweep_stale_mem0_pool(
     memory_service,
     project_id: str,
@@ -1251,6 +1289,7 @@ async def _sweep_stale_mem0_pool(
     enum_filters: dict | Sequence[dict] | None = None,
     terminal_task_ids: Collection[str] | None = None,
     taskless_retirement: _TasklessRetirement | None = None,
+    pool_kind: str | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1328,9 +1367,10 @@ async def _sweep_stale_mem0_pool(
     The ``None``-vs-``[]`` sentinel is load-bearing:
 
     - ``None`` (the default) means "NO gate requested" and leaves this
-      skeleton byte-for-byte as it was for the two age-only callers
-      (:func:`_sweep_stale_persistence_markers`,
-      :func:`_sweep_stale_mem0_flag_markers`), which are age-only by design.
+      skeleton byte-for-byte as it was for the two age-based callers with no
+      closure gate (:func:`_sweep_stale_persistence_markers`,
+      :func:`_sweep_stale_mem0_flag_markers`; the latter also withholds
+      foreign kinds through *pool_kind*).
     - An EMPTY collection means "gate active, nothing is terminal" and
       therefore retires no task-citing member this cycle.
       :func:`_resolve_terminal_task_ids` is explicitly fail-safe to ``[]`` on
@@ -1465,6 +1505,13 @@ async def _sweep_stale_mem0_pool(
             (default) keeps every such member. Has no effect when
             *terminal_task_ids* is ``None``, because then every age-stale
             member is already eligible.
+        pool_kind: Opt-in pool-membership arm (task 6241). When given, a
+            member for which
+            :func:`~fused_memory.reconciliation.mem0_tombstone.is_foreign_kind_record`
+            holds is kept at any age, checked after the two protected-record
+            guards and before the age test, and reported in one aggregate
+            WARNING per sweep. ``None`` (default) skips the arm, for a pool
+            whose filter is wide by design.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
@@ -1651,6 +1698,8 @@ async def _sweep_stale_mem0_pool(
     # to avoid. The per-member detail is not lost, only demoted to DEBUG.
     protected_audit = 0
     protected_audit_kinds: set[str] = set()
+    foreign_kind = 0
+    foreign_kinds: set[str] = set()
     for member in members:
         mid = member.get('id')
         if not mid:
@@ -1714,6 +1763,23 @@ async def _sweep_stale_mem0_pool(
             )
             continue
 
+        if pool_kind is not None and is_foreign_kind_record(member_metadata, pool_kind):
+            kind = member_metadata.get('kind')
+            foreign_kind += 1
+            foreign_kinds.add(kind if isinstance(kind, str) else repr(kind))
+            logger.debug(
+                'reconciliation.%s: SKIPPING foreign-kind record memory_id=%s '
+                '(kind=%r) — not a member of this pool (task 6241).',
+                log_name, mid, kind,
+                extra={
+                    'project_id': project_id,
+                    'memory_id': mid,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+            continue
+
         raw = member.get('created_at')
         if raw is None:
             continue
@@ -1751,37 +1817,36 @@ async def _sweep_stale_mem0_pool(
             stale_members.append(member)
 
     if protected_audit > 0:
-        # Protected-audit-record diagnostic (task 4375 amendment pass). Same
-        # shape and same fail-safe wrapper as the two other aggregate
-        # diagnostics in this function: emitted ONCE per sweep, purely
-        # informational, and it must never alter `members` or the returned
-        # count. The distinct kinds are carried because they are the actionable
-        # part — they say WHICH audit vocabulary this pool's filter is
-        # colliding with, which is what a filter fix would have to target.
-        try:
-            logger.warning(
-                'reconciliation.%s: RETAINED %d protected audit record(s) '
-                '(kinds=%s) matched by this %s pool filter — deliberately-'
-                'permanent audit-log records, kept regardless of age (task '
-                '4375). Expected and recurring: this pool filter is wide by '
-                'design, so a steady count here is healthy, not a failure. '
-                'Per-record ids are logged at DEBUG.',
-                log_name, protected_audit,
-                ','.join(sorted(protected_audit_kinds)) or '<none>', source,
-                extra={
-                    'project_id': project_id,
-                    'run_id': run_id,
-                    'log_name': log_name,
-                },
-            )
-        except Exception:
-            logger.warning(
-                'reconciliation.%s: protected-audit-record diagnostic raised; '
-                'skipping (fail-safe, does not affect the sweep count).',
-                log_name,
-                exc_info=True,
-                extra={'project_id': project_id, 'run_id': run_id},
-            )
+        _warn_retained_by_kind(
+            log_name, source,
+            cohort='protected audit record(s)',
+            count=protected_audit,
+            kinds=protected_audit_kinds,
+            disposition=(
+                'deliberately-permanent audit-log records, kept regardless of '
+                'age (task 4375). Expected and recurring: this pool filter is '
+                'wide by design, so a steady count here is healthy, not a '
+                'failure.'
+            ),
+            project_id=project_id,
+            run_id=run_id,
+        )
+
+    if foreign_kind > 0:
+        _warn_retained_by_kind(
+            log_name, source,
+            cohort='record(s) declaring a foreign kind',
+            count=foreign_kind,
+            kinds=foreign_kinds,
+            disposition=(
+                'not members of this pool, never deleted by this sweep (task '
+                '6241). Each stays until removed by hand: delete a dead record '
+                'with the fused-memory MCP delete_memory tool, or register a '
+                'permanent audit kind in mem0_tombstone.PROTECTED_AUDIT_KINDS.'
+            ),
+            project_id=project_id,
+            run_id=run_id,
+        )
 
     if retained_unclosed > 0:
         # Retained-unclosed diagnostic (task 4375). The gate's KEEP direction
@@ -2012,6 +2077,13 @@ async def _sweep_stale_mem0_flag_markers(
     :func:`_sweep_stale_mem0_pool`'s docstring for the full all-variants-zero
     rule and why this is safe to fail open.
 
+    Withholds foreign-kind records (task 6241): a member declaring a ``kind``
+    other than ``stage1_flag_marker`` belongs to another pool and is kept at
+    any age, with one WARNING per sweep, so this collector and
+    ``fused-memory/scripts/sweep_orphan_flag_markers.py`` agree on what the
+    pool is. The decision and its accepted cost are recorded in
+    ``docs/flag-marker-sweep-recurring.md``.
+
     Args:
         memory_service: Service with ``get_memories_by_metadata``,
             ``delete_memory``, and ``count_memories_by_metadata``.
@@ -2040,6 +2112,7 @@ async def _sweep_stale_mem0_flag_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
         enum_filters=_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS,
+        pool_kind=_STAGE1_FLAG_MARKER_MEM0_SOURCE,
     )
 
 
@@ -3336,8 +3409,9 @@ class TaskKnowledgeSync(BaseStage):
     # ── Inference-bearing payload sections (task 5113) ──────────────────────
     # INCLUSION CRITERION — a section belongs here iff prompts/stage2.py tells
     # the model to draw an inference from that section's ABSENCE ("If
-    # `### Live-Workflow Signals` is absent from the payload, no task is live
-    # this cycle …"). Every payload builder renders these via
+    # `### Live-Workflow Signals` is absent from the payload, no task the
+    # `### Active Task Tree` lists is live this cycle …"). Every payload builder
+    # renders these via
     # _render_required_sections(). Enforced by
     # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
     # docstring holds the section census: why each other conditional section
@@ -3351,6 +3425,8 @@ class TaskKnowledgeSync(BaseStage):
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+    # Set with filtered_task_tree: the instant that tree, and every heartbeat_at in it, was read.
+    filtered_task_tree_fetched_at: datetime | None = None
 
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
@@ -3439,7 +3515,6 @@ class TaskKnowledgeSync(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Capture run_id, run briefing-refresh hook, delegate to BaseStage.run(), then
         apply the same-run Stage 1 human_operator_required dedup post-processor.
@@ -3475,7 +3550,6 @@ class TaskKnowledgeSync(BaseStage):
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # --- missing-run_id marker stat (task 1257) ---
@@ -3755,7 +3829,7 @@ class TaskKnowledgeSync(BaseStage):
         # cycle, per-project, alongside the three sibling GC passes; explicit
         # value so downstream consumers never need a .get(..., 0) fallback.
         #
-        # Unlike the two age-only sibling sweeps above, retirement here is
+        # Unlike the two age-based sibling sweeps above, retirement here is
         # composite and gated on the terminal ids hoisted above (tasks 4375,
         # 4995); _sweep_stale_mem0_flag_for_stage2_markers' docstring owns the rule.
         report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
@@ -3890,7 +3964,7 @@ class TaskKnowledgeSync(BaseStage):
                         self.filtered_task_tree.cancelled_tasks,
                     )
                 )
-            summary = await _queue_briefing_refresh_tasks(
+            summary = await queue_briefing_refresh_tasks(
                 self.taskmaster,
                 self.scope.project_root,
                 mismatches,
@@ -3926,6 +4000,29 @@ class TaskKnowledgeSync(BaseStage):
             },
         )
 
+    async def _resolve_task_tree(self) -> tuple[FilteredTaskTree, datetime]:
+        """The task tree this payload renders, paired with the instant it was read.
+
+        Uses the harness-injected tree when there is one (task 455); otherwise
+        self-fetches from taskmaster and stamps the instant after the fetch.
+        """
+        if self.filtered_task_tree is not None:
+            read_at = resolve_tree_read_instant(
+                self.filtered_task_tree_fetched_at,
+                event='reconciliation.task_tree_read_instant_missing',
+                extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+            )
+            return self.filtered_task_tree, read_at
+
+        # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
+        tasks_data: object = {}
+        if self.taskmaster:
+            try:
+                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
+            except Exception:
+                tasks_data = {}
+        return filter_task_tree(tasks_data), datetime.now(UTC)
+
     async def assemble_payload(
         self,
         events: list[ReconciliationEvent],
@@ -3952,20 +4049,7 @@ class TaskKnowledgeSync(BaseStage):
 
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Dual-path: use harness-injected tree or self-fetch (task 455)
-        if self.filtered_task_tree is not None:
-            # Harness path: tree already fetched and filtered before run()
-            filtered = self.filtered_task_tree
-        else:
-            # Fallback path: self-fetch via taskmaster
-            # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
-            tasks_data: object = {}
-            if self.taskmaster:
-                try:
-                    tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
-                except Exception:
-                    tasks_data = {}
-            filtered = filter_task_tree(tasks_data)
+        filtered, tree_read_at = await self._resolve_task_tree()
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
@@ -4004,9 +4088,10 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # Done-Task Completion-Memory Audit — enumerate EVERY task that
-        # transitioned to `done` since the prior successful cycle boundary
-        # (watermark.last_full_run_completed) via an updatedAt-window scan over
-        # the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
+        # transitioned to `done` inside the task-change window, which starts when
+        # the previous full run STARTED (why not its completion:
+        # tests/reconciliation/test_recon_window_anchor.py), via an updatedAt scan
+        # over the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
         # 5-item Proactive Task Sample for done-task completion-memory coverage,
         # which systematically missed done tasks as throughput grew (the sample
         # sorts done tasks last, so they rarely survive the top-5 cut).  Gated on
@@ -4014,7 +4099,7 @@ class TaskKnowledgeSync(BaseStage):
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
         if not self.remediation_mode:
-            boundary = watermark.last_full_run_completed
+            boundary = watermark.last_task_change_timestamp
             audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
             total_audit = len(audit_tasks)
             boundary_label = (
@@ -4041,7 +4126,7 @@ class TaskKnowledgeSync(BaseStage):
             done_audit_section = (
                 f'\n### Done-Task Completion-Memory Audit '
                 f'({total_audit} since last cycle)\n'
-                f'Boundary (last full-run completed): {boundary_label}\n'
+                f'Boundary (previous full run started): {boundary_label}\n'
                 f'{audit_body}'
             )
 
@@ -4055,7 +4140,7 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # Inference-bearing sections (see REQUIRED_SECTIONS), bound here so their probes run first.
-        required_sections = await self._render_required_sections(filtered)
+        required_sections = await self._render_required_sections(filtered, tree_read_at)
 
         # Call render_active_section once to get both the visible-task list (for
         # hint-attention slice-then-filter below) and the fully assembled Active
@@ -4066,7 +4151,8 @@ class TaskKnowledgeSync(BaseStage):
         visible_active, active_tree_text = render_active_section(filtered)
 
         # Compute the hint-attention section: active tasks whose memory_hints
-        # need conversion from legacy list format (or are missing entirely).
+        # need conversion from legacy list format (or are missing entirely), less
+        # any task live-claimed when the tree was read (task 5093).
         # Gated on `if not self.remediation_mode:` — mirrors proactive_sample_section
         # (above) because hint conversion is a general-sync activity, not a Stage 1
         # remediation task. Rendered conditionally within that gate — omitted on the
@@ -4075,9 +4161,9 @@ class TaskKnowledgeSync(BaseStage):
         # always used for the prompt template slot regardless of remediation_mode.
         hint_conversion_section = ''
         if not self.remediation_mode:
-            tasks_needing_hint_attention = [
-                t for t in visible_active if _needs_hint_attention(t)
-            ]
+            tasks_needing_hint_attention = select_tasks_needing_hint_attention(
+                visible_active, claims_read_at=tree_read_at
+            )
             if tasks_needing_hint_attention:
                 hint_conversion_section = (
                     '\n### Tasks Needing Memory Hint Attention\n'
@@ -4357,7 +4443,9 @@ class TaskKnowledgeSync(BaseStage):
                 stale_ids,
             )
 
-        known_projects_section = self._format_known_projects_section()
+        known_projects_section = render_known_projects_section(
+            self.known_projects, current_project_id=self.project_id
+        )
 
         # Step 5 in the Your Task block below prescribes a PLAIN ADDITIVE
         # attach (append=True, metadata_mode OMITTED) for every task in the
@@ -4435,41 +4523,25 @@ Use project_root="{self.project_root}" for tasks scoped to this project.
 For cross-project routing see "Known Projects" above.
 """
 
-    def _format_known_projects_section(self) -> str:
-        """Render the cross-project routing context for the Stage 2 LLM.
-
-        Emits a ``### Known Projects`` markdown section listing every
-        configured project_id and its project_root, marking the current
-        one.  Returns the empty string when fewer than two projects are
-        known — there is no "cross-project" dimension to surface in that
-        case, and the section would only add noise.
-        """
-        known = self.known_projects
-        if len(known) < 2:
-            return ''
-        # Stable ordering: current project first, then alphabetical.
-        ordered = [(self.project_id, known[self.project_id])] if self.project_id in known else []
-        for pid in sorted(p for p in known if p != self.project_id):
-            ordered.append((pid, known[pid]))
-        # Pad the project_id column to a consistent width for readability.
-        width = max(len(pid) for pid, _ in ordered)
-        lines = []
-        for pid, root in ordered:
-            marker = '  (current)' if pid == self.project_id else ''
-            lines.append(f'- {pid:<{width}}  → {root}{marker}')
-        return '\n### Known Projects (for cross-project routing)\n' + '\n'.join(lines) + '\n'
-
-    async def _build_live_workflow_section(self, filtered: FilteredTaskTree) -> str:
+    async def _build_live_workflow_section(
+        self, filtered: FilteredTaskTree, tree_read_at: datetime,
+    ) -> str:
         """Return the Live-Workflow Signals section for *filtered*, or ``''``.
 
         Takes the payload's RESOLVED tree — harness-injected or self-fetched by
-        :meth:`assemble_payload` — which is why it is not a zero-arg reader of
-        ``self.filtered_task_tree`` like Stage 1's same-named renderer. An empty
-        active list renders ``''`` with no I/O.
+        :meth:`assemble_payload` — and the instant it was read, which is why it
+        is not a zero-arg reader of ``self.filtered_task_tree`` like Stage 1's
+        same-named renderer. Claimant heartbeats are aged at *tree_read_at*,
+        not at render time (task 6027). An empty active list renders ``''``
+        with no I/O.
         """
-        return await render_live_workflow_section(filtered.active_tasks, self.scope.project_root)
+        return await render_live_workflow_section(
+            filtered.active_tasks, self.scope.project_root, claims_read_at=tree_read_at,
+        )
 
-    async def _render_required_sections(self, filtered: FilteredTaskTree) -> str:
+    async def _render_required_sections(
+        self, filtered: FilteredTaskTree, tree_read_at: datetime,
+    ) -> str:
         """Render every inference-bearing payload section for *filtered*, in registry order.
 
         Every Stage-2 payload builder MUST interpolate this — enforced
@@ -4477,15 +4549,19 @@ For cross-project routing see "Known Projects" above.
         ``tests/reconciliation/test_stage2_payload_section_parity.py``. See
         :attr:`REQUIRED_SECTIONS` for which sections qualify.
 
-        Renderers receive the payload's resolved *filtered* tree, because
-        :meth:`assemble_payload` may self-fetch it rather than use the
-        harness-injected attribute. Each renderer keeps its own
-        conditional-empty contract, so ``''`` is a normal result and no
-        separator is added. The sections render on remediation passes too: the
-        harness sets the tree there as well.
+        Renderers receive the payload's resolved *filtered* tree AND
+        *tree_read_at*, the instant it was read (harness-injected, or stamped
+        after the self-fetch), because :meth:`assemble_payload` may self-fetch
+        the tree rather than use the harness-injected attribute. Each renderer
+        keeps its own conditional-empty contract, so ``''`` is a normal result
+        and no separator is added. The sections render on remediation passes
+        too: the harness sets the tree there as well.
         """
         return ''.join(
-            [await getattr(self, section.renderer)(filtered) for section in self.REQUIRED_SECTIONS]
+            [
+                await getattr(self, section.renderer)(filtered, tree_read_at)
+                for section in self.REQUIRED_SECTIONS
+            ]
         )
 
     @staticmethod
@@ -4569,7 +4645,6 @@ class IntegrityCheck(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Execute Stage 3 and post-process with task-dump spot-check.
 
@@ -4593,7 +4668,10 @@ class IntegrityCheck(BaseStage):
            read a Mem0-only task-count snapshot stat as evidence of a missing
            Graphiti temporal_facts edge, for every project (task 3487).  Records
            report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
-        5. Calls record_task_dump_spot_check() to record a non-destructive
+        5. Calls scan_cross_run_citations() and appends one finding per
+           confirmed-absent mem0 citation on a settled run's finding, recording
+           the scan's stage3_cross_run_* stats (task 5749).
+        6. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -4601,7 +4679,6 @@ class IntegrityCheck(BaseStage):
         """
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # Layer 3 (finding-side) gate for blocked-snapshot false positives.
@@ -4659,6 +4736,12 @@ class IntegrityCheck(BaseStage):
         report.stats['snapshot_stat_edge_findings_dropped'] = (
             _before - len(report.items_flagged)
         )
+
+        scan = await scan_cross_run_citations(
+            self.journal, self.memory, project_id=self.project_id
+        )
+        report.items_flagged.extend(build_dangling_citation_finding(r) for r in scan.dangling)
+        report.stats.update(scan.as_stats(STAGE_STAT_PREFIX[self.stage_id]))
 
         self.record_task_dump_spot_check(report)
         return report
@@ -4726,6 +4809,9 @@ class IntegrityCheck(BaseStage):
             flagged.extend(stage2_report.items_flagged)
 
         flagged_text = _format_flagged(flagged, run_stage='stage3')
+        known_projects_section = render_known_projects_section(
+            self.known_projects, current_project_id=self.project_id
+        )
 
         return f"""## Stage 3: Cross-System Integrity Check
 ## Project: {self.project_id}
@@ -4737,7 +4823,7 @@ class IntegrityCheck(BaseStage):
 {_format_report(stage2_report)}
 
 ### Items Flagged for Cross-System Verification ({len(flagged)})
-{flagged_text}
+{flagged_text}{known_projects_section}
 
 ## Your Task
 Verify consistency across all three systems:
@@ -4851,9 +4937,11 @@ def _format_flagged(
     stage-specific shortfall warning.
 
     Edge case: if the very first item's JSON alone exceeds *budget_chars*, a
-    truncated fragment is always rendered (with a ``… [item truncated]`` marker)
-    so the LLM receives at least some signal rather than an opaque footer-only
-    body.  ``rendered`` stays 0 (the fragment is not a full render) and the
+    truncated fragment is always rendered so the LLM receives at least some
+    signal rather than an opaque footer-only body.  The fragment is cut by
+    ``shared/elision.py::elide_at_word``, whose counted marker keeps the line
+    within *budget_chars*; a budget too small to hold that marker raises its
+    ``ValueError``.  ``rendered`` stays 0 (the fragment is not a full render) and the
     warning's ``extra`` includes ``first_item_fragmented=True`` so
     callers/telemetry can distinguish fragmented-first-item from all-dropped.
     """
@@ -4873,11 +4961,8 @@ def _format_flagged(
                 # First item alone exceeds the budget.  Always show at least a
                 # truncated fragment so the LLM has some signal rather than an
                 # opaque footer-only body.
-                marker = '… [item truncated]'
-                available = budget_chars - len('- ') - len(marker)
-                if available > 0:
-                    lines.append(f'- {json_str[:available]}{marker}')
-                    first_item_fragmented = True
+                lines.append(f'- {elide_at_word(json_str, budget_chars - len("- "))}')
+                first_item_fragmented = True
             dropped = len(items) - idx
             # Footer shows only items that are completely absent (not the
             # fragmented first item, which already appears as a truncated line).
@@ -5174,6 +5259,24 @@ def _needs_hint_attention(task: dict) -> bool:
     return not task_hints
 
 
+def select_tasks_needing_hint_attention(
+    tasks: Iterable[dict], *, claims_read_at: datetime
+) -> list[dict]:
+    """The tasks rendered as ``### Tasks Needing Memory Hint Attention``.
+
+    A task claimed by a live orchestrator run is left out, because a Stage 2
+    hint write would race that run's own metadata writers (task 5093). Claim
+    freshness is judged at *claims_read_at*, the instant the task snapshot was
+    read, not at wall clock.
+    """
+    return [
+        t
+        for t in tasks
+        if _needs_hint_attention(t)
+        and not has_live_claimant(t, claims_read_at, DEFAULT_CLAIMANT_HEARTBEAT_TTL)
+    ]
+
+
 async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dict] | None:
     """Run reify's refresh_briefing_known_gaps.py in --json mode.
 
@@ -5251,7 +5354,7 @@ async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dic
         return None
 
 
-async def _queue_briefing_refresh_tasks(
+async def queue_briefing_refresh_tasks(
     taskmaster: TaskBackendProtocol,
     project_root: ProjectRoot,
     mismatches: list[dict],
@@ -5259,6 +5362,10 @@ async def _queue_briefing_refresh_tasks(
     run_id: str = '',
 ) -> dict:
     """Create 'Refresh briefing: remove task N from known_gaps' tasks for each mismatch.
+
+    Each mismatch is a dict carrying the ``task_id`` still listed in a
+    briefing's known_gaps, its ``subproject``, its ``title``, and the gap
+    text ``what``; one refresh task is filed per mismatch.
 
     Skips creation when a task with status 'pending' and the same canonical title
     already exists (exact-title de-dup, case-sensitive string equality).

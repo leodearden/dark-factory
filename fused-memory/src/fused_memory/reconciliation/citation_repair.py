@@ -551,13 +551,8 @@ def _run_still_live_hint(
         )
         if status_value == RunStatus.interrupted.value:
             parts.append(
-                "An 'interrupted' run is RESUMABLE, not finished: the startup "
-                'adopt-and-resume pass re-claims exactly these runs '
-                "(get_interrupted_runs() is SELECT * FROM runs WHERE status = "
-                "'interrupted'), and the resumed cycle sets status = running IN "
-                "MEMORY ONLY — the row stays 'interrupted' on disk — while "
-                'rewriting stage_reports at each stage boundary. Retry once the '
-                'run reaches a terminal status.'
+                "'interrupted' is a legacy status that the next fused-memory "
+                "startup converts to 'failed'; retry after that."
             )
     if in_process:
         parts.append(

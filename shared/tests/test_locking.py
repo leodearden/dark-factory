@@ -21,6 +21,9 @@ from shared.locking import (
     normalize_lock,
     strip_directory_locks,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Drift guard — pins shared.locking.FILE_EXTENSIONS to the canonical vector.

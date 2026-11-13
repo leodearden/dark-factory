@@ -2,8 +2,9 @@
 
 The scorer judges each arm by the pair it attached a write to, read against a
 blind verdict corpus (one or more raters per (entry, target) pair). These
-tests reach it only through its public surface: ``resolve_verdicts``,
-``score_pairs`` and the ``main`` CLI.
+tests reach it only through its public surface: ``score_pairs``,
+``mcnemar_exact`` and the ``main`` CLI. The majority rule that resolves the
+corpus is tested in ``tests/test_verdict_majority.py``.
 
 The script is loaded by path (``scripts/`` is not a package), lazily through
 ``_mod()``, exactly as ``test_eval_write_triage_judge.py`` does.
@@ -220,96 +221,6 @@ def _seed_result() -> dict[str, Any]:
     )
 
 
-def _resolve_one(*verdicts: str) -> Any:
-    rows = [_vote('e', 't', word, f'r{i}') for i, word in enumerate(verdicts)]
-    return _mod().resolve_verdicts(rows)[('e', 't')]
-
-
-class TestResolveVerdicts:
-    def test_verdict_words_are_the_rater_briefs_seven_in_brief_order(self) -> None:
-        assert _mod().VERDICT_WORDS == (
-            'SAME', 'EXTENDS', 'SUBSUMED', 'CORRECTS', 'RELATED', 'UNRELATED', 'UNCLEAR',
-        )
-
-    @pytest.mark.parametrize(('word', 'expected'), [
-        ('SAME', 'agreeing'),
-        ('EXTENDS', 'agreeing'),
-        ('SUBSUMED', 'agreeing'),
-        ('CORRECTS', 'corrects'),
-        ('RELATED', 'misfile'),
-        ('UNRELATED', 'misfile'),
-        ('UNCLEAR', 'unclear'),
-    ])
-    def test_a_single_rater_resolves_by_word_class(self, word: str, expected: str) -> None:
-        assert _resolve_one(word) == _mod().Resolution(expected)
-
-    @pytest.mark.parametrize(('votes', 'expected'), [
-        (('CORRECTS', 'CORRECTS', 'RELATED'), 'corrects'),
-        (('SAME', 'RELATED', 'EXTENDS'), 'agreeing'),
-        (('RELATED', 'UNRELATED', 'SAME'), 'misfile'),
-        (('CORRECTS', 'SAME', 'RELATED'), 'agreeing'),
-    ])
-    def test_three_raters_take_the_majority_on_each_binary(
-        self, votes: tuple[str, ...], expected: str,
-    ) -> None:
-        assert _resolve_one(*votes) == _mod().Resolution(expected)
-
-    @pytest.mark.parametrize('votes', [
-        ('SAME', 'RELATED'),
-        ('CORRECTS', 'SAME'),
-    ])
-    def test_two_raters_split_on_either_binary_is_a_tie(self, votes: tuple[str, ...]) -> None:
-        assert _resolve_one(*votes) == _mod().Resolution.TIED
-
-    def test_unclear_abstains_from_the_majority(self) -> None:
-        assert _resolve_one('UNCLEAR', 'SAME') == _mod().Resolution.AGREEING
-
-    def test_only_unclear_votes_resolve_unclear(self) -> None:
-        assert _resolve_one('UNCLEAR', 'UNCLEAR') == _mod().Resolution.UNCLEAR
-
-    def test_belongs_is_true_exactly_for_agreeing_and_corrects(self) -> None:
-        resolution = _mod().Resolution
-        belonging = {member for member in resolution if member.belongs}
-        assert belonging == {resolution.AGREEING, resolution.CORRECTS}
-
-    def test_pairs_are_resolved_independently(self) -> None:
-        rows = [
-            _vote('e1', 't1', 'SAME', 'a'),
-            _vote('e1', 't2', 'RELATED', 'a'),
-            _vote('e2', 't1', 'CORRECTS', 'a'),
-        ]
-        resolution = _mod().Resolution
-        assert _mod().resolve_verdicts(rows) == {
-            ('e1', 't1'): resolution.AGREEING,
-            ('e1', 't2'): resolution.MISFILE,
-            ('e2', 't1'): resolution.CORRECTS,
-        }
-
-    @pytest.mark.parametrize('word', ['DUPLICATE', 'same'])
-    def test_a_word_outside_the_vocabulary_is_refused(self, word: str) -> None:
-        with pytest.raises(ValueError, match=r"(?s)e9.*t9|t9.*e9"):
-            _mod().resolve_verdicts([_vote('e9', 't9', word, 'a')])
-
-    @pytest.mark.parametrize('missing', ['entry_id', 'target_id', 'verdict', 'rater', 'batch'])
-    def test_a_row_missing_a_required_key_is_refused(self, missing: str) -> None:
-        row = _vote('e9', 't9', 'SAME', 'a')
-        del row[missing]
-        with pytest.raises(ValueError, match=missing):
-            _mod().resolve_verdicts([row])
-
-    def test_one_rater_voting_twice_on_one_pair_is_refused(self) -> None:
-        rows = [
-            _vote('e9', 't9', 'SAME', 'opus-r3', batch='b1'),
-            _vote('e9', 't9', 'SAME', 'opus-r3', batch='anchors'),
-        ]
-        with pytest.raises(ValueError, match=r"(?s)opus-r3.*e9.*t9|e9.*t9.*opus-r3"):
-            _mod().resolve_verdicts(rows)
-
-    def test_extra_keys_are_accepted(self) -> None:
-        row = {**_vote('e', 't', 'SAME', 'a'), 'reason': 'same claim, reworded'}
-        assert _mod().resolve_verdicts([row]) == {('e', 't'): _mod().Resolution.AGREEING}
-
-
 class TestQuality:
     def test_the_result_names_the_reference_and_every_arm(self) -> None:
         result = _synth_result()
@@ -504,6 +415,30 @@ class TestPairedVsReference:
         cases = _replaced(SYNTH_CASES, 'cand', 'w7', band_winner_id='p9')
         with pytest.raises(ValueError, match="'w7'"):
             _score(cases, SYNTH_VERDICTS)
+
+
+class TestMcNemarExact:
+    """p = min(1, 2 * sum_{k <= min(b, c)} C(b + c, k) / 2^(b + c)), to 4 places."""
+
+    def test_no_discordant_pairs_is_p_one(self) -> None:
+        assert _mod().mcnemar_exact(0, 0) == 1.0
+
+    @pytest.mark.parametrize(('only_first', 'only_second', 'expected'), [
+        (0, 5, 0.0625),
+        (5, 0, 0.0625),
+        (1, 9, 0.0215),
+        (9, 1, 0.0215),
+    ])
+    def test_the_test_is_two_sided_and_symmetric(
+        self, only_first: int, only_second: int, expected: float,
+    ) -> None:
+        assert _mod().mcnemar_exact(only_first, only_second) == expected
+
+    def test_p_is_rounded_to_four_places(self) -> None:
+        assert _mod().mcnemar_exact(0, 10) == 0.002
+
+    def test_p_is_clamped_to_one(self) -> None:
+        assert _mod().mcnemar_exact(3, 3) == 1.0
 
 
 class TestRefusal:

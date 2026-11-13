@@ -1,8 +1,18 @@
 """Sweep tool: relocate resolved/dismissed escalations from queue root to archive.
 
-Relocates resolved/dismissed escalations from queue root to archive.
-Run at the escalation server-start single-writer window (pre-serving) —
-the one window with no concurrent queue writers.
+``run_startup_sweep`` runs each time an escalation server is constructed
+(``escalation/src/escalation/server.py::create_server``), before that server
+binds — but other processes may be writing the same queue directory the whole
+time: a long-running fused-memory server's middlewares and reconciliation,
+other orchestrator components, another startup sweep, a manual run of this
+CLI.  So each per-record pass (1, 2 and 4) takes ``escalation_id_lock`` on
+every id it moves or unlinks, re-checks under that lock, and treats ENOENT on
+the source as work a concurrent actor already did, not as a fault; a missing
+destination dated subdir is re-raised (see ``_source_vanished``).  Pass 3
+(``escalation/src/escalation/archive.py::prune_archive``) removes whole dated
+subdirectories past retention, takes no per-id lock and does not tolerate a
+concurrent removal: an rmtree of a subdir that has already vanished raises.
+Task 6662 owns that hardening.
 
 Usage:
   python -m escalation.sweep --queue-dir <path>          # dry-run (default)

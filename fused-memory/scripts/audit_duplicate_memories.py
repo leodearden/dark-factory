@@ -198,9 +198,13 @@ from typing import Any
 
 from shared.cli_boundary import LoudArgumentParser, run_cli
 
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.task_filter import (
-    # `_CLAUSE_SPLIT_RE` is module-private BY CONTRACT — an AST scan over
-    # `src/` and `scripts/` (tests/test_task_filter.py
+    LIVE_TASK_STATUS_RE,
+    POINT_IN_TIME_CHECK_RE,
+    TASK_REF_RE,
+    # `WIDE_CLAUSE_BOUNDARY_RE` is for ALLOWLISTED consumers only — an AST
+    # scan over `src/` and `scripts/` (tests/test_task_filter.py
     # ::test_clause_split_re_has_no_out_of_module_consumers) enforces an
     # explicit allowlist, because the WIDENED splitter is only defensible for
     # callers that fail toward something self-healing. This module qualifies:
@@ -222,15 +226,9 @@ from fused_memory.reconciliation.task_filter import (
     # `liveness_snapshot_subject_facts` gates a clause-scoped key on TWO
     # conditions — divergence, and field-vocabulary equality with the
     # record's own key — rather than trusting the widened splitter alone.
-    _CLAUSE_SPLIT_RE,
-    LIVE_TASK_STATUS_RE,
-    POINT_IN_TIME_CHECK_RE,
-    TASK_REF_RE,
+    WIDE_CLAUSE_BOUNDARY_RE,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('audit_duplicate_memories')
 
@@ -776,7 +774,7 @@ def liveness_snapshot_subject_facts(
     unconditional *core_fact* bucket.
 
     The clause-scoped key comes from splitting the content with
-    ``task_filter._CLAUSE_SPLIT_RE`` and reading each clause's task refs
+    ``task_filter.WIDE_CLAUSE_BOUNDARY_RE`` and reading each clause's task refs
     (``TASK_REF_RE``) and ``<field>=<value>`` assignments separately — the
     technique ``task_filter.find_conflicting_task_status_ids`` uses — unioned
     over the clauses that NAME the subject. A clause ``_readable_field_pairs``
@@ -812,7 +810,7 @@ def liveness_snapshot_subject_facts(
 
     scoped: dict[str, set[str]] = {}
     if _asserts_one_field_twice(core_fact):
-        for clause in _CLAUSE_SPLIT_RE.split(record.get('content') or ''):
+        for clause in WIDE_CLAUSE_BOUNDARY_RE.split(record.get('content') or ''):
             if not clause.strip():
                 continue
             refs = {str(ref) for ref in TASK_REF_RE.findall(clause)}
@@ -926,9 +924,10 @@ def find_liveness_snapshot_recurrences(
     whole-record bucket either.
 
     The core fact is keyed PER SUBJECT by ``liveness_snapshot_subject_facts``,
-    which splits the content into clauses with ``task_filter._CLAUSE_SPLIT_RE``
-    and adds each subject's own clause-scoped key beside the whole-record one
-    — but only when BOTH of that function's gates hold: the DIVERGENCE gate
+    which splits the content into clauses with
+    ``task_filter.WIDE_CLAUSE_BOUNDARY_RE`` and adds each subject's own
+    clause-scoped key beside the whole-record one — but only when BOTH of
+    that function's gates hold: the DIVERGENCE gate
     (the record's union key names one field twice) and the FIELD-VOCABULARY
     gate (the clause names every field that union names, not a strict subset
     of them — a fragment). A multi-task re-verification reporting DIVERGENT
@@ -948,7 +947,7 @@ def find_liveness_snapshot_recurrences(
     (``TestLivenessSubjectFactsIsAdditive``).
 
     Clause scoping was INERT when the detector was first written:
-    ``_CLAUSE_SPLIT_RE`` split on EVERY ``.``, shattering
+    ``task_filter``'s clause splitter split on EVERY ``.``, shattering
     ``dark-factory-orchestrator.yaml`` mid-sentence, and the real content
     writes ``task/94``, which ``TASK_REF_RE``'s separator did not match —
     together the EMPTY SET on all four real records. Task 3403 fixed both at
@@ -1295,8 +1294,9 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
     """Pick the survivor from a near-duplicate memory group.
 
     Survivor selection (in order):
-      1. A member explicitly flagged canonical (``metadata.get('canonical')``
-         truthy) wins, regardless of age.
+      1. A member whose metadata claims canonical per
+         ``canonical_marker.py::is_canonical`` (bool ``True`` only; ``'true'``
+         or ``1`` is not a claim) wins, regardless of age.
       2. Otherwise, the oldest member by ``created_at`` (ISO string) wins.
          Records with a missing/unparseable ``created_at`` sort last (see
          ``_created_at_sort_key``) so they are never chosen as "oldest"
@@ -1312,7 +1312,7 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
         raise ValueError(f'pick_survivor requires a group of >= 2 memories, got {len(group)}')
 
     def _sort_key(m: dict) -> tuple[bool, int, float, str]:
-        canonical = bool((m.get('metadata') or {}).get('canonical'))
+        canonical = is_canonical(m.get('metadata'))
         bucket, ts = _created_at_sort_key(m.get('created_at'))
         # `not canonical` so canonical=True sorts first (False < True);
         # bucket/ts ascending so the oldest parseable timestamp sorts first;
@@ -2012,8 +2012,9 @@ def _consolidation_events(
 ) -> list[dict[str, Any]]:
     """Per-consolidation net delta: what accreted after it minus what it absorbed.
 
-    A consolidation event is a record carrying ``canonical: true`` and/or a
-    non-empty ``supersedes``. Its peer set — the population that can accrete
+    A consolidation event is a record whose metadata claims canonical
+    (``canonical_marker.py::is_canonical``) and/or carries a non-empty
+    ``supersedes``. Its peer set — the population that can accrete
     "after" it — is its shared ``metadata.topic`` when it has one, else the
     near-duplicate cluster it belongs to. An event with neither has no
     identifiable peers, so nothing is attributed to it (0), rather than
@@ -2048,7 +2049,7 @@ def _consolidation_events(
     events: list[dict[str, Any]] = []
     for index, record in enumerate(records):
         metadata = record.get('metadata') or {}
-        if not (metadata.get('canonical') or metadata.get('supersedes')):
+        if not (is_canonical(metadata) or metadata.get('supersedes')):
             continue
         topic = topic_by_index[index]
         event_ts = ts_by_index[index]
@@ -3059,23 +3060,19 @@ async def _run(args: argparse.Namespace) -> int:
     # half-completed, unrecoverable store mutation. Raising keeps it
     # un-maskable by, and un-confusable with, that report-shaped refusal.
     #
-    # ``logging.basicConfig`` already ran above, so this error is emitted.
+    # ``logging.basicConfig`` already ran above, so the guard's refusal record
+    # is emitted.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='audit_duplicate_memories --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'audit_duplicate_memories: --apply NOT started (fail-closed) -- this '
-                "process cannot write mem0's history directory, so each deletion "
-                'would remove a Qdrant point and then fail to write its history, '
-                'irreversibly destroying the non-survivors of every cluster. '
-                'Nothing was scanned and nothing was mutated, and no client was '
-                'opened. Route the deletions through the fused-memory MCP server '
-                '(the unsandboxed owner of the store), or re-run from an '
-                'unsandboxed operator shell. To obtain the audit report safely from '
-                'anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='audit_duplicate_memories --apply',
+            logger=logger,
+            extra_detail=(
+                'each deletion would remove a Qdrant point and then fail to write '
+                'its history, irreversibly destroying the non-survivors of every '
+                'cluster. Nothing was scanned and nothing was mutated, and no '
+                'client was opened.'
+            ),
+        )
 
     # De-duplicate while preserving the caller's order. A repeated
     # --categories value would otherwise ingest the same Qdrant points twice

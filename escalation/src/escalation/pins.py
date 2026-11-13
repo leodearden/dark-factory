@@ -63,16 +63,18 @@ if TYPE_CHECKING:
 
 __all__ = [
     'HUMAN_PARKED_MIN_LEVEL',
+    'ClusterPinRecord',
     'PinClass',
     'PinRecord',
     'PinReport',
     'classify_pins',
     'is_queue_handoff',
+    'needs_human',
     'pinned_only_by_human_parked',
 ]
 
-#: The escalation level at which a record is in front of a HUMAN (L2) — see
-#: :func:`pinned_only_by_human_parked`.
+#: The escalation level at which a record is in front of a HUMAN (L2) — read
+#: by :func:`pinned_only_by_human_parked` and :func:`needs_human`.
 HUMAN_PARKED_MIN_LEVEL: int = 2
 
 
@@ -124,6 +126,13 @@ class PinRecord(Protocol):
 
     @property
     def filing_claimant_run_id(self) -> str | None: ...
+
+
+class ClusterPinRecord(PinRecord, Protocol):
+    """A :class:`PinRecord` that also names the ids its cluster holds, read only by :func:`pinned_only_by_human_parked`."""
+
+    @property
+    def members(self) -> Sequence[str]: ...
 
 
 @dataclass(frozen=True)
@@ -249,13 +258,14 @@ def _classify_record(
     """Map one open escalation to its :class:`PinClass` (see the chain above)."""
     sev = normalised_severity(record.severity)
 
-    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Since
-    # task 3976, `escalation.server.promote_to_l2`'s inherited
-    # max(member severities) default can MINT a fresh L2 at severity='info'
-    # (previously the only info-severity L2s were ones `EscalationQueue.park()`
-    # promoted from an already-open L0/L1, never freshly filed ones), so this
-    # link now also decides an inherited-info L2 as NON_PINNING — see
-    # TestInfoAtL2Coupling in escalation/tests/test_pins.py (task 4402).
+    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Task
+    # 3976 let `escalation.server.promote_to_l2`'s inherited max(member
+    # severities) default mint a fresh L2 at severity='info'; since task 5222
+    # that default is REFUSED for an all-info cluster, but an explicit
+    # severity='info' promote (and `EscalationQueue.park()` of an already-open
+    # L0/L1) still produce info L2s, and this link decides each of them
+    # NON_PINNING — see TestInfoAtL2Coupling in escalation/tests/test_pins.py
+    # (task 4402).
     if sev == 'info':
         return PinClass.NON_PINNING
 
@@ -279,8 +289,8 @@ def _classify_record(
     # Link 3b — a BORN_AT_L2 severity (critical/urgent) at level 0 is
     # CONTRADICTORY state: such records are created directly at L2 and routed
     # straight to a human, which is why every in-repo producer stamps
-    # `level=2` alongside them and why `workflow.py` already treats the two
-    # signals as one (`e.severity in BORN_AT_L2_SEVERITIES or e.level >= 2`).
+    # `level=2` alongside them and why `needs_human` treats a born-at-L2
+    # severity as needing a human at any level.
     # Fail it safe to pinning for exactly the reason link 3 is written `!= 0`
     # — a human-routed record must never fall into the conversion-eligible
     # branch below on the strength of a level field that contradicts it.
@@ -362,22 +372,17 @@ def classify_pins(
     entry point with no orchestrator run_id and no session, so it structurally
     cannot, and which hardcodes ``level=2``),
     ``orchestrator.deterministic_runner`` (all six sites ``level=2`` /
-    ``severity='critical'``) and the other level-1/2-only filers — where link
-    3 makes the identity moot.  The L0 ``severity='info'`` filers (e.g.
-    ``orchestrator.merge_skew_tripwire``, ``orchestrator.offline_lane``'s
-    risk notice, the ``_AMENDMENT_TRUNCATION``/``_ROOT_CAUSE_OVERFOLD``
-    anchors in ``escalation.server``) do not stamp either, but they are moot
+    ``severity='critical'``),
+    ``orchestrator/src/orchestrator/merge_lane/worker.py::_file_main_health_escalation``
+    (level 1, no per-task incarnation; pinned by
+    ``orchestrator/tests/test_merge_queue_main_health_deferred.py::_assert_pins_only_as_queue_handoff``)
+    and the other level-1/2-only filers — where link 3 makes the identity
+    moot.  The L0 ``severity='info'`` filers (e.g.
+    ``orchestrator.merge_lane.skew_tripwire``, the ``_AMENDMENT_TRUNCATION``/
+    ``_ROOT_CAUSE_OVERFOLD`` anchors in ``escalation.server``) do not stamp either, but they are moot
     via link 1, not link 3.
 
-    One residual L0 gap is NOT closed by the stamping above:
-    ``orchestrator/src/orchestrator/merge_queue.py::_file_main_health_escalation``
-    builds at the DEFAULT level 0 with ``severity='blocking'`` (category
-    ``preexisting_main_break``) against a real ``req.task_id``, so links
-    1/2/3/3b all fall through and its records still read as UNKNOWN at link 4
-    — failing safe to pinning.  It is a module-level function with no
-    per-task incarnation, so ``None`` is the honest value there; closing the
-    gap needs a caller-supplied identity, not a stamp.  A second non-stamping
-    L0 ``'blocking'`` producer,
+    The one non-stamping L0 ``'blocking'`` producer,
     ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._escalate``,
     files against synthetic ``recon-<run_id>`` task ids on the reconciliation
     queue, which no task-scoped pin read binds to.
@@ -432,38 +437,76 @@ def classify_pins(
 
 def pinned_only_by_human_parked(
     report: PinReport,
-    records: Sequence[PinRecord] | None,
+    records: Sequence[ClusterPinRecord] | None,
+    *,
+    holder_candidates: Sequence[ClusterPinRecord] = (),
 ) -> bool:
     """Is everything that PINS this task already in front of a human?
 
     **This docstring is the canonical statement of the predicate; other sites
     point here.**  True iff the read succeeded, something pins the task, and
     every record in the ``queue_handoff`` bucket — the bucket
-    :attr:`PinReport.pins` reads — sits at ``level >= HUMAN_PARKED_MIN_LEVEL``.
+    :attr:`PinReport.pins` reads — is either itself at
+    ``level >= HUMAN_PARKED_MIN_LEVEL``, or a level-1 record that such a
+    human-level handoff names in its ``members``.  The L1 an L2 was promoted
+    from stays open, and still pins, until the L2's cascade closes it, yet a
+    human already holds it.  The holder may be among *records* — the caller's
+    read scope — or among *holder_candidates*, OPEN records from outside that
+    read: ``escalation/src/escalation/server.py::promote_to_l2`` mints a
+    cluster L2 under ONE task id, so the L2 holding this task's L1 may be
+    filed under another (task 7716).  A candidate only holds members: it never
+    pins this task, and it counts only as a human-level queue handoff
+    (:func:`is_queue_handoff`).  Candidates are never classified into
+    *report*, so passing the whole pending queue is safe.
+
     *report* is what :func:`classify_pins` returned for these same *records*,
     taken rather than recomputed so a caller that already classified them does
     not classify twice; the info, unknown-severity, dead-L0 and
-    store-unavailable rules are therefore the chain's own.  Records that do not
-    pin (see :attr:`PinReport.pins`) cannot spoil the answer, and a store that
-    could not be read never counts as parked.
+    store-unavailable rules are therefore the chain's own, and an info L2 —
+    no handoff — holds nothing.  Records that do not pin (see
+    :attr:`PinReport.pins`) cannot spoil the answer, and a store that could not
+    be read never counts as parked.
 
     Every uncertain input answers False — no records, an unreadable store, an
-    L1 nobody has promoted, a level that is missing or not an int (never
-    coerced: ``'3'``, ``2.9`` and ``True`` are not levels), a handoff id the
-    records do not carry — because a false True silences an alarm for a
-    genuinely stranded task, while a false False costs one quick triage.
+    L1 no human-level handoff holds, a level that is missing or
+    not an int (never coerced: ``'3'``, ``2.9`` and ``True`` are not levels,
+    and a held member must be a genuine int ``1``), ``members`` that are not a
+    list or tuple of str (never coerced, and a bare string is never
+    substring-matched), a handoff id the records do not carry — because a
+    false True silences an alarm for a genuinely stranded task, while a false
+    False costs one quick triage.
 
     The bar is the LEVEL, not ``severity in BORN_AT_L2_SEVERITIES``: ``level``
     records the promotion to a human, whereas a critical/urgent record still at
     level 0 is the contradictory state link 3b fails safe to pinning, not proof
     that anyone human holds the task.
 
-    Pure: no I/O, and neither argument is mutated.
+    Pure: no I/O, and no argument is mutated.
     """
     if report.store_unavailable or records is None or not report.queue_handoff:
         return False
-    levels = {record.id: record.level for record in records}
-    return all(_is_human_level(levels.get(esc_id)) for esc_id in report.queue_handoff)
+    parked = _human_parked_ids(report.queue_handoff, records, holder_candidates)
+    return set(report.queue_handoff) <= parked
+
+
+def _human_parked_ids(
+    handoff_ids: Sequence[str],
+    records: Sequence[ClusterPinRecord],
+    holder_candidates: Sequence[ClusterPinRecord],
+) -> frozenset[str]:
+    by_id = {record.id: record for record in records}
+    handoffs = [by_id[esc_id] for esc_id in handoff_ids if esc_id in by_id]
+    holders = [record for record in handoffs if _is_human_level(record.level)]
+    outside_holders = [
+        candidate
+        for candidate in holder_candidates
+        if _is_human_level(candidate.level) and is_queue_handoff(candidate)
+    ]
+    held = frozenset(
+        member for holder in holders + outside_holders for member in _member_ids(holder)
+    )
+    held_l1s = [record for record in handoffs if record.id in held and _is_l1(record.level)]
+    return frozenset(record.id for record in holders + held_l1s)
 
 
 def is_queue_handoff(record: PinRecord) -> bool:
@@ -471,11 +514,30 @@ def is_queue_handoff(record: PinRecord) -> bool:
 
     True iff the shared chain classifies *record* as ``QUEUE_HANDOFF``.
     ``live_claimant=True`` with no live id makes an L0 fail safe to a handoff,
-    so in practice only info never gates.  Consumers:
-    ``orchestrator/src/orchestrator/workflow.py::_is_gating_escalation`` and
-    ``::TaskWorkflow._wait_for_resolution`` (task 5222 / PRD gamma).
+    so in practice only info never gates.  Consumer: :func:`needs_human`
+    (task 5222 / PRD gamma).
     """
     return bool(classify_pins('', [record], live_claimant=True).queue_handoff)
+
+
+def needs_human(record: PinRecord) -> bool:
+    """Can only a human dispose of this ONE record — no steward applies?
+
+    True for a born-at-L2 severity (``critical``/``urgent``, routed straight
+    to a human; matched exactly, not normalised) at any level, or for a
+    ``level >= HUMAN_PARKED_MIN_LEVEL`` record that :func:`is_queue_handoff`
+    calls a handoff (PRD ``plans/info-l0-disposition-router-prd.md`` D3),
+    so an info L2 never needs one and an unknown severity fails safe to
+    needing one.  Consumers:
+    ``orchestrator/src/orchestrator/workflow.py::_is_gating_escalation``
+    together with the entry and tail checks of
+    ``TaskWorkflow._wait_for_resolution``, and
+    ``orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery``
+    (task 6145).
+    """
+    return record.severity in BORN_AT_L2_SEVERITIES or (
+        record.level >= HUMAN_PARKED_MIN_LEVEL and is_queue_handoff(record)
+    )
 
 
 def _is_human_level(level: object) -> bool:
@@ -484,3 +546,14 @@ def _is_human_level(level: object) -> bool:
         and not isinstance(level, bool)
         and level >= HUMAN_PARKED_MIN_LEVEL
     )
+
+
+def _is_l1(level: object) -> bool:
+    return isinstance(level, int) and not isinstance(level, bool) and level == 1
+
+
+def _member_ids(record: ClusterPinRecord) -> frozenset[str]:
+    members: object = record.members
+    if not isinstance(members, (list, tuple)):
+        return frozenset()
+    return frozenset(member for member in members if isinstance(member, str))

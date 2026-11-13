@@ -5,7 +5,8 @@ Lives here rather than in either suite because
 annotation, task 3543) and ``test_pending_scan_off_loop.py`` (the queue scan's
 ``asyncio.to_thread`` hop, task 4391) drive the SAME tool through the same
 four-piece harness — filing a pending record, a scheduler status stub, a
-duck-typed harness, and the ``await tool.fn(...)`` invocation.
+duck-typed harness, and the ``_get_pending`` invocation, which names the tool
+while the call shape itself lives in ``_tool_calls.py::call_tool``.
 
 Not a ``conftest.py`` fixture: ``_file`` and ``_harness`` are parameterised
 factories rather than per-test setup, so a plain importable module is the
@@ -25,6 +26,9 @@ from __future__ import annotations
 
 import types
 from typing import Any
+
+from _tool_calls import call_tool
+from fastmcp import FastMCP
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -80,8 +84,6 @@ def _harness(statuses: dict[str, str], *, live: set[str] | None = None, **kw: An
     )
 
 
-async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
-    """get_pending_escalations is an ASYNC def as of task 3543 — it awaits a
-    batched scheduler status read to compute pins_recovery."""
-    tool = await server.get_tool('get_pending_escalations')
-    return await tool.fn(**kwargs)
+async def _get_pending(server: FastMCP, **kwargs: Any) -> list[dict[str, Any]]:
+    """Invoke the server's ``get_pending_escalations`` tool with *kwargs*."""
+    return await call_tool(server, 'get_pending_escalations', **kwargs)

@@ -34,6 +34,7 @@ from orchestrator.offline_lane_records import (
     ProbeResult,
     RunRecord,
     RunRecordStore,
+    StoredPass,
     classify_exit,
     command_key,
     is_well_formed,
@@ -288,6 +289,7 @@ class TestAllocatePass:
     def test_header_only_pass_is_well_formed(self, store: RunRecordStore) -> None:
         lane_pass = store.allocate_pass('unit', Leg.NUMERIC, HEAD)
         loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert lane_pass.directory == store.pass_directory('unit', lane_pass.pass_id)
         assert loaded is not None
         assert (loaded.detect, loaded.confirm, loaded.outcome, loaded.effect) == (None,) * 4
 
@@ -516,6 +518,115 @@ class TestPassesSince:
         assert [p.pass_id for p in store.passes_since('Unit Tests', T0)] == [spaced]
 
 
+class TestStoredPassesSince:
+    SINCE = T0 + timedelta(hours=1)
+
+    def _written_at(self, store: RunRecordStore, clock: _Clock, when: datetime, command: str) -> str:
+        clock.current = when
+        lane_pass = store.allocate_pass(command, Leg.GENERIC, HEAD)
+        store.write_run(lane_pass, _record(command))
+        store.set_pass_blocks(lane_pass, outcome=None, effect={'tests_counted': []})
+        return lane_pass.pass_id
+
+    def _seeded(self, store: RunRecordStore, clock: _Clock) -> dict[str, list[str]]:
+        """Two well-formed passes per command in the window, three bad ones, and what must not be yielded."""
+        self._written_at(store, clock, T0, 'unit')
+        good = {
+            command: [
+                self._written_at(store, clock, self.SINCE + timedelta(minutes=offset, microseconds=250), command)
+                for offset in (10, 20)
+            ]
+            for command in ('unit', 'lint')
+        }
+        not_json = self._written_at(store, clock, self.SINCE + timedelta(minutes=30), 'unit')
+        store.pass_directory('unit', not_json).joinpath('record.json').write_text('{truncated')
+        no_effect = self._written_at(store, clock, self.SINCE + timedelta(minutes=40), 'unit')
+        record_path = store.pass_directory('unit', no_effect) / 'record.json'
+        payload = json.loads(record_path.read_text())
+        del payload['effect']
+        record_path.write_text(json.dumps(payload))
+        deleted = self._written_at(store, clock, self.SINCE + timedelta(minutes=50), 'lint')
+        store.pass_directory('lint', deleted).joinpath('record.json').unlink()
+        (store.root / 'unit' / 'scratch').mkdir()
+        return {'good_unit': good['unit'], 'good_lint': good['lint'], 'bad': [not_json, no_effect, deleted]}
+
+    def test_every_pass_directory_in_the_window_is_yielded_once_in_order(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        stored = list(store.stored_passes_since(self.SINCE))
+
+        assert [(item.command_key, item.pass_id) for item in stored] == [
+            *[('lint', pass_id) for pass_id in (*seeded['good_lint'], seeded['bad'][2])],
+            *[('unit', pass_id) for pass_id in (*seeded['good_unit'], *seeded['bad'][:2])],
+        ]
+
+    def test_a_well_formed_pass_carries_its_record_and_no_problem(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        stored = {(item.command_key, item.pass_id): item for item in store.stored_passes_since(self.SINCE)}
+
+        for command in ('unit', 'lint'):
+            for offset, pass_id in zip((10, 20), seeded[f'good_{command}'], strict=True):
+                item = stored[(command_key(command), pass_id)]
+                assert item.problem is None
+                assert item.record == store.load_pass(command, pass_id)
+                assert item.directory == store.pass_directory(command, pass_id)
+                assert item.started_at == self.SINCE + timedelta(minutes=offset)
+                assert item.command_key == command_key(command)
+
+    def test_a_malformed_or_unreadable_record_is_reported_not_skipped(
+        self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.offline_lane_records'):
+            stored = {(item.command_key, item.pass_id): item for item in store.stored_passes_since(self.SINCE)}
+
+        for key in zip(('unit', 'unit', 'lint'), seeded['bad'], strict=True):
+            item = stored[key]
+            assert item.record is None
+            assert item.problem
+            assert str(item.directory / 'record.json') in item.problem
+        assert caplog.records == []
+
+    def test_a_pass_before_the_cut_and_a_stray_directory_are_not_yielded(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        self._seeded(store, clock)
+
+        stored = list(store.stored_passes_since(self.SINCE))
+
+        assert all(item.started_at >= self.SINCE for item in stored)
+        assert 'scratch' not in {item.pass_id for item in stored}
+        assert len(stored) == 7
+
+    @pytest.mark.parametrize('with_record', [True, False])
+    def test_a_stored_pass_holds_exactly_one_of_record_or_problem_and_names_what_it_got(
+        self, store: RunRecordStore, clock: _Clock, with_record: bool
+    ) -> None:
+        pass_id = self._written_at(store, clock, self.SINCE, 'unit')
+        record = store.load_pass('unit', pass_id) if with_record else None
+        problem = 'record.json: unreadable' if with_record else None
+
+        with pytest.raises(ValueError, match='exactly one of record or problem') as raised:
+            StoredPass('unit', pass_id, self.SINCE, store.pass_directory('unit', pass_id), record, problem)
+
+        assert f'record is None={not with_record}, problem={problem!r}' in str(raised.value)
+
+    def test_a_store_whose_root_does_not_exist_yields_nothing_and_creates_nothing(
+        self, tmp_path: Path, clock: _Clock
+    ) -> None:
+        absent = tmp_path / 'absent'
+        store = RunRecordStore(absent, clock=clock)
+
+        assert list(store.stored_passes_since(T0)) == []
+        assert not absent.exists()
+
+
 class TestRetention:
     def _allocate_aged(self, store: RunRecordStore, clock: _Clock, now: datetime, days: int) -> str:
         clock.current = now - timedelta(days=days)
@@ -627,6 +738,12 @@ def _add_lane_script(tmp_path: Path, relative_path: str, body: str) -> None:
     script.chmod(0o755)
 
 
+#: The worker logs ``run() pass failed`` on ``orchestrator.offline_lane`` and each sub-run line on
+#: ``orchestrator.offline_lane_pass``; their common parent hears both.
+_LANE_LOGGERS = 'orchestrator'
+_SUB_RUN_LOGGER = 'orchestrator.offline_lane_pass'
+
+
 class _LaneLogWatch(logging.Handler):
     """Remembers the first ``run() pass failed`` line the lane worker logs, and every sub-run line."""
 
@@ -665,10 +782,10 @@ async def _drive_one_pass(
     which it does only after the seam that wrote the record returns.
     """
     watch = _LaneLogWatch()
-    lane_logger = logging.getLogger('orchestrator.offline_lane')
-    assert sub_run_label is None or lane_logger.isEnabledFor(logging.INFO), (
-        'awaiting a sub-run line needs the lane logger at INFO'
+    assert sub_run_label is None or logging.getLogger(_SUB_RUN_LOGGER).isEnabledFor(logging.INFO), (
+        'awaiting a sub-run line needs the pass logger at INFO'
     )
+    lane_logger = logging.getLogger(_LANE_LOGGERS)
     lane_logger.addHandler(watch)
     task = asyncio.create_task(worker.run())
     try:
@@ -746,7 +863,7 @@ class TestLanePassRecords:
     async def test_a_green_pass_records_its_detect_run_and_output(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             worker = await _run_one_pass(
                 tmp_path,
                 "printf '=== 3 passed in 0.10s ===\\n'; exit 0",
@@ -848,7 +965,7 @@ class TestLanePassRecords:
     async def test_a_signal_ended_run_records_ended_by_signal(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, command: str, returncode: int
     ) -> None:
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             worker = await _run_one_pass(tmp_path, command, until_phase=Phase.DETECT, until_logged=True)
 
         record = _current_pass_record(worker)
@@ -954,7 +1071,7 @@ class TestLegacyLegRecords:
             "echo '  RESULT: FAIL (test_x.sh)'\nexit 1",
         )
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
 
         record = _current_pass_record(worker, LEGACY_INFRA_COMMAND)
@@ -976,7 +1093,7 @@ class TestLegacyLegRecords:
         worker = _lane_worker(tmp_path, offline_lane_infra_enabled=True)
         _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, 'kill -9 $$')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.DETECT, sub_run_label='infra')
 
         assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, 'infra')] == [True]
@@ -1002,7 +1119,7 @@ class TestLegacyLegRecords:
         worker = _lane_worker(tmp_path, offline_lane_legacy_numeric_enabled=True)
         _add_lane_script(tmp_path, RUN_OFFLINE_DEEP_SCRIPT, body)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, Phase.DETECT, sub_run_label='numeric')
 
         record = _current_pass_record(worker, LEGACY_NUMERIC_COMMAND)

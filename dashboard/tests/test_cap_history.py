@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -67,19 +68,40 @@ def _insert_event(
     conn_sync.commit()
 
 
-def _make_db_with_events(tmp_path, name: str, events: list[tuple[str, str, datetime]]):
-    """Create a fresh DB file and insert events; return path."""
+def _encode_details(details: dict | str | None) -> str | None:
+    """A dict is JSON-encoded; a str is stored verbatim (to test malformed payloads)."""
+    if isinstance(details, dict):
+        return json.dumps(details)
+    return details
+
+
+def _make_db_with_events(
+    tmp_path,
+    name: str,
+    events: list[tuple[str, str, datetime] | tuple[str, str, datetime, dict | str | None]],
+):
+    """Create a fresh DB file and insert events; return path.
+
+    Each event is ``(account, event_type, ts)`` or ``(account, event_type, ts, details)``.
+    """
     db_path = tmp_path / name
     conn_sync = sqlite3.connect(str(db_path))
     conn_sync.executescript(CAP_HISTORY_SCHEMA)
-    for account, event_type, ts in events:
+    for account, event_type, ts, *details in events:
         conn_sync.execute(
-            'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
-            (account, event_type, ts.isoformat()),
+            'INSERT INTO account_events (account_name, event_type, details, created_at)'
+            ' VALUES (?, ?, ?, ?)',
+            (account, event_type, _encode_details(details[0] if details else None), ts.isoformat()),
         )
     conn_sync.commit()
     conn_sync.close()
     return db_path
+
+
+async def _read_intervals_at(db_path, now: datetime) -> list[CapInterval]:
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        return await read_cap_intervals([conn], days=7, now=now)
 
 
 # ---------------------------------------------------------------------------
@@ -165,16 +187,21 @@ class TestReadCapIntervals:
         assert result[0].account_name == 'acc-b'
 
     @pytest.mark.asyncio
-    async def test_fifo_pairing(self, tmp_path):
-        """cap1@T1, cap2@T2, resumed@T3, resumed@T4 → (T1,T3) and (T2,T4)."""
-        now = datetime.now(UTC)
+    async def test_redetected_cap_collapses_into_one_interval(self, tmp_path):
+        """cap@T1, cap@T2 (re-detection), resumed@T3, resumed@T4 → one (T1, T3).
+
+        A restarted UsageGate re-logs cap_hit for an account that is still
+        capped; that is the same cap, not a nested second one.  The stray
+        second 'resumed' has nothing open to close.
+        """
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
         t1 = now - timedelta(hours=4)
         t2 = now - timedelta(hours=3)
         t3 = now - timedelta(hours=2)
         t4 = now - timedelta(hours=1)
         db_path = _make_db_with_events(
             tmp_path,
-            'fifo.db',
+            'redetect.db',
             [
                 ('acc-c', 'cap_hit', t1),
                 ('acc-c', 'cap_hit', t2),
@@ -182,19 +209,208 @@ class TestReadCapIntervals:
                 ('acc-c', 'resumed', t4),
             ],
         )
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            result = await read_cap_intervals([conn], days=7)
 
-        assert len(result) == 2
-        # Sort by start for deterministic assertion
-        result.sort(key=lambda iv: iv.start)
-        assert abs((result[0].start - t1).total_seconds()) < 1
-        assert result[0].end is not None
-        assert abs((result[0].end - t3).total_seconds()) < 1
-        assert abs((result[1].start - t2).total_seconds()) < 1
-        assert result[1].end is not None
-        assert abs((result[1].end - t4).total_seconds()) < 1
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='acc-c', start=t1, end=t3)]
+
+    @pytest.mark.asyncio
+    async def test_unresumed_cap_closes_at_its_resets_at(self, tmp_path):
+        """No 'resumed', but the recorded resets_at has passed → closed at resets_at."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=3)
+        reset = now - timedelta(hours=1)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'reset_passed.db',
+            [('acc-a', 'cap_hit', t1, {'resets_at': reset.isoformat()})],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='acc-a', start=t1, end=reset)]
+
+    @pytest.mark.asyncio
+    async def test_unresumed_cap_with_future_resets_at_stays_open(self, tmp_path):
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=3)
+        reset = now + timedelta(hours=1)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'reset_future.db',
+            [('acc-a', 'cap_hit', t1, {'resets_at': reset.isoformat()})],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='acc-a', start=t1, end=None)]
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_after_expired_reset_opens_new_interval(self, tmp_path):
+        """A cap_hit at or after the open cap's reset is a NEW cap; the old one ends at its reset."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=6)
+        reset1 = now - timedelta(hours=4)
+        t2 = now - timedelta(hours=2)
+        reset2 = now + timedelta(hours=3)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'two_caps.db',
+            [
+                ('acc-a', 'cap_hit', t1, {'resets_at': reset1.isoformat()}),
+                ('acc-a', 'cap_hit', t2, {'resets_at': reset2.isoformat()}),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert sorted(result, key=lambda iv: iv.start) == [
+            CapInterval(account_name='acc-a', start=t1, end=reset1),
+            CapInterval(account_name='acc-a', start=t2, end=None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_resume_after_resets_at_closes_at_resume(self, tmp_path):
+        """A recorded resume is the more accurate end, even when it lands after resets_at."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=4)
+        reset = now - timedelta(hours=2)
+        t3 = now - timedelta(hours=1, minutes=43)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'late_resume.db',
+            [
+                ('acc-a', 'cap_hit', t1, {'resets_at': reset.isoformat()}),
+                ('acc-a', 'resumed', t3),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='acc-a', start=t1, end=t3)]
+
+    @pytest.mark.asyncio
+    async def test_redetection_carries_latest_resets_at(self, tmp_path):
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=6)
+        t2 = now - timedelta(hours=5)
+        reset1 = now - timedelta(hours=4)
+        reset2 = now - timedelta(hours=2)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'later_reset.db',
+            [
+                ('acc-a', 'cap_hit', t1, {'resets_at': reset1.isoformat()}),
+                ('acc-a', 'cap_hit', t2, {'resets_at': reset2.isoformat()}),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='acc-a', start=t1, end=reset2)]
+
+    @pytest.mark.asyncio
+    async def test_redetection_with_unknown_reset_keeps_known_reset(self, tmp_path):
+        """A re-detection whose classifier parsed no resets_at must not forget the known one."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=6)
+        t2 = now - timedelta(hours=5)
+        reset = now - timedelta(hours=4)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'redetect_unknown_reset.db',
+            [
+                ('acc-a', 'cap_hit', t1, {'resets_at': reset.isoformat()}),
+                ('acc-a', 'cap_hit', t2),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='acc-a', start=t1, end=reset)]
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_exactly_at_reset_opens_new_interval(self, tmp_path):
+        """The old cap is over at its reset instant, so a cap_hit landing there is a new cap."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=6)
+        reset1 = now - timedelta(hours=4)
+        reset2 = now + timedelta(hours=1)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'cap_at_reset.db',
+            [
+                ('acc-a', 'cap_hit', t1, {'resets_at': reset1.isoformat()}),
+                ('acc-a', 'cap_hit', reset1, {'resets_at': reset2.isoformat()}),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert sorted(result, key=lambda iv: iv.start) == [
+            CapInterval(account_name='acc-a', start=t1, end=reset1),
+            CapInterval(account_name='acc-a', start=reset1, end=None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_resets_at_not_after_cap_hit_is_unknown(self, tmp_path):
+        """A resets_at at or before its own cap_hit is a parse artefact, not an end."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=3)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'stale_reset.db',
+            [('acc-a', 'cap_hit', t1, {'resets_at': (t1 - timedelta(hours=1)).isoformat()})],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='acc-a', start=t1, end=None)]
+
+    @pytest.mark.asyncio
+    async def test_malformed_details_is_unknown_reset(self, tmp_path):
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=3)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'malformed.db',
+            [
+                ('acc-json', 'cap_hit', t1, 'not-json'),
+                ('acc-list', 'cap_hit', t1, '[1, 2]'),
+                ('acc-iso', 'cap_hit', t1, {'resets_at': 'garbage'}),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert sorted(result, key=lambda iv: iv.account_name) == [
+            CapInterval(account_name='acc-iso', start=t1, end=None),
+            CapInterval(account_name='acc-json', start=t1, end=None),
+            CapInterval(account_name='acc-list', start=t1, end=None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_scoped_cap_hit_yields_no_interval(self, tmp_path):
+        """A per-model scoped cap leaves the account usable and is never resumed."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=3)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'scoped.db',
+            [
+                (
+                    'a',
+                    'cap_hit',
+                    t1,
+                    {'scope': 'opus', 'resets_at': (now + timedelta(days=1)).isoformat()},
+                ),
+                ('b', 'cap_hit', t1),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='b', start=t1, end=None)]
 
     @pytest.mark.asyncio
     async def test_multi_account_partitioned(self, tmp_path):
@@ -766,6 +982,9 @@ class TestComputeOverlapMs:
 
 from dashboard.data.cap_history import compute_capped_now_and_windows  # noqa: E402
 
+_T1 = datetime(2026, 11, 10, 9, 0, tzinfo=UTC)
+_T2 = _T1 + timedelta(hours=1)
+
 
 class TestComputeCappedNowAndWindows:
     """Tests for compute_capped_now_and_windows(intervals).
@@ -878,6 +1097,44 @@ class TestComputeCappedNowAndWindows:
         assert capped_now == 1, (
             f'Both accounts open-ended: expected capped_now=1, got {capped_now}'
         )
+
+    def test_unseen_configured_account_means_no_open_window(self):
+        """A configured account with no cap history was never capped: no all-capped window."""
+        intervals = [CapInterval('a', _T1, None), CapInterval('b', _T1, None)]
+        assert compute_capped_now_and_windows(intervals, total_accounts=3) == (0, [])
+
+    def test_unseen_configured_account_means_no_closed_window(self):
+        intervals = [CapInterval('a', _T1, _T2), CapInterval('b', _T1, _T2)]
+        _, windows = compute_capped_now_and_windows(intervals, total_accounts=3)
+        assert windows == []
+
+    def test_total_accounts_equal_to_seen_still_merges(self):
+        intervals = [CapInterval('a', _T1, None), CapInterval('b', _T1, None)]
+        assert compute_capped_now_and_windows(intervals, total_accounts=2) == (1, [(_T1, None)])
+
+    @pytest.mark.parametrize(
+        ('intervals', 'total_accounts'),
+        [
+            pytest.param([], None, id='empty'),
+            pytest.param([CapInterval('a', _T1, None)], 3, id='one-open-of-3'),
+            pytest.param(
+                [CapInterval('a', _T1, None), CapInterval('b', _T1, None)], None, id='two-open-no-total'
+            ),
+            pytest.param(
+                [CapInterval('a', _T1, None), CapInterval('b', _T1, None)], 2, id='two-open-of-2'
+            ),
+            pytest.param(
+                [CapInterval('a', _T1, None), CapInterval('b', _T1, _T2)], None, id='open-and-closed'
+            ),
+            pytest.param(
+                [CapInterval('a', _T1, None), CapInterval('b', _T1, None)], 3, id='two-open-of-3'
+            ),
+        ],
+    )
+    def test_capped_now_agrees_with_open_ended_window(self, intervals, total_accounts):
+        """Both outputs describe one account universe, so they cannot disagree."""
+        capped_now, windows = compute_capped_now_and_windows(intervals, total_accounts)
+        assert capped_now == (1 if windows and windows[-1][1] is None else 0)
 
 
 # ---------------------------------------------------------------------------

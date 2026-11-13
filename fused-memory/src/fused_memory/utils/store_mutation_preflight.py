@@ -82,15 +82,16 @@ follows is still a dated audit, not a live guarantee -- the check enforces
 the RULE, not this prose, and it is call-shaped only. See below for what
 that still misses.
 
-GUARDED, as of task 4848 -- ``amend_stale_resume_cwd_records``,
+GUARDED, as of task 7397 -- ``amend_stale_resume_cwd_records``,
 ``audit_duplicate_memories``, ``backfill_entity_standing_decision``,
 ``cleanup_count_snapshots``, ``cleanup_pin_queue_edges``,
 ``clear_false_dependency_invalidations``, ``clear_malformed_empty_memory``,
 ``consolidate_namespace_families``, ``invalidate_fabricated_shipping_edges``,
-``migrate_cross_graph_leak``, ``normalize_topic_slugs``,
+``lane_dependency_probe``, ``migrate_cross_graph_leak``, ``normalize_topic_slugs``,
 ``prune_recon_cycle_summaries``, ``purge_knowlive_namespace``,
-``retro_stamp_topics``, ``sweep_orphan_flag_markers``,
-``sweep_toolcall_xml_leak``, ``tag_cgl_eta_rehome_scope`` (17 call sites).
+``replay_failed_mem0_intents``, ``retro_stamp_topics``,
+``sweep_orphan_flag_markers``, ``sweep_toolcall_xml_leak``,
+``tag_cgl_eta_rehome_scope`` (19 call sites).
 This column IS exhaustive, because CALLING this function is what "guarded"
 MEANS: ``grep -rln 'assert_store_mutation_allowed(' fused-memory/scripts/
 --include='*.py'`` re-derives it, and re-dates it, in one line.
@@ -154,7 +155,9 @@ measured:
     and ``cleanup_test_collections`` also mutate unguarded, but only ever touch
     scratch ``_test_*`` substrate and never the shared store, so they are
     deliberately in neither column. Task 4293 wrote that reasoning, with the
-    premises that would kill it, into each of those two files.
+    premises that would kill it, into each of those two files. Task 7792 added
+    ``seed_scratch_reference_graph`` on the same footing: it writes only
+    ``evalmem_`` graphs on the scratch FalkorDB and never touches mem0 or Qdrant.
 
 ``tests/test_store_mutation_conformance.py`` is that mechanism now, for the
 RULE. The three columns above are all still hand-written prose rather than
@@ -205,6 +208,12 @@ Two placement rules, which are the non-obvious part:
     on other grounds (an empty scan, a truncated scan, a safety cap). Those are
     handled outcomes an operator can reasonably read past. A half-completed
     store mutation is not, so this refusal must not be mistakable for one.
+    The guard also emits the refusal's operator-facing record itself: a call
+    site passes its own ``logger=`` and an ``extra_detail=`` naming its
+    mechanism (see :func:`assert_store_mutation_allowed`), and must not wrap
+    the guard in an ``except StoreMutationUnavailable`` arm that logs --
+    ``tests/test_store_mutation_conformance.py`` fails any guarded script
+    that does.
 
 On this section's own history, which is why it is shaped this way: an earlier
 draft stated the rule as a universal, and a one-line grep disproved it -- the
@@ -236,6 +245,7 @@ network, no ``MemoryService``.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -315,7 +325,36 @@ def _create_probe_file(path: Path) -> None:
     os.close(fd)
 
 
-def assert_store_mutation_allowed(*, operation: str) -> None:
+def _refusal_record_message(
+    *, operation: str, history_dir: Path, extra_detail: str | None, cause: OSError
+) -> str:
+    """Compose the operator-facing ERROR record for a refused *operation*.
+
+    Every guarded script used to hand-copy this prose into its own
+    ``except StoreMutationUnavailable`` arm, and the copies drifted. Only the
+    marker, the diagnosis, the remedy and the ``--apply`` tail are shared; the
+    one script-specific part is *extra_detail*, spliced in after "so" and
+    ended here with exactly one full stop, whatever the caller wrote.
+    """
+    ending = f', so {extra_detail.rstrip().rstrip(".")}.' if extra_detail else '.'
+    diagnosis = (
+        f'{operation}: NOT started (fail-closed) -- this process cannot write '
+        f"mem0's history directory {str(history_dir)!r}{ending}"
+    )
+    return (
+        f'{diagnosis} Route this operation through the fused-memory MCP server '
+        f'(the unsandboxed owner of the store), or re-run from an unsandboxed '
+        f"operator shell. To obtain this run's report safely from anywhere, "
+        f're-run without --apply. ({cause!r})'
+    )
+
+
+def assert_store_mutation_allowed(
+    *,
+    operation: str,
+    logger: logging.Logger | None = None,
+    extra_detail: str | None = None,
+) -> None:
     """Refuse *operation* unless this process can actually write mem0's history dir.
 
     Probes real capability by creating a uniquely-named file in the resolved
@@ -333,16 +372,52 @@ def assert_store_mutation_allowed(*, operation: str) -> None:
         operation: Human-readable name of the mutation being gated (e.g.
             ``'sweep_toolcall_xml_leak --apply'``). Echoed into the refusal
             message so an operator can tell WHICH operation was refused.
+        logger: The CALLER's own logger. When given, a refusal emits exactly
+            one ERROR record through it -- naming the operation, the probed
+            directory and the probe's error -- before raising. It is the
+            caller's rather than this module's because, in most guarded
+            scripts, that record is the only diagnosis an operator sees.
+            Omitted, nothing is logged. CALLER CONTRACT: the record tells the
+            operator to re-run without ``--apply``, so pass a logger only when
+            *operation* is the ``--apply`` mode of a dry-run-by-default script.
+        extra_detail: This script's own part of that record: the mechanism by
+            which its mutation would split in half, plus its "nothing was X'd"
+            clause, read as a continuation after "so". Its final full stop is
+            optional; the record supplies exactly one. CALLER CONTRACT: never
+            restate the shared remedy or the ``--apply`` tail, which the
+            record already carries. Only the record reads it, so it requires
+            *logger*.
 
     Raises:
         StoreMutationUnavailable: When the probe cannot be created. The caller
-            MUST NOT begin the mutation.
+            MUST NOT begin the mutation. Raised the same whether or not a
+            *logger* was given.
+        ValueError: When *extra_detail* is given without *logger*. Checked
+            before the probe, so a miswired call site fails on every run rather
+            than only on the rare refused one.
     """
+    if extra_detail is not None and logger is None:
+        raise ValueError(
+            f'assert_store_mutation_allowed(operation={operation!r}) was given '
+            f'extra_detail without a logger; only the record emitted through '
+            f"the caller's logger reads extra_detail, so it would be silently "
+            f"discarded. Pass the calling module's logger, or drop extra_detail."
+        )
+
     history_dir = resolve_history_dir()
     probe = history_dir / f'.store-mutation-probe-{uuid.uuid4().hex}'
     try:
         _create_probe_file(probe)
     except OSError as exc:
+        if logger is not None:
+            logger.error(
+                _refusal_record_message(
+                    operation=operation,
+                    history_dir=history_dir,
+                    extra_detail=extra_detail,
+                    cause=exc,
+                )
+            )
         raise StoreMutationUnavailable(
             f'Refusing to begin {operation!r}: this process cannot create files in '
             f"mem0's history directory {str(history_dir)!r} ({exc!r}). "
@@ -394,12 +469,14 @@ PREFLIGHT_EXEMPT_SCRIPTS: dict[str, str] = {
         'load_cleanup_script().E2_BAKEOFF_PREFIX on the run\'s own config '
         "copy, and no CLI flag reaches it (--project-suffix moves only the "
         "suffix), so neither call can be pointed at a 'fused'-prefixed "
-        'production collection; seed_arm also stubs mem0\'s shared '
-        'add_history writer before the first add, so it writes no shared '
-        'SQLite history either. Measured against this file as it stands '
-        '(task 4293), not a standing exemption: it dies the moment a CLI '
-        'flag reaches the collection prefix, or seed_arm stops stubbing the '
-        'shared history writer. Does not cover the live path\'s '
+        'production collection; run_bake_off also sets '
+        'config.mem0.persist_history=False on that same copy, so every arm\'s '
+        'mem0 instance keeps its history in a private in-memory DB and writes '
+        'no shared SQLite history either. Measured against this file as it '
+        'stands (task 4293 for the collection prefix, task 6100 for the '
+        'history), not a standing exemption: it dies the moment a '
+        'CLI flag reaches the collection prefix, or run_bake_off stops turning '
+        'config.mem0.persist_history off. Does not cover the live path\'s '
         'MemoryService.initialize() call (Graphiti startup maintenance '
         'against production FalkorDB) -- that residual is unaddressed here '
         'and stays tracked by tasks 4318 and 4350.'
@@ -417,5 +494,20 @@ PREFLIGHT_EXEMPT_SCRIPTS: dict[str, str] = {
         'standing exemption: it dies the moment this script constructs a '
         'MemoryService, or any input can widen PREFIXES past its two '
         'test-only names.'
+    ),
+    'seed_scratch_reference_graph.py': (
+        'Its unprobed mutations (RESTORE of the copy, graph.delete() of that '
+        'same fresh copy when verification fails, and SAVE) are FalkorDB-only '
+        'and bounded to the scratch server: the target comes from '
+        'scratch_falkordb_from_env, which raises ProductionFalkorDBTarget for '
+        'production, and every graph name passes require_scratch_name '
+        "(evalmem_ only). RESTORE never uses REPLACE and refuses a name the "
+        'target already holds, so it cannot overwrite anything. It constructs '
+        'no MemoryService and no Qdrant client, so it writes no mem0 SQLite '
+        'history and needs none of the capability this probe tests for. '
+        'Measured against this file as it stands (task 7792), not a standing '
+        'exemption: it dies the moment this script gains a MemoryService or a '
+        'Qdrant client, its target can resolve to production, or a graph name '
+        'can bypass require_scratch_name.'
     ),
 }

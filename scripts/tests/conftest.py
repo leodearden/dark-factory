@@ -31,18 +31,22 @@ auto-resolve for every file in this directory, whereas a `from conftest import
 copies of one fake-httpx idiom spread across four of this directory's files.
 
 So do `runs_db_path` / `runs_db` (task 5441): a synthetic orchestrator runs.db
-shared by the model-admission audit and review suites.
+shared by the model-admission audit and review suites. `make_runs_db` (task
+5989), its event-dict factory, replaced the private copies in the wiped-metadata,
+merge-lane-throughput and speculation-depth suites.
 
 And `fake_claude_cli` / `pool_roster` / `sentinel_login` (task 6042): a
 JSON-mode fake `claude` binary keyed on the leased OAuth token, a hermetic
 account roster, and a decoy operator login, for the legibility suites that
-drive the shared session runner end to end.
+drive the shared session runner end to end. The real UsageGate those fixtures
+drive has its dead-PID probe-dir sweep confined by the plugin
+``pytest_configure`` arms (task 6275).
 """
 import json
 import os
-import shutil
 import sqlite3
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -81,6 +85,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_fleet_deploy_clock_redirect,  # noqa: F401  — the binding IS the wiring
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
@@ -88,13 +93,17 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     _df_no_leaked_drain_processes,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — binding IS wiring
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Refuse an unsafe --basetemp (esc-3072-3); arm the UsageGate probe-dir sweep confinement."""
     reject_unsafe_basetemp(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
 
 
 # The fleet-deploy-clock redirect this directory relied on used to be defined
@@ -156,12 +165,13 @@ def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
 # Shared tasks.db fixtures (task 3336).
 #
 # _TASKS_SCHEMA is a deliberate SUBSET (of tables and columns) of
-# `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_SCHEMA_SQL`,
-# keeping only what the sweep scripts read, with the real shapes and NOT NULL
-# constraints of what it keeps rather than invented ones. For the full shape,
-# run `python scripts/tasks_db_schema.py`. It stays private to `make_tasks_db`,
-# which executes it on every use — that is the executable check, so no test
-# asserts on the literal.
+# `shared/src/shared/task_store_schema.py::TASK_STORE_DDL`, keeping only what
+# the sweep scripts read, with the real shapes and NOT NULL constraints of what
+# it keeps rather than invented ones. For the full shape, run
+# `python scripts/tasks_db_schema.py`. It stays private to `make_tasks_db`:
+# scripts/tests/test_make_tasks_db_schema.py builds a store through
+# `make_tasks_db` and checks it with `tasks_db_schema.columns_outside`, so no
+# test asserts on the literal.
 #
 # The schema is the SUPERSET of what the three sweep-script test files used
 # privately: audit_wiped_metadata_files' copy carries `priority TEXT`, the two
@@ -296,9 +306,8 @@ def install_fake_httpx(monkeypatch):
     httpx IS installed here — a direct dependency of ``shared``
     (``shared/pyproject.toml``, ``httpx>=0.27``, added for task 2965) — so the
     lazy, function-local ``import httpx`` in the modules under test resolves to
-    the real library and its POST genuinely goes out to
-    ``$FUSED_MEMORY_MCP_URL`` (default ``localhost:8002``).  On any box running
-    the fused-memory stack that POST SUCCEEDS, so a test leaning on ambient
+    the real library and its request genuinely goes out.  On any box where the
+    target is listening that request SUCCEEDS, so a test leaning on ambient
     unreachability flaps with the host's listener state — the exact defect
     tasks 3237/3291 fixed by injecting a fake.  Injecting makes both the
     request shape assertable and the failure path deterministic regardless of
@@ -309,19 +318,17 @@ def install_fake_httpx(monkeypatch):
 
     The stub exposes ``post``, and ``get``/``delete`` when a caller supplies
     one (task 3713: readiness polling hits GET ``/health`` and GET
-    ``/v1/models``, which a POST-only stub cannot express; task 3644:
-    ``census_trigger.post_mcp_envelope`` DELETEs the ``/mcp`` endpoint to
-    terminate the MCP session it opened, so the server does not leak one
-    session dict entry + one live anyio task per legibility escalation).
+    ``/v1/models``, which a POST-only stub cannot express).
     Both stay OPT-IN rather than no-arg defaults, so a module that starts
     issuing a verb without its test saying so still lands in the loud-miss
     path below instead of silently receiving a stub response nobody wrote.
 
     Any OTHER attribute is a loud ``pytest.fail`` rather than an
-    ``AttributeError``, because ``default_status_fetcher`` funnels every
-    ``Exception`` into ``StatusFetchUnavailable``: a future production change
-    reaching for e.g. ``httpx.Timeout`` or ``except httpx.HTTPError`` would
-    otherwise keep its test green off the stub's own miss.  ``pytest.fail``
+    ``AttributeError``, because a module under test whose error boundary is
+    ``except Exception`` would turn the miss into its own failure: a future
+    production change reaching for e.g. ``httpx.Timeout`` or
+    ``except httpx.HTTPError`` would otherwise keep its test green off the
+    stub's own miss.  ``pytest.fail``
     raises a ``BaseException``, which such a handler cannot swallow.  Dunders
     stay ordinary ``AttributeError``s so import machinery and introspection can
     still probe the module.
@@ -358,11 +365,13 @@ def install_fake_httpx(monkeypatch):
 # Moved here from test_audit_model_admission.py so the model-admission audit
 # and review suites seed ONE schema copy through one set of helpers. Fixtures
 # for the same importlib-mode reason as the tasks.db fixtures above.
+# `make_runs_db` (task 5989) is the event-dict factory that replaced the private
+# copies in the wiped-metadata, merge-lane-throughput and speculation-depth suites.
 #
-# RUNS_DB_SCHEMA is a VERBATIM copy of the three tables those scripts read,
+# RUNS_DB_SCHEMA is a VERBATIM copy of the four tables those scripts read,
 # captured with
 #
-#     sqlite3 data/orchestrator/runs.db ".schema events invocations account_events"
+#     sqlite3 data/orchestrator/runs.db ".schema events invocations account_events runs"
 #
 # Copied rather than imported because this directory is collected by
 # `uv run --project shared pytest` and imports NO first-party package (the
@@ -411,7 +420,26 @@ CREATE TABLE account_events (
     details      TEXT,
     created_at   TEXT NOT NULL
 );
+CREATE TABLE runs (
+    run_id         TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL,
+    prd_path       TEXT,
+    started_at     TEXT NOT NULL,
+    completed_at   TEXT,
+    total_tasks    INTEGER DEFAULT 0,
+    completed      INTEGER DEFAULT 0,
+    blocked        INTEGER DEFAULT 0,
+    escalated      INTEGER DEFAULT 0,
+    total_cost_usd REAL DEFAULT 0.0,
+    paused_for_cap INTEGER DEFAULT 0,
+    cap_pause_secs REAL DEFAULT 0.0
+);
 """
+
+_INSERT_EVENT = (
+    'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
+    'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+)
 
 
 def _payload(value):
@@ -451,8 +479,7 @@ class SeedingConnection(sqlite3.Connection):
     ):
         """Insert one `events` row, stating its payload as a dict rather than JSON text."""
         self.execute(
-            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
-            'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            _INSERT_EVENT,
             (
                 timestamp,
                 run_id,
@@ -530,18 +557,73 @@ class SeedingConnection(sqlite3.Connection):
         )
         self.commit()
 
+    def seed_run(self, *, run_id, started_at, project_id='dark_factory', completed_at=None):
+        """Insert one `runs` row: one orchestrator startup, as RunStore.start_run records it."""
+        self.execute(
+            'INSERT INTO runs (run_id, project_id, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?)',
+            (run_id, project_id, started_at, completed_at),
+        )
+        self.commit()
+
+
+_DEFAULT_EVENTS_EPOCH = datetime(2026, 7, 30, tzinfo=UTC)
+
 
 @pytest.fixture
-def runs_db_path(tmp_path):
+def make_runs_db(tmp_path):
+    """Factory: build a temp runs.db carrying :data:`RUNS_DB_SCHEMA`, seed *events*, return its Path.
+
+    Each event is a dict of column -> value. ``event_type`` is required.
+    ``run_id`` defaults to ``'run-1'``, and ``timestamp`` to one second per row
+    after a fixed epoch, so the defaults stay distinct and sort as TEXT however
+    many rows there are. ``task_id`` is stored as a str unless None. ``phase``,
+    ``role``, ``cost_usd`` and ``duration_ms`` stay NULL when omitted.
+
+    ``data`` follows :func:`_payload`: a str or None is stored VERBATIM — so
+    ``data=None`` is SQL NULL here, unlike :meth:`SeedingConnection.seed_event`,
+    which stores ``'{}'`` — and a dict/list is json-encoded. Rows are inserted
+    in list order, so *events* order IS ascending ``id`` order.
+
+    *directory* defaults to ``tmp_path`` and must already exist; pass it to
+    seed a db at a project-root-relative location such as
+    ``<root>/data/orchestrator/``. Building twice at one path raises
+    ``sqlite3.OperationalError`` rather than appending to the first db's rows.
+    """
+    def _make(events=(), name='runs.db', directory=None):
+        db_path = (Path(directory) if directory is not None else tmp_path) / name
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(RUNS_DB_SCHEMA)
+            for i, event in enumerate(events):
+                task_id = event.get('task_id')
+                conn.execute(
+                    _INSERT_EVENT,
+                    (
+                        event.get('timestamp')
+                        or (_DEFAULT_EVENTS_EPOCH + timedelta(seconds=i)).isoformat(),
+                        event.get('run_id', 'run-1'),
+                        None if task_id is None else str(task_id),
+                        event['event_type'],
+                        event.get('phase'),
+                        event.get('role'),
+                        _payload(event.get('data')),
+                        event.get('cost_usd'),
+                        event.get('duration_ms'),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path
+
+    return _make
+
+
+@pytest.fixture
+def runs_db_path(make_runs_db):
     """Path to a fresh, empty runs.db carrying :data:`RUNS_DB_SCHEMA`."""
-    path = tmp_path / 'runs.db'
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript(RUNS_DB_SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
-    return path
+    return make_runs_db()
 
 
 @pytest.fixture
@@ -565,9 +647,10 @@ def runs_db(runs_db_path):
 #
 # The legibility trickle and census spawn `claude` through the shared runner
 # (shared.cli_invoke.invoke_with_cap_retry -> invoke_claude_agent), which
-# resolves the BARE name against PATH. These fixtures put a fake first on PATH
-# and give it a per-token script, so a suite can drive a real UsageGate through
-# failover, auth rejection and caps without any real CLI being reachable.
+# resolves CLAUDE_BINARY, else the bare name, against PATH. These fixtures put a
+# fake first on PATH and give it a per-token script, so a suite can drive a real
+# UsageGate through failover, auth rejection and caps without any real CLI
+# being reachable.
 # ---------------------------------------------------------------------------
 
 _FAKE_CLAUDE_PLAN_ENV = 'FAKE_CLAUDE_PLAN'
@@ -686,12 +769,15 @@ class FakeClaudeCli:
 def fake_claude_cli(tmp_path, monkeypatch):
     """Install a :class:`FakeClaudeCli` as the only `claude` on PATH.
 
-    Prepended to PATH and then PROVEN to win: ``shutil.which('claude')`` must
-    resolve to the fake, so no test using this fixture can ever reach the real
-    CLI (real LLM spend, and a test passing for the wrong reason). The shebang
-    is ``sys.executable``, so the fake needs nothing else on PATH to start.
-    Starts with the default plan; call ``.plan(...)`` to script it.
+    Prepended to PATH and then PROVEN to win: ``resolve_claude_binary()``, the
+    resolution the spawn itself performs, must return the fake, so no test
+    using this fixture can ever reach the real CLI (real LLM spend, and a test
+    passing for the wrong reason). The shebang is ``sys.executable``, so the
+    fake needs nothing else on PATH to start. Starts with the default plan;
+    call ``.plan(...)`` to script it.
     """
+    from shared.cli_invoke import resolve_claude_binary
+
     bin_dir = tmp_path / 'fake-claude-bin'
     bin_dir.mkdir()
     state_dir = tmp_path / 'fake-claude-state'
@@ -705,9 +791,9 @@ def fake_claude_cli(tmp_path, monkeypatch):
     monkeypatch.setenv(_FAKE_CLAUDE_PLAN_ENV, str(fake._plan_path))
     monkeypatch.setenv(_FAKE_CLAUDE_CALLS_ENV, str(fake._calls_path))
     monkeypatch.setenv('PATH', f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-    assert shutil.which('claude') == str(fake.path), (
-        f"the fake claude at {fake.path} must be the one PATH resolves; "
-        f"got {shutil.which('claude')!r}"
+    assert resolve_claude_binary() == str(fake.path), (
+        f"the fake claude at {fake.path} must be the one the spawn resolves; "
+        f"got {resolve_claude_binary()!r}"
     )
     return fake
 

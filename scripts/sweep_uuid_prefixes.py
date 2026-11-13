@@ -53,7 +53,7 @@ from typing import Any, Generic, NamedTuple, Protocol, TypeVar
 import _checkout as _checkout
 import httpx
 import sweep_toolcall_markup as markup_sweep
-from _task_db_scan import UNREADABLE_STORE_ERRORS, connect_ro, decode_metadata, tasks_db_path
+from _task_db_scan import UNREADABLE_STORE_ERRORS, decode_metadata, tasks_db_path
 from fused_memory.models.scope import Scope, build_known_projects_map, resolve_project_id_for_root
 from migrate_metadata_modules_to_files import (
     DEFAULT_SERVER,
@@ -61,6 +61,7 @@ from migrate_metadata_modules_to_files import (
     write_failure_reason,
 )
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
+from shared.tasks_db_readonly import connect_ro
 from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute_all
 from shared.uuid_prefix_guard import PrefixResolver, Resolution, ResolverUnavailable
 

@@ -67,12 +67,16 @@ pin because it reads as authoritative.
 from __future__ import annotations
 
 import fnmatch
-import json
 import pathlib
-import subprocess
 import sys
 import tomllib
 from typing import Any
+
+import pytest
+from pyright_json import pyright_json_report
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -107,43 +111,6 @@ def _guarded_py_files() -> list[pathlib.Path]:
     return sorted(REPO_ROOT.glob("*.py"))
 
 
-def _pyright_report(paths: list[pathlib.Path]) -> dict[str, Any]:
-    """The parsed ``pyright --outputjson`` payload for *paths*.
-
-    Asserting on the parsed diagnostic SET rather than on the exit code is what
-    makes a failure message name the rule, the file and the line. It also keeps
-    the probe honest if pyright ever exits non-zero for a reason other than a
-    diagnostic — that surfaces below as a decode failure, not as a silent pass.
-
-    ``--outputjson`` also suppresses pyright-python's newer-version notice, so
-    stdout stays pure JSON.
-    """
-    proc = subprocess.run(
-        [
-            sys.executable, "-m", "pyright", "--outputjson",
-            *[str(p) for p in paths],
-        ],
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-    )
-    # No try/except-and-skip: a missing or broken pyright must FAIL this guard.
-    assert proc.returncode in (0, 1), (
-        f"`pyright --outputjson` exited {proc.returncode} (task 3960) — expected "
-        f"0 (clean) or 1 (diagnostics). A missing pyright module or a bad "
-        f"invocation must fail this guard rather than skip it; stderr: "
-        f"{proc.stderr.strip()!r}"
-    )
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:  # pragma: no cover - defensive
-        raise AssertionError(
-            f"could not parse `pyright --outputjson` output (task 3960): {exc}; "
-            f"stdout: {proc.stdout[:500]!r}; stderr: {proc.stderr.strip()!r}"
-        ) from exc
-    return payload
-
-
 def _errors(payload: dict[str, Any]) -> list[tuple[str, int, int, str, str]]:
     """``(rel path, line, col, rule, first message line)`` per error diagnostic.
 
@@ -176,6 +143,9 @@ def test_repo_root_py_is_pyright_clean() -> None:
     This is the invariant the task exists to establish, and it is RED on
     arrival — see the MEASURED RED paragraph in the module docstring.
 
+    It asserts on the parsed diagnostic SET rather than pyright's exit code,
+    which is what makes a failure name the rule, the file and the line.
+
     Findings here are FIXED, never carved back out with an ``exclude`` or a
     ``# pyright: ignore`` (task 3350's fix-don't-weaken precedent; the
     no-carve-out half is enforced by the config test below). An ignore comment
@@ -192,7 +162,7 @@ def test_repo_root_py_is_pyright_clean() -> None:
         "almost certainly wrong"
     )
 
-    payload = _pyright_report(files)
+    payload = pyright_json_report(files)
 
     # NON-VACUITY, side two: pyright silently analysing fewer files than were
     # named (a bad path, a config exclude swallowing one) would report a clean

@@ -26,6 +26,8 @@ scan budget is pinned as COUNTED WORK, and
 Subprocesses therefore get a generous ``timeout=`` rather than a clock guard.
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -49,6 +51,10 @@ from inline_suppression_kinds import KIND_SPECS, Kind
 from inline_suppression_scan import scan_tree
 from shared.governed_exceptions import INLINE_MARKER_FORMS, Policy
 from shared.ratchet import BASELINE_README, SCHEMA_VERSION, load
+from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'inline_suppressions.py'
@@ -146,9 +152,11 @@ def _run_script(
 def test_the_shipped_class_table_is_empty(tmp_path: Path):
     """D9 — the valve is the OPERATOR's, and it ships shut.
 
-    The rows are ruled by task 5603 and applied by task 5609; an implementer adding one here
-    would be ratifying a blanket exception on the operator's behalf, which is
-    the one thing D9 reserves.
+    The operator ruled the table empty on day one
+    (docs/legibility/inv12-day-one-rulings.md, Part 3 Q1), so each new
+    suppression carries its own inline disposition.  A row stays the operator's
+    alone to add: an implementer adding one here would be ratifying a blanket
+    exception on the operator's behalf, which is the one thing D9 reserves.
     """
     del tmp_path
     assert dict(inline_suppressions.RATIFIED_SUPPRESSION_CLASSES) == {}
@@ -850,7 +858,7 @@ def test_json_publishes_every_block_the_register_reads(tmp_path: Path, capsys):
     baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
     report = _json_report(tmp_path, baseline, capsys)
 
-    assert report['schema_version'] == inline_suppressions.REPORT_SCHEMA_VERSION == 1
+    assert report['schema_version'] == inline_suppressions.REPORT_SCHEMA_VERSION == 2
     assert set(report['params']) == {'kinds', 'key_scheme', 'digest_hex'}
     assert report['status'] == 'advisory'
     assert report['files_enumerated'] == 2
@@ -884,13 +892,29 @@ def test_json_names_every_debt_owner_and_every_ratified_id_with_its_sites(
     real ratification row, so it needs the ids AND the sites citing each one — an
     id with no sites to point at is a finding it cannot report.  The debt block
     is the same shape for the same reason: the owner has to be followable back to
-    a task or a ticket without re-scanning the tree.
+    a task or a ticket without re-scanning the tree — as the vocabulary's own
+    wire format, so no consumer parses an owner string back into a ref.
     """
-    baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
+    files = dict(_REPORT_TREE)
+    files['n.py'] = 'h = 8  # noqa: E402  # debt: ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY\n'
+    baseline = _write_fixture_tree(tmp_path, files)
     report = _json_report(tmp_path, baseline, capsys)
 
     assert report['debt'] == [
-        {'path': 'm.py', 'line': 2, 'kind': 'noqa', 'codes': ['E402'], 'owner': 'task 5601'}
+        {
+            'path': 'm.py',
+            'line': 2,
+            'kind': 'noqa',
+            'codes': ['E402'],
+            'owner': {'type': 'task', 'id': 5601},
+        },
+        {
+            'path': 'n.py',
+            'line': 1,
+            'kind': 'noqa',
+            'codes': ['E402'],
+            'owner': {'type': 'ticket', 'id': 'tkt_0RTCC80EM92A7WD08D6RF6ZZPY'},
+        },
     ]
     assert report['ratified'] == [
         {
@@ -955,6 +979,62 @@ def test_json_counts_a_class_ratified_site_under_its_class(tmp_path: Path, capsy
         }
     ]
     assert report['ownership']['class'] == 1
+
+
+def test_json_counts_sites_per_file_for_every_file_holding_one(tmp_path: Path, capsys):
+    """The per-file cut of the register's report, which it cannot derive without
+    re-scanning.  A tracked file with no marker is absent, not a zero row: the
+    block answers "where are the suppressions", and the corpus size is
+    ``files_enumerated``'s job.
+    """
+    baseline = _write_fixture_tree(
+        tmp_path,
+        {
+            'pyproject.toml': RUFF_CONFIG,
+            'pkg/b.py': 'z = 1  # type: ignore[arg-type]\n',
+            'a.py': (
+                'x = 1  # type: ignore[arg-type]\n'
+                'y = 2  # pyright: ignore[reportArgumentType]\n'
+                'w = 3  # noqa: E402\n'
+            ),
+            'quiet.py': 'nothing = "here"\n',
+        },
+    )
+
+    report = _json_report(tmp_path, baseline, capsys)
+
+    assert report['by_file'] == [{'path': 'a.py', 'sites': 3}, {'path': 'pkg/b.py', 'sites': 1}]
+
+
+def test_json_publishes_every_row_of_the_class_table_the_run_was_handed(
+    tmp_path: Path, capsys
+):
+    """The closed-world check needs every class row's Policy, including a row no
+    site matches: ``classes`` lists only rows with sites, so a row citing a
+    ratification that does not exist would otherwise escape the check entirely.
+    """
+    matched = SuppressionClass(kind=Kind.TYPE_IGNORE, code='arg-type', scope=Scope.ANY)
+    unmatched = SuppressionClass(kind=Kind.NOQA, code='E731', scope=Scope.TESTS)
+    baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
+
+    report = _json_report(
+        tmp_path,
+        baseline,
+        capsys,
+        classes={unmatched: Policy('inv12-b'), matched: Policy('inv12-a')},
+    )
+
+    assert report['class_table'] == [
+        {'class': 'noqa[E731]@tests', 'ratified': 'inv12-b'},
+        {'class': 'type: ignore[arg-type]@any', 'ratified': 'inv12-a'},
+    ]
+    assert [row['class'] for row in report['classes']] == ['type: ignore[arg-type]@any']
+
+
+def test_json_publishes_an_empty_class_table_for_the_shipped_one(tmp_path: Path, capsys):
+    baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
+
+    assert _json_report(tmp_path, baseline, capsys)['class_table'] == []
 
 
 def test_json_carries_the_verdict_a_check_would_reach(tmp_path: Path, capsys):
@@ -1104,7 +1184,26 @@ def _live_report(capsys, *extra: str) -> dict:
     return json.loads(captured.out)
 
 
-def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(capsys):
+# One loadgroup worker runs every consumer of `live_json_report`, so the live
+# tree is scanned once for them rather than once per worker that drew one.
+_LIVE_JSON_GROUP_NAME = 'inline_suppression_live_json'
+
+
+@pytest.fixture(scope='module')
+def live_json_report() -> dict:
+    """``_live_report`` with no extra argv, run once for every consumer.
+
+    Redirects the streams itself because capsys is function-scoped.
+    """
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = inline_suppressions.main(['--json', '--root', str(REPO_ROOT)])
+    assert code == 0, stderr.getvalue()
+    return json.loads(stdout.getvalue())
+
+
+@pytest.mark.xdist_group(_LIVE_JSON_GROUP_NAME)
+def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(live_json_report: dict):
     """The NON-VACUITY FLOOR, because "nothing was read" and "nothing was wrong"
     are otherwise the same output.
 
@@ -1124,7 +1223,7 @@ def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(capsys)
     that is a statement about the report's SHAPE, which no corpus can falsify.
     The four assertions above already carry the whole non-vacuity floor.
     """
-    report = _live_report(capsys)
+    report = live_json_report
 
     assert report['files_enumerated'] >= 1000
     assert report['sites'] >= 1000
@@ -1162,7 +1261,8 @@ def test_the_live_tree_carries_no_disposition_faults(tmp_path: Path, capsys):
     )
 
 
-def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
+@pytest.mark.xdist_group(_LIVE_JSON_GROUP_NAME)
+def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(live_json_report: dict):
     """THE ≤10 s BUDGET, PINNED AS COUNTED WORK AND NEVER AS A CLOCK.
 
     The budget fits only because of the prefilter, so the honest guard is that
@@ -1194,7 +1294,7 @@ def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
             for spec in specs
         )
 
-    report = _live_report(capsys)
+    report = live_json_report
 
     assert report['files_enumerated'] == len(tracked)
     assert report['files_tokenized'] < report['files_enumerated']
@@ -1223,3 +1323,17 @@ def test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded(capsys):
     assert inline_suppressions.main(['--check', '--root', str(REPO_ROOT)]) == 0, (
         capsys.readouterr().err
     )
+
+
+def test_the_live_json_report_consumers_share_one_xdist_worker(request):
+    consumers = {
+        test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce,
+        test_the_live_scan_tokenizes_exactly_the_marker_bearing_files,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, 'function', None) in consumers
+    ]
+    if not selected:
+        pytest.skip('no consumer of the live --json report is selected in this session')
+
+    assert single_xdist_group(selected) == _LIVE_JSON_GROUP_NAME

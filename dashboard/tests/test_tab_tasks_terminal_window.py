@@ -1,16 +1,15 @@
-"""Wiring of the Tasks tab's on-demand terminal window and its PRD-box count.
+"""Wiring of the Tasks tab's on-demand terminal window.
 
-PRD decisions 5 and 8 (plans/dashboard-one-datum-one-path-prd.md) and task
-4416's option (a): terminal rows are never on the default render; the Tasks tab
-requests a project's ``?terminal=<project>`` window when the terminal view is
-selected or that project is grouped by PRD, and a PRD box reads '≥n/m terminal'
-from a lower_bound Datum over the snapshot rows and that window.
+PRD decision 5 (plans/dashboard-one-datum-one-path-prd.md) and task 4416's
+option (a): terminal rows are never on the default render; the Tasks tab
+requests a project's ``?terminal=<project>`` window only when the terminal view
+is selected (plans/dashboard-prd-lanes-prd.md §4.4: the by-PRD lanes read
+/prds, not the window).
 
 This file pins only the WIRING, on comment-stripped served source. The rules
 themselves execute under node: which projects request the window in
-task_snapshot.test.mjs (terminalWindowProjects), what a requesting caller shows
-in data_on_demand.test.mjs (onDemandDatum), and the PRD count in
-prd_grouping.test.mjs (prdProgress, prdProgressReading).
+task_snapshot.test.mjs (terminalWindowProjects), and what a requesting caller
+shows in data_on_demand.test.mjs (onDemandDatum).
 """
 
 from __future__ import annotations
@@ -18,9 +17,8 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     extract_function_body,
-    find_function_params,
     strip_js_comments,
     walk_balanced,
 )
@@ -60,16 +58,12 @@ def _view_rows_args(tasks_tab_code: str) -> list[list[str]]:
 
 
 def test_the_wanted_set_is_terminal_window_projects_over_the_visible_projects(tasks_tab_code, wanted):
-    args = re.search(rf'\bconst\s+{wanted}\s*=\s*terminalWindowProjects\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)', tasks_tab_code)
-    assert args, f'{wanted} is not terminalWindowProjects(<project ids>, <filter>, <grouped ids>)'
-    ids, view_filter, grouped = args.groups()
+    args = re.search(rf'\bconst\s+{wanted}\s*=\s*terminalWindowProjects\(\s*(\w+)\s*,\s*(\w+)\s*\)', tasks_tab_code)
+    assert args, f'{wanted} is not terminalWindowProjects(<project ids>, <filter>)'
+    ids, view_filter = args.groups()
     assert re.fullmatch(r'projects\.map\(\s*(\w+)\s*=>\s*\1\.id\s*\)', _binding(tasks_tab_code, ids).strip()), (
         f'`{ids}` is not the visible projects\' ids'
     )
-    assert re.fullmatch(
-        rf"{ids}\.filter\(\s*(\w+)\s*=>\s*groupByPrdMap\[\s*\1\s*\]\s*===\s*'prd'\s*\)",
-        _binding(tasks_tab_code, grouped).strip(),
-    ), f'`{grouped}` is not the ids whose groupByPrdMap entry is \'prd\''
     assert any(call[2] == view_filter for call in _view_rows_args(tasks_tab_code)), (
         f'`{view_filter}` is not the view filter the listed rows are selected by'
     )
@@ -142,86 +136,17 @@ def test_a_requesting_project_reads_its_own_outcome_and_the_rest_read_the_unrequ
     )
 
 
-def test_the_flat_view_the_grouped_view_and_the_prd_count_read_one_terminal_datum(tasks_tab_code):
+def test_the_listed_and_the_held_rows_of_the_flat_view_read_one_terminal_datum(tasks_tab_code):
     calls = _view_rows_args(tasks_tab_code)
     assert len(calls) == 2, f'TasksTab calls viewRows {len(calls)} times; expected the listed and the held rows'
     rows, terminal = {call[0] for call in calls}, {call[1] for call in calls}
     assert len(rows) == 1 and len(terminal) == 1, f'the two viewRows calls read different Datums: {calls}'
-    [rows], [terminal] = rows, terminal
-    grouped = re.search(r'<ProjectPrdGroups\b(.*?)/>', tasks_tab_code, re.DOTALL)
-    assert grouped, 'TasksTab renders no <ProjectPrdGroups ... />'
-    for prop, datum in (('rows', rows), ('terminal', terminal)):
-        assert re.search(rf'\b{prop}=\{{\s*{datum}\s*\}}', grouped.group(1)), (
-            f'<ProjectPrdGroups> is not handed {prop}={{{datum}}}, the Datum the rows are listed from'
-        )
+    [terminal] = terminal
     source = re.search(rf'\bconst\s+{terminal}\s*=\s*(\w+)\(\s*p\.id\s*\)', tasks_tab_code)
     assert source, f'`{terminal}` is not read per project through one helper'
     assert 'onDemandDatum(' in _binding(tasks_tab_code, source.group(1)), (
         f'`{source.group(1)}` does not route a wanted project to onDemandDatum'
     )
-
-
-class TestThePrdCountIsMemoised:
-    """The count is rebuilt when a poll lands, not on the app's 1 s clock tick.
-
-    projectRows and the terminal readers stamp a fresh copy on every call, so a
-    memo cannot key on their identity; useHeldDatum keeps the copy it already
-    holds while task_snapshot.js::sameDatum says the new one is the same Datum.
-    Which copies are the same executes in task_snapshot.test.mjs.
-    """
-
-    @pytest.fixture(scope='class')
-    def project_prd_groups_code(self, tab_tasks_code):
-        return extract_function_body(tab_tasks_code, 'ProjectPrdGroups')
-
-    def test_tasks_tab_does_not_rebuild_the_count_per_render(self, tasks_tab_code):
-        assert 'prdProgress(' not in tasks_tab_code, (
-            'TasksTab calls prdProgress inline, so every render regroups the whole project'
-        )
-
-    def test_the_count_is_a_memo_over_the_held_rows_and_terminal_datums(self, project_prd_groups_code):
-        held = {}
-        for prop in ('rows', 'terminal'):
-            match = re.search(rf'\bconst\s+(\w+)\s*=\s*useHeldDatum\(\s*{prop}\s*\)', project_prd_groups_code)
-            assert match, f'ProjectPrdGroups does not hold its `{prop}` prop through useHeldDatum'
-            held[prop] = match.group(1)
-        rows, terminal = held['rows'], held['terminal']
-        assert re.search(
-            rf'\buM_T\(\s*\(\)\s*=>\s*prdProgress\(\s*{rows}\s*,\s*{terminal}\s*\)\s*,\s*\[\s*{rows}\s*,\s*{terminal}\s*\]\s*\)',
-            project_prd_groups_code,
-        ), f'the PRD count is not uM_T(() => prdProgress({rows}, {terminal}), [{rows}, {terminal}])'
-
-    def test_a_held_datum_is_replaced_only_when_it_is_not_the_same_datum(self, tab_tasks_code):
-        hook = extract_function_body(tab_tasks_code, 'useHeldDatum')
-        ref = re.search(r'\bconst\s+(\w+)\s*=\s*uR_T\(', hook)
-        assert ref, 'useHeldDatum keeps no ref'
-        assert re.search(rf'\bif\s*\(\s*!\s*sameDatum\(\s*{ref.group(1)}\.current\s*,', hook), (
-            'useHeldDatum does not compare the held Datum with task_snapshot.js::sameDatum'
-        )
-
-
-class TestThePrdBoxCount:
-    @pytest.fixture(scope='class')
-    def prd_box_code(self, tab_tasks_code):
-        return extract_function_body(tab_tasks_code, 'PrdBox')
-
-    def test_the_count_is_the_progress_datum_read_as_terminal_of_total(self, prd_box_code):
-        count = re.search(r'<span\s+className="prd-box-count"[^>]*>(.*?)</span>\s*</div>', prd_box_code, re.DOTALL)
-        assert count, 'PrdBox renders no .prd-box-count span'
-        assert re.fullmatch(
-            r'\s*<DatumReading\s+datum=\{\s*\w+\s*\}\s+format=\{\s*prdProgressReading\([^)]*\)\s*\}\s*/>\s*terminal\s*',
-            count.group(1),
-        ), f'the PRD count is not <DatumReading datum={{…}} format={{prdProgressReading(…)}} /> terminal: {count.group(1)!r}'
-        assert not re.search(r'\.views\.terminal\s*\}\s*/\s*\{', prd_box_code), (
-            'the interim n/m tally over the client-held members is still rendered'
-        )
-
-    @pytest.mark.parametrize('focus_prop', ['focusMode', 'focusAnchorId'])
-    def test_the_box_takes_no_focus_state(self, tab_tasks_jsx_body, focus_prop):
-        masked, start, end = find_function_params(tab_tasks_jsx_body, 'PrdBox')
-        params = tab_tasks_jsx_body[start:end]
-        assert params.strip(), 'PrdBox declares no parameters; the absence below would be vacuous'
-        assert not re.search(rf'\b{focus_prop}\b', params), f'PrdBox takes {focus_prop}: {params.strip()!r}'
 
 
 def test_a_selected_terminal_task_opens_in_the_detail_pane(tasks_tab_code, wanted):

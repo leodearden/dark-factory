@@ -1,13 +1,10 @@
 /* tab_memory_evals.jsx — memory-eval monitoring section, rendered INSIDE the
    Memory tab (PRD DD3: not a thirteenth top-level tab, no Rail entry).
 
-   The JSX/React wiring here is verified via Python source-assertion tests in
-   dashboard/tests/test_tab_memory_evals.py — no JSX runner exists (this file
-   is transformed by CDN Babel at runtime and the repo has no node_modules).
+   Render behaviour is covered by dashboard/tests/js/jsx_render.test.mjs.
    The pure, JSX-free logic that used to live here was moved to
-   /static/redux/memory_evals_fmt.js (task 3481) so it could escape that
-   limitation; WHY, in full, is in that file's header, which is the one place
-   that account is kept.
+   /static/redux/memory_evals_fmt.js (task 3481); WHY, in full, is in that
+   file's header, which is the one place that account is kept.
 
    LOAD ORDER IS THE CONTRACT, in both directions.
 
@@ -183,7 +180,10 @@ function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
   const badge = verdictBadge(m);
   return (
     <tr>
-      <td className="mono" style={{ color: 'var(--fg-1)' }}>{m.metric_id}</td>
+      <td className="mono" style={{ color: 'var(--fg-1)' }}>
+        {m.metric_id}
+        {m.item && <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>item {m.item}</div>}
+      </td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
         {m.kind}
         <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{m.rule_kind}</div>
@@ -574,7 +574,11 @@ function MemoryEvalCard({ ev, onOpenEscalation }) {
           </thead>
           <tbody>
             {metrics.map(m => (
-              <MemoryEvalMetricRow key={m.metric_id} metric={m} onOpenEscalation={onOpenEscalation} />
+              <MemoryEvalMetricRow
+                key={JSON.stringify([m.metric_id, m.item ?? null])}
+                metric={m}
+                onOpenEscalation={onOpenEscalation}
+              />
             ))}
           </tbody>
         </table>

@@ -48,6 +48,9 @@ from architecture_doc_transitions import (
 from shared import task_transitions
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import TRANSITIONS, ActorClass
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # shared/tests/test_architecture_doc_transition_parity.py -> parents[0]=shared/tests,
 # parents[1]=shared, parents[2]=repo root. Same idiom as

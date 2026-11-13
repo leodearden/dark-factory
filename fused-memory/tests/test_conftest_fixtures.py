@@ -24,6 +24,7 @@ from _fm_helpers import (
     make_rebuild_detail,
 )
 from _graphiti_fake import FakeGraphitiClient
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.graphiti_client import (
     INCOMPLETE_SHORT_READ,
@@ -31,6 +32,8 @@ from fused_memory.backends.graphiti_client import (
     PagedRead,
 )
 from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 

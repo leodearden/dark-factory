@@ -27,7 +27,7 @@ from typing import Any, Protocol
 
 from shared.task_statuses import TaskStatus
 
-from fused_memory.middleware.task_curator import embedding_text
+from fused_memory.middleware.curator_types import embedding_text
 
 logger = logging.getLogger(__name__)
 

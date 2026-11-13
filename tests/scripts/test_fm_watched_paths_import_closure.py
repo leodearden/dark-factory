@@ -22,6 +22,11 @@ from collections.abc import Iterator
 from types import ModuleType
 from typing import NamedTuple
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 ROOT_MEMBER = "fused-memory"
 

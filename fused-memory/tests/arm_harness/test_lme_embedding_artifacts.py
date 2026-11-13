@@ -19,6 +19,7 @@ from functools import cache
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.arm_spec import METERED_STACK, EmbeddingArmSpec, load_arm_spec
 from fused_memory.arm_harness.embedding_preregistration import (
@@ -43,6 +44,8 @@ from fused_memory.arm_harness.slate import (
     embedding_control_spec,
     load_embedding_slate,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[3]
 EMBEDDING_RELATIVE = 'plans/local-memory-models-eval-embedding'
@@ -193,6 +196,7 @@ def test_each_control_is_the_metered_incumbent_embedder(arm_id, scratch):
     assert expected.preregistration_sha is None
 
 
+@pytest.mark.reads_git_history
 def test_the_candidates_preregistration_sha_carries_the_doc_and_precedes_head():
     assert {_run(arm_id).spec.preregistration_sha for arm_id in CANDIDATES} == {
         PREREGISTRATION_SHA

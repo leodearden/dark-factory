@@ -38,9 +38,9 @@ persistence seam that later work (W3/2158) can type against.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
 __all__ = [
@@ -54,28 +54,6 @@ _VALID_EXECUTION_CLASSES: frozenset[str] = frozenset(EXECUTION_CLASSES)
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes → empty dict).
-
-    None → {}; empty string → {}; dict → returned as-is (callers that need
-    to mutate must copy first); JSON string → parsed dict, or {} if the
-    parse fails or yields a non-dict value; anything else → {}.
-    """
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        if not metadata:
-            return {}
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
 
 
 def _validation_error(message: str, *, hint: str | None = None) -> dict[str, Any]:
@@ -120,7 +98,7 @@ def execution_class_error(
     if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
         return None
 
-    execution_class = _parse_metadata(metadata).get('execution_class')
+    execution_class = raw_metadata_dict(metadata, source='execution_class_guard').get('execution_class')
     if execution_class not in _VALID_EXECUTION_CLASSES:
         valid_list = ', '.join(repr(c) for c in sorted(_VALID_EXECUTION_CLASSES))
         return _validation_error(
@@ -155,4 +133,4 @@ def inject_execution_class(
     Args:
         metadata: Incoming task metadata (dict, JSON string, or None).
     """
-    return dict(_parse_metadata(metadata))
+    return dict(raw_metadata_dict(metadata, source='execution_class_guard'))

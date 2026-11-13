@@ -391,7 +391,7 @@ class TestPartiallyProvisionedVenvIsEnvTransient:
             )
 
         assert result.failing_leg_categories is not None
-        assert result.failing_leg_categories[-1] == 'unknown_test_failure'
+        assert result.failing_leg_categories[-1] == 'type_error'
         assert _partial_venv_warnings(caplog) == []
 
     @pytest.mark.asyncio
@@ -403,7 +403,7 @@ class TestPartiallyProvisionedVenvIsEnvTransient:
             result = await self._run(tmp_path, invoked, test_command='')
 
         assert not [c for c in invoked if 'pytest' in c], invoked
-        assert result.category == 'unknown_test_failure'
+        assert result.category == 'type_error'
         assert _partial_venv_warnings(caplog) == []
 
     @pytest.mark.asyncio
@@ -415,5 +415,5 @@ class TestPartiallyProvisionedVenvIsEnvTransient:
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
             result = await self._run(tmp_path, test_command=TEST_CMD)
 
-        assert result.category == 'unknown_test_failure'
+        assert result.category == 'type_error'
         assert _partial_venv_warnings(caplog) == []

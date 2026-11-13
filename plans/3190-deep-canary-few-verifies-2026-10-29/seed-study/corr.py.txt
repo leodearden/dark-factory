@@ -1,0 +1,57 @@
+import json,re,time,bisect,collections,math,statistics as st
+T={}
+rx=re.compile(r"(psi_\w+_avg10|verify_concurrency|verify_rss_total_bytes|runqueue_ratio)': '([0-9.]+)'")
+for l in open('/tmp/3190s/ticks.raw',errors='replace'):
+    m=re.search(r'tick ts=(\d+)',l)
+    if not m:continue
+    t=int(m[1]);d={k:float(v) for k,v in rx.findall(l)}
+    if 'psi_io_some_avg10' in d:
+        o=T.get(t)
+        if o is None or d.get('verify_concurrency',0)>o.get('verify_concurrency',0):T[t]=d
+ts=sorted(T);print('ticks',len(ts),time.strftime('%m-%d %H:%M',time.gmtime(ts[0])),time.strftime('%m-%d %H:%M',time.gmtime(ts[-1])))
+gaps=[b-a for a,b in zip(ts,ts[1:])];print('tick gap p50',st.median(gaps))
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+def win(a,b):
+    i=bisect.bisect_left(ts,a);j=bisect.bisect_right(ts,b);return [T[ts[x]] for x in range(i,j)]
+keys=['psi_cpu_some_avg10','psi_io_some_avg10','psi_io_full_avg10','psi_mem_some_avg10','psi_mem_full_avg10','runqueue_ratio','verify_concurrency']
+S=json.load(open('/tmp/3190s/phases.json'))['seeds']
+print('DAY mean of every tick: '+' '.join(k.replace('_avg10','') for k in keys))
+b=collections.defaultdict(list)
+for t in ts:b[time.strftime('%m-%d',time.gmtime(t))].append(T[t])
+for k in sorted(b):
+    print(k,len(b[k]),*[f"{st.mean(x.get(q,0) for x in b[k]):.1f}" for q in keys])
+R=[]
+for s in S:
+    if 'clone0' in s and 'clone1' in s:
+        w=win(s['clone0'],s['clone1'])
+        if not w:continue
+        r=dict(t=s['clone0'],c=s['clone1']-s['clone0'],rl=s.get('relink',0)-s.get('reloc',0) if 'relink' in s and 'reloc' in s else None,rc=(s['reloc']-s['inval'])/max(s.get('ncand',1),1) if 'reloc' in s and 'inval' in s and s.get('ncand',0)>100 else None)
+        for k in keys:r[k]=st.mean(x.get(k,0) for x in w)
+        R.append(r)
+json.dump(R,open('/tmp/3190s/clone_psi.json','w'))
+def spear(a,b):
+    def rk(v):
+        o=sorted(range(len(v)),key=lambda i:v[i]);r=[0]*len(v)
+        for i,x in enumerate(o):r[x]=i
+        return r
+    ra,rb=rk(a),rk(b);n=len(a);ma=(n-1)/2
+    return sum((x-ma)*(y-ma) for x,y in zip(ra,rb))/math.sqrt(sum((x-ma)**2 for x in ra)*sum((y-ma)**2 for y in rb))
+print('Spearman clone vs mean tick in clone window, n=',len(R))
+for name,lo,hi in (('all',0,9e12),('W39-41 (to 10-11)',0,time.mktime((2026,10,12,0,0,0,0,0,0))),('W42 10-12..18',time.mktime((2026,10,12,0,0,0,0,0,0)),time.mktime((2026,10,19,0,0,0,0,0,0))),('W43+W44',time.mktime((2026,10,19,0,0,0,0,0,0)),9e12)):
+    X=[r for r in R if lo<=r['t']<hi]
+    print(name,len(X),*[f"{k.replace('_avg10','')}={spear([r['c'] for r in X],[r[k] for r in X]):+.2f}" for k in keys])
+print('clone p50 binned by psi_io_some in clone window, by era  (bin: n p50)')
+eras=[('09-27..10-11',0,1791763200),('10-12..10-18',1791763200,1792368000),('10-19..10-25',1792368000,1792972800),('10-26..10-30',1792972800,9e12)]
+for k,bins in (('psi_io_some_avg10',[0,5,10,20,30,40,60,100]),('psi_cpu_some_avg10',[0,20,40,50,60,70,80,100]),('verify_concurrency',[0,1,2,3,4,6,8,100]),('psi_mem_full_avg10',[0,0.5,1,2,5,10,20,100])):
+    print(k)
+    for nm,lo,hi in eras:
+        X=[r for r in R if lo<=r['t']<hi];out=[]
+        for a,c in zip(bins,bins[1:]):
+            v=[r['c'] for r in X if a<=r[k]<c]
+            if len(v)>=5:out.append(f"[{a},{c}) {len(v)} {pct(v,.5):.0f}")
+        print(' ',nm,len(X),'; '.join(out))
+print('relink phase p50 and reloc ms/candidate by era (CPU/process-spawn control)')
+for nm,lo,hi in eras:
+    X=[r for r in R if lo<=r['t']<hi]
+    print(nm,f"relink p50={pct([r['rl'] for r in X if r['rl']],.5):.1f} reloc_per_cand_ms={1000*pct([r['rc'] for r in X if r['rc']],.5):.1f}")

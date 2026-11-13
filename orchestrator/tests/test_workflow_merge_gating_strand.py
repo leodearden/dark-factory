@@ -83,11 +83,13 @@ from orchestrator.config import (
     TimeoutsConfig,
 )
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.resume_resolution import CarriedResolution
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardResolved,
     WorkflowState,
     outcome_allows_status,
@@ -304,7 +306,7 @@ def _time_the_wait(workflow: TaskWorkflow) -> dict[str, float]:
     timing: dict[str, float] = {}
     original = workflow._wait_for_resolution
 
-    async def _timed() -> str:
+    async def _timed() -> tuple[CarriedResolution, ...]:
         started = asyncio.get_running_loop().time()
         timing['calls'] = timing.get('calls', 0) + 1
         try:
@@ -316,6 +318,46 @@ def _time_the_wait(workflow: TaskWorkflow) -> dict[str, float]:
 
     workflow._wait_for_resolution = _timed  # type: ignore[method-assign]
     return timing
+
+
+def _file_gating_l0_after_the_wait(
+    workflow: TaskWorkflow, queue: EscalationQueue, task_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """File a plain blocking L0 the moment ``_wait_for_resolution`` returns.
+
+    That is the window AFTER the wait's tail read: the tail gates only what
+    ``needs_human`` selects, and the wait loop only re-polls level 0 before
+    it returns, so a plain blocking L0 landing here is seen by nothing but the
+    merge-entry handler's single-shot ``_is_gating_escalation`` re-check.
+    Deterministic, with no sleeps: the record exists before the handler reads
+    the queue again.
+
+    Install this BEFORE :func:`_time_the_wait`, so the timer wraps it and still
+    counts entries into the wait.
+    """
+    original = workflow._wait_for_resolution
+
+    async def _then_file() -> tuple[CarriedResolution, ...]:
+        carried = await original()
+        _submit_gating_l0(queue, task_id)
+        return carried
+
+    monkeypatch.setattr(workflow, '_wait_for_resolution', _then_file)
+
+
+def _journal_status_writes(
+    scheduler, events: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Append ``status:<status>`` to *events* on every task-status write, so a
+    test can order the park against the steward's lifecycle edges."""
+    record_status = scheduler.set_task_status
+
+    async def _journalled_set_task_status(task_id_, status, *args, **kwargs):
+        events.append(f'status:{status}')
+        return await record_status(task_id_, status, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler, 'set_task_status', _journalled_set_task_status)
 
 
 def _steward_wait_timeouts(store: _RecordingEventStore) -> list[dict]:
@@ -565,9 +607,11 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
     fresh level-0 is still within the WAIT's reach — its loop re-polls level-0
     on every wake, inside the SAME deadline — so this shape costs exactly one
     window and then parks via the expiry branch.  Contrast
-    :func:`_make_chained_l2_steward`, whose follow-on is invisible to the wait
-    entirely.  Between them they cover both halves of the single-shot bound
-    (spec S5).
+    :func:`_make_chained_l2_steward`, whose follow-on the wait LOOP never
+    polls; the wait's tail hands it off instead.  Neither shape reaches the
+    merge-entry handler's post-wait re-check:
+    ``TestGateReFireIsBounded::test_gating_record_filed_after_the_wait_parks_with_l1``
+    pins that arm.
 
     Runs in the background after a short delay for the same reason
     :func:`_make_chained_l2_steward` does: a synchronous ``start()`` would
@@ -658,10 +702,11 @@ def _make_journalling_resolving_steward(
                     esc.id, 'Resolved by journalling FakeSteward',
                     resolved_by='fake-steward',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Resolved by FakeSteward'),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Resolved by FakeSteward'),
+                    ))
 
         async def stop(self) -> None:
             events.append('steward:stop')
@@ -669,24 +714,20 @@ def _make_journalling_resolving_steward(
     return _FakeSteward
 
 
-def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
+def _make_chained_l2_steward(
+    queue: EscalationQueue, task_id: str, events: list[str] | None = None,
+) -> type:
     """A steward that resolves its own L0 then files a fresh born-at-L2.
 
     The same chained shape as :func:`_make_chained_gating_steward`, but the
-    follow-on record is one the WAIT provably never waits on — which is what
-    makes it the load-bearing case for the post-wait re-check:
-
-    * ``_wait_for_resolution``'s loop polls ``get_by_task(..., level=0)``, so a
-      level-2 record is invisible to it;
-    * its entry-time ``pending_high_sev`` stop-the-line check already ran,
-      before this record existed;
-    * its tail's ``has_open_l1`` matches level-1 only.
-
-    So the wait returns NORMALLY with no expiry, and without a re-check the
-    handler resumes the merge straight past an open, human-gated record — a D4
-    stop-the-line violation.  (A chained plain-blocking L0, by contrast, IS
-    caught by the wait loop, which re-polls it inside the SAME deadline; see
-    :func:`_make_chained_gating_steward`.)
+    follow-on record is one the wait's LOOP never waits on: the loop polls
+    ``get_by_task(..., level=0)``, and the entry-time stop-the-line check ran
+    before this record existed.  The wait's TAIL applies the same
+    ``needs_human`` rule to the full pending set, so it raises a
+    ``_HumanHandoff`` there and the handler parks rather than resuming the
+    merge past an open, human-gated record (D4 stop-the-line).  (A chained
+    plain-blocking L0, by contrast, IS caught by the wait loop, which re-polls
+    it inside the SAME deadline; see :func:`_make_chained_gating_steward`.)
 
     Mirrors ``TaskSteward._auto_escalate_to_human``'s real behaviour of filing
     a human-facing record while handing off.
@@ -699,6 +740,9 @@ def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
     never exercised at all.  (Same reasoning, and the same delay-then-wake
     shape, as ``_make_dismiss_and_publish_steward`` in
     test_workflow_escalated_steward_stall.py.)
+
+    With *events*, ``stop()`` journals ``steward:stop`` there, as
+    :func:`_make_journalling_resolving_steward` does.
     """
 
     class _FakeSteward:
@@ -746,6 +790,8 @@ def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
             self.chain_task = asyncio.create_task(self._chain())
 
         async def stop(self) -> None:
+            if events is not None:
+                events.append('steward:stop')
             if self.chain_task is not None:
                 await self.chain_task
 
@@ -1355,6 +1401,13 @@ class TestGateReFireIsBounded:
     by the time the merge-entry handler looks again there is a NEW gating
     record open that nothing has waited on.
 
+    Three shapes, each parking through a different arm:
+
+    * a chained born-at-L2 — the wait's tail hands it off (``_HumanHandoff``);
+    * a chained plain L0 — the wait loop re-polls it, then the wait expires;
+    * a plain L0 filed after the wait returns — only the handler's post-wait
+      single-shot re-check sees it.
+
     Both properties matter:
 
     * D4 stop-the-line still holds — nothing merges past an open gating
@@ -1372,14 +1425,14 @@ class TestGateReFireIsBounded:
     async def test_chained_l2_is_not_merged_past(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
     ):
-        """The load-bearing case: a chained record the WAIT never waits on.
+        """The load-bearing case: a chained record the wait LOOP never waits on.
 
-        ``_wait_for_resolution`` polls level-0 records only, ran its
-        stop-the-line check before this record existed, and matches level-1 in
-        its ``has_open_l1`` tail — so a level-2 filed mid-resolution slips
-        through all three and the wait returns normally with no expiry.  Only
-        a post-wait re-check of the SAME ``_is_gating_escalation`` predicate
-        catches it.
+        ``_wait_for_resolution`` polls level-0 records only and ran its entry
+        stop-the-line check before this record existed.  Its tail applies the
+        same ``needs_human`` rule to the full pending set, so a level-2 filed
+        mid-resolution raises a ``_HumanHandoff`` there and the task parks
+        through that arm; the handler's post-wait ``_is_gating_escalation``
+        re-check remains as redundant enforcement behind it.
         """
         queue = EscalationQueue(tmp_path / 'queue')
         task_id = task_assignment.task_id
@@ -1390,9 +1443,11 @@ class TestGateReFireIsBounded:
         _wire_resolve_callback(queue, wf)
         submit = _stub_merge_internals(wf, monkeypatch)
         timing = _time_the_wait(wf)
+        events: list[str] = []
+        _journal_status_writes(scheduler, events, monkeypatch)
 
         _submit_gating_l0(queue, task_id)
-        chained = _make_chained_l2_steward(queue, task_id)
+        chained = _make_chained_l2_steward(queue, task_id, events)
         wf._steward_factory = chained
 
         outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
@@ -1406,14 +1461,20 @@ class TestGateReFireIsBounded:
             f'the task must park visibly for the human the L2 is addressed to; '
             f'got {scheduler.statuses.get(task_id)}'
         )
-        # The human's record survives — the re-check parks, it does not consume.
+        # The human's record survives — the park does not consume it.
         assert len(queue.get_by_task(task_id, status='pending', level=2)) == 1
-        # Single-shot: the re-check parks rather than buying a second window.
+        # Single-shot: the park does not buy a second window.
         assert timing.get('calls') == 1, (
             f'the merge-entry gate must be single-shot; entered the steward '
             f'wait {timing.get("calls")} time(s)'
         )
         assert len(chained.instances) <= 1
+        # The park spawns the dry-run investigator in the steward's worktree,
+        # so the hand-off arm stops the steward first, like the re-check arm.
+        assert 'steward:stop' in events, f'the steward was never stopped; journal: {events}'
+        assert events.index('steward:stop') < events.index('status:blocked'), (
+            f'the steward was still live when the row was parked; journal: {events}'
+        )
 
     async def test_chained_gating_record_parks_instead_of_re_waiting(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
@@ -1421,8 +1482,9 @@ class TestGateReFireIsBounded:
         """The plain-L0 chain: caught by the wait loop's own re-poll, inside
         the SAME deadline, then parked by the expiry branch.  Pinned here so
         the two chained shapes stay legibly distinct — this one costs one
-        window and needs no re-check; the L2 one above needs the re-check and
-        costs none."""
+        window and needs no re-check; the L2 one above is stopped by the
+        wait's tail and costs none.  The re-check's own pin is
+        :meth:`test_gating_record_filed_after_the_wait_parks_with_l1`."""
         queue = EscalationQueue(tmp_path / 'queue')
         task_id = task_assignment.task_id
         worktree = await _make_advanced_worktree(git_ops, task_id)
@@ -1463,6 +1525,72 @@ class TestGateReFireIsBounded:
         assert len(chained.instances) <= 1, (
             f'the handler must not loop back into the machinery and build a '
             f'second steward; built {len(chained.instances)}'
+        )
+
+    async def test_gating_record_filed_after_the_wait_parks_with_l1(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """The shape only the post-wait single-shot re-check can stop.
+
+        The steward resolves the entry L0, so the wait returns normally.  A
+        plain blocking L0 then lands after the wait's tail read: the tail does
+        not gate it (it is not ``needs_human``), and the wait loop has already
+        exited.  At merge entry there is no later gate, so without the re-check
+        this record is merged straight past (D4).  The re-check must park the
+        row with an L1 for a human, stop and clear the still-live steward
+        BEFORE parking (``_mark_blocked(escalate_to_human=True)`` spawns the
+        dry-run investigator in the same worktree), and not buy a second wait
+        (spec S5).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+
+        events: list[str] = []
+        wf._steward_factory = _make_journalling_resolving_steward(
+            queue, task_id, events,
+        )
+        _journal_status_writes(scheduler, events, monkeypatch)
+
+        _file_gating_l0_after_the_wait(wf, queue, task_id, monkeypatch)
+        timing = _time_the_wait(wf)
+
+        _submit_gating_l0(queue, task_id)
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        assert submit.await_count == 0, (
+            'D4 stop-the-line: a gating record filed after the wait is still '
+            'open at the re-check — the merge must not proceed past it'
+        )
+        assert outcome is not None
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked'], (
+            f'the re-check must park the row visibly; got '
+            f'{scheduler.statuses.get(task_id)}'
+        )
+        assert timing.get('calls') == 1, (
+            f'the re-check is single-shot; entered the steward wait '
+            f'{timing.get("calls")} time(s)'
+        )
+        assert events.count('steward:start') == 1, (
+            f'the park must not build a fresh steward; journal: {events}'
+        )
+        assert 'steward:stop' in events, (
+            f'the re-check arm must stop the live steward; journal: {events}'
+        )
+        assert events.index('steward:stop') < events.index('status:blocked'), (
+            f'the steward was still live when the row was parked — two agents, '
+            f'one worktree; journal: {events}'
+        )
+        assert wf._steward is None
+        assert queue.has_open_l1(task_id), (
+            'the park must reach a human as an L1, not a fresh L0 for the '
+            'steward that just cleared the gate'
         )
 
 

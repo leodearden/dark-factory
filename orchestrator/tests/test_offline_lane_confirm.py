@@ -7,7 +7,6 @@ scenarios follow in this file under ``TestRealPytest…`` classes.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shlex
 import sys
@@ -19,7 +18,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _lane_confirm_project import Sabotage, arm, disarm, lane_project, node_id, write_script
+from _host_pytest_temp_root import listing, seed_dead_session_dirs
+from _lane_confirm_project import (
+    Sabotage,
+    arm,
+    disarm,
+    inherited_temp_root,
+    lane_project,
+    node_id,
+    write_pytest_config,
+    write_script,
+)
 
 from orchestrator.config import LaneCommand
 from orchestrator.offline_lane_confirm import (
@@ -28,13 +37,14 @@ from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
     ConfirmTarget,
+    InconclusiveReason,
     Outage,
     PassOutcome,
     Unconfirmable,
     UnconfirmableReason,
     confirm,
     confirm_mode,
-    legacy_confirmed_ids,
+    inconclusive_reason,
     outcome_from_json,
     outcome_to_json,
     partition,
@@ -351,6 +361,76 @@ class TestPartition:
         )
 
 
+_A = 'tests/t.py::test_a'
+_PARTITION_CASES = {
+    'compatible_failure': (_run((_A, 'failed')), _rerun((_A, 'failed'))),
+    'error_after_failed': (_run((_A, 'failed')), _rerun((_A, 'error'), outcomes={_A: 'passed'})),
+    'passed_in_incomplete_session': (_run((_A, 'failed')), _rerun(outcomes={_A: 'passed'}, session_complete=False)),
+    'skipped_in_complete_session': (_run((_A, 'failed')), _rerun(outcomes={_A: 'skipped'}, session_complete=True)),
+    'absent_from_outcomes': (
+        _run(('tests/t.py::test_steady', 'failed'), ('tests/t.py::test_flaky', 'failed')),
+        _rerun(
+            ('tests/t.py::test_steady', 'failed'),
+            returncode=2,
+            outcomes={'tests/t.py::test_other': 'passed'},
+            session_complete=True,
+        ),
+    ),
+    'complete_session_unnamed': (_run((_A, 'failed')), _rerun(session_complete=True)),
+    'incomplete_session_unnamed': (_run((_A, 'failed')), _rerun(session_complete=False)),
+    'detection_order': (
+        _run(('tests/t.py::test_c', 'failed'), (_A, 'failed'), ('tests/t.py::test_b', 'failed'), (_A, 'error')),
+        _rerun(
+            ('tests/t.py::test_z', 'failed'),
+            ('tests/t.py::test_b', 'failed'),
+            ('tests/t.py::test_c', 'failed'),
+            outcomes={_A: 'passed'},
+        ),
+    ),
+}
+
+
+class TestInconclusiveReason:
+    """Why the confirm left a node it did not reproduce inconclusive; ``None`` when it cleared it."""
+
+    def test_a_confirm_naming_it_with_another_kind_differs(self) -> None:
+        assert inconclusive_reason(_A, _rerun((_A, 'error'))) is InconclusiveReason.CONFIRM_KIND_DIFFERS
+
+    def test_per_test_evidence_of_a_skip_did_not_pass(self) -> None:
+        rerun = _rerun(outcomes={_A: 'skipped'}, session_complete=True)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_DID_NOT_PASS
+
+    def test_per_test_evidence_without_the_node_did_not_pass(self) -> None:
+        rerun = _rerun(outcomes={'tests/t.py::test_other': 'passed'}, session_complete=True)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_DID_NOT_PASS
+
+    def test_no_evidence_and_an_incomplete_session_is_incomplete(self) -> None:
+        rerun = _rerun(session_complete=False)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_SESSION_INCOMPLETE
+
+    @pytest.mark.parametrize(
+        'rerun',
+        [_rerun(outcomes={_A: 'passed'}, session_complete=False), _rerun(session_complete=True)],
+        ids=['evidence_passed', 'complete_session_unnamed'],
+    )
+    def test_a_cleared_node_has_no_reason(self, rerun: RunRecord) -> None:
+        assert inconclusive_reason(_A, rerun) is None
+
+    def test_the_reasons_are_their_wire_names(self) -> None:
+        assert [reason.value for reason in InconclusiveReason] == [
+            'confirm_kind_differs', 'confirm_did_not_pass', 'confirm_session_incomplete',
+        ]
+
+    @pytest.mark.parametrize('case', list(_PARTITION_CASES))
+    def test_a_node_is_inconclusive_exactly_when_unreproduced_with_a_reason(self, case: str) -> None:
+        detect, rerun = _PARTITION_CASES[case]
+        reproduced, _, inconclusive = partition(detect, rerun)
+
+        for node in {failure.node for failure in detect.failures}:
+            expected = node not in reproduced and inconclusive_reason(node, rerun) is not None
+            assert (node in inconclusive) == expected, node
+
+
 class TestConfirmUnconfirmable:
     @pytest.mark.asyncio
     async def test_no_detect_record(self, tmp_path: Path) -> None:
@@ -511,36 +591,6 @@ class TestConfirmTarget:
             ConfirmTarget(leg, tmp_path, _lane_command() if with_command else None)
 
 
-class TestLegacyConfirmedIds:
-    def test_confirmed_projects_to_its_sorted_reproduced_ids(self) -> None:
-        outcome = Confirmed(ConfirmMode.NARROWED, ('tests/t.py::b', 'tests/t.py::a'), ('tests/t.py::c',), ())
-        assert legacy_confirmed_ids(outcome, command_name='unit', leg=Leg.GENERIC) == ['tests/t.py::a', 'tests/t.py::b']
-
-    def test_a_generic_confirm_exiting_nonzero_naming_no_test_is_the_command_sentinel(self) -> None:
-        outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '2')
-        assert legacy_confirmed_ids(outcome, command_name='unit', leg=Leg.GENERIC) == ['unit::unconfirmable']
-
-    @pytest.mark.parametrize(
-        ('reason', 'leg'),
-        [
-            (UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, Leg.INFRA),
-            (UnconfirmableReason.DETECT_RED_NAMED_NO_TEST, Leg.GENERIC),
-            (UnconfirmableReason.CONFIRM_SIGNAL_ENDED, Leg.GENERIC),
-            (UnconfirmableReason.ID_FAILED_ROUND_TRIP, Leg.GENERIC),
-            (UnconfirmableReason.NUMERIC_EXIT, Leg.NUMERIC),
-        ],
-    )
-    def test_every_other_unconfirmable_confirms_nothing_with_a_warning(
-        self, caplog: pytest.LogCaptureFixture, reason: UnconfirmableReason, leg: Leg,
-    ) -> None:
-        with caplog.at_level(logging.WARNING, logger='orchestrator.offline_lane_confirm'):
-            ids = legacy_confirmed_ids(Unconfirmable(reason, 'why'), command_name=LEGACY_INFRA_COMMAND, leg=leg)
-        assert ids == []
-        assert [r.getMessage() for r in caplog.records] == [
-            f'offline-lane: {LEGACY_INFRA_COMMAND} pass unconfirmable: {reason} why',
-        ]
-
-
 _PROBE = ProbeResult(result='outage', returncode=2, failed_dependency='qdrant', first_line='refused', duration=1.5)
 
 
@@ -597,6 +647,12 @@ class TestJunitNodeOutcomes:
             'tests/test_a.py::test_c': 'skipped',
         }
 
+    def test_an_xdist_loadgroup_name_resolves_to_the_plain_node_id(self, tmp_path: Path) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 'test_a.py').write_text('')
+        report = _junit_report(tmp_path / 'r.xml', '<testcase classname="tests.test_a" name="test_b@grp"/>')
+        assert junit_node_outcomes(report, tmp_path) == {'tests/test_a.py::test_b': 'passed'}
+
     def test_no_report_is_none(self, tmp_path: Path) -> None:
         assert junit_node_outcomes(tmp_path / 'absent.xml', tmp_path) is None
 
@@ -633,6 +689,16 @@ class TestJunitFailingNodeIds:
             tmp_path / 'r.xml', '<testcase classname="" name="tests.t"><error message="collect"/></testcase>',
         )
         assert junit_failing_node_ids(report, tmp_path) == frozenset({'tests/t.py'})
+
+    def test_xdist_loadgroup_names_resolve_to_plain_node_ids(self, tmp_path: Path) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 't.py').write_text('')
+        report = _junit_report(
+            tmp_path / 'r.xml', _failing_case('tests.t', 'test_a[1]@grp'), _failing_case('tests.t.TestK', 'test_e@grp'),
+        )
+        assert junit_failing_node_ids(report, tmp_path) == frozenset(
+            {'tests/t.py::test_a[1]', 'tests/t.py::TestK::test_e'},
+        )
 
     def test_a_failing_test_whose_classname_names_no_file_leaves_the_report_unable_to_say(
         self, tmp_path: Path,
@@ -733,6 +799,7 @@ class TestIntersectedRoundTrip:
 LANE = LaneCommand(name='lane', command='pytest -q tests', cwd='.')
 OPAQUE = LaneCommand(name='opaque', command='timeout 600 pytest -q tests', cwd='.')
 KILLED = LaneCommand(name='killed', command='kill -9 $$', cwd='.')
+POOLED_ADDOPTS = '-n 2 --dist loadgroup'
 HEAD = 'c0ffee1234'
 SPACING = timedelta(minutes=31)
 
@@ -789,6 +856,49 @@ class TestRealPytestGenericLeg:
         evidence = _confirm_record(store, LANE.name)
         assert evidence.junit_path == str(require_current_pass(store, LANE.name).junit_path(Phase.CONFIRM))
         assert evidence.outcomes == {node_id('test_flaky'): 'passed'}
+
+    @pytest.mark.asyncio
+    async def test_an_xdist_loadgroup_detection_is_confirmed_by_its_plain_node_id(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok', addopts=POOLED_ADDOPTS)
+
+        detect = await _detect(store, LANE, project)
+        assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
+
+        outcome = await _confirm(store, LANE, project, detect)
+
+        assert outcome == Confirmed(ConfirmMode.NARROWED, (), (node_id('test_grouped_flaky'),), ())
+        assert _confirm_record(store, LANE.name).outcomes == {node_id('test_grouped_flaky'): 'passed'}
+
+    @pytest.mark.asyncio
+    async def test_a_pooled_detection_leaves_the_hosts_default_pytest_temp_root_untouched(
+        self, tmp_path: Path, store: RunRecordStore, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        host = tmp_path / 'host-temp'
+        seed_dead_session_dirs(host)
+        before = listing(host)
+        monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
+        project = lane_project(
+            tmp_path / 'wt', 'test_grouped_flaky', 'test_records_its_temp_root', addopts=POOLED_ADDOPTS,
+        )
+
+        detect = await _detect(store, LANE, project)
+
+        assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
+        assert inherited_temp_root(project) == str(host), (
+            'the pooled session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
+            'use the real host temp root and leave the stand-in untouched with or '
+            'without --basetemp: the assertion below would pass vacuously'
+        )
+        after = listing(host)
+        assert after == before, (
+            "a nested lane session must not create, lock or clean dirs in the "
+            "host's default pytest temp root: its exit-time cleanup of other "
+            "sessions' dead dirs is unbounded and runs before the lane's "
+            "proc.wait() returns\n"
+            f'before: {before}\nafter:  {after}'
+        )
 
     @pytest.mark.asyncio
     async def test_7_an_opaque_confirm_red_only_on_another_test_reproduces_only_the_detected_one(
@@ -860,7 +970,7 @@ class TestRealPytestGenericLeg:
     ) -> None:
         project = tmp_path / 'wt'
         (project / 'tests').mkdir(parents=True)
-        (project / 'pyproject.toml').write_text('[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider"\n')
+        write_pytest_config(project)
         (project / 'tests' / 'test_t.py').write_text(
             "import pytest\n\n\n@pytest.mark.parametrize('word', ['a] b'])\n"
             "def test_a(word):\n    assert word == 'ab'\n",

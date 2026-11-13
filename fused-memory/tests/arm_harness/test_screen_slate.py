@@ -1,18 +1,23 @@
 """η's sweep driver (scripts/local_memory_models_eval/screen_slate.py), fully offline."""
 
+import dataclasses
 import json
 import sys
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness._fakes import CODE_SHA, CORPUS_SHA, PREREG_SHA, SCREENING_PARAMS, slate_arm
+from arm_harness._loopback_http import HELD_PROMPT_TOKENS, held_upstream, post_json, unused_port
 from fused_memory.arm_harness.arm_spec import load_arm_spec
 from fused_memory.arm_harness.screening_evidence import (
     RELEASE_RECORD_FILENAME,
@@ -22,7 +27,10 @@ from fused_memory.arm_harness.screening_evidence import (
     load_arm_commands,
     load_arm_evidence,
 )
-from fused_memory.arm_harness.slate import arm_endpoint, candidate_spec
+from fused_memory.arm_harness.slate import SlateArm, arm_endpoint, candidate_spec
+from fused_memory.arm_harness.usage_tap import CallRecord, load_call_records
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LME_DIR = Path(__file__).parents[2] / 'scripts' / 'local_memory_models_eval'
 QWEN = slate_arm()
@@ -416,6 +424,72 @@ def test_a_non_empty_evidence_root_is_refused_before_anything_runs(driver, tmp_p
         driver.sweep(SLATE, config, runner=runner, tap_factory=FakeTaps())
 
     assert runner.calls == []
+
+
+# --- the real usage tap ---------------------------------------------------------------
+
+
+@dataclass
+class AbandoningRunner:
+    """Every verb succeeds; ``run`` leaves one episode call in flight through the tap."""
+
+    driver: ModuleType
+    config: Any
+    arm: SlateArm
+    received: threading.Event
+    release: threading.Event
+    run_raises: bool
+    clients: list[threading.Thread] = field(default_factory=list)
+    calls_at: dict[str, tuple[CallRecord, ...]] = field(default_factory=dict)
+
+    def __call__(self, argv: Sequence[str], cwd: Path) -> Any:
+        verb, _ = _label(argv)
+        if verb == 'run':
+            self._abandon_an_episode_call()
+            if self.run_raises:
+                raise RuntimeError('the harness died with an episode call in flight')
+        if verb in ('healthcheck', 'stop'):
+            paths = ArmEvidencePaths(self.config.evidence_root, self.arm.arm_id)
+            self.calls_at[verb] = load_call_records(paths.calls)
+        return self.driver.CommandOutcome(exit_code=0, output_tail='')
+
+    def _abandon_an_episode_call(self) -> None:
+        request = {
+            'model': self.arm.served_model_name,
+            'max_tokens': SCREENING_PARAMS.max_tokens,
+            'messages': [{'role': 'user', 'content': 'extract the entities'}],
+        }
+        client = threading.Thread(
+            target=post_json,
+            args=(self.config.tap_listen_url, '/v1/chat/completions', json.dumps(request).encode()),
+            daemon=True,
+        )
+        client.start()
+        self.clients.append(client)
+        assert self.received.wait(timeout=10)
+        threading.Timer(1.0, self.release.set).start()
+
+
+@pytest.mark.parametrize('run_raises', [False, True], ids=['run-exits', 'run-raises'])
+def test_the_arm_is_healthchecked_and_stopped_only_after_the_runs_abandoned_call_lands(
+    driver, tmp_path, run_raises
+):
+    received, release = threading.Event(), threading.Event()
+    with held_upstream(received, release) as upstream:
+        arm = slate_arm(port=urlsplit(upstream).port)
+        config = dataclasses.replace(_config(driver, tmp_path), tap_port=unused_port())
+        runner = AbandoningRunner(driver, config, arm, received, release, run_raises)
+        failures = driver.sweep((arm,), config, runner=runner)
+        for client in runner.clients:
+            client.join(timeout=10)
+
+    assert sorted(runner.calls_at) == (['stop'] if run_raises else ['healthcheck', 'stop'])
+    for calls in runner.calls_at.values():
+        (call,) = calls
+        assert call.status == 200
+        assert call.prompt_tokens == HELD_PROMPT_TOKENS
+        assert call.outlived_session is False
+    assert failures == ((arm.arm_id,) if run_raises else ())
 
 
 # --- the real runner ------------------------------------------------------------------

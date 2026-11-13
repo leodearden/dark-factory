@@ -172,13 +172,9 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
     )
     assert concurrency <= 8, (
         f'_TASKS_ROOT_CONCURRENCY is {concurrency} — the walk must stay '
-        'BOUNDED. burndown.py records the measurement: a full fan-out over '
-        'every root hits a SINGLE fused-memory server where the requests '
-        'serialise server-side, on the SAME shared httpx client the 3s render '
-        'polls use, which is "a live httpx.PoolTimeout risk for request-path '
-        'handlers" (see burndown._SNAPSHOT_PAGE_SIZE and '
-        '_fetch_snapshot_tasks). An unbounded gather trades this endpoint\'s '
-        'latency for every other endpoint\'s availability.'
+        'BOUNDED; see the WHY BOUNDED comment on '
+        'active_tasks._TASKS_ROOT_CONCURRENCY. An unbounded gather trades '
+        'this endpoint\'s latency for every other endpoint\'s availability.'
     )
 
     # (g) at least one project's budget fits inside the whole. See the

@@ -3,7 +3,8 @@
 WHY THIS FILE LIVES HERE AND NOT IN ``scripts/tests/``.
 ``scripts/check_consolidation_closure.py`` imports ``TaskInterceptor`` at
 MODULE scope — that is the INV-5 single-sourcing of
-``_CONSOLIDATION_SCROLL_LIMIT`` and ``_extract_metadata_dict`` which makes
+``_CONSOLIDATION_SCROLL_LIMIT`` (and, beside it, the seam's own
+``metadata_dict.py::extract_metadata_dict``) which makes
 "the same mechanical check" literally true rather than aspirational.  That
 import transitively pulls in ``services.memory_service`` and therefore
 ``graphiti_core``, which is absent from the ``shared`` venv that runs
@@ -33,6 +34,8 @@ import pytest
 from _fm_helpers import load_script_module
 from shared.project_id import project_id_for_root
 from shared.project_layout import default_project_root, tasks_db
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
@@ -40,6 +43,8 @@ from fused_memory.reconciliation.consolidation_gate import (
     closure_exists_probe,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = _ROOT / 'scripts' / 'check_consolidation_closure.py'
@@ -59,8 +64,6 @@ def _load_module() -> types.ModuleType:
 
 
 mod = _load_module()
-TaskDbUnreadable = mod.TaskDbUnreadable
-TaskDbProblem = sys.modules[mod.connect_ro.__module__].TaskDbProblem
 
 _TOPIC = 'cli-demo-topic'
 _PROJECT_ID = 'dark_factory'

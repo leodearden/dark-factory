@@ -134,6 +134,13 @@ graphiti/, mem0/     # git submodules (upstream Graphiti, Mem0)
 | `RECONCILIATION_PLAN.md` | Three-stage sleep-mode reconciliation between memory and tasks |
 | `docs/legibility/design-invariants.md` | Checkable design invariants gating `/prd` decompose and `/review` phase 2 |
 
+## Client feed
+
+The `client-feed/` workspace member publishes one client project's build
+evidence to the LDE client portal through files, with one publisher unit per
+project. Design: `plans/client-feed-prd.md`. Operating it: `OPERATIONS.md`
+§"Client feed".
+
 ## Status & known limitations
 
 - **Single-host, personal-fleet heritage.** This repo grew up running one

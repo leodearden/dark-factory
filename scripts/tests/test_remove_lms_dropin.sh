@@ -82,6 +82,17 @@ check() {  # check <label> <expected> <actual>
     fi
 }
 
+run_script() {  # run_script <repo_root>: sets rc, prints the script's output indented
+    local out
+    set +e
+    out="$(LMS_UNIT_TEMPLATE="$TEMPLATE" LMS_REPO_ROOT="$1" "$SCRIPT" 2>&1)"
+    rc=$?
+    set -e
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out" | sed 's/^/    | /'
+    fi
+}
+
 cleanup() {
     rm -f "$DROPIN" "$UNIT" 2>/dev/null || true
     rmdir "$DROPIN_DIR" 2>/dev/null || true
@@ -113,19 +124,12 @@ wd="$(systemctl --user show -p WorkingDirectory --value "${TEMPLATE}probe.servic
 check "drop-in is in effect before the run" "/nonexistent/selftest-worktree" "$wd"
 
 echo "== case 1: REFUSES when the launcher is absent from the repo root =="
-set +e
-LMS_UNIT_TEMPLATE="$TEMPLATE" LMS_REPO_ROOT="/nonexistent/not-a-repo" \
-    "$SCRIPT" >/dev/null 2>&1
-rc=$?
-set -e
+run_script "/nonexistent/not-a-repo"
 check "exit code is 1" "1" "$rc"
 check "drop-in still present after refusal" "yes" "$([ -e "$DROPIN" ] && echo yes || echo no)"
 
 echo "== case 2: REMOVES and verifies when the launcher is present =="
-set +e
-LMS_UNIT_TEMPLATE="$TEMPLATE" LMS_REPO_ROOT="$FAKE_REPO" "$SCRIPT" >/dev/null 2>&1
-rc=$?
-set -e
+run_script "$FAKE_REPO"
 check "exit code is 0" "0" "$rc"
 check "drop-in removed" "no" "$([ -e "$DROPIN" ] && echo yes || echo no)"
 check "drop-in dir removed" "no" "$([ -d "$DROPIN_DIR" ] && echo yes || echo no)"
@@ -134,20 +138,14 @@ wd="$(systemctl --user show -p WorkingDirectory --value "${TEMPLATE}probe.servic
 check "WorkingDirectory now resolves to the repo root" "$FAKE_REPO" "$wd"
 
 echo "== case 3: idempotent re-run is a clean no-op =="
-set +e
-LMS_UNIT_TEMPLATE="$TEMPLATE" LMS_REPO_ROOT="$FAKE_REPO" "$SCRIPT" >/dev/null 2>&1
-rc=$?
-set -e
+run_script "$FAKE_REPO"
 check "exit code is 0 on re-run" "0" "$rc"
 check "template survives the re-run" "yes" "$([ -f "$UNIT" ] && echo yes || echo no)"
 
 echo "== case 4: REFUSES when the template is missing =="
 rm -f "$UNIT"
 systemctl --user daemon-reload
-set +e
-LMS_UNIT_TEMPLATE="$TEMPLATE" LMS_REPO_ROOT="$FAKE_REPO" "$SCRIPT" >/dev/null 2>&1
-rc=$?
-set -e
+run_script "$FAKE_REPO"
 check "exit code is 1 when template absent" "1" "$rc"
 
 echo

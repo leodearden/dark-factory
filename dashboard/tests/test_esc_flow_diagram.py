@@ -24,14 +24,14 @@ distinct implementations, so a fix to any of them had to be applied nine
 times or not at all — and the one worth making (scoping to a NESTED
 declaration) went unmade for exactly that reason.  `_client` is now the
 module-scoped fixture in conftest.py and `extract_function_body` is imported
-from `_dashboard_helpers`; test_jsx_source_helpers.py owns their contract and
+from `_jsx_source_helpers`; test_jsx_source_helpers.py owns their contract and
 guards against the copies returning.
 
 Task 4881 finished the job that retirement started, so the paragraph above is
 now the whole story rather than a claim scoped to two helpers.  The
 script-order trio this file uses (`ScriptTagCollector`,
 `find_script_position`, `assert_script_loads_before`) is imported from
-`_dashboard_helpers` rather than copied here and into four other modules;
+`_jsx_source_helpers` rather than copied here and into four other modules;
 `extract_df_data_block` likewise replaced three copies; and
 test_charts_axis_labels.py's `_extract_signature` is now a projection over the
 same `find_function_params` paren walk `extract_function_body` is built on,
@@ -44,7 +44,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     assert_script_loads_before,
     extract_function_body,
     find_script_position,

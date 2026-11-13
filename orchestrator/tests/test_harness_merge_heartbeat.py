@@ -81,8 +81,29 @@ class TestWriteMergeHeartbeat:
             'ts_epoch': payload['ts_epoch'],
             'drain': None,
             'verifies_in_flight': [],
+            'deployed_sha': None,
         }
         assert isinstance(payload['ts_epoch'], float)
+
+    async def test_heartbeat_carries_the_deployed_sha(
+        self, harness: Harness, tmp_path: Path, monkeypatch
+    ):
+        """Task 6565 D1: the unit's deployed sha and its flags reach the heartbeat."""
+        from orchestrator.deployed_sha import DeployedSha
+
+        fleet_dir = tmp_path / 'fleet'
+        monkeypatch.setenv('ORCH_UNIT', 'orchestrator-reify.service')
+        monkeypatch.setenv('ORCH_FLEET_DIR', str(fleet_dir))
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+        deployed = DeployedSha(sha='9' * 40, indeterminate=False, dirty_wire_path=True)
+        harness._deployed_sha = deployed
+
+        await harness._write_merge_heartbeat()
+
+        payload = json.loads((fleet_dir / 'orchestrator-reify.service.json').read_text())
+        assert payload['deployed_sha'] == deployed.to_wire()
 
     async def test_busy_tick_writes_heartbeat_with_merge_idle_false(
         self, harness: Harness, tmp_path: Path, monkeypatch

@@ -21,7 +21,7 @@ import logging
 import os
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -29,7 +29,12 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import (
+    BUDGET_EXHAUSTED_SUBTYPE,
+    AgentResult,
+    claude_binary_spec,
+    parse_claude_cli_output,
+)
 from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
@@ -56,6 +61,7 @@ from shared.invocation_outcome import (
 # guard that keeps a fabricating fork from being re-introduced here.
 from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_strict
 from shared.proc_group import terminate_process_group
+from shared.secret_env import agent_subprocess_env
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -87,6 +93,11 @@ __all__ = [
 # this module now consumes them indirectly via classify_invocation.
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 
+_EMPTY_POOL_FIX_HINT = (
+    '— export the oauth_token_env vars named in usage_cap.accounts_file, or '
+    '(interactive tooling only) set usage_cap.fallback_to_default_credential: true'
+)
+
 # Robustness bound for the scoped no-freeze wait (task 2857 amendment). The
 # per-scope waiter Event is set() ONLY by the scope-uncap sweep
 # (_refresh_scope_capped), so it never wakes on an ACCOUNT-level transition —
@@ -104,10 +115,9 @@ _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 # How often a FULLY-CAPPED park re-announces itself (task 4945). The park
 # below used to log once at INFO and then block on a bare `_open.wait()`
 # with no further output for as long as the freeze lasted, which made a
-# frozen pool indistinguishable from a hung run — the gap
-# orchestrator/evals/runner.py names, where cap_wait_sanity_secs bounds
-# only the post-invocation cap-RETRY branch and cannot see this wait at
-# all. 600s matches `cli_invoke._CAP_WAIT_LOG_INTERVAL_SECS`, whose
+# frozen pool indistinguishable from a hung run. It is also the longest single
+# wait of an unbounded park; a caller's `max_wait_secs` can only shorten it.
+# 600s matches `cli_invoke._CAP_WAIT_LOG_INTERVAL_SECS`, whose
 # `cap_wait` heartbeat this one deliberately mirrors: a park is measured
 # in hours, so ~10 min is frequent enough to prove liveness and rare
 # enough not to bury the signal. Deliberately an internal observability
@@ -183,52 +193,54 @@ def _sweep_stale_probe_dirs_once() -> int:
     )
 
 
-def _load_probe_result(stdout_bytes: bytes) -> dict[str, object] | None:
-    """Return the probe's CLI JSON result object, or None when stdout is
-    empty, not JSON, or not a JSON object."""
-    if not stdout_bytes:
-        return None
-    try:
-        obj = json.loads(stdout_bytes.decode(errors='replace'))
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
+def _classify_probe_result(result: AgentResult) -> InvocationOutcome:
+    """Classify the probe's parsed CLI result under the DD-2 probe regime.
+
+    ``success`` is withheld so ``classify_invocation``'s OK short-circuit
+    cannot skip the cap tier: the probe runs only while an account is already
+    blocked, and any cap prefix in its output means the account is still
+    capped, even beside a served result. ``strict_confirm=False`` for the same
+    reason: a bare prefix with no confirm keyword still counts, deliberately
+    asymmetric with ``detect_cap_hit``. Served-ness is decided afterwards by
+    ``_probe_hit_local_budget_cap`` and ``_probe_succeeded``. Pinned by
+    ``shared/tests/test_probe_loop.py::TestRunProbe::test_probe_prefix_only_without_confirm_keyword_still_returns_false``.
+    """
+    return classify_invocation(replace(result, success=False), strict_confirm=False, backend='claude')
 
 
-def _probe_hit_local_budget_cap(result: dict[str, object] | None) -> bool:
-    """Return True iff the probe's CLI JSON result reports that the local
-    ``--max-budget-usd`` cap was hit.
+def _probe_hit_local_budget_cap(result: AgentResult) -> bool:
+    """Return True iff the probe's CLI result reports that the local
+    ``--max-budget-usd`` cap was hit, with no API error status.
 
     This indicates the Anthropic API accepted the request and consumed real
     tokens — the account is NOT capped. Distinct from account-level cap hits
     (which surface as text prefixes in stderr, not JSON subtypes).
     """
-    return result is not None and result.get('subtype') == 'error_max_budget_usd'
+    return result.subtype == BUDGET_EXHAUSTED_SUBTYPE and result.api_error_status is None
 
 
-def _probe_succeeded(returncode: int | None, result: dict[str, object] | None) -> bool:
+def _probe_succeeded(returncode: int, result: AgentResult) -> bool:
     """Return True iff the probe's CLI result is POSITIVE evidence that the
     API served the request: exit 0, subtype ``success``, no ``is_error`` and
     no ``api_error_status``.
 
-    The absence of recognised failure text is never enough — an org-disabled
-    account answers with a ``success``-subtype result carrying ``is_error``
-    and a 403 (task 5944).
+    Under subtype ``success``, ``success and not schema_salvaged`` is exactly
+    ``not is_error``. The absence of recognised failure text is never enough —
+    an org-disabled account answers with a ``success``-subtype result carrying
+    ``is_error`` and a 403 (task 5944).
     """
     return (
-        result is not None
-        and returncode == 0
-        and result.get('subtype') == 'success'
-        and not result.get('is_error', False)
-        and result.get('api_error_status') is None
+        returncode == 0
+        and result.subtype == 'success'
+        and result.success
+        and not result.schema_salvaged
+        and result.api_error_status is None
     )
 
 
-def _probe_result_snippet(result: dict[str, object] | None) -> str:
-    """One line of the probe's ``result`` text, cut to 120 characters."""
-    if result is None:
-        return '<no JSON result>'
-    return ' '.join(str(result.get('result', '')).split())[:120]
+def _probe_result_snippet(result: AgentResult) -> str:
+    """One line of the probe's result text, cut to 120 characters."""
+    return ' '.join(result.output.split())[:120]
 
 
 class AccountPhase(StrEnum):
@@ -356,6 +368,10 @@ class AccountState:
     near_cap: bool = False
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
+    # Serialises `UsageGate._reprobe_account` per account (task 5946): SIGHUP
+    # probes an AUTH_FAILED account while its re-probe loop may be mid-probe,
+    # and two overlapping spawn faults would count one host fault twice.
+    reprobe_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     # CONSECUTIVE probe-spawn failures (task 4512), reset to 0 by any probe
     # that actually RAN — whatever its verdict — and by this account leaving
     # the CAPPED/AUTH_FAILED set, after which it spawns no probes at all and
@@ -370,6 +386,13 @@ class AccountState:
     # detect whether the account has re-transitioned since the lease was
     # taken — see `UsageGate.lease_is_current`.
     generation: int = 0
+    # Releases a PROBE_IN_FLIGHT claim whose holder has reported no verdict
+    # within UsageCapConfig.probe_slot_hold_secs (task 9327). Armed by
+    # `UsageGate._transition` on entering PROBE_IN_FLIGHT, cancelled on
+    # leaving it and by `UsageGate.shutdown`.
+    probe_hold_timer: asyncio.TimerHandle | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     # Per-(account, model) cap overlay (task 2855 / PRD scope substrate).
     # Lazily populated by later tasks when a scoped cap is observed; keys are a
@@ -470,12 +493,13 @@ class SessionBudgetExhausted(Exception):
 
 
 class PoolFrozen(Exception):
-    """No account is admissible and the caller asked not to park (task 6042).
+    """No account became admissible within the caller's park allowance.
 
-    Raised by :meth:`UsageGate.before_invoke` with ``park=False`` at the point
-    where the default would wait: every account capped and/or AUTH_FAILED, or
-    (for a scoped call) the scope exhausted on every account. A nightly
-    oneshot uses it to defer instead of hanging until a reset.
+    Raised by :meth:`UsageGate.before_invoke` once ``max_wait_secs`` is spent,
+    the allowance being zero for ``park=False`` (task 6042): every account
+    capped and/or AUTH_FAILED, or (for a scoped call) the scope exhausted on
+    every account. A nightly oneshot uses it to defer instead of hanging until
+    a reset.
 
     Deliberately NOT an ``AllAccountsCappedException``: a pool that is frozen
     because every account's credentials were rejected will not clear at any
@@ -504,6 +528,21 @@ class PoolFrozen(Exception):
         )
 
 
+def _park_deadline(park: bool, max_wait_secs: float | None) -> float | None:
+    """When a caller's park allowance runs out on the monotonic clock, or
+    ``None`` for an unbounded park. ``park=False`` is the zero allowance."""
+    if not park:
+        return time.monotonic()
+    if max_wait_secs is None:
+        return None
+    return time.monotonic() + max(0.0, max_wait_secs)
+
+
+def _park_time_left(deadline: float | None) -> float | None:
+    """Seconds left before *deadline*, or ``None`` when the park is unbounded."""
+    return None if deadline is None else deadline - time.monotonic()
+
+
 class InvokeSlot:
     """Probe-slot guard for one iteration of a cap-retry loop.
 
@@ -517,7 +556,7 @@ class InvokeSlot:
 
         async with gate.invoke_slot() as slot:
             result = await run_agent(oauth_token=slot.token)
-            if slot.detect_cap_hit(result.stderr, result.output):
+            if not result.success and slot.detect_cap_hit(result.stderr, result.output):
                 continue  # probe slot released by detect_cap_hit
             slot.confirm(result.cost_usd)
             break  # probe slot released by confirm
@@ -747,7 +786,8 @@ class UsageGate:
     ``_account_resume_probe_loop`` has no such deadline and will keep
     re-probing indefinitely at the ``max_probe_interval_secs`` backoff
     ceiling — recovery then requires an operator token refresh + SIGHUP
-    (``_on_sighup_async`` force-resets every account to AVAILABLE). See
+    (``_on_sighup_async`` force-resets every account except an AUTH_FAILED
+    one, so every CAPPED account, to AVAILABLE). See
     PRD §7.3 (task W4-γ) for the full transition table.
     """
 
@@ -762,7 +802,8 @@ class UsageGate:
     # in `before_invoke` when a lease is finally served — the moment the park
     # actually ends — so elapsed_s measures how long the pool has been unable
     # to serve ANYONE, and cleared again when the LAST parked caller is
-    # cancelled or errors out (see `_wait_for_any_account_to_reopen`), so an
+    # cancelled, errors out or reaches its deadline (see
+    # `_wait_for_any_account_to_reopen`), so an
     # abandoned park cannot bequeath its clock to an unrelated later one.
     # `_park_waiters` exists only to make "the last one" answerable: a
     # cancelled waiter must not reset the clock of a park its siblings are
@@ -863,10 +904,11 @@ class UsageGate:
     def _init_accounts(self) -> list[AccountState]:
         """Resolve account tokens from env vars.
 
-        If no accounts are configured, falls back to reading the default
-        credential from ``~/.claude/.credentials.json`` — unless the config
-        disables that fallback (``fallback_to_default_credential=False``), in
-        which case the pool stays empty.
+        If no configured account resolves a token the pool stays empty, unless
+        the config opts in with ``fallback_to_default_credential=True``: then
+        the default credential from ``~/.claude/.credentials.json`` is adopted
+        as a single account (interactive tooling only; ruling 2026-11-01,
+        task 8161).
         """
         accounts: list[AccountState] = []
         for acct_cfg in self._config.accounts:
@@ -882,7 +924,7 @@ class UsageGate:
         if not accounts and not self._config.fallback_to_default_credential:
             logger.warning(
                 'No configured account resolved a token, and the ~/.claude '
-                'default-credential fallback is disabled — the pool is empty'
+                f'default-credential fallback is disabled, so the pool is empty {_EMPTY_POOL_FIX_HINT}'
             )
         elif not accounts:
             token = _read_oauth_token()
@@ -923,7 +965,9 @@ class UsageGate:
         Also owns the per-phase side effects that used to be scattered
         across callers: starting/cancelling the resume and auth-reprobe
         background tasks, firing the ``cap_hit``/``auth_failed`` cost
-        events (entering CAPPED/AUTH_FAILED), stamping gate-level
+        events (entering CAPPED/AUTH_FAILED), arming the probe-hold timer on
+        entering PROBE_IN_FLIGHT and cancelling it on leaving by any edge
+        (task 9327, ``_arm_probe_hold``), stamping gate-level
         ``_pause_started_at``/``_paused_reason`` when the edge closes the
         gate for every account — and, symmetrically, consuming the elapsed
         gate-level pause into ``_total_pause_secs`` and clearing
@@ -985,6 +1029,8 @@ class UsageGate:
             old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase == AccountPhase.AVAILABLE
         ):
             acct.probe_count = 0
+        if old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase != AccountPhase.PROBE_IN_FLIGHT:
+            self._disarm_probe_hold(acct)
         if old_phase in (AccountPhase.CAPPED, AccountPhase.AUTH_FAILED) and new_phase not in (
             AccountPhase.CAPPED,
             AccountPhase.AUTH_FAILED,
@@ -1024,10 +1070,10 @@ class UsageGate:
             acct.probe_count = 0
             acct.resets_at = None
             # Covers the AVAILABLE -> AVAILABLE self-loop the blocked-set
-            # block above cannot see (task 4512 review): SIGHUP discards every
-            # account's cap/auth evidence, so it must discard the spawn-fault
-            # evidence with it rather than stay latched on counts it has just
-            # invalidated.
+            # block above cannot see (task 4512 review): SIGHUP discards the
+            # cap/auth evidence of every account it resets, so it must discard
+            # the spawn-fault evidence with it rather than stay latched on
+            # counts it has just invalidated.
             self._reset_probe_spawn_failures(acct, reason='operator hard reset (SIGHUP)')
 
         # --- Centralized _open recompute (DD-5) ---------------------------
@@ -1083,6 +1129,8 @@ class UsageGate:
                 if resets_at is not None:
                     details['resets_at'] = resets_at.isoformat()
                 self._fire_cost_event(acct.name, 'auth_failed', json.dumps(details))
+        elif new_phase == AccountPhase.PROBE_IN_FLIGHT:
+            self._arm_probe_hold(acct)
 
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
@@ -1100,7 +1148,6 @@ class UsageGate:
         self,
         *,
         scope: str | None = None,
-        reverse: bool = False,
         exclude: Collection[str] | None = None,
     ) -> AccountLease | None:
         """Select an admissible account and return its lease, or ``None`` —
@@ -1112,43 +1159,30 @@ class UsageGate:
         ADMISSION POLICY: ``before_invoke`` waits for headroom that does not
         exist yet, this returns ``None`` and lets the caller decide.
 
-        WHY THE SYNC POLICY EXISTS (task 5488). A plain synchronous process
-        with no event loop cannot await ``before_invoke``; today that caller
-        is ``scripts/sitting/nightly_prepare.py``, which leases one account
-        for one headless run and hands the lease straight back. (The
-        legibility trickle it was added for now runs every call through
-        :func:`shared.cli_invoke.invoke_with_cap_retry` on its own event loop
-        with ``park_on_frozen_pool=False``, task 6042.) The alternative — a
-        hand-rolled rotation in ``scripts/`` — would duplicate the skip
-        predicate, the probe-slot claim and the failover event, which is
-        precisely the drift this extraction prevents.
+        WHY THE SYNC POLICY EXISTS (task 5488). This is ``before_invoke``'s
+        selection walk, callable without an event loop. Its in-tree loop-less
+        callers are tests, which use it to lease, settle or enumerate a
+        named account through the public surface. Every production session,
+        the scripts/ ones included, runs through
+        :func:`shared.cli_invoke.invoke_with_cap_retry` on an event loop
+        (tasks 6042 and 6214). The alternative to this walk for a loop-less
+        caller — a hand-rolled rotation — would duplicate the skip predicate,
+        the probe-slot claim and the failover event, which is precisely the
+        drift this extraction prevents.
 
         NARROW CONTRACT, READ IT BEFORE CALLING. This method deliberately
         does NOT acquire ``self._lock``: that is an ``asyncio.Lock``, which
         synchronous code cannot hold. It is therefore safe ONLY for a
         single-threaded caller with no concurrent coroutines touching this
-        gate — one process, one invocation at a time, which is exactly
-        nightly_prepare. Every ASYNC caller must keep using
-        :meth:`before_invoke` / :meth:`invoke_slot`, which call this under
-        the lock and keep the blocking policy.
+        gate — one process, one invocation at a time. Every ASYNC caller
+        must keep using :meth:`before_invoke` / :meth:`invoke_slot`, which
+        call this under the lock and keep the blocking policy.
 
         Mutating, not a query, despite the name's "try" framing: selecting a
         PROBING account CLAIMS its probe slot (PROBE_IN_FLIGHT) and a change
         of account emits the failover cost event, same as before_invoke.
         Settle the returned lease through :class:`InvokeSlot` so the claim is
         always released.
-
-        *reverse* walks the roster from the END (last → first rather than
-        first → last). It is an ordering PREFERENCE, not a different
-        admission rule: the same skip predicate, the same probe claim, the
-        same lease. The trickle's 33 haiku one-shots drain from the end so
-        they do not contend with the orchestrator's first-available
-        first → last order; the two orders meet only when the pool is nearly exhausted,
-        which is exactly when contention is unavoidable anyway. Opt-in, and
-        that matters: ``before_invoke`` never passes it, so every existing
-        caller keeps the order it has always had. The knob lives HERE, in the
-        gate, rather than in a caller-side rotation that would have to
-        re-implement selection to express it.
 
         *exclude* skips accounts by NAME. It is a CALLER-SIDE BOUND — a
         synchronous caller rotating through the pool saying "not this one
@@ -1166,12 +1200,11 @@ class UsageGate:
         — its termination would depend on the gate's handler semantics. With
         a growing exclusion set the bound is structural: the walk never
         returns an excluded name, so the set grows by one per pass and the
-        selection runs out after at most one pass per account. Like
-        *reverse*, it is opt-in and ``before_invoke`` never passes it, so the
-        blocking policy and the orchestrator's ordering are unchanged.
+        selection runs out after at most one pass per account. It is opt-in
+        and ``before_invoke`` never passes it, so the blocking policy and the
+        orchestrator's ordering are unchanged.
         """
-        roster = reversed(self._accounts) if reverse else self._accounts
-        for acct in roster:
+        for acct in self._accounts:
             if acct.capped or acct.probe_in_flight or acct.auth_failed:
                 continue
             if exclude and acct.name in exclude:
@@ -1191,7 +1224,9 @@ class UsageGate:
                 continue
             if acct.probing:
                 # First task claims the probe slot — others block
-                # until confirm_account_ok() or _handle_cap_detected().
+                # until confirm_account_ok() or _handle_cap_detected(),
+                # or until the claim outlives
+                # UsageCapConfig.probe_slot_hold_secs (task 9327).
                 # _transition owns: the phase write, probe_count
                 # reset, and the centralized _open recompute.
                 self._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
@@ -1246,15 +1281,19 @@ class UsageGate:
         return None
 
     async def before_invoke(
-        self, scope: str | None = None, *, park: bool = True,
+        self,
+        scope: str | None = None,
+        *,
+        park: bool = True,
+        max_wait_secs: float | None = None,
     ) -> AccountLease | None:
         """Block until at least one account is available. Return its lease.
 
         Returns an :class:`AccountLease` snapshotting the selected account's
         name/token/generation (task W4-δ, PRD §7.4) — built IN-LOCK, after
         any PROBING -> PROBE_IN_FLIGHT claim, so the returned lease always
-        names the SAME account as its token. Returns ``None`` if no accounts
-        are configured (no token override).
+        names the SAME account as its token. Raises :class:`RuntimeError` if
+        the pool is empty (no account resolved a token).
 
         *scope* (PRD task γ, task 2857): when non-None (a scoped-cap model, e.g.
         ``claude-fable-5``), selection additionally skips accounts whose
@@ -1264,11 +1303,13 @@ class UsageGate:
         the scope predicate and the scope-wait fall-through are both guarded on
         ``scope is not None``.
 
-        *park* (task 6042): ``False`` raises :class:`PoolFrozen` at the point
-        where the default would wait — after the reset sweeps freed nothing,
-        and before EITHER park (the per-scope waiter or the ``_open`` freeze).
-        For a caller that must defer rather than wait out a reset; the
-        default ``True`` is unchanged.
+        *max_wait_secs* bounds BOTH parks (the per-scope waiter and the
+        ``_open`` freeze) by one deadline taken at entry. Once it passes, the
+        next pass re-runs selection and the reset sweeps, so an account that
+        reopens right at the deadline is still served, and only then raises
+        :class:`PoolFrozen`. *park* ``False`` (task 6042) is the zero allowance:
+        it raises before parking at all. The default, ``park=True`` with no
+        ``max_wait_secs``, parks until an account reopens.
         """
         # Session budget check
         if (
@@ -1278,10 +1319,9 @@ class UsageGate:
             raise SessionBudgetExhausted(self._cumulative_cost)
 
         if not self._accounts:
-            raise RuntimeError(
-                'No OAuth accounts available — configure accounts or provide credentials'
-            )
+            raise RuntimeError(f'No OAuth accounts available {_EMPTY_POOL_FIX_HINT}')
 
+        park_deadline = _park_deadline(park, max_wait_secs)
         # Find first non-capped account (works with 1 or N)
         while True:
             async with self._lock:
@@ -1307,7 +1347,8 @@ class UsageGate:
                 if self._refresh_scope_capped(scope):
                     continue
                 if not self.is_paused:
-                    if not park:
+                    park_left = _park_time_left(park_deadline)
+                    if park_left is not None and park_left <= 0:
                         raise self._pool_frozen(scope)
                     # Fleet is NOT frozen — at least one account is generally
                     # serviceable, only this scope is exhausted. Park on the
@@ -1348,6 +1389,8 @@ class UsageGate:
                     # already set and would return at once.)
                     if any(a.probe_in_flight for a in self._accounts):
                         sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
+                    if park_left is not None:
+                        sleep_for = min(sleep_for, park_left)
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(evt.wait(), timeout=sleep_for)
                     continue
@@ -1366,42 +1409,42 @@ class UsageGate:
             # the for-loop above just confirmed every account is non-AVAILABLE
             # and non-PROBING, so clearing here is always correct regardless of
             # how _open drifted.
-            if not park:
+            park_left = _park_time_left(park_deadline)
+            if park_left is not None and park_left <= 0:
                 raise self._pool_frozen(None)
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
-            await self._wait_for_any_account_to_reopen()
+            await self._wait_for_any_account_to_reopen(park_deadline)
 
     def _pool_frozen(self, scope: str | None) -> PoolFrozen:
         """The :class:`PoolFrozen` describing this gate right now."""
         return PoolFrozen(
             account_count=self.account_count,
-            capped_account_names=tuple(a.name for a in self._accounts if a.capped),
+            capped_account_names=self.capped_account_names,
             auth_failed_account_names=self.auth_failed_account_names,
             scope=scope,
         )
 
-    async def _wait_for_any_account_to_reopen(self) -> None:
-        """Block until ``_open`` is set, announcing the park as it waits.
+    async def _wait_for_any_account_to_reopen(self, deadline: float | None) -> None:
+        """Block until ``_open`` is set or *deadline* passes, announcing the
+        park as it waits.
 
-        SEMANTICS ARE THOSE OF ``await self._open.wait()``, unchanged: this
-        returns only once an account reopens, and every ``TimeoutError`` is
-        suppressed and retried. The heartbeat is PURELY ADDITIVE — it alters
-        neither what ``before_invoke`` returns nor when it unblocks.
+        *deadline* is the caller's park deadline on the monotonic clock, or
+        ``None`` for an unbounded park. Returning at the deadline leaves the
+        raise to ``before_invoke``, which first re-runs selection. The
+        heartbeat is PURELY ADDITIVE — it alters neither what
+        ``before_invoke`` returns nor when it unblocks.
 
         WHY THE PARK NEEDS A VOICE. Before task 4945 the caller logged one
         INFO line and then blocked here with no further output for however
         long the pool stayed frozen, so a parked campaign and a hung process
-        produced identical logs. ``orchestrator/evals/runner.py`` names this
-        gap explicitly: its ``cap_wait_sanity_secs`` bound is consulted only
-        in the cap-RETRY branch, AFTER an invocation returned, and so cannot
-        see this wait at all. Evals now share the fleet pool rather than
+        produced identical logs. Evals now share the fleet pool rather than
         holding a private reserve (ruling 2026-08-30, tasks 4741/4945),
         which makes a fully-capped park a routine outcome rather than an
         exotic one.
 
         NEVER TIGHT-SPINS. Each iteration waits on the event with a strictly
-        positive timeout — the same
+        positive timeout, the lesser of the interval and the time left — the same
         ``asyncio.wait_for`` + ``contextlib.suppress(TimeoutError)`` shape
         the scoped park above uses — so a frozen pool costs one wakeup per
         interval, not a burned core.
@@ -1442,8 +1485,9 @@ class UsageGate:
         that ended long ago, and suppress its first heartbeat for up to a
         full interval — both of them precisely the failures this helper
         exists to fix. So the clock is cleared on the way out of an abandoned
-        park too, guarded by ``_park_waiters`` so a cancelled waiter cannot
-        reset a park its siblings are still inside. The staleness check at
+        park too, and of one that reached its deadline, guarded by
+        ``_park_waiters`` so a departing waiter cannot reset a park its
+        siblings are still inside. The staleness check at
         ENTRY is the backstop for the residue no local handler can see: a
         cancellation that lands at one of the caller's OTHER awaits, between
         two re-entries of this helper. Entry is also the only place it
@@ -1489,6 +1533,9 @@ class UsageGate:
                 self._park_last_logged_at = None
             while not self._open.is_set():
                 now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    self._release_park_clock()
+                    return
                 if self._park_started_at is None:
                     self._park_started_at = now
                 if (
@@ -1502,6 +1549,11 @@ class UsageGate:
                                 'event': 'all_capped_park',
                                 'elapsed_s': round(now - self._park_started_at, 1),
                                 'account_count': self.account_count,
+                                'capped_accounts': list(self.capped_account_names),
+                                'auth_failed_accounts': list(self.auth_failed_account_names),
+                                'probe_in_flight_accounts': list(
+                                    self.probe_in_flight_account_names
+                                ),
                                 'soonest_open_at': (
                                     self.soonest_resets_at.isoformat()
                                     if self.soonest_resets_at
@@ -1512,35 +1564,44 @@ class UsageGate:
                         )
                     )
                     self._park_last_logged_at = now
+                wait_for = _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
+                if deadline is not None:
+                    wait_for = min(wait_for, deadline - now)
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._open.wait(),
-                        timeout=_ALL_CAPPED_PARK_LOG_INTERVAL_SECS,
-                    )
+                    await asyncio.wait_for(self._open.wait(), timeout=wait_for)
         except BaseException:
             # Abandoned park: cancellation (the routine case — callers wrap
             # `before_invoke` in `asyncio.wait_for`) or an error out of the
             # wait. `BaseException` because CancelledError is not an
             # Exception, and it is re-raised untouched — this handler changes
-            # nothing about control flow, only the clock. Clear ONLY if no
-            # sibling is still parked: the timestamps are shared, and a
-            # frozen pool typically has many waiters, so an unguarded clear
-            # would restart a live park's elapsed_s every time any one of
-            # them was cancelled.
-            if self._park_waiters <= 1:
-                self._park_started_at = None
-                self._park_last_logged_at = None
+            # nothing about control flow, only the clock.
+            self._release_park_clock()
             raise
         finally:
             self._park_waiters -= 1
 
+    def _release_park_clock(self) -> None:
+        """Clear the shared heartbeat clock as a parked caller leaves, unless a
+        sibling is still parked: a frozen pool typically has many waiters, so
+        an unguarded clear would restart a live park's elapsed_s every time
+        any one of them left."""
+        if self._park_waiters <= 1:
+            self._park_started_at = None
+            self._park_last_logged_at = None
+
     @contextlib.asynccontextmanager
-    async def invoke_slot(self, scope: str | None = None, *, park: bool = True):
+    async def invoke_slot(
+        self,
+        scope: str | None = None,
+        *,
+        park: bool = True,
+        max_wait_secs: float | None = None,
+    ):
         """Acquire an account slot, releasing the probe lock on any exit path.
 
-        *park* is forwarded to :meth:`before_invoke`: ``False`` raises
-        :class:`PoolFrozen` out of the ``async with`` instead of waiting, before
-        any account is claimed.
+        *park* and *max_wait_secs* are forwarded to :meth:`before_invoke`: a
+        spent park allowance raises :class:`PoolFrozen` out of the
+        ``async with``, before any account is claimed.
 
         Yields an :class:`InvokeSlot` whose ``token`` and ``account_name``
         are ready to use.  On exit, if neither :meth:`~InvokeSlot.detect_cap_hit`
@@ -1559,13 +1620,17 @@ class UsageGate:
             while True:
                 async with gate.invoke_slot() as slot:
                     result = await run_agent(oauth_token=slot.token)
-                    if slot.detect_cap_hit(result.stderr, result.output):
+                    if not result.success and slot.detect_cap_hit(
+                        result.stderr, result.output,
+                    ):
                         continue   # probe settled by cap detection
                     slot.confirm(result.cost_usd)
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
-        lease = await self.before_invoke(scope=scope, park=park)
+        lease = await self.before_invoke(
+            scope=scope, park=park, max_wait_secs=max_wait_secs,
+        )
         slot = InvokeSlot(self, lease, scope=scope)
         try:
             yield slot
@@ -1594,6 +1659,10 @@ class UsageGate:
         ``_run_probe`` regime). CliLocalError now outranks CapHit/NearCap
         uniformly here, exactly as it already did at the cli_invoke layer
         (reify-3604).
+
+        Callers offer it only results that FAILED
+        (``shared/src/shared/cli_invoke.py::invoke_with_cap_retry``): a
+        successful reply that merely quotes a banner would read as a cap here.
 
         Returns True if a cap-hit or near-cap pattern was detected **and** an
         account was successfully resolved and mutated.  Returns False both when
@@ -2050,54 +2119,60 @@ class UsageGate:
           fault, carrying no evidence about this token at all. Recorded on the
           gate's shared spawn-fault accounting and the account left
           ``AUTH_FAILED``.
-        """
-        load_dotenv(override=True)
-        token_env = self._token_env_for(acct)
-        if token_env:
-            fresh = os.environ.get(token_env)
-            if fresh and fresh != acct.token:
-                logger.info(f'Account {acct.name}: env token changed — refreshing')
-                acct.token = fresh
 
-        logger.info(f'Account {acct.name}: firing auth re-probe')
-        try:
-            ok = await self._run_probe(acct)
-        except ProbeSpawnError as exc:
-            # The probe could not be spawned — a host fault, not evidence
-            # about this token. Record it and stay AUTH_FAILED: an account we
-            # could not VERIFY must not be read as recovered.
-            #
-            # Caught HERE rather than left to _auth_reprobe_loop's broad
-            # `except Exception`, which would downgrade it to a WARNING
-            # ('auth re-probe raised') and re-hide the one signal that says
-            # this is not an auth problem. Returning early also skips the
-            # 'auth re-probe failed — staying auth_failed' line below, which
-            # asserts a probe that ran.
-            self._note_probe_spawn_failure(acct, exc)
-            return
-        self._clear_probe_spawn_failures(acct)
-        if ok:
-            if acct.phase == AccountPhase.AUTH_FAILED:
-                # _transition owns: the phase write, clearing auth_failed_at,
-                # and the centralized _open recompute. A phase mismatch here
-                # (e.g. SIGHUP's fan-out reprobing an account that was never
-                # auth_failed) is a pure no-op — mirrors the idempotency
-                # guards on _handle_cap_detected/_handle_auth_failure. The
-                # old unconditional field writes + event fire re-ran (and
-                # re-fired 'auth_resumed') on every successful call
-                # regardless of the account's current phase.
-                self._transition(acct, AccountPhase.AVAILABLE)
-                logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
-                if self._cost_store:
-                    self._fire_cost_event(
-                        acct.name,
-                        'auth_resumed',
-                        json.dumps({}),
-                    )
-        else:
-            logger.info(
-                f'Account {acct.name}: auth re-probe failed — staying auth_failed',
-            )
+        Calls for one account run one at a time (``acct.reprobe_lock``): a
+        caller that arrives mid-probe waits, then probes with the env as it
+        is by then.
+        """
+        async with acct.reprobe_lock:
+            load_dotenv(override=True)
+            token_env = self._token_env_for(acct)
+            if token_env:
+                fresh = os.environ.get(token_env)
+                if fresh and fresh != acct.token:
+                    logger.info(f'Account {acct.name}: env token changed — refreshing')
+                    acct.token = fresh
+
+            logger.info(f'Account {acct.name}: firing auth re-probe')
+            try:
+                ok = await self._run_probe(acct)
+            except ProbeSpawnError as exc:
+                # The probe could not be spawned — a host fault, not evidence
+                # about this token. Record it and stay AUTH_FAILED: an account
+                # we could not VERIFY must not be read as recovered.
+                #
+                # Caught HERE rather than left to _auth_reprobe_loop's broad
+                # `except Exception`, which would downgrade it to a WARNING
+                # ('auth re-probe raised') and re-hide the one signal that says
+                # this is not an auth problem. Returning early also skips the
+                # 'auth re-probe failed — staying auth_failed' line below,
+                # which asserts a probe that ran.
+                self._note_probe_spawn_failure(acct, exc)
+                return
+            self._clear_probe_spawn_failures(acct)
+            if ok:
+                if acct.phase == AccountPhase.AUTH_FAILED:
+                    # _transition owns: the phase write, clearing
+                    # auth_failed_at, and the centralized _open recompute. A
+                    # phase mismatch here (e.g. SIGHUP's fan-out reprobing an
+                    # account that was never auth_failed) is a pure no-op —
+                    # mirrors the idempotency guards on
+                    # _handle_cap_detected/_handle_auth_failure. The old
+                    # unconditional field writes + event fire re-ran (and
+                    # re-fired 'auth_resumed') on every successful call
+                    # regardless of the account's current phase.
+                    self._transition(acct, AccountPhase.AVAILABLE)
+                    logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
+                    if self._cost_store:
+                        self._fire_cost_event(
+                            acct.name,
+                            'auth_resumed',
+                            json.dumps({}),
+                        )
+            else:
+                logger.info(
+                    f'Account {acct.name}: auth re-probe failed — staying auth_failed',
+                )
 
     def _token_env_for(self, acct: AccountState) -> str | None:
         """Look up the env-var name that sourced *acct*'s token."""
@@ -2157,9 +2232,11 @@ class UsageGate:
         Treats SIGHUP as an operator-driven "refresh everything" signal:
         - reload .env (override existing env vars)
         - refresh each account's token from its env var if it changed
-        - force every account to AVAILABLE so it is probe-worthy
+        - force every account except an AUTH_FAILED one to AVAILABLE; an
+          AUTH_FAILED account stays blocked until its probe confirms the token
         - reopen the global gate
         - fire a probe per account in parallel
+        - clear the pause reason once the pool is no longer paused
 
         ``cumulative_cost`` is intentionally NOT reset — it is a budget
         counter, unrelated to token state.
@@ -2178,13 +2255,18 @@ class UsageGate:
             # centralized _open recompute. force=True is required because
             # CAPPED/AUTH_FAILED -> AVAILABLE is not a legal edge outside
             # this operator-driven hard reset.
-            self._transition(acct, AccountPhase.AVAILABLE, force=True)
-        self._paused_reason = ''
+            #
+            # An AUTH_FAILED account is left to _reprobe_account, which
+            # un-blocks it only on a probe that ran and succeeded (task 5946).
+            if acct.phase != AccountPhase.AUTH_FAILED:
+                self._transition(acct, AccountPhase.AVAILABLE, force=True)
         logger.info(f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes')
         await asyncio.gather(
             *(self._reprobe_account(a) for a in self._accounts),
             return_exceptions=True,
         )
+        if not self.is_paused:
+            self._paused_reason = ''
 
     def _find_account_by_token(self, token: str) -> AccountState | None:
         for acct in self._accounts:
@@ -2242,6 +2324,45 @@ class UsageGate:
                 )
         except RuntimeError:
             pass
+
+    def _arm_probe_hold(self, acct: AccountState) -> None:
+        """Bound the probe claim just taken on *acct*; see
+        ``UsageCapConfig.probe_slot_hold_secs``.
+
+        A loop-less ``try_lease`` caller arms nothing: its contract is one
+        invocation at a time, so no second caller can starve.
+        """
+        if getattr(self, '_shutting_down', False):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._disarm_probe_hold(acct)
+        acct.probe_hold_timer = loop.call_later(
+            self._config.probe_slot_hold_secs,
+            self._expire_probe_hold,
+            acct,
+            acct.generation,
+        )
+
+    def _disarm_probe_hold(self, acct: AccountState) -> None:
+        if acct.probe_hold_timer is not None:
+            acct.probe_hold_timer.cancel()
+            acct.probe_hold_timer = None
+
+    def _expire_probe_hold(self, acct: AccountState, claim_generation: int) -> None:
+        acct.probe_hold_timer = None
+        # The legacy AccountState boolean setters write `phase` without
+        # `_transition`, so the claim this timer was armed for may be gone.
+        if acct.phase != AccountPhase.PROBE_IN_FLIGHT or acct.generation != claim_generation:
+            return
+        logger.info(
+            f'Account {acct.name}: probe slot held '
+            f'{self._config.probe_slot_hold_secs:g}s with no cap verdict — '
+            f'holder is being served; opening to all tasks',
+        )
+        self._transition(acct, AccountPhase.AVAILABLE, clear_near_cap=False)
 
     async def _write_cost_event(
         self,
@@ -2331,9 +2452,10 @@ class UsageGate:
         # cadence (`_account_resume_probe_loop` / `_auth_reprobe_loop`), so
         # only they can ever produce the probe that zeroes the count again.
         #
-        # `_on_sighup_async` is the path that proved it: it force-resets EVERY
-        # account to AVAILABLE (which zeroes the counter via `_transition`)
-        # and only THEN fans out `_reprobe_account` over all of them. On a
+        # `_on_sighup_async` is the path that proved it: it force-resets every
+        # account except an AUTH_FAILED one to AVAILABLE (which zeroes the
+        # counter via `_transition`) and only THEN fans out `_reprobe_account`
+        # over all of them. On a
         # broken host that left every AVAILABLE account holding a count of 1
         # that nothing would ever clear — `_transition`'s reset fires on
         # LEAVING the blocked set, and AVAILABLE -> CAPPED is an ENTRY — so a
@@ -2601,8 +2723,10 @@ class UsageGate:
 
         Returns ``True`` only when the CLI result proves the API served the
         request — a success result, or the local budget cap after real spend —
-        and ``False`` otherwise.  Uses haiku to minimise cost (~$0.001 per
-        probe).
+        and ``False`` otherwise.  The result is parsed once, by
+        ``shared.cli_invoke.parse_claude_cli_output``, and that one parse feeds
+        both the cap classification and the served check in
+        ``_probe_verdict``.  Uses haiku to minimise cost (~$0.001 per probe).
 
         Raises:
             ProbeSpawnError: The probe could not be SPAWNED (task 4512) — the
@@ -2623,7 +2747,7 @@ class UsageGate:
             config_dir.write_credentials(acct.token)
 
         cmd = [
-            'claude',
+            claude_binary_spec(),
             '--print',
             '--output-format',
             'json',
@@ -2639,7 +2763,7 @@ class UsageGate:
             'Say ok',
         ]
 
-        env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+        env = agent_subprocess_env(os.environ)
         if acct.token is not None:
             env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
         env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
@@ -2716,19 +2840,20 @@ class UsageGate:
 
         stdout_text = stdout_bytes.decode(errors='replace') if stdout_bytes else ''
         stderr_text = stderr_bytes.decode(errors='replace') if stderr_bytes else ''
+        returncode = proc.returncode if proc.returncode is not None else 1
+        result = parse_claude_cli_output(
+            stdout=stdout_text, stderr=stderr_text, returncode=returncode,
+        )
+        return self._probe_verdict(acct, returncode, result)
 
-        # NOTE — intentional asymmetry with detect_cap_hit: strict_confirm=False
-        # skips the CAP_CONFIRM_KEYWORDS guard applied by detect_cap_hit's
-        # strict_confirm=True regime (see DD-2 on classify_invocation).  The
-        # probe runs only while an account is already blocked (capped or
-        # auth_failed); any whiff of a cap prefix in the probe output means the
-        # account is still capped and we must NOT unpause it.  Being
-        # conservative here avoids the far worse outcome of unpausing a capped
-        # account and burning quota on a still-limited account.  Do not 'fix'
-        # this asymmetry without understanding the safety-margin implications
-        # — see test_probe_prefix_only_without_confirm_keyword_still_returns_false.
-        result = AgentResult(success=False, output=stdout_text, stderr=stderr_text)
-        outcome = classify_invocation(result, strict_confirm=False, backend='claude')
+    def _probe_verdict(self, acct: AccountState, returncode: int, result: AgentResult) -> bool:
+        """Judge one finished probe of *acct* from its parsed CLI *result*.
+
+        A cap message keeps the account blocked (demoting AUTH_FAILED to
+        CAPPED); otherwise only positive evidence the API served the call
+        returns True.
+        """
+        outcome = _classify_probe_result(result)
         if isinstance(outcome, (CapHit, NearCap)):
             logger.info(
                 f'Account {acct.name}: probe got cap message: {outcome.reason}',
@@ -2774,28 +2899,24 @@ class UsageGate:
         # request and consumed real tokens — the account has capacity. Cache
         # creation on a fresh session easily pushes total_cost past $0.01, so
         # this is a routine outcome, not a cap hit.
-        probe_result = _load_probe_result(stdout_bytes)
-        result_fields = probe_result or {}
-        if (
-            _probe_hit_local_budget_cap(probe_result)
-            and result_fields.get('api_error_status') is None
-        ):
+        if _probe_hit_local_budget_cap(result):
             logger.info(
                 f'Account {acct.name}: probe hit local $0.01 budget '
                 f'cap (API accepted request) — treating as success',
             )
             return True
-        if _probe_succeeded(proc.returncode, probe_result):
+        if _probe_succeeded(returncode, result):
             logger.info(f'Account {acct.name}: probe succeeded')
             return True
         logger.warning(
             'Account %s: probe did not succeed — exit %s, subtype=%r, '
-            'api_error_status=%s: %s — account stays blocked',
+            'api_error_status=%s, outcome=%s: %s — account stays blocked',
             acct.name,
-            proc.returncode,
-            result_fields.get('subtype'),
-            result_fields.get('api_error_status'),
-            _probe_result_snippet(probe_result),
+            returncode,
+            result.subtype,
+            result.api_error_status,
+            type(outcome).__name__,
+            _probe_result_snippet(result),
         )
         return False
 
@@ -2808,6 +2929,7 @@ class UsageGate:
         # would otherwise leak a background task past shutdown.
         self._shutting_down = True
         for acct in self._accounts:
+            self._disarm_probe_hold(acct)
             if acct.resume_task and not acct.resume_task.done():
                 acct.resume_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -2915,6 +3037,17 @@ class UsageGate:
     def auth_failed_account_names(self) -> tuple[str, ...]:
         """Names of the accounts currently AUTH_FAILED, in roster order."""
         return tuple(acct.name for acct in self._accounts if acct.auth_failed)
+
+    @property
+    def probe_in_flight_account_names(self) -> tuple[str, ...]:
+        """Names of the accounts whose probe claim awaits its holder's
+        verdict, in roster order."""
+        return tuple(acct.name for acct in self._accounts if acct.probe_in_flight)
+
+    @property
+    def capped_account_names(self) -> tuple[str, ...]:
+        """Names of the accounts currently capped, in roster order."""
+        return tuple(acct.name for acct in self._accounts if acct.capped)
 
     @property
     def soonest_resets_at(self) -> datetime | None:

@@ -3,9 +3,9 @@
 (merge-queue-reliability PRD P-2, scope-3 leaf theta, task 2161).
 
 Both semaphores are single-owned by a
-:class:`~orchestrator.merge_speculation_controller.PermitLedger` instance
+:class:`~orchestrator.merge_lane.speculation_controller.PermitLedger` instance
 (``_speculation_ledger`` / ``_merge_ahead_ledger`` on
-:class:`~orchestrator.merge_queue.SpeculativeMergeWorker`): every acquire
+:class:`~orchestrator.merge_lane.worker.SpeculativeMergeWorker`): every acquire
 returns a permit token (``SpecPermit``/``CapPermit``) and every release goes
 through ``ledger.release(token)`` -- or, for the shutdown-only over-release,
 ``ledger.release_for_shutdown(count)``. A raw
@@ -32,14 +32,14 @@ import ast
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This guard AST-parses every *.py under orchestrator/src/orchestrator/ via
 # rglob. Not individually reproduced under load; marked because it is
 # structurally identical to the three members that crashed.
 # WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
 # ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

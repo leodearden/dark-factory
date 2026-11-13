@@ -3,8 +3,8 @@
 Task 5267. A member with a ``[tool.pyright]`` table type-checks through two
 entry points that select files independently:
 
-  * a BARE ``pyright`` run from the member directory (``hooks/project-checks``,
-    the fleet chain in ``dark-factory-orchestrator.yaml``, an editor), which
+  * a BARE ``pyright`` run from the member directory (the fleet chain in
+    ``dark-factory-orchestrator.yaml``, an editor), which
     selects by ``[tool.pyright] include``;
   * the member's module verify type leg, ``<member>/orchestrator.yaml``
     ``type_check_command``. Under the root config's
@@ -50,7 +50,9 @@ import tomllib
 from collections.abc import Callable
 from typing import Any
 
+import pytest
 from orchestrator.config import ModuleConfig
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_command_invariants import (
     PYRIGHT,
     anchor_split,
@@ -58,6 +60,8 @@ from verify_command_invariants import (
     positional_targets,
     required_segment,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

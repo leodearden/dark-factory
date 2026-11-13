@@ -257,6 +257,16 @@ class TestMem0TombstoneDeleters:
         assert set(m.MEM0_TOMBSTONE_DELETERS) == expected
 
 
+class TestFormatMem0TombstoneDeleters:
+    """format_mem0_tombstone_deleters() is the one prompt rendering of
+    MEM0_TOMBSTONE_DELETERS that every recon prompt site interpolates."""
+
+    def test_renders_each_deleter_backticked_in_declared_order(self):
+        assert m.format_mem0_tombstone_deleters().split(', ') == [
+            f'`{deleter}`' for deleter in m.MEM0_TOMBSTONE_DELETERS
+        ]
+
+
 class _OneTombstoneReader:
     """A memory service holding exactly one tombstone."""
 
@@ -452,23 +462,11 @@ class TestRenderCycleSummarySection:
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL == 'stage2_cycle_summary'
 
     def test_tombstone_claim_names_its_deleters(self):
-        """The scoped claim is single-sourced from MEM0_TOMBSTONE_DELETERS.
-
-        Deliberately stronger than a per-element `deleter in text` loop:
-        that form is satisfied by ANY ordering, duplication, or scattering
-        of the tags, so it can only fail if the f-string interpolation is
-        deleted outright — it carries almost no regression signal. Asserting
-        the exact backtick-wrapped, comma-joined, in-declared-order
-        substring instead also catches a reordering, a gap opened up by an
-        unrelated edit landing mid-list, or the render switching away from
-        MEM0_TOMBSTONE_DELETERS as its source, while still failing closed if
-        the interpolation is deleted entirely.
-        """
-        text = m.render_cycle_summary_section()
-        expected_deleters_str = ', '.join(f'`{deleter}`' for deleter in m.MEM0_TOMBSTONE_DELETERS)
-        assert expected_deleters_str in text, (
-            f'Expected the exact ordered, comma-joined deleter list '
-            f'{expected_deleters_str!r} in render_cycle_summary_section()'
+        """The rendered section contains the shared deleter list exactly, so a
+        reorder, a gap or a switch away from the shared source fails."""
+        deleters = m.format_mem0_tombstone_deleters()
+        assert deleters in m.render_cycle_summary_section(), (
+            f'Expected the shared deleter list {deleters!r} in render_cycle_summary_section()'
         )
 
 
@@ -660,6 +658,75 @@ class TestPremiseLint:
             # setattr, not a direct attribute assignment, so this stays pyright-clean
             # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
             setattr(v, 'premise', 'mutated')  # noqa: B010
+
+
+class TestMarkerDeletionPremise:
+    """The rule flags "Stage 3 / remediation / the LLM deletes a marker"
+    within one clause. A clause ends at `.`, `;`, a newline or a negation cue
+    (not/never/n't); a line break inside the subject or marker name does not
+    end it."""
+
+    INVARIANT = 'markers_deleted_only_by_gc'
+
+    def _invariants(self, text: str) -> set[str]:
+        return {v.invariant for v in m.premise_lint(text)}
+
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'The LLM removes the stage1_flag_marker once resolved.',
+            'Remediation purges the flag_for_stage2 records.',
+            'stage3 clears the marker',
+            'Stage\n3 deletes the marker.',
+            'Stage 3 deletes the flag\nmarker.',
+            'Stage 3 deletes the stale entries and the marker.',
+        ],
+    )
+    def test_flags_the_claim(self, claim):
+        assert self.INVARIANT in self._invariants(claim)
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'Stage 3 remediation does not delete the flag marker.',
+            "Stage 3 remediation doesn't remove the marker.",
+            'Stage 3 never clears the stage1_flag_marker.',
+            'Stage 3 deletes the stale task, not the marker.',
+            'Stage 3 remediation deletes the task; GC later deletes the marker.',
+            'GC deletes the marker after Stage 3 runs.',
+            'Stage 3 remediation runs\nGC deletes the marker on terminal task.',
+        ],
+    )
+    def test_does_not_flag(self, text):
+        assert self.INVARIANT not in self._invariants(text)
+
+    BUDGET_SECONDS = 1.0
+
+    @pytest.mark.parametrize(
+        ('near_miss', 'length'),
+        [
+            ('stage 3 deletes ', 4_800),
+            ('stage 3 ', 40_000),
+        ],
+        ids=['subject-verb-pairs', 'subjects'],
+    )
+    def test_lint_time_is_linear_in_clause_length(self, near_miss, length):
+        """`premise_lint` runs synchronously on the `submit_task` path; the
+        real claim in the clause after the near-misses pins correctness
+        alongside cost."""
+        text = (
+            near_miss * (length // len(near_miss))
+            + '. '
+            + 'Stage 3 remediation deletes the flag marker.'
+        )
+        started = time.perf_counter()
+        invariants = self._invariants(text)
+        elapsed = time.perf_counter() - started
+        assert self.INVARIANT in invariants
+        assert elapsed < self.BUDGET_SECONDS, (
+            f'premise_lint took {elapsed:.3f}s on {len(text)} characters '
+            f'(budget {self.BUDGET_SECONDS}s)'
+        )
 
 
 class TestNegativeProbeSetPremise:

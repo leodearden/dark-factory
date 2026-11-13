@@ -8,6 +8,38 @@
       "severity": "suggestion",
       "description": "The marker-based _extract_inline_script matches the first <script> body containing the sentinel using a regex that does not parse HTML comments, so a commented-out <script> block containing 'mergeQueueDepthChart' is returned before the real partial script. This is a real correctness weakness (self-documented and asserted by test_sentinel_in_commented_script_is_still_matched), though unlikely to bite given real rendered HTML.",
       "mutation_type": "logic"
+    },
+    {
+      "id": "mined_752_pool_01",
+      "location": "dashboard/tests/test_merge_queue_panel.py:555",
+      "category": "naming",
+      "severity": "suggestion",
+      "description": "`test_ignores_script_tag_inside_html_comment` claims the helper ignores scripts inside HTML comments, but the helper has no comment handling: the commented `<script>var x = 1;</script>` is skipped only because it lacks the sentinel, as the sibling `test_sentinel_in_commented_script_is_still_matched` shows. The test therefore exercises the same mechanism as `test_skips_foreign_script_before_partial` and its name misstates the helper's guarantee.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_752_pool_02",
+      "location": "dashboard/tests/test_merge_queue_panel.py:496",
+      "category": "duplication",
+      "severity": "suggestion",
+      "description": "The new TestExtractInlineScript tests hard-code the literal 'mergeQueueDepthChart' in fixture HTML and assertions (including the error-message check) instead of referencing `_PARTIAL_SCRIPT_SENTINEL`, and repeat the same partial-script and alpine:init fixture snippets inline, so changing the sentinel requires editing several copies.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_752_pool_03",
+      "location": "dashboard/tests/test_merge_queue_panel.py:62",
+      "category": "comments",
+      "severity": "suggestion",
+      "description": "The sentinel's rationale is written twice (a 6-line comment above `_PARTIAL_SCRIPT_SENTINEL` and a ~20-line helper docstring around a 6-line body); the docstring calls the approach 'immune' and then documents where it is not; and the new test docstrings carry change-history prose for a reviewer ('this test drives the refactor', 'The old position-based re.search...', 'from the task details', a cross-reference to another test by name) that will drift.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_752_pool_04",
+      "location": "dashboard/tests/test_merge_queue_panel.py:95",
+      "category": "diagnostics",
+      "severity": "suggestion",
+      "description": "When no script carries the sentinel, the AssertionError names the sentinel but not the template (partials/merge_queue.html) that is expected to contain it, so a canvas-id rename surfaces as a helper failure without pointing at its source. Minor.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

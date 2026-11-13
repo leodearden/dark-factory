@@ -13,6 +13,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 WRAPPER = Path(__file__).resolve().parents[1] / 'return-brief.sh'
 PREFIX = 'return-brief: '

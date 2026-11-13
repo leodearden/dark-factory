@@ -1,0 +1,72 @@
+{
+  "task_id": "6132",
+  "reason": "Net-additive bug fix: deep merge-ahead build_chain now refuses a link whose branch carries a stack base that never landed on main (GitOps.unlanded_stack_base, a read-only predicate, plus worker.py::_link_refusal and one ChainTruncationReason value), so the link takes the sequential path where classify_and_merge un-stacks it (task 5618) instead of landing the base's commits under its name; build_chain's own branching moved into the helper.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1465,
+      "current": 1467
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2203,
+      "current": 2205
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 16133,
+      "current": 16151
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1911,
+      "current": 1915
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22303,
+      "current": 22326
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9331,
+      "current": 9342
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 986,
+      "current": 989
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12528,
+      "current": 12540
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4883,
+      "current": 4887
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57575,
+      "current": 57620
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31662,
+      "current": 31688
+    }
+  ]
+}

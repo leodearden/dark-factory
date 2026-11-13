@@ -30,10 +30,13 @@ from typing import Any
 from unittest import mock
 
 import pytest
-from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
+from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid, wait_pid_gone
 
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult, run_git
 from shared.proc_group import process_group_members, read_stat_fields
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture
@@ -127,6 +130,17 @@ async def test_child_env_forces_c_locale() -> None:
     result = await run_git(['sh', '-c', 'echo "$LC_ALL:$LANG"'])
 
     assert result.stdout == 'C:C'
+
+
+async def test_an_unpinned_child_inherits_the_callers_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('LANG', 'en_GB.UTF-8')
+    monkeypatch.delenv('LC_ALL', raising=False)
+
+    result = await run_git(['sh', '-c', 'echo "${LC_ALL-unset}:$LANG"'], pin_c_locale=False)
+
+    assert result.stdout == 'unset:en_GB.UTF-8'
 
 
 # ---------------------------------------------------------------------------
@@ -357,22 +371,6 @@ async def test_bounded_calls_do_not_queue_behind_unbounded_ones() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
-    """Poll until *pid* is gone or a zombie; False if still running at *timeout*.
-
-    A zombie counts as exited: an orphaned grandchild of a killed group awaits
-    systemd --user's reap, which is not run_git's to perform (task 6029).
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        fields = read_stat_fields(Path('/proc') / str(pid))
-        if fields is None or fields.state in ('Z', 'X'):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-
-
 def _leaker_argv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """argv of a script that backgrounds a grandchild and records its pid in ``leaked.pid``."""
     leaker = tmp_path / 'leaker.sh'
@@ -394,7 +392,7 @@ def _spawned_child(marker: str) -> int | None:
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
-        fields = read_stat_fields(entry)
+        fields = read_stat_fields(entry, skip_malformed=True)
         if fields is None or fields.ppid != os.getpid():
             continue
         with contextlib.suppress(OSError):
@@ -417,7 +415,7 @@ async def test_cancellation_kills_a_backgrounded_grandchild(
         leaked_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leaked.pid')
         task.cancel()
 
-        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid), (
+        assert await asyncio.to_thread(wait_pid_gone, leaked_pid, timeout=5.0), (
             f'pid {leaked_pid}, a backgrounded grandchild, survived a cancelled run_git'
         )
         with pytest.raises(asyncio.CancelledError):
@@ -462,7 +460,7 @@ async def test_cancellation_mid_spawn_kills_a_backgrounded_grandchild(
         )
         task.cancel()
 
-        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid), (
+        assert await asyncio.to_thread(wait_pid_gone, leaked_pid, timeout=5.0), (
             f'pid {leaked_pid}, a backgrounded grandchild, survived a run_git '
             'cancelled mid-spawn'
         )
@@ -509,7 +507,7 @@ async def test_own_timeout_kills_a_backgrounded_grandchild(
     try:
         leaked_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leaked.pid')
 
-        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid, run_timeout + 5.0), (
+        assert await asyncio.to_thread(wait_pid_gone, leaked_pid, timeout=run_timeout + 5.0), (
             f'pid {leaked_pid}, a backgrounded grandchild, survived a timed-out run_git'
         )
         result = await task

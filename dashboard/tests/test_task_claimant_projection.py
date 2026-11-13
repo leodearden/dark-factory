@@ -112,13 +112,12 @@ class TestShapeTaskCarriesClaimantFields:
 
         assert shaped is not None
         assert set(shaped) == {
-            'id', 'title', 'description', 'status', 'priority',
+            'id', 'title', 'status', 'priority',
             'dependencies', 'metadata', 'updated_at',
-            'claimant_run_id', 'heartbeat_at',
+            'claimant_run_id', 'heartbeat_at', 'created_at', 'created_at_source',
         }
         assert shaped['id'] == 7            # cast to int at the boundary
         assert shaped['title'] == 'a distinctive title'
-        assert shaped['description'] == 'a distinctive description'
         assert shaped['status'] == 'blocked'
         assert shaped['priority'] == 'high'
         assert shaped['dependencies'] == [3, 4]   # deps cast to int too

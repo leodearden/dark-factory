@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "step-9: four dispatch-site re-anchor tests (consumers 4 and 5) drive _dispatch_item on a bare worker with a seeded verify frontier and a dead-base ledger entry",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_chain_intact.py",
+      "baseline": 70,
+      "current": 74
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6425,
+      "current": 6428
+    }
+  ]
+}

@@ -12,6 +12,12 @@ import { applyServed, loadClient, payload } from './_boundary_client.mjs';
 const TASKS = '/api/v2/dashboard/tasks';
 const HOUR_MS = 60 * 60 * 1000;
 
+// The banner notices the Tasks tab and the System health row render, read
+// through the ONE DF_DATA mapping both of them call.
+function bannerNotices(client) {
+  return client.window.DF_TASKS_OFFLINE_BANNER.tasksBannerNoticesFor(client.window.DF_DATA);
+}
+
 async function served(name) {
   const client = loadClient();
   const body = payload(name);
@@ -104,14 +110,7 @@ test('sketch #2: an unknown census renders the placeholder and its reason on eve
     }
   }
 
-  const D = client.window.DF_DATA;
-  const notices = client.window.DF_TASKS_OFFLINE_BANNER.tasksBannerNotices({
-    offline: !!D.TASKS_OFFLINE,
-    offlineProjects: D.TASKS_OFFLINE_PROJECTS || [],
-    degradedProjects: D.TASKS_DEGRADED_PROJECTS || [],
-    countUnknownProjects: D.TASKS_COUNT_UNKNOWN_PROJECTS || [],
-    totalProjects: D.TASKS_PROJECT_COUNT || 0,
-  });
+  const notices = bannerNotices(client);
   assert.deepEqual(notices.map(n => n.kind), ['count-unknown']);
   assert.ok(notices[0].text.includes('dark-factory'), notices[0].text);
 });
@@ -133,6 +132,13 @@ test('sketch #3: a census served three hours stale renders its value with an age
   for (const [surface, view] of Object.entries(anHourOn.readings)) {
     assert.equal(view.age, '4h', `${surface} an hour later, with no new payload`);
   }
+
+  // The banner names the project without contradicting the value and age
+  // badge every surface above renders for it.
+  const notices = bannerNotices(client);
+  assert.deepEqual(notices.map(n => n.kind), ['count-stale']);
+  assert.ok(notices[0].text.includes('dark-factory'), notices[0].text);
+  assert.doesNotMatch(notices[0].text, /unknown|unavailable/);
 });
 
 test('sketch #4: the client partitions and sums the served census without re-counting it', async () => {
@@ -166,12 +172,14 @@ test('sketch #5: nine statuses, each counted once, review and infra-hold in flig
 test('sketch #13: a transient census failure renders fresh, then stale with its ReadTimeout, then fresh', async () => {
   const client = loadClient();
   const rendered = [];
+  const bannerKinds = [];
   for (const phase of ['before', 'during', 'after']) {
     const body = payload(`census_transient_${phase}`);
     const receivedAt = Date.parse(body.served_at);
     assert.equal(await applyServed(client, TASKS, body, { receivedAt }), 'applied');
     const { census, readings } = surfaces(client, 'dark-factory', receivedAt);
     rendered.push({ state: census.state, title: readings.progress.title, text: readings.progress.text });
+    bannerKinds.push(bannerNotices(client).map(n => n.kind));
   }
 
   const [before, during, after] = rendered;
@@ -180,4 +188,5 @@ test('sketch #13: a transient census failure renders fresh, then stale with its 
   assert.equal(during.text, '4106/5459');
   assert.match(during.title, /ReadTimeout/);
   assert.deepEqual(after, { state: 'fresh', title: null, text: '4106/5459' });
+  assert.deepEqual(bannerKinds, [[], ['count-stale'], []]);
 });

@@ -167,10 +167,7 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.memory_metadata import validate_memory_metadata
 from fused_memory.models import MEM0_PRIMARY, MemoryCategory
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 from fused_memory.utils.toolcall_xml_leak import LEAK_TAIL
 
 logger = logging.getLogger('sweep_toolcall_xml_leak')
@@ -771,18 +768,14 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
     # Gated on ``not dry_run`` so a read-only run stays pure-read and needs no
     # write capability at all.
     if not dry_run:
-        try:
-            assert_store_mutation_allowed(operation='sweep_toolcall_xml_leak --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'sweep_toolcall_xml_leak: --apply NOT started (fail-closed) -- this '
-                'process cannot write mem0\'s history directory, so a repair would '
-                'delete the Qdrant point and then fail to write the replacement. '
-                'Nothing was scanned and nothing was mutated. Route the repair '
-                'through the fused-memory MCP server, or re-run from an '
-                'unsandboxed operator shell.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='sweep_toolcall_xml_leak --apply',
+            logger=logger,
+            extra_detail=(
+                'a repair would delete the Qdrant point and then fail to write the '
+                'replacement. Nothing was scanned and nothing was mutated.'
+            ),
+        )
 
     scan = await memory_service.scan_memory_content(
         project_id=args.project_id,

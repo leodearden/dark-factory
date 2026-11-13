@@ -32,12 +32,12 @@ from typing import Any, Protocol
 import httpx
 from _task_db_scan import (
     UNREADABLE_STORE_ERRORS,
-    connect_ro,
     decode_metadata,
     format_kv_line,
     tasks_db_path,
 )
 from migrate_metadata_modules_to_files import FusedMemoryClient, write_failure_reason
+from shared.tasks_db_readonly import connect_ro
 
 # Bind shared/ and fused-memory/ to THIS checkout rather than whichever copy an
 # editable install put on sys.path (scripts/audit_manifest_descriptor_drift.py::_SHARED_SRC).
@@ -240,11 +240,7 @@ async def _clear_claimant(client: ToolClient, project_root: str, violation: Viol
 
 
 def holder_task_ids(project_root: str) -> frozenset[str]:
-    state = read_scheduler_state(Path(project_root))
-    holders = state.get('current_holders') if isinstance(state, Mapping) else None
-    if not isinstance(holders, Mapping):
-        return frozenset()
-    return frozenset(str(task_id) for task_id in holders.values())
+    return frozenset(read_scheduler_state(Path(project_root)).current_holders.values())
 
 
 def observed_delta(

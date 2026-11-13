@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""The whole-repo quality metrics snapshot: plans/quality-metrics-snapshot-prd.md §Contract, schema 2 (schema 1 is still read).
+"""The whole-repo quality metrics snapshot: plans/quality-metrics-snapshot-prd.md §Contract, schema 3 (schemas 1 and 2 are still read).
 
 A report, never a gate: it emits measures and the quality doc's two heuristic-14
-marks, and no verdict, ranking, average or threshold of its own.
+marks, and no verdict, ranking, average or threshold of its own. The params
+fields are plans/quality-dashboard-prd.md §Contract (Snapshot identity).
 
     --run-id RUN_ID --out PATH [--root DIR] [--diff PREVIOUS.json]   measure HEAD, write PATH
     --current SNAPSHOT.json --diff PREVIOUS.json                      diff two snapshots
     --summary SNAPSHOT.json                                           per-member table
+    --params                                                          the params a measurement here records
 
 Exit 0 when done; exit 2 on an instrument failure, with the cause named on
 stderr. The PRD holds the rationale for every choice made here.
@@ -17,6 +19,7 @@ import argparse
 import ast
 import dataclasses
 import json
+import platform
 import sys
 import time
 from collections import Counter
@@ -29,7 +32,7 @@ import source_measures
 
 from shared import safe_io
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 INSTRUMENT = 'quality-metrics-snapshot'
 
 #: heuristic 14's two marks (docs/code-quality.md, heuristic 14) -- the doc's figures, not this script's thresholds.
@@ -531,10 +534,25 @@ def _require_unmoved_head(root: Path, as_of: str) -> None:
         )
 
 
+def measurement_params() -> dict[str, Any]:
+    """What a measurement by this interpreter and this instrument records as its params."""
+    complexipy_version = source_measures.require_complexipy()
+    return {
+        'complexipy_version': complexipy_version,
+        'python_version': platform.python_version(),
+        'instrument': {
+            'quality_metrics_snapshot': source_measures.blob_sha(Path(__file__).resolve()),
+            'source_measures': source_measures.blob_sha(Path(source_measures.__file__).resolve()),
+        },
+        'h14_soft_ceiling_lines': H14_SOFT_CEILING_LINES,
+        'h14_alarm_lines': H14_ALARM_LINES,
+    }
+
+
 def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
     """Measure *root*'s HEAD as a SCHEMA_VERSION snapshot; refuse a dirty domain or a moved HEAD."""
     started = time.monotonic()
-    version = source_measures.require_complexipy()
+    params = measurement_params()
     as_of = source_measures.head_commit(root)
     domain = source_measures.workspace_domain(root)
     _require_clean_domain(root, as_of)
@@ -549,16 +567,43 @@ def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
         'since': since,
         'evidence': _evidence(domain, measured),
         'cost': {'wall_clock_s': round(time.monotonic() - started, 1)},
-        'params': {
-            'complexipy_version': version,
-            'h14_soft_ceiling_lines': H14_SOFT_CEILING_LINES,
-            'h14_alarm_lines': H14_ALARM_LINES,
-        },
+        'params': params,
         'files': {path: dict(record) for path, record in measured.files.items()},
         'functions': dict(measured.functions),
         'import_graph': dict(measured.import_graph),
     }
     return validate_snapshot(snapshot, origin='this measurement')
+
+
+@dataclasses.dataclass(frozen=True)
+class MeasurementIdentity:
+    """plans/quality-dashboard-prd.md decision 17: the params held as canonical JSON, so the value is hashable and fixed."""
+
+    as_of_sha: str
+    params_json: str
+
+    @classmethod
+    def of(cls, as_of_sha: str, params: Mapping[str, Any]) -> MeasurementIdentity:
+        return cls(as_of_sha, json.dumps(params, sort_keys=True))
+
+    def __str__(self) -> str:
+        return f'{self.as_of_sha} {self.params_json}'
+
+
+def identity_known(snapshot: Mapping[str, Any]) -> bool:
+    """Whether a validated snapshot's schema records every params key, so that it has an identity."""
+    return not _unknown_params(snapshot)
+
+
+def measurement_identity(snapshot: Mapping[str, Any]) -> MeasurementIdentity:
+    """A validated snapshot's identity; refused when it is not *identity_known*, since unknown equals nothing."""
+    unknown = _unknown_params(snapshot)
+    if unknown:
+        raise source_measures.MetricsError(
+            f'a schema-{snapshot["schema_version"]} snapshot records no {", ".join(unknown)}: '
+            'its measurement identity is unknown, and unknown equals no identity'
+        )
+    return MeasurementIdentity.of(snapshot['as_of_sha'], snapshot['params'])
 
 
 # ---------------------------------------------------------------------------
@@ -736,15 +781,28 @@ _SCHEMA_1_IMPORT_GRAPH = _Object({
     'cycles': _CYCLES,
 })
 
+_SCHEMA_1_PARAMS = _Object({
+    'complexipy_version': _STRING,
+    'h14_soft_ceiling_lines': _INTEGER,
+    'h14_alarm_lines': _INTEGER,
+})
+
+_PARAMS = _Object({
+    **_SCHEMA_1_PARAMS.fields,
+    'python_version': _STRING,
+    'instrument': _Object({'quality_metrics_snapshot': _STRING, 'source_measures': _STRING}),
+})
+
 _INSTRUMENT = _Leaf(lambda value: value == INSTRUMENT, json.dumps(INSTRUMENT))
 
 
 @dataclasses.dataclass(frozen=True)
 class _Schema:
-    """What a schema version's file record and import graph hold."""
+    """What a schema version's file record, import graph and params hold."""
 
     record: _ByKind
     import_graph: _Object
+    params: _Object
 
 
 def _snapshot_shape(version: int, schema: _Schema) -> _Object:
@@ -767,11 +825,7 @@ def _snapshot_shape(version: int, schema: _Schema) -> _Object:
                 ordered=True,
             ),
             'cost': _Object({'wall_clock_s': _NUMBER}),
-            'params': _Object({
-                'complexipy_version': _STRING,
-                'h14_soft_ceiling_lines': _INTEGER,
-                'h14_alarm_lines': _INTEGER,
-            }),
+            'params': schema.params,
             'files': _MapOf(schema.record),
             'functions': _MapOf(_INTEGER),
             'import_graph': schema.import_graph,
@@ -780,16 +834,26 @@ def _snapshot_shape(version: int, schema: _Schema) -> _Object:
     )
 
 
-#: Schema 1 is read so a committed pre-6612 snapshot still diffs and summarises (the PRD's §Contract).
+_SCHEMA_2_RECORD = _record_shape({**_SCHEMA_1_SRC, 'cycle_closing_imports': _INTEGER})
+
+#: Schemas 1 and 2 are read so a committed pre-6612 or pre-8463 snapshot still diffs and summarises (the PRD's §Contract).
 _SCHEMAS: Mapping[int, _Schema] = {
-    1: _Schema(_record_shape(_SCHEMA_1_SRC), _SCHEMA_1_IMPORT_GRAPH),
-    SCHEMA_VERSION: _Schema(
-        _record_shape({**_SCHEMA_1_SRC, 'cycle_closing_imports': _INTEGER}), _IMPORT_GRAPH
-    ),
+    1: _Schema(_record_shape(_SCHEMA_1_SRC), _SCHEMA_1_IMPORT_GRAPH, _SCHEMA_1_PARAMS),
+    2: _Schema(_SCHEMA_2_RECORD, _IMPORT_GRAPH, _SCHEMA_1_PARAMS),
+    SCHEMA_VERSION: _Schema(_SCHEMA_2_RECORD, _IMPORT_GRAPH, _PARAMS),
 }
 _SNAPSHOTS: Mapping[int, _Object] = {
     version: _snapshot_shape(version, schema) for version, schema in _SCHEMAS.items()
 }
+
+#: Every params key a read schema records, so a key neither side records still reads unknown.
+_PARAMS_KEYS = tuple(sorted({key for schema in _SCHEMAS.values() for key in schema.params.fields}))
+
+
+def _unknown_params(snapshot: Mapping[str, Any]) -> list[str]:
+    """The params keys *snapshot*'s schema does not record: unknown, which equals nothing, not even unknown."""
+    recorded = _SCHEMAS[snapshot['schema_version']].params.fields
+    return [key for key in _PARAMS_KEYS if key not in recorded]
 
 
 def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
@@ -962,6 +1026,11 @@ _PAIR_MOVED = (
 )
 _PAIR_ADDED = '; total up: complexity added'
 _CROSSING_LABEL = 'measure per heuristic 14, not a target'
+_PARAMS_DIFFER = 'params differ: '
+_NOT_ATTRIBUTABLE = (
+    'not attributable to code: a delta below may come from the params change, not from the code'
+)
+_UNKNOWN = 'unknown'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1035,6 +1104,32 @@ def _record_pairs(
     pairs += [(path, None, now[path]) for path in pairing.added if path in now]
     pairs += [(path, before[path], None) for path in pairing.removed if path in before]
     return sorted(pairs, key=lambda pair: pair[0])
+
+
+def _param_rendered(snapshot: Mapping[str, Any], key: str) -> str:
+    """*key*'s value as JSON, or bare unknown when *snapshot*'s schema does not record it."""
+    if key in _unknown_params(snapshot):
+        return _UNKNOWN
+    return json.dumps(snapshot['params'][key], sort_keys=True)
+
+
+def _params_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    """Every params key unknown on either side or differing, sorted: unknown never equals unknown."""
+    renderings = (
+        (key, _param_rendered(previous, key), _param_rendered(current, key)) for key in _PARAMS_KEYS
+    )
+    return [
+        f'{key} {before} -> {after}'
+        for key, before, after in renderings
+        if _UNKNOWN in (before, after) or before != after
+    ]
+
+
+def _params_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    entries = _params_entries(current, previous)
+    if not entries:
+        return []
+    return [_PARAMS_DIFFER + '; '.join(entries), f'  {_NOT_ATTRIBUTABLE}']
 
 
 def _header(label: str, snapshot: Mapping[str, Any]) -> str:
@@ -1157,10 +1252,15 @@ def _diff_section(header: str, entries: Sequence[str]) -> list[str]:
 
 
 def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
-    """What moved from *previous* to *current*: measures and their changes, never a verdict."""
+    """What moved from *previous* to *current*: measures and their changes, never a verdict.
+
+    When a params key differs or is unknown on either side, a params-differ line
+    and its not-attributable label come first.
+    """
     pairing = _pairing(current, previous)
     pairs = _record_pairs(pairing, current, previous)
     return [
+        *_params_lines(current, previous),
         _header('current', current),
         _header('previous', previous),
         *_diff_section('unreadable (measures unknown, never zero):', _unreadable_entries(current, previous)),
@@ -1306,12 +1406,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--diff', help='The previous snapshot to diff against.')
     parser.add_argument('--current', help='Diff this snapshot instead of measuring.')
     parser.add_argument('--summary', help='Print this snapshot as a per-member table.')
+    parser.add_argument(
+        '--params',
+        action='store_true',
+        help='Print the params a measurement here would record, as one JSON line; measure nothing.',
+    )
     return parser
 
 
 def _require_one_mode(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     measuring = (args.run_id, args.out, args.root) != (None, None, None)
-    if args.summary is not None:
+    if args.params:
+        if measuring or (args.diff, args.current, args.summary) != (None, None, None):
+            parser.error('--params takes no other argument')
+    elif args.summary is not None:
         if measuring or args.diff is not None or args.current is not None:
             parser.error('--summary takes no other argument')
     elif args.current is not None:
@@ -1320,7 +1428,7 @@ def _require_one_mode(parser: argparse.ArgumentParser, args: argparse.Namespace)
     elif args.run_id is None or args.out is None:
         parser.error(
             'measuring needs both --run-id and --out; '
-            'otherwise give --current with --diff, or --summary'
+            'otherwise give --current with --diff, --summary, or --params'
         )
 
 
@@ -1365,6 +1473,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _require_one_mode(parser, args)
     try:
+        if args.params:
+            print(json.dumps(measurement_params()))
+            return 0
         if args.summary is not None:
             print(summary_table(load_snapshot(Path(args.summary))))
             return 0

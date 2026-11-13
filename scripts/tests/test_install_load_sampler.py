@@ -25,6 +25,11 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 SCRIPT = Path(__file__).parent.parent / 'install-load-sampler.sh'
 REPO_ROOT = Path(__file__).parent.parent.parent
 TEMPLATES_DIR = REPO_ROOT / 'dashboard'

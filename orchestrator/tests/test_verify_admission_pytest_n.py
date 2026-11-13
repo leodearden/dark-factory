@@ -45,15 +45,14 @@ from orchestrator.verify_cmd import (
 )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyAdmissionPytestNConfigDefault:
     """Behavior-preserving default: 'auto' means no `-n` rewrite is injected
     (see the wiring tests below), so an untuned install keeps today's
     `-n auto` pyproject addopts byte-for-byte.
     """
 
-    def test_default_is_str_auto(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_default_is_str_auto(self):
         cfg = OrchestratorConfig()
         assert isinstance(cfg.verify_admission_pytest_n, str)
         assert cfg.verify_admission_pytest_n == 'auto'
@@ -90,18 +89,16 @@ class TestVerifyAdmissionPytestNReloadDisposition:
             'reloadable but is missing from RELOADABLE_FIELDS'
         )
 
-    def test_edit_lands_in_applied_candidates_not_restart_required(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(verify_admission_pytest_n='auto')
         fresh = OrchestratorConfig(verify_admission_pytest_n='16')
         diff = diff_config(live, fresh)
         assert 'verify_admission_pytest_n' in diff.applied_candidates
         assert 'verify_admission_pytest_n' not in diff.restart_required
 
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(verify_admission_pytest_n='auto')
         fresh = OrchestratorConfig(verify_admission_pytest_n='16')
         report = apply_reload(live, fresh)

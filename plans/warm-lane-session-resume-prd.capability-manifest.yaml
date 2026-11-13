@@ -100,3 +100,5 @@ tasks:
       kind: manual
       reason: docs-only leaf with no dependents; check would never run; signal is
         the git docs commit + the two PRDs' cross-PRD tables naming this seam.
+signal_leaves:
+- ω

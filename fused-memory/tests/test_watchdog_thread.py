@@ -17,6 +17,11 @@ import time
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 # ---------------------------------------------------------------------------
 # Step-1: loop-independence test for _watchdog_thread_loop
 # ---------------------------------------------------------------------------

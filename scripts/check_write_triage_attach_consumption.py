@@ -84,7 +84,7 @@ _CHILD_ID = 'child-1'
 
 #: Six ordinary candidates plus the evidence child. The child scores HIGHEST,
 #: which is what makes it the band's winner and therefore the thing
-#: ``_canonical_id_of`` hoists.
+#: ``canonical_id_of`` hoists.
 _ORDINARY_COUNT = 6
 _TOP_SCORE = 0.60
 _SCORE_STEP = 0.05
@@ -214,7 +214,7 @@ def _fixture_results(parent_field: str, child_kind: str) -> _SearchResults:
 
 
 def _child_kind(module: Any) -> str:
-    """A ``kind`` the ref's own ``_canonical_id_of`` treats as a child.
+    """A ``kind`` the ref's own ``canonical_id_of`` treats as a child.
 
     Read from the ref, because a hardcoded kind would silently stop the hoist
     — and with it the case that matters — if the vocabulary moved.
@@ -229,12 +229,16 @@ def _child_kind(module: Any) -> str:
 def _attach_id_for(module: Any, candidate: Any) -> Any:
     """The id an attach to *candidate* MUST land on: its own, or its PARENT's.
 
-    ``_canonical_id_of`` makes hoisting a child to its parent mandatory, so a
+    ``canonical_id_of`` makes hoisting a child to its parent mandatory, so a
     correct remedy lands there. The ref's own function decides, so the probe
-    cannot drift from the write side. The metadata rule is only the fallback
-    for a ref that renamed it.
+    cannot drift from the write side; a ref older than the public name still
+    spells it ``_canonical_id_of``. The metadata rule is only the fallback for
+    a ref that spells it neither way.
     """
-    hoist = getattr(module, '_canonical_id_of', None)
+    hoist = (
+        getattr(module, 'canonical_id_of', None)
+        or getattr(module, '_canonical_id_of', None)
+    )
     if callable(hoist):
         try:
             resolved = hoist(candidate)

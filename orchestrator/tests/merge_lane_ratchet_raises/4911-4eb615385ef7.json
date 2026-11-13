@@ -1,0 +1,18 @@
+{
+  "task_id": "4911",
+  "reason": "SPOT: extract task_citation_pattern so the steward briefing renders the citation gate from find_task_citation_commit_checked's own derivation",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1504,
+      "current": 1505
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5034,
+      "current": 5035
+    }
+  ]
+}

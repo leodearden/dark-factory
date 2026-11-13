@@ -12,9 +12,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 
 
 @dataclass(frozen=True)
@@ -110,6 +110,7 @@ def apply_spec_to_host_config(
     global_verify_command: VerifyCommand | None,
     module_configs: Sequence[ModuleConfig],
     field_overrides: Mapping[str, Any],
+    git_field_overrides: Mapping[str, Any],
     verify_cold_preprovision_command: str,
 ) -> OrchestratorConfig:
     """Return a copy of the consuming host's *config* with a spec applied onto it.
@@ -141,21 +142,30 @@ def apply_spec_to_host_config(
       decodes to, so a host-side value (leo-laptop's 2026-10-01 operational
       fix is the live case) is never wiped.  PRD:
       plans/remote-task-leg-verify-prd.md §4.1.
+    - *git_field_overrides* (task 7465): the spec's verdict-deciding GitConfig
+      leaves, under the same strict check as *field_overrides*; ``{}`` when
+      the spec carries none and the host's GitConfig decides.
 
-    Two spelling hazards, both because ``model_copy`` carries field and
+    Three spelling hazards, all because ``model_copy`` carries field and
     private-attribute VALUES over by reference: verify_env is a FRESH dict
-    (never an in-place update), and ``_module_configs`` is REBOUND on the copy
-    (never mutated, and never routed through ``model_copy(update=...)``, which
-    would shadow the PrivateAttr in ``__dict__``).  Either mistake corrupts
-    the caller's config — the one cli.py loaded and may still use.
+    (never an in-place update), ``git`` is a ``model_copy`` of the host's
+    GitConfig (never assigned into), and ``_module_configs`` is REBOUND on
+    the copy (never mutated, and never routed through
+    ``model_copy(update=...)``, which would shadow the PrivateAttr in
+    ``__dict__``).  Any of these mistakes corrupts the caller's config — the
+    one cli.py loaded and may still use.
     """
     overrides = dict(field_overrides)
     if verify_cold_preprovision_command != '':
         overrides['verify_cold_preprovision_command'] = verify_cold_preprovision_command
     update: dict[str, Any] = {
-        **_validated_field_overrides(overrides),
+        **_validated_field_overrides(OrchestratorConfig, overrides, label='field_overrides'),
         'verify_env': {**config.effective_verify_env, **verify_env},
     }
+    if git_field_overrides:
+        update['git'] = config.git.model_copy(update=_validated_field_overrides(
+            GitConfig, git_field_overrides, label='git_field_overrides',
+        ))
     if global_verify_command is not None:
         update['test_command'] = global_verify_command.test_command
         update['lint_command'] = global_verify_command.lint_command
@@ -165,11 +175,16 @@ def apply_spec_to_host_config(
     return applied
 
 
-def _validated_field_overrides(field_overrides: Mapping[str, Any]) -> dict[str, Any]:
-    fields = OrchestratorConfig.model_fields
+def _validated_field_overrides(
+    model: type[BaseModel],
+    field_overrides: Mapping[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    fields = model.model_fields
     unknown = sorted(set(field_overrides) - set(fields))
     if unknown:
-        raise TypeError(f'field_overrides name no OrchestratorConfig field: {unknown}')
+        raise TypeError(f'{label} name no {model.__name__} field: {unknown}')
     validated: dict[str, Any] = {}
     for name, value in field_overrides.items():
         adapter = TypeAdapter(fields[name].rebuild_annotation())
@@ -177,8 +192,8 @@ def _validated_field_overrides(field_overrides: Mapping[str, Any]) -> dict[str, 
             validated[name] = adapter.validate_python(value, strict=True)
         except ValidationError as exc:
             raise TypeError(
-                f'field_overrides[{name!r}] = {value!r} is not a valid '
-                f'OrchestratorConfig.{name}'
+                f'{label}[{name!r}] = {value!r} is not a valid '
+                f'{model.__name__}.{name}'
             ) from exc
     return validated
 

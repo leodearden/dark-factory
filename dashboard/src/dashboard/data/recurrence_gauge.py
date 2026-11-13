@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Any
 
 import aiosqlite
+from shared.milestone_rearm import scheduled_fire_at
 from shared.recurrence_chains import current_links
 from shared.task_metadata import Milestone, Recurrence
 from shared.task_metadata_wire import coerce_task_metadata
@@ -61,14 +62,22 @@ def overdue_grace(metadata: Mapping[str, Any]) -> timedelta:
     return timedelta(seconds=min(recurrence.interval_secs, _OVERDUE_GRACE_CAP_SECS))
 
 
+def _raw_fire_time(metadata: Mapping[str, Any]) -> str | None:
+    return scheduled_fire_at(metadata.get('milestone'))
+
+
 def _fire_time(metadata: Mapping[str, Any]) -> datetime | None:
     try:
         milestone = Milestone.model_validate(metadata.get('milestone'))
     except ValueError:
         return None
-    if milestone.mode != 'dated' or milestone.at is None:
+    raw = _raw_fire_time(metadata)
+    if milestone.mode != 'dated' or raw is None:
         return None
-    at = datetime.fromisoformat(milestone.at)
+    try:
+        at = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
     return at if at.tzinfo is not None else at.replace(tzinfo=UTC)
 
 
@@ -110,12 +119,6 @@ class ChainEntry:
 
 def _as_link(row: Mapping[str, Any]) -> dict[str, Any]:
     return {**row, 'metadata': coerce_task_metadata(row['metadata']) or {}}
-
-
-def _raw_fire_time(metadata: Mapping[str, Any]) -> str | None:
-    milestone = metadata.get('milestone')
-    at = milestone.get('at') if isinstance(milestone, Mapping) else None
-    return at if isinstance(at, str) else None
 
 
 def _entry(

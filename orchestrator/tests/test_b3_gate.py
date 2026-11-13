@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # ---------------------------------------------------------------------------
 # Shared helpers (adapted from test_dry_run_unblock.py)
@@ -1144,6 +1145,73 @@ class TestReaderFailureWarning:
             f'{[r.message for r in warn_records]}'
         )
 
+    def _seed_stub_tasks_db(self, tmp_path):
+        """The 0-byte decoy shape: a tasks.db that exists and holds nothing."""
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b'')
+        return db
+
+    def _run_check_warnings(self, tmp_path, capsys, caplog):
+        """Run the public 'check' verb; return its verdict and EVERY warning.
+
+        Every warning, not only those naming the store: run_check reads tasks.db
+        through both readers, and _read_latest_proposal must stay silent while
+        _read_task_description warns once, so a second warning is a regression.
+        """
+        import argparse
+        import logging as _logging
+
+        from orchestrator.b3_gate import run_check
+        args = argparse.Namespace(
+            task_id='42',
+            worktree=str(tmp_path),
+            project_root=str(tmp_path),
+            config=None,
+            now='2026-06-04T12:00:00+00:00',
+            tag='master',
+            category=None,
+            verb='check',
+        )
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            run_check(args)
+
+        result = json.loads(capsys.readouterr().out)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= _logging.WARNING]
+        return result, warnings
+
+    def test_run_check_on_a_stub_store_warns_once_naming_the_refusal(
+        self, tmp_path, capsys, caplog,
+    ):
+        db = self._seed_stub_tasks_db(tmp_path)
+
+        result, warnings = self._run_check_warnings(tmp_path, capsys, caplog)
+
+        assert 'verdict' in result
+        refusal = str(TaskDbUnreadable(db.resolve(), TaskDbProblem.EMPTY_STUB))
+        assert len(warnings) == 1, warnings
+        assert refusal in warnings[0]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='mode 000 does not deny root')
+    def test_run_check_on_an_unopenable_store_warns_once(self, tmp_path, capsys, caplog):
+        """A store connect_ro cannot OPEN raises sqlite3.Error, not a refusal.
+
+        It propagates out of _open_tasks_db like a non-ABSENT refusal, so the
+        description reader warns instead of answering a silent None.
+        """
+        _seed_tasks_db(tmp_path, 42, [])
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.chmod(0o000)
+        try:
+            result, warnings = self._run_check_warnings(tmp_path, capsys, caplog)
+        finally:
+            db.chmod(0o600)
+
+        assert 'verdict' in result
+        assert len(warnings) == 1, warnings
+        assert sqlite3.OperationalError.__name__ in warnings[0]
+
 
 # ---------------------------------------------------------------------------
 # step-15: _resolve_cap
@@ -1789,7 +1857,8 @@ class TestStopScanExcludesCapturedOutput:
     """check_proposal's step-1c scan skips the fenced captured output of each
     verify failure-report section in block_reason, and still scans every
     authored text: proposal_text, extra_texts, and the rest of block_reason
-    (task 6933).
+    (task 6933). The failure-report stream cases cover every captured section
+    shape failure_report emits (task 5357).
     """
 
     _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
@@ -1913,14 +1982,27 @@ class TestStopScanExcludesCapturedOutput:
         )},
         {'lint_output': 'x.py:1:1: E501 do not run this by hand'},
         {'type_output': 'x.py:1: error: do not run this by hand'},
-    ], ids=['test_output', 'lint_output', 'type_output'])
+        {'test_output': 'collected 3 items\nsetup note: do not run this by hand\n3 errors in 1.2s'},
+        {'type_output': 'x.py:1: warning: do not run this by hand'},
+        {'lint_output': '\n'.join(
+            [f'x.py:{i}:1: E501 line too long' for i in range(80)]
+            + ['x.py:999:1: E501 do not run this by hand']
+        )},
+    ], ids=[
+        'test_output', 'lint_output', 'type_output',
+        'test_output_without_marker', 'type_output_without_error',
+        'truncated_lint_output',
+    ])
     def test_verify_failure_report_streams_are_fenced_and_skipped(self, stream):
         from orchestrator.b3_gate import FRESH, check_proposal
         from orchestrator.stop_instruction import detect_stop_instruction
         from orchestrator.verify import VerifyResult
 
         streams = {'test_output': '', 'lint_output': '', 'type_output': '', **stream}
-        report = VerifyResult(passed=False, summary='Failures: tests failed', **streams)
+        report = VerifyResult(
+            passed=False, summary='Failures: tests failed',
+            test_leg_failed=bool(streams['test_output']), **streams,
+        )
         block_reason = 'Post-merge verification failed: tests failed\n\n' + report.failure_report()
 
         assert '```' in block_reason
@@ -2208,7 +2290,7 @@ class TestMergeCompletionConsumptionContract:
     These are CONTRACT/regression tests, not tests driving new b3_gate code:
     the (a)+(b)+(c) eligibility gate is enforced at GENERATION time by the
     dry_run_unblock.run_dry_run_unblock risk_label clamp (see
-    orchestrator.merge_completion.merge_completion_eligible and
+    orchestrator.merge_lane.completion.merge_completion_eligible and
     TestMergeCompletionRiskClamp in test_dry_run_unblock.py) —
     check_proposal itself is UNCHANGED by task 2633. This class pins that
     the EXISTING check_proposal behaviour already delivers the three

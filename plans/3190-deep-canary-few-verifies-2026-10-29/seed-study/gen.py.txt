@@ -1,0 +1,19 @@
+import json,time,collections
+d=json.load(open('/tmp/3190s/phases.json'));S=d['seeds']
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+print('per-day clone p05 p10 p25 p50 p75 p90 max, n; rule: complete sweep seeds, Cloning->Clone complete, day=UTC of start')
+b=collections.defaultdict(list)
+for s in S:
+    if 'clone0' in s and 'clone1' in s:
+        b[time.strftime('%m-%d',time.gmtime(s['clone0']))].append(s['clone1']-s['clone0'])
+for k in sorted(b):
+    v=b[k];print(k,len(v),*[f"{pct(v,q):.0f}" for q in (.05,.1,.25,.5,.75,.9)],f"{max(v):.0f}")
+print('per-gen: first seen, n, clone p05 p50 p90, cand, relink(max), delta p50')
+g=collections.defaultdict(list)
+for s in S:
+    if s.get('gen') and 'clone0' in s and 'clone1' in s: g[s['gen']].append(s)
+for k in sorted(g):
+    v=g[k];c=[s['clone1']-s['clone0'] for s in v]
+    nc=[s['ncand'] for s in v if 'ncand' in s];nd=[s['ndelta'] for s in v if 'ndelta' in s]
+    print(k,time.strftime('%m-%d %H:%M',time.gmtime(v[0]['clone0'])),len(v),f"{pct(c,.05):.0f} {pct(c,.5):.0f} {pct(c,.9):.0f}",sorted(set(nc))[-2:],f"{pct(nd,.5):.0f}" if nd else None)

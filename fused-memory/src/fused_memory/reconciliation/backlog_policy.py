@@ -4,7 +4,10 @@ Bounds the backlog of unprocessed reconciliation events per project. When the
 count of buffered events plus the in-flight queue exceeds a hard limit, the
 policy routes to one of two outcomes:
 
-* **Orchestrator live for project** → file an L1 escalation under
+* **Orchestrator holds its project flock** (some process holds
+  ``<project_root>/data/orchestrator/orchestrator.lock``; see
+  ``fused_memory/services/orchestrator_detector.py``'s module docstring for
+  why the flock, not the PID probe, gates filing) → file an L1 escalation under
   ``<project_root>/data/escalations/`` through
   ``escalation.dedupe.submit_or_dedupe``. A tick that finds the condition
   still live FOLDS into the pending record for the same
@@ -33,6 +36,8 @@ from urllib.parse import quote
 
 from shared.project_layout import escalation_queue_dir
 from shared.safe_io import atomic_write_text
+
+from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -80,7 +85,7 @@ logger = logging.getLogger(__name__)
 
 
 OrchestratorDetector = Callable[[str], bool]
-"""Callable that takes a project_root path and returns True iff orchestrator is live."""
+"""Blocking callable: project_root -> True iff an orchestrator is live. Called through asyncio.to_thread."""
 
 TimeProvider = Callable[[], float]
 
@@ -210,6 +215,21 @@ class _PolicyState:
     project_root: str | None = None
 
 
+@dataclass(frozen=True)
+class _EscalationFiling:
+    """One escalation to file: rate-limited on the loop, filed on a worker thread."""
+
+    project_id: str
+    project_root: str
+    backlog: int
+    threshold: int
+    kind: str
+    error_type: str
+    summary: str
+    detail: str
+    suggested_action: str
+
+
 class BacklogPolicy:
     """Bounded-backlog policy with escalation or rejection.
 
@@ -224,7 +244,7 @@ class BacklogPolicy:
         self,
         event_buffer: EventBuffer,
         event_queue: EventQueueLike | None,
-        orchestrator_detector: OrchestratorDetector,
+        orchestrator_detector: OrchestratorDetector = is_orchestrator_lock_held,
         *,
         hard_limit: int = 500,
         hard_limit_overrides: dict[str, int] | None = None,
@@ -411,6 +431,8 @@ class BacklogPolicy:
         when ``queue.resolve()`` confirms the record reached a terminal status
         — reporting a close that did not happen would be the same silent rot
         this method exists to remove, merely relabelled as success.
+
+        The scan, reads and closes run in one ``asyncio.to_thread`` hop (INV-8).
         """
         project_root = self.project_root_for(project_id)
         if project_root is None:
@@ -420,6 +442,16 @@ class BacklogPolicy:
                 project_id,
             )
             return []
+        return await asyncio.to_thread(
+            self._close_pending_halt_records, project_root, project_id,
+        )
+
+    def _close_pending_halt_records(self, project_root: str, project_id: str) -> list[str]:
+        """Runs on a worker thread; touches no ``_PolicyState`` or ``self._lock``.
+
+        Not serialised against ``_file_escalation``; its docstring records the
+        race that leaves open, and why.
+        """
         if not _HAS_ESCALATION or EscalationQueue is None:  # pragma: no cover
             logger.warning(
                 'backlog_policy: cannot close halt escalation for %s — '
@@ -603,6 +635,11 @@ class BacklogPolicy:
         Writes one escalation per project with a non-zero buffered count (or
         per registered project, if the buffered count is unavailable). Returns
         the verdicts produced, primarily for test introspection.
+
+        A project whose routing raises (its orchestrator probe can, e.g. ENOLCK
+        from flock) is logged with its traceback and left out of the result;
+        it never suppresses the alert for the projects after it, the same
+        LOUD-and-INCLUSIVE rule ``_projects_with_backlog`` follows.
         """
         verdicts: list[BacklogVerdict] = []
         # One stats() snapshot for the whole fan-out, and the per-project
@@ -614,19 +651,23 @@ class BacklogPolicy:
         queue_pressure = self._queue_pressure()
         for project_id, buffered in await self._projects_with_backlog():
             backlog = queue_pressure + (buffered or 0)
-            verdict = await self._route_over_limit(
-                project_id=project_id,
-                backlog=backlog,
-                kind='wedge',
-                error_type='SqliteDrainerWedged',
-                summary=f'SQLite drainer wedged for {project_id}',
-                detail=(
-                    'The reconciliation event-queue drainer has not committed '
-                    f'within the stall threshold. Diagnostic payload: '
-                    f'{json.dumps(payload, default=str, sort_keys=True)[:2000]}'
-                ),
-                suggested_action='inspect_sqlite_drainer',
-            )
+            try:
+                verdict = await self._route_over_limit(
+                    project_id=project_id,
+                    backlog=backlog,
+                    kind='wedge',
+                    error_type='SqliteDrainerWedged',
+                    summary=f'SQLite drainer wedged for {project_id}',
+                    detail=(
+                        'The reconciliation event-queue drainer has not committed '
+                        f'within the stall threshold. Diagnostic payload: '
+                        f'{json.dumps(payload, default=str, sort_keys=True)[:2000]}'
+                    ),
+                    suggested_action='inspect_sqlite_drainer',
+                )
+            except Exception:
+                logger.exception('backlog_policy: wedge routing failed for %s', project_id)
+                continue
             verdicts.append(verdict)
         return verdicts
 
@@ -704,8 +745,8 @@ class BacklogPolicy:
         """
         limit = self.hard_limit_for(project_id)
         project_root = self.project_root_for(project_id)
-        if project_root is not None and self._detector(project_root):
-            path = await self._maybe_write_escalation(
+        if project_root is not None and await asyncio.to_thread(self._detector, project_root):
+            path = await self._maybe_write_escalation(_EscalationFiling(
                 project_id=project_id,
                 project_root=project_root,
                 backlog=backlog,
@@ -715,7 +756,7 @@ class BacklogPolicy:
                 summary=summary,
                 detail=detail,
                 suggested_action=suggested_action,
-            )
+            ))
             return BacklogVerdict(
                 outcome='escalated',
                 backlog=backlog,
@@ -763,25 +804,16 @@ class BacklogPolicy:
             error_type=error_type,
         )
 
-    async def _maybe_write_escalation(
-        self,
-        *,
-        project_id: str,
-        project_root: str,
-        backlog: int,
-        threshold: int,
-        kind: str,
-        error_type: str,
-        summary: str,
-        detail: str,
-        suggested_action: str,
-    ) -> Path | None:
+    async def _maybe_write_escalation(self, filing: _EscalationFiling) -> Path | None:
         """File an escalation unless rate-limited. Returns the record's path.
 
         Rate-limiting is per-(project, ``kind``): a backlog escalation never
         suppresses a judge-halt or wedge escalation within the window, and
         vice-versa (task 2920 (a)). The id prefix is derived from ``kind`` so a
         halt/wedge is never mis-filed as 'backlog'.
+
+        Everything past the rate-limit gate runs in one ``asyncio.to_thread``
+        hop (INV-8).
 
         The rate limit now bounds the FOLD cadence, not the mint cadence. Past
         the window a still-live condition routes through ``submit_or_dedupe``
@@ -828,17 +860,32 @@ class BacklogPolicy:
         delivered by 4885 (esc-5557-1), so nothing here waits on them.
         """
         async with self._lock:
-            state = self._state.setdefault(project_id, _PolicyState())
+            state = self._state.setdefault(filing.project_id, _PolicyState())
             now = self._now()
-            last = state.last_escalation_ts.get(kind, 0.0)
+            last = state.last_escalation_ts.get(filing.kind, 0.0)
             if (now - last) < self._rate_limit_seconds:
                 logger.info(
                     'backlog_policy: rate-limited %s escalation for %s (%.0fs since last)',
-                    kind, project_id, now - last,
+                    filing.kind, filing.project_id, now - last,
                 )
                 return None
-            state.last_escalation_ts[kind] = now
+            state.last_escalation_ts[filing.kind] = now
 
+        return await asyncio.to_thread(self._file_escalation, filing)
+
+    def _file_escalation(self, filing: _EscalationFiling) -> Path | None:
+        """Runs on a worker thread; touches no ``_PolicyState`` or ``self._lock``.
+
+        Nothing serialises it against ``_close_pending_halt_records``, which
+        also runs on a worker thread. A judge_halt filing can therefore fold
+        into a pending parent that an unhalt resolves a moment later, and
+        return that closed parent's path. That is left open deliberately: the
+        escalation server, a separate process, can already resolve the parent
+        in the same window, so an in-process lock would narrow the race
+        without closing it. If it is ever seen, the fix is a per-project
+        ``threading.Lock`` held by both helpers, which are this process's only
+        writers of these records.
+        """
         # Every name is listed, not just one: only an identity check on the
         # name itself narrows an optionally-imported symbol, so a guard on
         # EscalationQueue alone would leave the other five typed ``... | None``
@@ -857,13 +904,13 @@ class BacklogPolicy:
             logger.warning(
                 'backlog_policy: escalation package unavailable — no escalation '
                 'written for %s (kind=%s)',
-                project_id, kind,
+                filing.project_id, filing.kind,
             )
             return None
 
-        esc_dir = escalation_queue_dir(project_root)
+        esc_dir = escalation_queue_dir(filing.project_root)
         ts = datetime.fromtimestamp(self._now(), tz=UTC).isoformat()
-        esc_id = _escalation_id(kind, project_id, ts)
+        esc_id = _escalation_id(filing.kind, filing.project_id, ts)
 
         # Fold key = (category, kind, project_id) and NOTHING else. ``kind``
         # occupies the finding_category slot so a judge halt can never fold into
@@ -885,7 +932,7 @@ class BacklogPolicy:
         # normalised tokens ('reconciliation', 'backlog', 'exceeded') are the
         # same for EVERY project, so it would cross-fold projects.
         fingerprint = compute_content_fingerprint(
-            _ESCALATION_CATEGORY, kind, [project_id], '',
+            _ESCALATION_CATEGORY, filing.kind, [filing.project_id], '',
         )
         if not fingerprint:
             # Fail CLOSED. find_dedupe_parent treats a falsy key as "never
@@ -896,7 +943,7 @@ class BacklogPolicy:
             logger.error(
                 'backlog_policy: empty dedupe_fingerprint for %s (kind=%s) — '
                 'refusing to file an unfoldable record',
-                project_id, kind,
+                filing.project_id, filing.kind,
             )
             return None
 
@@ -913,14 +960,14 @@ class BacklogPolicy:
             agent_role='fused-memory',
             severity='blocking',
             category=_ESCALATION_CATEGORY,
-            summary=summary,
-            detail=detail,
-            suggested_action=suggested_action,
+            summary=filing.summary,
+            detail=filing.detail,
+            suggested_action=filing.suggested_action,
             timestamp=ts,
             level=1,
             workflow_state='infra',
             dedupe_fingerprint=fingerprint,
-            project_id=project_id,
+            project_id=filing.project_id,
         )
         # BROAD by intent, and the breadth is the point. This used to guard a
         # single ``path.write_text`` where OSError was the whole failure
@@ -939,8 +986,8 @@ class BacklogPolicy:
         # is the only thing that names which hop failed.
         try:
             # Constructed only now: EscalationQueue.__init__ mkdirs, and the
-            # rate-limit gate above must keep returning before any directory
-            # work.
+            # rate-limit gate in the caller, _maybe_write_escalation, must keep
+            # returning before any directory work.
             queue = EscalationQueue(esc_dir)
             config = DedupeConfig(
                 infra_dedupe_enabled=True,
@@ -997,9 +1044,9 @@ class BacklogPolicy:
         # (stamped by attach_dedupe_child) and dedupe_count/dedupe_children
         # (the queue's to write).
         outcome = self._merge_onto_persisted(esc_dir, record_id, {
-            **_policy_keys(error_type, backlog, threshold),
-            'summary': summary,
-            'detail': detail,
+            **_policy_keys(filing.error_type, filing.backlog, filing.threshold),
+            'summary': filing.summary,
+            'detail': filing.detail,
         })
         if outcome.path is None:
             # An 'accepted_unpersisted' response, or a record gone from both the
@@ -1008,7 +1055,7 @@ class BacklogPolicy:
             logger.warning(
                 'backlog_policy: filed %s for %s (kind=%s) but could not read it '
                 'back — reporting no escalation path',
-                record_id, project_id, kind,
+                record_id, filing.project_id, filing.kind,
             )
             return None
         if not outcome.merged:
@@ -1036,7 +1083,7 @@ class BacklogPolicy:
                 'backlog_policy: filed %s for %s (kind=%s) but could not stamp '
                 '%s onto it — reporting no escalation path so the next tick '
                 're-files rather than standing down on a record missing them',
-                record_id, project_id, kind, sorted(_POLICY_ONLY_KEYS),
+                record_id, filing.project_id, filing.kind, sorted(_POLICY_ONLY_KEYS),
             )
             return None
         path = outcome.path
@@ -1046,12 +1093,12 @@ class BacklogPolicy:
             logger.warning(
                 'backlog_policy: folded %s escalation for %s into pending %s '
                 '(child=%s, backlog=%d, threshold=%d)',
-                kind, project_id, record_id, result.get('child_id'),
-                backlog, threshold,
+                filing.kind, filing.project_id, record_id, result.get('child_id'),
+                filing.backlog, filing.threshold,
             )
         else:
             logger.warning(
                 'backlog_policy: wrote L1 escalation %s (backlog=%d, threshold=%d)',
-                path, backlog, threshold,
+                path, filing.backlog, filing.threshold,
             )
         return path

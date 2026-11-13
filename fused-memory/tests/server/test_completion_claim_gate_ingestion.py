@@ -32,9 +32,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _distinct_git_repo import init_distinct_git_repo
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.task_interceptor import TicketStoreNotConfiguredError
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # An applied-work completion claim naming task 5422 — the esc-5603-1 shape.
 _APPLIED_CONTENT = "task 5422's de-flake fix has been applied"

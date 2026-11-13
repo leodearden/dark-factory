@@ -375,7 +375,9 @@ class TestAdvisoryVsRejectionWording:
         actually CREATES a task yields one carrying the stamp; a submission
         that is dropped yields no task at all, and one folded into an
         existing task leaves that target without this candidate's stamp
-        (``_execute_combine`` propagates only the ``curator_*`` keys).  So
+        (``_execute_combine`` never copies a candidate's
+        ``possible_scope_mismatch``; its writes are the ``curator_*``
+        markers, ``declared_scope`` and ``followup_items``).  So
         at the moment this escalation is written, "the task WAS created" is
         a claim the escalator cannot possibly have verified, and on a
         drop/combine it is simply false — the operator (and any agent handed

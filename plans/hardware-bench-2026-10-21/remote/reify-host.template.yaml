@@ -1,0 +1,39 @@
+# The bench pod's reify verify-host config: leo-laptop's
+# ~/.config/orchestrator/reify-laptop.yaml (read 2026-10-22) with only the
+# changes a pod forces. reify_gate.sh substitutes @PROJECT_ROOT@.
+#   verify_use_cgroup_scope: false   no systemd user session on a pod (the
+#                                    laptop runs each leg in a MemoryMax=32G scope)
+# Everything else is the laptop's, persistent_merge_worktree included: the
+# laptop's gate reuses _merge-verify's target/ from its previous gate, and the
+# bench reproduces that by running the cold gate at the laptop's previous gated
+# merge and the warm gate at REIFY_SHA in the same retained worktree.
+project_root: "@PROJECT_ROOT@"
+
+test_command: "./scripts/verify.sh test --scope branch --include-infra"
+lint_command: "./scripts/verify.sh lint --scope branch --include-infra"
+type_check_command: "true"
+concurrent_verify: false
+verify_use_cgroup_scope: false
+
+verify_env:
+  REIFY_RUN_ALL_EXCLUDE_HOST_INFRA: "1"
+  REIFY_GATE_EXCLUDE_HEAVY: "1"
+  RUSTC_WRAPPER: sccache
+  CARGO_INCREMENTAL: "0"
+  REIFY_BUILD_CACHE_ARM: sccache
+
+git:
+  persistent_merge_worktree: true
+  main_branch: "main"
+  branch_prefix: "task/"
+  remote: "workstation"
+  worktree_dir: ".worktrees"
+
+fused_memory:
+  url: "http://127.0.0.1:8002"
+  project_id: "reify"
+  server_command: []
+
+escalation:
+  queue_dir: "data/escalations"
+  port: 8100

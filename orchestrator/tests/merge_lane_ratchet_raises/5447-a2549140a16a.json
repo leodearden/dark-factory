@@ -1,0 +1,66 @@
+{
+  "task_id": "5447",
+  "reason": "merge main (task 5371 restart-drain) into task/5447: re-absorbs 5447's own net-additive observation -- VerifyBaseFacts on types.py and its publication on snapshot()['entries'][*]['verify_base'] from _run_inflight_verify -- on top of 5371's baseline; the raises are exactly 5447's recorded deltas replayed over main, no new production behaviour",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 65,
+      "current": 66
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2189,
+      "current": 2192
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_run_inflight_verify",
+      "baseline": 101,
+      "current": 102
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::snapshot",
+      "baseline": 59,
+      "current": 61
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1786,
+      "current": 1827
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22055,
+      "current": 22057
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 941,
+      "current": 962
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4823,
+      "current": 4827
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57293,
+      "current": 57336
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31934,
+      "current": 31946
+    }
+  ]
+}

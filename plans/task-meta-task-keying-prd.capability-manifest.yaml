@@ -190,3 +190,5 @@ tasks:
       kind: manual
       reason: the task IS the check suite; its signal is the green B1-B9 matrix, in
         particular B2's zero-architect-invocation assertion
+signal_leaves:
+- ω

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import gzip
+import json
+from urllib.parse import urlsplit
+
 import pytest
 
 # Skip entire module when aiohttp is not installed (optional [vllm] extra)
@@ -546,6 +550,31 @@ async def mock_upstream_truncated_json():
     await runner.cleanup()
 
 
+@pytest.fixture
+async def mock_upstream_header_capture():
+    """Start a mock upstream that records every request's method, path and headers.
+
+    Header names are lower-cased on capture so a lookup cannot miss on case alone.
+    """
+    app = web.Application()
+    received: list[tuple[str, str, dict[str, str]]] = []
+
+    async def handler(request):
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        received.append((request.method, request.path, headers))
+        return web.json_response({'role': 'assistant', 'content': [], 'stop_reason': 'end_turn'})
+
+    app.router.add_route('*', '/{tail:.*}', handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    port = _site_port(site)
+    url = f'http://127.0.0.1:{port}'
+    yield url, received
+    await runner.cleanup()
+
+
 @pytest.mark.asyncio
 class TestVllmBridgeIntegration:
 
@@ -641,3 +670,77 @@ class TestVllmBridgeIntegration:
             assert resp.status == 200
             body = await resp.read()
             assert body == b'{"role": "assistant", "content":'
+
+
+_BRIDGE_REQUEST_PATHS = pytest.mark.parametrize(
+    'path',
+    [
+        pytest.param('/v1/messages', id='messages-handler'),
+        pytest.param('/v1/messages/count_tokens', id='catchall-proxy'),
+    ],
+)
+
+
+_MESSAGES_JSON = json.dumps({'model': 'x', 'messages': []}).encode()
+
+
+async def _post_through_bridge(upstream_url, path, headers, data=_MESSAGES_JSON):
+    async with (
+        VllmBridge(upstream_url=upstream_url) as bridge,
+        aiohttp.ClientSession() as session,
+        session.post(
+            bridge.url + path,
+            data=data,
+            headers={'Content-Type': 'application/json', **headers},
+        ) as resp,
+    ):
+        assert resp.status == 200
+        return bridge.url
+
+
+def _only_request_to(received, path):
+    matching = [headers for _method, req_path, headers in received if req_path == path]
+    assert len(matching) == 1, f'expected one upstream request to {path}, got {received!r}'
+    return matching[0]
+
+
+@pytest.mark.asyncio
+class TestVllmBridgeUpstreamHeaders:
+
+    @_BRIDGE_REQUEST_PATHS
+    async def test_upstream_sees_its_own_host(self, mock_upstream_header_capture, path):
+        """The upstream receives its own netloc as Host, not the bridge's loopback one."""
+        upstream_url, received = mock_upstream_header_capture
+        bridge_url = await _post_through_bridge(upstream_url, path, {'x-api-key': 'test-key'})
+
+        upstream_headers = _only_request_to(received, path)
+        assert upstream_headers['host'] == urlsplit(upstream_url).netloc
+        assert upstream_headers['host'] != urlsplit(bridge_url).netloc
+        assert upstream_headers['x-api-key'] == 'test-key'
+
+    @_BRIDGE_REQUEST_PATHS
+    async def test_client_accept_encoding_is_not_forwarded(
+        self, mock_upstream_header_capture, path
+    ):
+        """The client's Accept-Encoding offer stays on the client-to-bridge hop."""
+        upstream_url, received = mock_upstream_header_capture
+        coding_no_aiohttp_build_decodes = 'x-test-sentinel'
+        await _post_through_bridge(
+            upstream_url, path, {'Accept-Encoding': coding_no_aiohttp_build_decodes}
+        )
+
+        upstream_headers = _only_request_to(received, path)
+        assert coding_no_aiohttp_build_decodes not in upstream_headers.get('accept-encoding', '')
+
+    @_BRIDGE_REQUEST_PATHS
+    async def test_client_content_encoding_is_not_forwarded(
+        self, mock_upstream_header_capture, path
+    ):
+        """The bridge forwards the body it decoded, so the client's coding no longer applies."""
+        upstream_url, received = mock_upstream_header_capture
+        await _post_through_bridge(
+            upstream_url, path, {'Content-Encoding': 'gzip'}, data=gzip.compress(_MESSAGES_JSON)
+        )
+
+        upstream_headers = _only_request_to(received, path)
+        assert 'content-encoding' not in upstream_headers

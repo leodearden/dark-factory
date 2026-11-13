@@ -22,13 +22,12 @@ import contextlib
 import logging
 import os
 import signal
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
-from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
+from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid, wait_pid_gone
 from pydantic import ValidationError
 from shared.delivered_check_polarity import (
     CheckOutcome,
@@ -36,7 +35,6 @@ from shared.delivered_check_polarity import (
     build_path_argv,
     interpret_grep_rc,
 )
-from shared.proc_group import read_stat_fields
 
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
@@ -56,6 +54,19 @@ from orchestrator.scheduler import (
     _build_delivered_check_escalation,
     _delivered_checks_descriptor_digest,
 )
+
+
+def _gate_on_config(max_per_module: int) -> OrchestratorConfig:
+    """A config with the delivered-checks gate pinned ON.
+
+    For tests about gate BEHAVIOUR.  The flag's default is
+    ``TestDeliveredChecksConfig::test_default_enabled_is_true``'s claim; every
+    other key still reads the operational config.
+    """
+    config = OrchestratorConfig(max_per_module=max_per_module)
+    config.delivered_checks.enabled = True
+    return config
+
 
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
@@ -421,7 +432,9 @@ class TestRunnerScriptKind:
         try:
             leaked_pid = await asyncio.to_thread(read_leaked_pid, pidfile)
 
-            assert await _wait_pid_exited(leaked_pid, timeout=check['timeout_secs'] + 5.0), (
+            assert await asyncio.to_thread(
+                wait_pid_gone, leaked_pid, timeout=check['timeout_secs'] + 5.0
+            ), (
                 f'pid {leaked_pid}, a helper the script backgrounded, survived its timeout'
             )
             assert await task is DeliveredCheckResult.ERRORED
@@ -430,22 +443,6 @@ class TestRunnerScriptKind:
             if leaked_pid is not None:
                 with contextlib.suppress(OSError):
                     os.kill(leaked_pid, signal.SIGKILL)
-
-
-async def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
-    """Poll until *pid* is gone or a zombie; False if still running at *timeout*.
-
-    A zombie counts as exited: an orphaned grandchild of a killed group awaits
-    systemd --user's reap, which is not the runner's to perform (task 6029).
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        fields = read_stat_fields(Path('/proc') / str(pid))
-        if fields is None or fields.state in ('Z', 'X'):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        await asyncio.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -1333,7 +1330,7 @@ class TestPhaseBackfillTerminalDepRecords:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         scheduler = Scheduler(config)
         scheduler.finish_startup()
         return scheduler
@@ -1367,22 +1364,25 @@ class TestPhaseBackfillTerminalDepRecords:
         scheduler.get_task.assert_awaited_once_with('20')
         assert ctx.terminal_dep_records == {'20': fetched}
 
-    # --- (b) kill switch: delivered_checks.enabled=False -> no fetch -------
+    # --- (b) delivered_checks.enabled=False -> still fetched ---------------
 
     @pytest.mark.asyncio
-    async def test_disabled_kill_switch_skips_fetch(self, scheduler: Scheduler):
+    async def test_disabled_delivered_checks_still_backfills_records(self, scheduler: Scheduler):
+        """The records also feed the scheduled-deploy hold, so the delivered-check
+        kill switch does not switch the backfill off."""
         scheduler.config.delivered_checks.enabled = False
         dependent = self._dependent()
         ctx = TickContext(
             tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
         )
-        scheduler.get_task = AsyncMock(return_value={'id': '20'})
+        fetched = {'id': '20', 'status': 'done', 'metadata': {}}
+        scheduler.get_task = AsyncMock(return_value=fetched)
 
         result = await scheduler._phase_backfill_terminal_dep_records(ctx)
 
         assert result is _CONTINUE
-        scheduler.get_task.assert_not_awaited()
-        assert ctx.terminal_dep_records == {}
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records == {'20': fetched}
 
     # --- (c) dep already in tasks_by_id -> not "missing", no fetch ---------
 
@@ -1612,6 +1612,169 @@ class TestPhaseBackfillTerminalDepRecords:
         assert scheduler._terminal_dep_record_cache['21'] == stale_record
 
 
+    # --- (k) a held scheduled self-deploy record is mutable until verified ---
+
+    @staticmethod
+    def _scheduled_deploy_record(dep_id: str, phase: str) -> dict:
+        return {
+            'id': dep_id,
+            'status': 'done',
+            'metadata': {
+                'done_provenance': {
+                    'kind': 'deterministic-deploy-scheduled',
+                    'unit': 'orchestrator-dark-factory.service',
+                    'transient_unit': f'orch-redeploy-restart-{dep_id}.service',
+                    'fire_delay_secs': 60,
+                },
+                'deploy_state': {'phase': phase},
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_warmed_record_awaiting_scheduled_restart_is_refetched(
+        self, scheduler: Scheduler
+    ):
+        scheduler._terminal_dep_record_cache['20'] = self._scheduled_deploy_record(
+            '20', 'scheduled'
+        )
+        verified = self._scheduled_deploy_record('20', 'verified')
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
+        )
+        scheduler.get_task = AsyncMock(return_value=verified)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records['20'] == verified
+        assert scheduler._terminal_dep_record_cache['20'] == verified
+
+    @pytest.mark.asyncio
+    async def test_budget_prioritizes_held_revalidation_over_new_dep(
+        self, scheduler: Scheduler
+    ):
+        """A deferred held record would fail open, so it outranks a new dep_id
+        (which only waits a tick).  '21' < '29' so plain sort would pick the new
+        dep first."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler._terminal_dep_record_cache['29'] = self._scheduled_deploy_record(
+            '29', 'scheduled'
+        )
+        task_a = self._dependent(task_id='10', dep_id='29')  # held re-validation
+        task_b = self._dependent(task_id='11', dep_id='21')  # never cached
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'21': 'done', '29': 'done'},
+            tasks_by_id={'10': task_a, '11': task_b},
+        )
+        still_held = self._scheduled_deploy_record('29', 'scheduled')
+        scheduler.get_task = AsyncMock(return_value=still_held)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('29')
+        assert ctx.terminal_dep_records == {'29': still_held}
+
+    # --- (l) a held record survives a failed or deferred re-fetch ----------
+
+    def _held_ctx(self, scheduler: Scheduler) -> tuple[TickContext, dict]:
+        held = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler._terminal_dep_record_cache['20'] = held
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
+        )
+        return ctx, held
+
+    @pytest.mark.asyncio
+    async def test_held_record_is_still_served_when_its_refetch_returns_none(
+        self, scheduler: Scheduler, caplog
+    ):
+        ctx, held = self._held_ctx(scheduler)
+        scheduler.get_task = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        assert ctx.terminal_dep_records['20'] == held
+        assert scheduler._terminal_dep_record_cache['20'] == held
+        assert any(
+            'hold retained' in r.getMessage() and '20' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test_held_record_is_still_served_when_its_refetch_raises(
+        self, scheduler: Scheduler
+    ):
+        ctx, held = self._held_ctx(scheduler)
+        scheduler.get_task = AsyncMock(side_effect=RuntimeError('fused-memory down'))
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        assert ctx.terminal_dep_records['20'] == held
+
+    @pytest.mark.asyncio
+    async def test_held_record_deferred_by_the_budget_is_still_served(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        held_21 = self._scheduled_deploy_record('21', 'scheduled')
+        scheduler._terminal_dep_record_cache['20'] = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler._terminal_dep_record_cache['21'] = held_21
+        task_a = self._dependent(task_id='10', dep_id='20')
+        task_b = self._dependent(task_id='11', dep_id='21')
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'20': 'done', '21': 'done'},
+            tasks_by_id={'10': task_a, '11': task_b},
+        )
+        still_held_20 = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler.get_task = AsyncMock(return_value=still_held_20)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records == {'20': still_held_20, '21': held_21}
+        assert ctx.deferred_terminal_deps == frozenset()
+
+    # --- (m) a never-cached dep deferred by the budget is named on ctx -----
+
+    @pytest.mark.asyncio
+    async def test_only_a_never_cached_dep_deferred_by_the_budget_is_named_on_ctx(
+        self, scheduler: Scheduler
+    ):
+        """A deferred dep with no record would fail open; the scheduled-deploy
+        arm waits on it instead.  A deferred re-validation keeps its cached,
+        known-unheld record, so it is not named."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler._terminal_dep_record_cache['22'] = {
+            'id': '22',
+            'status': 'done',
+            'metadata': {'delivered_checks': [{'kind': 'grep', 'name': 'c', 'pattern': 'P'}]},
+        }
+        dependents = [
+            self._dependent(task_id=task_id, dep_id=dep_id)
+            for task_id, dep_id in (('10', '20'), ('11', '21'), ('12', '22'))
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '21': 'done', '22': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20', 'status': 'done', 'metadata': {}})
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.deferred_terminal_deps == frozenset({'21'})
+
+
 # ---------------------------------------------------------------------------
 # TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
@@ -1647,6 +1810,7 @@ class TestDeliveredChecksConfig:
     sub-model.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_max_checks_per_tick_is_50(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.max_checks_per_tick == 50
@@ -1666,12 +1830,14 @@ class TestDeliveredChecksConfig:
 
     # --- task 2583 (epsilon) knobs: enabled / grace_cycles / check_timeout_secs -
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_enabled_is_true(self):
         """The gate is inert without metadata.delivered_checks on any dep, so
         it defaults ON — an operator must opt OUT explicitly."""
         config = OrchestratorConfig()
         assert config.delivered_checks.enabled is True
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_grace_cycles_is_3(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.grace_cycles == 3
@@ -1684,6 +1850,7 @@ class TestDeliveredChecksConfig:
         with pytest.raises(ValidationError):
             DeliveredChecksConfig(grace_cycles=-1)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_check_timeout_secs_is_120(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.check_timeout_secs == 120
@@ -1721,7 +1888,7 @@ class TestDeliveredCheckGateEnabledSwitch:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -1788,7 +1955,7 @@ class TestBuildDeliveredCheckEscalation:
         assert 'src/' in detail
         assert 'present' in detail
         assert 'FAILED' in detail
-        assert 'set task 10 back to pending' in detail
+        assert detail.splitlines()[-1] == 'observed: FAILED'
 
     def test_script_kind_detail_names_script_and_args_not_pattern(self):
         check = {
@@ -1817,7 +1984,7 @@ class TestBuildDeliveredCheckEscalation:
         assert 'exit_zero' in detail
         assert 'FAILED' in detail
         assert 'pattern' not in detail, 'script-kind detail must not mention pattern'
-        assert 'set task 11 back to pending' in detail
+        assert detail.splitlines()[-1] == 'observed: FAILED'
 
     def test_path_kind_detail_names_paths_and_expect_not_pattern(self):
         """A path descriptor has no ``pattern``; the binary that used to
@@ -2926,7 +3093,7 @@ class TestDeliveredCheckGraceEscalation:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         config.delivered_checks.grace_cycles = 3
         scheduler = Scheduler(
             config,
@@ -3009,6 +3176,14 @@ class TestDeliveredCheckGraceEscalation:
         assert 'cap-one' in call_kwargs['summary']
         assert '20' in call_kwargs['summary']
         assert 'sha1' in call_kwargs['summary']
+        # The scheduler hands over the failed descriptor and the DEPENDENCY
+        # (not the blocked dependent) as the check's owner.
+        assert call_kwargs['check'] == dep['metadata']['delivered_checks'][0]
+        assert call_kwargs['owner'] == {
+            'task_id': '20',
+            'check_name': 'cap-one',
+            'sidecar': None,
+        }
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
         # No held event on the escalation (3rd) tick — only ticks 1 and 2.
         assert len(self._held_events(scheduler)) == 2
@@ -3241,7 +3416,7 @@ class TestAcquireNextDeliveredGate:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=2)
+        config = _gate_on_config(max_per_module=2)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -3432,7 +3607,7 @@ class TestAcquireNextDeliveredGateRealFilteredFetch:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=2)
+        config = _gate_on_config(max_per_module=2)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler

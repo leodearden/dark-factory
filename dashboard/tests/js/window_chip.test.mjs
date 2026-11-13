@@ -3,10 +3,11 @@
 // served-window echo each reports, and how a served window is labelled and
 // highlighted (app.jsx's Toolbar wiring and tabs.jsx's panel headers).
 //
-// THE VOCABULARIES ARE SPELLED ONCE HERE, as literals, because the two sets are
-// the decision under test: they mirror dashboard/src/dashboard/api/window.py::_WINDOW_DAYS
-// and dashboard/src/dashboard/api/burndown.py::_BURNDOWN_WINDOWS. The server's
-// half is pinned by tests/test_app.py's _parse_window tests.
+// THE VOCABULARIES ARE SPELLED ONCE HERE, as literals, because the sets are
+// the decision under test: they mirror dashboard/src/dashboard/api/window.py::_WINDOW_DAYS,
+// dashboard/src/dashboard/api/burndown.py::_BURNDOWN_WINDOWS and
+// dashboard/src/dashboard/api/quality.py::_QUALITY_WINDOWS. The server's half
+// is pinned by tests/test_app.py's _parse_window tests.
 //
 // LOADED THROUGH A WINDOW SHIM, in index.html's order: window_chip.js
 // destructures window.DF_DATUM at module scope with no fallback, and datum.js
@@ -39,9 +40,11 @@ const { api: chip, window: loadedWindow } = loadWindowChip();
 const {
   WINDOW_SETS,
   DEFAULT_WINDOW,
+  LANDING_DEFAULT_WINDOW,
   TAB_WINDOWS,
   windowForTab,
   windowEcho,
+  receiptWindow,
   windowLabel,
   highlightedWindow,
   pendingWindow,
@@ -51,6 +54,7 @@ const { EM_DASH } = loadedWindow.DF_DATUM;
 
 const STANDARD = ['24h', '7d', '30d', 'all'];
 const BURNDOWN = ['24h', '7d', '30d', '90d'];
+const LANDINGS = ['100', '300', 'all'];
 const COSTS_PATH = '/api/v2/dashboard/costs';
 const PERFORMANCE_PATH = '/api/v2/dashboard/performance';
 const MERGE_QUEUE_PATH = '/api/v2/dashboard/merge-queue';
@@ -59,6 +63,9 @@ const BURNDOWN_PATH = '/api/v2/dashboard/burndown';
 const HONOURED_7D = Object.freeze({ requested: '7d', served: '7d', days: 7 });
 const HONOURED_24H = Object.freeze({ requested: '24h', served: '24h', days: 1 });
 const DECLINED_90D = Object.freeze({ requested: '90d', served: '30d', days: 30 });
+const HONOURED_100 = Object.freeze({ requested: '100', served: '100', landings: 100 });
+const HONOURED_ALL_LANDINGS = Object.freeze({ requested: 'all', served: 'all', landings: null });
+const DECLINED_50 = Object.freeze({ requested: '50', served: '100', landings: 100 });
 
 // ---------------------------------------------------------------------------
 // (a) the tables
@@ -67,10 +74,12 @@ const DECLINED_90D = Object.freeze({ requested: '90d', served: '30d', days: 30 }
 test('exports: the module publishes exactly its API, on module.exports and window.DF_WINDOW_CHIP', () => {
   assert.deepEqual(Object.keys(chip).sort(), [
     'DEFAULT_WINDOW',
+    'LANDING_DEFAULT_WINDOW',
     'TAB_WINDOWS',
     'WINDOW_SETS',
     'highlightedWindow',
     'pendingWindow',
+    'receiptWindow',
     'recentMergesCaption',
     'windowEcho',
     'windowForTab',
@@ -79,16 +88,22 @@ test('exports: the module publishes exactly its API, on module.exports and windo
   assert.equal(loadedWindow.DF_WINDOW_CHIP, chip);
 });
 
-test('WINDOW_SETS: the standard and burndown vocabularies, in chip order', () => {
-  assert.deepEqual(Object.keys(WINDOW_SETS).sort(), ['burndown', 'standard']);
+test('WINDOW_SETS: the standard, burndown and landing vocabularies, in chip order', () => {
+  assert.deepEqual(Object.keys(WINDOW_SETS).sort(), ['burndown', 'landings', 'standard']);
   assert.deepEqual([...WINDOW_SETS.standard], STANDARD);
   assert.deepEqual([...WINDOW_SETS.burndown], BURNDOWN);
+  assert.deepEqual([...WINDOW_SETS.landings], LANDINGS);
 });
 
-test('DEFAULT_WINDOW is a member of every set, so a reset always lands on a servable window', () => {
-  for (const [name, windows] of Object.entries(WINDOW_SETS)) {
-    assert.ok(windows.includes(DEFAULT_WINDOW), `DEFAULT_WINDOW ${DEFAULT_WINDOW} is not in ${name}`);
+test('DEFAULT_WINDOW is a member of every day set, so a reset always lands on a servable window', () => {
+  for (const name of ['standard', 'burndown']) {
+    assert.ok(WINDOW_SETS[name].includes(DEFAULT_WINDOW), `DEFAULT_WINDOW ${DEFAULT_WINDOW} is not in ${name}`);
   }
+});
+
+test('LANDING_DEFAULT_WINDOW is the quality route\'s own default, a member of the landing set', () => {
+  assert.equal(LANDING_DEFAULT_WINDOW, '100');
+  assert.ok(WINDOW_SETS.landings.includes(LANDING_DEFAULT_WINDOW));
 });
 
 test('the tables are frozen', () => {
@@ -148,6 +163,11 @@ test('windowForTab: esc-analytics owns its own 7d/28d toggle, not the global chi
   for (const w of ['24h', '90d', 'all']) assert.equal(windowForTab('esc-analytics', w), w);
 });
 
+test('windowForTab: the quality tab owns its own landing-window selector, not the global chip', () => {
+  assert.equal(Object.hasOwn(TAB_WINDOWS, 'quality'), false);
+  for (const w of ['24h', '90d', 'all', '100', '300']) assert.equal(windowForTab('quality', w), w);
+});
+
 // ---------------------------------------------------------------------------
 // (c) windowEcho — the validated echo from a receipt
 // ---------------------------------------------------------------------------
@@ -175,6 +195,38 @@ test('windowEcho: null for a missing receipt, a missing window, or a malformed o
   }
 });
 
+test('windowEcho: accepts a landing echo, its landings finite or null', () => {
+  const receipts = {
+    a: { servedAt: 'S', receivedAt: 1, window: DECLINED_50 },
+    b: { servedAt: 'S', receivedAt: 1, window: HONOURED_ALL_LANDINGS },
+  };
+  assert.deepEqual(windowEcho(receipts, 'a'), DECLINED_50);
+  assert.deepEqual(windowEcho(receipts, 'b'), HONOURED_ALL_LANDINGS);
+});
+
+test('receiptWindow: the validated echo of one receipt, day or landing', () => {
+  const receipt = window => ({ servedAt: 'S', receivedAt: 1, window });
+  assert.deepEqual(receiptWindow(receipt(HONOURED_100)), HONOURED_100);
+  assert.deepEqual(receiptWindow(receipt(HONOURED_ALL_LANDINGS)), HONOURED_ALL_LANDINGS);
+  assert.deepEqual(receiptWindow(receipt(DECLINED_90D)), DECLINED_90D, 'a day echo is returned unchanged');
+});
+
+test('receiptWindow: null for a missing receipt or a missing or malformed echo', () => {
+  const receipt = window => ({ servedAt: 'S', receivedAt: 1, window });
+  assert.equal(receiptWindow(undefined), null);
+  assert.equal(receiptWindow(null), null);
+  assert.equal(receiptWindow({ servedAt: 'S', receivedAt: 1 }), null);
+  for (const bad of [
+    { requested: '100', served: 100, landings: 100 },
+    { requested: '100', served: '100', landings: '100' },
+    { requested: '100', served: '100', landings: Number.NaN },
+    { requested: '100', served: '100' },
+    { requested: '100', served: '100', landings: undefined },
+  ]) {
+    assert.equal(receiptWindow(receipt(bad)), null, JSON.stringify(bad));
+  }
+});
+
 // ---------------------------------------------------------------------------
 // (d) windowLabel
 // ---------------------------------------------------------------------------
@@ -185,6 +237,14 @@ test('windowLabel: an honoured window reads as itself', () => {
 
 test('windowLabel: a declined window names what was served and what was not available (sketch #8)', () => {
   assert.equal(windowLabel(DECLINED_90D), '30d (90d not available)');
+  assert.equal(windowLabel(DECLINED_50), '100 (50 not available)');
+});
+
+test('highlightedWindow and pendingWindow work over the landing set', () => {
+  assert.equal(highlightedWindow(HONOURED_100, WINDOW_SETS.landings), '100');
+  assert.equal(highlightedWindow(DECLINED_50, WINDOW_SETS.landings), null);
+  assert.equal(pendingWindow('300', HONOURED_100, WINDOW_SETS.landings), '300');
+  assert.equal(pendingWindow('100', HONOURED_100, WINDOW_SETS.landings), null);
 });
 
 test('windowLabel: nothing served yet reads as the one placeholder', () => {

@@ -12,9 +12,9 @@ import ast
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# Whole-tree scanner: see WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py and
+# Whole-tree scanner: see shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -47,13 +47,11 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_item_union.py',
     'test_merge_lane_package.py',
     'test_merge_queue_bounce.py',
-    'test_merge_queue_build_chain.py',
     'test_merge_queue_c3_submit_identity.py',
     'test_merge_queue_chain_intact.py',
     'test_merge_queue_coalesce.py',
     'test_merge_queue_concurrent_verify.py',
     'test_merge_queue_conflict_graph.py',
-    'test_merge_queue_deep_dispatch.py',
     'test_merge_queue_depth_telemetry.py',
     'test_merge_queue_dry_run_unblock.py',
     'test_merge_queue_duplicate_submission.py',
@@ -95,7 +93,7 @@ _NOT_YET_MIGRATED = frozenset({
     'test_rebase_verify_cost.py',
     'test_reconcile_done_step_commits.py',
     'test_remove_merge_worktree_guarded.py',
-    'test_session_hooks.py',
+    'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
     'test_substrate_gate.py',
     'test_suffix_conflict_tracker.py',

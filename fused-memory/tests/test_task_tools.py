@@ -10,8 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _TOOLS_LOGGER = 'fused_memory.server.tools'
 
@@ -419,7 +422,7 @@ async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
     key; dropping done_provenance is refused with the same canonical dict the
     interceptor returns. Metadata is sent as a dict, so the tool's own
     json.dumps coercion is on the path."""
-    from _fm_helpers import _init_git_repo
+    from _fm_git_repos import _init_git_repo
 
     from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
     from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
@@ -472,6 +475,99 @@ async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
     assert 'stale_key' not in task['metadata']
     assert task['metadata']['done_provenance'] == stamped['done_provenance']
     assert task['metadata']['files'] == ['x.py']
+
+
+async def _seed_task_with_done_provenance(interceptor, root: str) -> dict:
+    """Add task 1 carrying a done_provenance and return its stored metadata."""
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T',
+        metadata=json.dumps({
+            'done_provenance': {'kind': 'merged', 'commit': 'a' * 40},
+            'files': ['x.py'],
+        }),
+    )
+    return (await interceptor.get_task('1', root))['metadata']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [('not json{', 'invalid_json'), ('"bare"', 'string'), ('7', 'number')],
+)
+async def test_update_task_non_object_metadata_rejection_byte_identical_across_surfaces(
+    real_task_stack, tmp_path, payload, received,
+):
+    """A metadata payload that is not a JSON object is refused with the same
+    canonical dict through the MCP tool and the interceptor, and the stored
+    blob, done_provenance included, is left untouched (task 6130).
+
+    The payloads are ones FastMCP's argument pre-parse hands to the tool body
+    as strings; '[]' and 'null' are decoded before the tool runs and are
+    pinned separately below."""
+    from fused_memory.backends.task_backend_errors import metadata_not_an_object_error
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    before = await _seed_task_with_done_provenance(interceptor, root)
+
+    dict_tools = await server._tool_manager.call_tool(
+        'update_task', {'id': '1', 'project_root': root, 'metadata': payload},
+    )
+    dict_interceptor = await interceptor.update_task(
+        '1', root, metadata=payload, metadata_mode='replace',
+    )
+
+    expected = metadata_not_an_object_error('1', received)
+    assert dict_tools == expected, f'tools.py surface diverged from canonical shape: {dict_tools}'
+    assert dict_interceptor == expected, (
+        f'interceptor surface diverged from canonical shape: {dict_interceptor}'
+    )
+    assert interceptor_write_succeeded(dict_tools) is False
+    assert interceptor_write_succeeded(dict_interceptor) is False
+    assert (await interceptor.get_task('1', root))['metadata'] == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', ['[]', '["a"]'])
+async def test_update_task_array_metadata_fails_mcp_argument_validation(
+    real_task_stack, tmp_path, payload,
+):
+    """'[]' is the payload that wiped done_provenance in the original bug
+    (task 6130). Through the MCP tool, FastMCP's argument pre-parse decodes it
+    to a list, which fails argument validation before the tool body runs, and
+    the stored blob, done_provenance included, is left untouched."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    before = await _seed_task_with_done_provenance(interceptor, root)
+
+    with pytest.raises(ToolError, match=r'validation errors? for update_taskArguments\nmetadata\.'):
+        await server._tool_manager.call_tool(
+            'update_task', {'id': '1', 'project_root': root, 'metadata': payload},
+        )
+    assert (await interceptor.get_task('1', root))['metadata'] == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
+    real_task_stack, tmp_path,
+):
+    """Through the MCP tool, a 'null' metadata payload is decoded to an
+    omitted metadata argument (task 6130): the call writes no metadata, so the
+    stored blob, done_provenance included, is left untouched. With no other
+    field it is a fieldless call, which task 4867 refuses instead of
+    reporting a success that wrote nothing."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    before = await _seed_task_with_done_provenance(interceptor, root)
+
+    result = await server._tool_manager.call_tool(
+        'update_task', {'id': '1', 'project_root': root, 'metadata': 'null'},
+    )
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
+    assert (await interceptor.get_task('1', root))['metadata'] == before
 
 
 @pytest.mark.asyncio
@@ -683,6 +779,36 @@ async def test_update_task_status_none_still_allowed(
     task_interceptor.update_task.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'ignored_arguments',
+    [{}, {'append': True}, {'metadata_mode': 'merge'}, {'tag': 'master'}],
+    ids=['bare', 'append-only', 'metadata_mode-only', 'tag-only'],
+)
+async def test_update_task_with_no_mutating_field_returns_typed_error(
+    real_task_stack, tmp_path, ignored_arguments,
+):
+    """Task 4867: a fieldless update_task reports failure, never ``updated``.
+
+    esc-3147-7 and esc-3671-7 came from a misnamed ``metadata`` argument being
+    dropped, so the call wrote nothing and still reported success. The
+    refusal reaches callers as the same ``error_type`` dict every other raw
+    backend refusal uses, through the real tool, interceptor and backend. No
+    task is created: the refusal is a floor that precedes the row lookup.
+    """
+    server, _interceptor = real_task_stack
+
+    result = await server._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': str(tmp_path), **ignored_arguments},
+    )
+
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
+    assert result['error'].startswith('TASKMASTER_TOOL_ERROR: '), result
+    assert 'metadata' in result['error'], result
+    assert 'updated' not in result, result
+
+
 # ------------------------------------------------------------------
 # Defensive tool registration (always registered, even without Taskmaster)
 # ------------------------------------------------------------------
@@ -823,6 +949,9 @@ async def test_set_task_status_accepts_merge_deferred(
         reopen_reason=None,
         agent_id=None,
         client_op_id=None,
+        deferral=None,
+        expected_stamped_at=None,
+        restamp_only=False,
     )
 
 
@@ -1721,7 +1850,7 @@ async def test_resolve_ticket_idempotent_passthrough_strips_whitespace(
 
     The MCP wire schema enforces ``ticket: str``, so int passthrough is
     only meaningful at the interceptor layer; it's covered by the
-    ``_looks_like_task_id`` unit tests in test_task_interceptor.py.
+    ``looks_like_task_id`` unit tests in shared/tests/test_task_submit.py.
     """
     from unittest.mock import AsyncMock
     task_interceptor.resolve_ticket = AsyncMock()
@@ -2396,12 +2525,13 @@ async def test_submit_task_accepts_none_metadata(
 # ---------------------------------------------------------------------------
 
 
-async def _seed_modules_carrier(interceptor, root):
+async def _seed_modules_carrier(interceptor, root, status='pending'):
     """Write a historical carrier straight through the backend, bypassing the
     submit-time guard exactly as every pre-retirement record did."""
     added = await interceptor.taskmaster.add_task(
         project_root=root, title='Legacy carrier',
         metadata=json.dumps({'files': ['src/a.py'], 'modules': ['src']}),
+        status=status,
     )
     return added['id']
 
@@ -2518,9 +2648,7 @@ async def test_commit_planning_of_modules_carrier_is_not_rejected_by_retired_key
     existing rows and mints no new carrier."""
     server, interceptor = real_task_stack
     root = str(tmp_path)
-    task_id = await _seed_modules_carrier(interceptor, root)
-    deferred = await interceptor.set_task_status(task_id, 'deferred', root)
-    assert 'error' not in deferred, deferred
+    task_id = await _seed_modules_carrier(interceptor, root, status='deferred')
 
     result = await server._tool_manager.call_tool(
         'commit_planning', {'project_root': root, 'task_ids': task_id},
@@ -2528,6 +2656,102 @@ async def test_commit_planning_of_modules_carrier_is_not_rejected_by_retired_key
 
     assert 'error' not in result, result
     assert await interceptor.get_statuses(root, ids=[task_id]) == {task_id: 'pending'}
+
+
+# ---------------------------------------------------------------------------
+# Simple-task files guard δ — simple_task_files_error at the MCP boundary (task 4524)
+#
+# The unit matrix lives in test_simple_task_files_guard.py. These drive the
+# REAL stack: a complexity='simple' submission with no declared files is
+# rejected on both creation paths and persists nothing, while declaring files
+# (or not declaring simple) is accepted. Paths are UNOWNED by any project
+# prefix so the interceptor's path-scope guard never answers first.
+# ---------------------------------------------------------------------------
+
+
+async def _submit_simple_shaped(server, root, planning_mode, metadata):
+    """Submit the one payload the δ tests share, varying only metadata."""
+    return await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Rename widget helper',
+            'description': 'Rename the widget helper for clarity',
+            'planning_mode': planning_mode,
+            'metadata': metadata,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [{'complexity': 'simple'}, {'complexity': 'simple', 'files': []}, {'complexity': ' Simple '}],
+    ids=['files-absent', 'files-empty', 'non-canonical-spelling'],
+)
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_simple_without_files_returns_simple_task_files_error(
+    planning_mode, encode, metadata, real_task_stack, tmp_path,
+):
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert result.get('error_type') == 'SimpleTaskFilesRequired', f'got {result!r}'
+    assert result['required_key'] == 'files'
+    assert result['error']
+    assert result['hint']
+    assert 'ticket' not in result
+    assert 'task_id' not in result
+    assert await interceptor.get_statuses(root) == {}
+
+
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_simple_with_files_succeeds(
+    planning_mode, encode, real_task_stack, tmp_path,
+):
+    """Paired positive: the rejected payload plus ``files`` is accepted, so
+    declaring the files is the whole fix."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    metadata = {'complexity': 'simple', 'files': ['widget/src/widget/app.py']}
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+        persisted = (await interceptor.get_task(result['task_id'], root))['metadata']
+        assert persisted['complexity'] == 'simple'
+        assert persisted['files'] == metadata['files']
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
+
+
+@pytest.mark.parametrize(
+    'metadata', [{'complexity': 'full'}, {}], ids=['full', 'no-complexity'],
+)
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_non_simple_without_files_is_not_rejected_by_simple_task_files_error(
+    planning_mode, encode, metadata, real_task_stack, tmp_path,
+):
+    """A fileless full-path task stays legal: its architect derives scope."""
+    server, _ = real_task_stack
+    root = str(tmp_path)
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
 
 
 # ---------------------------------------------------------------------------

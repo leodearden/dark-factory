@@ -26,6 +26,9 @@ from pathlib import Path
 import lms_fetch_weights
 import lms_slate_run
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _BACKGROUND_SHELL_TOKENS = ('nohup', 'setsid', 'disown', '&', ';', '|')
 

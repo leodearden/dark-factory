@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from shared.briefing_queries import BriefingQuerySpec, BriefingScope, queries_for
+from shared.mcp_session import is_timeout_failure
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+from shared.project_id import normalize_project_id
 
 from orchestrator.mcp_lifecycle import (
-    is_timeout_failure,
     mcp_call,
     tool_error_text,
     tool_text_blocks,
@@ -42,8 +45,9 @@ stamps the tags this reads; the two are copies, pinned equal by a test.
 GROUPED_CHILD_KEYS = ('amendments', 'matched_children')
 """Where fused-memory nests child bodies inside a kept result's ``grouped`` block.
 
-``group_search_results`` hangs amendment digests under ``amendments`` and
-full swallowed bodies under ``matched_children``. Both render into the
+``group_search_results`` hangs amendment entries under ``amendments``, each
+carrying its text as ``content`` capped at the judge's field cap, and full
+swallowed bodies under ``matched_children``. Both render into the
 ``# Context`` block, so both are filtered and rendered. ``grouped['parent']``
 is absent because only ``get_memory_by_id`` produces it, and recall never
 calls that tool.
@@ -52,7 +56,7 @@ calls that tool.
 CONTESTED_CHILD_KEY = 'contested'
 """The flag fused-memory stamps on a grouped child that contests its parent.
 
-``fused-memory/src/fused_memory/server/grouped_read.py::_digest_entry`` stamps
+``fused-memory/src/fused_memory/server/grouped_read.py::_amendment_entry`` stamps
 it from ``is_contested_child``, the single definition of contested. It is read
 here exactly as stamped (``is True``), never re-derived from the child's own
 ``x_contested`` metadata. A copy rather than an import, because the
@@ -60,17 +64,6 @@ orchestrator has no runtime dependency on fused-memory; the recorded replies
 under ``orchestrator/tests/fixtures/grouped_search_contesting_child/`` pin it
 (see their ``PROVENANCE.md``).
 """
-
-
-def _canonical_project(value: str) -> str:
-    """Canonicalise a project identifier the way fused-memory does.
-
-    Mirrors ``canonicalize_project_id`` (strip, lowercase, ``'-'`` -> ``'_'``)
-    so ``dark-factory`` is not mistaken for a project distinct from
-    ``dark_factory``. Re-implemented because the orchestrator has no runtime
-    dependency on fused-memory.
-    """
-    return value.strip().lower().replace('-', '_')
 
 
 def _result_project(entry: dict) -> tuple[str, str] | None:
@@ -97,7 +90,7 @@ def _foreign_tag(entry: dict, target: str) -> tuple[str, str] | None:
     if match is None:
         return None
     key, tag = match
-    if _canonical_project(tag) == target:
+    if normalize_project_id(tag.strip()) == target:
         return None
     return key, tag
 
@@ -186,7 +179,7 @@ def filter_foreign_project_results(results: Sequence[Any], project_id: str) -> F
     result, or one with non-dict metadata, is kept as untagged. *results* is
     never mutated.
     """
-    target = _canonical_project(project_id)
+    target = normalize_project_id(project_id.strip())
     kept = []
     dropped = 0
     nested_dropped = 0
@@ -253,11 +246,24 @@ def _entry_id(entry: dict) -> str | None:
 
 
 def _entry_text(entry: Any) -> str | None:
-    """What an entry has to read, its ``content`` else its ``digest``; None when blank."""
+    """What an entry has to read, its ``content`` else its ``digest``; None when blank.
+
+    ``content`` is what fused-memory emits since task 7518: an amendment's text
+    capped at the judge's field cap. ``digest`` is the 240-char text a
+    pre-7518 server emits instead, kept so a briefing renders while the two
+    are redeployed at different times.
+    """
     if not isinstance(entry, dict):
         return None
     text = entry.get('content') or entry.get('digest')
     return text if isinstance(text, str) and text.strip() else None
+
+
+def _superseded_by(entry: dict) -> str | None:
+    """The id of the record that superseded *entry*, when its metadata names one."""
+    metadata = entry.get('metadata')
+    mark = metadata.get(SUPERSEDED_BY_METADATA_KEY) if isinstance(metadata, dict) else None
+    return mark if isinstance(mark, str) and mark else None
 
 
 def _memory_bullet(
@@ -265,16 +271,19 @@ def _memory_bullet(
 ) -> str | None:
     """Render one recalled entry as ``- [category · date · store] content``.
 
-    A *label* leads the tag when given. None for an entry with no text: an
-    empty bullet spends tokens announcing something unreadable. Content
-    renders WHOLE, with continuation lines indented so a multi-paragraph
-    memory stays inside its own bullet.
+    A superseded entry's tag opens ``superseded by <id>``, and a *label* leads
+    the tag when given. None for an entry with no text: an empty bullet spends
+    tokens announcing something unreadable. Content renders WHOLE, with
+    continuation lines indented so a multi-paragraph memory stays inside its
+    own bullet.
     """
     text = _entry_text(entry)
     if text is None:
         return None
     body = text.strip().replace('\n', '\n' + indent + '  ')
     tag = f'{_entry_category(entry)} · {_entry_date(entry)} · {store}'
+    if (superseded_by := _superseded_by(entry)) is not None:
+        tag = f'superseded by {superseded_by} · {tag}'
     if label is not None:
         tag = f'{label} · {tag}'
     return f'{indent}- [{tag}] {body}'
@@ -313,9 +322,12 @@ def _contesting_bullet(
 ) -> str | None:
     """Render a child that contests its parent, tagged ``contests its parent``.
 
-    The child's full body is on the wire only as its own top-level hit, so
-    that hit renders, under its own store, when the reply carries one. The
-    child entry itself is the fallback, under its parent's store.
+    When the reply carries the child's own top-level hit, that hit renders,
+    with its whole uncapped body under its own store. Otherwise the grouped
+    entry renders under its parent's store:
+    ``fused-memory/src/fused_memory/server/grouped_read.py::_amendment_entry``
+    gives every amendment entry its text as ``content``, capped at the judge's
+    field cap, and :func:`_entry_text` shows that.
     """
     label = 'contests its parent'
     child_id = _entry_id(child)
@@ -355,9 +367,11 @@ def render_memory_results(results: Sequence[Any]) -> str:
     Each grouped child (:data:`GROUPED_CHILD_KEYS`) renders as a nested bullet
     tagged with its parent's store, since a collapsed child has none of its own.
     A child marked :data:`CONTESTED_CHILD_KEY` renders first under its parent,
-    tagged ``contests its parent``, from its own top-level hit and that hit's
-    store when the reply carries one; that hit is then not rendered again at
-    its own rank.
+    tagged ``contests its parent``, in full: from its own top-level hit and
+    that hit's store when the reply carries one, which is then not rendered
+    again at its own rank, else from the grouped entry's capped ``content``.
+    A superseded entry is tagged ``superseded by <id>`` in place,
+    never dropped or reordered.
     """
     entries = [entry for entry in results if isinstance(entry, dict)]
     hits_by_id: dict[str, dict] = {}
@@ -379,6 +393,15 @@ def render_memory_results(results: Sequence[Any]) -> str:
     return '\n'.join(bullets)
 
 
+ENTITY_BLOCK_MAX_EDGES = 10
+"""The most edge facts one task-entity block renders.
+
+The exact-name ``get_entity`` path returns every connected edge, uncapped.
+"""
+
+ENTITY_EDGES_OMITTED_NOTICE = '_{count} more knowledge-graph fact(s) about **{name}** not shown._'
+
+
 def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
     """Render a ``get_entity`` reply, but ONLY for a node named exactly *expected_name*.
 
@@ -387,6 +410,11 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
     own. Exact-name admission is what makes the channel safe to render. An
     edge's date is best-effort and never required. Returns '' for a missing,
     empty or wrong-named node.
+
+    A fact the summary already says, or one an earlier edge carried, renders
+    once. At most :data:`ENTITY_BLOCK_MAX_EDGES` edge facts render, newest
+    first, and the rest are counted in-block by
+    :data:`ENTITY_EDGES_OMITTED_NOTICE`.
     """
     nodes = payload.get('nodes')
     nodes = nodes if isinstance(nodes, list) else []
@@ -405,13 +433,31 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
         )
         return ''
 
-    summary = node.get('summary')
-    heading = f'**{expected_name}**'
-    if isinstance(summary, str) and summary.strip():
-        heading += f' — {summary.strip()}'
+    raw_summary = node.get('summary')
+    summary = raw_summary.strip() if isinstance(raw_summary, str) else ''
+    heading = f'**{expected_name}** — {summary}' if summary else f'**{expected_name}**'
+    distinct = _newest_distinct_facts(_edge_facts(payload.get('edges')), summary)
+    lines = [heading, *(edge.bullet() for edge in distinct[:ENTITY_BLOCK_MAX_EDGES])]
+    if (omitted := len(distinct) - ENTITY_BLOCK_MAX_EDGES) > 0:
+        lines.append(ENTITY_EDGES_OMITTED_NOTICE.format(count=omitted, name=expected_name))
+    return '\n'.join(lines)
 
-    lines = [heading]
-    edges = payload.get('edges')
+
+@dataclass(frozen=True)
+class _EdgeFact:
+    """One ``get_entity`` edge with a non-blank fact; ``valid_at`` is set only when usably dated."""
+
+    fact: str
+    valid_at: str | None
+
+    def bullet(self) -> str:
+        dated = f' ({self.valid_at[:10]})' if self.valid_at else ''
+        return f'- {self.fact}{dated}'
+
+
+def _edge_facts(edges: Any) -> list[_EdgeFact]:
+    """The reply's renderable edges, in reply order; a non-list *edges* has none."""
+    parsed: list[_EdgeFact] = []
     for edge in edges if isinstance(edges, list) else []:
         if not isinstance(edge, dict):
             continue
@@ -420,9 +466,27 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
             continue
         temporal = edge.get('temporal')
         valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
-        dated = f' ({valid_at[:10]})' if isinstance(valid_at, str) and len(valid_at) >= 10 else ''
-        lines.append(f'- {fact.strip()}{dated}')
-    return '\n'.join(lines)
+        dated = isinstance(valid_at, str) and len(valid_at) >= 10
+        parsed.append(_EdgeFact(fact.strip(), valid_at if dated else None))
+    return parsed
+
+
+def _newest_distinct_facts(facts: Sequence[_EdgeFact], summary: str) -> list[_EdgeFact]:
+    """*facts*, newest ``valid_at`` first, minus each one *summary* already
+    states or an earlier edge already carried; undated edges follow in reply order."""
+    seen: set[str] = set()
+    distinct: list[_EdgeFact] = []
+    for edge in sorted(facts, key=lambda edge: edge.valid_at or '', reverse=True):
+        if _states(summary, edge.fact) or edge.fact in seen:
+            continue
+        seen.add(edge.fact)
+        distinct.append(edge)
+    return distinct
+
+
+def _states(summary: str, fact: str) -> bool:
+    """Whether *fact* appears in *summary* bounded by whitespace or its ends, not inside longer text."""
+    return re.search(rf'(?<!\S){re.escape(fact)}(?!\S)', summary) is not None
 
 
 class MemoryFailure(Enum):

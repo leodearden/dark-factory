@@ -23,11 +23,15 @@
 //     dashboard/src/dashboard/api/window.py::_WINDOW_DAYS — no 1h, no 90d.
 //   - Burndown obeys dashboard/src/dashboard/api/burndown.py::_BURNDOWN_WINDOWS
 //     — 90d, no all.
-// WINDOW_SETS mirrors those two tables by hand; no parity test crosses the
+//   - The Quality tab's own landing selector (no global chip: the tab is not
+//     in TAB_WINDOWS) obeys dashboard/src/dashboard/api/quality.py::_QUALITY_WINDOWS,
+//     which counts landings, not days.
+// WINDOW_SETS mirrors those three tables by hand; no parity test crosses the
 // language boundary. Drift is VISIBLE rather than silent because every
-// windowed payload echoes `WINDOW: {requested, served, days}`: a chip the
-// server does not map reads "30d (Xd not available)" in the panel header and
-// lights no chip, instead of quietly relabelling the server's default.
+// windowed payload echoes `WINDOW: {requested, served, days}` (or `landings`,
+// null for 'all'): a chip the server does not map reads "30d (Xd not
+// available)" in the panel header and lights no chip, instead of quietly
+// relabelling the server's default.
 //
 // A chip tab re-validates the window on every switch: a window it does not
 // offer resets to DEFAULT_WINDOW. A chip-less tab keeps the user's last
@@ -41,9 +45,11 @@ const { EM_DASH: WINDOW_LABEL_UNKNOWN } = window.DF_DATUM;
 const WINDOW_SETS = Object.freeze({
   standard: Object.freeze(['24h', '7d', '30d', 'all']),
   burndown: Object.freeze(['24h', '7d', '30d', '90d']),
+  landings: Object.freeze(['100', '300', 'all']),
 });
 
 const DEFAULT_WINDOW = '24h';
+const LANDING_DEFAULT_WINDOW = '100';
 
 // Each chip tab's offered windows, and the endpoint whose WINDOW echo its
 // headers report. A tab absent here carries no global chip.
@@ -60,17 +66,25 @@ function windowForTab(tab, win) {
   return chip && !chip.windows.includes(win) ? DEFAULT_WINDOW : win;
 }
 
-// The echo recorded in data.js's per-endpoint receipt, or null when there is
-// none yet or it is malformed. data.js transports it verbatim; this is where
-// it is validated.
+// A day echo carries a finite `days`; a landing echo a `landings` that is
+// finite, or null for 'all'.
+function isWellFormedEcho(echo) {
+  if (!echo || typeof echo.requested !== 'string' || typeof echo.served !== 'string') return false;
+  if (Number.isFinite(echo.days)) return true;
+  return Object.hasOwn(echo, 'landings') && (echo.landings === null || Number.isFinite(echo.landings));
+}
+
+// The echo recorded in one data.js receipt, or null when there is none yet or
+// it is malformed. data.js transports it verbatim; this is where it is
+// validated.
+function receiptWindow(receipt) {
+  const echo = (receipt || {}).window;
+  return isWellFormedEcho(echo) ? echo : null;
+}
+
+// The echo of a polled endpoint's receipt, keyed by its path.
 function windowEcho(receipts, path) {
-  const echo = ((receipts || {})[path] || {}).window;
-  if (!echo) return null;
-  const { requested, served, days } = echo;
-  const wellFormed = typeof requested === 'string'
-    && typeof served === 'string'
-    && Number.isFinite(days);
-  return wellFormed ? echo : null;
+  return receiptWindow((receipts || {})[path]);
 }
 
 function isHonoured(echo) {
@@ -108,9 +122,11 @@ function recentMergesCaption(shown, total, echo) {
 const WINDOW_CHIP_API = {
   WINDOW_SETS,
   DEFAULT_WINDOW,
+  LANDING_DEFAULT_WINDOW,
   TAB_WINDOWS,
   windowForTab,
   windowEcho,
+  receiptWindow,
   windowLabel,
   highlightedWindow,
   pendingWindow,

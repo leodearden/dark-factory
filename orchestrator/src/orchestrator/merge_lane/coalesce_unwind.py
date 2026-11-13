@@ -17,7 +17,7 @@ from orchestrator.branch_stack import PreStackTip, TipRestore, TipRestoreOutcome
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import GroupMergeRequest
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 _RESTORABLE_STATUSES: frozenset[str] = frozenset({'merge-deferred', 'pending', 'blocked'})
 

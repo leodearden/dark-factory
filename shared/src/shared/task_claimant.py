@@ -36,6 +36,7 @@ from shared.timestamps import parse_timestamp_or_warn
 
 __all__ = [
     'DEFAULT_CLAIMANT_HEARTBEAT_TTL',
+    'carries_claimant',
     'compose_claimant_run_id',
     'has_live_claimant',
     'is_hygiene_tier_claimant',
@@ -83,7 +84,8 @@ def compose_claimant_run_id(run_id: str, session_id: str, owner_pid: int) -> str
     return f'{run_id}/{session_id}/pid={owner_pid}'
 
 
-def _carries_claimant(task: Mapping) -> bool:
+def carries_claimant(task: Mapping) -> bool:
+    """True unless ``claimant_run_id`` is None or blank; ignores status, heartbeat and metadata."""
     claimant = task.get('claimant_run_id')
     return not (claimant is None or (isinstance(claimant, str) and not claimant.strip()))
 
@@ -116,7 +118,7 @@ def _claimant_liveness_stranded(task: Mapping, now: datetime, ttl: timedelta) ->
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
 
-    if not _carries_claimant(task):
+    if not carries_claimant(task):
         return True
 
     heartbeat, ok = parse_timestamp_or_warn(
@@ -252,7 +254,7 @@ def violates_terminal_claimant_invariant(task: Mapping) -> bool:
     (``docs/prds/claimant-invariant-enforcement.md`` "Contract"). It takes no
     TTL: freshness is irrelevant to the terminal tier.
     """
-    return str(task.get('status')) in TERMINAL and _carries_claimant(task)
+    return str(task.get('status')) in TERMINAL and carries_claimant(task)
 
 
 def is_hygiene_tier_claimant(task: Mapping) -> bool:
@@ -262,7 +264,7 @@ def is_hygiene_tier_claimant(task: Mapping) -> bool:
     claimant here is the legal C3.1 teardown window, so only the stale subset
     (:func:`is_stale_hygiene_tier_claimant`) is repairable.
     """
-    return str(task.get('status')) in _HYGIENE_TIER_STATUSES and _carries_claimant(task)
+    return str(task.get('status')) in _HYGIENE_TIER_STATUSES and carries_claimant(task)
 
 
 def is_stale_hygiene_tier_claimant(task: Mapping, now: datetime, ttl: timedelta) -> bool:
@@ -285,7 +287,7 @@ def ledger_covers_claimant(task: Mapping) -> bool:
     Status-agnostic; the alarm tier is
     ``violates_terminal_claimant_invariant(t) and not ledger_covers_claimant(t)``.
     """
-    if not _carries_claimant(task):
+    if not carries_claimant(task):
         return False
     metadata = task.get('metadata')
     if not isinstance(metadata, Mapping):

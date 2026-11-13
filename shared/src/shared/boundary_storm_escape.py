@@ -42,6 +42,7 @@ __all__ = [
     'BoundaryStormEscape',
     'Sink',
     'call_sink',
+    'storm_outcome_label',
 ]
 
 logger = logging.getLogger(__name__)
@@ -57,9 +58,15 @@ Sink = Callable[[dict[str, Any]], Any | Awaitable[Any]]
 #: ``crossing`` fact may not reuse one: it would silently overwrite the burst's
 #: own numbers, or its attribution, in the record an operator triages.
 _RESERVED_RECORD_KEYS = frozenset({
-    'error_type', 'count', 'threshold', 'window_seconds', 'outcome', 'project',
-    'callers',
+    'error_type', 'count', 'threshold', 'window_seconds', 'outcome', 'reason',
+    'project', 'callers',
 })
+
+
+def storm_outcome_label(storm: Mapping[str, Any]) -> str:
+    """A storm record's outcome as an operator reads it: ``outcome (reason)`` when it has one."""
+    reason = storm.get('reason')
+    return storm['outcome'] if reason is None else f"{storm['outcome']} ({reason})"
 
 
 async def call_sink(sink: Sink, record: dict[str, Any], channel: str, *, owner: str) -> Any:
@@ -96,7 +103,7 @@ async def call_sink(sink: Sink, record: dict[str, Any], channel: str, *, owner: 
 
 
 class BoundaryStormEscape:
-    """Count one guard's absorbed outcomes per ``(project, outcome)``; escalate a burst.
+    """Count one guard's absorbed outcomes per ``(project, outcome[, reason])``; escalate a burst.
 
     *owner* names the guard in this module's log lines. *error_type* is how a
     fired burst names itself to the escalation sink, and *log_event* is the
@@ -149,7 +156,7 @@ class BoundaryStormEscape:
 
     @property
     def tracked_keys(self) -> frozenset[str]:
-        """The ``(project, outcome)`` keys currently holding a counter.
+        """The ``(project, outcome[, reason])`` keys currently holding a counter.
 
         Public because ``project`` is CALLER-SUPPLIED: one counter per key
         means one object per key ever seen, so "dormant keys are evicted" is a
@@ -164,15 +171,17 @@ class BoundaryStormEscape:
         outcome: str,
         project: str | None,
         *,
+        reason: str | None = None,
         caller: str | None = None,
         crossing: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Count one absorbed *outcome*; escalate and return a summary iff a burst fired.
 
-        Keyed by ``(project, outcome)`` as a single string, so neither a second
-        project nor a second outcome can pool into a premature fire. *caller*
-        is the event's ATTRIBUTION label, never part of the key: it names who
-        was in the window without changing when the window fires.
+        Keyed by ``(project, outcome[, reason])`` as a single string, so no
+        second project, outcome or reason can pool into a premature fire.
+        *reason* qualifies the outcome and rides on the record only when given.
+        *caller* is the event's ATTRIBUTION label, never part of the key: it
+        names who was in the window without changing when the window fires.
 
         *crossing* holds facts about THIS call, which matter only if it is the
         one that crosses the threshold. They are merged into the record after
@@ -187,8 +196,11 @@ class BoundaryStormEscape:
         """
         crossing = crossing or {}
         self._require_wiring(caller, crossing)
+        key = f'{project}\x1f{outcome}'
+        if reason is not None:
+            key += f'\x1f{reason}'
         summary = self._counters.record(
-            f'{project}\x1f{outcome}',
+            key,
             threshold=self.threshold,
             window_seconds=self.window_seconds,
             label=caller,
@@ -202,6 +214,7 @@ class BoundaryStormEscape:
             'threshold': summary['threshold'],
             'window_seconds': summary['window_seconds'],
             'outcome': outcome,
+            **({} if reason is None else {'reason': reason}),
             'project': project,
             **crossing,
         }
@@ -241,7 +254,7 @@ class BoundaryStormEscape:
         suffix = f'; crossing call {rendered}' if crossing else ''
         logger.error(
             '%s: %d %s outcome(s) in %ss for project=%r%s%s',
-            self._log_event, storm['count'], storm['outcome'],
+            self._log_event, storm['count'], storm_outcome_label(storm),
             storm['window_seconds'], storm['project'], advice, suffix,
         )
 

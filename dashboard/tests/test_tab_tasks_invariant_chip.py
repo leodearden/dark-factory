@@ -13,7 +13,7 @@ structural facts about served HTML, never JSX source text (esc-3857-9).
 from __future__ import annotations
 
 from _cache_buster_helpers import redux_cache_buster_versions
-from _dashboard_helpers import ScriptTagCollector, assert_script_loads_before
+from _jsx_source_helpers import ScriptTagCollector, assert_script_loads_before
 
 _CHIP_SRC = '/static/redux/invariant_chip.js'
 

@@ -2185,8 +2185,10 @@ class TestBuildEvalEnvSharedPool:
     reserve: his own sessions exhaust its weekly cap most weeks, so it
     cannot double as a private eval reserve. Evals have no dedicated
     account — they draw on the same pool as the rest of the fleet and
-    tolerate cap/429 events via ``invoke_with_cap_retry``'s 48h patience
-    (``orchestrator.evals.runner``) instead.
+    tolerate cap/429 events via ``invoke_with_cap_retry``'s shared default
+    cap-wait patience
+    (``shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS``,
+    reached from ``orchestrator.evals.runner``) instead.
 
     The ``USAGE_ACCOUNTS_FILE`` override itself is NOT the defect and is
     deliberately kept (see the plan's design decision): it is the

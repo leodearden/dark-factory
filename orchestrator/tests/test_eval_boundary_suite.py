@@ -83,11 +83,11 @@ import logging
 import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.cli_invoke import AgentResult
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
     _CONSTRUCT_RE,
@@ -117,7 +117,7 @@ from orchestrator.workflow import TaskWorkflow
 # because it is structurally identical to the three members that crashed.
 # WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
 # ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -198,7 +198,7 @@ def committed_diff_fixture(tmp_path: Path) -> tuple[Path, str]:
 
 def _fake_invoke_agent(
     captured_prompts: list[str],
-) -> Callable[..., Coroutine[Any, Any, SimpleNamespace]]:
+) -> Callable[..., Coroutine[Any, Any, AgentResult]]:
     """Return an ``invoke_agent`` replacement that records prompts.
 
     Monkeypatch the returned coroutine over ``judge.invoke_agent`` (or
@@ -208,15 +208,17 @@ def _fake_invoke_agent(
     reads).  No real agent runs, so B4 grades the real committed diff for free.
     """
 
-    async def _fake(**kwargs: Any) -> SimpleNamespace:
+    async def _fake(**kwargs: Any) -> AgentResult:
         captured_prompts.append(str(kwargs.get('prompt', '')))
-        return SimpleNamespace(
+        return AgentResult(
+            success=True,
             structured_output={
                 'winner': 'A',
                 'confidence': 0.9,
                 'reasoning': 'canned boundary-suite verdict',
             },
             output='{"winner": "A", "confidence": 0.9, "reasoning": "r"}',
+            cost_usd=0.0,
         )
 
     return _fake

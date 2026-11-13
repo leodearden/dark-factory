@@ -54,6 +54,7 @@ class TestVerifyCgroupCpuWeightBounds:
         assert getattr(cfg, field) == good_value
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyCgroupCpuWeightReloadDisposition:
     """Every weight knob is green-tier: hot-reloadable without a restart.
 
@@ -62,11 +63,7 @@ class TestVerifyCgroupCpuWeightReloadDisposition:
     """
 
     @pytest.mark.parametrize('field', WEIGHT_FIELDS)
-    def test_weight_edit_lands_in_applied_candidates_not_restart_required(
-        self, field, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_weight_edit_lands_in_applied_candidates_not_restart_required(self, field):
         before: dict[str, Any] = {field: 33}
         after: dict[str, Any] = {field: 50}
         diff = diff_config(OrchestratorConfig(**before), OrchestratorConfig(**after))

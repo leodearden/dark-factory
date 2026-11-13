@@ -1,0 +1,12 @@
+{
+  "task_id": "3076",
+  "reason": "code motion, net zero for the cluster \u2014 \u03b4 amendment extracts the lane_in_use refcount from GitOps into lane_lifecycle.LaneLiveness (reviewer heuristics 6/9); git_ops.py cognitive falls by the same 1 that lane_lifecycle.py rises, and total:cognitive holds",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 57,
+      "current": 58
+    }
+  ]
+}

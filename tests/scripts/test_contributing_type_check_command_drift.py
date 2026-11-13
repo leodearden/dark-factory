@@ -47,11 +47,11 @@ on merge verify would be vacuous the same way the drift it watches for is — th
 rationale ``test_contributing_lint_command_drift.py`` and
 ``test_pyright_version_pin.py`` both state.
 
-OUT OF SCOPE, and deliberately not pinned here. ``hooks/project-checks`` carries its own
-``PYRIGHT_PACKAGES`` list, pinned against the live chain by
-``test_hook_pyright_packages_drift.py`` (task 5338). CONTRIBUTING.md's §4
+OUT OF SCOPE, and deliberately not pinned here. ``hooks/project-checks`` runs the
+registered module commands via ``scripts/hook_module_checks.py``, a derivation
+pinned by ``test_hook_pyright_packages_drift.py`` (tasks 5338, 8531). CONTRIBUTING.md's §4
 item 3 (``uv run pyright`` in each touched, pyright-configured package) and its
-pre-commit pyright sentence are generic advice and must stay unpinned here. §4 item 3 is additionally the
+pre-commit sentence are generic advice and must stay unpinned here. §4 item 3 is additionally the
 DECOY this module's extractor is explicitly tested against below: pinning that
 generic instruction to the live config would be wrong twice over — it would fail
 immediately, and "fixing" it would destroy correct, audience-appropriate advice.
@@ -71,8 +71,11 @@ import tomllib
 import pytest
 import verify_command_invariants as vci
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify_cmd
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -246,9 +249,9 @@ cd alpha && uv run pyright && \\
 # (f) Decoy immunity. CONTRIBUTING.md's REAL §4 item 3 line and its real
 # pre-commit "pyright up to 3x" sentence appear BOTH before and after the marker
 # block, so neither a "first span" nor a "last span" heuristic passes by
-# accident. A MEASURED hazard, not hypothetical: CONTRIBUTING.md really carries
-# both, and both are CORRECT about `hooks/project-checks`'s three-package
-# `PYRIGHT_PACKAGES` — they must stay generic and unpinned.
+# accident. A MEASURED hazard, not hypothetical: CONTRIBUTING.md carried both
+# when this was written (the pre-commit sentence described the PYRIGHT_PACKAGES
+# list task 8531 retired), and such generic prose must stay unpinned.
 _DECOY_DOC = """\
 3. `uv run pyright` in each touched, pyright-configured package
    (`fused-memory`, `orchestrator`, `dashboard`).

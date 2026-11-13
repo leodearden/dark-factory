@@ -15,19 +15,23 @@ marks this module demands guarantee the family never drops BELOW it, which is
 what a floor is for.  The value history of both lives in
 plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 
-What makes the breach so expensive is the two settings around it:
+Until task 6354 what made the breach so expensive was the two settings around
+it:
 
-* ``[tool.pytest.ini_options].timeout_method = "thread"`` means a breach does
-  NOT fail the test -- pytest-timeout's thread method ``os._exit()``s the whole
+* ``[tool.pytest.ini_options].timeout_method = "thread"`` meant a breach did
+  NOT fail the test -- pytest-timeout's thread method ``os._exit()``ed the whole
   xdist worker ("node down: Not properly terminated");
 * ``--max-worker-restart=0`` (in ``[tool.pytest.ini_options].addopts``, task
-  1907) then declines to replace that worker, degrading the run to a TRUNCATED
-  whole-suite session whose surviving failure names some innocent guard that
+  1907) then declined to replace that worker, degrading the run to a TRUNCATED
+  whole-suite session whose surviving failure named some innocent guard that
   merely happened to share the dead worker.
 
-So a single slow tree-scan does not cost one red test -- it costs the whole
-verify run, and it misattributes the blame.  Escalations esc-3980-1 and
-esc-3787-1 are both instances.
+So a single slow tree-scan cost the whole verify run, and misattributed the
+blame.  Escalations esc-3980-1 and esc-3787-1 are both instances.  Since task
+6354 the method is ``signal``: a breach fails the one scanner, with its own
+traceback, and the worker lives on.  That is still a false red on a
+healthy-but-slow test, and the marks still prevent it, so the census below
+stays as it is.
 
 THE FIX the pyproject itself sanctions ("Slow tests opt out with
 ``@pytest.mark.timeout(N)``", the comment on
@@ -35,7 +39,7 @@ THE FIX the pyproject itself sanctions ("Slow tests opt out with
 ``pytestmark`` on each scanner.  This module pins the two constants that mark
 uses, and (from step-5 on) recomputes the census of scanners from source on
 every run so the Nth new scanner is caught at commit time rather than by another
-truncated verify.
+false red in verify.
 
 NOT widening the global ``timeout`` *as the remedy for THIS hazard*: doing it
 for that reason would blunt the hang-catching ceiling for the other ~16000
@@ -47,10 +51,10 @@ a host's contention are separate things to size against.)
 WHERE THE RATIONALE LIVES.  The mechanism is restated here because this is the
 module a failing run points at, but the CANONICAL home -- the derivation of the
 ceiling, the full measurement record, and the escalation references -- is the
-``WHOLE_TREE_SCAN_TEST_TIMEOUT`` comment in ``_orch_helpers.py``.  The ~13
-modules that carry the mark point THERE rather than repeating it, so retuning
-the ceiling or switching ``timeout_method`` is one edit plus this file, not
-fourteen.
+``WHOLE_TREE_SCAN_TEST_TIMEOUT`` comment in
+``shared/src/shared/whole_tree_guard_family.py``.  The modules that carry the
+mark point THERE rather than repeating it, so retuning the ceiling or switching
+``timeout_method`` is one edit plus this file, not one per member.
 """
 from __future__ import annotations
 
@@ -64,9 +68,13 @@ from _orch_helpers import (
     PYPROJECT_DEFAULT_TIMEOUT,
     UNDER_LOAD_HEADROOM_FACTOR,
     VERIFY_CLI_PER_TEST_TIMEOUT,
-    WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
-from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    WHOLE_TREE_SCAN_TIMEOUT_NAME,
+    is_whole_tree_guard_module,
+    module_level_timeout_arguments,
+)
 
 from orchestrator.pytest_markers import module_level_marker_names
 
@@ -141,18 +149,27 @@ def _pytest_ini_options() -> dict[str, object]:
 class TestTimeoutConstants:
     """The two constants this guard's remediation advice depends on."""
 
-    def test_a_hung_test_dumps_its_stacks_before_any_kill_can_reach_it(self) -> None:
-        """``faulthandler_timeout`` must fire below the tightest kill a test meets.
+    def test_a_hung_test_dumps_its_stacks_below_the_verify_cap(self) -> None:
+        """``faulthandler_timeout`` must fire below the tightest cap a test meets.
 
-        Under ``timeout_method = "thread"`` the kill is an ``os._exit()`` that
-        leaves no traceback.  pytest-timeout's own banner goes through the
-        terminal writer to the worker's STDOUT, which execnet's
-        ``init_popen_io`` dup2s to /dev/null, so under xdist it never reaches
-        the controller; the faulthandler dump goes to STDERR, which the worker
+        The dump writes every thread's stack to STDERR, which an xdist worker
         inherits from the controller, and verify merges stderr into its log.
-        The dump is evidence only if it lands first, and the tightest kill an
-        UNMARKED test can meet is verify's CLI ``--timeout=300``, not this
-        file's ini default.  Marked tests below this value still die silently.
+        The bound serves two hangs.
+
+        A main thread blocked in a C call that never returns is one that
+        ``timeout_method = "signal"`` cannot interrupt: the cap never fires,
+        the worker hangs until verify's outer kill, and this dump is the only
+        witness.  Any positive value below the cap lands it well inside the
+        verify run.
+
+        A hang the cap DOES interrupt (a main thread waiting on a deadlocked
+        peer, say) fails with the main thread's traceback alone.
+        pytest-timeout writes the other threads' stacks to the terminal, and
+        on an xdist worker that is stdout, which execnet points at /dev/null.
+        pytest also cancels the pending dump when the test ends.  So the peer's
+        stack reaches the verify log only if this dump fires before the cap,
+        and the tightest cap an UNMARKED test can meet is verify's CLI
+        ``--timeout=300``, not this file's ini default.
         """
         ini_options = _pytest_ini_options()
 
@@ -163,7 +180,9 @@ class TestTimeoutConstants:
         assert 0 < dump_after < VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'faulthandler_timeout ({dump_after}) must be positive and below '
             f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}), or a '
-            'hung test is killed before its stacks reach the verify log'
+            "hang the cap interrupts fails without its other threads' stacks: "
+            "pytest-timeout writes those to the xdist worker's discarded stdout, "
+            'and the pending dump is cancelled with the test'
         )
 
     def test_pyproject_default_timeout_mirrors_pyproject(self) -> None:
@@ -178,10 +197,13 @@ class TestTimeoutConstants:
         citing a line number in a comment, which is precisely how the earlier
         mirror was free to go stale.
 
-        ``timeout_method`` is asserted alongside it because the entire cost model
-        above rests on it: under thread mode a breach ``os._exit()``s the xdist
-        worker instead of failing the test.  If someone switches back to signal
-        mode, the rationale for every mark this guard demands changes, and that
+        ``timeout_method`` is asserted alongside it because the cost model above
+        rests on it.  Under signal mode a breach fails the one test, with its
+        traceback, and the worker lives on; a breach inside a long C or Rust
+        call (complexipy's analysis) is raised only once that call returns; and
+        a C call that never returns is not interrupted at all, which is what
+        ``faulthandler_timeout``'s dump is for.  If someone switches the method,
+        the cost of every breach this guard's marks prevent changes, and that
         should surface loudly here rather than be discovered later.
         """
         ini_options = _pytest_ini_options()
@@ -194,13 +216,16 @@ class TestTimeoutConstants:
             'WHOLE_TREE_SCAN_TEST_TIMEOUT, which is derived from it, still '
             'clears the measured worst case.'
         )
-        assert ini_options['timeout_method'] == 'thread', (
-            'timeout_method is no longer "thread" in '
-            f'{_ORCH_PYPROJECT} (got {ini_options["timeout_method"]!r}). The '
-            'whole rationale for this guard -- a breach os._exit()s the xdist '
-            'worker rather than failing the test, and --max-worker-restart=0 '
-            'turns that into a truncated whole-suite run -- is specific to '
-            'thread mode. Revisit this module before changing it.'
+        assert ini_options['timeout_method'] == 'signal', (
+            'timeout_method is no longer "signal" in '
+            f'{_ORCH_PYPROJECT} (got {ini_options["timeout_method"]!r}). This '
+            "guard's cost model is signal's: a breach fails the one test, with "
+            'its traceback, and the worker lives on; a breach inside a long C or '
+            'Rust call (complexipy) is raised only once that call returns; and a '
+            'C call that never returns is not interrupted, which is what '
+            "faulthandler_timeout's dump is for. The trade is decided in "
+            'tests/scripts/test_timeout_method_policy.py; revisit this module '
+            'before changing the method.'
         )
 
     def test_whole_tree_scan_timeout_clears_default_with_margin(self) -> None:
@@ -343,26 +368,12 @@ def _scans_whole_tree_py(source: str) -> bool:
 
 
 #: Names that resolve to ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` at import time.  A
-#: bare ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` (the house `from _orch_helpers import`
-#: idiom, used by all 13 members) and the dotted
-#: ``_orch_helpers.WHOLE_TREE_SCAN_TEST_TIMEOUT`` both land here, since only the
-#: trailing name is compared.
-_SANCTIONED_CEILING_NAMES = frozenset({'WHOLE_TREE_SCAN_TEST_TIMEOUT'})
-
-
-def _timeout_call_arg(call: ast.Call) -> ast.expr | None:
-    """The seconds expression a ``pytest.mark.timeout(...)`` *call* pins.
-
-    Both spellings pytest-timeout accepts are read: the positional
-    ``timeout(300)`` and the keyword ``timeout(timeout=300)``.  A call with
-    neither (``timeout()``, or one passing only ``method=``) yields None.
-    """
-    if call.args:
-        return call.args[0]
-    for keyword in call.keywords:
-        if keyword.arg == 'timeout':
-            return keyword.value
-    return None
+#: bare ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` (the house
+#: `from shared.whole_tree_guard_family import` idiom) and a dotted
+#: ``<module>.WHOLE_TREE_SCAN_TEST_TIMEOUT`` both land here, since only the
+#: trailing name is compared.  The spelling itself is
+#: ``shared.whole_tree_guard_family``'s -- the same one its family predicate reads.
+_SANCTIONED_CEILING_NAMES = frozenset({WHOLE_TREE_SCAN_TIMEOUT_NAME})
 
 
 def _module_level_timeout_ceiling(source: str) -> float | None:
@@ -397,34 +408,17 @@ def _module_level_timeout_ceiling(source: str) -> float | None:
     legal), the SMALLEST resolvable one wins -- the ambiguity is real and the
     conservative reading is the one that surfaces it.
 
-    ``pytestmark_value``, ``marker_name`` and ``mark_elements`` are imported
-    from :mod:`shared.pytest_mark_grammar` rather than re-derived, for the same
-    reason the family invariant imports ``module_level_marker_names``: the
-    grammar of a module-level ``pytestmark`` (``Assign`` vs ``AnnAssign``,
-    last-assignment-wins, list/tuple element forms) belongs in exactly one
+    The seconds expressions come from
+    :func:`shared.whole_tree_guard_family.module_level_timeout_arguments` rather
+    than a fold of this module's own, for the same reason the family invariant
+    imports ``module_level_marker_names``: the grammar of a module-level
+    ``pytestmark`` (``Assign`` vs ``AnnAssign``, last-assignment-wins,
+    list/tuple element forms, positional vs ``timeout=``) belongs in exactly one
     place, and a rename there should break this import loudly at collection
     rather than let two readings of the same syntax drift apart.
     """
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return None
-
-    value: ast.expr | None = None
-    for statement in tree.body:
-        bound = pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    if value is None:
-        return None
-
     resolved: list[float] = []
-    for element in mark_elements(value):
-        if not isinstance(element, ast.Call) or marker_name(element) != 'timeout':
-            continue
-        arg = _timeout_call_arg(element)
-        if arg is None:
-            continue
+    for arg in module_level_timeout_arguments(source):
         if (
             isinstance(arg, ast.Constant)
             and isinstance(arg.value, int | float)
@@ -440,6 +434,30 @@ def _module_level_timeout_ceiling(source: str) -> float | None:
         if name in _SANCTIONED_CEILING_NAMES:
             resolved.append(float(WHOLE_TREE_SCAN_TEST_TIMEOUT))
     return min(resolved) if resolved else None
+
+
+def _scanner_offence(name: str, source: str) -> str | None:
+    """Why the whole-tree scanner *name* (content *source*) breaks the family invariant, else None.
+
+    The three halves in order: a module-level timeout NAME, a resolvable VALUE
+    not below the family ceiling (an unresolvable one is no opinion), and
+    MEMBERSHIP of the family task-role verify enumerates.
+    """
+    if 'timeout' not in module_level_marker_names(source):
+        return f'{name}: no module-level pytestmark timeout'
+    ceiling = _module_level_timeout_ceiling(source)
+    if ceiling is not None and ceiling < WHOLE_TREE_SCAN_TEST_TIMEOUT:
+        return (
+            f'{name}: module-level timeout pins {ceiling:g}s, below '
+            f'the {WHOLE_TREE_SCAN_TEST_TIMEOUT}s family ceiling'
+        )
+    if not is_whole_tree_guard_module(source):
+        return (
+            f'{name}: module-level timeout is not spelled '
+            'pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT), so verify_plan\'s '
+            'task-role guard family will not run it'
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +646,7 @@ def test_ceiling_resolves_the_sanctioned_constant_name() -> None:
     """The house spelling resolves to the constant's real runtime value."""
     source = (
         'import pytest\n'
-        'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+        'from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
         'pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n'
     )
     assert _module_level_timeout_ceiling(source) == float(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -758,6 +776,95 @@ def test_a_synthetic_new_scanner_marked_too_tight_is_an_offender() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Membership of this module itself. The family predicate's own unit tests live
+# with it, in shared/tests/test_whole_tree_guard_family.py.
+# ---------------------------------------------------------------------------
+
+
+def test_this_guard_module_is_itself_a_guard_family_member() -> None:
+    """The real-name coupling: this module carries the house mark, so renaming
+    the constant or its spelling in shared.whole_tree_guard_family reds here."""
+    assert is_whole_tree_guard_module(Path(__file__).read_text(encoding='utf-8')) is True
+
+
+# ---------------------------------------------------------------------------
+# _scanner_offence(name, source) -- the per-scanner verdict the family
+# invariant applies to each detected scanner, pinned synthetically because the
+# real tree is green by construction and cannot demonstrate any offence.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_scanner(mark_lines: str) -> str:
+    """A whole-tree scanner module whose module-level marks are *mark_lines*."""
+    return (
+        'import ast\n'
+        'import pytest\n'
+        'from pathlib import Path\n'
+        'from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+        f'{mark_lines}'
+        '\n'
+        '_TESTS_DIR = Path(__file__).parent\n'
+        '\n'
+        'def test_some_new_invariant() -> None:\n'
+        "    for py_file in sorted(_TESTS_DIR.rglob('*.py')):\n"
+        "        ast.parse(py_file.read_text(encoding='utf-8'))\n"
+    )
+
+
+def test_offence_is_none_for_the_house_spelling() -> None:
+    source = _synthetic_scanner('pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n')
+    assert _scanner_offence('test_new.py', source) is None
+
+
+def test_offence_names_a_missing_module_level_timeout() -> None:
+    offence = _scanner_offence('test_new.py', _synthetic_scanner(''))
+    assert offence is not None
+    assert offence.startswith('test_new.py: ')
+    assert 'no module-level pytestmark timeout' in offence
+
+
+def test_offence_names_a_ceiling_below_the_family_ceiling() -> None:
+    offence = _scanner_offence(
+        'test_new.py', _synthetic_scanner('pytestmark = pytest.mark.timeout(30)\n'),
+    )
+    assert offence is not None
+    assert 'pins 30s' in offence
+    assert 'below the' in offence and 'family ceiling' in offence
+
+
+@pytest.mark.parametrize(
+    'mark_line',
+    [
+        pytest.param('pytestmark = pytest.mark.timeout(1500)\n', id='literal-above-the-ceiling'),
+        pytest.param(
+            'from somewhere import SOME_OTHER_TIMEOUT\n'
+            'pytestmark = pytest.mark.timeout(SOME_OTHER_TIMEOUT)\n',
+            id='unresolvable-constant',
+        ),
+    ],
+)
+def test_offence_names_a_mark_outside_the_guard_family(mark_line: str) -> None:
+    """Passing the name and value halves is not enough: task-role verify runs
+    only the family ``is_whole_tree_guard_module`` admits, so a scanner spelled
+    any other way would stop running before the merge gate."""
+    offence = _scanner_offence('test_new.py', _synthetic_scanner(mark_line))
+    assert offence is not None
+    assert 'WHOLE_TREE_SCAN_TEST_TIMEOUT' in offence
+    assert 'guard family' in offence
+
+
+def test_a_synthetic_new_scanner_marked_by_a_literal_is_not_a_family_member() -> None:
+    """END TO END on the third half: detected, named, AT the ceiling by value --
+    and still an offender, proving the membership half is not dead code."""
+    synthetic_source = _synthetic_scanner('pytestmark = pytest.mark.timeout(1500)\n')
+    assert _scans_whole_tree_py(synthetic_source) is True
+    assert 'timeout' in module_level_marker_names(synthetic_source)
+    ceiling = _module_level_timeout_ceiling(synthetic_source)
+    assert ceiling is not None and ceiling >= WHOLE_TREE_SCAN_TEST_TIMEOUT
+    assert _scanner_offence('test_new.py', synthetic_source) is not None
+
+
+# ---------------------------------------------------------------------------
 # The family invariant: the actual ratchet.
 #
 # Allowlist-free and TOTAL -- every whole-tree scanner under this directory
@@ -769,9 +876,9 @@ def test_a_synthetic_new_scanner_marked_too_tight_is_an_offender() -> None:
 
 def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     """Every whole-tree ``*.py`` scanner here needs a MODULE-LEVEL timeout mark
-    AT the family ceiling.
+    AT the family ceiling, spelled via ``WHOLE_TREE_SCAN_TEST_TIMEOUT``.
 
-    TWO HALVES, because either alone is insufficient. The NAME half
+    THREE HALVES, applied per scanner by :func:`_scanner_offence`. The NAME half
     (:func:`module_level_marker_names`) catches a scanner with no mark; the
     VALUE half (:func:`_module_level_timeout_ceiling`) catches one marked
     ``pytest.mark.timeout(30)``, which carries the name yet sits BELOW even the
@@ -779,6 +886,12 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     exact cliff this module exists to clear. Only a value the grammar can
     actually resolve can offend: an unresolvable expression is skipped, keeping
     the guard a floor rather than a proof.
+
+    The MEMBERSHIP half exists because task 7253 (the gate-5702 ruling) narrowed
+    the task-role verify floor to the touched tests plus this family, enumerated
+    by :func:`shared.whole_tree_guard_family.is_whole_tree_guard_module`. A scanner
+    outside the family -- marked by a literal, or by another constant -- would
+    silently stop running before the merge gate, so membership is not fail-soft.
 
     Why module-level rather than "a timeout mark somewhere in the file": only a
     module-level ``pytestmark`` is a statically sound LOWER BOUND on every
@@ -796,9 +909,8 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     acts purely as a FLOOR and narrows nothing.
 
     NO SKIP-SELF, deliberately, and stated here because it inverts a convention
-    a reviewer will expect. Five sibling guards
+    a reviewer will expect. Four sibling guards
     (test_prune_chokepoint_guard.py::test_exactly_one_prune_argv_literal_inside_chokepoint,
-    test_event_loop_antipattern_guard.py::test_no_get_event_loop_in_orchestrator_tests,
     and the serial-merge-worker, reachback and lock-release guards) carry a
     ``_THIS_FILE``/``continue``
     skip-self because their forbidden pattern necessarily appears in their own
@@ -832,19 +944,9 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
         if not _scans_whole_tree_py(source):
             continue
         scanners.append(py_file)
-        if 'timeout' not in module_level_marker_names(source):
-            offenders.append(f'{py_file.name}: no module-level pytestmark timeout')
-            continue
-        # NAME present, but at what value? A mark of `timeout(30)` satisfies the
-        # check above while sitting BELOW even the global ini default -- see
-        # _module_level_timeout_ceiling. None means unresolvable, which is NOT
-        # an offence (fail-soft; the guard stays a floor).
-        ceiling = _module_level_timeout_ceiling(source)
-        if ceiling is not None and ceiling < WHOLE_TREE_SCAN_TEST_TIMEOUT:
-            offenders.append(
-                f'{py_file.name}: module-level timeout pins {ceiling:g}s, below '
-                f'the {WHOLE_TREE_SCAN_TEST_TIMEOUT}s family ceiling'
-            )
+        offence = _scanner_offence(py_file.name, source)
+        if offence is not None:
+            offenders.append(offence)
 
     assert examined >= _MIN_EXPECTED_TEST_FILES, (
         f'only {examined} .py files examined under {_TESTS_DIR} (expected at '
@@ -866,8 +968,9 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
         raise AssertionError(
             f'{len(offenders)} whole-tree AST-scanning test module(s) under '
             f'{_TESTS_DIR.name}/ lack a module-level timeout mark AT THE FAMILY '
-            'CEILING (either no mark at all, or one pinned lower). Add\n\n'
-            '    from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+            'CEILING (no mark at all, one pinned lower, or one not spelled via '
+            'WHOLE_TREE_SCAN_TEST_TIMEOUT). Add\n\n'
+            '    from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
             '    pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n\n'
             'at module level in each. These modules rglob() every *.py in the '
             'repo and ast.parse() each one; under `-n auto` that has been '
@@ -882,6 +985,7 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
             'Use WHOLE_TREE_SCAN_TEST_TIMEOUT rather than a hand-picked number: '
             'a smaller literal carries the marker NAME while leaving the test at '
             'or under the cliff, which is why the value is checked and not just '
-            'the name.'
+            'the name. Any other spelling, even a larger literal, also leaves the '
+            'module out of the guard family task-role verify runs.'
             f'\n\nOffending scanners:\n  {offender_list}'
         )

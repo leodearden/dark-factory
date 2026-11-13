@@ -1,0 +1,12 @@
+{
+  "task_id": "6219",
+  "reason": "Review amendment, net-additive guard: GitOps._rebase_requeued_onto_main now refuses to un-stack unless the worktree it was handed is the one git reports holding the branch (a failed rebind, or a duplicate holder), so a requeue never rewrites another worktree's branch (task 6219, reviewer suggestion 6). Not a refactor that failed; the same amendment lowers create_worktree by sharing one _is_train_successor predicate.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_rebase_requeued_onto_main",
+      "baseline": 2,
+      "current": 4
+    }
+  ]
+}

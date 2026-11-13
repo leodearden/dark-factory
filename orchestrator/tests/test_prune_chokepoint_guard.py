@@ -22,8 +22,6 @@ phrase (e.g. verify.py's DD5 notes, git_ops.py's own docstrings) are never
 matched, avoiding false positives. A literal only counts as "inside the
 chokepoint" when it falls within a ``_prune_registrations`` method defined
 directly on the ``GitOps`` class (not merely any same-named function).
-Mirrors the AST-walk / rglob / offender file:line list / skip-self pattern
-used by orchestrator/tests/test_event_loop_antipattern_guard.py.
 """
 from __future__ import annotations
 
@@ -32,14 +30,14 @@ from pathlib import Path
 from typing import TypeGuard
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This guard AST-parses every *.py under orchestrator/src recursively via
 # rglob. Not individually reproduced under load; marked because it is
 # structurally identical to the three members that crashed.
 # WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
 # ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

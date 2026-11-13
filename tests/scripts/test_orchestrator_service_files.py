@@ -9,7 +9,8 @@ required.  Every suite here takes a .service / .timer template as its SUBJECT:
      - scripts/orchestrator-watchdog.service
      - scripts/orchestrator-watchdog.timer
      - every scripts/orchestrator-*.service, via ALL_ORCHESTRATOR_SERVICE_FILES
-       (ORCH_UNIT self-identification; canonical --config filename)
+       (ORCH_UNIT self-identification; canonical --config filename; the
+       StartLimit cap, which also covers the factory-init reference unit)
 
 WHAT LEFT, AND WHY (task 3746).  Two further suites lived here until this
 module reached ~1300 lines: scripts/setup-host.sh installer coverage and
@@ -49,8 +50,10 @@ See also:
 """
 
 import pathlib
+import re
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Shared with tests/scripts/test_know_live_installed_unit_parity.py, which had
 # hand-copied the ExecStart parsers from this module and drifted; task 3773
@@ -69,11 +72,14 @@ import pytest
 from systemd_unit_invariants import (
     ALL_ORCHESTRATOR_SERVICE_FILES,
     CANONICAL_CONFIG_BASENAME,
+    FACTORY_INIT_REFERENCE,
     MalformedExecStart,
     config_arg_from_exec_start,
     logical_exec_start,
     parse_sections,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_SERVICE = REPO_ROOT / "scripts" / "orchestrator-dark-factory.service"
@@ -81,6 +87,9 @@ REIFY_SERVICE = REPO_ROOT / "scripts" / "orchestrator-reify.service"
 AUTOPILOT_SERVICE = REPO_ROOT / "scripts" / "orchestrator-autopilot-video.service"
 WATCHDOG_SERVICE = REPO_ROOT / "scripts" / "orchestrator-watchdog.service"
 WATCHDOG_TIMER = REPO_ROOT / "scripts" / "orchestrator-watchdog.timer"
+
+# The restart-rate cap every supervised orchestrator unit declares under [Unit].
+EXPECTED_START_LIMIT = ("StartLimitIntervalSec=1800", "StartLimitBurst=10")
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +157,6 @@ def test_dark_factory_orchestrator_service_structure() -> None:
     # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
     # in tests/scripts/test_systemd_restart_backoff.py.
     assert "RestartSteps=4" in content
-    assert "StartLimitIntervalSec=600" in content
-    assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     # TimeoutStartSec must exceed the ExecStartPre poll budget (280s) so a slow
     # fused-memory cold-start is covered by ONE start attempt rather than
@@ -227,8 +234,6 @@ def test_reify_orchestrator_service_structure() -> None:
     # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
     # in tests/scripts/test_systemd_restart_backoff.py.
     assert "RestartSteps=4" in content
-    assert "StartLimitIntervalSec=600" in content
-    assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     assert "TimeoutStartSec=300" in content
     assert "StandardOutput=journal" in content
@@ -403,8 +408,6 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     ), "ExecStart must invoke the orchestrator with the autopilot-video config, no-sync"
     assert "Restart=on-failure" in content
-    assert "StartLimitIntervalSec=600" in content
-    assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     assert "TimeoutStartSec=300" in content
     assert "StandardOutput=journal" in content
@@ -412,17 +415,6 @@ def test_autopilot_video_service_exists_and_structure() -> None:
 
     # --- [Install] ---
     assert "WantedBy=default.target" in content
-
-
-def test_autopilot_video_start_limit_directives_under_unit_section() -> None:
-    """StartLimit directives must be under [Unit], not [Service] (systemd >=230)."""
-    sections = parse_sections(AUTOPILOT_SERVICE.read_text(encoding="utf-8"))
-    unit_text = "\n".join(sections.get("Unit", []))
-    service_text = "\n".join(sections.get("Service", []))
-    assert "StartLimitIntervalSec=600" in unit_text
-    assert "StartLimitBurst=10" in unit_text
-    assert "StartLimitIntervalSec" not in service_text
-    assert "StartLimitBurst" not in service_text
 
 
 # ---------------------------------------------------------------------------
@@ -509,24 +501,48 @@ def test_watchdog_service_structure() -> None:
 # StartLimit directives must live in [Unit], not [Service]
 # ---------------------------------------------------------------------------
 
+# Every supervised orchestrator unit, plus the factory-init reference new ones
+# are copied from.  orchestrator-watchdog.service is a oneshot probe with no
+# restart loop for a StartLimit cap to bound.
+_START_LIMITED_UNITS = [
+    *(path for path in ALL_ORCHESTRATOR_SERVICE_FILES if path != WATCHDOG_SERVICE),
+    REPO_ROOT / FACTORY_INIT_REFERENCE,
+]
 
-@pytest.mark.parametrize(
-    "service_path",
-    [
-        pytest.param(
-            REPO_ROOT / "scripts" / "orchestrator-dark-factory.service",
-            id="orchestrator-dark-factory",
-        ),
-        pytest.param(
-            REPO_ROOT / "scripts" / "orchestrator-reify.service",
-            id="orchestrator-reify",
-        ),
-    ],
-)
-def test_start_limit_directives_under_unit_section(
-    service_path: pathlib.Path,
-) -> None:
-    """StartLimitIntervalSec and StartLimitBurst must be in [Unit], NOT [Service].
+_INI_FENCE = re.compile(r"^```ini\n(.*?)^```", re.DOTALL | re.MULTILINE)
+
+
+def _service_unit_text(path: pathlib.Path) -> str:
+    """The service unit *path* declares: the file itself, or a reference doc's service block.
+
+    The factory-init reference fences two units, the service and then its
+    socket.  Parsing the whole document would let the socket's [Unit] header
+    replace the service's, so only the one ``ini`` block with a [Service]
+    section is returned.
+    """
+    content = path.read_text(encoding="utf-8")
+    if path.suffix != ".md":
+        return content
+    service_blocks = [
+        block for block in _INI_FENCE.findall(content) if "[Service]" in block.splitlines()
+    ]
+    assert len(service_blocks) == 1, (
+        f"{path.name} must fence exactly one ```ini service unit, found {len(service_blocks)}"
+    )
+    return service_blocks[0]
+
+
+def _directives(section_lines: list[str]) -> list[str]:
+    return [
+        line.strip()
+        for line in section_lines
+        if line.strip() and not line.lstrip().startswith(("#", ";"))
+    ]
+
+
+@pytest.mark.parametrize("unit_path", _START_LIMITED_UNITS, ids=lambda p: p.name)
+def test_start_limit_directives_under_unit_section(unit_path: pathlib.Path) -> None:
+    """EXPECTED_START_LIMIT must be declared in [Unit], and no StartLimit key in [Service].
 
     Since systemd v230 these directives are only honoured under [Unit].
     Under [Service] systemd 255 (the target host) treats them as unknown keys
@@ -534,28 +550,17 @@ def test_start_limit_directives_under_unit_section(
     allow an unbounded 10s restart loop — especially dangerous when combined
     with the watchdog.
     """
-    content = service_path.read_text(encoding="utf-8")
-    sections = parse_sections(content)
+    sections = parse_sections(_service_unit_text(unit_path))
+    unit_directives = _directives(sections.get("Unit", []))
+    service_directives = _directives(sections.get("Service", []))
 
-    unit_text = "\n".join(sections.get("Unit", []))
-    service_text = "\n".join(sections.get("Service", []))
+    missing = [d for d in EXPECTED_START_LIMIT if d not in unit_directives]
+    assert not missing, f"{unit_path.name} must declare {missing} under [Unit]"
 
-    # Must be present in [Unit]
-    assert "StartLimitIntervalSec=600" in unit_text, (
-        f"StartLimitIntervalSec=600 must be under [Unit] in {service_path.name}"
-    )
-    assert "StartLimitBurst=10" in unit_text, (
-        f"StartLimitBurst=10 must be under [Unit] in {service_path.name}"
-    )
-
-    # Must NOT appear in [Service] (where systemd 255 ignores them)
-    assert "StartLimitIntervalSec" not in service_text, (
-        f"StartLimitIntervalSec must NOT be under [Service] in {service_path.name} "
-        "(systemd >=230 only honours it under [Unit])"
-    )
-    assert "StartLimitBurst" not in service_text, (
-        f"StartLimitBurst must NOT be under [Service] in {service_path.name} "
-        "(systemd >=230 only honours it under [Unit])"
+    misplaced = [d for d in service_directives if d.startswith("StartLimit")]
+    assert not misplaced, (
+        f"{unit_path.name} declares {misplaced} under [Service], where systemd "
+        ">=230 silently ignores them; they belong under [Unit]"
     )
 
 
@@ -580,12 +585,13 @@ _EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES = {
     "orchestrator-autopilot-video.service",
     "orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service",
+    "orchestrator-stream-touch.service",
     "orchestrator-watchdog.service",
 }
 
 
 def test_orchestrator_service_glob_covers_all_known_units() -> None:
-    """Coverage guard: the glob must be non-empty and include all eight known units.
+    """Coverage guard: the glob must be non-empty and include all nine known units.
 
     A wrong CWD or other glob mishap would silently shrink the parametrized
     ORCH_UNIT lint below to zero cases — a zero-case parametrize collects no

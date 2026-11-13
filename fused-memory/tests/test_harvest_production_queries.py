@@ -38,7 +38,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo, load_script_module
+from _fm_git_repos import _init_git_repo
+from _fm_helpers import load_script_module
 from shared.briefing_queries import (
     CONVENTIONS_AREA,
     CONVENTIONS_GENERIC,
@@ -48,6 +49,9 @@ from shared.briefing_queries import (
     BriefingScope,
     queries_for,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
@@ -80,10 +84,10 @@ class TestTheScriptIsLoadedOnceNotReExecuted:
 
     Narrower than the bake-off module's version of this test, and
     deliberately so: the hazard THAT one names —
-    ``scripts/read_transform_selection.py::_load_script`` serving
-    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check — cannot
-    reach this key at all, because that bootstrap is only ever called via
-    ``bake_off()`` with the name ``'bake_off_storage_shape'``.
+    ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``
+    serving whichever object a test module last registered — cannot reach
+    this key at all, because no script asks it for
+    ``'harvest_production_queries'``.
 
     What is real here is smaller: TWO test modules register
     ``'harvest_production_queries'`` for the same file — this module's
@@ -1216,6 +1220,23 @@ class TestTheJournalPathIsAnchoredOnTheMainCheckout:
         result = _load_copy_in(plain).harvest(journal, tail_sample=5)
 
         assert result.journal_path == 'data/j.db'
+
+
+class TestTheDefaultJournalIsTheMainCheckouts:
+    """The default `--journal` is derived from where the checkout really lives.
+
+    It names no user's home directory, and a lane run reads the same live
+    journal as a run from the main checkout.
+    """
+
+    def test_a_lane_copy_defaults_to_the_main_checkouts_journal(self, tmp_path):
+        main, lane = _seed_checkout_with_harvest_copy(tmp_path)
+
+        args = _load_copy_in(lane).build_parser().parse_args(
+            ['--out', str(tmp_path / 'out.jsonl')]
+        )
+
+        assert Path(args.journal).resolve() == main / 'data' / 'reconciliation' / 'write_journal.db'
 
 
 class TestTheCommittedArtifactsCarryNoAbsolutePath:

@@ -19,7 +19,8 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
+from shared.milestone_rearm import rearmed_milestone
 
 from fused_memory.backends import sqlite_task_backend
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -337,6 +338,42 @@ async def test_chain_titles_do_not_accumulate_run_labels(interceptor, backend, r
     assert len(link3s) == 1, link3s
     assert link3s[0]['title'] == 'Nightly check [due 2026-09-03T12:00:00+00:00]'
     assert (await backend.get_task(link2_id, project_root=root))['status'] == 'done'
+
+
+@pytest.mark.asyncio
+async def test_a_rearmed_link_mints_a_successor_with_exactly_one_run_label(
+    interceptor, backend, root, store_clock,
+):
+    pid = await _seed_carrier(interceptor, backend, root)
+    assert 'error' not in await interceptor.set_task_status(pid, 'done', root)
+    [link2] = await _chain_links(backend, root, excluding=pid)
+    link2_id = str(link2['id'])
+    link2_title = 'Nightly check [due 2026-09-02T12:00:00+00:00]'
+    assert link2['title'] == link2_title
+
+    rearm = await interceptor.update_task(
+        link2_id,
+        root,
+        metadata=json.dumps({
+            'milestone': rearmed_milestone(
+                link2['metadata']['milestone'], '2026-09-03T06:00:00+00:00',
+            ),
+        }),
+        metadata_mode='merge',
+    )
+    assert 'error' not in rearm, rearm
+
+    store_clock.advance(timedelta(days=1))
+    assert 'error' not in await interceptor.set_task_status(link2_id, 'in-progress', root)
+    assert 'error' not in await interceptor.set_task_status(link2_id, 'done', root)
+
+    link3s = [
+        t for t in await _chain_links(backend, root, excluding=pid)
+        if t['metadata']['recurrence'].get('minted_from') == link2_id
+    ]
+    assert len(link3s) == 1, link3s
+    assert link3s[0]['title'] == 'Nightly check [due 2026-09-03T12:00:00+00:00]'
+    assert (await backend.get_task(link2_id, project_root=root))['title'] == link2_title
 
 
 @pytest.mark.asyncio

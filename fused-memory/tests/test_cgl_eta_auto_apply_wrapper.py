@@ -38,6 +38,9 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _FM = Path(__file__).resolve().parents[1]
 WRAPPER = _FM / "scripts" / "cgl_eta_auto_apply.sh"

@@ -71,19 +71,14 @@
 // needed nothing of its own — and what its hole decision drives — is documented
 // where that code lives, in charts.jsx.
 //
-// ── SCOPE, ONCE MORE: ALSO ONE TICK-LABEL FORMATTER (task 4232) ────────────
+// ── SCOPE, ONCE MORE: ALSO ONE COUNT-AXIS RULE (task 6370) ─────────────────
 //
-// `formatCountTick` widens this file a second time, and differently: it is not
-// scale/path math at all but the y-tick LABEL a caller hands charts.jsx as
-// `formatY` when its series is an integer COUNT. It is here rather than in
-// charts.jsx for the reason this file exists in the first place — charts.jsx is
-// JSX behind CDN Babel with no node_modules, so nothing defined there can be
-// EXECUTED by a test, and a label rule with a measured table of correct outputs
-// is exactly the kind of thing that must be executed rather than grepped for.
-// It also belongs beside `plottableMax`/`axisY` specifically: those two are
-// what produce the ticks it formats, and its correctness argument is a claim
-// about their arithmetic (see its own header below). `niceCountMax` (task 5121)
-// is its pair: the count-axis MAXIMUM rule, under which every tick is whole.
+// `axisMax` widens this file a second time, and differently: it is a policy,
+// not path math. It decides the axis maximum a charts.jsx chart scales against:
+// a chart marked `countAxis` snaps up via the module-private `niceCountMax`
+// (task 5121), and every other chart keeps its exact data maximum. It is here
+// rather than in charts.jsx so it can be EXECUTED by a test, and because it
+// composes with `plottableMax`, whose folded maximum is its input.
 
 // ── Is this value a real, plottable measurement? ───────────────────────────
 // Finite numbers only. `null`/`undefined` (a missing sample), `NaN`/`±Infinity`
@@ -144,8 +139,8 @@ function sparkScale(values, width, height) {
 // is deliberately just the functions listed in SPARK_PATH_API, and
 // spark_path.test.mjs asserts that set EXHAUSTIVELY.
 //
-// Shared verbatim by all four builders (sparkPaths, stepPaths, axisPaths and
-// stackedAreaPaths), which is most of why task 3489's chart primitives were
+// Shared verbatim by every builder (sparkPaths, stepPaths, axisPaths,
+// bandPaths and stackedAreaPaths), which is most of why task 3489's chart primitives were
 // added to this module rather than a second one.
 function plottableRuns(points) {
   const runs = [];
@@ -336,74 +331,16 @@ function axisY(value, geom) {
   return geom.y0 + geom.height - ((value - geom.min) / geom.range) * geom.height;
 }
 
-// ── Y-tick LABEL for an INTEGER-COUNT axis ─────────────────────────────────
-// The one entry in this module that is not scale/path math. It is the
-// `formatY` a charts.jsx caller passes when its series is a COUNT — memory
-// reads/writes per hour (a SQL `COUNT(*)`), merge attempts per 15-minute
-// bucket, escalation re-filings per day.
-//
-// WHY IT BLANKS RATHER THAN ROUNDS (task 4232). LineChart's ticks are
-// `minV + (range * i) / 4` with minV = 0 and range = plottableMax(all, 1), so
-// on a count axis whose maximum is not a multiple of 4 the default
-// `(v) => String(v)` draws `1.75` / `3.5` / `5.25` — counts that cannot exist.
-// Rounding is the obvious fix and it is the wrong one: it trades fractional
-// labels for FABRICATED ones. Measured under node on those exact ticks,
-// `Math.round` gives 0/0/1/1/1 at maxV=1, 0/1/1/2/2 at maxV=2, 0/1/3/4/5 at
-// maxV=5, and labels a 749.25 gridline `749` at maxV=999 — i.e. duplicate
-// labels, which is character-for-character the defect task 4059 was filed for
-// one primitive over. maxV=1 is not a corner case: `plottableMax(values, 1)`
-// seeds at 1, so every idle or all-zero count series lands exactly there.
-//
-// Labelling only the whole ticks never fabricates and never duplicates:
-// maxV=7 -> ['0','','','','7'], maxV=10 -> ['0','','5','','10'], and
-// maxV=4/8/12/100 label all five ticks identically to rounding. Because maxV
-// is always an integer on a count axis, the FLOOR and the PEAK are always
-// labelled. This is the same omit-rather-than-fabricate rule the rest of this
-// file is built on: an unlabelled gridline is an omission, whereas a `2`
-// printed on a 1.75 gridline is a measurement that was never taken.
-//
-// THE WHOLE-NUMBER TEST IS EXACT, WITH NO TOLERANCE. `range * i` is an exact
-// integer (at most 4 * maxV, far inside 2^53) and the tick count 4 is a power
-// of two, so `(range * i) / 4` only decrements the exponent and is exact in
-// IEEE-754. Every tick is therefore the exact rational maxV*i/4 and
-// `Number.isInteger` is mathematically correct on it — the same property the
-// axisY fixtures rely on.
-//
-// DELIBERATELY NOT LineChart's DEFAULT. Four call sites rely on that default
-// and only three of them are counts: tab_escalation_analytics.jsx plots a
-// genuine `filings / done` ratio (escalation_analytics.py::_esc_per_done)
-// through it, and rounding-by-default would collapse that axis to 0/0/0/1/1
-// exactly as pre-4059 StackedAreaChart collapsed the 100%-normalized Workflow
-// axis. So this is opt-in per caller, and LineChart's default stays
-// `(v) => String(v)`.
-//
-// THE AXIS-MAXIMUM SNAP NOW EXISTS as `niceCountMax` below (task 5121), and a
-// chart opts into it per caller via its `snapMax` prop. Under a snapped maximum
-// every tick is whole, so this function labels all five; it stays wired at the
-// count callers as the label rule for any axis maximum that was not snapped.
-//
-// Non-finite and absent input yields '' rather than `String(v)`: this is
-// called from inside a JSX render, so `NaN`/`undefined` must never reach an
-// axis as text and it must never throw (one exception blanks the whole chart).
-// `Number.isInteger` is the WHOLE guard for that, with no finiteness conjunct
-// beside it: unlike the global `isNaN`/`parseInt` family it does not coerce, so
-// it returns false for every non-number (`null`, `undefined`, `'4'`, `{}`) and
-// for `NaN`/`±Infinity` on its own. Verified under node — the two spellings
-// never diverge on any input.
-function formatCountTick(v) {
-  return Number.isInteger(v) ? String(v) : '';
-}
-
 // ── Count-axis MAXIMUM: the smallest multiple of the tick count >= maxV ────
-// The `snapMax` a charts.jsx caller passes when its series is a COUNT (task
-// 5121). Taking the axis maximum as given costs real labels: over every integer
-// maxV in 1..200, 100 axes label only 2 of their 5 ticks and 50 label 3, and
-// maxV=999 reads `0 ... 999` over three bare gridlines. Snapped, 999 -> 1000
-// and every tick is labelled.
+// Module-private, reached only through axisMax below (task 5121). Taking a
+// count axis's maximum as given leaves fractional gridlines: over every integer
+// maxV in 1..200, 100 axes have only 2 of their 5 ticks whole and 50 have 3,
+// and maxV=999 reads `0 ... 999` over three fractional gridlines. Snapped,
+// 999 -> 1000 and every tick is whole.
 //
 // Exact, with no tolerance: a multiple of `ticks` divided by `ticks` is an
-// exact integer in IEEE-754, so formatCountTick's `Number.isInteger` labels all
-// five ticks. spark_path_count_axis.test.mjs pins the table and the 1..200 sweep.
+// exact integer in IEEE-754, so every tick (max*i)/ticks is whole.
+// spark_path_count_axis.test.mjs pins the table and the 1..200 sweep.
 //
 // OPT-IN, never a default: a fraction axis snaps 0.8 or 1 up to 4, so a ratio
 // or 100%-normalized chart would read 0%..400%.
@@ -413,6 +350,15 @@ function formatCountTick(v) {
 function niceCountMax(maxV, ticks) {
   if (!isPlottable(maxV) || !Number.isInteger(ticks) || ticks <= 0) return maxV;
   return Math.ceil(maxV / ticks) * ticks;
+}
+
+// ── The axis maximum a charts.jsx chart scales against (task 6370) ─────────
+// A COUNT axis (the chart's `countAxis` prop) snaps up to a whole multiple of
+// the tick count via niceCountMax, so every tick is an exact integer. Every
+// other axis keeps its exact data maximum. Only a literal `true` snaps, because
+// snapping a fraction axis reads 0%..400%.
+function axisMax(dataMax, ticks, countAxis) {
+  return countAxis === true ? niceCountMax(dataMax, ticks) : dataMax;
 }
 
 // ── Line + area path builder for a PADDED chart (charts.jsx's `LineChart`) ─
@@ -444,7 +390,7 @@ function niceCountMax(maxV, ticks) {
 // series paths are skipped.
 function axisPaths(values, geom) {
   const series = values || [];
-  const stepX = geom.width / Math.max(geom.count - 1, 1);
+  const stepX = columnStepX(geom);
   const baselineY = geom.y0 + geom.height;
 
   // x comes from the ORIGINAL index, exactly as sparkScale does — compacting
@@ -471,6 +417,41 @@ function axisPaths(values, geom) {
   }
 
   return { line: lines.join(' '), area: areas.join(' '), stepX };
+}
+
+// The one x-mapping of the padded charts, shared by axisPaths, bandPaths and
+// stackedAreaPaths so a band or stack can never drift from the line it sits
+// under. Module-private.
+function columnStepX(geom) {
+  return geom.width / Math.max(geom.count - 1, 1);
+}
+
+// One run of [x, yTop, yBase] points as a closed polygon: forward along the
+// top, back along the base. A one-column run is a zero-width sliver at its own
+// x, never widened toward a neighbouring slot. Module-private.
+function closedBand(run) {
+  const forward = run.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`));
+  const back = run.slice().reverse().map(p => `L${p[0]},${p[2]}`);
+  return `${forward.concat(back).join(' ')} Z`;
+}
+
+// ── Bound band for a PADDED chart (charts.jsx's `LineChart` `band` prop) ───
+// Same `geom` as axisPaths. Returns one closed subpath per run of indices
+// where BOTH lo[i] and hi[i] are plottable; a hole in either bound ends the
+// run, and a band with nothing plottable is []. A missing bound is a band of
+// holes, so a count series with no interval draws nothing rather than a
+// fabricated band.
+function bandPaths(lo, hi, geom) {
+  const lower = lo || [];
+  const upper = hi || [];
+  const stepX = columnStepX(geom);
+  const points = [];
+  for (let i = 0; i < Math.max(lower.length, upper.length); i++) {
+    const yTop = axisY(upper[i], geom);
+    const yBase = axisY(lower[i], geom);
+    points.push(yTop === null || yBase === null ? null : [geom.x0 + i * stepX, yTop, yBase]);
+  }
+  return plottableRuns(points).map(closedBand);
 }
 
 // ── Bar sizes as a fraction of the axis max (`BarChart`, `HistBar`, ───────
@@ -559,9 +540,9 @@ function barFractions(values, max) {
 //
 // THE OPTIONAL `snapMax` maps that folded maximum to the axis maximum BEFORE
 // any band is scaled, and defaults to the identity. StackedAreaChart passes
-// niceCountMax for count axes (task 5121). It has to live here rather than at
-// the call site because the polygons are scaled inside this function: a snap
-// applied to the returned `max` would move the ticks but not the bands.
+// axisMax for a `countAxis` chart (task 6370). It has to live here rather than
+// at the call site because the polygons are scaled inside this function: a
+// snap applied to the returned `max` would move the ticks but not the bands.
 //
 // On hole-free input this reproduces the pre-fix polygons character-for-
 // character (the scrub never fires, and clause (b) introduces no new maximum);
@@ -569,7 +550,7 @@ function barFractions(values, max) {
 function stackedAreaPaths(stacks, geom, snapMax = (foldedMax) => foldedMax) {
   const layers = (stacks || []).map(st => (st && st.values) || []);
   const count = geom.count;
-  const stepX = geom.width / Math.max(count - 1, 1);
+  const stepX = columnStepX(geom);
 
   // Per layer, per column: the cumulative base/top pair, or null where the
   // prefix rule says this band's position is unknowable.
@@ -616,20 +597,11 @@ function stackedAreaPaths(stacks, geom, snapMax = (foldedMax) => foldedMax) {
       );
     }
 
-    const polygons = [];
-    for (const run of plottableRuns(points)) {
-      // Forward along the top, back along the base, closed — the same shape
-      // the pre-fix code built, but per RUN rather than once across the whole
-      // label row, so a band never spans a column it was not measured in. A
-      // run of one column emits a zero-width polygon at its own x (a thin tick
-      // under the component's stroke): an honest "measured here, unknown
-      // either side", deliberately not widened toward a neighbouring slot.
-      const forward = run.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`));
-      const back = run.slice().reverse().map(p => `L${p[0]},${p[2]}`);
-      polygons.push(`${forward.concat(back).join(' ')} Z`);
-    }
-
-    return polygons.join(' ');
+    // The same shape the pre-fix code built, but per RUN rather than once
+    // across the whole label row, so a band never spans a column it was not
+    // measured in. A run of one column is a thin tick under the component's
+    // stroke: an honest "measured here, unknown either side".
+    return plottableRuns(points).map(closedBand).join(' ');
   });
 
   return { max, paths, stepX };
@@ -647,9 +619,9 @@ const SPARK_PATH_API = {
   stepPaths,
   plottableMax,
   axisY,
-  formatCountTick,
-  niceCountMax,
+  axisMax,
   axisPaths,
+  bandPaths,
   barFractions,
   stackedAreaPaths,
 };

@@ -13,6 +13,7 @@ from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
@@ -23,6 +24,8 @@ from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.targeted import TargetedReconciler
 from fused_memory.reconciliation.verify import CodebaseVerifier
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest_asyncio.fixture
@@ -5082,10 +5085,9 @@ class TestVerificationFailureAudit:
 
         with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
             agent = AsyncMock()
-            agent.run = AsyncMock(return_value=(
-                {'warning': 'no_tool_calls', 'warning_origin': 'cli_output_unparseable', 'text': ''},
-                [],
-            ))
+            agent.run = AsyncMock(return_value={
+                'warning': 'no_tool_calls', 'warning_origin': 'cli_output_unparseable', 'text': '',
+            })
             MockAgentLoop.return_value = agent
 
             await _run_done_transition(reconciler, project_root=str(real_root))
@@ -5514,6 +5516,52 @@ async def test_unblock_dependent_guards(
             reconciler.task_interceptor.set_task_status.assert_not_awaited()
     else:
         mock_taskmaster.set_task_status.assert_not_awaited()
+
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_VETO_READER_SOURCE = 'source=targeted._unblock_veto_reason'
+
+
+def _veto_reader_discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _VETO_READER_SOURCE in m]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'metadata, expected_type, census_lines',
+    [
+        pytest.param('{not json', 'dependent_unblock_applied', 1, id='unparseable_string'),
+        pytest.param(42, 'dependent_unblock_applied', 1, id='non_str_value'),
+        pytest.param(
+            json.dumps({'parent_cancelled': '7'}), 'dependent_unblock_vetoed', 0,
+            id='readable_json_string_control',
+        ),
+    ],
+)
+async def test_unblock_veto_reader_logs_unreadable_dependent_metadata_once(
+    wired_reconciler, mock_taskmaster, tmp_path, caplog,
+    metadata, expected_type, census_lines,
+):
+    """Unreadable dependent metadata still reads as empty, so it raises no
+    veto (the ``blocked_unparseable_metadata_treated_as_empty`` pin above),
+    but the veto reader now logs the discard once under the shared census
+    line. Readable metadata is not logged."""
+    dependent = {
+        'id': '2', 'title': 'Downstream', 'status': 'blocked',
+        'dependencies': ['1'], 'metadata': metadata,
+    }
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(dependent))
+
+    with caplog.at_level(logging.WARNING):
+        result = await wired_reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root=str(tmp_path),
+            task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+        )
+
+    assert [a['type'] for a in _dep_actions_for(result, '2')] == [expected_type]
+    assert len(_veto_reader_discard_lines(caplog)) == census_lines
 
 
 # ── task-4903: durability of the write + per-dependent isolation ───────────

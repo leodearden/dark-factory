@@ -11,7 +11,10 @@ import suite_census_evidence as ev
 import suite_census_outcomes as oc
 import suite_census_pinning as pinning
 import suite_census_rust as rust
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from suite_census_fixtures import nextest_project, pytest_project
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _argv(ecosystem: str, project: Path, out: Path, *extra: str) -> list[str]:

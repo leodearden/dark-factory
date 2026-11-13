@@ -1,0 +1,28 @@
+{
+ "stream": "S15",
+ "prd_path": "docs/prds/review-all-provider-mode-as-a-typed-axis.md",
+ "manifest_path": "docs/prds/review-all-provider-mode-as-a-typed-axis.capability-manifest.yaml",
+ "leaves_estimate": 8,
+ "lead_rulings_on_open_questions": [
+  "Q1: ProviderMode is homed in settings.py (S18 stratum 0, imports nothing); models/billing_run.py imports it downward and the column still uses enum_column. The S9 amendment line 'S15's mode-column leaf depends on S9-beta and gamma1 (ProviderMode homed in models/billing_run.py)' is amended to 'ProviderMode homed in settings.py; models/billing_run.py imports it'; S9's D3 home rule gains 'or the lowest stratum that types it'.",
+  "Q2: task 466 (P-Gate theta) is re-scoped onto S15: edges 466 -> alpha1 and 466 -> epsilon; dated note (no billing/providers/mode.py, no gocardless_environment — derived from mode; production refuses sandbox too per R15; B19's production+fake half becomes beta's row; the replay case edits ci/billing_drift_lane.py; find_by_reference_key takes ReferenceKey); its delivered_check providers-for-issue-built is repathed or dropped. 466 keeps replay-safe Stripe, the lookups, the provider-customer record and the issue wiring.",
+  "Q3 RULED by Leo 2026-10-16 (ruled_by: human; session rule:solar_challenge_platform#1279, commit d6ea845): production fails closed and a new `staging` ENVIRONMENT rung (development/test < staging < production) carries demos and pre-production testing. staging is hardened like production, admits non-production modes each set explicitly, and refuses provider mode live. Every hermetic-switch row declares which environments refuse it (one mechanism in S24-gamma 1077): hardening rows (444's secret rules, db-sqlite, mqtt-tls-off, telemetry-store-volatile, consent-off) refused on staging and production; reality rows (provider-mode-not-live, clock-override, registry-yaml-only, a new simulated-fleet row) refused in production only. Riders: R-a 461 drops BILL from PROVIDER_ROLES and 465 adds the issue role (1278/461 second-to-land adapts); R-b 1279 updates 444's O4 case; R-c 653's sandbox witness = a pytest lane. Follow-up filed: a staging banner in the ops console and member portal. Options rejected: A as originally ruled (nu's drain would need an unrecorded ENVIRONMENT override), B1 free flag, B2 sandbox on a simulated fleet, C pull 461 forward; D adopted as a third rung rather than a second axis.",
+  "Q4: edges 641, 644 and 655 -> S15-epsilon added (add-the-edge rule), so P-Collect's attempt and paid-out-of-band keys and P-Correct's revision extend provider_keys / ReferenceKey."
+ ],
+ "lead_actions_at_decompose": [
+  "delta = 1025 amended in place (+ fk-060d7b2890a1); 1014 and 1041 unchanged (delta/alpha1 depend on 1014; zeta on 1041)",
+  "routing stamps: fk-97dcf1114cc0 -> 637 (plus zeta); fk-29ac1fb9951f -> 637 and 641; fk-fc2f2705caa3 -> 641 and 466 (the replay-idempotency half of fk-0959d091d763 goes to 466)",
+  "edges 466 -> alpha1 + epsilon; 641, 644, 655 -> epsilon; coordination notes on 465, 467, 644/641, 655, 653",
+  "nothing held once S2 is filed: alpha2 -> 1151 (S3-epsilon); beta -> 1077 (S24-gamma); gamma -> S2-beta2 (push read-through and codec) + 1098 (S9-beta) + 1100 (S9-gamma1); delta -> 1097 (S18-alpha)",
+  "high leaves epsilon, zeta -> gate 1065"
+ ],
+ "cross_reference_lines": [
+  "Seam row 'billing/providers/ binding constructors': billing/providers/binding.py::providers_for / stripe_for / gocardless_for with ProviderPorts, ProviderCredentials and ProviderModeRefused (C10's providers_from_env renamed: it reads Settings, not env).",
+  "S3: BillGraph gains providers: ProviderPorts; S15-alpha2 depends on S3-epsilon (1151).",
+  "S24: PROVIDER_ROLES (instance/topology.py) is the roles value of the provider-mode-not-live row and of the two provider secret rows; S15-beta depends on S24-gamma (1077).",
+  "S2: the push takes one providers: ProviderPorts, not separate stripe and gocardless arguments, and the codec maps mode; S15-gamma depends on S2's push module (beta2).",
+  "S18: delta moves ci from stratum 1 to 7 in docs/package-strata.toml in the change that moves the lane (ci now imports billing and stays below validation); no allowlist entry.",
+  "S12: contention only on validation/run.py::query_smoke_summary and dropped_readings.py::_bill_or_raise. S23: RunView may carry mode (optional).",
+  "Triage: after zeta, fake refs start with fake_, so a fake_ ref seen in a production database is evidence of the pre-beta hazard, not a new defect."
+ ]
+}

@@ -1,0 +1,278 @@
+# Machine-readable twin of plans/instruments-honesty-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract; loader shared/src/shared/capability_manifest.py.
+# task_id values are stamped by commit_planning at decompose. Every grep pattern below had 0 matches on
+# main a42f82cb52 (2026-11-05), so each check fails until its producer lands.
+prd: plans/instruments-honesty-prd.md
+schema_version: 1
+signal_leaves: ["θ"]
+tasks:
+  - label: "α"
+    task_id: 8558
+    title: "tasks.created_at + created_at_source: v5→v6 migration, stamp in add_task, projection keys, dashboard Filed column, backfill script"
+    capabilities:
+      - name: "created-at-columns-in-ddl-and-ladder"
+        binding: "capability→producer — fused-memory/src/fused_memory/backends/sqlite_task_backend.py TASK_STORE_DDL + _migrate_v5_to_v6 (new) on the _migrate_v1_to_v2 / add_column_if_missing idiom"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _migrate_v5_to_v6\\("
+          paths: ["fused-memory/src/fused_memory/backends/"]
+          expect: present
+      - name: "created-at-source-stamped-in-add-task"
+        binding: "field-population — SqliteTaskBackend.add_task writes created_at from the same now as pending_since and created_at_source='stamped'; add_task is the only INSERT into tasks (six callers)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "created_at_source"
+          paths: ["fused-memory/src/fused_memory/backends/sqlite_task_backend.py"]
+          expect: present
+      - name: "projection-exposes-created-at"
+        binding: "capability→producer — fused-memory/src/fused_memory/backends/task_projection.py::TASK_ROW_KEYS gains both keys, omitted on a connection whose v6 ALTER never landed"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "created_at"
+          paths: ["fused-memory/src/fused_memory/backends/task_projection.py"]
+          expect: present
+      - name: "backfill-script-exists"
+        binding: "capability→producer — scripts/backfill_task_created_at.py (new); the earliest usable of the runs.db first event, a non-backfilled pending_since and updated_at; never overwrites a stamped row"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "created_at_source"
+          paths: ["scripts/backfill_task_created_at.py"]
+          expect: present
+  - label: "β1"
+    task_id: 8559
+    title: "Scheduler snapshot truth: flush at pause/resume/restore/shutdown; shared cross-checking reader; dashboard paused list consumes it"
+    capabilities:
+      - name: "flush-called-from-harness"
+        binding: "capability→producer (wired) — orchestrator/src/orchestrator/harness.py calls Scheduler.flush_state_snapshot (exists, zero callers today) at pause_scheduler, resume_scheduler, _load_persisted_scheduler_pause and the run() shutdown finally"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "flush_state_snapshot\\("
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "checked-reader-homed-in-shared"
+        binding: "capability→producer — shared/src/shared/scheduler_state.py::read_scheduler_state_checked (new) beside SchedulerStateSnapshot; reads runs.db scheduler_state mode=ro via RunStore.load_scheduler_pause's row shape"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def read_scheduler_state_checked\\("
+          paths: ["shared/src/shared/scheduler_state.py"]
+          expect: present
+      - name: "both-consumers-call-the-reader"
+        binding: "capability→producer (wired) — fused-memory/src/fused_memory/mcp_tools/scheduler_state.py and dashboard/src/dashboard/data/scheduler.py call read_scheduler_state_checked; the dashboard keeps importing only shared"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "read_scheduler_state_checked"
+          paths: ["dashboard/src/dashboard/data/scheduler.py", "fused-memory/src/fused_memory/mcp_tools/scheduler_state.py"]
+          expect: present
+  - label: "β2"
+    task_id: 8560
+    title: "Run-store counters: lifetime review_cycles, cap-pause before finish_run, persisted digest window"
+    capabilities:
+      - name: "review-cycles-from-lifetime-counter"
+        binding: "capability→producer (wired) — harness.py TaskReport build reads TaskArtifacts.get_review_cycles_total (exists in artifacts.py, reachable after run(), persisted per task) instead of workflow.metrics.review_cycles"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "get_review_cycles_total"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "digest-window-table"
+        binding: "capability→producer — orchestrator/src/orchestrator/run_store.py digest_window single-row table (new) on the main_sweep_cold_control / add_column_if_missing_sync pattern; seeded by harness.py::_init_digest_state"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "digest_window"
+          paths: ["orchestrator/src/orchestrator/run_store.py"]
+          expect: present
+      - name: "cap-pause-written-before-finish-run"
+        binding: "field-population — harness.py sets report.paused_for_cap / cap_pause_duration_secs from usage_gate.total_pause_secs BEFORE _run_store.finish_run; today the order is reversed"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an ordering of two existing calls inside Harness.run; pinned by β2's ordering test, not expressible as a stable grep"
+  - label: "γ"
+    task_id: 8561
+    title: "Merge-halt events and the 7-day halt-hours datum"
+    capabilities:
+      - name: "halt-event-types"
+        binding: "capability→producer — orchestrator/src/orchestrator/event_store.py::EventType gains merge_halted / merge_unhalted (name == value, test_all_event_types_valid)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_halted"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "edge-detected-transition-callback"
+        binding: "capability→producer (wired) — merge_lane/halt.py::HaltState.on_transition (new, beside on_resume) fired only on a lane state change; wired to the event store where merge_lane/worker.py constructs HaltState"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "on_transition"
+          paths: ["orchestrator/src/orchestrator/merge_lane/halt.py"]
+          expect: present
+      - name: "halt-hours-datum"
+        binding: "readers-prove-their-producer — dashboard/src/dashboard/data/merge_halt.py::halt_hours (new) on the data/merge_queue.py::merge_attempts with_db + Datum template; 'no halt event recorded yet' distinct from 0 h"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def halt_hours\\("
+          paths: ["dashboard/src/dashboard/data/merge_halt.py"]
+          expect: present
+  - label: "δ"
+    task_id: 8562
+    title: "Resolution provenance: ruled_by_human, level-2 class requirement, resolver_tier(record), skill and sitting-path stamping, analytics and shadow-ruling relabel"
+    capabilities:
+      - name: "ruled-by-human-field"
+        binding: "capability→producer — escalation/src/escalation/models.py::Escalation.ruled_by_human (new); legacy JSON reads None through the to_dict/from_dict filter (no migration)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ruled_by_human"
+          paths: ["escalation/src/escalation/models.py"]
+          expect: present
+      - name: "level-2-class-required-typed-refusal"
+        binding: "rejection-mechanism — queue.py::EscalationQueue.resolve refuses a level-2 close with a None stamped class as resolution_class_required; tests assert the code, never the class enum"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "resolution_class_required"
+          paths: ["escalation/src/escalation/"]
+          expect: present
+      - name: "record-based-tier"
+        binding: "capability→producer (wired) — classify.py::resolver_tier(record) (new) over the unchanged classify_resolver_tier(resolved_by); shadow_ruling.py and dashboard escalation_analytics.py route through it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def resolver_tier\\("
+          paths: ["escalation/src/escalation/classify.py"]
+          expect: present
+      - name: "l2-skill-stamps-class"
+        binding: "capability→producer — skills/escalation-watcher/SKILL.md resolve examples pass resolution_class (0 mentions today) and state the ruled_by_human rule; contract test runs the examples against the fixture server (INV-10)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "resolution_class"
+          paths: ["skills/escalation-watcher/SKILL.md"]
+          expect: present
+      - name: "sitting-path-stamps"
+        binding: "capability→producer (wired) — scripts/sitting/payloads.py::resolve_issue_payload and prepare_sitting.py::_cmd_resolve_answers carry resolution_class and ruled_by_human"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ruled_by_human"
+          paths: ["scripts/sitting/"]
+          expect: present
+      - name: "executor-identity-upstream"
+        binding: "DAG-direction — the executor / coordinator identities and the executor-side class requirement are decision-stream α (task 8422, in progress), upstream of δ"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a dependency edge on 8422, wired at decompose"
+  - label: "ε"
+    task_id: 8563
+    title: "Brief over the registry's roots with activity fields; landed over landings(); digest done-in-window via to_thread; relabel the former counts"
+    capabilities:
+      - name: "brief-roots-from-registry"
+        binding: "capability→producer (wired) — scripts/sitting/return_brief.py::build measures §2–§5 over inventory.queue_project_roots(sources.queues_scanned) (helper exists, used by prepare_sitting.read_sources today)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "queue_project_roots"
+          paths: ["scripts/sitting/return_brief.py"]
+          expect: present
+      - name: "landed-counts-landings"
+        binding: "capability→producer — scripts/sitting/fleet_state.py::landed keeps Measurement[int], gains repo, counts shared.quality_series.landings rows in the window; orchestrator digest.py calls the same through asyncio.to_thread"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "quality_series"
+          paths: ["scripts/sitting/fleet_state.py", "orchestrator/src/orchestrator/digest.py"]
+          expect: present
+      - name: "landings-datum-upstream"
+        binding: "DAG-direction — shared/src/shared/quality_series/landings.py::landings is quality-dashboard α (task 8457, pending), upstream of ε; 8457 amended to promise since_cursor=None means full history"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a dependency edge on 8457, wired at decompose"
+      - name: "activity-fields-on-projectstate"
+        binding: "field-population — fleet_state.ProjectState gains unit_active, pause_reason (runs.db scheduler_state row), new_escalations, active, inactive_reason; every scanned root appears once"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "inactive_reason"
+          paths: ["scripts/sitting/fleet_state.py"]
+          expect: present
+  - label: "ζ"
+    task_id: 8564
+    title: "Counting rules beside the stores and docs/data-map.md; burndown measured_snapshots view; OPERATIONS.md corrections; review-all header and Phase 0 refresh"
+    capabilities:
+      - name: "data-map-exists"
+        binding: "capability→producer — docs/data-map.md (new) points at EventType, disposition.py, metadata.spawn_context, resolver tiers, landings(), created_at and each store's timestamp type without restating them (INV-9)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_halted"
+          paths: ["docs/data-map.md"]
+          expect: present
+      - name: "measured-snapshots-view"
+        binding: "capability→producer — dashboard/src/dashboard/data/burndown.py BURNDOWN_SCHEMA gains CREATE VIEW IF NOT EXISTS measured_snapshots with the state IS NULL OR state = 'value' predicate"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "measured_snapshots"
+          paths: ["dashboard/src/dashboard/data/burndown.py"]
+          expect: present
+      - name: "review-all-dispositions-header"
+        binding: "capability→producer — skills/review-all render + report-format carry 'dispositions as of <as_of_sha>'; Phase 0 refreshes by x_finding_key as hotspot-survey does"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "dispositions as of"
+          paths: ["skills/review-all/"]
+          expect: present
+  - label: "η"
+    task_id: 8565
+    title: "Deploy gate (OPERATOR GATE): delete the return-brief drop-in, drop the autotrade root, drained fleet sweep, amend the owner tasks"
+    capabilities:
+      - name: "units-and-drop-in-patched"
+        binding: "capability→producer — host-local systemd files (~/.config/systemd/user/return-brief.service.d/known-project-roots.conf removed; fused-memory.service and dark-factory-dashboard.service root lists lose /home/leo/src/autotrade), patched surgically"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "host-local, gitignored state; verified by θ row 1"
+      - name: "producers-reach-production"
+        binding: "DAG-direction — α β1 β2 γ δ ε ζ upstream; the drained fleet sweep restarts every unit on the new code"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a fleet restart, verified by θ"
+  - label: "θ"
+    task_id: 8566
+    title: "Integration gate: boundary rows 1–21 against the live df and reify stores (rows 3–5 on a fixture orchestrator), observed postconditions recorded in the PRD"
+    capabilities:
+      - name: "boundary-sketch-observed"
+        binding: "DAG-direction — every producer upstream through η; live rows read live stores, never seeded rows (INV-13)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "## Integration gate record"
+          paths: ["plans/instruments-honesty-prd.md"]
+          expect: present
+  - label: "ι"
+    task_id: 8567
+    title: "Observation 7 days after θ: producers wrote in production; record appended to the PRD"
+    capabilities:
+      - name: "observation-record"
+        binding: "readers-prove-their-producer — counts of created_at-stamped tasks, snapshot flushes on real pauses, halt events for real halts, class-stamped L2 closes and nightly brief coverage since deploy, each with its rule"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "## Observation record"
+          paths: ["plans/instruments-honesty-prd.md"]
+          expect: present

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
+from _jsx_source_helpers import extract_function_body, strip_js_comments, walk_balanced
 
 
 class TestOverviewTabCurrentTaskRemoved:
@@ -69,7 +69,7 @@ def tab_overview_jsx_code(tab_overview_jsx_body):
     file's `alarmed_open` / `clear` assertions once passed while matching only
     explanatory prose.
 
-    The stripping itself is delegated to `_dashboard_helpers.strip_js_comments`,
+    The stripping itself is delegated to `_jsx_source_helpers.strip_js_comments`,
     which is quote-aware (it will not eat a `//` inside a string literal) and
     whose contract is pinned by `TestStripJsComments` in
     test_jsx_source_helpers.py.

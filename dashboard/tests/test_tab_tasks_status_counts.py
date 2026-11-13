@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     destructure_bindings,
     extract_function_body,
     strip_js_comments,
@@ -167,10 +167,10 @@ class TestRowsComeFromTheSnapshotByView:
         setter = re.search(r'\bconst\s+flipFilter\s*=\s*\(?\s*\w+\s*\)?\s*=>\s*(\w+)\(', tasks_tab_code)
         assert setter, 'TasksTab has no `const flipFilter = key => setX(...)`'
         state = re.search(
-            rf'\bconst\s*\[\s*\w+\s*,\s*{setter.group(1)}\s*\]\s*=\s*tasksPersistedState\(\s*[\'"]([^\'"]+)[\'"]',
+            rf'\bconst\s*\[\s*\w+\s*,\s*{setter.group(1)}\s*\]\s*=\s*usePersistedState\(\s*[\'"]([^\'"]+)[\'"]',
             tasks_tab_code,
         )
-        assert state, f'the filter setter {setter.group(1)} is not a tasksPersistedState'
+        assert state, f'the filter setter {setter.group(1)} is not a usePersistedState'
         assert state.group(1) != 'df.tasksFilters', (
             'a browser holding the old {active, pending, ...} object would read as "nothing '
             'selected" under the view keys; a fresh storage key makes it fall back to the default.'
@@ -214,11 +214,11 @@ class TestRowsComeFromTheSnapshotByView:
         gate = re.search(
             rf'\bconst\s+(\w+)\s*=\s*{listed}\.placeholder\s*&&\s*{filtered}\.length\s*===\s*0\s*;', tasks_tab_code,
         )
-        body = gate and re.search(rf'\{{\s*!\s*{gate.group(1)}\s*&&\s*\(', tasks_tab_code)
+        body = gate and re.search(rf'!\s*{gate.group(1)}\s*&&\s*\(', tasks_tab_code)
         drawn = body and walk_balanced(tasks_tab_code, body.end() - 1, '(', ')')
-        assert drawn and '<TaskGraph' in drawn and '<ProjectPrdGroups' in drawn, (
+        assert drawn and '<TaskGraph' in drawn, (
             f'TasksTab does not bind `const X = {listed}.placeholder && {filtered}.length === 0;` '
-            'and gate both graph bodies behind `{!X && (...)}`'
+            'and gate the graph body behind `!X && (...)`'
         )
 
 

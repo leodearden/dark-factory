@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 
-from _task_db_scan import TaskDbUnreadable, connect_ro, discover_project_roots, tasks_db_path
+from _task_db_scan import discover_project_roots, tasks_db_path
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 from orchestrator.session_registry import (
@@ -39,13 +39,16 @@ from orchestrator.session_registry import (
     decisions_dir,
     list_decisions,
     normalize_escalations_dir,
-    normalize_project_token,
 )
+from shared.project_id import fold_project_token
 from shared.project_layout import ESCALATION_QUEUE_RELPATH
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
+RECON_QUEUE_RELPATH = Path('data', 'reconciliation', 'escalations')
+RECON_QUEUE_TAG = 'recon'
 QUEUE_TAGS: Mapping[Path, str] = MappingProxyType({
     Path(ESCALATION_QUEUE_RELPATH): '',
-    Path('data', 'reconciliation', 'escalations'): 'recon',
+    RECON_QUEUE_RELPATH: RECON_QUEUE_TAG,
 })
 QUEUE_SUBDIRS: tuple[Path, ...] = tuple(QUEUE_TAGS)
 
@@ -54,7 +57,10 @@ TASK_CITATION_RE = re.compile(r'\btask (\d+)\b', re.IGNORECASE)
 
 _SCAN_CONTEXT = 'sitting.inventory'
 _SCAN_PARSE_ERRORS: tuple[type[BaseException], ...] = (json.JSONDecodeError, KeyError, TypeError, ValueError)
-_KEY_ARITY = {'esc': 3, 'decision': 2}
+ESCALATION_KIND = 'esc'
+AUDIT_KIND = 'audit'
+QUESTION_KINDS = frozenset({ESCALATION_KIND, 'decision'})
+_KEY_ARITY = {ESCALATION_KIND: 3, 'decision': 2, AUDIT_KIND: 2}
 
 ItemKey = tuple[str, ...]
 
@@ -104,6 +110,18 @@ class OpenItem:
     def kind(self) -> str:
         return self.key[0]
 
+    @property
+    def store_task_id(self) -> str | None:
+        """``task_id`` when it names a task in ``project``'s store (all digits), else None.
+
+        None for a sentinel, for no task, and for an escalation on a reconciliation
+        queue: that queue carries other projects' gates, so its ``task_id`` is not
+        a task of ``project``, the queue's own project.
+        """
+        if self.kind == ESCALATION_KIND and queue_tag(self.queue_dir) == RECON_QUEUE_TAG:
+            return None
+        return self.task_id if self.task_id and self.task_id.isdigit() else None
+
 
 @dataclass(frozen=True)
 class PendingRecords:
@@ -135,11 +153,16 @@ class Glossary:
 
 
 def escalation_key(queue_dir: str, escalation_id: str) -> ItemKey:
-    return ('esc', queue_dir, escalation_id)
+    return (ESCALATION_KIND, queue_dir, escalation_id)
 
 
 def decision_key(decision_id: str) -> ItemKey:
     return ('decision', decision_id)
+
+
+def audit_key(decision_id: str) -> ItemKey:
+    """An executor close drawn for audit, keyed by the DecisionRecord that closed it."""
+    return (AUDIT_KIND, decision_id)
 
 
 def key_str(key: ItemKey) -> str:
@@ -183,7 +206,16 @@ def queue_tag(queue_dir: str) -> str:
 
 def queue_project(queue_dir: str) -> str:
     root = queue_project_root(queue_dir)
-    return normalize_project_token(root.name) if root is not None else ''
+    return fold_project_token(root.name) if root is not None else ''
+
+
+def queue_project_roots(queue_dirs: Iterable[str]) -> Mapping[str, Path]:
+    """Each queue's canonical project and the root holding it; a queue of no known shape names none."""
+    return MappingProxyType({
+        queue_project(q): root
+        for q in queue_dirs
+        if (root := queue_project_root(q)) is not None
+    })
 
 
 def escalation_queue_dirs(
@@ -216,7 +248,7 @@ def collect_open_items(
 
     *decisions_root* is the fleet root holding ``decisions/`` (see
     ``session_registry.fleet_root``). *project*, when given, is folded through
-    ``normalize_project_token`` and keeps only that project's items.
+    ``fold_project_token`` and keeps only that project's items.
     """
     if now.tzinfo is None:
         raise ValueError('now must be timezone-aware')
@@ -226,7 +258,7 @@ def collect_open_items(
     items: dict[ItemKey, OpenItem] = {}
     for queue_dir in dict.fromkeys(normalize_escalations_dir(q) for q in queue_dirs):
         queue_index, records = _scan_queue(queue_dir)
-        index[queue_dir] = MappingProxyType(queue_index)
+        index[queue_dir] = queue_index
         pending[queue_dir] = records
         shortfalls += records.unreadable
         for esc in (esc for escs in records.by_task.values() for esc in escs if esc.level == 2):
@@ -243,7 +275,7 @@ def collect_open_items(
         host = items.get(host_key) if host_key is not None else None
         if host_key is not None and host is not None and host.decision_id is None:
             items[host_key] = replace(
-                host, decision_id=record.id, decision_project=normalize_project_token(record.project)
+                host, decision_id=record.id, decision_project=fold_project_token(record.project)
             )
         else:
             item = _decision_item(record, queue_dir, now)
@@ -251,7 +283,7 @@ def collect_open_items(
 
     selected = items.values()
     if project is not None:
-        wanted = normalize_project_token(project)
+        wanted = fold_project_token(project)
         selected = [item for item in selected if item.project == wanted]
     return Inventory(
         items=tuple(sorted(selected, key=_oldest_first)),
@@ -304,7 +336,7 @@ def gloss(
         escalations[queue_dir] = MappingProxyType(summaries)
         shortfalls += queue_shortfalls
 
-    roots = {queue_project(q): root for q in escalation_index if (root := queue_project_root(q)) is not None}
+    roots = queue_project_roots(escalation_index)
     tasks: dict[str, Mapping[str, str]] = {}
     for project, task_ids in task_scoped.items():
         if not task_ids:
@@ -351,13 +383,17 @@ def read_escalation(path: Path) -> tuple[Escalation | None, Shortfall | None]:
     return esc, None
 
 
-def _scan_queue(queue_dir: str) -> tuple[dict[str, Path], PendingRecords]:
+def index_queue(queue_dir: str) -> Mapping[str, Path]:
+    """Every root and archive record of *queue_dir*, id to path, the root copy winning; nothing is read."""
+    return MappingProxyType({path.stem: path for path in iter_all_escalation_paths(Path(queue_dir))})
+
+
+def _scan_queue(queue_dir: str) -> tuple[Mapping[str, Path], PendingRecords]:
     root = Path(queue_dir)
-    index: dict[str, Path] = {}
+    index = index_queue(queue_dir)
     by_task: dict[str, list[Escalation]] = defaultdict(list)
     unreadable: list[Shortfall] = []
-    for path in iter_all_escalation_paths(root):
-        index[path.stem] = path
+    for path in index.values():
         if path.parent != root:
             continue
         esc, problem = read_escalation(path)
@@ -406,10 +442,10 @@ def _decision_item(record: DecisionRecord, queue_dir: str, now: datetime) -> Ope
     return OpenItem(
         key=decision_key(record.id),
         decision_id=record.id,
-        decision_project=normalize_project_token(record.project),
+        decision_project=fold_project_token(record.project),
         escalation_id=record.escalation_id,
         queue_dir=queue_dir,
-        project=normalize_project_token(record.project),
+        project=fold_project_token(record.project),
         task_id=record.task_id,
         severity=record.severity,
         text=record.text,

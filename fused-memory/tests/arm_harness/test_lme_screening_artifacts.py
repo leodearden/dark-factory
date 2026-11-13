@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.arm_spec import LlmArmSpec, load_arm_spec
 from fused_memory.arm_harness.corpus import corpus_sha
@@ -47,6 +48,8 @@ from fused_memory.arm_harness.screening_evidence import (
     load_arm_evidence,
 )
 from fused_memory.arm_harness.slate import LOOPBACK_HOST, SlateArm, candidate_spec, load_llm_slate
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[3]
 SCREENING_RELATIVE = 'plans/local-memory-models-eval-screening'
@@ -150,6 +153,7 @@ def test_each_spec_is_the_slate_arms_candidate_spec_through_a_loopback_tap(arm_i
     assert urlsplit(spec.serving.base_url).hostname == LOOPBACK_HOST
 
 
+@pytest.mark.reads_git_history
 def test_one_preregistration_sha_that_carries_the_doc_and_is_on_this_history():
     shas = {_evidence(arm_id).spec.preregistration_sha for arm_id in SLATE_IDS}
 

@@ -11,12 +11,18 @@ curator instead.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from shared.defects import DeclareEvent, OutcomeEvent
+
+from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
+    DefectWriteResult,
     DependencyResult,
     GetTasksResult,
+    MetadataLookupResult,
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
@@ -62,11 +68,29 @@ class TaskBackendProtocol(Protocol):
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
         statuses: list[str] | None = None,
-    ) -> GetTasksResult: ...
+        fields: Sequence[str] | None = None,
+    ) -> GetTasksResult:
+        """``fields`` projects each row; the contract is ``fused_memory/backends/task_projection.py``."""
+        ...
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict: ...
+
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        """One page of tasks whose top-level ``metadata[key]`` matches; see plans/task-metadata-lookup-prd.md."""
+        ...
 
     async def get_statuses_raw(
         self,
@@ -213,6 +237,9 @@ class TaskBackendProtocol(Protocol):
           preserved; every supplied key overwrites wholesale.
         * ``metadata_mode='additive'`` — recursive list union+dedup,
           scalar/type-collision OLD-wins.  Required by list-append callers.
+          A merge nested too deeply to compute must be refused by raising
+          (e.g. ``MetadataTooDeepError``), never resolved by a fallback that
+          drops stored keys (task 6248).
         * ``metadata_mode='replace'`` — whole-blob overwrite.  Bypasses the
           corrupt-blob guard; the sanctioned repair path.  It is the ONLY mode
           that can retire a key ('merge'/'additive' have no deletion
@@ -260,6 +287,19 @@ class TaskBackendProtocol(Protocol):
         with ``append`` omitted.  ``dependencies`` is also replace-only but is
         deliberately NOT covered.
 
+        **Implementations MUST reject a call that supplies none of ``prompt``,
+        ``metadata``, ``title``, ``description``, ``details``, ``priority`` or
+        ``dependencies``** by raising (``NoFieldsToUpdateError``, which keeps the
+        ``TASKMASTER_TOOL_ERROR`` code and names those parameters).  Such a call
+        can only bump ``updated_at``, and reporting it as a success hid a dropped
+        argument in esc-3147-7 and esc-3671-7 (a misnamed ``metadata`` was
+        ignored and the reply still said ``updated: True``).  ``task_id``,
+        ``project_root``, ``tag``, ``append`` and ``metadata_mode`` do not count:
+        they steer a write, they are not one.  The test is "is the argument
+        ``None``", never "would a column change": ``dependencies=[]`` (clear the
+        list) and ``metadata='{}'`` are real writes.  Refuse after the ``status``
+        and ``metadata_mode`` value refusals and before the row lookup.
+
         **Implementations MUST reject a non-None ``status`` by raising** (e.g.
         ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``
         is the only sanctioned status writer — it enforces the terminal-exit,
@@ -276,10 +316,35 @@ class TaskBackendProtocol(Protocol):
         and JSON value match the stored row exactly, and refuse a payload
         carrying the key when the stored blob does not parse.
 
+        **Implementations MUST reject a metadata payload that is not a JSON
+        object** (unparseable text, or JSON that decodes to an array, null,
+        string, number or boolean) in every ``metadata_mode``, by raising (e.g.
+        ``MetadataNotAnObjectError``), before the row lookup.  Such a payload
+        has no keys to merge; treating it as a last-write-wins replacement
+        wiped the whole stored blob, ``done_provenance`` included (task 6130).
+
         The ``status`` param is kept in the signature as a **reject-trap**: it
         preserves the ``status=None`` passthrough that ``server/tools.py`` and
         ``task_interceptor.py`` forward via ``**kwargs``, and it makes the
         reject-only contract explicit for future backend authors.
+        """
+        ...
+
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        tag: str | None = None,
+    ) -> DefectWriteResult:
+        """Fold *events* into the task's ``defects`` / ``defect_test_retirements``, all or nothing.
+
+        The one post-creation writer of both defect keys: the rules are
+        ``fused_memory/backends/defect_records.py``'s, and the read-fold-write
+        runs in one write transaction. It takes none of the interceptor's
+        locks and journals nothing; its caller supplies both, as
+        ``TaskInterceptor.apply_defect_events`` does for the MCP tools.
         """
         ...
 

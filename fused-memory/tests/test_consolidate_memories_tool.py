@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pydantic_core
 import pytest
 from _fm_helpers import MCP_SAFE_RESPONSE_CHARS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import fused_memory.server.tools as tools_module
 from fused_memory.config.schema import Mem0UpdateConfig
@@ -36,6 +37,8 @@ from fused_memory.server.consolidation import build_consolidation_result
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.topic_cluster_store import TopicClusterStore
 from fused_memory.services.memory_service import DescendantScan
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ID = 'dark_factory'
 # On the default allowlist for both mem0_update arms, so no case here can

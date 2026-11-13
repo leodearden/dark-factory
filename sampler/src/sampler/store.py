@@ -56,6 +56,7 @@ import statistics
 from pathlib import Path
 from typing import Protocol
 
+from shared.sqlite_column_migration import add_column_if_missing_sync
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from sampler.metrics import SampleKey, Samples
@@ -154,17 +155,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     retries. The feature-detect runs under the write lock, so a concurrent
     construction waits, then reads ``leaf`` present and does nothing.
     Statements are ``execute()``d one by one: ``executescript`` would commit
-    first. The additive idiom is the one
-    ``orchestrator/src/orchestrator/run_store.py::RunStore._migrate_task_results_block_context``
-    follows; unlike it, a failure here raises, and the store is not built.
+    first. The column add is
+    ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing_sync``,
+    which never commits; a failure here raises, and the store is not built.
     """
     conn.execute('BEGIN IMMEDIATE')
     try:
-        columns = {row[1] for row in conn.execute('PRAGMA table_info(samples)')}
-        if 'leaf' in columns:
+        if not add_column_if_missing_sync(conn, 'samples', 'leaf', 'TEXT'):
             conn.rollback()
             return
-        conn.execute('ALTER TABLE samples ADD COLUMN leaf TEXT')
         split = conn.execute(_SPLIT_LEGACY_KEYS_SQL).rowcount
         _create_indexes(conn)
         conn.execute('DROP INDEX IF EXISTS idx_samples_metric_ts')

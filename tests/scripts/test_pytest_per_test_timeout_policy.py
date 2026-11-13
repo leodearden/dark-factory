@@ -34,16 +34,24 @@ here.
 """
 from __future__ import annotations
 
+import contextlib
+import getpass
+import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
+import time
+from collections.abc import Iterator
 
 import pytest
 import verify_command_invariants as vci
+from pytest_config_discovery import discovered_pytest_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -154,9 +162,9 @@ def _ignored_scratch_root() -> pathlib.Path:
     return PROBE_SCRATCH_ROOT
 
 
-@pytest.fixture
-def root_bound_probe():
-    """A throwaway probe test file under REPO_ROOT, removed afterwards.
+@contextlib.contextmanager
+def _probe_under_repo_root(filename: str, source: str) -> Iterator[pathlib.Path]:
+    """A throwaway probe test file *filename* carrying *source* under REPO_ROOT, removed afterwards.
 
     Inside the repo, not in ``tmp_path``: see ``PROBE_SCRATCH_ROOT`` for the
     measurement that rules ``tmp_path`` out, and for why it nests inside an
@@ -167,11 +175,18 @@ def root_bound_probe():
         tempfile.mkdtemp(dir=_ignored_scratch_root(), prefix=PROBE_DIR_PREFIX)
     )
     try:
-        probe = directory / 'test_root_bound_timeout_probe.py'
-        probe.write_text(_PROBE_SRC, encoding='utf-8')
+        probe = directory / filename
+        probe.write_text(source, encoding='utf-8')
         yield probe
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.fixture
+def root_bound_probe() -> Iterator[pathlib.Path]:
+    """The per-test-timeout probe, placed by ``_probe_under_repo_root``."""
+    with _probe_under_repo_root('test_root_bound_timeout_probe.py', _PROBE_SRC) as probe:
+        yield probe
 
 
 def _run_probe(probe: pathlib.Path) -> subprocess.CompletedProcess[str]:
@@ -189,28 +204,34 @@ def _run_probe(probe: pathlib.Path) -> subprocess.CompletedProcess[str]:
     ``sys.executable -m pytest`` rather than a bare ``pytest``: the interpreter
     running this guard is the one whose resolution is being asked about, so
     naming it explicitly removes any dependence on an ambient ``PATH``.
+
+    The child runs under a private ``--basetemp`` outside the repo, never in the
+    host's default temp root; why is
+    ``tests/scripts/test_pytest_per_test_timeout_policy.py::test_the_root_bound_probe_leaves_the_hosts_default_temp_root_untouched``.
     """
-    return subprocess.run(
-        [
-            sys.executable,
-            '-m',
-            'pytest',
-            str(probe),
-            '-q',
-            '-p',
-            'no:cacheprovider',
-            '-o',
-            'addopts=',
-        ],
-        capture_output=True,
-        text=True,
-        timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
-        cwd=str(REPO_ROOT),
-        check=False,
-    )
+    with tempfile.TemporaryDirectory(prefix='root-bound-probe-basetemp-') as basetemp:
+        return subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'pytest',
+                str(probe),
+                '-q',
+                '-p',
+                'no:cacheprovider',
+                '-o',
+                'addopts=',
+                f'--basetemp={basetemp}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
+            cwd=str(REPO_ROOT),
+            check=False,
+        )
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_root_bound_run_resolves_a_per_test_timeout(root_bound_probe: pathlib.Path) -> None:
     """RUN pytest from the repo root and ask the session what cap it resolved.
 
@@ -224,10 +245,11 @@ def test_root_bound_run_resolves_a_per_test_timeout(root_bound_probe: pathlib.Pa
 
     The explicit ``@pytest.mark.timeout`` is not decoration. This guard is about
     the suite's default per-test budget, so it must never be able to SIT on that
-    default — 120s TIGHTENS rather than raises (the scripts verify leg passes
-    ``--timeout=300``), and a probe that runs one trivial test has no business
-    taking two minutes even behind a pytest startup on a loaded 32-core host.
-    Same reasoning as ``test_merge_gate_parallelism_config.py``'s probes.
+    default. What fails a wedged probe fast is ``PROBE_SUBPROCESS_TIMEOUT_SECS``,
+    which surfaces a ``TimeoutExpired`` carrying the child's output. The marker
+    equals verify's own ``--timeout=300`` so it does not invert that budget and
+    clamp the merge-gating leg; why is in
+    ``shared/src/shared/testing_timeout_markers.py``.
 
     MEASURED RED at base ``832d6faf16``: the probe resolved
     ``inipath=<repo>/pyproject.toml`` with ``getini('timeout') == ''`` and
@@ -261,85 +283,78 @@ def test_root_bound_run_resolves_a_per_test_timeout(root_bound_probe: pathlib.Pa
     )
 
 
-# ``'.'`` names the ROOT pyproject.toml, the convention
-# ``test_merge_gate_parallelism_config.py::_declared_addopts`` already
-# established: the root is a genuinely different file from any member's, and
-# naming it this way lets it read as one more entry in the sweep instead of a
-# special case bolted onto it.
-ROOT_CONFIG_NAME = '.'
+# Requests ``tmp_path`` so the child calls ``getbasetemp()`` whatever the root
+# conftest's autouse fixtures do, and records the temp root it inherited.
+_TEMPROOT_RECORDER_SRC = '''\
+import os
+import pathlib
 
-# A FLOOR, not an equality — 8 at authorship (the repo root plus all seven
-# workspace members) — so a member added later is swept with no edit here, while
-# a discovery that rots and finds fewer still fails loudly. Same idiom, and the
-# same reason, as ``test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES``.
-MIN_EXPECTED_PYTEST_CONFIGS = 8
+
+def test_records_the_inherited_temproot(tmp_path):
+    pathlib.Path(__file__).with_name("inherited-temproot").write_text(
+        os.environ.get("PYTEST_DEBUG_TEMPROOT", "")
+    )
+'''
+
+# Older than pytest's 3-day LOCK_TIMEOUT, so the lock counts as dead.
+_DEAD_LOCK_AGE_SECS = 5 * 24 * 60 * 60
+
+
+def _seed_another_sessions_leftovers(user_root: pathlib.Path) -> None:
+    """A dead session's ``pytest-0``, ``pytest-1..3`` making it a cleanup
+    candidate once a new session adds ``pytest-4``, and a ``garbage-*`` dir."""
+    (user_root / 'pytest-0' / 'leftover').mkdir(parents=True)
+    lock = user_root / 'pytest-0' / '.lock'
+    lock.write_text('')
+    dead = time.time() - _DEAD_LOCK_AGE_SECS
+    os.utime(lock, (dead, dead))
+    for n in (1, 2, 3):
+        (user_root / f'pytest-{n}').mkdir()
+    (user_root / 'garbage-seeded' / 'leftover').mkdir(parents=True)
+
+
+def _listing(root: pathlib.Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob('*'))
+
+
+@pytest.mark.timeout(300)
+def test_the_root_bound_probe_leaves_the_hosts_default_temp_root_untouched(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Structural, not timed: the stand-in temp root's listing must not change."""
+    host = tmp_path / 'host-temp'
+    _seed_another_sessions_leftovers(host / f'pytest-of-{getpass.getuser()}')
+    before = _listing(host)
+    monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
+
+    with _probe_under_repo_root(
+        'test_temproot_recorder_probe.py', _TEMPROOT_RECORDER_SRC,
+    ) as probe:
+        result = _run_probe(probe)
+        recorded = probe.with_name('inherited-temproot')
+        inherited = recorded.read_text(encoding='utf-8') if recorded.exists() else None
+
+    assert result.returncode == 0, (
+        f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+    )
+    assert inherited == str(host), (
+        f'the probe child never inherited PYTEST_DEBUG_TEMPROOT (recorded '
+        f'{inherited!r}), so it would use the real host temp root and the listing '
+        f'check below would pass whether or not it did'
+    )
+    after = _listing(host)
+    assert after == before, (
+        "a nested probe session must not create, lock or clean dirs in the host's "
+        "default pytest temp root: its exit-time cleanup of other sessions' dead "
+        'dirs runs outside pytest-timeout (task 7228)\n'
+        f'before: {before}\nafter:  {after}'
+    )
+
 
 # The two keys every config must carry. `timeout` alone is not enough: without
 # `timeout_method` the enforcement mechanism is whatever pytest-timeout defaults
 # to rather than one this repo chose against a measured failure.
 REQUIRED_TIMEOUT_KEYS = ('timeout', 'timeout_method')
-
-
-def _pytest_ini_options(pyproject: pathlib.Path) -> dict | None:
-    """``[tool.pytest.ini_options]`` for *pyproject*, or ``None`` if it declares none.
-
-    Shape copied from ``test_pytest_workspace_collection.py::_pytest_ini_options``,
-    with ONE deliberate difference: that helper returns ``{}`` both for an absent
-    file and for a config that declares no pytest table, which is right for a
-    caller reading a single key out of it. This file DISCOVERS configs by the
-    presence of that table, so the two cases have to be distinguishable — an
-    empty-but-present table would otherwise be skipped by discovery rather than
-    reported as a config missing both keys, which is a vacuity hole exactly where
-    this file can least afford one.
-    """
-    if not pyproject.exists():
-        return None
-    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
-    pytest_table = data.get('tool', {}).get('pytest', {})
-    if 'ini_options' not in pytest_table:
-        return None
-    return pytest_table['ini_options']
-
-
-def discovered_pytest_configs() -> dict[str, dict]:
-    """Every pyproject.toml in this repo declaring ``[tool.pytest.ini_options]``.
-
-    DISCOVERED from ``[tool.uv.workspace].members`` rather than hardcoded, so a
-    new member joins the sweep with no edit here. That is the whole point: the
-    defect this file guards against is a config that nobody remembered to give a
-    cap, and a hand-written list is the same class of forgetting.
-
-    Both anti-vacuity guards live HERE rather than in each caller, because they
-    are properties of DISCOVERY and every sweep in this file depends on them.
-    """
-    root_pyproject = REPO_ROOT / 'pyproject.toml'
-    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
-    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
-
-    # A typo'd key here would make the loop below iterate nothing and turn every
-    # sweep in this file into a silent pass.
-    assert members, (
-        '[tool.uv.workspace].members is empty or missing in the root '
-        'pyproject.toml — this guard reads it to discover which subprojects to '
-        'check, so it would otherwise pass vacuously.'
-    )
-
-    configs: dict[str, dict] = {}
-    for name in [ROOT_CONFIG_NAME, *members]:
-        ini_options = _pytest_ini_options(REPO_ROOT / name / 'pyproject.toml')
-        if ini_options is not None:
-            configs[name] = ini_options
-
-    assert len(configs) >= MIN_EXPECTED_PYTEST_CONFIGS, (
-        f'only discovered {len(configs)} pytest configs '
-        f'({sorted(configs)}), expected at least '
-        f'{MIN_EXPECTED_PYTEST_CONFIGS} (task 5442). The sweep may be looking in '
-        f'the wrong place — it reads the root pyproject.toml plus one per '
-        f'[tool.uv.workspace].members entry, with {ROOT_CONFIG_NAME!r} naming the '
-        f'root. A config that stopped being discovered is a config nothing in '
-        f'this file checks any more.'
-    )
-    return configs
 
 
 def test_every_pytest_config_declares_a_per_test_timeout() -> None:
@@ -412,12 +427,10 @@ def test_every_pytest_config_declares_a_supported_timeout_method() -> None:
     and for the ROOT config that is every root-bound invocation in the repo.
 
     Which method each config declares is deliberately NOT asserted: `signal` and
-    `thread` are a live trade with measured evidence on both sides
-    (``fused-memory/pyproject.toml`` records signal proving unreliable under
-    xdist workers; ``escalation/pyproject.toml`` records signal measured green
-    under the identical flags), and pinning a winner here would settle that trade
-    by guard rather than by measurement. This asserts only that the declared
-    value is one pytest-timeout will accept.
+    `thread` are a trade owned, with its measurement, by
+    ``tests/scripts/test_timeout_method_policy.py``, and pinning a winner here
+    would settle that trade by guard rather than by measurement. This asserts
+    only that the declared value is one pytest-timeout will accept.
     """
     declared = {
         name: ini_options['timeout_method']

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from shared.memory_eval_metrics import canonical_json_text
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness._fakes import (
     EVIDENCE_STAMP,
@@ -37,6 +38,8 @@ from fused_memory.arm_harness.screening_evidence import (
     write_screening_spec,
 )
 from fused_memory.arm_harness.slate import arm_endpoint
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 QWEN = slate_arm()
 SERVING_ROOT = Path(__file__).parents[3] / 'scripts' / 'local-model-serving'

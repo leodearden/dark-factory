@@ -1,6 +1,9 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
 from fused_memory.models.reconciliation import FindingSeverity
+from fused_memory.reconciliation.dangling_citation import (
+    DANGLING_CROSS_RUN_CITATION_FLAG_TYPE,
+)
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
@@ -18,6 +21,34 @@ from fused_memory.reconciliation.prompts import (
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNED_STAT_KEY,
     SNAPSHOT_WRITTEN_STAT_KEY,
+)
+
+# Rendered separately so the flag type is interpolated from the leaf that emits
+# the finding. Must not name the repair tool: Stage 3 is denied it, pinned by
+# test_recon_report_stage_gated_tool_advertisement.py.
+DANGLING_CITATION_HANDOFF_SECTION = (
+    """\
+## Dangling Cross-Run Citations — Detected For You
+
+**The defect.** A finding of a PRIOR, settled run (completed or failed) cites a Mem0 memory \
+that no longer resolves, typically because a later consolidation or supersession deleted it.
+
+"""
+    f"""**The detection.** After your turn, the integrity-check stage's own code scans \
+recently settled runs in the reconciliation journal, confirms each cited Mem0 memory with a \
+point read, and appends one finding per confirmed-absent citation, with \
+`flag_type='{DANGLING_CROSS_RUN_CITATION_FLAG_TYPE}'`.
+
+"""
+    """\
+**The handoff.** Stage 1 receives those findings, in a remediation pass and as the next \
+cycle's prior Stage 3 findings, and repairs the owning run's journal record. You are \
+read-only and hold no tool for it.
+
+**Your action: none.** You cannot read a closed run's findings, so do not file your own \
+finding for this defect. A dangling citation in THIS run's Stage 1/2 findings is already \
+handled by citation verification at report assembly.
+"""
 )
 
 STAGE3_SYSTEM_PROMPT = f"""\
@@ -422,6 +453,7 @@ the finding on positive corroboration. It is the authoritative backstop, but it 
 re-check what you cite, so cite every candidate you considered rather than only the ones \
 you managed to confirm yourself.
 
+{DANGLING_CITATION_HANDOFF_SECTION}
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {get_recon_report_tool_guidance()}
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}

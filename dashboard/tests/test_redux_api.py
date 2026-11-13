@@ -6,7 +6,6 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from dashboard import loops
 from dashboard.data import burndown, census, redux_api
 from dashboard.data.datum import (
     Datum,
@@ -17,8 +16,12 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
+from dashboard.data.merge_queue import MergeAttempts, TrainThroughput
 from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
+from dashboard.project_labels import ProjectLabels
+
+_BASENAME_LABELS = ProjectLabels.of_roots(())
 
 # ---------------------------------------------------------------------------
 # shape_orchestrators / PROJECTS
@@ -38,7 +41,7 @@ def test_shape_orchestrators_picks_first_pid_and_basename_project():
         'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
     }]
 
-    body = redux_api.shape_orchestrators(raw)
+    body = redux_api.shape_orchestrators(raw, labels=_BASENAME_LABELS)
     [orch] = body['ORCHESTRATORS']
     assert orch['pid'] == 482103
     assert orch['pids'] == [482103, 482104]
@@ -58,7 +61,7 @@ def test_shape_orchestrators_marks_inactive_known_projects():
         'running': True, 'summary': {}, 'started': '', 'worktrees': {},
     }]
     body = redux_api.shape_orchestrators(
-        raw, known_project_roots=['/a/dark-factory', '/b/reify'],
+        raw, labels=ProjectLabels.of_roots(['/a/dark-factory', '/b/reify']),
     )
     by_id = {p['id']: p for p in body['PROJECTS']}
     assert by_id['dark-factory']['active'] is True
@@ -79,7 +82,7 @@ def test_shape_orchestrators_copies_last_update_when_present():
         'worktrees': {},
         'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
     }]
-    body = redux_api.shape_orchestrators(raw)
+    body = redux_api.shape_orchestrators(raw, labels=_BASENAME_LABELS)
     [orch] = body['ORCHESTRATORS']
     assert orch['last_update'] == '2026-06-14T20:00:00'
 
@@ -97,7 +100,7 @@ def test_shape_orchestrators_last_update_none_when_absent():
         'worktrees': {},
         'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
     }]
-    body = redux_api.shape_orchestrators(raw)
+    body = redux_api.shape_orchestrators(raw, labels=_BASENAME_LABELS)
     [orch] = body['ORCHESTRATORS']
     assert orch['last_update'] is None
 
@@ -122,7 +125,7 @@ def test_shape_orchestrators_propagates_offline_marker():
         'error': 'boom',
     }]
 
-    body = redux_api.shape_orchestrators(raw)
+    body = redux_api.shape_orchestrators(raw, labels=_BASENAME_LABELS)
     [orch] = body['ORCHESTRATORS']
     assert orch.get('offline') is True, f'expected offline=True in ORCHESTRATORS entry, got: {orch}'
     assert orch.get('error') == 'boom', f'expected error=boom in ORCHESTRATORS entry, got: {orch}'
@@ -161,7 +164,7 @@ def test_shape_orchestrators_projects_degraded():
         ),
     }]
 
-    body = redux_api.shape_orchestrators(raw)
+    body = redux_api.shape_orchestrators(raw, labels=_BASENAME_LABELS)
     [orch] = body['ORCHESTRATORS']
     assert orch.get('degraded') is True, f'expected degraded=True in ORCHESTRATORS entry, got: {orch}'
     assert orch.get('offline') is False, (
@@ -190,7 +193,7 @@ def test_shape_orchestrators_degraded_defaults_false_when_absent():
         'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
     }]
 
-    body = redux_api.shape_orchestrators(raw)
+    body = redux_api.shape_orchestrators(raw, labels=_BASENAME_LABELS)
     [orch] = body['ORCHESTRATORS']
     assert orch.get('degraded') is False, (
         f'degraded must be present and False on every entry, got: {orch}'
@@ -670,14 +673,27 @@ def test_shape_recon_refuses_a_burst_row_the_partition_never_stamped():
 MQ_SERVED_AT = datetime(2026, 10, 1, 12, 0, 30, tzinfo=UTC)
 """The serving instant every shape_merge_queue case ages and validates against."""
 
+
+def _mq_read(value: object) -> Datum:
+    """A runs.db window read measured at the serving instant."""
+    return Datum(value, MQ_SERVED_AT, DatumState.FRESH, None, 30)
+
+
+_MQ_ZERO_THROUGHPUT: TrainThroughput = {
+    'trains_landed': 0, 'tasks_landed_via_trains': 0, 'train_verifies_per_landed_task': 0.0,
+    'baseline_solo_landed': 0, 'baseline_verifies_per_landed_task': 0.0,
+    'verifies_per_landed_task_delta': 0.0, 'train_cas_retry_rate': 0.0,
+    'baseline_cas_retry_rate': 0.0, 'cas_retry_rate_delta': 0.0, 'improved': False,
+}
+
 _MQ_MEASURED_QUEUE = {
     'in_queue': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
     'live_probe_configured': True,
-    'speculative': Datum(
-        {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
-        MQ_SERVED_AT, DatumState.FRESH, None, 30,
-    ),
-    'recent_total': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
+    'speculative': _mq_read({'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}),
+    'recent_total': _mq_read(0),
+    'depth_timeseries': _mq_read({'labels': [], 'values': [], 'bucket_minutes': 15}),
+    'attempts': _mq_read(MergeAttempts()),
+    'train_throughput': _mq_read(_MQ_ZERO_THROUGHPUT),
 }
 """The queue fields the route resolves for every project: here, a measured empty queue."""
 
@@ -695,21 +711,42 @@ def _task_ids(rows):
 def test_shape_merge_queue_relabels_and_renames_depth():
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [0, 1], 'values': [3, 4]},
-            'outcomes': {'labels': ['done'], 'values': [12]},
-            'latency': {'p50': 6000},
             'recent': [_mq_titled('17')],
             'active': [],
             **_MQ_MEASURED_QUEUE,
+            'depth_timeseries': _mq_read({'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}),
         },
     }
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     assert 'dark-factory' in body['MERGE_QUEUE']
     section = body['MERGE_QUEUE']['dark-factory']
-    assert section['depth'] == {'labels': [0, 1], 'values': [3, 4]}
+    assert section['depth']['state'] == 'fresh'
+    assert section['depth']['value'] == {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}
     assert _task_ids(section['recent']) == ['17']
     # Default: no halt_status passed → offline fallback per project.
     assert section['halt'] == {'offline': True}
+
+
+def test_shape_merge_queue_trims_the_depths_leading_zero_buckets():
+    """Leading empty buckets are dropped; an interior zero is an activity gap and stays."""
+    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 3, 0, 4], 'bucket_minutes': 15}
+
+    depth = _shaped(depth_timeseries=_mq_read(series))['depth']
+
+    assert depth['value'] == {'labels': ['b', 'c', 'd'], 'values': [3, 0, 4], 'bucket_minutes': 15}
+
+
+def test_shape_merge_queue_serves_no_width_for_a_depth_that_names_none():
+    """A depth series without bucket_minutes serves None for it, never a guessed width."""
+    depth = _shaped(depth_timeseries=_mq_read({'labels': [], 'values': []}))['depth']
+
+    assert depth['value'] == {'labels': [], 'values': [], 'bucket_minutes': None}
+
+
+def test_shape_merge_queue_serves_an_unread_depth_as_unknown():
+    unread = unknown_datum('the merge_attempt depth series could not be read from runs.db', 30)
+
+    assert _shaped(depth_timeseries=unread)['depth'] == unread.to_wire()
 
 
 def test_shape_merge_queue_carries_the_recent_window_total():
@@ -718,16 +755,15 @@ def test_shape_merge_queue_carries_the_recent_window_total():
     recent_total = Datum(228, MQ_SERVED_AT, DatumState.FRESH, None, 30)
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': recent,
             'active': [],
             **_MQ_MEASURED_QUEUE,
             'recent_total': recent_total,
         },
     }
-    mq = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)['MERGE_QUEUE']
+    mq = redux_api.shape_merge_queue(
+        raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
+    )['MERGE_QUEUE']
     assert mq['dark-factory']['recent_total'] == recent_total.to_wire()
     assert _task_ids(mq['dark-factory']['recent']) == _task_ids(recent)
 
@@ -735,9 +771,6 @@ def test_shape_merge_queue_carries_the_recent_window_total():
 def test_shape_merge_queue_refuses_a_project_without_a_recent_total():
     """A project the route never gave a window total is a wiring bug, not a zero."""
     project = {
-        'depth_timeseries': {'labels': [], 'values': []},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
         'recent': [],
         'active': [],
         **_MQ_MEASURED_QUEUE,
@@ -745,7 +778,9 @@ def test_shape_merge_queue_refuses_a_project_without_a_recent_total():
     del project['recent_total']
 
     with pytest.raises(DatumContractError) as excinfo:
-        redux_api.shape_merge_queue({'/home/leo/src/reify': project}, served_at=MQ_SERVED_AT)
+        redux_api.shape_merge_queue(
+            {'/home/leo/src/reify': project}, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
+        )
 
     assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
 
@@ -753,25 +788,16 @@ def test_shape_merge_queue_refuses_a_project_without_a_recent_total():
 def test_shape_merge_queue_injects_halt_status_per_project():
     raw = {
         '/home/leo/src/reify': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
         '/home/leo/src/know-live': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
@@ -782,7 +808,9 @@ def test_shape_merge_queue_injects_halt_status_per_project():
         'know-live': {'wired': True, 'halted': False, 'owner_esc_id': None, 'offline': False},
         # dark-factory deliberately absent → offline fallback
     }
-    body = redux_api.shape_merge_queue(raw, halt_status=halt_status, served_at=MQ_SERVED_AT)
+    body = redux_api.shape_merge_queue(
+        raw, halt_status=halt_status, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
+    )
     mq = body['MERGE_QUEUE']
     assert mq['reify']['halt']['halted'] is True
     assert mq['reify']['halt']['owner_esc_id'] == 'esc-42'
@@ -795,9 +823,6 @@ def test_shape_merge_queue_includes_train_events():
     """shape_merge_queue exposes train_events list per project."""
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
@@ -812,7 +837,7 @@ def test_shape_merge_queue_includes_train_events():
             ],
         },
     }
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     section = body['MERGE_QUEUE']['dark-factory']
     assert 'train_events' in section, f'Missing train_events in section keys: {list(section.keys())}'
     assert isinstance(section['train_events'], list)
@@ -822,16 +847,15 @@ def test_shape_merge_queue_includes_train_events():
     # When 'train_events' key is absent, result should default to []
     raw_no_train = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
             # no 'train_events' key
         },
     }
-    body2 = redux_api.shape_merge_queue(raw_no_train, served_at=MQ_SERVED_AT)
+    body2 = redux_api.shape_merge_queue(
+        raw_no_train, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
+    )
     assert body2['MERGE_QUEUE']['dark-factory']['train_events'] == []
 
 
@@ -853,18 +877,19 @@ def test_shape_merge_queue_attaches_outcome_colors():
     """shape_merge_queue adds outcomes['colors'] parallel to labels."""
     from dashboard.data.outcome_colors import assign_outcome_colors
 
+    # Equal counts, so the chart's alphabetical tie-break keeps _REIFY_LABELS' order.
+    attempts = MergeAttempts(outcomes=dict.fromkeys(_REIFY_LABELS, 2))
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': _REIFY_LABELS, 'values': [3, 2, 1, 4, 2]},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
+            'attempts': _mq_read(attempts),
         },
     }
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
-    outcomes = body['MERGE_QUEUE']['dark-factory']['outcomes']
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
+    outcomes = body['MERGE_QUEUE']['dark-factory']['attempts']['value']['outcomes']
+    assert outcomes['labels'] == _REIFY_LABELS
 
     assert 'colors' in outcomes, f"Expected 'colors' key in outcomes; got keys: {list(outcomes)}"
     colors = outcomes['colors']
@@ -881,16 +906,13 @@ def test_shape_merge_queue_empty_outcomes_yields_empty_colors():
     """shape_merge_queue with empty outcomes attaches colors == []."""
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
     }
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
-    outcomes = body['MERGE_QUEUE']['dark-factory']['outcomes']
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
+    outcomes = body['MERGE_QUEUE']['dark-factory']['attempts']['value']['outcomes']
     assert outcomes.get('colors') == [], (
         f"Expected colors == [] for empty outcomes, got {outcomes.get('colors')!r}"
     )
@@ -1082,7 +1104,7 @@ def test_shape_burndown_aggregates_and_keeps_per_project():
         'reify':        {'labels': ['D-1', 'D-0'], 'done': [1, 2], 'in_progress': [0, 1],
                          'blocked': [0, 0], 'pending': [4, 3]},
     }
-    body = redux_api.shape_burndown(series)
+    body = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)
     aggregate = body['BURNDOWN']
     assert aggregate['labels'] == ['D-0', 'D-1']  # sorted
     # D-0 done: 4 + 2; D-1 done: 3 + 1
@@ -1107,7 +1129,7 @@ def test_shape_burndown_emits_completed_and_velocity():
             'done': [10, 12], 'in_progress': [0, 1], 'blocked': [0, 0], 'pending': [4, 3],
         },
     }
-    body = redux_api.shape_burndown(series)
+    body = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)
 
     df = body['BURNDOWN_BY_PROJECT']['dark_factory']['latest']['value']
     assert df['completed'] == 2       # 5 - 3
@@ -1141,7 +1163,7 @@ def test_shape_burndown_completed_ignores_snapshot_frequency():
             'pending': [5] * 100,
         },
     }
-    body = redux_api.shape_burndown(series)
+    body = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)
     assert body['BURNDOWN']['latest']['value']['completed'] == 0
     assert body['BURNDOWN']['latest']['value']['velocity'] == 0.0
 
@@ -1175,7 +1197,7 @@ def test_shape_burndown_per_project_labels_are_that_projects_own_row():
     step.  It fires if a future change densifies per-project rows onto the
     union row, which would silently re-break the tabs.jsx consumer.
     """
-    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES, labels=_BASENAME_LABELS)
 
     assert body['BURNDOWN_BY_PROJECT']['p1']['labels'] == [
         '2026-05-20T00:00:00', '2026-05-22T00:00:00',
@@ -1208,7 +1230,7 @@ def test_shape_burndown_per_project_series_are_co_length_with_own_labels():
     require making deriveVelocitySeries, the summary-table last-value reads, and
     compute_window_completion hole-aware first.
     """
-    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES, labels=_BASENAME_LABELS)
 
     for pid, block in body['BURNDOWN_BY_PROJECT'].items():
         for key in _BURNDOWN_SERIES_KEYS:
@@ -1226,7 +1248,7 @@ def test_shape_burndown_aggregate_series_are_co_length_with_union_labels():
     values into the 05-21 slot) nor a zero-fill (which would read p1 as
     having nothing at 05-21, only because its collector ticked elsewhere).
     """
-    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES, labels=_BASENAME_LABELS)
     agg = body['BURNDOWN']
     n = len(agg['labels'])
 
@@ -1272,7 +1294,7 @@ def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
             'done': [3, 7],  # ragged: one short of its own label row
             'in_progress': [1, 2, 3], 'blocked': [0, 0, 0], 'pending': [10, 9, 8],
         },
-    })
+    }, labels=_BASENAME_LABELS)
 
     block = body['BURNDOWN_BY_PROJECT']['p1']
     assert len(block['labels']) == 3
@@ -1306,7 +1328,7 @@ def test_shape_burndown_aggregate_endpoint_is_the_sum_of_each_projects_last_meas
          'blocked': [1, 0], 'pending': [9, 7]}
     b = {'labels': [t2], 'done': [50], 'in_progress': [6], 'blocked': [2], 'pending': [30]}
 
-    agg = redux_api.shape_burndown({'A': a, 'B': b})['BURNDOWN']
+    agg = redux_api.shape_burndown({'A': a, 'B': b}, labels=_BASENAME_LABELS)['BURNDOWN']
 
     assert agg['labels'] == [t1, t2, t3]
     for key in ('in_progress', 'blocked', 'pending', 'done'):
@@ -1325,7 +1347,7 @@ def test_shape_burndown_aggregate_carries_a_hole_where_the_project_contributes()
     a = {'labels': labels, 'done': [1, 2, 3], 'pending': [9, 8, 7], 'review': [1, 2, 3]}
     b = {'labels': [labels[1]], 'done': [5], 'pending': [4], 'review': [None]}
 
-    agg = redux_api.shape_burndown({'A': a, 'B': b})['BURNDOWN']
+    agg = redux_api.shape_burndown({'A': a, 'B': b}, labels=_BASENAME_LABELS)['BURNDOWN']
 
     assert agg['review'] == [1, None, None]
     assert agg['done'] == [1, 7, 8]
@@ -1352,7 +1374,7 @@ def test_shape_burndown_carries_all_nine_members_and_the_split_to_the_wire():
     a = _nine_member_series(labels, base=1)
     b = _nine_member_series(labels, base=1000)
 
-    body = redux_api.shape_burndown({'A': a, 'B': b})
+    body = redux_api.shape_burndown({'A': a, 'B': b}, labels=_BASENAME_LABELS)
 
     for key in (*census.SERIES_KEYS.values(), *_SPLIT_SERIES_KEYS):
         for pid, fixture in (('A', a), ('B', b)):
@@ -1372,7 +1394,7 @@ def test_shape_burndown_aggregate_forecast_is_the_measured_rows_fold():
     a = {'labels': labels, 'done': list(range(10)), 'pending': [20] * 10}
     b = {'labels': labels[5:], 'done': [4000] * 5, 'pending': [5] * 5}
 
-    agg = redux_api.shape_burndown({'A': a, 'B': b})['BURNDOWN']
+    agg = redux_api.shape_burndown({'A': a, 'B': b}, labels=_BASENAME_LABELS)['BURNDOWN']
 
     assert burndown.aggregate_forecast_confidence([a, b]) == {
         'forecast_low': 27.8,
@@ -1385,7 +1407,7 @@ def test_shape_burndown_aggregate_forecast_is_the_measured_rows_fold():
 # shape_burndown — every block serves its own provenance (task 5592)
 # ---------------------------------------------------------------------------
 
-_BOUND = 2 * loops._SAMPLE_INTERVAL_SECONDS
+_BOUND = 2 * burndown.SAMPLE_INTERVAL_SECONDS
 _BASE = datetime(2026, 5, 20, tzinfo=UTC)
 _WIRE_SERIES_KEYS = (*census.SERIES_KEYS.values(), *_SPLIT_SERIES_KEYS)
 _DATUM_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
@@ -1436,8 +1458,9 @@ _PAYLOADS_OF_EVERY_STATE = {
 
 
 def test_shape_burndown_latest_is_fresh_for_a_project_measured_at_the_newest_sample():
-    block = redux_api.shape_burndown({'alpha': _ALPHA}, served_at=_served(25))[
-        'BURNDOWN_BY_PROJECT']['alpha']
+    block = redux_api.shape_burndown(
+        {'alpha': _ALPHA}, served_at=_served(25), labels=_BASENAME_LABELS,
+    )['BURNDOWN_BY_PROJECT']['alpha']
     completion = burndown.compute_window_completion(_ALPHA)
     assert block['latest'] == {
         'value': {
@@ -1455,7 +1478,9 @@ def test_shape_burndown_latest_is_fresh_for_a_project_measured_at_the_newest_sam
 
 def test_shape_burndown_latest_is_stale_for_a_project_carried_to_the_newest_sample():
     """bravo last measured at +10min; the newest sample is alpha's at +20min."""
-    body = redux_api.shape_burndown({'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25))
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25), labels=_BASENAME_LABELS,
+    )
     latest = body['BURNDOWN_BY_PROJECT']['bravo']['latest']
     assert latest['state'] == 'stale'
     assert latest['as_of'] == _label(10)
@@ -1465,7 +1490,9 @@ def test_shape_burndown_latest_is_stale_for_a_project_carried_to_the_newest_samp
 
 
 def test_shape_burndown_latest_is_unknown_for_a_project_with_no_measured_row():
-    body = redux_api.shape_burndown({'alpha': _ALPHA, 'echo': _EMPTY}, served_at=_served(25))
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA, 'echo': _EMPTY}, served_at=_served(25), labels=_BASENAME_LABELS,
+    )
     latest = body['BURNDOWN_BY_PROJECT']['echo']['latest']
     assert latest['state'] == 'unknown'
     assert latest['value'] is None
@@ -1475,7 +1502,9 @@ def test_shape_burndown_latest_is_unknown_for_a_project_with_no_measured_row():
 
 def test_shape_burndown_aggregate_latest_headline_is_the_spark_endpoint():
     """Sketch #6: the tile's number and the spark's last point are one number."""
-    body = redux_api.shape_burndown({'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25))
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25), labels=_BASENAME_LABELS,
+    )
     agg = body['BURNDOWN']
     value = agg['latest']['value']
     assert value['counts'] == {key: agg[key][-1] for key in _WIRE_SERIES_KEYS}
@@ -1488,7 +1517,9 @@ def test_shape_burndown_aggregate_latest_headline_is_the_spark_endpoint():
 
 
 def test_shape_burndown_aggregate_latest_is_stale_as_of_its_oldest_contribution():
-    body = redux_api.shape_burndown({'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25))
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25), labels=_BASENAME_LABELS,
+    )
     latest = body['BURNDOWN']['latest']
     assert latest['state'] == 'stale'
     assert latest['as_of'] == _label(10)
@@ -1497,7 +1528,9 @@ def test_shape_burndown_aggregate_latest_is_stale_as_of_its_oldest_contribution(
 
 
 def test_shape_burndown_aggregate_latest_is_a_lower_bound_when_a_project_is_unmeasured():
-    body = redux_api.shape_burndown({'alpha': _ALPHA, 'echo': _EMPTY}, served_at=_served(25))
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA, 'echo': _EMPTY}, served_at=_served(25), labels=_BASENAME_LABELS,
+    )
     latest = body['BURNDOWN']['latest']
     assert latest['state'] == 'lower_bound'
     assert latest['value'] is not None
@@ -1506,7 +1539,9 @@ def test_shape_burndown_aggregate_latest_is_a_lower_bound_when_a_project_is_unme
 
 def test_shape_burndown_aggregate_latest_is_fresh_when_every_project_is_measured_at_the_newest():
     both = {'alpha': _ALPHA, 'bravo': _nine_member_series([_label(5), _label(20)], base=500)}
-    latest = redux_api.shape_burndown(both, served_at=_served(25))['BURNDOWN']['latest']
+    latest = redux_api.shape_burndown(
+        both, served_at=_served(25), labels=_BASENAME_LABELS,
+    )['BURNDOWN']['latest']
     assert latest['state'] == 'fresh'
     assert latest['reason'] is None
     assert latest['as_of'] == _label(20)
@@ -1515,6 +1550,7 @@ def test_shape_burndown_aggregate_latest_is_fresh_when_every_project_is_measured
 def test_shape_burndown_latest_goes_stale_past_the_freshness_bound():
     body = redux_api.shape_burndown(
         {'alpha': _ALPHA}, served_at=_served(20) + timedelta(seconds=_BOUND + 1),
+        labels=_BASENAME_LABELS,
     )
     for latest in (body['BURNDOWN']['latest'], body['BURNDOWN_BY_PROJECT']['alpha']['latest']):
         assert latest['state'] == 'stale'
@@ -1524,7 +1560,9 @@ def test_shape_burndown_latest_goes_stale_past_the_freshness_bound():
 
 def test_shape_burndown_latest_is_stale_when_the_newest_sample_postdates_the_serving_instant():
     """A sample stamped after served_at is doubted, never served as FRESH from the future."""
-    body = redux_api.shape_burndown({'alpha': _ALPHA}, served_at=_served(10))
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA}, served_at=_served(10), labels=_BASENAME_LABELS,
+    )
     for latest in (body['BURNDOWN']['latest'], body['BURNDOWN_BY_PROJECT']['alpha']['latest']):
         assert latest['state'] == 'stale'
         assert latest['as_of'] == _label(20)
@@ -1536,6 +1574,7 @@ def test_shape_burndown_an_unparseable_label_makes_every_measured_block_unknown(
     """With one newest label unreadable no block can say how old it is, so none claims to know."""
     body = redux_api.shape_burndown(
         {'alpha': _ALPHA, 'zulu': _ZULU_UNPARSEABLE}, served_at=_served(25),
+        labels=_BASENAME_LABELS,
     )
     for where, datum in _served_datums(body).items():
         assert datum['state'] == 'unknown', where
@@ -1545,7 +1584,9 @@ def test_shape_burndown_an_unparseable_label_makes_every_measured_block_unknown(
 
 def test_shape_burndown_aggregate_latest_is_unknown_when_nothing_was_measured():
     for series in ({'echo': _EMPTY}, {}):
-        latest = redux_api.shape_burndown(series, served_at=_served(25))['BURNDOWN']['latest']
+        latest = redux_api.shape_burndown(
+            series, served_at=_served(25), labels=_BASENAME_LABELS,
+        )['BURNDOWN']['latest']
         assert latest['state'] == 'unknown'
         assert latest['value'] is None
         assert latest['reason']
@@ -1553,7 +1594,7 @@ def test_shape_burndown_aggregate_latest_is_unknown_when_nothing_was_measured():
 
 def test_shape_burndown_forecast_datum_carries_its_blocks_latest_provenance():
     series = {'alpha': _eight_daily(0), 'bravo': _eight_daily(50)}
-    body = redux_api.shape_burndown(series, served_at=_served(7 * 24 * 60))
+    body = redux_api.shape_burndown(series, served_at=_served(7 * 24 * 60), labels=_BASENAME_LABELS)
 
     blocks = [(body['BURNDOWN'], burndown.aggregate_forecast_confidence(series.values()))]
     blocks += [(body['BURNDOWN_BY_PROJECT'][pid], burndown.compute_forecast_confidence(s))
@@ -1568,7 +1609,9 @@ def test_shape_burndown_forecast_datum_carries_its_blocks_latest_provenance():
 
 
 def test_shape_burndown_forecast_datum_is_unknown_on_sparse_history():
-    body = redux_api.shape_burndown({'alpha': _ALPHA}, served_at=_served(25))
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA}, served_at=_served(25), labels=_BASENAME_LABELS,
+    )
     for block in (body['BURNDOWN'], body['BURNDOWN_BY_PROJECT']['alpha']):
         assert block['forecast']['state'] == 'unknown'
         assert block['forecast']['value'] is None
@@ -1579,7 +1622,9 @@ def test_shape_burndown_forecast_datum_is_unknown_on_sparse_history():
 def test_shape_burndown_every_datum_declares_two_sample_intervals(case):
     """PRD open question 1: burndown data is sampled, so its bound is two intervals."""
     series, served_at = _PAYLOADS_OF_EVERY_STATE[case]
-    for where, datum in _served_datums(redux_api.shape_burndown(series, served_at=served_at)).items():
+    for where, datum in _served_datums(redux_api.shape_burndown(
+        series, served_at=served_at, labels=_BASENAME_LABELS,
+    )).items():
         assert set(datum) == _DATUM_KEYS, where
         assert datum['freshness_bound_seconds'] == _BOUND, where
 
@@ -1588,7 +1633,9 @@ def test_shape_burndown_every_datum_declares_two_sample_intervals(case):
 def test_shape_burndown_every_datum_keeps_the_wire_triad(case):
     """unknown <=> no value <=> no as_of; anything but fresh says why."""
     series, served_at = _PAYLOADS_OF_EVERY_STATE[case]
-    for where, datum in _served_datums(redux_api.shape_burndown(series, served_at=served_at)).items():
+    for where, datum in _served_datums(redux_api.shape_burndown(
+        series, served_at=served_at, labels=_BASENAME_LABELS,
+    )).items():
         unknown = datum['state'] == 'unknown'
         assert unknown == (datum['value'] is None) == (datum['as_of'] is None), where
         if datum['state'] != 'fresh':
@@ -1599,14 +1646,16 @@ def test_shape_burndown_reasons_do_not_move_with_the_serving_instant():
     """A payload over data already past the bound is identical one second later."""
     served_at = _served(20) + timedelta(seconds=_BOUND + 60)
     series = {'alpha': _ALPHA, 'bravo': _BRAVO, 'echo': _EMPTY}
-    assert redux_api.shape_burndown(series, served_at=served_at) == redux_api.shape_burndown(
-        series, served_at=served_at + timedelta(seconds=1),
+    assert redux_api.shape_burndown(
+        series, served_at=served_at, labels=_BASENAME_LABELS,
+    ) == redux_api.shape_burndown(
+        series, served_at=served_at + timedelta(seconds=1), labels=_BASENAME_LABELS,
     )
 
 
 def test_shape_burndown_per_project_blocks_carry_completed_per_day():
     series = {'alpha': _eight_daily(0), 'bravo': _BRAVO}
-    body = redux_api.shape_burndown(series, served_at=_served(25))
+    body = redux_api.shape_burndown(series, served_at=_served(25), labels=_BASENAME_LABELS)
     for pid, s in series.items():
         assert body['BURNDOWN_BY_PROJECT'][pid]['completed_per_day'] == (
             burndown.compute_window_completion(s)['completed_per_day']
@@ -1614,7 +1663,9 @@ def test_shape_burndown_per_project_blocks_carry_completed_per_day():
 
 
 def test_shape_burndown_blocks_carry_no_flat_copy_of_a_datum_value():
-    body = redux_api.shape_burndown({'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25))
+    body = redux_api.shape_burndown(
+        {'alpha': _ALPHA, 'bravo': _BRAVO}, served_at=_served(25), labels=_BASENAME_LABELS,
+    )
     for block in (body['BURNDOWN'], *body['BURNDOWN_BY_PROJECT'].values()):
         assert not set(_FLAT_FIELDS_NOW_IN_DATUMS) & set(block)
 
@@ -1669,7 +1720,7 @@ def test_shape_burndown_carries_split_and_conserves_in_progress():
         'dark_factory': _split_series(labels, [5, 4], [3, 4], [2, 0], [24, 24]),
         'reify': _split_series(labels, [2, 7], [2, 5], [0, 2], [12, 12]),
     }
-    body = redux_api.shape_burndown(series)
+    body = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)
 
     df = body['BURNDOWN_BY_PROJECT']['dark_factory']
     assert df['in_progress_live'] == [3, 4]
@@ -1698,7 +1749,7 @@ def test_shape_burndown_split_defaults_to_all_live_when_absent():
             'done': [1, 2], 'in_progress': [4, 6], 'blocked': [0, 0], 'pending': [3, 2],
         },
     }
-    body = redux_api.shape_burndown(series)
+    body = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)
 
     legacy = body['BURNDOWN_BY_PROJECT']['legacy']
     assert legacy['in_progress_live'] == [4, 6]
@@ -1720,7 +1771,7 @@ def test_shape_burndown_per_project_carries_parity_block():
         'dark_factory': _split_series(labels, [36, 20], [33, 20], [3, 0], [24, 24]),
         'reify': _split_series(labels, [2, 3], [2, 3], [0, 0], [100, 100]),
     }
-    body = redux_api.shape_burndown(series)
+    body = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)
 
     df = body['BURNDOWN_BY_PROJECT']['dark_factory']
     assert df['parity_alarm'] is True
@@ -1747,7 +1798,7 @@ def test_shape_burndown_aggregate_parity_ors_projects_not_summed_counts():
         'dark_factory': _split_series(labels, [36, 20], [33, 20], [3, 0], [24, 24]),
         'reify': _split_series(labels, [2, 3], [2, 3], [0, 0], [100, 100]),
     }
-    agg = redux_api.shape_burndown(series)['BURNDOWN']
+    agg = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)['BURNDOWN']
 
     assert agg['parity_alarm'] is True
     assert agg['parity_projects'] == ['dark_factory']
@@ -1774,7 +1825,7 @@ def test_shape_burndown_parity_ignores_a_series_with_no_split():
             'concurrency_cap': [24, 24],
         },
     }
-    body = redux_api.shape_burndown(series)
+    body = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)
 
     legacy = body['BURNDOWN_BY_PROJECT']['legacy']
     assert legacy['parity_alarm'] is False
@@ -1795,7 +1846,7 @@ def test_shape_burndown_aggregate_parity_ignores_capless_projects():
         'dark_factory': _split_series(labels, [20], [20], [0], [24]),
         'reify': _split_series(labels, [30], [30], [0], [None]),
     }
-    body = redux_api.shape_burndown(series)
+    body = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)
 
     assert body['BURNDOWN_BY_PROJECT']['reify']['parity_cap'] is None
     assert body['BURNDOWN_BY_PROJECT']['reify']['parity_alarm'] is False
@@ -1818,7 +1869,7 @@ def test_shape_burndown_aggregate_parity_reports_the_worst_breach():
         'reify': _split_series(labels, [9, 4], [9, 4], [0, 0], [8, 8]),
         'quiet': _split_series(labels, [1, 1], [1, 1], [0, 0], [16, 16]),
     }
-    agg = redux_api.shape_burndown(series)['BURNDOWN']
+    agg = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)['BURNDOWN']
 
     assert agg['parity_alarm'] is True
     assert agg['parity_projects'] == ['dark_factory', 'reify']  # sorted, quiet excluded
@@ -1834,7 +1885,7 @@ def test_shape_burndown_aggregate_has_no_summed_concurrency_cap():
         'dark_factory': _split_series(labels, [1], [1], [0], [24]),
         'reify': _split_series(labels, [1], [1], [0], [12]),
     }
-    agg = redux_api.shape_burndown(series)['BURNDOWN']
+    agg = redux_api.shape_burndown(series, labels=_BASENAME_LABELS)['BURNDOWN']
     assert 'concurrency_cap' not in agg
 
 
@@ -2048,9 +2099,6 @@ class TestShapeEscalationAnalytics:
 def _mq_project(**overrides) -> dict:
     """A minimal per-project aggregate entry; *overrides* replace its keys."""
     data: dict = {
-        'depth_timeseries': {'labels': [], 'values': []},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
         'recent': [],
         'active': [],
         **_MQ_MEASURED_QUEUE,
@@ -2062,7 +2110,7 @@ def _mq_project(**overrides) -> dict:
 
 def _shaped(**overrides) -> dict:
     body = redux_api.shape_merge_queue(
-        {'/proj/myproj': _mq_project(**overrides)}, served_at=MQ_SERVED_AT,
+        {'/proj/myproj': _mq_project(**overrides)}, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
     )
     return body['MERGE_QUEUE']['myproj']
 
@@ -2072,7 +2120,7 @@ class TestShapeMergeQueueServedDatums:
 
     def test_the_payload_carries_served_at(self):
         body = redux_api.shape_merge_queue(
-            {'/proj/myproj': _mq_project()}, served_at=MQ_SERVED_AT,
+            {'/proj/myproj': _mq_project()}, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
         )
 
         assert body['served_at'] == MQ_SERVED_AT.isoformat()
@@ -2104,7 +2152,9 @@ class TestShapeMergeQueueServedDatums:
         del project['in_queue']
 
         with pytest.raises(DatumContractError) as excinfo:
-            redux_api.shape_merge_queue({'/proj/myproj': project}, served_at=MQ_SERVED_AT)
+            redux_api.shape_merge_queue(
+                {'/proj/myproj': project}, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
+            )
 
         assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
         assert 'myproj' in str(excinfo.value)
@@ -2131,10 +2181,44 @@ class TestShapeMergeQueueServedDatums:
         assert table in str(excinfo.value)
 
     def test_latency_carries_the_timed_and_untimed_split(self):
-        latency = {'p50': 100, 'p95': 200, 'p99': 300, 'mean_ms': 150.0,
-                   'with_duration': 3, 'without_duration': 2}
+        record = MergeAttempts(outcomes={'done': 5}, durations=(100.0, 200.0, 300.0))
 
-        assert _shaped(latency=latency)['latency'] == latency
+        latency = _shaped(attempts=_mq_read(record))['attempts']['value']['latency']
+
+        assert latency == record.latency()
+        assert (latency['with_duration'], latency['without_duration']) == (3, 2)
+
+    def test_attempts_is_one_wire_datum_over_the_chart_and_the_latency(self):
+        """Sketch #9: one provenance behind the donut and the latency block."""
+        from dashboard.data.outcome_colors import assign_outcome_colors
+
+        record = MergeAttempts(
+            outcomes={'done': 3, 'conflict': 2, 'blocked': 1}, durations=(100.0, 250.0, 400.0),
+        )
+
+        section = _shaped(attempts=_mq_read(record))
+
+        chart = record.outcome_chart()
+        assert section['attempts']['state'] == 'fresh'
+        assert section['attempts']['value'] == {
+            'outcomes': {**chart, 'colors': assign_outcome_colors(chart['labels'])},
+            'latency': record.latency(),
+        }
+        assert not {'outcomes', 'latency'} & set(section)
+
+    def test_an_unknown_attempts_keeps_its_reason(self):
+        unread = unknown_datum('the merge_attempt events could not be read from runs.db', 30)
+
+        assert _shaped(attempts=unread)['attempts'] == unread.to_wire()
+
+    def test_a_fresh_attempts_past_its_bound_is_served_stale(self):
+        as_of = MQ_SERVED_AT - timedelta(seconds=45)
+
+        wire = _shaped(attempts=Datum(MergeAttempts(), as_of, DatumState.FRESH, None, 30))['attempts']
+
+        assert wire['state'] == 'stale'
+        assert wire['as_of'] == as_of.isoformat()
+        assert '30s freshness bound' in wire['reason']
 
     @pytest.mark.parametrize('configured', [True, False])
     def test_live_probe_configured_is_carried_verbatim(self, configured):
@@ -2175,17 +2259,21 @@ class TestShapeMergeQueueServedDatums:
         assert wire == unread.to_wire()
         assert wire['state'] == 'unknown'
 
-    @pytest.mark.parametrize('field, bare', [
-        ('speculative', {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}),
-        ('recent_total', 0),
+    @pytest.mark.parametrize('raw_key, wire_name, bare', [
+        ('speculative', 'speculative',
+         {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}),
+        ('recent_total', 'recent_total', 0),
+        ('depth_timeseries', 'depth', {'labels': [], 'values': [], 'bucket_minutes': 15}),
+        ('attempts', 'attempts', MergeAttempts()),
+        ('train_throughput', 'train_throughput', {}),
     ])
-    def test_a_bare_value_is_a_wiring_bug(self, field, bare):
+    def test_a_bare_value_is_a_wiring_bug(self, raw_key, wire_name, bare):
         with pytest.raises(DatumContractError) as excinfo:
-            _shaped(**{field: bare})
+            _shaped(**{raw_key: bare})
 
         assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
         assert 'myproj' in str(excinfo.value)
-        assert field in str(excinfo.value)
+        assert wire_name in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2194,11 +2282,10 @@ class TestShapeMergeQueueServedDatums:
 
 
 def test_shape_merge_queue_includes_train_throughput():
-    """shape_merge_queue exposes train_throughput dict per project.
+    """shape_merge_queue serves train_throughput as a wire Datum per project.
 
-    When per-project data contains 'train_throughput', it must appear in the
-    shaped output alongside 'train_events'.
-    When 'train_throughput' is absent, the shaped output defaults to {}.
+    A project the route never gave a train_throughput is a wiring bug
+    (DATUM_REQUIRED), not an empty dict.
     """
     throughput_payload = {
         'trains_landed': 2,
@@ -2214,42 +2301,30 @@ def test_shape_merge_queue_includes_train_throughput():
     }
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
             'train_events': [],
-            'train_throughput': throughput_payload,
+            'train_throughput': _mq_read(throughput_payload),
         },
     }
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     section = body['MERGE_QUEUE']['dark-factory']
 
-    assert 'train_throughput' in section, (
-        f"expected 'train_throughput' in shaped output; keys: {list(section.keys())}"
-    )
-    tt = section['train_throughput']
+    assert section['train_throughput']['state'] == 'fresh'
+    tt = section['train_throughput']['value']
     assert tt['trains_landed'] == 2
     assert tt['tasks_landed_via_trains'] == 4
     assert tt['improved'] is True
 
-    # When 'train_throughput' key is absent, defaults to {}.
-    raw_no_throughput = {
-        '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
-            'recent': [],
-            'active': [],
-            **_MQ_MEASURED_QUEUE,
-            'train_events': [],
-            # no 'train_throughput' key
-        },
-    }
-    body2 = redux_api.shape_merge_queue(raw_no_throughput, served_at=MQ_SERVED_AT)
-    assert body2['MERGE_QUEUE']['dark-factory']['train_throughput'] == {}
+    no_throughput = {'recent': [], 'active': [], **_MQ_MEASURED_QUEUE, 'train_events': []}
+    del no_throughput['train_throughput']
+    with pytest.raises(DatumContractError) as excinfo:
+        redux_api.shape_merge_queue(
+            {'/home/leo/src/dark-factory': no_throughput},
+            served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
+        )
+    assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
 
 
 # ---------------------------------------------------------------------------
@@ -2260,9 +2335,6 @@ def test_shape_merge_queue_includes_train_throughput():
 def _mq_project_base() -> dict:
     """Minimal per-project data dict for shape_merge_queue tests."""
     return {
-        'depth_timeseries': {'labels': [], 'values': []},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
         'recent': [],
         'active': [],
         **_MQ_MEASURED_QUEUE,
@@ -2286,7 +2358,7 @@ def test_shape_merge_queue_surfaces_live_metrics():
     proj = _mq_project_base()
     proj['live_metrics'] = _LIVE_METRICS
     raw = {'/home/leo/src/dark-factory': proj}
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     section = body['MERGE_QUEUE']['dark-factory']
     assert 'metrics' in section, (
         f"shape_merge_queue must emit 'metrics' key per project; "
@@ -2300,7 +2372,7 @@ def test_shape_merge_queue_metrics_defaults_to_empty_when_absent():
     proj = _mq_project_base()
     # no 'live_metrics' key
     raw = {'/home/leo/src/dark-factory': proj}
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     section = body['MERGE_QUEUE']['dark-factory']
     assert 'metrics' in section, (
         f"'metrics' key must always be present in shaped output; "
@@ -2314,7 +2386,7 @@ def test_shape_merge_queue_metrics_defaults_to_empty_when_none():
     proj = _mq_project_base()
     proj['live_metrics'] = None
     raw = {'/home/leo/src/dark-factory': proj}
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     section = body['MERGE_QUEUE']['dark-factory']
     assert section['metrics'] == {}
 
@@ -2324,5 +2396,5 @@ def test_shape_merge_queue_metrics_rpl_value():
     proj = _mq_project_base()
     proj['live_metrics'] = {'retries_per_landing': 2.0, 'drift_at_detection': {'last': 5}}
     raw = {'/home/leo/src/dark-factory': proj}
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     assert body['MERGE_QUEUE']['dark-factory']['metrics']['retries_per_landing'] == 2.0

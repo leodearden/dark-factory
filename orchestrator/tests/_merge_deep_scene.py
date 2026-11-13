@@ -1,24 +1,23 @@
 """Shared scene layer for the deep merge-ahead test modules.
 
-ONE home for the repo fixtures, builders, git helpers, spies, permit census and
-durable-tier readers that test_merge_queue_deep_integration_gate.py and
-test_merge_queue_deep_landing.py used to carry as code-identical clones.
-Membership was decided by comparing the two modules' ASTs, docstrings stripped
-and the ``merge_queue`` alias normalised: every helper here was identical in
-both.  test_merge_deep_scene_dedup.py guards the single-sourcing.  Greek
-letters (δ, η1) and "PRD decision #N" refer to plans/deep-merge-ahead-prd.md.
+ONE home for the repo fixtures, builders, git helpers, verify doubles, spies,
+permit census and durable-tier readers that the deep integration gate, deep
+landing, deep dispatch (γ) and build-chain (β) modules used to carry as clones:
+test_merge_queue_deep_integration_gate.py, test_merge_queue_deep_landing.py,
+test_merge_queue_deep_dispatch.py and test_merge_queue_build_chain.py.
+Membership is decided by comparing their ASTs, docstrings stripped and the
+worker-module alias normalised: a helper lives here when its consumers' copies
+were one body, or had drifted apart only by accident.
+test_merge_deep_scene_dedup.py guards the single-sourcing.  Greek letters
+(β, γ, δ, η1) and "PRD decision #N" refer to plans/deep-merge-ahead-prd.md.
 
 Deduplicate a BODY, never a NAME.  Some helpers share a name across consumers
 but not a body, so they stay local to each consumer: ``_make_worker`` (each
 builds a differently-defaulted lane), ``_assert_quiescent`` and
 ``_finalized_rows`` (different surfaces and readers), and the single-consumer
-``_lane_of``, ``_spy_post_merge_verify`` and ``_fail_verify_result``.  The
-invariant gate's ``_setup_repo``, ``git_repo`` and ``_make_req`` collide by
-name only (a README-only repo with no recording seed, a positional ``lane``),
-so that module imports nothing from here.
-
-test_merge_queue_deep_dispatch.py and test_merge_queue_build_chain.py still
-clone some of these helpers; task 5172 owns folding them in.
+``_lane_of``.  The invariant gate's ``_setup_repo``, ``git_repo`` and
+``_make_req`` collide by name only (a README-only repo with no recording seed,
+a positional ``lane``), so that module imports nothing from here.
 
 This module follows the flat-helper convention ``_merge_queue_harness.py``
 documents: conftest.py puts the tests dir on ``sys.path``, so consumers import
@@ -27,7 +26,7 @@ it.
 
 CRITICAL: every ``merge_queue`` MODULE-LEVEL function is reached as
 ``_mq.<name>``, resolved on the live module at call time, never through a
-from-import.  Consumers patch ``'orchestrator.merge_queue.<name>'``, and a
+from-import.  Consumers patch ``'orchestrator.merge_lane.worker.<name>'``, and a
 from-import would bind a reference here that such a patch cannot reach.
 Classes constructed by value (``MergeRequest``, ``SpeculativeMergeWorker`` and
 the rest) are never patched, so they stay ordinary from-imports.
@@ -40,19 +39,20 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 
-from orchestrator import merge_queue as _mq
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import (
+from orchestrator.merge_lane import worker as _mq
+from orchestrator.merge_lane.types import (
     CapPermit,
     MergeResult,
     QueuedBranch,
     RealMergeItem,
     SpecPermit,
 )
+from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
 
 # ── repo fixtures ────────────────────────────────────────────────────────────
 
@@ -77,6 +77,16 @@ async def _setup_repo(repo: Path) -> None:
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
+async def _commit_seed_script(repo: Path, body: str, message: str) -> None:
+    """Commit an executable ``scripts/seed-warm-lane.sh`` running *body* at HEAD."""
+    script = repo / 'scripts' / 'seed-warm-lane.sh'
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text('#!/usr/bin/env bash\n' + body)
+    script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', message], cwd=repo)
+
+
 async def _add_recording_seed_to_repo(repo: Path) -> None:
     """Commit a recording ``scripts/seed-warm-lane.sh`` into the repo at HEAD.
 
@@ -87,18 +97,13 @@ async def _add_recording_seed_to_repo(repo: Path) -> None:
     absent dir, but a repo-local ``scripts/seed-warm-lane.sh`` still resolves
     first — which is why committing it here works.
     """
-    scripts_dir = repo / 'scripts'
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    script = scripts_dir / 'seed-warm-lane.sh'
-    script.write_text(
-        '#!/usr/bin/env bash\n'
+    await _commit_seed_script(
+        repo,
         '# argv: <base_target> <lane_dir> <mode>\n'
         'ARGV_FILE="$2/scripts/seed-warm-lane.sh.argv"\n'
         'echo "$@" >> "$ARGV_FILE"\n',
+        'add recording seed-warm-lane.sh',
     )
-    script.chmod(0o755)
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'add recording seed-warm-lane.sh'], cwd=repo)
 
 
 @pytest.fixture
@@ -148,17 +153,11 @@ def _make_config(
 
     ``chain_cap`` defaults to 0 — α's shipped kill switch — so a test that wants
     the deep path must opt in explicitly, exactly as an operator would.
-
-    The main-health probe is switched off through its own operator flag: a red
-    verdict here would otherwise spawn a DETACHED project-wide verify of the
-    tmp repo that outlives the test (task 5811; conftest's leaked-task drain
-    is the net under every scene that does not).
     """
-    return OrchestratorConfig(
-        project_root=repo,
-        git=git_config or _make_spec_git_config(),
+    return lane_scene_config(
+        repo,
+        git_config or _make_spec_git_config(),
         merge_deep=MergeDeepConfig(chain_cap=chain_cap),
-        escalate_preexisting_main_break=False,
     )
 
 
@@ -290,6 +289,20 @@ async def _rev_parse(cwd: Path, rev: str = 'HEAD') -> str:
     """Return the stripped SHA of *rev* resolved inside *cwd*."""
     _, sha, _ = await _run(['git', 'rev-parse', rev], cwd=cwd)
     return sha.strip()
+
+
+async def _worktree_names(git_ops: GitOps) -> set[str]:
+    """Return the set of registered worktree directory names."""
+    _, out, _ = await _run(
+        ['git', 'worktree', 'list', '--porcelain'],
+        cwd=git_ops.project_root,
+    )
+    names: set[str] = set()
+    for line in out.splitlines():
+        if line.startswith('worktree '):
+            wt_path = Path(line[len('worktree '):].strip())
+            names.add(wt_path.name)
+    return names
 
 
 def _shared_txt_with(line_no: int, text: str) -> str:
@@ -427,7 +440,110 @@ def _fake_pass_runner(name: str = 'fake-runner'):
     return fake
 
 
+def _fail_verify_result():
+    """A failing :class:`VerifyResult` — a RED tip verdict."""
+    from orchestrator.verify import VerifyResult
+
+    return VerifyResult(
+        passed=False, test_output='tip is red', lint_output='', type_output='',
+        summary='fail', category='',
+    )
+
+
+class _StubRemoteAllocator:
+    """Minimal HostAllocator stand-in handing out ONE remote lease at a time.
+
+    REMOTE deliberately: a remote lease makes ``_run_post_merge_verify`` build
+    its pool from the injected runner instead of a real ``LocalRunner``, so
+    ``VerifyRunnerPool.dispatch`` — the single ``merge_verify`` emission site —
+    genuinely runs and genuinely emits.  Replacing ``_run_post_merge_verify``
+    wholesale (:func:`_spy_post_merge_verify`) emits no event at all, which
+    would make every ``chain_items`` telemetry assertion vacuous.
+    """
+
+    def __init__(self, lease) -> None:
+        self._lease = lease
+        self._held = False
+
+    def free_host_count(self) -> int:
+        return 0 if self._held else 1
+
+    async def acquire(self, _local_factory, *, policy):
+        if self._held:
+            return None
+        self._held = True
+        return self._lease
+
+    async def release(self, _lease) -> None:
+        self._held = False
+
+    async def cancel_and_release(self, _lease) -> bool:
+        self._held = False
+        return True
+
+    # -- the read side `snapshot()` goes through --------------------------------
+    # Minimal, but not optional: `SpeculativeMergeWorker.snapshot()` reads
+    # `host_names` UNCONDITIONALLY for `occupancy.hosts_total`
+    # (orchestrator/src/orchestrator/merge_lane/worker.py::
+    # SpeculativeMergeWorker.snapshot), so without it the worker's own public
+    # observation surface, and every placement reader built on it, fails with an
+    # AttributeError from inside snapshot() instead of with a failed claim.
+    #
+    # `host_states()` is deliberately NOT provided: the `hosts` block is built
+    # by `_host_states_block`, whose first statement is
+    # `if not isinstance(self._host_allocator, HostAllocator): return []`.
+    # That gate is a TYPE check by design, so for THIS duck-typed stub the block
+    # is `[]` whatever the stub offers -- and an assertion written against
+    # `hosts` here would be permanently vacuous.
+
+    @property
+    def host_names(self) -> list[str]:
+        return [self._lease.name]
+
+
 # ── dispatch-scene spies ─────────────────────────────────────────────────────
+
+
+def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[dict]:
+    """Replace ``_run_post_merge_verify`` with a recorder returning *outcome*.
+
+    Returns the recorded call list — each entry carries the positional
+    ``merge_wt`` plus every keyword argument the worker passed (``merge_sha``,
+    ``chain_items`` and the rest).  ``outcome=None`` is a PASS in this
+    function's vocabulary; a :class:`VerifyResult` is a FAIL.  *raises* makes
+    the verify blow up instead, which is the third exit the lane release must
+    survive.
+    """
+    calls: list[dict] = []
+
+    async def _recording(git_ops, req, merge_wt, **kwargs):
+        calls.append({'merge_wt': merge_wt, **kwargs})
+        if raises is not None:
+            raise raises
+        return outcome
+
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.worker._run_post_merge_verify', _recording,
+    )
+    return calls
+
+
+def _count_spec_lane_acquires(git_ops: GitOps, monkeypatch) -> list[str]:
+    """Record every ``git_ops.acquire_spec_lane`` call; return the record list.
+
+    Passthrough and INSTANCE-level: the real acquire still runs, so lane state
+    stays real while the call count — including the zero a cap=0 kill switch
+    must cost — stays observable.
+    """
+    calls: list[str] = []
+    original = git_ops.acquire_spec_lane
+
+    async def _recording(merge_commit: str):
+        calls.append(merge_commit)
+        return await original(merge_commit)
+
+    monkeypatch.setattr(git_ops, 'acquire_spec_lane', _recording)
+    return calls
 
 
 def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
@@ -445,7 +561,7 @@ def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
         return await real(git_ops, lane, warm=warm)
 
     monkeypatch.setattr(
-        'orchestrator.merge_queue.release_chain_build_lane', _recording,
+        'orchestrator.merge_lane.worker.release_chain_build_lane', _recording,
     )
     return calls
 
@@ -545,14 +661,11 @@ def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
     quietly drained away.
     """
     drained: set[str] = set()
-    for lane in ('high', 'normal'):
-        buf = worker._lane_buffers[lane]
-        while buf:
-            req = buf.popleft()  # a deque, not a list — `pop(0)` is a TypeError
-            drained.add(req.task_id)
-            if not req.result.done():
-                req.result.cancel()
-            worker._retire_item(req.request_id)
+    for req in worker._intake.drain_lanes_for_shutdown():
+        drained.add(req.task_id)
+        if not req.result.done():
+            req.result.cancel()
+        worker._retire_item(req.request_id)
     return drained
 
 
@@ -591,11 +704,6 @@ def _canary_predicate_items_per(
     correct if the per-walk contributions SUM to the number of items the walk
     landed.  Emitting the chain size k on every one of k items would yield
     k²/n_deep; emitting 1-indexed positions would yield k(k+1)/2.
-
-    The shipped predicate carries a ``dur`` alongside each event's parsed
-    ``data`` (for its unrelated p90 statistic); this helper takes the ``data``
-    dicts alone, because durations play no part in the ``items_per`` arithmetic
-    reproduced here.
     """
     # A "deep" verify is one whose verified tree carried >= 2 chained items.
     deep = [

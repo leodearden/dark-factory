@@ -21,6 +21,9 @@ import pytest
 import yaml
 from legibility import config as mod
 from pydantic import ValidationError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 MINIMAL_YAML = textwrap.dedent("""\
     project_id: dark_factory
@@ -94,9 +97,7 @@ class TestNestedDefaults:
 
     def test_census_defaults(self, tmp_path):
         cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
-        assert cfg.census.max_interval_days == 10
-        assert cfg.census.tasks_landed_threshold == 120
-        assert cfg.census.tasks_landed_min_days == 7
+        assert cfg.census.completion_threshold_pct == 70
         assert cfg.census.novelty_spike.count == 4
         assert cfg.census.novelty_spike.window_hours == 72
         assert cfg.census.novelty_spike.multiple == 2
@@ -202,11 +203,11 @@ class TestTrickleCensusCaps:
     def test_trigger_thresholds_survive_alongside_trickle_caps(self, tmp_path):
         text = MINIMAL_YAML + textwrap.dedent("""\
             census:
-              max_interval_days: 3
+              floor_days: 3
               trickle_caps: {max_batches: 10}
             """)
         cfg = mod.load_config(_write(tmp_path, text))
-        assert cfg.census.max_interval_days == 3
+        assert cfg.census.floor_days == 3
         assert cfg.census.trickle_caps.max_batches == 10
 
     def test_caps_are_immutable_so_no_holder_can_uncap_a_shared_instance(self):
@@ -238,6 +239,143 @@ class TestLedgerRetentionDays:
         text = MINIMAL_YAML + f'census: {{ledger_retention_days: {bad_value}}}\n'
         with pytest.raises(ValidationError):
             mod.load_config(_write(tmp_path, text))
+
+
+class TestCompletionThresholdPct:
+    """``census.completion_threshold_pct`` — the completion share, as a
+    percentage, at which the previous run's filed tasks fire the census
+    (plans/census-incremental-prd.md C7 (a)), an unquoted int in 1..100."""
+
+    def test_default_is_seventy(self):
+        assert mod.Census().completion_threshold_pct == 70
+
+    def test_yaml_without_the_key_keeps_the_default(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {floor_days: 5}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.completion_threshold_pct == 70
+
+    def test_yaml_value_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {completion_threshold_pct: 85}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.completion_threshold_pct == 85
+
+    @pytest.mark.parametrize('bad_value', ['0', '101', '-5', "'70'", '70.5', 'true', 'null'])
+    def test_out_of_range_or_non_int_value_raises(self, tmp_path, bad_value):
+        text = MINIMAL_YAML + f'census: {{completion_threshold_pct: {bad_value}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
+class TestStrictCensusThresholds:
+    """PRD boundary row 12 (plans/review-all-s21-legibility-pipeline-prd.md):
+    a malformed census threshold fails load_config naming its field and the
+    offending value, so no reader can fall back to a default."""
+
+    @pytest.mark.parametrize(
+        ('census_yaml', 'expected_fragments'),
+        [
+            ('{floor_days: -1}', ['floor_days', 'input_value=-1']),
+            ('{floor_days: true}', ['floor_days', 'input_value=True']),
+            ("{floor_days: '5'}", ['floor_days', "input_value='5'"]),
+            ('{floor_days: 2.5}', ['floor_days', 'input_value=2.5']),
+            ("{novelty_spike: {count: '9'}}", ['count', "input_value='9'"]),
+            ('{novelty_spike: {window_hours: true}}', ['window_hours', 'input_value=True']),
+            ('{completion_threshold_pct: true}', ['completion_threshold_pct', 'input_value=True']),
+            ('{saturation: {dup_rate: 1.5}}', ['dup_rate', 'input_value=1.5']),
+            ('{saturation: {dup_rate: true}}', ['dup_rate', 'input_value=True']),
+            ("{saturation: {dup_rate: '0.9'}}", ['dup_rate', "input_value='0.9'"]),
+            ('{saturation: {consecutive_batches: 0}}', ['consecutive_batches', 'input_value=0']),
+            ("{saturation: {consecutive_batches: '2'}}", ['consecutive_batches', "input_value='2'"]),
+            (
+                '{adjudication: {attach_min_similarity: true}}',
+                ['attach_min_similarity', 'input_value=True'],
+            ),
+            (
+                "{adjudication: {cluster_min_similarity: '0.8'}}",
+                ['cluster_min_similarity', "input_value='0.8'"],
+            ),
+        ],
+    )
+    def test_malformed_value_names_field_and_value(self, tmp_path, census_yaml, expected_fragments):
+        text = MINIMAL_YAML + f'census: {census_yaml}\n'
+        with pytest.raises(ValidationError) as excinfo:
+            mod.load_config(_write(tmp_path, text))
+        message = str(excinfo.value)
+        for fragment in expected_fragments:
+            assert fragment in message
+
+    def test_an_unquoted_int_dup_rate_loads_as_a_float(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {saturation: {dup_rate: 1}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.saturation.dup_rate == 1.0
+        assert isinstance(cfg.census.saturation.dup_rate, float)
+
+    def test_census_block_is_frozen(self):
+        census = mod.Census()
+        with pytest.raises(ValidationError):
+            census.floor_days = 0
+        assert census.floor_days == 5
+
+    def test_novelty_spike_block_is_frozen(self):
+        novelty = mod.NoveltySpike()
+        with pytest.raises(ValidationError):
+            novelty.count = 0
+        assert novelty.count == 4
+
+    def test_saturation_block_is_frozen(self):
+        saturation = mod.Saturation()
+        with pytest.raises(ValidationError):
+            saturation.dup_rate = 0.1
+        assert saturation.dup_rate == 0.9
+
+
+RETIRED_KEYS = ('max_interval_days', 'tasks_landed_threshold', 'tasks_landed_min_days')
+
+
+def _warnings(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.levelname == 'WARNING']
+
+
+class TestRetiredCensusKeys:
+    """PRD boundary row 13: a retired census key (task 6408) is accepted and
+    ignored with ONE warning at load_config, whatever its value."""
+
+    def test_all_three_retired_keys_load_with_one_warning_naming_them(self, tmp_path, caplog):
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            census:
+              max_interval_days: 10
+              tasks_landed_threshold: 120
+              tasks_landed_min_days: 7
+            """)
+        path = _write(tmp_path, text)
+        with caplog.at_level('WARNING'):
+            cfg = mod.load_config(path)
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1
+        for key in RETIRED_KEYS:
+            assert key in warnings[0]
+        assert 'retired' in warnings[0]
+        assert 'ignored' in warnings[0]
+        assert str(path) in warnings[0]
+        assert cfg.census.completion_threshold_pct == 70
+        extra = cfg.census.model_extra or {}
+        assert not any(key in extra for key in RETIRED_KEYS)
+
+    @pytest.mark.parametrize('junk', ['true', "'ten'", 'null', '[10]'])
+    def test_a_junk_retired_value_still_loads_with_one_warning(self, tmp_path, caplog, junk):
+        text = MINIMAL_YAML + f'census: {{max_interval_days: {junk}}}\n'
+        with caplog.at_level('WARNING'):
+            cfg = mod.load_config(_write(tmp_path, text))
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1
+        assert 'max_interval_days' in warnings[0]
+        assert 'max_interval_days' not in (cfg.census.model_extra or {})
+
+    def test_a_census_block_without_retired_keys_warns_nothing(self, tmp_path, caplog):
+        text = MINIMAL_YAML + 'census: {floor_days: 3}\n'
+        with caplog.at_level('WARNING'):
+            mod.load_config(_write(tmp_path, text))
+        assert _warnings(caplog) == []
 
 
 class TestNoveltySpikeBaseline:
@@ -274,6 +412,108 @@ class TestNoveltySpikeBaseline:
             mod.load_config(_write(tmp_path, text))
 
 
+class TestAdjudication:
+    """``census.adjudication`` — the similarity stage's thresholds, its
+    per-run queue cap and its embedding model (plans/census-incremental-prd.md
+    D3, D4, T1)."""
+
+    def test_defaults_when_census_block_omitted_entirely(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        adjudication = cfg.census.adjudication
+        assert isinstance(adjudication, mod.Adjudication)
+        assert adjudication.attach_min_similarity == 0.90
+        assert adjudication.cluster_min_similarity == 0.85
+        assert adjudication.max_clusters_per_run == 10
+        assert adjudication.embedding_model == 'text-embedding-3-small'
+
+    def test_partial_block_keeps_other_defaults(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {adjudication: {max_clusters_per_run: 3}}\n'
+        adjudication = mod.load_config(_write(tmp_path, text)).census.adjudication
+        assert adjudication.max_clusters_per_run == 3
+        assert adjudication.attach_min_similarity == 0.90
+        assert adjudication.cluster_min_similarity == 0.85
+        assert adjudication.embedding_model == 'text-embedding-3-small'
+
+    def test_full_override_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            census:
+              adjudication:
+                attach_min_similarity: 0.95
+                cluster_min_similarity: 0.8
+                max_clusters_per_run: 4
+                embedding_model: text-embedding-3-large
+            """)
+        adjudication = mod.load_config(_write(tmp_path, text)).census.adjudication
+        assert adjudication.attach_min_similarity == 0.95
+        assert adjudication.cluster_min_similarity == 0.8
+        assert adjudication.max_clusters_per_run == 4
+        assert adjudication.embedding_model == 'text-embedding-3-large'
+
+    def test_zero_cap_is_legal(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {adjudication: {max_clusters_per_run: 0}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.adjudication.max_clusters_per_run == 0
+
+    @pytest.mark.parametrize('bad_value', ['-1', "'10'", '2.5'])
+    def test_negative_or_non_int_cap_raises(self, tmp_path, bad_value):
+        text = MINIMAL_YAML + f'census: {{adjudication: {{max_clusters_per_run: {bad_value}}}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+    @pytest.mark.parametrize('field', ['attach_min_similarity', 'cluster_min_similarity'])
+    @pytest.mark.parametrize('bad_value', ['-0.1', '1.5'])
+    def test_similarity_outside_unit_interval_raises(self, tmp_path, field, bad_value):
+        text = MINIMAL_YAML + f'census: {{adjudication: {{{field}: {bad_value}}}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_block_is_frozen(self):
+        adjudication = mod.Adjudication()
+        with pytest.raises(ValidationError):
+            adjudication.max_clusters_per_run = 99
+        assert adjudication.max_clusters_per_run == 10
+
+
+class TestLandingGate:
+    """``census.landing_gate`` — the command run in the project's checkout
+    before a census output lands (task 7448). Absent means ungated."""
+
+    def test_block_loads_as_a_frozen_landing_gate(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {landing_gate: {argv: [a, b], timeout_secs: 60}}\n'
+        gate = mod.load_config(_write(tmp_path, text)).census.landing_gate
+        assert isinstance(gate, mod.LandingGate)
+        assert gate.argv == ('a', 'b')
+        assert gate.timeout_secs == 60
+        with pytest.raises(ValidationError):
+            gate.timeout_secs = 1
+
+    def test_timeout_defaults_to_nine_hundred_seconds(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {landing_gate: {argv: [a]}}\n'
+        gate = mod.load_config(_write(tmp_path, text)).census.landing_gate
+        assert gate is not None
+        assert gate.timeout_secs == 900
+
+    def test_no_block_is_ungated(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML + 'census: {floor_days: 5}\n'))
+        assert cfg.census.landing_gate is None
+
+    @pytest.mark.parametrize(
+        'block',
+        [
+            '{argv: []}',
+            "{argv: [a, '']}",
+            '{argv: [a], timeout_secs: 0}',
+            '{argv: [a], timeout_secs: true}',
+            "{argv: [a], timeout_secs: '60'}",
+        ],
+        ids=['empty-argv', 'empty-arg', 'zero-timeout', 'bool-timeout', 'str-timeout'],
+    )
+    def test_a_malformed_block_raises(self, tmp_path, block):
+        text = MINIMAL_YAML + f'census: {{landing_gate: {block}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""
 
@@ -281,9 +521,7 @@ class TestFullConfigOverridesDefaults:
         budgets: {max_daily_digest_bytes: 123456}
         sampling: {top_fraction: 0.2, per_stratum_min: 3}
         census:
-          max_interval_days: 11
-          tasks_landed_threshold: 200
-          tasks_landed_min_days: 8
+          completion_threshold_pct: 85
           novelty_spike: {count: 5, window_hours: 48}
           floor_days: 6
           saturation: {dup_rate: 0.8, consecutive_batches: 3}
@@ -295,9 +533,7 @@ class TestFullConfigOverridesDefaults:
         assert cfg.budgets.max_daily_digest_bytes == 123456
         assert cfg.sampling.top_fraction == 0.2
         assert cfg.sampling.per_stratum_min == 3
-        assert cfg.census.max_interval_days == 11
-        assert cfg.census.tasks_landed_threshold == 200
-        assert cfg.census.tasks_landed_min_days == 8
+        assert cfg.census.completion_threshold_pct == 85
         assert cfg.census.novelty_spike.count == 5
         assert cfg.census.novelty_spike.window_hours == 48
         assert cfg.census.floor_days == 6
@@ -494,10 +730,12 @@ class TestShippedDarkFactoryConfig:
         assert cfg.sampling.top_fraction == 0.12
         assert cfg.sampling.per_stratum_min == 2
 
-    def test_shipped_config_census_and_models_nonempty(self):
-        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
-        assert cfg.census.max_interval_days > 0
-        assert cfg.census.tasks_landed_threshold > 0
+    def test_shipped_config_census_and_models_nonempty(self, caplog):
+        with caplog.at_level('WARNING'):
+            cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert _warnings(caplog) == [], 'the shipped config carries a retired key'
+        assert cfg.census.completion_threshold_pct == 70
+        assert cfg.census.floor_days > 0
         assert cfg.models.trickle
         assert cfg.models.census_miner
         assert cfg.models.census_verify
@@ -545,6 +783,22 @@ class TestShippedDarkFactoryConfig:
         assert cfg.census.novelty_spike.window_hours == 72
         assert cfg.census.novelty_spike.multiple == 2
         assert cfg.census.novelty_spike.baseline_days == 30
+
+    def test_shipped_config_gates_landing_on_the_tests_that_read_the_live_codebook(self):
+        gate = mod.load_config(self.SHIPPED_CONFIG_PATH).census.landing_gate
+        assert gate is not None
+        assert 'scripts/tests/test_codebook.py' in gate.argv
+        assert 'scripts/tests/test_legibility_coder.py' in gate.argv
+
+    def test_shipped_config_landing_gate_names_only_test_files_that_exist(self):
+        # The gate fails closed: a renamed gated test makes pytest exit 4 and
+        # quarantines every dark_factory census, so the rename must go red here.
+        repo_root = Path(__file__).resolve().parents[2]
+        gate = mod.load_config(self.SHIPPED_CONFIG_PATH).census.landing_gate
+        assert gate is not None
+        test_paths = [arg for arg in gate.argv if arg.startswith('scripts/tests/')]
+        assert test_paths
+        assert [path for path in test_paths if not (repo_root / path).is_file()] == []
 
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):

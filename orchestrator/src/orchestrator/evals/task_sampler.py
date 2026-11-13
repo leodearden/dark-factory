@@ -34,6 +34,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from shared.merge_subject import MergeSubject, parse_merge_subject
+from shared.task_complexity import is_simple_complexity
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
+
 from orchestrator.agents.triage import has_simple_task_blocker
 from orchestrator.evals.snapshots import _run as _git_run
 from orchestrator.evals.snapshots import get_diff_between_commits
@@ -252,7 +256,7 @@ def classify_path(candidate: CompletedTaskCandidate) -> str:
     candidate toward ``'full'`` (never toward a spurious ``'simple'``), which
     is the safe direction for an eval-corpus stratifier.
     """
-    if (candidate.complexity or '').strip().lower() != 'simple':
+    if not is_simple_complexity(candidate.complexity):
         return 'full'
     text = f'{candidate.title}\n{candidate.description}'
     if has_simple_task_blocker(text):
@@ -538,11 +542,6 @@ def build_fixture_record(
 # Git glue — merge-log discovery, commit resolution, reference capture, pin
 # ---------------------------------------------------------------------------
 
-# A completed-task merge subject: ``Merge task/<id> into main``. The id is the
-# task id (may be non-numeric for legacy fixtures, so ``\S+``).
-_MERGE_SUBJECT_RE = re.compile(r'Merge task/(\S+) into main')
-
-
 async def resolve_task_commits_from_merge(
     repo_root: Path | str, merge_sha: str,
 ) -> tuple[str, str]:
@@ -621,17 +620,31 @@ async def pin_eval_branch(
     return branch
 
 
+def _landed_task_id(subject: str, *, branch_prefix: str, main_branch: str) -> str | None:
+    """The task id whose ``<branch_prefix><id>`` branch *subject* lands into *main_branch*, else None."""
+    match parse_merge_subject(subject):
+        case MergeSubject(branch=branch, main_branch=target) if (
+            target == main_branch and branch.startswith(branch_prefix)
+        ):
+            return branch[len(branch_prefix):] or None
+    return None
+
+
 async def discover_completed_tasks(
     repo_root: Path | str,
     since: str | None = None,
     *,
     project: str,
     project_root: str | None = None,
+    branch_prefix: str,
+    main_branch: str,
 ) -> list[CompletedTaskCandidate]:
     """Discover completed-task merges via the git log (read-only).
 
-    Runs ``git log --grep='Merge task/' [--since=<since>]`` and parses each
-    ``Merge task/<id> into main`` subject into a :class:`CompletedTaskCandidate`
+    Pre-filters ``git log [--since=<since>]`` on the bare *branch_prefix* (it
+    survives a wrapped first paragraph, which ``%s`` joins), then re-reads each
+    subject with ``shared/src/shared/merge_subject.py::parse_merge_subject``
+    against *branch_prefix* / *main_branch*. Each landing becomes a :class:`CompletedTaskCandidate`
     STUB carrying ``task_id`` + ``merge_sha`` + resolved ``pre_commit`` (M^1) /
     ``post_commit`` (M). ``title`` / ``description`` / ``complexity`` /
     ``modules`` are left empty for a downstream enrichment pass (the CLI fills
@@ -644,7 +657,7 @@ async def discover_completed_tasks(
     """
     root = Path(repo_root)
     resolved_root = project_root or str(root)
-    cmd = ['git', 'log', '--grep=Merge task/', '--pretty=%H %s']
+    cmd = ['git', 'log', '--fixed-strings', f'--grep={branch_prefix}', '--pretty=%H %s']
     if since:
         cmd.insert(2, f'--since={since}')
     out = await _git_run(cmd, cwd=root)
@@ -652,14 +665,10 @@ async def discover_completed_tasks(
     # First pass: parse ``(task_id, merge_sha)`` from each merge subject.
     parsed: list[tuple[str, str]] = []
     for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        sha, _, subject = line.partition(' ')
-        match = _MERGE_SUBJECT_RE.search(subject)
-        if not match:
-            continue
-        parsed.append((match.group(1), sha))
+        sha, _, subject = line.strip().partition(' ')
+        task_id = _landed_task_id(subject, branch_prefix=branch_prefix, main_branch=main_branch)
+        if task_id is not None:
+            parsed.append((task_id, sha))
 
     if not parsed:
         return []
@@ -705,26 +714,17 @@ def enrich_candidates_from_task_db(
     best-effort pass looks each *numeric* task id up in the ``tasks`` table at
     *db_path* (``<project_root>/.taskmaster/tasks/tasks.db``) and returns copies
     with those fields filled (``complexity`` read from the row's ``metadata``
-    JSON blob). Opened ``mode=ro`` (mirroring
-    ``curator_corpus.read_curator_decisions``) so it never locks the live db.
-    Not ``scripts/_task_db_scan.py::connect_ro``, deliberately: package code
-    cannot import a ``scripts/`` sibling, and this pass degrades to stubs
-    rather than refusing.
+    JSON blob). Opens through
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro``, so it never locks
+    the live db, and a refusal degrades to stubs with the refusal's remedy in
+    the warning.
 
     Degrades to the UNCHANGED stub — never raises — for a non-numeric id
     (legacy fixtures), an id absent from the db, or a missing/unreadable db: a
     stub still classifies (to the default cell) rather than crashing the cut.
     """
-    db_path = Path(db_path)
-    if not db_path.exists():
-        logger.warning(
-            'enrich_candidates_from_task_db: no task db at %s; keeping %d '
-            'candidate(s) as stubs', db_path, len(candidates),
-        )
-        return list(candidates)
-
     try:
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -732,10 +732,10 @@ def enrich_candidates_from_task_db(
             ).fetchall()
         finally:
             conn.close()
-    except sqlite3.Error as exc:
+    except (TaskDbUnreadable, sqlite3.Error) as exc:
         logger.warning(
-            'enrich_candidates_from_task_db: read of %s failed (%s); keeping stubs',
-            db_path, exc,
+            'enrich_candidates_from_task_db: %s; keeping %d candidate(s) as stubs',
+            exc, len(candidates),
         )
         return list(candidates)
 

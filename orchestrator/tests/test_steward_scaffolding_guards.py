@@ -59,15 +59,15 @@ from unittest.mock import MagicMock
 import pytest
 from _orch_helpers import (
     MOCK_WORKFLOW_PROJECT_ROOT,
-    WHOLE_TREE_SCAN_TEST_TIMEOUT,
     assert_sandboxed_project_root,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Both AST guards below rglob() every *.py under orchestrator/tests/ and
 # ast.parse() each one, which is the family the pyproject default 60s timeout is
 # too tight for under `-n auto`. WHY the ceiling is a shared constant rather than
 # a hand-picked literal, and the guard that ENFORCES this mark: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -1074,7 +1074,7 @@ class _Adjudicated(NamedTuple):
 # TWO FAMILIES survive here, and they are exceptions for DIFFERENT reasons:
 #   * the canonical constant in `_orch_helpers.py`, which the 16 Family-A sites
 #     now reference rather than re-spell;
-#   * the REVIEW family, five sites that must stay outside pytest's tmp_path
+#   * the REVIEW family, six sites that must stay outside pytest's tmp_path
 #     because `ReviewCheckpoint._run_review` raises ValueError on `/tmp/pytest`.
 #
 # Adding an entry is a DECISION, not a formality — see the failure message.
@@ -1127,6 +1127,15 @@ _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS: dict[str, _Adjudicated] = {
             'same ReviewCheckpoint `/tmp/pytest`-guard family, and censused '
             'rather than renamed, for the same reason as '
             'test_review_checkpoint_cap.py above'
+        ),
+    ),
+    'test_review_checkpoint_pre_test.py': _Adjudicated(
+        sites=1,
+        reason=(
+            'same ReviewCheckpoint `/tmp/pytest`-guard family as '
+            'test_review_checkpoint_cap.py; the pre-test setup commands need a '
+            'real cwd, so the inert MOCK_WORKFLOW_PROJECT_ROOT cannot stand in '
+            '(task 6020)'
         ),
     ),
     'test_task_creation_migration.py': _Adjudicated(

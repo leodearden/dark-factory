@@ -91,7 +91,7 @@ class TestPersistentSetSemantics:
         assert 'esc-1' not in s
 
     def test_discard_of_absent_key_is_a_noop(self):
-        """``_maybe_promote_blocker``'s done-clear arm discards unconditionally."""
+        """Discarding a key that was never added does not raise."""
         s = PersistentSet(None, ttl=_TTL)
         s.discard('never-added')
         assert len(s) == 0
@@ -160,7 +160,7 @@ class TestPersistentMapSemantics:
         assert m['k'] == 1
 
     def test_stores_str_values_too(self):
-        """``open_fix_tasks[fp] = task_id`` stores a task id, not a count."""
+        """A map value may be a string, not only a count."""
         m = PersistentMap(None, ttl=_TTL)
         m['fp'] = 'fix-1'
         assert m['fp'] == 'fix-1'
@@ -171,7 +171,7 @@ class TestPersistentMapSemantics:
         assert m.get('missing', 0) == 0
 
     def test_augmented_increment(self):
-        """``self._red_advance_counts[fp] += 1`` is the offline lane's idiom."""
+        """``m[key] += 1`` reads, increments and persists the value."""
         m = PersistentMap(None, ttl=_TTL)
         m['k'] = 1
         m['k'] += 1
@@ -202,8 +202,8 @@ class TestPersistentMapSemantics:
         assert sorted(m) == ['a', 'b']
 
     def test_equals_plain_dict_in_both_directions(self):
-        """``assert worker.open_fix_tasks == {}`` in test_offline_lane.py
-        depends on this; ``Mapping.__eq__`` supplies it."""
+        """An empty map equals an empty dict whichever side is on the left;
+        ``Mapping.__eq__`` supplies it."""
         m = PersistentMap(None, ttl=_TTL)
         empty: dict[str, str] = {}
         assert m == empty

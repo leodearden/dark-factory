@@ -1,0 +1,18 @@
+{
+  "task_id": "6219",
+  "reason": "Net-additive defect fix: GitOps._reuse_warm_lane (warm-lane reuse routes and the cold gamma reattach) re-attaches the lane first, then un-stacks a requeued branch from a never-landed stack base before rebasing it onto main, via the new _rebase_requeued_onto_main; train successors (order > 0) keep their stack via a keep_stack keyword (task 6219). Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1480,
+      "current": 1482
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5015,
+      "current": 5017
+    }
+  ]
+}
