@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from _merge_lane_fakes import lane_scene_config
 from _orch_helpers import make_placeholder_future
+from test_merge_queue_concurrent_verify import _inject_two_host_allocator
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -554,6 +555,14 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         assert worker._host_allocator is None
         return worker
 
+    def _two_host_worker(self, git_ops: GitOps, rec):
+        """A worker over local + one remote at K = hosts + 1 = 3 (task 8526)."""
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), event_store=rec, speculation_depth=3,
+        )
+        _inject_two_host_allocator(worker, SimpleNamespace(name='laptop'))
+        return worker
+
     async def test_single_local_dispatch_emits_nothing(
         self, git_ops: GitOps, config: OrchestratorConfig, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -714,11 +723,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
 
         rec = _RecordingEventStore()
-        worker = SpeculativeMergeWorker(
-            git_ops, asyncio.Queue(), event_store=rec, speculation_depth=3,
-        )
-        worker._host_allocator = HostAllocator([SimpleNamespace(name='laptop')])
-        assert worker._host_allocator.host_names == ['local', 'laptop']
+        worker = self._two_host_worker(git_ops, rec)
 
         item_a = await _make_merged_item(git_ops, config, '9015')
         item_b = await _make_merged_item(git_ops, config, '9016')

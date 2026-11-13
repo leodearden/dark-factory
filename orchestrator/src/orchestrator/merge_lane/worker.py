@@ -4371,6 +4371,11 @@ def _verifying_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
     return _task_ids_by_host(row for row in rows if row.counts_verifying)
 
 
+def _leased_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
+    """``occupancy.inflight_by_host``: :func:`_task_ids_by_host` of the rows that hold a lease."""
+    return _task_ids_by_host(row for row in rows if row.holds_lease)
+
+
 def _ssh_targets_by_runner(config: OrchestratorConfig) -> Mapping[str, str]:
     """``{runner name: ssh_host}`` of *config*'s enabled verify runners."""
     return {r.name: r.ssh_host for r in config.enabled_verify_runners}
@@ -9141,14 +9146,16 @@ class SpeculativeMergeWorker:
 
     async def _verify_releasing_at_verdict(
         self,
-        verify: Coroutine[Any, Any, InflightVerifyResult],
+        verify: Callable[[], Awaitable[InflightVerifyResult]],
         entry_slot: InflightEntrySlot,
     ) -> InflightVerifyResult:
         """Run *verify*, then release its host at the verdict (task 8526).
 
-        A raise or a cancellation releases nothing: the canceller owns the lease.
+        *verify* is called inside this task, so a task cancelled before its
+        first step leaves no never-awaited verify coroutine behind.  A raise
+        or a cancellation releases nothing: the canceller owns the lease.
         """
-        vr = await verify
+        vr = await verify()
         await self._release_lease_at_verdict(entry_slot, vr)
         return vr
 
@@ -12580,13 +12587,12 @@ class SpeculativeMergeWorker:
         and ``leases`` and ``verifying_by_host`` say what each is doing
         (tasks 5290, 8526).
         """
-        leased = [row for row in rows if row.holds_lease]
-        inflight_by_host = _task_ids_by_host(leased)
+        inflight_by_host = _leased_by_host(rows)
         return {
             'hosts_total': self._hosts_total(),
             'hosts_busy': len(inflight_by_host),
             # LOSSY on purpose (historical shape): the last occupant per host.
-            'by_host': {row.host: row.task_id for row in leased},
+            'by_host': {host: task_ids[-1] for host, task_ids in inflight_by_host.items()},
             'inflight_by_host': inflight_by_host,
             'inflight_total': len(rows),
             'leases': [row.to_wire() for row in rows],
@@ -19644,9 +19650,9 @@ class SpeculativeMergeWorker:
           PASS          — vr.outcome is None (or verify_task=None for compat shim):
                           CAS advance_main loop.
 
-        A lease still held at finalize (a verdict kept on the persistent merge
-        lane, or a pre-verdict exit) and the speculation slot are released in
-        the single finally:
+        A lease still held at finalize (the head's own verdict, a verdict kept
+        on the persistent merge lane, or a pre-verdict exit) and the
+        speculation slot are released in the single finally:
           · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED,
                                     unless vacated: lease is None; and a gate
                                     re-verify interrupted mid-run, as an
@@ -21607,7 +21613,8 @@ class SpeculativeMergeWorker:
         entry_slot = InflightEntrySlot()
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
             self._verify_releasing_at_verdict(
-                self._run_inflight_verify(
+                functools.partial(
+                    self._run_inflight_verify,
                     item, lease, depth=depth, probe_base=probe_base,
                     chain_items=chain_items, chain=chain, verify_wt=verify_wt,
                     entry_slot=entry_slot, dispatch_facts=dispatch_facts,
