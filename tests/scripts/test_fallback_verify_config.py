@@ -705,10 +705,10 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 #     `scripts/tests/` together, and `tests/scripts` already has its own row, so
 #     a combined figure would double-count it.
 #
-#   tests/repo_guards — task 5654, 2026-11-12: two back-to-back runs of the
-#     verbatim segment, 11.61s and 7.73s at loadavg ~44; the lower is kept, as
-#     for tests/scripts. The module then held only its first two guards, so
-#     re-measure as more move in.
+#   tests/repo_guards — task 5654, 2026-11-13: two back-to-back runs of the
+#     verbatim segment once every moved guard was in (1033 tests), 106.32s and
+#     106.70s wall at loadavg 43.05 -> 49.63; the lower is kept, as for
+#     tests/scripts. Re-measure whenever guards move in or out.
 #
 # KNOWN-STALE ROWS, deliberately not re-measured here. Two 2026-07-31 rows are
 # stale in OPPOSITE directions: `shared` UNDER-states (task 5131 measured +48%
@@ -756,7 +756,7 @@ MEASURED_FLEET_SEGMENT_SECS = {
     'tests/scripts': 105.0,
     'scripts/tests': 113.0,
     'client-feed': 2.67,
-    'tests/repo_guards': 7.73,
+    'tests/repo_guards': 106.32,
 }
 
 
@@ -802,7 +802,7 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
         '2026-10-15', 3, '6966',
         'standalone local runs recorded in the task 6966 commit message'),
     'tests/repo_guards': _SegmentProvenance(
-        '2026-11-12', 2, '5654',
+        '2026-11-13', 2, '5654',
         'standalone local runs recorded beside MEASURED_FLEET_SEGMENT_SECS'),
 }
 

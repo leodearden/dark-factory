@@ -301,7 +301,7 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'cockpit': 130.50,
     'client-feed': 7.88,
     # Task 5654; the runs and their loadavg are in tests/repo_guards/orchestrator.yaml.
-    'tests/repo_guards': 36.83,
+    'tests/repo_guards': 165.09,
     # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
     # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing
     # regime's worst GREEN full-suite run.
