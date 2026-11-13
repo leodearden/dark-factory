@@ -7731,6 +7731,27 @@ class TestMilestoneTimeGate:
         ]
         assert len(warnings) == 1
 
+    @pytest.mark.parametrize('after_secs', [10**12, 10**15])
+    def test_unrepresentable_delayed_deadline_fails_safe_and_warns_once(
+        self, after_secs, caplog
+    ):
+        import logging
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+            'milestone_deps_satisfied_at': '2026-11-01T00:00:00+00:00',
+        })
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
     def test_malformed_milestone_warning_deduped_per_task_and_cause(self, caplog):
         """reviewer_comprehensive observability finding (task 2335 β
         amendment): _milestone_time_gated is invoked once per candidate loop

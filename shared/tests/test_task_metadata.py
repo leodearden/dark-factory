@@ -736,6 +736,18 @@ class TestMilestoneFired:
         with pytest.raises(ValueError):
             self._delayed().fired('not-a-timestamp', self.NOW)
 
+    @pytest.mark.parametrize(
+        ('after_secs', 'anchor'),
+        [
+            pytest.param(10**12, '2026-11-01T00:00:00+00:00', id='date_out_of_range'),
+            pytest.param(10**15, '2026-11-01T00:00:00+00:00', id='int_too_large_for_c'),
+            pytest.param(1, '9999-12-31T23:59:59', id='anchor_at_datetime_max'),
+        ],
+    )
+    def test_delayed_unrepresentable_deadline_raises_value_error(self, after_secs, anchor):
+        with pytest.raises(ValueError):
+            self._delayed(after_secs).fired(anchor, self.NOW)
+
 
 class TestRecurrence:
     """``metadata.recurrence`` — the recurring-chain link spec (task 4676).
