@@ -330,12 +330,12 @@ class ClaimResult(Generic[R]):
 class ResolveOutcome(TypedDict):
     """What ONE :meth:`EscalationQueue.resolve` call actually DID (task 4495).
 
-    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: the
-    ``Escalation`` is ``resolve()``'s primary return value and every existing
-    call site reads it directly, so widening the return into a tuple would churn
-    all of them — the member cascade, ``dismiss_all_pending``, the steward, the
-    five workflow auto-dismiss backstops — for a fact only ``server.resolve_issue``
-    and ``dismiss_all_pending`` want.
+    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: only
+    ``server.resolve_issue`` and ``dismiss_all_pending`` want this fact, while the
+    ``Escalation`` is ``resolve()``'s primary return value and every other call
+    site reads it directly — the member cascade, the steward, the five workflow
+    auto-dismiss backstops — so widening the return into a tuple would churn all
+    of them.
 
     WHY IT EXISTS: ``resolve()``'s already-terminal branch is a no-op, so a caller
     whose text did NOT apply gets back a perfectly healthy-looking ``Escalation``

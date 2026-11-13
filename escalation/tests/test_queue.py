@@ -32,7 +32,7 @@ from escalation.amendments import (
     MAX_AMENDMENTS,
     amendment_room,
 )
-from escalation.classify import effective_benign
+from escalation.classify import default_resolution_class_for_resolver, effective_benign
 from escalation.models import Escalation
 from escalation.queue import (
     _MAX_LATE_RESOLUTION_CHARS,
@@ -398,12 +398,20 @@ class TestDismissAllPendingKeep:
         assert level_1.status == 'pending'
 
 
-def _peer_resolves(peer: EscalationQueue, esc_id: str) -> Callable[[Escalation], bool]:
-    """A ``keep`` predicate through which *peer* resolves *esc_id* first, keeping nothing."""
+def _peer_resolves(
+    peer: EscalationQueue, esc_id: str, peer_wrote: list[Escalation],
+) -> Callable[[Escalation], bool]:
+    """A ``keep`` predicate through which *peer* resolves *esc_id* first, keeping nothing.
+
+    The record as the peer left it on disk is appended to *peer_wrote*.
+    """
 
     def keep(esc: Escalation) -> bool:
         if esc.id == esc_id:
             peer.resolve(esc_id, 'Fixed by a peer process', resolved_by='steward')
+            written = peer.get(esc_id)
+            assert written is not None
+            peer_wrote.append(written)
         return False
 
     return keep
@@ -422,16 +430,19 @@ class TestDismissAllPendingCountsOnlyAppliedDismissals:
         for task_id in ('1', '2', '3'):
             queue.submit(_make_escalation(f'esc-{task_id}-1', task_id=task_id))
 
+        peer_wrote: list[Escalation] = []
+
         count = queue.dismiss_all_pending(
-            'Stale from prior run', keep=_peer_resolves(peer, 'esc-2-1'),
+            'Stale from prior run', keep=_peer_resolves(peer, 'esc-2-1', peer_wrote),
         )
 
         assert count == 2, f'only the two records this sweep dismissed count: {count}'
-        won = queue.get('esc-2-1')
-        assert won is not None
-        assert (won.status, won.resolved_by, won.resolution) == (
-            'resolved', 'steward', 'Fixed by a peer process',
-        ), f'the peer won and the late sweep resolve was a no-op: {won}'
+        assert [(e.status, e.resolved_by, e.resolution) for e in peer_wrote] == [
+            ('resolved', 'steward', 'Fixed by a peer process'),
+        ], peer_wrote
+        assert queue.get('esc-2-1') == peer_wrote[0], (
+            'the late sweep resolve left the peer-resolved record untouched'
+        )
         for esc_id in ('esc-1-1', 'esc-3-1'):
             swept = queue.get(esc_id)
             assert swept is not None
@@ -448,18 +459,21 @@ class TestDismissAllPendingCountsOnlyAppliedDismissals:
         queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2'))
         queue.submit(_aged_escalation('esc-3-1', age_secs=90.0, task_id='3'))
 
+        peer_wrote: list[Escalation] = []
+
         with caplog.at_level(logging.INFO, logger='escalation.queue'):
             count = queue.dismiss_all_pending(
                 'Stale from prior run',
                 strand_age_secs=600.0,
-                keep=_peer_resolves(peer, 'esc-2-1'),
+                keep=_peer_resolves(peer, 'esc-2-1', peer_wrote),
             )
 
         assert count == 2, f'only the two records this sweep dismissed count: {count}'
-        won = queue.get('esc-2-1')
-        assert won is not None
-        assert won.resolution_class != 'stale-strand' and won.resolved_by == 'steward', (
-            f'the peer-resolved strand keeps the peer resolution: {won}'
+        assert [(e.resolved_by, e.resolution_class) for e in peer_wrote] == [
+            ('steward', default_resolution_class_for_resolver('steward')),
+        ], peer_wrote
+        assert queue.get('esc-2-1') == peer_wrote[0], (
+            'the late sweep resolve neither re-stamped nor otherwise touched the peer-resolved strand'
         )
         sweep_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith('Dismissed ')]
         assert len(sweep_lines) == 1, f'one sweep INFO line expected: {sweep_lines}'
