@@ -74,7 +74,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1524, "function_local_imports": 4, "lines": 16787, "prose_lines": 9548, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1528, "function_local_imports": 4, "lines": 16815, "prose_lines": 9558, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 360, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 205, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_reservation.py": {"cognitive": 24, "function_local_imports": 0, "lines": 167, "prose_lines": 19, "reexport_names": 0},
@@ -183,7 +183,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_release_orphaned_lane_flock": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_foreign_meta_root": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_into_quarantine": 3,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_unregistered": 9,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_unregistered": 11,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_remove_ephemeral_worktree": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_rename_branch_aside": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_repair_orphaned_reuse_lane": 2,
@@ -206,6 +206,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_scrub_seeded_lane_target": 11,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_seed_warm_lane": 14,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_settle_branch_checkout": 9,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_sever_parked_gitfile": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_shed_unlanded_base": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_spec_lane_cold_fallback": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_stack_ledger": 0,
