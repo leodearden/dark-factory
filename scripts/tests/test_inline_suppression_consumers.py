@@ -5,9 +5,7 @@ One subject: D8's consumer model — whether pyright, ruff (through the nearest
 suppression.  ``plans/inv12-exceptions-owned-or-ratified-prd.md``, D8.
 
 SUBPROCESSES IN ONE TEST ONLY, deliberately.  The first-party code drift guard
-runs every checker ``FIRST_PARTY_CODES`` names (today
-``fused-memory/scripts/check_bare_magicmock_config.py`` and
-``fused-memory/scripts/check_module_local_testclient.py``) as a subprocess and
+runs every checker ``FIRST_PARTY_CODES`` names as a subprocess and
 reads the violation messages each EMITS, rather than importing any private
 ``_RULE_*CODE`` constant — ``docs/code-quality.md``'s Tests stance (a test that
 reads another module's private attributes pins implementation rather than
@@ -83,7 +81,7 @@ def test_every_kind_the_scanner_scans_resolves_to_a_consumer(tmp_path: Path):
     DRIVEN OFF ``KIND_SPECS`` AND THE PUBLIC RESOLVER, never by patching the
     private table by dotted path: that is the one shape ``docs/code-quality.md``
     names outright, and the first-party drift guard
-    (``test_the_first_party_table_matches_the_codes_that_checker_actually_emits``)
+    (``test_the_first_party_table_matches_the_codes_each_checker_actually_emits``)
     turns down the same shortcut for the first-party code table.  A behavioural assertion is also
     strictly stronger here — it fails for a kind whose row exists but resolves
     by accident, which a patched-out table could not detect.
@@ -428,7 +426,13 @@ _FIRST_PARTY_TRIGGERS: Mapping[str, Mapping[str, str]] = {
 
 def _codes_emitted_by(checker: str, triggers: Mapping[str, str], directory: Path) -> set[str]:
     """The suppression codes *checker* names in the remedies it prints for
-    *triggers*, each written under *directory* and run as its own subprocess."""
+    *triggers*, each written under *directory* and run as its own subprocess.
+
+    Every fixture must report a violation (exit 1) and name a remedy code.  A
+    run that does neither fails here with its exit code and both streams, so a
+    misspelled checker path or a crashing checker (exit 2, the cause on
+    stderr) cannot pass itself off as a fixture that stopped triggering.
+    """
     write_files(directory, triggers)
 
     emitted: set[str] = set()
@@ -440,7 +444,13 @@ def _codes_emitted_by(checker: str, triggers: Mapping[str, str], directory: Path
             text=True,
             timeout=SUBPROCESS_TIMEOUT_SECS,
         )
-        emitted.update(re.findall(r'#\s*noqa:\s*([a-z0-9]+(?:-[a-z0-9]+)+)', completed.stdout))
+        codes = re.findall(r'#\s*noqa:\s*([a-z0-9]+(?:-[a-z0-9]+)+)', completed.stdout)
+        assert completed.returncode == 1 and codes, (
+            f'{checker} on fixture {name!r} exited {completed.returncode} naming '
+            f'codes {codes}; a triggering fixture exits 1 and names one.\n'
+            f'stdout: {completed.stdout!r}\nstderr: {completed.stderr!r}'
+        )
+        emitted.update(codes)
     return emitted
 
 
@@ -484,11 +494,7 @@ def test_the_first_party_table_matches_the_codes_each_checker_actually_emits(tmp
 
     EQUALITY, not containment, and that direction is load-bearing.  A
     containment check ("every code in our table is real") passes happily while
-    the table MISSES a code a checker honours — which is exactly the defect
-    this test found twice: ``wall-clock-deadline`` (Rule C, task 4246), and
-    then ``module-local-testclient`` (task 6651), a second checker's code that
-    a guard running only one checker could never see.  Both are live
-    first-party codes the PRD's D8 prose omits.  Missing a code is the
+    the table MISSES a code a checker honours.  Missing a code is the
     expensive direction: the scanner would tell an author to delete a marker a
     live checker genuinely reads.
 
@@ -505,8 +511,4 @@ def test_the_first_party_table_matches_the_codes_each_checker_actually_emits(tmp
     for code, checker in FIRST_PARTY_CODES.items():
         expected.setdefault(checker, set()).add(code)
 
-    silent = sorted(checker for checker, codes in emitted.items() if not codes)
-    assert not silent, (
-        f'{silent} emitted no suppression remedy at all — fixtures stopped triggering'
-    )
     assert emitted == expected
