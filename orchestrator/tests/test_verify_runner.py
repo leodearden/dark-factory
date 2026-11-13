@@ -8769,7 +8769,7 @@ class TestRemoteRunnerStderrArchival:
 class TestRemoteRunnerStreamArchival:
     """RemoteRunner archives test/lint/type output streams on failure (task 1921).
 
-    Mirrors _archive_merge_verify_logs via a synthetic runs projection.
+    Mirrors archive_verify_logs via a synthetic runs projection.
     Filename pattern: attempt-1.remote-<name>.{label}-<utc_ts>.log
                       attempt-1.remote-<name>.summary-<utc_ts>.json
     """
@@ -9060,8 +9060,8 @@ class TestRemoteRunnerStreamArchival:
     async def test_stream_archival_exception_is_swallowed_result_unchanged(self, tmp_path, monkeypatch):
         """Non-OSError in _archive_failure_streams → swallowed; VerifyResult returned unchanged.
 
-        Monkeypatches orchestrator.verify_runner._archive_merge_verify_logs to raise
-        RuntimeError('boom') — a non-OSError that _archive_merge_verify_logs's internal
+        Monkeypatches orchestrator.verify_runner.archive_verify_logs to raise
+        RuntimeError('boom') — a non-OSError that archive_verify_logs's internal
         OSError handler does not catch.  Verifies that run_merge_verify:
           (1) does NOT raise;
           (2) returns the VerifyResult unchanged.
@@ -9074,7 +9074,7 @@ class TestRemoteRunnerStreamArchival:
         def boom(*args, **kwargs):
             raise RuntimeError('boom')
 
-        monkeypatch.setattr(_vrmod, '_archive_merge_verify_logs', boom)
+        monkeypatch.setattr(_vrmod, 'archive_verify_logs', boom)
 
         fail_result = VerifyResult(
             passed=False, test_output='FAILED', lint_output='', type_output='',
