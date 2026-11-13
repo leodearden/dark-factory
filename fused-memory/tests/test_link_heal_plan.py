@@ -785,7 +785,7 @@ class TestPlanRunsRecordEveryExamination:
         report = await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases)
 
         for record in ledger.run_records(report.run_id):
-            assert record.action_taken == 'none', record.child_id
+            assert record.action_taken is None, record.child_id
             assert record.after_child == record.before_child, record.child_id
 
     @pytest.mark.asyncio

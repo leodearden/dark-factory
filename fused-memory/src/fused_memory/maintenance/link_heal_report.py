@@ -19,17 +19,13 @@ from typing import Any
 
 from fused_memory.maintenance.link_heal import RunCounts
 from fused_memory.maintenance.link_heal_executor import undo_command
-from fused_memory.maintenance.link_heal_ledger import (
-    NO_ACTION_TAKEN,
-    ActionState,
-    CandidateRecord,
-)
+from fused_memory.maintenance.link_heal_ledger import ActionState, CandidateRecord
 from fused_memory.maintenance.link_heal_store import CreatedWindow, parse_record_time
 
 SWEEP_REPORT_FORMAT = 'link-heal-sweep-report/1'
 
-#: The verdict column of a record no adjudication decided.
-NO_VERDICT = 'none'
+#: A cell of a record with no verdict, no applied action, or no staged heal.
+NONE_CELL = 'none'
 
 
 class WritesWithheld(StrEnum):
@@ -155,9 +151,13 @@ _CROSS_TAB_KEYS = ('project', 'decision', 'verdict', 'action_taken', 'action_sta
 
 
 def _cells(record: CandidateRecord) -> tuple[str, str, str, str, str]:
-    verdict = NO_VERDICT if record.verdict is None else record.verdict.value
-    state = NO_ACTION_TAKEN if record.action_state is None else record.action_state.value
-    return record.project_id, record.decision.value, verdict, record.action_taken, state
+    return (
+        record.project_id,
+        record.decision.value,
+        NONE_CELL if record.verdict is None else record.verdict.value,
+        NONE_CELL if record.action_taken is None else record.action_taken.value,
+        NONE_CELL if record.action_state is None else record.action_state.value,
+    )
 
 
 def run_headline(view: SweepRunView) -> dict[str, Any]:

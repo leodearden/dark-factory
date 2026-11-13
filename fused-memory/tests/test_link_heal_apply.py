@@ -37,7 +37,7 @@ from _link_heal_harness import (
 )
 from orchestrator.agents.memory_recall import render_memory_results
 
-from fused_memory.maintenance.link_heal import BasisSource, LinkBasis
+from fused_memory.maintenance.link_heal import BasisSource, HealAction, LinkBasis
 from fused_memory.maintenance.link_heal_executor import (
     BACKLOG_ANCHOR,
     WRITE_FAILURE_ANCHOR,
@@ -358,7 +358,7 @@ class TestWriteTimeRecords:
 
         (record,) = ledger.run_records(plan.run_id)
         row = only_outcome(ledger, report)
-        assert record.action_taken == 'detach'
+        assert record.action_taken is HealAction.DETACH
         assert record.after_child is not None
         assert record.after_child.snapshot_id == row.after_child_snapshot_id
         assert record.after_child.link_image() == row.planned.post_image

@@ -22,13 +22,13 @@ from fused_memory.maintenance.link_heal import (
 )
 from fused_memory.maintenance.link_heal_executor import undo_command
 from fused_memory.maintenance.link_heal_ledger import (
-    NO_ACTION_TAKEN,
     ActionState,
     CandidateRecord,
     Disposition,
     RecordSnapshot,
 )
 from fused_memory.maintenance.link_heal_report import (
+    NONE_CELL,
     CalibrationStatus,
     LedgerRun,
     SweepRunView,
@@ -96,7 +96,7 @@ def _record(
         decision=decision,
         disposition=disposition,
         action_id=n if isinstance(decision, HealAction) else None,
-        action_taken=decision.value if applied else NO_ACTION_TAKEN,
+        action_taken=decision if applied and isinstance(decision, HealAction) else None,
         action_state=ActionState.APPLIED if applied else None,
         after_child=after,
         at='2026-11-02T02:16:00+00:00',
@@ -166,12 +166,12 @@ class TestCounts:
 
     def test_by_action_counts_what_was_taken(self):
         assert _document(_view())['counts']['by_action'] == {
-            'detach': 2, 'relabel': 1, NO_ACTION_TAKEN: 3,
+            'detach': 2, 'relabel': 1, NONE_CELL: 3,
         }
 
     def test_by_action_state_tells_an_applied_heal_from_no_heal(self):
         assert _document(_view())['counts']['by_action_state'] == {
-            ActionState.APPLIED.value: 3, NO_ACTION_TAKEN: 3,
+            ActionState.APPLIED.value: 3, NONE_CELL: 3,
         }
 
     def test_the_cross_tab_is_one_row_per_project_decision_verdict_action_and_state(self):
@@ -181,13 +181,13 @@ class TestCounts:
             {'project': DF, 'decision': 'detach', 'verdict': 'RELATED',
              'action_taken': 'detach', 'action_state': applied, 'count': 2},
             {'project': DF, 'decision': 'no_action', 'verdict': 'SAME',
-             'action_taken': NO_ACTION_TAKEN, 'action_state': NO_ACTION_TAKEN, 'count': 1},
+             'action_taken': NONE_CELL, 'action_state': NONE_CELL, 'count': 1},
             {'project': DF, 'decision': 'relabel', 'verdict': 'EXTENDS',
              'action_taken': 'relabel', 'action_state': applied, 'count': 1},
             {'project': REIFY, 'decision': 'flag', 'verdict': 'CORRECTS',
-             'action_taken': NO_ACTION_TAKEN, 'action_state': NO_ACTION_TAKEN, 'count': 1},
+             'action_taken': NONE_CELL, 'action_state': NONE_CELL, 'count': 1},
             {'project': REIFY, 'decision': 'has_children', 'verdict': 'none',
-             'action_taken': NO_ACTION_TAKEN, 'action_state': NO_ACTION_TAKEN, 'count': 1},
+             'action_taken': NONE_CELL, 'action_state': NONE_CELL, 'count': 1},
         ]
 
     def test_each_run_discloses_its_own_counts(self):

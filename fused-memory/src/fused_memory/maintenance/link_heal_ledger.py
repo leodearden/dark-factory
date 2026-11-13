@@ -121,9 +121,6 @@ class Disposition(StrEnum):
     REPORTED = 'reported'
 
 
-#: What a candidate record says was done when no heal of it applied.
-NO_ACTION_TAKEN = 'none'
-
 _DECISIONS: Mapping[str, HealAction | Report] = MappingProxyType({
     **{action.value: action for action in HealAction},
     **{report.value: report for report in Report},
@@ -495,7 +492,7 @@ class CandidateRecord:
     """One examined link of a plan run: its before-state, decision, and what became of it.
 
     ``action_taken`` is the linked heal's action once it applied, even if an undo
-    later took it back, else :data:`NO_ACTION_TAKEN`; ``undone_run_id`` names that
+    later took it back, else ``None``; ``undone_run_id`` names that
     undo run. ``action_state`` is the linked heal's state, ``None`` when no heal
     was staged, so a failed, withheld or skipped heal is told apart from a dry run.
     ``after_child`` is the child as a write's verification read it whenever one
@@ -517,7 +514,7 @@ class CandidateRecord:
     decision: HealAction | Report
     disposition: Disposition
     action_id: int | None
-    action_taken: str
+    action_taken: HealAction | None
     after_child: RecordSnapshot | None
     at: str
     action_state: ActionState | None = None
@@ -735,7 +732,7 @@ class LinkHealLedger:
             decision=_DECISIONS[row['decision']],
             disposition=Disposition(row['disposition']),
             action_id=row['action_id'],
-            action_taken=row['action_value'] if applied else NO_ACTION_TAKEN,
+            action_taken=HealAction(row['action_value']) if applied else None,
             after_child=after_child,
             at=row['at'],
             action_state=action_state,

@@ -51,7 +51,6 @@ from fused_memory.maintenance.link_heal_executor import (
     run_undo,
 )
 from fused_memory.maintenance.link_heal_ledger import (
-    NO_ACTION_TAKEN,
     ActionState,
     Disposition,
     LinkHealLedger,
@@ -366,7 +365,7 @@ class TestADryRunSweep:
         records = ledger.run_records(report.plan_run_id)
         assert len(records) == 6
         for record in records:
-            assert record.action_taken == NO_ACTION_TAKEN
+            assert record.action_taken is None
             assert record.after_child == record.before_child
 
     @pytest.mark.asyncio
@@ -504,13 +503,14 @@ class TestAllowedWrites:
         }
         records = {record.child_id: record for record in ledger.run_records(report.plan_run_id)}
         for child, action in (
-            (MISFILED, 'detach'), (EXTENDS, 'relabel'), (TRIAGE_CONTESTED, 'detach'),
+            (MISFILED, HealAction.DETACH), (EXTENDS, HealAction.RELABEL),
+            (TRIAGE_CONTESTED, HealAction.DETACH),
         ):
             record = records[child]
-            assert record.action_taken == action
+            assert record.action_taken is action
             assert record.after_child is not None
             assert record.after_child.link_image() == post_images[record.action_id]
-        assert records[AMENDMENT_CORRECTS].action_taken == NO_ACTION_TAKEN
+        assert records[AMENDMENT_CORRECTS].action_taken is None
 
     @pytest.mark.asyncio
     async def test_undoing_the_apply_run_restores_every_before_state(
@@ -553,14 +553,15 @@ class TestAllowedWrites:
         }
         records = {record.child_id: record for record in ledger.run_records(report.plan_run_id)}
         for child, action in (
-            (MISFILED, 'detach'), (EXTENDS, 'relabel'), (TRIAGE_CONTESTED, 'detach'),
+            (MISFILED, HealAction.DETACH), (EXTENDS, HealAction.RELABEL),
+            (TRIAGE_CONTESTED, HealAction.DETACH),
         ):
             record = records[child]
-            assert record.action_taken == action
+            assert record.action_taken is action
             assert record.after_child is not None
             assert record.after_child.link_image() == post_images[record.action_id]
             assert record.undone_run_id == undo.run_id
-        assert records[AMENDMENT_CORRECTS].action_taken == NO_ACTION_TAKEN
+        assert records[AMENDMENT_CORRECTS].action_taken is None
         assert records[AMENDMENT_CORRECTS].undone_run_id is None
         for record in records.values():
             restored = LinkImage.from_metadata(harness.mem0.payload(DF, record.child_id))
@@ -631,7 +632,7 @@ class TestAWriteThatLandedButFailedVerification:
 
         record = {r.child_id: r for r in ledger.run_records(report.plan_run_id)}[MISFILED]
         assert record.action_state is ActionState.FAILED
-        assert record.action_taken == NO_ACTION_TAKEN
+        assert record.action_taken is None
         assert record.after_child is not None
         assert record.after_child.metadata.get(TAMPER_KEY) is True
         assert TAMPER_KEY not in record.before_child.metadata
@@ -1063,7 +1064,7 @@ class TestTheShareEscape:
         assert harness.mem0.write_count == 0
         assert report.apply_run_id is not None
         records = ledger.run_records(report.plan_run_id)
-        assert {record.action_taken for record in records} == {NO_ACTION_TAKEN}
+        assert {record.action_taken for record in records} == {None}
         assert _report_json(report)['undo_run_id'] is None
 
 
