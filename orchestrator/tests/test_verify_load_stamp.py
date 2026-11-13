@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from typing import Any
 
 import pytest
@@ -275,6 +276,13 @@ class TestLoadSample:
 # which the verify path never reads.
 LIVE_TEST_COMMAND = (
     'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300'
+)
+
+# tests/scripts/orchestrator.yaml's `test_command`. It already names `-n auto`,
+# so verify's role cap lands on its argv as a SECOND `-n`.
+TESTS_SCRIPTS_TEST_COMMAND = (
+    'uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300'
+    ' -n auto --dist loadgroup'
 )
 
 
@@ -562,6 +570,44 @@ class TestXdistWorkers:
         )
 
         assert json.loads(json.dumps(record)) == record
+
+    @pytest.mark.parametrize(
+        ('cmd', 'expected'),
+        [
+            (TESTS_SCRIPTS_TEST_COMMAND + ' -n 8', '8'),
+            ('uv run pytest tests/ --numprocesses=auto -n8', '8'),
+            ('uv run pytest tests/ -n 8 -n auto', 'auto'),
+            ('uv run pytest tests/ -n 0 -n 4', '4'),
+            ('uv run pytest tests/ -n 4 -k -n0', '4'),
+        ],
+        ids=[
+            'tests-scripts-leg-as-capped',
+            'mixed-spellings',
+            'position-not-value-decides',
+            'a-zero-count-outvoted',
+            'a-later-k-value-is-not-a-count',
+        ],
+    )
+    def test_a_later_worker_count_outvotes_an_earlier_one(self, cmd, expected):
+        """argparse is last-wins, so the stamp records the count pytest runs with, not an overridden one.
+
+        Ruling D17 (task 3353) wants the count in effect.
+        """
+        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+
+        assert _xdist_workers(cmd, {})['n_flag'] == expected
+
+    def test_the_stamp_reads_the_cap_verify_appends(self):
+        from orchestrator.verify import (  # noqa: PLC0415
+            _with_pytest_numprocesses_str,
+            _xdist_workers,
+        )
+        from orchestrator.verify_cmd import worker_count_values  # noqa: PLC0415
+
+        capped = _with_pytest_numprocesses_str(TESTS_SCRIPTS_TEST_COMMAND, '8')
+
+        assert worker_count_values(shlex.split(capped)) == ['auto', '8']
+        assert _xdist_workers(capped, {})['n_flag'] == '8'
 
 
 class TestLoadReachesTheSummaryPayload:
