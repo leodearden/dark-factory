@@ -1616,22 +1616,9 @@ class TestDigestByteCostFn:
         mod.digest_byte_cost_fn(build=fake_build)(self._record())
         assert calls == [mod.DEFAULT_DIGEST_MAX_BYTES]
 
-    def test_module_constant_matches_the_renderers_own_default(self):
-        """The whole point of this change is that the COST basis and the
-        RENDER basis are provably the same number. ``digest.py`` is outside
-        task 3268's locked scope, so its ``max_bytes=15360`` literal stays a
-        third independent definition of the §7.2 cap — this pins it equal to
-        ours so a drift fails here instead of silently mis-charging the
-        budget (reviewer_comprehensive, task 3268 amendment pass).
-        """
-        import inspect
-
-        from legibility import digest as digest_mod
-
-        renderer_default = (
-            inspect.signature(digest_mod.build_digest).parameters['max_bytes'].default
-        )
-        assert renderer_default == mod.DEFAULT_DIGEST_MAX_BYTES
+    def test_module_constant_is_an_alias_of_the_digest_cap(self):
+        """The cost cap must be the renderer's constant, not an equal copy."""
+        assert mod.DEFAULT_DIGEST_MAX_BYTES is digest.DEFAULT_MAX_BYTES
 
 
 class TestRenderManifest:
