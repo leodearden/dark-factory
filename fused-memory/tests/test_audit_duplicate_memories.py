@@ -4822,6 +4822,22 @@ class TestRunWiring:
         await _run(await self._parse(tmp_path))
         assert _FakeMemoryService.instances[-1].closed is True
 
+    async def test_the_printed_plan_carries_each_categorys_scan_coverage(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Task 3136's report reads coverage off stdout, not off the metrics."""
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', _VENV_GOTCHA_A), _raw('m2', _DISTRACTOR)]},
+        )
+        await _run(await self._parse(
+            tmp_path, '--categories', _PK, '--scan-limit', '2',
+        ))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['scan_coverage'] == {
+            _PK: {'scanned': 2, 'truncated': 1, 'scan_limit': 2},
+        }
+
 
 # ---------------------------------------------------------------------------
 # Liveness-snapshot recurrence fixtures (task 3098)

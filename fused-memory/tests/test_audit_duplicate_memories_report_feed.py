@@ -167,3 +167,101 @@ class TestRetainedCarveoutCounts:
     def test_an_empty_scan_still_carries_both_reasons(self) -> None:
         plan = build_sweep_plan([], threshold=_THRESHOLD)
         assert plan['retained_carveout'] == {'topic_stamped': 0, 'child_record': 0}
+
+
+_MEMBER_FACT_KEYS = {'id', 'created_at', 'topic', 'canonical', 'parent_id', 'kind'}
+
+
+class TestMemberFacts:
+    def test_every_group_carries_one_fact_row_per_member_in_member_order(self) -> None:
+        plan = build_sweep_plan([
+            _record('b', 0, '2026-02-01T00:00:00+00:00', topic='venv', canonical=True),
+            _record('a', 1, '2026-01-01T00:00:00+00:00', parent_id='b', kind='sighting'),
+            _record('c', 2, '2026-03-01T00:00:00+00:00'),
+        ], threshold=_THRESHOLD)
+
+        group = _only_group(plan)
+        assert [m['id'] for m in group['members']] == group['member_ids']
+        assert all(set(m) == _MEMBER_FACT_KEYS for m in group['members'])
+        assert group['members'] == [
+            {'id': 'a', 'created_at': '2026-01-01T00:00:00+00:00', 'topic': None,
+             'canonical': False, 'parent_id': 'b', 'kind': 'sighting'},
+            {'id': 'b', 'created_at': '2026-02-01T00:00:00+00:00', 'topic': 'venv',
+             'canonical': True, 'parent_id': None, 'kind': None},
+            {'id': 'c', 'created_at': '2026-03-01T00:00:00+00:00', 'topic': None,
+             'canonical': False, 'parent_id': None, 'kind': None},
+        ]
+
+    def test_canonical_is_the_strict_marker_reading(self) -> None:
+        plan = build_sweep_plan([
+            _record('a', 0, '2026-01-01T00:00:00+00:00', canonical='true'),
+            _record('b', 1, '2026-02-01T00:00:00+00:00', canonical=1),
+        ], threshold=_THRESHOLD)
+
+        assert [m['canonical'] for m in _only_group(plan)['members']] == [False, False]
+
+    def test_a_record_without_a_timestamp_reports_none(self) -> None:
+        records = [
+            _record('a', 0, '2026-01-01T00:00:00+00:00'),
+            {**_record('b', 1, ''), 'created_at': None},
+        ]
+        plan = build_sweep_plan(records, threshold=_THRESHOLD)
+        assert _only_group(plan)['members'][1]['created_at'] is None
+
+
+class TestChildCounts:
+    def test_children_are_counted_per_parent_and_kind_over_every_swept_record(
+        self,
+    ) -> None:
+        unrelated = 'An unrelated note about rustfmt edition pinning in the reify crate.'
+        plan = build_sweep_plan([
+            _record('p', 0, '2026-01-01T00:00:00+00:00'),
+            _record('s1', 1, '2026-02-01T00:00:00+00:00', parent_id='p', kind='sighting'),
+            _record('s2', 2, '2026-03-01T00:00:00+00:00', parent_id='p', kind='sighting'),
+            _record('m1', 3, '2026-04-01T00:00:00+00:00', parent_id='p', kind='amendment'),
+            {**_record('q1', 0, '2026-01-01T00:00:00+00:00', parent_id='q',
+                       kind='sighting'), 'content': unrelated},
+            _record('n1', 4, '2026-05-01T00:00:00+00:00', category=_PN, parent_id='z'),
+            _record('x1', 4, '2026-05-01T00:00:00+00:00',
+                    category='observations_and_summaries', parent_id='p', kind='sighting'),
+        ], threshold=_THRESHOLD, categories=(_PK, _PN))
+
+        assert plan['child_counts'] == [
+            {'parent_id': 'p', 'kind': 'sighting', 'count': 2},
+            {'parent_id': 'p', 'kind': 'amendment', 'count': 1},
+            {'parent_id': 'q', 'kind': 'sighting', 'count': 1},
+            {'parent_id': 'z', 'kind': None, 'count': 1},
+        ]
+
+    def test_a_corpus_without_children_reports_an_empty_list(self) -> None:
+        plan = build_sweep_plan([
+            _record('x', 0, '2026-01-01T00:00:00+00:00'),
+            _record('y', 1, '2026-02-01T00:00:00+00:00'),
+        ], threshold=_THRESHOLD)
+        assert plan['child_counts'] == []
+
+
+class TestScanCoverageEcho:
+    def test_the_callers_coverage_is_echoed_as_a_plain_dict(self) -> None:
+        coverage = {_PK: {'scanned': 2, 'truncated': 0, 'scan_limit': 5000}}
+        plan = build_sweep_plan([], threshold=_THRESHOLD, scan_coverage=coverage)
+        assert plan['scan_coverage'] == coverage
+        assert type(plan['scan_coverage']) is dict
+
+    def test_an_omitted_coverage_is_present_and_none(self) -> None:
+        plan = build_sweep_plan([], threshold=_THRESHOLD)
+        assert 'scan_coverage' in plan
+        assert plan['scan_coverage'] is None
+
+
+class TestPreExistingKeysKeepTheirMeaning:
+    def test_cluster_and_delete_keys_are_unchanged(self) -> None:
+        plan = build_sweep_plan([
+            _record('x', 0, '2026-01-01T00:00:00+00:00'),
+            _record('y', 1, '2026-02-01T00:00:00+00:00'),
+            _record('z', 2, '2026-03-01T00:00:00+00:00'),
+        ], threshold=_THRESHOLD, scan_coverage={_PK: {'scanned': 3, 'truncated': 0}})
+
+        assert plan['clusters_total'] == 1
+        assert _only_group(plan)['member_ids'] == ['x', 'y', 'z']
+        assert plan['delete_candidates'] == ['y', 'z']
