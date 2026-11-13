@@ -351,7 +351,11 @@ class _RowClaims:
 
 @dataclass(frozen=True, slots=True)
 class _JoinSources:
-    """The program-wide indexes, read once per build, that every eval's rows join against."""
+    """The program-wide inputs, read once per build, that every eval's rows join against or repeat.
+
+    ``storm`` is the projected storm block: each eval's payload repeats it whole,
+    while the escalation join reads only whether it is set.
+    """
 
     verdicts: _VerdictIndex
     escalations: Mapping[str, Escalation]

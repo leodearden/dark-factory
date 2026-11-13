@@ -23,10 +23,8 @@ def _metric(metric_id: str, kind: str = 'count') -> dict[str, Any]:
     return {'metric_id': metric_id, 'kind': kind, 'value': 1.0, 'n': 3}
 
 
-def _write_eval(
-    root: Path, eval_id: str, metrics: list[dict[str, Any]], *, run_stamp: str = _RUN,
-) -> None:
-    dump_artifact(root / eval_id / f'metrics-{_RUN}.json', {'run_stamp': run_stamp, 'metrics': metrics})
+def _write_eval(root: Path, eval_id: str, metrics: list[dict[str, Any]]) -> None:
+    dump_artifact(root / eval_id / f'metrics-{_RUN}.json', {'run_stamp': _RUN, 'metrics': metrics})
     dump_artifact(root / eval_id / 'limits-current.json', {'run_stamp': _RUN, 'verdicts': []})
 
 
@@ -176,7 +174,7 @@ class TestIssueOrder:
         })
         dump_artifact(eval_dir / 'metrics-20260705T031500Z.json', {
             'run_stamp': 'not-a-stamp',
-            'metrics': [_metric('m-verdict')],
+            'metrics': [_metric('m-verdict'), _metric('m-z', kind='histogram2')],
         })
         _write_verdicts(root, [
             {'eval_id': 'eval-a', 'metric_id': 'm-verdict', 'verdict': 'bogus', 'fingerprint': 'fp-x'},
@@ -192,4 +190,5 @@ class TestIssueOrder:
             'unparseable_run_stamp',
             'unknown_kind',
             'unknown_verdict',
+            'unknown_kind',
         ]
