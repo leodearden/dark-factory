@@ -944,6 +944,14 @@ without having been capped. ``truncated_items`` is therefore tracked from
 what :func:`_cap_item` actually did (see :func:`_build_sections`), never
 re-derived by scanning the rendered body."""
 
+DEFAULT_MAX_BYTES = 15360
+"""The PRD §7.2 per-digest soft cap, in UTF-8 bytes.
+
+SOFT because :func:`_truncate_sections` stops trimming once every section is
+empty: a soft cap cannot shrink the frontmatter itself, so a digest whose
+frontmatter alone exceeds *max_bytes* (a pathological ``cwd``/``session``
+value, or a very small injected cap) renders LARGER than the cap."""
+
 MAX_ITEM_BYTES = 2048
 """Hard ceiling on a single rendered item's UTF-8 byte length, regardless
 of how large *max_bytes* is."""
@@ -1042,7 +1050,7 @@ def _cap_item(line: str, cap: int) -> str:
 def _build_sections(
     records: list[dict[str, Any]],
     *,
-    item_max_bytes: int = _item_byte_cap(15360),
+    item_max_bytes: int,
     hits: Sequence[RecordHits] | None = None,
 ) -> tuple[dict[str, list[str]], set[tuple[str, int]]]:
     """Run every detector once and render its hits to markdown bullet
@@ -1225,7 +1233,7 @@ def render_digest(
     *,
     agent_class: str,
     path: Any = None,
-    max_bytes: int = 15360,
+    max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> str:
     """Render the full markdown digest: frontmatter + one section per
     non-empty signal class (PRD Sec 7.2), soft-capped at *max_bytes*.
@@ -1274,7 +1282,8 @@ def render_digest(
 
 
 def build_digest(
-    path: Any, *, agent_class_override: str | None = None, max_bytes: int = 15360,
+    path: Any, *, agent_class_override: str | None = None,
+    max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> str:
     """Orchestrate the full pipeline for a single transcript file: parse,
     classify, render. This is the headline entry point (PRD Sec 8.1
@@ -1315,7 +1324,7 @@ def main(argv: Sequence[str]) -> int:
         help='Render this agent_class instead of classifying the transcript',
     )
     parser.add_argument(
-        '--max-bytes', type=int, default=15360,
+        '--max-bytes', type=int, default=DEFAULT_MAX_BYTES,
         help='Soft byte cap for the rendered digest (default: %(default)s)',
     )
     parser.add_argument(

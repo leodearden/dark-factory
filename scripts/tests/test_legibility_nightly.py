@@ -445,15 +445,6 @@ def _write_multi_mb_transcript(
     path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
 
 
-def test_nightly_cap_is_an_alias_of_the_sampler_cap_not_a_second_literal():
-    """``DEFAULT_MAX_DIGEST_BYTES`` and ``sampling.DEFAULT_DIGEST_MAX_BYTES``
-    are a word-order swap apart. If they were independent literals, a drift
-    between the cost basis and the render basis would be invisible to every
-    test — so nightly's name BINDS to the sampler's rather than re-declaring
-    it (reviewer_comprehensive, task 3268 amendment pass)."""
-    assert nightly.DEFAULT_MAX_DIGEST_BYTES is nightly.sampling.DEFAULT_DIGEST_MAX_BYTES
-
-
 def test_select_digest_sessions_charges_real_digest_bytes(tmp_path):
     """The cost basis handed to the sampler must be the REAL rendered digest
     size -- what makes ``max_daily_digest_bytes`` mean what it says.
@@ -482,7 +473,7 @@ def test_select_digest_sessions_charges_real_digest_bytes(tmp_path):
         digest.build_digest(
             record.path,
             agent_class_override=record.stratum,
-            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+            max_bytes=digest.DEFAULT_MAX_BYTES,
         ).encode('utf-8')
     )
     assert sample.bytes_used == expected
@@ -517,15 +508,15 @@ def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_wit
     sample = nightly.select_digest_sessions(
         cfg, projects_root, date(2026, 7, 13), build=recording_build,
     )
-    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES], (
-        'the sampler must charge at the nightly cap, not at build_digest\'s own default'
+    assert caps == [digest.DEFAULT_MAX_BYTES], (
+        'the sampler must charge at the cap build_digests renders with'
     )
 
     # RENDER side: build_digests, called by run_nightly with no max_bytes
     # override, must reach the renderer with that SAME cap.
     caps.clear()
     nightly.build_digests(sample.selected, build=recording_build)
-    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES]
+    assert caps == [digest.DEFAULT_MAX_BYTES]
 
 
 def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_path):
@@ -644,7 +635,7 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
     assert digests == [
         digest.build_digest(
             session_path, agent_class_override=sample.selected[0].stratum,
-            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+            max_bytes=digest.DEFAULT_MAX_BYTES,
         )
     ], 'the cached digest must be byte-identical to a fresh render'
 
