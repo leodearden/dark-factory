@@ -11,7 +11,6 @@ import json
 import re
 import shutil
 from collections.abc import Callable, Mapping
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -606,29 +605,29 @@ class TestConfiguredAdjudicator:
         ] * 2
 
     @pytest.mark.asyncio
-    async def test_without_a_brief_text_the_brief_is_read_once_at_construction(
-        self, monkeypatch, tmp_path,
-    ):
+    async def test_without_a_brief_text_the_brief_is_read_once_at_construction(self, tmp_path):
         brief = tmp_path / 'brief.md'
         brief.write_text(FIXED_BRIEF, encoding='utf-8')
-        monkeypatch.setattr(link_adjudicator, 'RATER_BRIEF_PATH', brief)
-        reads: list[Path] = []
-        read_text = Path.read_text
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+        config = LinkHealConfig(shard_size=1)
+        adjudicate = configured_adjudicator(config, brief_path=brief, invoke=invoke)
+        brief.unlink()
 
-        def counting_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
-            if path == brief:
-                reads.append(path)
-            return read_text(path, *args, **kwargs)
+        verdicts = await adjudicate(_pairs(2))
 
-        monkeypatch.setattr(Path, 'read_text', counting_read_text)
+        assert [verdict.verdict for verdict in verdicts] == [Verdict.SAME, Verdict.SAME]
+        assert [call['system_prompt'] for call in invoke.calls] == [
+            render_system_prompt(FIXED_BRIEF),
+        ] * 2
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, config.field_chars)
+        assert adjudicate.model == config.adjudicator_model
 
-        adjudicate = configured_adjudicator(LinkHealConfig())
-        fake_backed = configured_adjudicator(LinkHealConfig(), ask=FakeAsker())
-        await fake_backed(_pairs(3))
+    def test_by_default_the_brief_is_the_rater_brief(self):
+        adjudicate = configured_adjudicator(LinkHealConfig(), ask=FakeAsker())
 
-        assert reads == [brief, brief]
-        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, LinkHealConfig().field_chars)
-        assert adjudicate.model == LinkHealConfig().adjudicator_model
+        brief = link_adjudicator.RATER_BRIEF_PATH.read_text(encoding='utf-8')
+        assert adjudicate.prompt_sha256 == prompt_sha256(brief, LinkHealConfig().field_chars)
 
     @pytest.mark.asyncio
     async def test_the_config_leaves_bind_model_sharding_cap_and_streak(self):

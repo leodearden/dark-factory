@@ -472,19 +472,25 @@ class ConfiguredAdjudicator:
 
 
 def configured_adjudicator(
-    config: LinkHealConfig, *, ask: ShardAsker | None = None, brief_text: str | None = None,
+    config: LinkHealConfig,
+    *,
+    ask: ShardAsker | None = None,
+    brief_text: str | None = None,
+    brief_path: Path = RATER_BRIEF_PATH,
+    invoke: Invoke = invoke_with_cap_retry,
 ) -> ConfiguredAdjudicator:
     """The ``link_heal`` leaves and the brief, both read now, bound for a run.
 
-    *brief_text* defaults to the brief at :data:`RATER_BRIEF_PATH`, read once
-    here; *ask* defaults to a :class:`ClaudeShardAsker` over that same text.
+    *brief_text* defaults to the brief at *brief_path*, read once here; *ask*
+    defaults to a :class:`ClaudeShardAsker` over that same text, calling the CLI
+    through *invoke*.
     """
-    brief = RATER_BRIEF_PATH.read_text(encoding='utf-8') if brief_text is None else brief_text
+    brief = brief_path.read_text(encoding='utf-8') if brief_text is None else brief_text
     return ConfiguredAdjudicator(
         model=config.adjudicator_model,
         prompt_sha256=prompt_sha256(brief, config.field_chars),
         shard_size=config.shard_size,
         field_chars=config.field_chars,
         failure_streak=config.shard_failure_streak,
-        ask=ClaudeShardAsker(brief_text=brief) if ask is None else ask,
+        ask=ClaudeShardAsker(brief_text=brief, invoke=invoke) if ask is None else ask,
     )
