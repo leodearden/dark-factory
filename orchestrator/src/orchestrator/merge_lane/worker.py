@@ -15665,6 +15665,9 @@ class SpeculativeMergeWorker:
         #
         # No hard block: the append already happened above; this block has no
         # `return`, no `raise`, and no veto.
+        #
+        # The bound is the host count, not speculation depth: leased verifies
+        # are bounded by one allocator slot per host, while K = hosts + 1.
         try:
             _local = sum(
                 1 for _e in self._frozen_inflight_entries()
@@ -15677,7 +15680,7 @@ class SpeculativeMergeWorker:
             alarm_serial_lane_breach(
                 check_serial_lane_tripwire(
                     _local,
-                    merge_ahead_bound=self._speculation_depth,
+                    merge_ahead_bound=_hosts,
                     num_hosts=_hosts,
                 ),
                 event_store=self._event_store,
