@@ -1966,11 +1966,11 @@ async def validate_landing_evidence(
     Returns:
         A :class:`LandingVerdict`.
     """
+    enabled = _checks_enabled_leaf(delivered_checks, checks_enabled)
     # THE MODE, made explicit.  The two arms below have always been two
     # policies; until now the only way to tell which one produced a verdict was
     # to know which branch the caller's arguments had taken.  Naming it here
     # makes it readable off the verdict itself.
-    enabled = _checks_enabled_leaf(delivered_checks, checks_enabled)
     method = (
         LandingMethod.merge_marker if candidate_sha is not None
         else LandingMethod.citation

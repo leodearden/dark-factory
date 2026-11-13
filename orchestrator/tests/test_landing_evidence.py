@@ -122,6 +122,24 @@ def _git_ops(
     return git_ops
 
 
+def _survival_rejecting_git_ops(candidate_sha: str) -> MagicMock:
+    """A git_ops whose survival check REJECTS — the only path the
+    delivered-checks differential is ever consulted on.
+    """
+    return _git_ops(
+        citation=None,
+        is_ancestor_map={},
+        effect_present=False,
+        effect_probe=CommitEffectProbe(
+            present=False,
+            diverged_paths=('shared/manifest.py',),
+            anchor_sha=candidate_sha,
+            failure='effect_not_survived',
+            aggregate_survival=0.42,
+        ),
+    )
+
+
 @pytest.mark.asyncio
 class TestValidateLandingEvidenceDiscoveryMode:
     """DISCOVERY mode (candidate_sha=None): discover a citation, apply the
@@ -1106,24 +1124,6 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
     branch — not by care.
     """
 
-    @staticmethod
-    def _rejecting_git_ops(candidate_sha: str) -> MagicMock:
-        """A git_ops whose survival check REJECTS — the only path the
-        differential is ever consulted on.
-        """
-        return _git_ops(
-            citation=None,
-            is_ancestor_map={},
-            effect_present=False,
-            effect_probe=CommitEffectProbe(
-                present=False,
-                diverged_paths=('shared/manifest.py',),
-                anchor_sha=candidate_sha,
-                failure='effect_not_survived',
-                aggregate_survival=0.42,
-            ),
-        )
-
     async def test_differential_upgrades_a_survival_rejection(self) -> None:
         """(a) FAIL at the parent, PASS at the citation, PASS at main ->
         a verdict survival REJECTED is ACCEPTED.
@@ -1132,7 +1132,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         merge made the capability true is the entire signal.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1230,7 +1230,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         an exception, always an explicit NO SIGNAL in the probe.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         by_ref = {
             f'{sha}^1': outcomes['parent'],
             sha: outcomes['citation'],
@@ -1255,7 +1255,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         recorded into the probe that gets rendered into the escalation.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
 
         async def _boom(check, *, project_root, ref='main', runner=None):
             raise RuntimeError('delivered-check runner exploded')
@@ -1285,7 +1285,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         invert them a second time.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1311,7 +1311,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         the precise double-inversion bug this pins against.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, _calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.DELIVERED,
             sha: DeliveredCheckResult.FAILED,
@@ -1334,7 +1334,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         that would answer identically each time.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({})
 
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
@@ -1356,7 +1356,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         kinds still gets the differential from the greppable one.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1388,16 +1388,16 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         })
 
         unwired = await validate_landing_evidence(
-            self._rejecting_git_ops(sha), '42', 'task/42',
+            _survival_rejecting_git_ops(sha), '42', 'task/42',
             branch_tip_sha=None, candidate_sha=sha,
         )
         none_declared = await validate_landing_evidence(
-            self._rejecting_git_ops(sha), '42', 'task/42',
+            _survival_rejecting_git_ops(sha), '42', 'task/42',
             branch_tip_sha=None, candidate_sha=sha, delivered_checks=[], checks_enabled=True,
         )
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             evaluated = await validate_landing_evidence(
-                self._rejecting_git_ops(sha), '42', 'task/42',
+                _survival_rejecting_git_ops(sha), '42', 'task/42',
                 branch_tip_sha=None, candidate_sha=sha,
                 delivered_checks=[_grep_check()], checks_enabled=True,
             )
@@ -1535,7 +1535,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         structurally incapable of ever confirming.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         git_ops.merge_base_with_main = AsyncMock(return_value=sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
@@ -1565,7 +1565,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         silently mis-target.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         git_ops.config = SimpleNamespace(main_branch='trunk')
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
@@ -1597,7 +1597,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         """
         sha = 'c' * 40
         if mode == 'candidate':
-            git_ops = self._rejecting_git_ops(sha)
+            git_ops = _survival_rejecting_git_ops(sha)
             candidate_sha: str | None = sha
         else:
             git_ops = _git_ops(
@@ -1668,7 +1668,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
                 '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
             )
             rejected = await validate_landing_evidence(
-                self._rejecting_git_ops(sha), '42', 'task/42',
+                _survival_rejecting_git_ops(sha), '42', 'task/42',
                 branch_tip_sha=None, candidate_sha=sha,
             )
 
@@ -3386,50 +3386,36 @@ class TestDeliveredChecksLeafIsTheCallers:
             'an operator must see the path was switched off, not merely unlucky'
         )
 
+    @pytest.mark.parametrize('candidate_sha', [
+        pytest.param('c' * 40, id='candidate'),
+        pytest.param(None, id='discovery'),
+    ])
     @pytest.mark.parametrize('delivered_checks', [
         pytest.param([], id='none_declared'),
         pytest.param([_grep_check()], id='declared'),
     ])
-    async def test_supplying_checks_without_the_leaf_is_refused(
-        self, real_git_ops: GitOps, real_git_repo: Path,
-        delivered_checks: list[dict[str, object]],
+    async def test_supplying_checks_without_the_leaf_is_refused_before_any_git_call(
+        self, delivered_checks: list[dict[str, object]], candidate_sha: str | None,
     ) -> None:
         """``[]`` counts as supplied: a wired site states the leaf even when
-        its task declares nothing."""
-        cited = _build_reverted_capability(_Repo(real_git_repo))
-        stub, calls = _check_runner({
-            f'{cited}^1': DeliveredCheckResult.FAILED,
-            cited: DeliveredCheckResult.DELIVERED,
-            'main': DeliveredCheckResult.DELIVERED,
-        })
+        its task declares nothing.  Each mode's first git probe is pinned
+        unawaited, so the refusal cannot drift behind git work."""
+        git_ops = _survival_rejecting_git_ops('c' * 40)
 
-        with (
-            patch('orchestrator.delivered_checks.run_delivered_check', stub),
-            pytest.raises(TypeError, match='checks_enabled'),
-        ):
+        with pytest.raises(TypeError, match='require checks_enabled'):
             await validate_landing_evidence(
-                real_git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=cited,
-                delivered_checks=delivered_checks,
+                git_ops, '42', 'task/42', branch_tip_sha='f' * 40,
+                candidate_sha=candidate_sha, delivered_checks=delivered_checks,
             )
 
-        assert calls == []
+        git_ops.find_task_citation_commit.assert_not_awaited()
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
 
     async def test_a_stand_in_git_ops_config_is_never_consulted(self) -> None:
         """A stand-in whose config says DISABLED cannot override a caller
         that says ENABLED: nothing is read off ``git_ops.config``."""
         sha = 'c' * 40
-        git_ops = _git_ops(
-            citation=None,
-            is_ancestor_map={},
-            effect_present=False,
-            effect_probe=CommitEffectProbe(
-                present=False,
-                diverged_paths=('shared/manifest.py',),
-                anchor_sha=sha,
-                failure='effect_not_survived',
-                aggregate_survival=0.42,
-            ),
-        )
+        git_ops = _survival_rejecting_git_ops(sha)
         git_ops.config = SimpleNamespace(
             main_branch='main', delivered_checks=SimpleNamespace(enabled=False),
         )
