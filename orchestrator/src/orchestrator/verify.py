@@ -3685,24 +3685,29 @@ def archive_verify_logs(
     cause_hint: str,
     *,
     module_prefix: 'str | None' = None,
-    role: Literal['merge', 'task'] = 'merge',
+    role: Literal['merge', 'task'],
 ) -> list[Path]:
     """Write a verify's run outputs + summary DIRECTLY to the durable archive.
 
-    ``role`` (default 'merge') is stamped into the summary;
-    ``verify_runner.RemoteRunner`` passes 'task' for remote task verifies.
+    ``role`` is stamped into the summary: 'merge' from the local merge lane
+    and ``verify_runner.RemoteRunner.run_merge_verify``, 'task' from
+    ``verify_runner.RemoteRunner.run_task_verify``.
 
     Unlike ``_archive_attempt_log`` (which copies files from the worktree's
     ``.task/verify/``), this function writes directly to
-    ``<archive_root>/<task_id>/`` because merge worktrees have ``.task/``
-    scrubbed by design (git_ops.py) and there are no intermediate worktree
-    log files to copy from.
+    ``<archive_root>/<task_id>/`` because no caller has worktree log files
+    to copy from: merge worktrees have ``.task/`` scrubbed by design
+    (git_ops.py), and a remote verify's streams arrive over ssh with no
+    worktree copy on this host.
 
     Differences from the task-path helpers:
-    - **No deny-list check**: on the merge path there is no debugger loop;
-      every failure reaches a human.  ``infra_timeout`` and ``test_failure``
-      (the exact categories that distinguish timeout-vs-real-failure) are
-      archived unconditionally.
+    - **No deny-list check, for either role**.  On the merge path there is
+      no debugger loop; every failure reaches a human.  A remote task
+      verify does have one, but ``plans/remote-task-leg-verify-prd.md``
+      §4.3 archives its streams on every red: this archive is their only
+      copy on this host, and the result's ``archive_log_paths`` point at it.
+      ``infra_timeout`` and ``test_failure`` (the exact categories that
+      distinguish timeout-vs-real-failure) are archived unconditionally.
     - **Direct-to-archive**: bypasses ``.task/verify/``; the archive is the
       only persistence target that survives merge_wt cleanup.
 

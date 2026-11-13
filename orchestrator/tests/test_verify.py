@@ -6509,8 +6509,6 @@ class TestRunVerificationMergeArchival:
     These tests use a fake worktree with NO .task/ dir (mimicking a merge
     worktree) and verify that passing role='merge' + archive_root causes
     archive_verify_logs to be called directly.
-
-    Tests are RED until step-4 adds the role=='merge' branch to run_verification.
     """
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
@@ -9871,7 +9869,7 @@ class TestArchiveVerifyLogs:
         from orchestrator.verify import archive_verify_logs
         return archive_verify_logs(
             runs, archive_root, task_id, attempt_id, category, cause_hint,
-            module_prefix=module_prefix,
+            module_prefix=module_prefix, role='merge',
         )
 
     # (a) writes per-command .log files into <archive_root>/<task_id>/

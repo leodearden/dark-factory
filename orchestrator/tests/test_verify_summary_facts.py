@@ -155,17 +155,6 @@ class TestTheSummaryCarriesTheRole:
 
         assert _read_archived_summary(archive_root)['role'] == role
 
-    def test_the_archive_writer_defaults_to_merge(self, tmp_path):
-        """'merge' is the DEFAULT role when the caller passes none."""
-        from orchestrator.verify import archive_verify_logs
-
-        archive_root = tmp_path / 'archive'
-        archive_verify_logs(
-            [_run('test', rc=1)], archive_root, '5671', 1, 'test_failure', '',
-        )
-
-        assert _read_archived_summary(archive_root)['role'] == 'merge'
-
 
 class TestTheTopLevelNamesItsCommand:
     """The top-level rc/cmd/... copy ONE run's fields; 'label' says which.
