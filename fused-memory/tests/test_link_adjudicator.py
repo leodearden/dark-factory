@@ -7,7 +7,6 @@ so the two must agree word for word (INV-10).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import shutil
@@ -561,14 +560,27 @@ FIXED_BRIEF = '# A fixed brief\n\nJudge each pair, once.\n'
 
 
 class TestPromptVersion:
-    def test_the_prompt_version_is_the_sha_of_the_rendered_system_prompt(self):
-        rendered = render_system_prompt(FIXED_BRIEF).encode('utf-8')
+    """The prompt version names everything besides the model that decides what the
+    model is asked: the rendered system prompt, and the cap its pair texts are cut to."""
 
-        assert prompt_sha256(FIXED_BRIEF) == hashlib.sha256(rendered).hexdigest()
+    def test_it_is_a_sha256(self):
+        assert re.fullmatch(r'[0-9a-f]{64}', prompt_sha256(FIXED_BRIEF, 4000))
 
     def test_it_is_stable_for_a_brief_and_moves_with_it(self):
-        assert prompt_sha256(FIXED_BRIEF) == prompt_sha256(FIXED_BRIEF)
-        assert prompt_sha256(FIXED_BRIEF) != prompt_sha256(FIXED_BRIEF + 'One more rule.\n')
+        assert prompt_sha256(FIXED_BRIEF, 4000) == prompt_sha256(FIXED_BRIEF, 4000)
+        assert prompt_sha256(FIXED_BRIEF, 4000) != prompt_sha256(
+            FIXED_BRIEF + 'One more rule.\n', 4000,
+        )
+
+    def test_it_moves_with_the_field_cap(self):
+        assert prompt_sha256(FIXED_BRIEF, 4000) != prompt_sha256(FIXED_BRIEF, 2000)
+
+    def test_a_configured_adjudicator_names_the_version_of_its_own_field_cap(self):
+        config = LinkHealConfig(field_chars=1234)
+
+        adjudicate = configured_adjudicator(config, ask=FakeAsker(), brief_text=FIXED_BRIEF)
+
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, 1234)
 
 
 class TestConfiguredAdjudicator:
@@ -587,7 +599,7 @@ class TestConfiguredAdjudicator:
         verdicts = await adjudicate(_pairs(2))
 
         assert adjudicate.model == 'haiku'
-        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF)
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, LinkHealConfig().field_chars)
         assert [verdict.verdict for verdict in verdicts] == [Verdict.SAME, Verdict.SAME]
         assert [call['system_prompt'] for call in invoke.calls] == [
             render_system_prompt(FIXED_BRIEF),
@@ -615,7 +627,7 @@ class TestConfiguredAdjudicator:
         await fake_backed(_pairs(3))
 
         assert reads == [brief, brief]
-        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF)
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, LinkHealConfig().field_chars)
         assert adjudicate.model == LinkHealConfig().adjudicator_model
 
     @pytest.mark.asyncio

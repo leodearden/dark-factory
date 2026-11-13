@@ -17,7 +17,9 @@ parsing and the failed-shard streak, so every asker, fake or real, runs through
 them. :func:`configured_adjudicator` reads the brief once and binds it, with
 the ``link_heal`` leaves, into a :class:`ConfiguredAdjudicator` that names its
 model and prompt version (:func:`prompt_sha256`), so every verdict of a run is
-attributable to the one prompt it was asked under.
+attributable to the one prompt it was asked under. The model is named as
+``link_heal.adjudicator_model`` spells it: an alias such as ``opus`` names the
+same adjudicator after the CLI moves it to a newer model.
 :class:`ClaudeShardAsker` is the production asker, in the shape of
 ``middleware/path_scope_adjudicator.py::PathScopeAdjudicator.adjudicate`` and
 ``reconciliation/judge.py::Judge._call_judge_cli``: the Claude CLI over OAuth,
@@ -159,9 +161,12 @@ def render_system_prompt(brief_text: str) -> str:
     return f'{brief_text.rstrip()}\n\n## Protocol for this call\n\n{_PROTOCOL}\n'
 
 
-def prompt_sha256(brief_text: str) -> str:
-    """The prompt version: the sha256 of the system prompt *brief_text* renders."""
-    return hashlib.sha256(render_system_prompt(brief_text).encode('utf-8')).hexdigest()
+def prompt_sha256(brief_text: str, field_chars: int) -> str:
+    """The prompt version: the sha256 of everything besides the model that decides what
+    the model is asked, the system prompt *brief_text* renders and the *field_chars*
+    cap its pair texts are cut to."""
+    identity = {'system_prompt': render_system_prompt(brief_text), 'field_chars': field_chars}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode('utf-8')).hexdigest()
 
 
 def render_user_prompt(shard: Shard) -> str:
@@ -477,7 +482,7 @@ def configured_adjudicator(
     brief = RATER_BRIEF_PATH.read_text(encoding='utf-8') if brief_text is None else brief_text
     return ConfiguredAdjudicator(
         model=config.adjudicator_model,
-        prompt_sha256=prompt_sha256(brief),
+        prompt_sha256=prompt_sha256(brief, config.field_chars),
         shard_size=config.shard_size,
         field_chars=config.field_chars,
         failure_streak=config.shard_failure_streak,

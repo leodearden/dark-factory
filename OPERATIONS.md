@@ -3304,7 +3304,13 @@ check.
   `relabel`) are staged; every other heal is recorded as `not_enabled`.
 - **When it writes.** It writes only when `link_heal.writes: true` is set, no
   `--dry-run` is given, and the latest calibration of the adjudicator's exact
-  model and prompt version (the sha256 of the rendered system prompt) passed.
+  model and prompt version passed. The prompt version is the sha256 of the
+  rendered system prompt together with `link_heal.field_chars`, the cap the
+  pair texts are cut to. The model is keyed as `link_heal.adjudicator_model`
+  spells it: an alias such as the default `opus` stays the same key when the
+  Claude CLI moves the alias to a newer model, so the old calibration and old
+  verdicts keep counting. Re-run `calibrate` after a CLI upgrade moves the
+  alias, or set `link_heal.adjudicator_model` to an exact model id.
   Otherwise the report's Writes line says `dry-run` or
   `withheld (uncalibrated)` / `withheld (calibration_failed)`, or
   `withheld (plan_stopped)` when the run's own plan document could not be
@@ -3324,7 +3330,8 @@ check.
   `link_heal.py sweep --since <the oldest withheld child's created_at>`. The
   report's Writes line and its `withheld_heals.oldest_child_created_at` give
   that time, and its tables count every heal the run withheld or superseded.
-- **Calibrate first, and again after any model or brief change.** From the
+- **Calibrate first, and again after any change of model, alias target, brief
+  or `link_heal.field_chars`.** From the
   main checkout (the soak data is gitignored there):
 
   ```bash
