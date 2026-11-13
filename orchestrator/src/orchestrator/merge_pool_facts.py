@@ -111,7 +111,7 @@ class PickRecords:
             'waiting_dropped': len(waiting) - len(listed),
             'halted_lanes': [ln for ln in self._lanes if self._is_lane_halted(ln)],
             'textual_conflict_pairs': _pairs_within(graph.textual_edges, members),
-            'footprint_pair_count': len(_pairs_within(graph.footprint_edges, members)),
+            'footprint_pair_count': sum(1 for pair in graph.footprint_edges if pair <= members),
         }
 
     def _waiting_entry(self, lane: str, req: MergeRequest) -> dict[str, object]:
