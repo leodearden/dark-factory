@@ -61,11 +61,12 @@ import signal
 import sys
 import time
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
-from inotify_simple import INotify, flags
+from inotify_simple import Event, INotify, flags
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
@@ -229,6 +230,79 @@ def _emit(
             logger.error('WATCHER_NTFY_OUTCOME: FAILED esc=%s url=%s: %s', esc.id, ntfy_url, e)
 
 
+class EventSource(Protocol):
+    """The read half of an inotify watch, as `watch` consumes it."""
+
+    def read(self, timeout: int | None = None) -> Iterable[Event]: ...
+
+
+def _read_timeout_ms(deadline: float | None, clock: Callable[[], float]) -> int | None:
+    """Milliseconds left before `deadline`, floored at 0; None blocks indefinitely."""
+    if deadline is None:
+        return None
+    return max(0, int((deadline - clock()) * 1000))
+
+
+def _first_matching_event(
+    queue_dir: Path,
+    events: Iterable[Event],
+    task_id: str | None,
+    level: int | None,
+    excludes: frozenset[str],
+) -> Escalation | None:
+    """Return the escalation of the first event that names a matching pending record."""
+    for event in events:
+        name = event.name
+        if not name or not (name.startswith('esc-') and name.endswith('.json')):
+            continue
+
+        if name[:-5] in excludes:
+            continue
+
+        esc, _reason = read_escalation_for_scan(
+            queue_dir / name, context='watcher.watch', parse_errors=_WATCHER_PARSE_ERRORS,
+        )
+        if esc is not None and _matches(esc, task_id, level, excludes):
+            return esc
+    return None
+
+
+def watch(
+    queue_dir: Path,
+    source: EventSource,
+    *,
+    task_id: str | None,
+    level: int | None,
+    timeout: float | None,
+    current_excludes: Callable[[], frozenset[str]],
+    clock: Callable[[], float],
+) -> Escalation | None:
+    """Return the first pending escalation matching the filters, or None once `timeout` expires.
+
+    `source` must already be armed on `queue_dir`, so nothing filed during the
+    initial scan is missed.  `current_excludes` is called before the scan and
+    once per poll, and the `timeout` deadline is measured from the end of the
+    scan.
+    """
+    match = _initial_scan(queue_dir, task_id, level, current_excludes())
+    if match is not None:
+        return match
+
+    deadline = None if timeout is None else clock() + timeout
+    while True:
+        timeout_ms = _read_timeout_ms(deadline, clock)
+        if timeout_ms == 0:
+            return None
+
+        events = list(source.read(timeout=timeout_ms))
+        if deadline is not None and not events:
+            return None
+
+        match = _first_matching_event(queue_dir, events, task_id, level, current_excludes())
+        if match is not None:
+            return match
+
+
 def main() -> None:
     # Invariant (c)'s marker is an operator-facing STDERR line, so this process
     # has to own a handler: without one it reaches stderr only by grace of
@@ -296,52 +370,14 @@ def main() -> None:
     watch_flags = flags.CREATE | flags.MOVED_TO
     inotify.add_watch(str(queue_dir), watch_flags)
 
-    # Initial scan: emit any already-pending escalation and exit immediately.
-    match = _initial_scan(queue_dir, args.task_id, args.level, current_excludes())
-    if match is not None:
-        _emit(match, args.ntfy_url)
-        sys.exit(0)
-
-    # Compute monotonic deadline (None = block indefinitely).
-    deadline: float | None = (
-        None if args.timeout is None else time.monotonic() + args.timeout
+    match = watch(
+        queue_dir, inotify, task_id=args.task_id, level=args.level, timeout=args.timeout,
+        current_excludes=current_excludes, clock=time.monotonic,
     )
-
-    # Event loop: wait for new files.
-    while True:
-        if deadline is not None:
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            if remaining_ms == 0:
-                sys.exit(124)
-            events = list(inotify.read(timeout=remaining_ms))
-        else:
-            events = list(inotify.read(timeout=None))
-
-        if deadline is not None and not events:
-            sys.exit(124)
-
-        excludes = current_excludes()  # RE-READ each poll (--exclude-file may have changed)
-
-        for event in events:
-            name = event.name
-            if not name or not (name.startswith('esc-') and name.endswith('.json')):
-                continue
-
-            if name[:-5] in excludes:
-                continue
-
-            path = queue_dir / name
-            esc, _reason = read_escalation_for_scan(
-                path, context='watcher.main', parse_errors=_WATCHER_PARSE_ERRORS,
-            )
-            if esc is None:
-                continue
-
-            if not _matches(esc, args.task_id, args.level, excludes):
-                continue
-
-            _emit(esc, args.ntfy_url)
-            sys.exit(0)
+    if match is None:
+        sys.exit(124)
+    _emit(match, args.ntfy_url)
+    sys.exit(0)
 
 
 if __name__ == '__main__':

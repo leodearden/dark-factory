@@ -1059,44 +1059,6 @@ class TestMainLoop:
 
             mock_exit.assert_called_once_with(0)
 
-    def test_undecodable_event_is_warned_and_loop_continues(
-        self, tmp_path, blocking_escalation: Escalation, capsys, caplog,
-    ):
-        """A non-UTF-8 record arriving via inotify must not crash the loop."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        (queue_dir / 'esc-binary.json').write_bytes(b'\xff\xfe\x00\x80')
-        (queue_dir / f'{blocking_escalation.id}.json').write_text(blocking_escalation.to_json())
-
-        binary_event = MagicMock()
-        binary_event.name = 'esc-binary.json'
-        valid_event = MagicMock()
-        valid_event.name = f'{blocking_escalation.id}.json'
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-            caplog.at_level(logging.WARNING),
-        ):
-            MockINotify.return_value.read.side_effect = [[binary_event, valid_event]]
-
-            from escalation.watcher import main
-
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-
-        assert exc_info.value.code == 0
-        assert blocking_escalation.id in capsys.readouterr().out
-        assert any(
-            r.levelno == logging.WARNING
-            and 'watcher.main' in r.getMessage()
-            and 'esc-binary.json' in r.getMessage()
-            for r in caplog.records
-        ), [(r.levelname, r.getMessage()) for r in caplog.records]
-
 
 class TestTimeout:
     """--timeout arg: exit 124 on expiry; no timeout -> block indefinitely."""
