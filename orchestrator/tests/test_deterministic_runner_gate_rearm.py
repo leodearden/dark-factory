@@ -22,6 +22,7 @@ from escalation.queue import EscalationQueue
 from shared.task_metadata import parse_metadata
 
 from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE, DeterministicRunner
+from orchestrator.gate_preconditions import GATE_ESCALATED_PRECONDITIONS_KEY
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
@@ -112,13 +113,16 @@ async def _fire_and_resolve(scheduler: _SchedulerDouble, queue: EscalationQueue)
     return _resolve_pending(queue)
 
 
-def _assert_refired(
-    scheduler: _SchedulerDouble, queue: EscalationQueue, outcome: WorkflowOutcome,
-    first: Escalation,
+async def _dispatch_expecting_refire(
+    scheduler: _SchedulerDouble, queue: EscalationQueue, first: Escalation,
 ) -> Escalation:
+    statuses_before = len(scheduler.statuses())
+
+    outcome = await _dispatch(scheduler, queue)
+
     assert outcome == WorkflowOutcome.BLOCKED
+    assert scheduler.statuses()[statuses_before:] == [{'status': 'blocked'}]
     assert scheduler.done_writes() == []
-    assert scheduler.statuses()[-1]['status'] == 'blocked'
     pending = _pending(queue)
     assert len(pending) == 1, pending
     refiled = pending[0]
@@ -147,9 +151,7 @@ async def test_gate_held_behind_a_new_dependency_refires_when_it_lands(queue):
     first = await _fire_and_resolve(scheduler, queue)
     scheduler.task['dependencies'] = [10, 20]
 
-    outcome = await _dispatch(scheduler, queue)
-
-    _assert_refired(scheduler, queue, outcome, first)
+    await _dispatch_expecting_refire(scheduler, queue, first)
 
 
 @pytest.mark.asyncio
@@ -157,7 +159,7 @@ async def test_refired_gate_closes_on_its_next_resolution(queue):
     scheduler = _SchedulerDouble(_gate_task(deps=[10]))
     first = await _fire_and_resolve(scheduler, queue)
     scheduler.task['dependencies'] = [10, 20]
-    refiled = _assert_refired(scheduler, queue, await _dispatch(scheduler, queue), first)
+    refiled = await _dispatch_expecting_refire(scheduler, queue, first)
     _resolve_pending(queue)
 
     outcome = await _dispatch(scheduler, queue)
@@ -184,9 +186,7 @@ async def test_gate_held_behind_a_moved_milestone_refires(
     first = await _fire_and_resolve(scheduler, queue)
     scheduler.task['metadata']['milestone'] = milestone_after_resolve
 
-    outcome = await _dispatch(scheduler, queue)
-
-    _assert_refired(scheduler, queue, outcome, first)
+    await _dispatch_expecting_refire(scheduler, queue, first)
 
 
 @pytest.mark.asyncio
@@ -195,9 +195,7 @@ async def test_gate_held_behind_a_new_external_dependency_refires(queue):
     first = await _fire_and_resolve(scheduler, queue)
     scheduler.task['metadata']['external_deps'] = ['reify:42']
 
-    outcome = await _dispatch(scheduler, queue)
-
-    _assert_refired(scheduler, queue, outcome, first)
+    await _dispatch_expecting_refire(scheduler, queue, first)
 
 
 @pytest.mark.asyncio
@@ -222,16 +220,32 @@ async def test_removed_dependency_does_not_refire(queue):
 
 
 @pytest.mark.asyncio
-async def test_unreadable_preconditions_stamp_refires(queue):
-    from orchestrator.gate_preconditions import GATE_ESCALATED_PRECONDITIONS_KEY
+async def test_curator_gate_held_behind_a_new_dependency_refires_the_gate(queue):
+    scheduler = _SchedulerDouble(_gate_task(deps=[10], human_curator_gate=True))
+    first = await _fire_and_resolve(scheduler, queue)
+    scheduler.task['dependencies'] = [10, 20]
 
+    await _dispatch_expecting_refire(scheduler, queue, first)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'unreadable_record',
+    [
+        pytest.param('hand-edited', id='not-a-dict'),
+        pytest.param(
+            {'dependencies': '10', 'external_deps': [], 'milestone': None},
+            id='wrong-typed-field',
+        ),
+        pytest.param({'dependencies': ['10'], 'external_deps': []}, id='no-milestone'),
+    ],
+)
+async def test_unreadable_preconditions_stamp_refires(queue, unreadable_record):
     scheduler = _SchedulerDouble(_gate_task(deps=[10]))
     first = await _fire_and_resolve(scheduler, queue)
-    scheduler.task['metadata'][GATE_ESCALATED_PRECONDITIONS_KEY] = 'hand-edited'
+    scheduler.task['metadata'][GATE_ESCALATED_PRECONDITIONS_KEY] = unreadable_record
 
-    outcome = await _dispatch(scheduler, queue)
-
-    _assert_refired(scheduler, queue, outcome, first)
+    await _dispatch_expecting_refire(scheduler, queue, first)
 
 
 @pytest.mark.asyncio
