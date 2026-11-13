@@ -47,6 +47,9 @@ if str(_SCRIPTS) not in sys.path:
 import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
 _FACADE = 'orchestrator.merge_lane'
+#: Every spelling of a ``from`` import of the façade names this identifier,
+#: however its dotted name is spaced.
+_FACADE_LEAF = _FACADE.rpartition('.')[2]
 
 #: The package's own files import their siblings, never the façade.
 _PACKAGE_DIR = 'orchestrator/src/orchestrator/merge_lane/'
@@ -83,7 +86,8 @@ def _tracked_files_outside_the_package() -> tuple[Path, ...]:
 
 
 def _module_facade_imports(module: ParsedModule) -> tuple[tuple[int, str], ...]:
-    if _FACADE not in module.source:
+    """:func:`facade_imports` over *module*, parsing it only if it can name the façade's last part."""
+    if not module.may_name(_FACADE_LEAF):
         return ()
     return tuple(facade_imports_in(module.tree))
 
@@ -135,6 +139,19 @@ def test_no_tracked_file_imports_a_missing_name_from_the_facade(
         f'only {importers} files import from the façade; the sweep is not reading the tree'
     )
     assert not stale, 'names imported from the façade that it does not have:\n' + '\n'.join(stale)
+
+
+@pytest.mark.parametrize('source', [
+    pytest.param('from orchestrator.ｍerge_lane import NoSuchName\n', id='compatibility-spelling'),
+    pytest.param('from orchestrator . merge_lane import NoSuchName\n', id='spaced-dot'),
+])
+def test_sweep_reads_every_spelling_of_the_facade_the_parser_accepts(
+    tmp_path: Path, source: str,
+) -> None:
+    path = tmp_path / 'importer.py'
+    path.write_text(source, encoding='utf-8')
+
+    assert _module_facade_imports(ParsedModule(path)) == ((1, 'NoSuchName'),)
 
 
 class TestStaleFacadeNames:

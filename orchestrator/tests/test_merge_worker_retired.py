@@ -49,14 +49,9 @@ _MIN_EXPECTED_FILES = {_TESTS_DIR: 400, _SRC_DIR: 100}
 def _defines_retired_class(source: str) -> bool:
     """Whether *source* defines a class named ``MergeWorker`` at any depth.
 
-    A mention in a comment or docstring is not a definition. The substring test
-    only spares parsing the hundreds of files that cannot contain one.
+    A mention in a comment or docstring is not a definition.
     """
-    return _may_define_retired_class(source) and _defines_retired_class_in(ast.parse(source))
-
-
-def _may_define_retired_class(source: str) -> bool:
-    return f'class {_RETIRED_CLASS}' in source
+    return _defines_retired_class_in(ast.parse(source))
 
 
 def _defines_retired_class_in(tree: ast.Module) -> bool:
@@ -67,7 +62,8 @@ def _defines_retired_class_in(tree: ast.Module) -> bool:
 
 
 def _retired_class_defined(module: ParsedModule) -> bool:
-    return _may_define_retired_class(module.source) and _defines_retired_class_in(module.tree)
+    """:func:`_defines_retired_class` over *module*, parsing it only if it can name the class."""
+    return module.may_name(_RETIRED_CLASS) and _defines_retired_class_in(module.tree)
 
 
 ANALYSIS = TreeAnalysis(
@@ -89,6 +85,14 @@ def test_detector_sees_a_definition_and_not_a_mention() -> None:
         '# class MergeWorker(_WipHaltMixin): was its header\n'
         'class SpeculativeMergeWorker:\n    pass\n'
     )
+
+
+def test_sweep_sees_a_compatibility_spelling_the_parser_normalizes(tmp_path: Path) -> None:
+    """``class ＭergeWorker`` defines ``MergeWorker``, so the sweep must not skip the file unparsed."""
+    path = tmp_path / 'copy.py'
+    path.write_text('class ＭergeWorker:\n    pass\n', encoding='utf-8')
+
+    assert _retired_class_defined(ParsedModule(path))
 
 
 def test_no_copy_of_the_serial_worker_anywhere(tree_pass: TreePass) -> None:

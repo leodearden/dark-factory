@@ -208,28 +208,11 @@ def _killpg_over_getpgid(source: str) -> list[tuple[int, str]]:
     AST-based, returning ``[]`` on a :class:`SyntaxError` so a stray
     non-Python-3 file in the tree cannot break the guard.
     """
-    if not _may_dispatch_killpg(source):
-        return []
-
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return []
     return _killpg_over_getpgid_in(tree)
-
-
-def _may_dispatch_killpg(source: str) -> bool:
-    """Token prefilter before the (expensive) parse.
-
-    EXACTLY as strong as the detector, not an approximation: every hit is an
-    ast.Call whose func is an ast.Attribute with ``.attr == 'killpg'`` or an
-    ast.Name with ``.id == 'killpg'``, and both spellings require the literal
-    token ``killpg`` in the source text.  A dynamic spelling that avoids the
-    token (``getattr(os, 'kill' + 'pg')``) is invisible to the AST walk too, so
-    nothing detectable is lost.  Worth it: ~97% of the swept files never mention
-    killpg, and the shared pass parses a file only when an analysis asks.
-    """
-    return 'killpg' in source
 
 
 def _killpg_over_getpgid_in(tree: ast.Module) -> list[tuple[int, str]]:
@@ -409,9 +392,14 @@ def test_known_gap_taint_does_not_reach_a_nested_def() -> None:
 
 
 def _killpg_sites(module: ParsedModule) -> tuple[tuple[int, str], ...]:
-    """Unsafe killpg dispatches in *module*; none if it cannot be read or parsed."""
+    """Unsafe killpg dispatches in *module*; none if it cannot be read or parsed.
+
+    Every finding is a call named ``killpg``, so a module that cannot name it is
+    never parsed: ~97% of the swept files.  A dynamic spelling that avoids the
+    name (``getattr(os, 'kill' + 'pg')``) is invisible to the walk as well.
+    """
     try:
-        if not _may_dispatch_killpg(module.source):
+        if not module.may_name('killpg'):
             return ()
         tree = module.tree
     except (UnicodeDecodeError, OSError, SyntaxError):
@@ -427,6 +415,14 @@ ANALYSIS = TreeAnalysis(
     extract=_killpg_sites,
 )
 TREE_ANALYSES = (ANALYSIS,)
+
+
+def test_sweep_flags_a_compatibility_spelling_the_parser_normalizes(tmp_path: Path) -> None:
+    """``ｋｉｌｌｐｇ`` parses as ``killpg``, so the sweep must not skip the file unparsed."""
+    path = tmp_path / 'cleanup.py'
+    path.write_text('os.ｋｉｌｌｐｇ(os.getpgid(proc.pid), signal.SIGKILL)\n', encoding='utf-8')
+
+    assert _killpg_sites(ParsedModule(path)) == ((1, _DIRECT),)
 
 
 def test_sweep_is_not_vacuous(tree_pass: TreePass) -> None:
