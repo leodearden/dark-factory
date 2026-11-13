@@ -401,7 +401,7 @@ class TimeoutsConfig(BaseModel):
 
 
 class BackendsConfig(BaseModel):
-    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini', 'pi', 'zcode'."""
+    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini', 'pi', 'zcode', 'mimo'."""
 
     architect: str = Field(default='claude')
     implementer: str = Field(default='claude')

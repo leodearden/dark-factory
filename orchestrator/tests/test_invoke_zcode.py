@@ -14,15 +14,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _zcode_fixture import (
-    BASE_URL,
+from _operator_home_fixture import (
     OPERATOR_EMAIL,
     OPERATOR_ENV_VARS,
     OPERATOR_IGNORED_FILE,
-    measured_output,
-    plan_tools_mcp,
     write_operator_home,
 )
+from _plan_tools_mcp_fixture import plan_tools_mcp
+from _zcode_fixture import BASE_URL, measured_output
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import sandbox_dispatch
@@ -239,6 +238,14 @@ class TestInvokeZCode:
     ):
         with pytest.raises(ZCodeEndpointMissing):
             await _invoke(worktree, env_overrides={'ANTHROPIC_BASE_URL': BASE_URL})
+        assert not fake_zcode.capture_path.exists()
+
+    async def test_a_missing_home_is_refused_naming_zcode_before_any_spawn(
+        self, fake_zcode, worktree, monkeypatch,
+    ):
+        monkeypatch.delenv('HOME')
+        with pytest.raises(ValueError, match='HOME.*zcode|zcode.*HOME'):
+            await _invoke(worktree)
         assert not fake_zcode.capture_path.exists()
 
     async def test_the_run_home_is_writable_inside_the_sandbox(

@@ -15,14 +15,9 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from _zcode_fixture import (
-    BASE_URL,
-    OPERATOR_EMAIL,
-    OPERATOR_IGNORED_FILE,
-    measured_output,
-    plan_tools_mcp,
-    write_operator_home,
-)
+from _operator_home_fixture import OPERATOR_EMAIL, OPERATOR_IGNORED_FILE, write_operator_home
+from _plan_tools_mcp_fixture import plan_tools_mcp
+from _zcode_fixture import BASE_URL, measured_output
 from shared.cli_invoke import _SubprocessResult
 from shared.process_cost import ProcessCostBasis
 
@@ -33,7 +28,6 @@ from orchestrator.agents.zcode_backend import (
     parse_zcode_output,
     zcode_argv,
     zcode_cli_config,
-    zcode_operator_home,
     zcode_provider_config,
     zcode_run_home,
     zcode_spawn_env,
@@ -339,17 +333,6 @@ def _run_home(system_prompt: str = 'SYS PROMPT', operator_home: Path = OPERATOR_
         system_prompt=system_prompt, model='glm-5.3', endpoint=ENDPOINT,
         mcp_config=plan_tools_mcp(), operator_home=operator_home,
     )
-
-
-class TestZCodeOperatorHome:
-
-    def test_the_operator_home_is_the_inherited_home(self):
-        assert zcode_operator_home({'HOME': '/home/operator', 'PATH': '/bin'}) == OPERATOR_HOME
-
-    @pytest.mark.parametrize('base_env', [{}, {'HOME': ''}, {'HOME': '   '}])
-    def test_a_missing_or_blank_home_is_refused_by_name(self, base_env):
-        with pytest.raises(ValueError, match='HOME'):
-            zcode_operator_home(base_env)
 
 
 class TestZCodeRunHome:
