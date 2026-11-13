@@ -307,6 +307,7 @@ def _quarantine_stamp(reason: str) -> dict[str, Any]:
         'quarantined_at': '2026-11-12T00:00:00+00:00',
         'reason': reason,
         'parking': f'/quarantine/test-1-{reason}',
+        'stored_title': None,
     }
 
 

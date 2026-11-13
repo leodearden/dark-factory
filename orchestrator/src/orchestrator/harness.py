@@ -4475,7 +4475,7 @@ class Harness:
                             )
                             await self._quarantine_and_emit(
                                 entry, rec.task_id, 'recovery-identity-mismatch',
-                                recycled_id=True,
+                                stored_title=stored_title,
                             )
                             self.git_ops._lane_lifecycle.transition(
                                 entry, DurableLaneState.QUARANTINED,
@@ -4686,7 +4686,7 @@ class Harness:
                 )
                 await self._quarantine_and_emit(
                     entry, recovery_id, 'recovery-identity-mismatch',
-                    recycled_id=True,
+                    stored_title=stored_title,
                 )
                 return _WorktreeRecovery.CLEANED
 
@@ -5087,17 +5087,17 @@ class Harness:
         return failures
 
     async def _quarantine_and_emit(
-        self, entry: Path, task_id: str, reason: str, *, recycled_id: bool = False,
+        self, entry: Path, task_id: str, reason: str, *, stored_title: str | None = None,
     ) -> QuarantineOutcome:
         """Quarantine *entry*, dispatched for *task_id*, for *reason*; emit ``worktree_quarantined`` with its payload.
 
         *task_id* is also the branch id, bare: every lane and cold worktree
-        branch is ``<branch_prefix><task_id>``. *recycled_id* marks *entry* as
-        an earlier task's work under an id another task now holds
+        branch is ``<branch_prefix><task_id>``. *stored_title* is the title
+        *entry* recorded, stamped as identity evidence
         (``GitOps.quarantine_worktree``).
         """
         outcome = await self.git_ops.quarantine_worktree(
-            entry, task_id, reason, recycled_id=recycled_id,
+            entry, task_id, reason, stored_title=stored_title,
         )
         if self.event_store:
             self.event_store.emit(

@@ -1370,7 +1370,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         )
         # Quarantined (relocates the worktree), not cleaned up (a different cell)
         mock_quarantine.assert_called_once_with(
-            lane_entry, '3459', 'recovery-record-divergence', recycled_id=False,
+            lane_entry, '3459', 'recovery-record-divergence', stored_title=None,
         )
         mock_cleanup.assert_not_called()
         # Lane must remain FREE (never pinned) and its durable record QUARANTINED
@@ -1437,13 +1437,15 @@ class TestRecordDrivenQuarantineProvenance:
         assert not parked_plan.is_symlink()
         return data
 
-    async def test_identity_mismatch_site_parks_without_stamping_the_live_plan(self, tmp_path: Path):
+    async def test_identity_mismatch_site_stamps_the_stored_title(self, tmp_path: Path):
         harness, artifacts, events = await self._recover_a_divergent_lane(
             tmp_path, live_title='A different live task', drop_admin_entry=False,
         )
 
-        await self._assert_parked(harness, events, 'recovery-identity-mismatch')
-        assert '_quarantined_from' not in artifacts.read_plan()
+        data = await self._assert_parked(harness, events, 'recovery-identity-mismatch')
+        entry = artifacts.read_plan()['_quarantined_from'][-1]
+        assert entry['branch'] == data['branch']
+        assert entry['stored_title'] == 'Stored title'
 
     async def test_record_divergence_site_records_provenance(self, tmp_path: Path):
         harness, artifacts, events = await self._recover_a_divergent_lane(

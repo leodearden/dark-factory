@@ -43,6 +43,7 @@ STAMP_FIELDS: Mapping[str, tuple[type, ...]] = MappingProxyType({
     'quarantined_at': (str,),
     'reason': (str,),
     'parking': (str,),
+    'stored_title': (str, NoneType),
 })
 """Every ``_quarantined_from`` entry's keys, each with the value types it accepts. No field accepts a bool."""
 
@@ -132,15 +133,17 @@ def stamp_quarantined_from(artifacts: TaskArtifacts, stamp: Mapping[str, Any]) -
 
 
 def record_quarantine_provenance(
-    worktree: Path, task_id: str, outcome: QuarantineOutcome, reason: str, *, recycled_id: bool = False,
+    worktree: Path, task_id: str, outcome: QuarantineOutcome, reason: str, *, stored_title: str | None = None,
 ) -> None:
     """Snapshot the task's artifacts into the parking, then stamp the live plan. Never raises.
 
     *worktree* is the lane's path BEFORE the move, which is what its lane
     ``.task-meta`` root is named after. The two records are independent: a
-    failed snapshot is logged and the stamp is still attempted. A
-    *recycled_id* parking holds an earlier task's work under an id another
-    task now holds, so it is snapshotted but never stamped onto that task's plan.
+    failed snapshot is logged and the stamp is still attempted. Every
+    relocation is stamped. *stored_title* is the title the parked worktree
+    recorded, passed by an identity-mismatch quarantine and stamped as
+    evidence: a title mismatch is either a recycled id or the same task
+    retitled, and only a reader comparing titles can tell which.
     """
     if outcome.dest is None:
         return
@@ -154,10 +157,8 @@ def record_quarantine_provenance(
         snapshot_into_parking(artifacts, parking)
     except Exception:
         logger.warning(_UNRECORDED, 'the artifact snapshot', worktree, task_id, parking, exc_info=True)
-    if recycled_id:
-        return
     try:
-        stamp_quarantined_from(artifacts, _stamp_for(outcome, parking, reason))
+        stamp_quarantined_from(artifacts, _stamp_for(outcome, parking, reason, stored_title))
     except Exception:
         logger.warning(
             _UNRECORDED, f'the {QUARANTINED_FROM_KEY} stamp', worktree, task_id, parking, exc_info=True,
@@ -167,7 +168,9 @@ def record_quarantine_provenance(
 _UNRECORDED = 'quarantine provenance: could not record %s for the parking of %s (task %s) at %s'
 
 
-def _stamp_for(outcome: QuarantineOutcome, parking: Path, reason: str) -> dict[str, Any]:
+def _stamp_for(
+    outcome: QuarantineOutcome, parking: Path, reason: str, stored_title: str | None,
+) -> dict[str, Any]:
     return {
         'branch': outcome.branch,
         'tip_sha': outcome.tip_sha,
@@ -175,6 +178,7 @@ def _stamp_for(outcome: QuarantineOutcome, parking: Path, reason: str) -> dict[s
         'quarantined_at': datetime.now(UTC).isoformat(),
         'reason': reason,
         'parking': str(parking),
+        'stored_title': stored_title,
     }
 
 

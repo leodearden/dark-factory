@@ -4945,7 +4945,7 @@ class GitOps:
                     )
                     outcome = await self.quarantine_worktree(
                         worktree_path, branch_name, 'reuse-identity-mismatch',
-                        recycled_id=True,
+                        stored_title=stored_title,
                     )
                     # Relocate (not delete) the foreign sibling .task-meta
                     # root alongside the quarantined worktree — mirrors the
@@ -5306,7 +5306,7 @@ class GitOps:
                 )
                 outcome = await self.quarantine_worktree(
                     worktree_path, branch_name, 'cold-reattach-identity-mismatch',
-                    recycled_id=True,
+                    stored_title=stored_title,
                 )
                 if outcome.dest is None:
                     # quarantine_worktree never raises — a None dest means
@@ -16435,7 +16435,7 @@ class GitOps:
             return True
 
     async def quarantine_worktree(
-        self, worktree: Path, branch: str, reason: str, *, recycled_id: bool = False,
+        self, worktree: Path, branch: str, reason: str, *, stored_title: str | None = None,
     ) -> QuarantineOutcome:
         """Relocate a worktree (and its branch) into the quarantine base.
 
@@ -16454,10 +16454,10 @@ class GitOps:
         A relocation is recorded before this returns
         (``orchestrator/src/orchestrator/quarantine_provenance.py::record_quarantine_provenance``):
         the task's artifacts are copied into the parking, and the live task
-        plan gains a ``_quarantined_from`` entry unless *recycled_id* says the
-        worktree holds an earlier task's work under an id another task now
-        holds. It reads the PRE-move *worktree* path, so it runs ahead of any
-        caller relocating a ``.task-meta`` root.
+        plan gains a ``_quarantined_from`` entry, carrying *stored_title* (the
+        title an identity-mismatch caller read from the worktree) as evidence.
+        It reads the PRE-move *worktree* path, so it runs ahead of any caller
+        relocating a ``.task-meta`` root.
 
         Logs a WARNING and returns the parking as a :class:`QuarantineOutcome`,
         or ``NOT_RELOCATED`` if the relocation could not complete; a failed
@@ -16484,7 +16484,7 @@ class GitOps:
             'commits beyond main=%s)',
             worktree, dest_path, reason, outcome.branch, outcome.unique_commit_count,
         )
-        record_quarantine_provenance(worktree, bare, outcome, reason, recycled_id=recycled_id)
+        record_quarantine_provenance(worktree, bare, outcome, reason, stored_title=stored_title)
         return outcome
 
     async def _relocate_into_quarantine(

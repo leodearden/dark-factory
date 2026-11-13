@@ -28,7 +28,7 @@ from orchestrator.quarantine_provenance import (
     stamp_quarantined_from,
 )
 
-_STAMP_KEYS = {'branch', 'tip_sha', 'unique_commit_count', 'quarantined_at', 'reason', 'parking'}
+_STAMP_KEYS = {'branch', 'tip_sha', 'unique_commit_count', 'quarantined_at', 'reason', 'parking', 'stored_title'}
 _SNAPSHOT_NAMES: tuple[str, ...] = ('plan.json', 'metadata.json', 'review_state.json', 'iterations.jsonl')
 _PLAN = {
     'task_id': '42',
@@ -66,6 +66,7 @@ def _stamp(reason: str = 'unit-test', **overrides: object) -> dict[str, object]:
         'quarantined_at': datetime.now(UTC).isoformat(),
         'reason': reason,
         'parking': '/quarantine/42-20261112T000000Z',
+        'stored_title': None,
     }
     stamp.update(overrides)
     return stamp
@@ -247,7 +248,7 @@ class TestRecordQuarantineProvenance:
         assert entry['parking'] == str(parking)
         assert datetime.fromisoformat(entry['quarantined_at']).tzinfo is not None
 
-    def test_a_recycled_id_parking_is_snapshotted_but_never_stamped(
+    def test_an_identity_mismatch_parking_is_stamped_with_its_stored_title(
         self, artifacts: TaskArtifacts, lane, tmp_path,
     ):
         parking = tmp_path / 'quarantine' / '42-20261112T000000Z'
@@ -256,12 +257,16 @@ class TestRecordQuarantineProvenance:
         live_before = artifacts.artifact_path('plan.json').read_bytes()
         outcome = QuarantineOutcome(dest=parking, branch='task/42-X', tip_sha='abc', unique_commit_count=3)
 
-        record_quarantine_provenance(lane, '42', outcome, 'recovery-identity-mismatch', recycled_id=True)
+        record_quarantine_provenance(
+            lane, '42', outcome, 'recovery-identity-mismatch', stored_title='An earlier title',
+        )
 
         parked_plan = parking / '.task' / 'plan.json'
         assert not parked_plan.is_symlink()
         assert parked_plan.read_bytes() == live_before
-        assert artifacts.artifact_path('plan.json').read_bytes() == live_before
+        (entry,) = artifacts.read_plan()[QUARANTINED_FROM_KEY]
+        assert entry['reason'] == 'recovery-identity-mismatch'
+        assert entry['stored_title'] == 'An earlier title'
 
     def test_not_relocated_writes_nothing(self, artifacts: TaskArtifacts, lane):
         before = artifacts.artifact_path('plan.json').read_bytes()

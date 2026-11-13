@@ -7045,7 +7045,7 @@ class TestWorktreeReuseIdentityGuard:
         assert len(quarantined) == 1
         assert (quarantined[0] / 'spline.rs').exists()
 
-    async def test_mismatch_never_stamps_the_live_plan_with_the_earlier_tasks_parking(
+    async def test_mismatch_stamps_the_live_plan_with_the_stored_title(
         self, git_ops: GitOps,
     ):
         info = await git_ops.create_worktree('recycled-plan')
@@ -7062,7 +7062,10 @@ class TestWorktreeReuseIdentityGuard:
 
         (parking,) = git_ops.quarantine_base.glob('recycled-plan-*')
         assert json.loads((parking / '.task' / 'plan.json').read_text()) == plan_before
-        assert live.read_plan() == plan_before
+        (entry,) = live.read_plan()['_quarantined_from']
+        assert entry['reason'] == 'reuse-identity-mismatch'
+        assert entry['stored_title'] == 'Trajectory beta: spline solver'
+        assert entry['parking'] == str(parking)
 
     async def test_none_expected_title_skips_guard(self, git_ops: GitOps):
         info = await git_ops.create_worktree('reuse-noguard')
