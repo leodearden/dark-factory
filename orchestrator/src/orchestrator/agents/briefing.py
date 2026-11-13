@@ -1041,10 +1041,11 @@ The implementation was reviewed and blocking issues were found.
     ) -> str:
         """Build prompt for the SIMPLE_TASK agent (Lever C).
 
-        The agent will explore briefly, register a single-step plan via the
-        plan-tools MCP server, edit the listed files, commit, then call
-        ``mark_step_done`` and stop. The orchestrator then advances to VERIFY
-        without invoking the implementer.
+        The workflow and its exits live in
+        ``orchestrator/src/orchestrator/agents/roles.py::SIMPLE_TASK_WORKFLOW``,
+        which ``SIMPLE_TASK.system_prompt`` carries, so this briefing adds only
+        the task preamble and the listed files. The orchestrator then advances
+        to VERIFY without invoking the implementer.
         """
         preamble = await self._task_preamble(task, 'simple_task', context)
 
@@ -1055,47 +1056,14 @@ The implementation was reviewed and blocking issues were found.
         else:
             files_section = '_No files listed in task metadata — explore briefly to identify the target file(s)._'
 
-        # The stop-criterion prose below ("no new abstraction, no cross-module design,
-        # substantial architectural thought") mirrors _COMPLEXITY_RUBRIC in roles.py.
-        # Update both in lockstep if the rubric changes.
         return f"""\
 {preamble}
 
 # Action
 
-This task was routed to the SIMPLE_TASK path because its author declared
-complexity:simple. A simple task may be high-priority and may span several
-files/modules — the declaration means the *change* is mechanically simple,
-not that the task is trivial. Your job is to do the change end-to-end in a
-single session:
-
-1. **Read the listed files** below. Confirm the change is mechanically
-   simple — no new abstraction, no cross-module design required.
-2. **Register a plan via plan-tools MCP** — call
-   `mcp__plan-tools__create_plan(task_id, title, analysis, files)`.
-   - For doc/comment-only or behaviour-preserving refactors: add a single
-     `impl` step via `add_plan_step`.
-   - If a new test belongs here: add `test` then `impl`.
-3. **Implement** — edit the file(s), run any tests touching the module,
-   commit (excluding `.task/`), then call
-   `mcp__plan-tools__mark_step_done(step_id, commit_sha)`.
-4. **Stop after marking done.** Do not loop further.
-
-If the change turns out to need cross-module design, a new abstraction, or
-substantial architectural thought, STOP without calling `create_plan` — do
-NOT stop merely because the change spans several files/modules. The
-orchestrator will route to the full architect path on the next dispatch.
-
-If the task spec itself is broken or unworkable, call
-`mcp__plan-tools__report_unactionable_task(reason, evidence)` and stop.
-
-If instead the work is already complete and green on THIS BRANCH and only
-the merge to main is missing — a clean fast-forward (main is an ancestor of
-the branch tip and the tip is not already contained in main), verify already
-PASSED on this exact tip, and review already returned PASS or
-suggestions-only on this exact tree — call
-`mcp__plan-tools__report_ready_to_merge(commit, evidence)` instead of
-`report_unactionable_task` and stop.
+Make this change end-to-end in this one session, following the workflow in
+your role instructions; it also says when to stop and which exit to report
+instead.
 
 {files_section}
 """
