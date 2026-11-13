@@ -1095,6 +1095,61 @@ async def test_two_recon_writers_on_one_read_cannot_clobber_each_other(
     assert (await read())['details'] == 'Body from writer A. Amended by writer B.'
 
 
+async def _real_backend_task(real_task_stack, tmp_path, details: str):
+    from _fm_helpers import _init_git_repo
+
+    server, interceptor = real_task_stack
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _init_git_repo(repo)
+    root = str(repo)
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T', description='Summary.', details=details,
+    )
+
+    async def read() -> dict:
+        return await server._tool_manager.call_tool(
+            'get_task', {'id': '1', 'project_root': root},
+        )
+
+    async def write(**params: object) -> dict:
+        return await server._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '1', 'project_root': root,
+                'agent_id': 'recon-stage-task_knowledge_sync', **params,
+            },
+        )
+
+    return read, write
+
+
+@pytest.mark.asyncio
+async def test_a_recon_details_append_reads_back_verified_on_the_real_backend(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    landed = await write(details='Appended section.', append=True)
+
+    assert landed['text_verified'] is True, landed
+    assert (await read())['details'] == 'Original body.\n\nAppended section.'
+
+
+@pytest.mark.asyncio
+async def test_a_recon_trimming_replace_reads_back_verified_on_the_real_backend(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(
+        real_task_stack, tmp_path, 'Para A. Para B is a false premise.',
+    )
+
+    landed = await write(details='Para A.', expected_text_fp=(await read())['task_text_fp'])
+
+    assert landed['text_verified'] is True, landed
+    assert (await read())['details'] == 'Para A.'
+
+
 # ------------------------------------------------------------------
 # submit_task execution-class guard η (task 2225/W5-η) — boundary test E1
 #

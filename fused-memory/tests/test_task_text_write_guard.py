@@ -277,6 +277,63 @@ class TestVerifyTextWrite:
         assert verification is not None
         assert verification.confirmed is False
 
+    def test_an_unlanded_trimming_replace_is_unconfirmed(self):
+        verification = _verify(
+            {'details': 'Para A. Para B is a false premise.'}, details='Para A.',
+        )
+
+        assert verification is not None
+        assert verification.confirmed is False
+        assert verification.unconfirmed_fields == ('details',)
+
+    def test_an_unlanded_clear_is_unconfirmed(self):
+        verification = _verify({'details': OLD_PARAGRAPH}, details='')
+
+        assert verification is not None
+        assert verification.confirmed is False
+
+    def test_a_landed_clear_is_confirmed(self):
+        verification = _verify({'details': ''}, details='')
+
+        assert verification is not None
+        assert verification.confirmed is True
+
+    def test_a_clear_read_back_against_a_missing_or_none_field_is_unconfirmed(self):
+        for after in ({'id': '3708'}, {'details': None}):
+            verification = _verify(after, details='')
+
+            assert verification is not None
+            assert verification.confirmed is False
+
+    def test_an_unlanded_description_trim_is_unconfirmed(self):
+        verification = _verify({'description': 'Fix the reader'}, description='Fix')
+
+        assert verification is not None
+        assert verification.confirmed is False
+        assert verification.unconfirmed_fields == ('description',)
+
+    def test_an_unlanded_prompt_trim_is_unconfirmed(self):
+        verification = _verify({'details': OLD_PARAGRAPH}, prompt=OLD_PARAGRAPH[:20])
+
+        assert verification is not None
+        assert verification.confirmed is False
+
+    def test_an_append_whose_payload_is_not_at_the_end_is_unconfirmed(self):
+        verification = _verify(
+            {'details': NEW_PARAGRAPH + '\n\n' + OLD_PARAGRAPH},
+            details=NEW_PARAGRAPH,
+            append=True,
+        )
+
+        assert verification is not None
+        assert verification.confirmed is False
+
+    def test_an_append_onto_an_empty_base_is_confirmed(self):
+        verification = _verify({'details': NEW_PARAGRAPH}, details=NEW_PARAGRAPH, append=True)
+
+        assert verification is not None
+        assert verification.confirmed is True
+
     def test_result_keys(self):
         verification = _verify(
             {'description': 'New summary.', 'details': OLD_PARAGRAPH},
@@ -638,6 +695,24 @@ class TestInterceptorTextVerificationBoundary:
             '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
             expected_text_fp=text_fp_of(before),
         )
+        (filed,) = filer.await_args_list
+        (finding,) = filed.args
+        assert finding.unconfirmed_fields == ('details',)
+
+    @pytest.mark.asyncio
+    async def test_a_trim_that_reads_back_the_longer_old_text_is_unverified_and_filed(
+        self, interceptor, taskmaster,
+    ):
+        filer = AsyncMock()
+        interceptor.set_text_write_unconfirmed_filer(filer)
+        before = _before_then_after(taskmaster, dict(LIVE_ROW))
+
+        result = await interceptor.update_task(
+            '4644', '/project', details=OLD_PARAGRAPH[:20], agent_id=RECON_AGENT,
+            expected_text_fp=text_fp_of(before),
+        )
+
+        assert result['text_verified'] is False
         (filed,) = filer.await_args_list
         (finding,) = filed.args
         assert finding.unconfirmed_fields == ('details',)
