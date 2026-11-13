@@ -14,6 +14,7 @@ from shared.project_layout import escalation_queue_dir
 from fused_memory.models.scope import ProjectRoot
 from fused_memory.reconciliation.reconciler_escalation import (
     INSTALLED_ESCALATION_QUEUE_FACTORY,
+    EscalationQueueFactory,
     file_reconciler_l1,
     pending_escalations,
 )
@@ -26,7 +27,12 @@ def _root(tmp_path: Path) -> ProjectRoot:
     return ProjectRoot(str(tmp_path))
 
 
-def _file(root: ProjectRoot, *, task_id: str = '42', factory=EscalationQueue) -> str:
+def _file(
+    root: ProjectRoot,
+    *,
+    task_id: str = '42',
+    factory: EscalationQueueFactory = EscalationQueue,
+) -> str:
     return file_reconciler_l1(
         factory,
         root,

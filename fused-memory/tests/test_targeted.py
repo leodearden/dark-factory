@@ -7483,8 +7483,8 @@ class TestContradictedEscalationSurvivesAMemoryOutage:
 class TestContradictedEscalationWithoutTheEscalationPackage:
     """A minimal install with no escalation package must still reconcile.
 
-    `escalation` is an optional workspace package, defensively imported at the
-    top of targeted.py; when it is absent the reconciler's default
+    `escalation` is an optional workspace package, defensively imported in
+    reconciliation/reconciler_escalation.py; when it is absent the reconciler's default
     escalation-queue factory is None.  The `factory is None` arm is what
     keeps a contradicted verdict from crashing such an install — and it is
     the arm with the least other signal, since the environment that exercises
