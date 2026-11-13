@@ -9162,14 +9162,17 @@ class SpeculativeMergeWorker:
         VERIFIED_PENDING_LANDING.  The head keeps its lease to its finalize,
         which follows at once: a head whose CAS meets a moved main holds it
         through its parked gate, which keeps the host for its rebased head.
-        A DROPPED, REQUEUED or RUNNER_UNAVAILABLE exit has already vacated or
-        benched it.  The lease is cleared before the release, so no finalize,
-        cascade or ``stop()`` releases it again.
+        A verdict in the persistent merge lane keeps its lease too: that
+        singleton is where its landing still runs, and the held local lease
+        is what serializes it.  A DROPPED, REQUEUED or RUNNER_UNAVAILABLE
+        exit has already vacated or benched it.  The lease is cleared before
+        the release, so no finalize, cascade or ``stop()`` releases it again.
         """
         entry = entry_slot.entry
         if (
             vr.status is not None or entry is None or entry.lease is None
             or self._host_allocator is None or not self._lands_behind_another(entry)
+            or (vr.merge_wt is not None and self._git_ops.is_persistent_merge_lane(vr.merge_wt))
         ):
             return
         lease = entry.lease
