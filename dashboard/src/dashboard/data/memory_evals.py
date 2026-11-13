@@ -92,6 +92,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -302,7 +304,7 @@ _MAX_DISCARDED_VALUE_REPR = 120
 #
 # Rejection is lossless: the only `eval_id` that can ever link a row is an
 # eval directory's own `name` (`_build_eval` assigns `eval_id =
-# eval_dir.name`, and `consumed` is keyed on it), and a single path
+# eval_dir.name`, and `_RowClaims.verdict_keys` is keyed on it), and a single path
 # component is bounded by POSIX `NAME_MAX` on every filesystem this runs
 # on.  An `eval_id` longer than that was therefore already unmatchable by
 # construction — indexing it could only ever carry the artifact's own
@@ -321,6 +323,39 @@ _MAX_EVAL_ID_LENGTH = 255
 # ``(eval_id, metric_id) -> {item -> entry}``; a window metric's entry has no
 # ``item`` and is keyed ``None``.
 _VerdictIndex = dict[tuple[str, str], dict[str | None, dict[str, Any]]]
+
+
+@dataclass(frozen=True, slots=True)
+class _RowClaims:
+    """What the payload's rows have accounted for so far in its two joins.
+
+    ``verdict_keys``: the verdict-index keys some row read.  ``linked``: the
+    fingerprints some row, or the storm block, links.  ``suppressed``: the
+    fingerprints a row claims while a triggered storm suppressed per-metric
+    links.
+    """
+
+    verdict_keys: frozenset[tuple[str, str]] = frozenset()
+    linked: frozenset[str] = frozenset()
+    suppressed: frozenset[str] = frozenset()
+
+    def with_verdict_key(self, key: tuple[str, str]) -> _RowClaims:
+        return replace(self, verdict_keys=self.verdict_keys | {key})
+
+    def with_link(self, fingerprint: str) -> _RowClaims:
+        return replace(self, linked=self.linked | {fingerprint})
+
+    def with_suppressed(self, fingerprint: str) -> _RowClaims:
+        return replace(self, suppressed=self.suppressed | {fingerprint})
+
+
+@dataclass(frozen=True, slots=True)
+class _JoinSources:
+    """The program-wide indexes, read once per build, that every eval's rows join against."""
+
+    verdicts: _VerdictIndex
+    escalations: Mapping[str, Escalation]
+    storm: dict[str, Any] | None
 
 
 def _load_json(path: Path) -> Any:
@@ -749,7 +784,7 @@ def _name_shared_fingerprints(index: _VerdictIndex, path: Path, issues: list[dic
 
     A fingerprint names one ``(eval_id, metric_id, item)`` identity and the
     escalation join is whole-string equality on it, so two entries sharing one
-    would both claim the same escalation.  ``_verdict_row_fields`` links it to
+    would both claim the same escalation.  ``_join_escalation`` links it to
     the first row that claims it; this makes the sharing itself visible.
     """
     holders: dict[str, tuple[str, str, str | None]] = {}
@@ -793,10 +828,11 @@ def _escalation_projection(escalation: Escalation) -> dict[str, Any]:
 def _unmatched_projection(escalation: Escalation, reason: str) -> dict[str, Any]:
     """An open escalation that no metric row links, plus WHY it carries no link.
 
-    ``no_matching_verdict`` — nothing in the verdicts artifact claims this
-    fingerprint.  That covers genuine contract drift AND escalations no metric
-    row can ever explain (the runner-failure self-report is itself an
-    ``eval_regression``).
+    ``no_matching_verdict`` — no row in this payload claims this fingerprint.
+    That covers genuine contract drift, escalations no metric row can ever
+    explain (the runner-failure self-report is itself an ``eval_regression``)
+    and, beside an ``internal_error`` naming the eval, a row lost to a
+    dashboard bug.
     ``storm_suppressed`` — a metric row DOES claim this fingerprint, but this
     run's storm escape collapsed per-metric links into the aggregate, so the
     row deliberately renders none.  Per-metric filings from EARLIER runs stay
@@ -995,7 +1031,7 @@ def _parity(verdict_class: str, escalation: dict[str, Any] | None) -> str:
 
     Reachability of ``unjudged_open``, which is not obvious: the row-level join
     only runs when the verdict ENTRY carries a fingerprint (see
-    ``_verdict_row_fields``), so a row no ``(eval_id, metric_id, item)`` entry
+    ``_join_escalation``), so a row no ``(eval_id, metric_id, item)`` entry
     names can never link.  The
     linked variant is reached only by an entry that has a ``fingerprint`` and
     no ``verdict`` field — exactly the case that used to claim a recovery that
@@ -1014,15 +1050,36 @@ def _item_order(item: str | None) -> tuple[bool, str]:
     return item is not None, item or ''
 
 
+def _join_escalation(
+    fingerprint: Any,
+    sources: _JoinSources,
+    claims: _RowClaims,
+) -> tuple[Escalation | None, _RowClaims]:
+    """The escalation a row carrying *fingerprint* links, and *claims* extended by that row's claim.
+
+    Whole-string equality, NOT gated on the verdict: a recovered metric whose
+    escalation is still open keeps its link.  A triggered storm filed one
+    aggregate instead of per-metric escalations, so it suppresses the link and
+    records the claim, letting ``unmatched_escalations`` say why.  A
+    fingerprint links only its first claimer; ``_name_shared_fingerprints``
+    names the sharing.
+    """
+    if not (isinstance(fingerprint, str) and fingerprint) or fingerprint not in sources.escalations:
+        return None, claims
+    if sources.storm is not None:
+        return None, claims.with_suppressed(fingerprint)
+    if fingerprint in claims.linked:
+        return None, claims
+    return sources.escalations[fingerprint], claims.with_link(fingerprint)
+
+
 def _verdict_row_fields(
     entry: dict[str, Any] | None,
     metric_id: str,
     eval_dir: Path,
+    matched: Escalation | None,
+    storm_triggered: bool,
     issues: list[dict[str, Any]],
-    escalation_index: dict[str, Escalation],
-    linked_fingerprints: set[str],
-    storm_suppressed: set[str],
-    storm: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """The verdict half of one metric row: *entry*'s fields, its escalation link and its parity.
 
@@ -1035,36 +1092,6 @@ def _verdict_row_fields(
     # dict makes every verdict field read as None below without a second
     # code path.
     judged: dict[str, Any] = entry or {}
-
-    # The join, in full: whole-string equality on the fingerprint.  It is
-    # NOT gated on the verdict — a metric that has recovered while its
-    # escalation is still open is a real transient state (the watcher has
-    # not closed it yet), and hiding the link there would make the
-    # escalation look orphaned in exactly the window an operator is most
-    # likely to be looking at it.
-    #
-    # While a storm is triggered the runner files ONE aggregate escalation
-    # instead of N per-metric ones, so per-metric links are suppressed
-    # here.  Showing them would invent links that were never filed.
-    #
-    # Suppressed is NOT unexplained: a per-metric escalation from an
-    # earlier run stays open while this run's storm collapses, and it must
-    # not then be reported as an escalation nothing accounts for.  The row
-    # renders no link; the fingerprint is recorded so
-    # ``unmatched_escalations`` can say WHY.
-    #
-    # A fingerprint links at most one row, the first to claim it, so an
-    # escalation keeps exactly one home even when two entries share its
-    # fingerprint (named by ``_name_shared_fingerprints``).
-    fingerprint = judged.get('fingerprint')
-    matched: Escalation | None = None
-    if isinstance(fingerprint, str) and fingerprint:
-        if storm is None:
-            matched = None if fingerprint in linked_fingerprints else escalation_index.get(fingerprint)
-            if matched is not None:
-                linked_fingerprints.add(fingerprint)
-        elif fingerprint in escalation_index:
-            storm_suppressed.add(fingerprint)
     escalation = _escalation_projection(matched) if matched is not None else None
 
     # Classified ONCE and reused for both the parity badge and the
@@ -1100,12 +1127,12 @@ def _verdict_row_fields(
         'value': judged.get('value'),
         'item': judged.get('item'),
         'limit_ref': judged.get('limit_ref'),
-        'fingerprint': fingerprint,
+        'fingerprint': judged.get('fingerprint'),
         'run_stamp': judged.get('run_stamp'),
         'escalation': escalation,
         'parity': (
             'storm_collapsed'
-            if storm is not None and verdict == 'alarm'
+            if storm_triggered and verdict == 'alarm'
             else _parity(verdict_class, escalation)
         ),
     }
@@ -1113,15 +1140,11 @@ def _verdict_row_fields(
 
 def _build_eval(
     eval_dir: Path,
-    issues: list[dict[str, Any]],
-    verdict_index: _VerdictIndex,
-    consumed: set[tuple[str, str]],
-    escalation_index: dict[str, Escalation],
-    linked_fingerprints: set[str],
-    storm_suppressed: set[str],
-    storm: dict[str, Any] | None,
+    sources: _JoinSources,
+    claims: _RowClaims,
     now: datetime,
-) -> dict[str, Any]:
+    issues: list[dict[str, Any]],
+) -> tuple[dict[str, Any], _RowClaims]:
     """Assemble one eval's trend payload from its ``metrics-*.json`` series.
 
     Runs are ordered by FILENAME — the producer's own contract
@@ -1297,12 +1320,13 @@ def _build_eval(
                     ),
                 )
 
-        entries = verdict_index.get((eval_id, metric_id), {})
+        entries = sources.verdicts.get((eval_id, metric_id), {})
         if entries:
-            consumed.add((eval_id, metric_id))
+            claims = claims.with_verdict_key((eval_id, metric_id))
         # A metric no entry judges still gets its one (unjudged) row.
         row_entries = [entries[item] for item in sorted(entries, key=_item_order)]
         for entry in row_entries or [None]:
+            matched, claims = _join_escalation((entry or {}).get('fingerprint'), sources, claims)
             metrics.append({
                 'metric_id': metric_id,
                 'kind': kind,
@@ -1315,8 +1339,7 @@ def _build_eval(
                 'direction': current.get('direction'),
                 'trend': {'labels': list(run_stamps), 'values': list(values)},
                 **_verdict_row_fields(
-                    entry, metric_id, eval_dir, issues,
-                    escalation_index, linked_fingerprints, storm_suppressed, storm,
+                    entry, metric_id, eval_dir, matched, sources.storm is not None, issues,
                 ),
             })
 
@@ -1330,14 +1353,14 @@ def _build_eval(
         # is the one the program-wide banner reads).  Repeated per row purely so
         # a row showing ``storm_collapsed`` parity carries, in place, the reason
         # its escalation link is absent.
-        'storm_escape': storm,
+        'storm_escape': sources.storm,
         'run_stamps': run_stamps,
         'run_count': len(run_stamps),
         'runs_on_disk': runs_on_disk,
         'truncated': truncated,
         'corpus': corpus,
         'metrics': metrics,
-    }
+    }, claims
 
 
 def build_memory_evals(
@@ -1502,6 +1525,33 @@ def _empty_payload(resolved_now: datetime, issues: list[dict[str, Any]]) -> dict
     }
 
 
+def _resolve_storm(
+    storm: dict[str, Any] | None,
+    escalation_index: Mapping[str, Escalation],
+) -> tuple[dict[str, Any] | None, _RowClaims]:
+    """Project the run-scoped storm block, resolving its aggregate against the rows' escalation index.
+
+    A resolved aggregate is claimed as linked: the storm block, not a row,
+    explains it, so it is not then reported as unmatched.
+    """
+    if storm is None:
+        return None, _RowClaims()
+    aggregate_fingerprint = storm.get('aggregate_fingerprint')
+    aggregate: Escalation | None = None
+    linked: frozenset[str] = frozenset()
+    if isinstance(aggregate_fingerprint, str) and aggregate_fingerprint:
+        aggregate = escalation_index.get(aggregate_fingerprint)
+        if aggregate is not None:
+            linked = frozenset({aggregate_fingerprint})
+    block = {
+        'triggered': storm.get('triggered'),
+        'alarm_count': storm.get('alarm_count'),
+        'aggregate_fingerprint': aggregate_fingerprint,
+        'escalation': _escalation_projection(aggregate) if aggregate is not None else None,
+    }
+    return block, _RowClaims(linked=linked)
+
+
 def _build_payload(
     payload: dict[str, Any],
     memory_evals_dir: Path,
@@ -1548,44 +1598,20 @@ def _build_payload(
 
     escalation_index, unfingerprinted = _index_escalations(corpus, escalation_queue, issues)
 
-    consumed: set[tuple[str, str]] = set()
-    linked_fingerprints: set[str] = set()
-    # Fingerprints a metric row claims but deliberately does not link because a
-    # storm collapsed this run's per-metric filings into one aggregate.
-    storm_suppressed: set[str] = set()
-
-    # The storm block is run-scoped across the whole program; resolve its
-    # aggregate against the SAME escalation index the metric rows use, and
-    # mark that fingerprint consumed so the aggregate is not then reported as
-    # unexplained.  It IS explained — by the storm block, not by a row.
-    storm_block: dict[str, Any] | None = None
-    if storm is not None:
-        aggregate_fingerprint = storm.get('aggregate_fingerprint')
-        aggregate: Escalation | None = None
-        if isinstance(aggregate_fingerprint, str) and aggregate_fingerprint:
-            aggregate = escalation_index.get(aggregate_fingerprint)
-            if aggregate is not None:
-                linked_fingerprints.add(aggregate_fingerprint)
-        storm_block = {
-            'triggered': storm.get('triggered'),
-            'alarm_count': storm.get('alarm_count'),
-            'aggregate_fingerprint': aggregate_fingerprint,
-            'escalation': _escalation_projection(aggregate) if aggregate is not None else None,
-        }
+    storm_block, claims = _resolve_storm(storm, escalation_index)
     payload['storm_escape'] = storm_block
+    sources = _JoinSources(verdict_index, escalation_index, storm_block)
 
     # Per-eval bug boundary, not one comprehension.  Artifact errors are
     # already handled inside ``_build_eval``, so anything escaping it is a bug
     # — and as a single comprehension a bug on the fifth of ten dirs discarded
     # the other nine, leaving a present-but-empty root that reads as "no evals
-    # have run".  Per-eval it costs that one row and names which one.
+    # have run".  Per-eval it costs that one row and names which one, and
+    # ``claims`` advances only past a row that ships.
     evals: list[dict[str, Any]] = []
     for eval_dir in eval_dirs:
         try:
-            evals.append(_build_eval(
-                eval_dir, issues, verdict_index, consumed, escalation_index,
-                linked_fingerprints, storm_suppressed, storm_block, resolved_now,
-            ))
+            row, claims = _build_eval(eval_dir, sources, claims, resolved_now, issues)
         except Exception as exc:  # noqa: BLE001 - per-eval half of the never-500 boundary
             logger.exception('memory-evals eval build failed for %s', eval_dir)
             _issue(
@@ -1595,6 +1621,8 @@ def _build_payload(
                     'artifact; see the dashboard log for the traceback'
                 ),
             )
+        else:
+            evals.append(row)
     payload['evals'] = evals
 
     # The reverse direction: an open eval_regression escalation that no metric
@@ -1604,10 +1632,10 @@ def _build_payload(
     payload['unmatched_escalations'] = [
         _unmatched_projection(
             record,
-            'storm_suppressed' if fingerprint in storm_suppressed else 'no_matching_verdict',
+            'storm_suppressed' if fingerprint in claims.suppressed else 'no_matching_verdict',
         )
         for fingerprint, record in escalation_index.items()
-        if fingerprint not in linked_fingerprints
+        if fingerprint not in claims.linked
     ] + [
         # Open, and unlinkable rather than merely unlinked: with no usable
         # fingerprint these never reached the index, so this is the only place
@@ -1619,7 +1647,7 @@ def _build_payload(
     # A verdict resolving onto nothing is contract drift between the evaluator
     # and the artifact tree — surfaced, not dropped.
     for eval_id, metric_id in verdict_index:
-        if (eval_id, metric_id) in consumed:
+        if (eval_id, metric_id) in claims.verdict_keys:
             continue
         _issue(
             issues,
