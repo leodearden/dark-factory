@@ -401,6 +401,14 @@ def resolve_header_positions(header, wanted: dict[str, str]) -> dict[str, int]:
 
 INDEX_CATALOG_QUERY = 'CALL db.indexes()'
 
+#: Names the definition columns only, omitting the ``info`` statistics and the
+#: ``status`` build state, which move with any write on a live graph.
+INDEX_DEFINITION_QUERY = (
+    'CALL db.indexes() YIELD label, properties, types, options, language, stopwords, entitytype '
+    'RETURN label, properties, types, options, language, stopwords, entitytype '
+    'ORDER BY entitytype, label'
+)
+
 #: The output keys of a ``list_indices()`` record, mapped to the FalkorDB
 #: ``CALL db.indexes()`` column names they are read from.
 INDEX_RECORD_COLUMNS = {
