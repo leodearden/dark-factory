@@ -851,7 +851,30 @@ class TestTheStormNamesItsCallSites:
             assert 'look at main' in text
             assert 'merge_gate' not in text
         assert f'probed main SHA {_PROBED_MAIN_SHA}' in storm.detail
+        assert f'observing task_id: {_TASK_ID}' in storm.detail
         assert 'merge-verify' not in storm.summary
+
+    async def test_a_wire_shaped_str_call_site_still_names_main_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        q = _FakeEscalationQueue(open_l2=None)
+        for n in range(_STORM_AT):
+            s = replace(
+                _suppression(observed_at=f'2026-08-22T12:{n:02d}:00+00:00'),
+                call_site='main_probe', runner='local',
+            )
+            await flake_recorder.record_flake_observation(
+                s,
+                project_root=tmp_path,
+                project_id=_PROJECT_ID,
+                merge_sha=_PROBED_MAIN_SHA,
+                task_id=_TASK_ID,
+                escalation_queue=q,
+            )
+
+        (storm,) = q.submitted
+        assert 'main_probe' in storm.summary
+        assert 'call_site=main_probe, probed main SHA' in storm.detail
 
     async def test_a_merge_gate_storm_names_merge_gate_only(self, tmp_path: Path) -> None:
         q = _FakeEscalationQueue(open_l2=None)
@@ -925,6 +948,22 @@ class TestTheStormNamesItsCallSites:
         for text in (storm.summary, storm.detail):
             assert 'main_probe' in text
             assert 'merge_gate' not in text
+
+    async def test_a_deduped_window_logs_the_call_sites_the_open_l2_does_not_name(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'queue')
+        for n in range(_STORM_AT):
+            await self._main_probe(tmp_path, n, queue)
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_recorder'):
+            for n in range(_STORM_AT, 2 * _STORM_AT):
+                await self._merge_gate(tmp_path, n, queue)
+
+        (deduped,) = [r for r in caplog.records if _STORM_SENTINEL in r.getMessage()]
+        assert 'call site(s) merge_gate' in deduped.getMessage()
+        assert f'merge SHA {_MERGE_SHA}' in deduped.getMessage()
 
 
 _HEAD = 'e' * 40

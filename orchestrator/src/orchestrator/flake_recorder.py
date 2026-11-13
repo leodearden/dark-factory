@@ -30,10 +30,10 @@ files the owner afterwards (PRD §5.9) and raises any ``regressed_after_resoluti
 escalation, so no network call is left on the observation path.
 
 Since ε1 (task 6864) :func:`record_call_site_observations` is the one body every call
-site records through, and :data:`_CALL_SITES_WITH_LIVE_SIGNALS` names the call sites
-whose observations do more than write the rows and the due items, and words how the
-storm escalation names each of them.  The merge-gate entry
-unwraps its ``VerifyResult`` and delegates.
+site records through, and :data:`_LIVE_SIGNAL_CALL_SITE_STORM_WORDING` names the call
+sites whose observations do more than write the rows and the due items, and words how
+the storm escalation names each of them.  The merge-gate entry unwraps its
+``VerifyResult`` and delegates.
 
 Import discipline: this module imports ``flake_ledger`` (which depends on ``shared``
 alone) at runtime and NOTHING else from ``orchestrator``.
@@ -88,7 +88,7 @@ class _StormWording:
 #: suppression also masks a red a merge depends on (task 3788).  The offline lane gates no
 #: merge, so a lane clear masks nothing (offline-lane PRD D6, call 1).  Each entry is how
 #: the storm L2 names that call site (task 7249).
-_CALL_SITES_WITH_LIVE_SIGNALS: Final[Mapping[FlakeCallSite, _StormWording]] = {
+_LIVE_SIGNAL_CALL_SITE_STORM_WORDING: Final[Mapping[FlakeCallSite, _StormWording]] = {
     FlakeCallSite.merge_gate: _StormWording(
         reds='merge-verify reds',
         observer=(
@@ -170,7 +170,7 @@ def _bump_suppression_streak_and_maybe_escalate(
     the threshold, then reset the counter (INV-4).
 
     *call_site* is the call site whose suppression this is, one of
-    :data:`_CALL_SITES_WITH_LIVE_SIGNALS`; any other is refused before the window
+    :data:`_LIVE_SIGNAL_CALL_SITE_STORM_WORDING`; any other is refused before the window
     moves.  The window records the call sites that fed it and the storm escalation
     names them, so a storm the main-health probe fed points its reader at main.
 
@@ -206,10 +206,10 @@ def _bump_suppression_streak_and_maybe_escalate(
     """
     global _merge_flake_suppression_streak, _merge_flake_suppression_window_call_sites
     site = FlakeCallSite(call_site)
-    if site not in _CALL_SITES_WITH_LIVE_SIGNALS:
+    if site not in _LIVE_SIGNAL_CALL_SITE_STORM_WORDING:
         raise ValueError(
             f'call_site={site} has no live signals, so it cannot feed the storm streak; '
-            f'only {", ".join(_CALL_SITES_WITH_LIVE_SIGNALS)} do',
+            f'only {", ".join(_LIVE_SIGNAL_CALL_SITE_STORM_WORDING)} do',
         )
     prior = (
         _merge_flake_suppression_window_call_sites
@@ -233,16 +233,27 @@ def _bump_suppression_streak_and_maybe_escalate(
 
 
 def _in_table_order(sites: frozenset[FlakeCallSite]) -> list[FlakeCallSite]:
-    return [s for s in _CALL_SITES_WITH_LIVE_SIGNALS if s in sites]
+    return [s for s in _LIVE_SIGNAL_CALL_SITE_STORM_WORDING if s in sites]
+
+
+def _storm_wording(site: FlakeCallSite) -> _StormWording:
+    return _LIVE_SIGNAL_CALL_SITE_STORM_WORDING[site]
 
 
 def _storm_summary(sites: frozenset[FlakeCallSite]) -> str:
-    parts = '; '.join(
-        f'{s}: {_CALL_SITES_WITH_LIVE_SIGNALS[s].reds}' for s in _in_table_order(sites)
-    )
+    parts = '; '.join(f'{s}: {_storm_wording(s).reds}' for s in _in_table_order(sites))
     return (
         'Flake-suppression storm: isolated re-runs have suppressed '
         f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} reds since the last reset ({parts})'
+    )
+
+
+def _most_recent_suppression(
+    latest: FlakeCallSite, *, head_sha: str, task_id: str | None,
+) -> str:
+    return (
+        f'call_site={latest}, {_storm_wording(latest).head_label} {head_sha}, '
+        f'observing task_id: {task_id}'
     )
 
 
@@ -254,14 +265,14 @@ def _storm_detail(
     task_id: str | None,
 ) -> str:
     ordered = _in_table_order(sites)
-    observers = ' '.join(f'{s}: {_CALL_SITES_WITH_LIVE_SIGNALS[s].observer}.' for s in ordered)
+    observers = ' '.join(f'{s}: {_storm_wording(s).observer}.' for s in ordered)
     return (
         f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} suppressions since the counter was '
         f'last reset, from call site(s) {", ".join(ordered)}: a CUMULATIVE count, NOT '
         'necessarily back-to-back merges (a clean verify does not reset the counter). '
         f'{observers} '
-        f'Most recent suppression: call_site={latest}, '
-        f'{_CALL_SITES_WITH_LIVE_SIGNALS[latest].head_label} {head_sha}, task_id: {task_id}. '
+        'Most recent suppression: '
+        f'{_most_recent_suppression(latest, head_sha=head_sha, task_id=task_id)}. '
         'Each suppression means a red passed on isolated re-run; a sustained rate '
         'indicates either chronic host CPU starvation or a genuinely flaky test being '
         "repeatedly masked. Each flake_occurrence row carries its suppression's call_site. "
@@ -279,13 +290,16 @@ def _file_storm_escalation(
 ) -> None:
     """File the storm escalation naming the window's *sites*, unless one is open.
 
-    Modeled on ``merge_queue._alarm_verify_worktree_contention``: a born-at-L2
-    escalation (``severity='critical'``, ``level=2``,
+    Modeled on
+    ``orchestrator/src/orchestrator/merge_lane/worker.py::_alarm_verify_worktree_contention``:
+    a born-at-L2 escalation (``severity='critical'``, ``level=2``,
     ``agent_role='orchestrator-merge-flake-monitor'`` — the ``orchestrator-``
     prefix marks it a harness sentinel so the escalation server never downgrades
     the critical severity) that routes straight to a human, bypassing the
     auto-watcher. Deduped on a fixed open-L2 sentinel task_id so a persistent
-    storm files at most one open critical per window, whichever call sites fed it.
+    storm files at most one open critical per window, whichever call sites fed it;
+    a deduped window's call sites reach only the log, since the open L2 names the
+    window that filed it.
     """
     from escalation.models import Escalation  # noqa: PLC0415 — local, escalation optional dep
 
@@ -293,6 +307,13 @@ def _file_storm_escalation(
     # Dedup: don't re-alarm while an open L2 already exists for the storm
     # sentinel (has_open_l1 is hardcoded to level=1, so get_by_task is used).
     if escalation_queue.get_by_task(sentinel, status='pending', level=2):
+        logger.warning(
+            'flake-suppression storm deduped: an L2 for %s is already open, so it does '
+            'not name this window from call site(s) %s; most recent suppression: %s',
+            sentinel,
+            ', '.join(_in_table_order(sites)),
+            _most_recent_suppression(latest, head_sha=merge_sha, task_id=task_id),
+        )
         return
 
     esc = Escalation(
@@ -520,7 +541,7 @@ async def record_call_site_observations(
     on the ledger's due list carrying its context, in the same transaction as the rows
     of the suppression that names it; which tests are eligible is the caller's call,
     never derived from a verdict here.  Then, for a call site in
-    :data:`_CALL_SITES_WITH_LIVE_SIGNALS`, each ``passes_in_isolation`` suppression
+    :data:`_LIVE_SIGNAL_CALL_SITE_STORM_WORDING`, each ``passes_in_isolation`` suppression
     emits its fact and bumps the storm streak.
 
     ORDER IS THE CONTRACT: the durable rows and items first, the in-process signals
@@ -549,7 +570,7 @@ async def record_call_site_observations(
         ledger_db_path(project_root), project_id, suppressions, due,
         head=head, observing_task_id=observing_task_id, guard=guard,
     )
-    if call_site in _CALL_SITES_WITH_LIVE_SIGNALS:
+    if call_site in _LIVE_SIGNAL_CALL_SITE_STORM_WORDING:
         _fire_live_signals(
             suppressions,
             call_site=call_site, head_sha=head_sha, observing_task_id=observing_task_id,
