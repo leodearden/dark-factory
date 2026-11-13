@@ -52,7 +52,32 @@ MOVED_GUARDS = (
     'test_usage_gate_shutdown_pairing.py',
     'test_wildcard_mcp_scoping_gate.py',
     'test_tree_scan_sharing.py',
+    'TestFileExtensionsDriftGuard',
+    'TestExtensionlessFilenamesDriftGuard',
+    'TestSingleResetsParserOwnership',
+    'TestOwnershipScanUsesTheSharedTree',
+    'test_only_allowlisted_modules_import_declared_scope',
+    'test_the_sweep_sees_the_known_importers',
+    'test_forbidden_readers_are_real_and_never_allowed',
+    'test_every_allowlist_entry_is_real_unless_pending',
+    'test_no_forbidden_reader_names_declared_scope',
+    'TestMergeSubmitStatusEnum::test_exact_vocabulary',
+    'TestSubmitPartitions::test_submit_terminal_matches_merge_outcome_status',
+    'TestSpecimenAntiFabrication',
+    'test_interim_cli_agrees_with_the_committed_fixture',
 )
+
+#: Qualified names split out of shared/tests modules into tests/repo_guards.
+SPLIT_OUT_OF_SHARED = frozenset({
+    'TestFileExtensionsDriftGuard',
+    'TestExtensionlessFilenamesDriftGuard',
+    'TestSingleResetsParserOwnership',
+    'TestOwnershipScanUsesTheSharedTree',
+    'TestMergeSubmitStatusEnum.test_exact_vocabulary',
+    'TestSubmitPartitions.test_submit_terminal_matches_merge_outcome_status',
+    'TestSpecimenAntiFabrication',
+    'test_interim_cli_agrees_with_the_committed_fixture',
+})
 
 SHARED_TESTS_DIR = REPO_ROOT / 'shared' / 'tests'
 
@@ -73,6 +98,7 @@ FIRST_PARTY_TREE_FAMILY = (
     'test_tree_scan_sharing.py',
     'session_prebuild.py',
     'test_session_prebuild.py',
+    'test_declared_scope_readers.py',
 )
 
 #: Repo-relative homes the whole-file moves vacated.
@@ -272,6 +298,47 @@ def _absolute_imports(source: str) -> set[str]:
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
             imported.add(node.module)
     return imported
+
+
+def _defined_qualnames(source: str) -> set[str]:
+    """Module-level class and function names, plus ``Class.method`` for each class's methods."""
+    defined: set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            defined.add(node.name)
+            defined.update(
+                f'{node.name}.{member.name}'
+                for member in node.body
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+    return defined
+
+
+def test_defined_qualnames_reads_classes_methods_and_functions() -> None:
+    source = (
+        'class TestA:\n'
+        '    def test_m(self): ...\n'
+        '    async def test_n(self): ...\n'
+        'def test_f(): ...\n'
+        "TEXT = '''class TestInString: ...'''\n"
+    )
+    assert _defined_qualnames(source) == {'TestA', 'TestA.test_m', 'TestA.test_n', 'test_f'}
+
+
+def test_no_split_guard_is_still_defined_under_shared_tests() -> None:
+    left_behind = {
+        str(path.relative_to(REPO_ROOT)): found
+        for path in sorted(SHARED_TESTS_DIR.rglob('*.py'))
+        if (found := sorted(
+            _defined_qualnames(path.read_text(encoding='utf-8')) & SPLIT_OUT_OF_SHARED
+        ))
+    }
+    assert not left_behind, (
+        f'these guards moved to {MODULE_PREFIX}/ but are still defined under '
+        f'shared/tests: {left_behind}'
+    )
 
 
 def test_shared_conftest_builds_no_first_party_tree() -> None:
