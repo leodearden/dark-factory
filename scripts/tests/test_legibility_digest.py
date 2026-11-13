@@ -2824,7 +2824,7 @@ class TestRenderDigest:
 
 def _oversized_not_found_records(n=600):
     """One gold user-correction plus *n* not-found hits -- enough bytes to
-    exceed the default 15360-byte soft cap on its own."""
+    exceed the DEFAULT_MAX_BYTES soft cap on its own."""
     records = [_with_session_meta(_user_text('This approach is wrong, please redo it properly.'))]
     for i in range(n):
         records.append(_with_session_meta(
@@ -2853,7 +2853,7 @@ class TestRenderDigestTruncation:
     def test_default_cap_is_respected_and_gold_survives(self):
         digest = mod.render_digest(_oversized_not_found_records(), agent_class='interactive')
 
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
         assert '## User Corrections' in digest
         # truncation genuinely trimmed the low-signal section, not a no-op
         assert digest.count('command not found') < 600
@@ -2880,6 +2880,37 @@ class TestRenderDigestTruncation:
         # Lowest-priority retry_loops (60 groups) is what absorbed the
         # truncation: fewer than all 60 groups survive.
         assert digest.count('Bash x3:') < 60
+
+
+class TestDefaultMaxBytes:
+    def test_default_max_bytes_is_the_prd_7_2_cap(self):
+        assert mod.DEFAULT_MAX_BYTES == 15360
+
+    def test_render_digest_defaults_to_the_module_cap(self):
+        records = _oversized_not_found_records()
+
+        default = mod.render_digest(records, agent_class='interactive')
+
+        assert default == mod.render_digest(
+            records, agent_class='interactive', max_bytes=mod.DEFAULT_MAX_BYTES,
+        )
+        assert default != mod.render_digest(
+            records, agent_class='interactive', max_bytes=mod.DEFAULT_MAX_BYTES - 1024,
+        )
+
+    def test_build_digest_defaults_to_the_module_cap(self, tmp_path):
+        path = _write_jsonl(tmp_path, _oversized_not_found_records())
+
+        assert mod.build_digest(path) == mod.build_digest(path, max_bytes=mod.DEFAULT_MAX_BYTES)
+
+    def test_cli_max_bytes_defaults_to_the_module_cap(self, tmp_path, capsys):
+        path = _write_jsonl(tmp_path, _oversized_not_found_records())
+
+        mod.main([str(path)])
+
+        assert capsys.readouterr().out == (
+            mod.build_digest(path, max_bytes=mod.DEFAULT_MAX_BYTES) + '\n'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3023,7 +3054,7 @@ class TestPerItemByteCap:
         assert '## User Corrections' in digest
         assert '## Error Neighborhoods' in digest
         assert '## Not Found' in digest
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
         assert mod.ITEM_TRUNCATION_MARKER in digest
 
     def test_gold_section_still_precedes_error_neighborhoods_under_cap(self):
@@ -3629,7 +3660,7 @@ class TestBuildDigestBoundary:
         for heading in ('User Corrections', 'Error Neighborhoods', 'Self-Corrections', 'Retry Loops'):
             assert f'## {heading}' in digest, f'missing heading: {heading}'
 
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
@@ -3665,7 +3696,7 @@ class TestMainCLI:
         assert '## User Corrections' in captured.out
         # print() appends exactly one trailing newline beyond the digest
         # itself -- strip it before checking the digest's own soft cap.
-        assert len(captured.out.rstrip('\n').encode('utf-8')) <= 15360
+        assert len(captured.out.rstrip('\n').encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
 
     def test_agent_class_flag_overrides_frontmatter_class(self, tmp_path, capsys):
         path = _write_jsonl(tmp_path, _boundary_records())
