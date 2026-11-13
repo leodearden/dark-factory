@@ -161,7 +161,8 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     commit ON MAIN here (this exception does NOT reach the where-the-sha-
     came-from paragraphs above), but the EFFECT-PRESENT guarantee is gone:
     ``validate_landing_evidence``'s second accept path
-    (``orchestrator/src/orchestrator/landing_evidence.py``, both modes)
+    (``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::validate_landing_evidence``,
+    both modes)
     sits INSIDE the ``commit_effect_present_in_main(...) is False`` branch
     and accepts anyway when the three-leg delivered-checks differential
     confirms.  So ``merge_sha`` may name a landing that was later REVERTED
@@ -381,6 +382,7 @@ async def _evidence_verdict(
     fetch: TaskMetadataResult,
     *,
     branch_tip_sha: str | None,
+    checks_enabled: bool,
     candidate_sha: str | None = None,
     pattern_template: str | None = None,
 ) -> GitAuthorityVerdict:
@@ -424,6 +426,10 @@ async def _evidence_verdict(
     "``{}`` is not proof" invariant travels with the data, and so the
     unavailability flag reaches the verdict without a second parameter.
 
+    *checks_enabled* is the project's ``delivered_checks.enabled`` leaf, read
+    from :func:`probe_landing`'s ``orch_config``, because a real
+    ``GitOps.config`` is the ``git`` sub-config and cannot supply it.
+
     The runtime-only reverse import is repeated here rather than threaded in
     from :func:`probe_landing` — see the module docstring for why it must
     stay inside a function body.  Resolving it per call is also what lets
@@ -440,6 +446,7 @@ async def _evidence_verdict(
         candidate_sha=candidate_sha,
         pattern_template=pattern_template,
         delivered_checks=fetch.metadata.get('delivered_checks') or [],
+        checks_enabled=checks_enabled,
     )
     # Plain `str`, never LandingReason — see GitAuthorityVerdict.reason.
     reason = None if verdict.reason is None else str(verdict.reason)
@@ -485,6 +492,7 @@ async def _marker_arm(
     fetch: TaskMetadataResult,
     *,
     marker: str,
+    checks_enabled: bool,
 ) -> GitAuthorityVerdict:
     """Judge a merge marker found on main for a deleted branch ref.
 
@@ -506,7 +514,7 @@ async def _marker_arm(
         )
     return await _evidence_verdict(
         git_ops, tid, full_branch, GitAuthorityArm.marker, fetch,
-        branch_tip_sha=None, candidate_sha=marker,
+        branch_tip_sha=None, candidate_sha=marker, checks_enabled=checks_enabled,
     )
 
 
@@ -518,6 +526,7 @@ async def _ancestor_arm(
     *,
     branch_tip_sha: str,
     pattern: str | None,
+    checks_enabled: bool,
 ) -> GitAuthorityVerdict:
     """Judge a live branch whose tip is an ancestor of main but not main's tip.
 
@@ -554,6 +563,7 @@ async def _ancestor_arm(
     return await _evidence_verdict(
         git_ops, tid, full_branch, GitAuthorityArm.ancestor, fetch,
         branch_tip_sha=branch_tip_sha, pattern_template=pattern,
+        checks_enabled=checks_enabled,
     )
 
 
@@ -668,6 +678,7 @@ async def probe_landing(
 
     try:
         git_config = orch_config.git
+        checks_enabled = orch_config.delivered_checks.enabled
         full_branch = canonical_queued_branch_name(key, git_config.branch_prefix)
         tip = await git_ops.resolve_branch_sha(full_branch)
         main_tip = await git_ops.resolve_branch_sha(git_config.main_branch)
@@ -680,7 +691,10 @@ async def probe_landing(
                 return _verdict(GitAuthorityOutcome.no_signal)
             fetch = await task_metadata(harness, tid, site=site)
             metadata_unavailable = fetch.unavailable
-            return await _marker_arm(git_ops, tid, full_branch, fetch, marker=marker)
+            return await _marker_arm(
+                git_ops, tid, full_branch, fetch,
+                marker=marker, checks_enabled=checks_enabled,
+            )
         if tip == main_tip:
             # A commit is its own ancestor, so a branch at exactly main's HEAD
             # passes is_ancestor while nothing has been merged.
@@ -692,6 +706,7 @@ async def probe_landing(
             return await _ancestor_arm(
                 git_ops, tid, full_branch, fetch,
                 branch_tip_sha=tip, pattern=git_config.commit_citation_pattern,
+                checks_enabled=checks_enabled,
             )
         return await _patch_id_arm(
             git_ops, tid, full_branch, fetch, branch_tip_sha=tip,
