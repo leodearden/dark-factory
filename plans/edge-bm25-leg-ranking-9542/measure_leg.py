@@ -78,7 +78,7 @@ class ReadOnlyGraph:
             self.issued.append((cypher, params, len(records)))
             return records, [], None
 
-        driver.execute_query = execute  # pyright: ignore[reportAttributeAccessIssue]
+        driver.execute_query = execute
         return driver
 
 
