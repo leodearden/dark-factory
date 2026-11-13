@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _falkor_index_doubles import LIVE_HEADER
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, await_index_operational, falkor_skipif
 from _fm_helpers import load_script_module
 from _fm_sockets import refused_port
@@ -27,6 +28,7 @@ from redis.exceptions import ResponseError
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.topology import read_topology, topology_hash
+from fused_memory.backends.falkor_indices import INDEX_DEFINITION_QUERY
 from fused_memory.config.falkordb_endpoints import PRODUCTION_FALKORDB
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -34,7 +36,6 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 SEED = load_script_module(
     Path(__file__).resolve().parents[1] / 'scripts' / 'seed_scratch_reference_graph.py'
 )
-INDEX_DEFINITION_QUERY = SEED.INDEX_DEFINITION_QUERY
 
 SEED_CYPHER = (
     'CREATE (a:Entity {uuid: "n-merge", name: "merge worker", group_id: $g, '
@@ -116,7 +117,7 @@ class _EmptyGraph:
         self.deleted = False
 
     async def ro_query(self, query: str, *args: object, **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(header=[[1, 'label'], [1, 'status']], result_set=[])
+        return SimpleNamespace(header=LIVE_HEADER, result_set=[])
 
     async def delete(self) -> None:
         if self.delete_error is not None:
