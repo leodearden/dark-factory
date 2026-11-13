@@ -92,6 +92,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -302,7 +304,7 @@ _MAX_DISCARDED_VALUE_REPR = 120
 #
 # Rejection is lossless: the only `eval_id` that can ever link a row is an
 # eval directory's own `name` (`_build_eval` assigns `eval_id =
-# eval_dir.name`, and `consumed` is keyed on it), and a single path
+# eval_dir.name`, and `_RowClaims.verdict_keys` is keyed on it), and a single path
 # component is bounded by POSIX `NAME_MAX` on every filesystem this runs
 # on.  An `eval_id` longer than that was therefore already unmatchable by
 # construction — indexing it could only ever carry the artifact's own
@@ -321,6 +323,43 @@ _MAX_EVAL_ID_LENGTH = 255
 # ``(eval_id, metric_id) -> {item -> entry}``; a window metric's entry has no
 # ``item`` and is keyed ``None``.
 _VerdictIndex = dict[tuple[str, str], dict[str | None, dict[str, Any]]]
+
+
+@dataclass(frozen=True, slots=True)
+class _RowClaims:
+    """What the payload's rows have accounted for so far in its two joins.
+
+    ``verdict_keys``: the verdict-index keys some row read.  ``linked``: the
+    fingerprints some row, or the storm block, links.  ``suppressed``: the
+    fingerprints a row claims while a triggered storm suppressed per-metric
+    links.
+    """
+
+    verdict_keys: frozenset[tuple[str, str]] = frozenset()
+    linked: frozenset[str] = frozenset()
+    suppressed: frozenset[str] = frozenset()
+
+    def with_verdict_key(self, key: tuple[str, str]) -> _RowClaims:
+        return replace(self, verdict_keys=self.verdict_keys | {key})
+
+    def with_link(self, fingerprint: str) -> _RowClaims:
+        return replace(self, linked=self.linked | {fingerprint})
+
+    def with_suppressed(self, fingerprint: str) -> _RowClaims:
+        return replace(self, suppressed=self.suppressed | {fingerprint})
+
+
+@dataclass(frozen=True, slots=True)
+class _JoinSources:
+    """The program-wide inputs, read once per build, that every eval's rows join against or repeat.
+
+    ``storm`` is the projected storm block: each eval's payload repeats it whole,
+    while the escalation join reads only whether it is set.
+    """
+
+    verdicts: _VerdictIndex
+    escalations: Mapping[str, Escalation]
+    storm: dict[str, Any] | None
 
 
 def _load_json(path: Path) -> Any:
@@ -423,7 +462,7 @@ def _read_limits(
             )
         return None, {}
 
-    # Scoped to the read+parse itself, exactly as ``_build_eval`` already does
+    # Scoped to the read+parse itself, exactly as ``_read_run`` already does
     # for each metrics run.  Wrapping the WHOLE function instead (as the caller
     # used to) meant a code bug anywhere below was reported as an unreadable
     # artifact.
@@ -749,7 +788,7 @@ def _name_shared_fingerprints(index: _VerdictIndex, path: Path, issues: list[dic
 
     A fingerprint names one ``(eval_id, metric_id, item)`` identity and the
     escalation join is whole-string equality on it, so two entries sharing one
-    would both claim the same escalation.  ``_verdict_row_fields`` links it to
+    would both claim the same escalation.  ``_join_escalation`` links it to
     the first row that claims it; this makes the sharing itself visible.
     """
     holders: dict[str, tuple[str, str, str | None]] = {}
@@ -793,10 +832,11 @@ def _escalation_projection(escalation: Escalation) -> dict[str, Any]:
 def _unmatched_projection(escalation: Escalation, reason: str) -> dict[str, Any]:
     """An open escalation that no metric row links, plus WHY it carries no link.
 
-    ``no_matching_verdict`` — nothing in the verdicts artifact claims this
-    fingerprint.  That covers genuine contract drift AND escalations no metric
-    row can ever explain (the runner-failure self-report is itself an
-    ``eval_regression``).
+    ``no_matching_verdict`` — no row in this payload claims this fingerprint.
+    That covers genuine contract drift, escalations no metric row can ever
+    explain (the runner-failure self-report is itself an ``eval_regression``)
+    and, beside an ``internal_error`` naming the eval, a row lost to a
+    dashboard bug.
     ``storm_suppressed`` — a metric row DOES claim this fingerprint, but this
     run's storm escape collapsed per-metric links into the aggregate, so the
     row deliberately renders none.  Per-metric filings from EARLIER runs stay
@@ -995,7 +1035,7 @@ def _parity(verdict_class: str, escalation: dict[str, Any] | None) -> str:
 
     Reachability of ``unjudged_open``, which is not obvious: the row-level join
     only runs when the verdict ENTRY carries a fingerprint (see
-    ``_verdict_row_fields``), so a row no ``(eval_id, metric_id, item)`` entry
+    ``_join_escalation``), so a row no ``(eval_id, metric_id, item)`` entry
     names can never link.  The
     linked variant is reached only by an entry that has a ``fingerprint`` and
     no ``verdict`` field — exactly the case that used to claim a recovery that
@@ -1014,15 +1054,36 @@ def _item_order(item: str | None) -> tuple[bool, str]:
     return item is not None, item or ''
 
 
+def _join_escalation(
+    fingerprint: Any,
+    sources: _JoinSources,
+    claims: _RowClaims,
+) -> tuple[Escalation | None, _RowClaims]:
+    """The escalation a row carrying *fingerprint* links, and *claims* extended by that row's claim.
+
+    Whole-string equality, NOT gated on the verdict: a recovered metric whose
+    escalation is still open keeps its link.  A triggered storm filed one
+    aggregate instead of per-metric escalations, so it suppresses the link and
+    records the claim, letting ``unmatched_escalations`` say why.  A
+    fingerprint links only its first claimer; ``_name_shared_fingerprints``
+    names the sharing.
+    """
+    if not (isinstance(fingerprint, str) and fingerprint) or fingerprint not in sources.escalations:
+        return None, claims
+    if sources.storm is not None:
+        return None, claims.with_suppressed(fingerprint)
+    if fingerprint in claims.linked:
+        return None, claims
+    return sources.escalations[fingerprint], claims.with_link(fingerprint)
+
+
 def _verdict_row_fields(
     entry: dict[str, Any] | None,
     metric_id: str,
     eval_dir: Path,
+    matched: Escalation | None,
+    storm_triggered: bool,
     issues: list[dict[str, Any]],
-    escalation_index: dict[str, Escalation],
-    linked_fingerprints: set[str],
-    storm_suppressed: set[str],
-    storm: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """The verdict half of one metric row: *entry*'s fields, its escalation link and its parity.
 
@@ -1035,36 +1096,6 @@ def _verdict_row_fields(
     # dict makes every verdict field read as None below without a second
     # code path.
     judged: dict[str, Any] = entry or {}
-
-    # The join, in full: whole-string equality on the fingerprint.  It is
-    # NOT gated on the verdict — a metric that has recovered while its
-    # escalation is still open is a real transient state (the watcher has
-    # not closed it yet), and hiding the link there would make the
-    # escalation look orphaned in exactly the window an operator is most
-    # likely to be looking at it.
-    #
-    # While a storm is triggered the runner files ONE aggregate escalation
-    # instead of N per-metric ones, so per-metric links are suppressed
-    # here.  Showing them would invent links that were never filed.
-    #
-    # Suppressed is NOT unexplained: a per-metric escalation from an
-    # earlier run stays open while this run's storm collapses, and it must
-    # not then be reported as an escalation nothing accounts for.  The row
-    # renders no link; the fingerprint is recorded so
-    # ``unmatched_escalations`` can say WHY.
-    #
-    # A fingerprint links at most one row, the first to claim it, so an
-    # escalation keeps exactly one home even when two entries share its
-    # fingerprint (named by ``_name_shared_fingerprints``).
-    fingerprint = judged.get('fingerprint')
-    matched: Escalation | None = None
-    if isinstance(fingerprint, str) and fingerprint:
-        if storm is None:
-            matched = None if fingerprint in linked_fingerprints else escalation_index.get(fingerprint)
-            if matched is not None:
-                linked_fingerprints.add(fingerprint)
-        elif fingerprint in escalation_index:
-            storm_suppressed.add(fingerprint)
     escalation = _escalation_projection(matched) if matched is not None else None
 
     # Classified ONCE and reused for both the parity badge and the
@@ -1100,223 +1131,202 @@ def _verdict_row_fields(
         'value': judged.get('value'),
         'item': judged.get('item'),
         'limit_ref': judged.get('limit_ref'),
-        'fingerprint': fingerprint,
+        'fingerprint': judged.get('fingerprint'),
         'run_stamp': judged.get('run_stamp'),
         'escalation': escalation,
         'parity': (
             'storm_collapsed'
-            if storm is not None and verdict == 'alarm'
+            if storm_triggered and verdict == 'alarm'
             else _parity(verdict_class, escalation)
         ),
     }
 
 
-def _build_eval(
-    eval_dir: Path,
-    issues: list[dict[str, Any]],
-    verdict_index: _VerdictIndex,
-    consumed: set[tuple[str, str]],
-    escalation_index: dict[str, Escalation],
-    linked_fingerprints: set[str],
-    storm_suppressed: set[str],
-    storm: dict[str, Any] | None,
-    now: datetime,
-) -> dict[str, Any]:
-    """Assemble one eval's trend payload from its ``metrics-*.json`` series.
+@dataclass(frozen=True, slots=True)
+class _Run:
+    """One parsed metrics run; ``path`` names its file, since two runs may share a stamp."""
 
-    Runs are ordered by FILENAME — the producer's own contract
-    (``shared.memory_eval_metrics.load_series_window`` sorts the same way,
-    because the stamp is a zero-padded UTC string) — so the dashboard never
-    invents a second ordering rule.  The x-axis label for each run is the
-    artifact's in-body ``run_stamp``.
+    stamp: Any
+    metrics: dict[str, dict[str, Any]]
+    corpus: dict[str, Any] | None
+    path: Path
 
-    Each verdict entry gets its own row, so a tripwire's items are rows that
-    repeat the metric-level fields, each with its own ``trend`` object.
+
+@dataclass(frozen=True, slots=True)
+class _RunSeries:
+    """The parsed trailing window of one eval's runs, oldest first, and how much of the disk it covers."""
+
+    runs: tuple[_Run, ...]
+    runs_on_disk: int
+    truncated: bool
+
+
+def _read_run(path: Path, eval_id: str, issues: list[dict[str, Any]]) -> _Run | None:
+    """Parse one metrics run, or name why it cannot be charted and return None.
+
+    Validates only what the reader must READ and RENDER; the M1 schema's
+    cross-field rules are the producer's to reject at emit time.
     """
-    eval_id = eval_dir.name
-    all_paths = sorted(eval_dir.glob('metrics-*.json'))
+    try:
+        body = _load_json(path)
+    except _ARTIFACT_ERRORS as exc:
+        _issue(issues, 'unreadable_metrics', eval_id=eval_id, path=path, detail=str(exc))
+        return None
 
-    # Trailing window: keep the MOST RECENT runs, drop the oldest.  Dropping
-    # the newest instead would leave a trend that ends N runs ago reading as
-    # current.  ``_TREND_RUN_CAP`` is looked up in the module namespace here
-    # (not captured at import) so it stays one adjustable knob.
-    #
-    # No silent caps: whenever this window drops anything, the count dropped
-    # is disclosed IN THE PAYLOAD (``truncated`` + ``runs_on_disk`` beside
-    # ``run_count``), never only in a log the operator will not read.
-    runs_on_disk = len(all_paths)
-    paths = all_paths[-_TREND_RUN_CAP:] if _TREND_RUN_CAP else all_paths
-    truncated = len(paths) < runs_on_disk
+    if not isinstance(body, dict) or not isinstance(body.get('metrics'), list):
+        _issue(
+            issues, 'malformed_metrics', eval_id=eval_id, path=path,
+            detail=f'expected an object with a list "metrics" field, got {type(body).__name__}',
+        )
+        return None
 
-    # (in-body stamp, metric_id -> record, source path).  The path is carried
-    # so a per-run issue can name the FILE that caused it: the committed
-    # ``malformed/`` exemplar's two runs share one in-body run_stamp, so the
-    # stamp alone would not identify which artifact is at fault.
-    runs: list[tuple[Any, dict[str, dict], Path]] = []
-    corpus: dict | None = None
-    for path in paths:
-        try:
-            body = _load_json(path)
-        except _ARTIFACT_ERRORS as exc:
-            # One unreadable run degrades one run, not the whole eval.
-            _issue(issues, 'unreadable_metrics', eval_id=eval_id, path=path, detail=str(exc))
-            continue
-
-        # The reader validates only what it needs to READ and RENDER.  The M1
-        # schema's cross-field rules (a proportion inside [0,1], a required
-        # denominator) are the producer's to reject at emit time — restating
-        # them here would be a second implementation of what the producer has
-        # already decided.
-        if not isinstance(body, dict) or not isinstance(body.get('metrics'), list):
-            _issue(
-                issues, 'malformed_metrics', eval_id=eval_id, path=path,
-                detail=f'expected an object with a list "metrics" field, got {type(body).__name__}',
-            )
-            continue
-
-        stamp = body.get('run_stamp')
-        if stamp is None:
-            _issue(
-                issues, 'missing_run_stamp', eval_id=eval_id, path=path,
-                detail='run artifact carries no in-body run_stamp',
-            )
-        # The corpus block describes THIS run, so the row carries the LATEST
-        # parsed run's block or none at all — never the newest run that merely
-        # HAPPENED to carry one.  Carrying it forward would present an older
-        # run's counts as current with nothing disclosing the skew, while every
-        # other latest-run field on this row (``current_value``, ``n``,
-        # ``denominator``, ``kind``) has no such fallback and the module
-        # elsewhere discloses drift explicitly (``limits.stale_for_latest_run``,
-        # ``truncated``/``runs_on_disk``).  ``corpus`` is optional in M1, so
-        # "this run reported none" is a truthful answer.  Assigning on every
-        # appended run keeps this field pinned to ``runs[-1]``, the same run
-        # ``latest_run_stamp`` and the latest-run scalars are read from.
-        run_corpus = body.get('corpus')
-        corpus = dict(run_corpus) if isinstance(run_corpus, dict) else None
-        runs.append((stamp, _by_metric_id(body, eval_id, path, issues), path))
-
-    run_stamps = [stamp for stamp, _, _ in runs]
-
-    # Metric identity is the metric_id, unioned across the whole window: a
-    # metric that appears only in some runs still gets a full-width series
-    # (with holes), so every series stays index-aligned to the shared axis.
-    metric_ids: list[str] = []
-    for _, by_id, _path in runs:
-        for metric_id in by_id:
-            if metric_id not in metric_ids:
-                metric_ids.append(metric_id)
-
-    latest_run_stamp = run_stamps[-1] if run_stamps else None
-    # ``_read_limits`` owns its own read boundary and degrades to ``(None, {})``
-    # in place, so there is nothing for the caller to catch.
-    limits, limits_by_metric = _read_limits(
-        eval_dir, latest_run_stamp, issues, has_runs=bool(all_paths),
+    stamp = body.get('run_stamp')
+    if stamp is None:
+        _issue(
+            issues, 'missing_run_stamp', eval_id=eval_id, path=path,
+            detail='run artifact carries no in-body run_stamp',
+        )
+    corpus = body.get('corpus')
+    return _Run(
+        stamp=stamp,
+        metrics=_by_metric_id(body, eval_id, path, issues),
+        corpus=dict(corpus) if isinstance(corpus, dict) else None,
+        path=path,
     )
 
-    # Staleness is DISPLAYED, never alarmed on.  An unparseable stamp degrades
-    # the age to None (and says so) rather than raising or guessing a date.
-    age_seconds: float | None = None
-    if isinstance(latest_run_stamp, str):
-        try:
-            run_at = datetime.strptime(latest_run_stamp, _RUN_STAMP_FORMAT).replace(tzinfo=UTC)
-        except ValueError:
+
+def _read_run_series(eval_dir: Path, issues: list[dict[str, Any]]) -> _RunSeries:
+    """Parse the newest ``_TREND_RUN_CAP`` of *eval_dir*'s metrics runs, ordered by FILENAME.
+
+    Filename order is the producer's own (``shared.memory_eval_metrics.load_series_window``):
+    the stamp is zero-padded UTC.  A run the window drops is disclosed as ``truncated``.
+    """
+    all_paths = sorted(eval_dir.glob('metrics-*.json'))
+    window = all_paths[-_TREND_RUN_CAP:] if _TREND_RUN_CAP else all_paths
+    parsed = (_read_run(path, eval_dir.name, issues) for path in window)
+    return _RunSeries(
+        runs=tuple(run for run in parsed if run is not None),
+        runs_on_disk=len(all_paths),
+        truncated=len(window) < len(all_paths),
+    )
+
+
+def _run_age_seconds(
+    eval_dir: Path,
+    latest_run_stamp: Any,
+    now: datetime,
+    issues: list[dict[str, Any]],
+) -> float | None:
+    """How old the newest run is, for DISPLAY only; an unparseable stamp is named and reads as None."""
+    if not isinstance(latest_run_stamp, str):
+        return None
+    try:
+        run_at = datetime.strptime(latest_run_stamp, _RUN_STAMP_FORMAT).replace(tzinfo=UTC)
+    except ValueError:
+        _issue(
+            issues, 'unparseable_run_stamp', eval_id=eval_dir.name, path=eval_dir,
+            detail=f'run_stamp {_short_repr(latest_run_stamp)} is not in {_RUN_STAMP_FORMAT}',
+        )
+        return None
+    return (now - run_at).total_seconds()
+
+
+def _name_unrenderable_kinds(
+    eval_id: str,
+    metric_id: str,
+    runs: tuple[_Run, ...],
+    issues: list[dict[str, Any]],
+) -> None:
+    """Name each distinct absent or unknown kind *metric_id* carries anywhere in the window.
+
+    Deduped on the RAW ``repr``, never capped, so two oversized kinds sharing a
+    prefix stay distinct.  A run the metric is absent from is a trend hole, not a defect.
+    """
+    seen_kinds: set[str] = set()
+    for run in runs:
+        record = run.metrics.get(metric_id)
+        if record is None:
+            continue
+        run_kind = record.get('kind')
+        if isinstance(run_kind, str) and run_kind in _KNOWN_KINDS:
+            continue
+        if repr(run_kind) in seen_kinds:
+            continue
+        seen_kinds.add(repr(run_kind))
+        if run_kind is None:
             _issue(
-                issues, 'unparseable_run_stamp', eval_id=eval_id, path=eval_dir,
-                detail=f'run_stamp {_short_repr(latest_run_stamp)} is not in {_RUN_STAMP_FORMAT}',
+                issues, 'missing_kind', eval_id=eval_id, path=run.path,
+                detail=(
+                    f'metric {_short_repr(metric_id)} carries no "kind" (a required M1 field), '
+                    'so it has no chart primitive'
+                ),
             )
         else:
-            age_seconds = (now - run_at).total_seconds()
+            _issue(
+                issues, 'unknown_kind', eval_id=eval_id, path=run.path,
+                detail=(
+                    f'metric {_short_repr(metric_id)} has kind {_short_repr(run_kind)}, '
+                    'which has no chart primitive'
+                ),
+            )
 
-    latest = runs[-1][1] if runs else {}
+
+def _metric_fields(metric_id: str, runs: tuple[_Run, ...], rule_kind: Any) -> dict[str, Any]:
+    """The metric half of one row: the latest run's fields and a full-width trend.
+
+    A run the metric is absent from is a ``None`` hole, keeping every series
+    index-aligned to the shared axis.
+    """
+    current = runs[-1].metrics.get(metric_id, {})
+    return {
+        'metric_id': metric_id,
+        'kind': current.get('kind'),
+        'rule_kind': rule_kind,
+        'current_value': current.get('value'),
+        'n': current.get('n'),
+        'denominator': current.get('denominator'),
+        'direction': current.get('direction'),
+        'trend': {
+            'labels': [run.stamp for run in runs],
+            'values': [run.metrics.get(metric_id, {}).get('value') for run in runs],
+        },
+    }
+
+
+def _build_eval(
+    eval_dir: Path,
+    sources: _JoinSources,
+    claims: _RowClaims,
+    now: datetime,
+    issues: list[dict[str, Any]],
+) -> tuple[dict[str, Any], _RowClaims]:
+    """Fold one eval in: returns the eval's payload row and *claims* extended by what its rows
+    claim.  Each verdict entry is its own metric row, so a tripwire's items repeat the
+    metric-level fields.
+    """
+    eval_id = eval_dir.name
+    series = _read_run_series(eval_dir, issues)
+    run_stamps = [run.stamp for run in series.runs]
+    latest_run_stamp = run_stamps[-1] if run_stamps else None
+    limits, limits_by_metric = _read_limits(
+        eval_dir, latest_run_stamp, issues, has_runs=series.runs_on_disk > 0,
+    )
+    age_seconds = _run_age_seconds(eval_dir, latest_run_stamp, now, issues)
+
     metrics: list[dict[str, Any]] = []
-    for metric_id in sorted(metric_ids):
-        # A metric missing from a run contributes a None hole at that index
-        # rather than being dropped — dropping would silently shift this
-        # metric's points against its neighbours'.
-        values = [by_id.get(metric_id, {}).get('value') for _, by_id, _p in runs]
-        current = latest.get(metric_id, {})
-
-        # A kind outside the closed vocabulary is a RENDERING failure: there is
-        # no chart primitive for it, so the dashboard genuinely cannot resolve
-        # it and says so.  The value itself is still real and is still shown.
-        # An ABSENT kind is exactly as unrenderable — ``kind`` is a required M1
-        # field — so it is named too, under its own issue kind because the
-        # operator-facing fix differs (a field to add, not a vocabulary to
-        # widen).
-        #
-        # Checked across the WHOLE window, not just the newest run: a trend
-        # line is drawn from every point, so an unrenderable kind anywhere in
-        # the series is a rendering failure even when the latest run is clean.
-        # The committed ``malformed/`` exemplar is exactly that shape — its
-        # bad-kind artifact sorts BEFORE its well-kinded one, so a latest-run
-        # check would have declared that fixture healthy.
-        #
-        # One issue per distinct (metric, kind): a kind that is wrong in every
-        # run of a 90-run window is one problem, not ninety.  Deduped on the
-        # repr so an unhashable value out of a malformed artifact cannot raise.
-        # This repr is an internal dedup key, never emitted into a detail, and
-        # deliberately NOT routed through `_short_repr`: capping it would make
-        # two distinct oversized kinds that differ only past the cap collide
-        # on their shared prefix, silently swallowing the second metric's
-        # `unknown_kind` issue (DD6/INV-2 forbids exactly that silent drop).
-        # The `unknown_kind` detail below IS capped — only the key stays raw.
-        kind = current.get('kind')
-        seen_kinds: set[str] = set()
-        for _stamp, by_id, run_path in runs:
-            record = by_id.get(metric_id)
-            if record is None:
-                # Absent from THIS run: a None hole in the trend, which is a
-                # legitimate shape (a metric introduced mid-window).  This is
-                # why an absent record cannot be conflated with a record whose
-                # ``kind`` is missing — both read as None off a ``.get`` chain,
-                # and only the second is a defect.
-                continue
-            run_kind = record.get('kind')
-            # ``isinstance`` before the set lookup: an unhashable kind out of a
-            # malformed artifact would make ``in _KNOWN_KINDS`` raise, and a
-            # non-string kind is unrenderable anyway.
-            if isinstance(run_kind, str) and run_kind in _KNOWN_KINDS:
-                continue
-            if repr(run_kind) in seen_kinds:
-                continue
-            seen_kinds.add(repr(run_kind))
-            if run_kind is None:
-                _issue(
-                    issues, 'missing_kind', eval_id=eval_id, path=run_path,
-                    detail=(
-                        f'metric {_short_repr(metric_id)} carries no "kind" (a required M1 field), '
-                        'so it has no chart primitive'
-                    ),
-                )
-            else:
-                _issue(
-                    issues, 'unknown_kind', eval_id=eval_id, path=run_path,
-                    detail=(
-                        f'metric {_short_repr(metric_id)} has kind {_short_repr(run_kind)}, '
-                        'which has no chart primitive'
-                    ),
-                )
-
-        entries = verdict_index.get((eval_id, metric_id), {})
+    for metric_id in sorted({metric_id for run in series.runs for metric_id in run.metrics}):
+        _name_unrenderable_kinds(eval_id, metric_id, series.runs, issues)
+        entries = sources.verdicts.get((eval_id, metric_id), {})
         if entries:
-            consumed.add((eval_id, metric_id))
+            claims = claims.with_verdict_key((eval_id, metric_id))
+        rule_kind = limits_by_metric.get(metric_id, {}).get('rule_kind')
         # A metric no entry judges still gets its one (unjudged) row.
-        row_entries = [entries[item] for item in sorted(entries, key=_item_order)]
-        for entry in row_entries or [None]:
+        for entry in [entries[item] for item in sorted(entries, key=_item_order)] or [None]:
+            matched, claims = _join_escalation((entry or {}).get('fingerprint'), sources, claims)
             metrics.append({
-                'metric_id': metric_id,
-                'kind': kind,
-                # Looked up by metric_id, never zipped positionally: the two lists
-                # are ordered independently and a metric may be absent from either.
-                'rule_kind': limits_by_metric.get(metric_id, {}).get('rule_kind'),
-                'current_value': current.get('value'),
-                'n': current.get('n'),
-                'denominator': current.get('denominator'),
-                'direction': current.get('direction'),
-                'trend': {'labels': list(run_stamps), 'values': list(values)},
+                **_metric_fields(metric_id, series.runs, rule_kind),
                 **_verdict_row_fields(
-                    entry, metric_id, eval_dir, issues,
-                    escalation_index, linked_fingerprints, storm_suppressed, storm,
+                    entry, metric_id, eval_dir, matched, sources.storm is not None, issues,
                 ),
             })
 
@@ -1330,14 +1340,14 @@ def _build_eval(
         # is the one the program-wide banner reads).  Repeated per row purely so
         # a row showing ``storm_collapsed`` parity carries, in place, the reason
         # its escalation link is absent.
-        'storm_escape': storm,
+        'storm_escape': sources.storm,
         'run_stamps': run_stamps,
         'run_count': len(run_stamps),
-        'runs_on_disk': runs_on_disk,
-        'truncated': truncated,
-        'corpus': corpus,
+        'runs_on_disk': series.runs_on_disk,
+        'truncated': series.truncated,
+        'corpus': series.runs[-1].corpus if series.runs else None,
         'metrics': metrics,
-    }
+    }, claims
 
 
 def build_memory_evals(
@@ -1502,6 +1512,33 @@ def _empty_payload(resolved_now: datetime, issues: list[dict[str, Any]]) -> dict
     }
 
 
+def _resolve_storm(
+    storm: dict[str, Any] | None,
+    escalation_index: Mapping[str, Escalation],
+) -> tuple[dict[str, Any] | None, _RowClaims]:
+    """Project the run-scoped storm block, resolving its aggregate against the rows' escalation index.
+
+    A resolved aggregate is claimed as linked: the storm block, not a row,
+    explains it, so it is not then reported as unmatched.
+    """
+    if storm is None:
+        return None, _RowClaims()
+    aggregate_fingerprint = storm.get('aggregate_fingerprint')
+    aggregate: Escalation | None = None
+    linked: frozenset[str] = frozenset()
+    if isinstance(aggregate_fingerprint, str) and aggregate_fingerprint:
+        aggregate = escalation_index.get(aggregate_fingerprint)
+        if aggregate is not None:
+            linked = frozenset({aggregate_fingerprint})
+    block = {
+        'triggered': storm.get('triggered'),
+        'alarm_count': storm.get('alarm_count'),
+        'aggregate_fingerprint': aggregate_fingerprint,
+        'escalation': _escalation_projection(aggregate) if aggregate is not None else None,
+    }
+    return block, _RowClaims(linked=linked)
+
+
 def _build_payload(
     payload: dict[str, Any],
     memory_evals_dir: Path,
@@ -1548,44 +1585,20 @@ def _build_payload(
 
     escalation_index, unfingerprinted = _index_escalations(corpus, escalation_queue, issues)
 
-    consumed: set[tuple[str, str]] = set()
-    linked_fingerprints: set[str] = set()
-    # Fingerprints a metric row claims but deliberately does not link because a
-    # storm collapsed this run's per-metric filings into one aggregate.
-    storm_suppressed: set[str] = set()
-
-    # The storm block is run-scoped across the whole program; resolve its
-    # aggregate against the SAME escalation index the metric rows use, and
-    # mark that fingerprint consumed so the aggregate is not then reported as
-    # unexplained.  It IS explained — by the storm block, not by a row.
-    storm_block: dict[str, Any] | None = None
-    if storm is not None:
-        aggregate_fingerprint = storm.get('aggregate_fingerprint')
-        aggregate: Escalation | None = None
-        if isinstance(aggregate_fingerprint, str) and aggregate_fingerprint:
-            aggregate = escalation_index.get(aggregate_fingerprint)
-            if aggregate is not None:
-                linked_fingerprints.add(aggregate_fingerprint)
-        storm_block = {
-            'triggered': storm.get('triggered'),
-            'alarm_count': storm.get('alarm_count'),
-            'aggregate_fingerprint': aggregate_fingerprint,
-            'escalation': _escalation_projection(aggregate) if aggregate is not None else None,
-        }
+    storm_block, claims = _resolve_storm(storm, escalation_index)
     payload['storm_escape'] = storm_block
+    sources = _JoinSources(verdict_index, escalation_index, storm_block)
 
     # Per-eval bug boundary, not one comprehension.  Artifact errors are
     # already handled inside ``_build_eval``, so anything escaping it is a bug
     # — and as a single comprehension a bug on the fifth of ten dirs discarded
     # the other nine, leaving a present-but-empty root that reads as "no evals
-    # have run".  Per-eval it costs that one row and names which one.
+    # have run".  Per-eval it costs that one row and names which one, and
+    # ``claims`` advances only past a row that ships.
     evals: list[dict[str, Any]] = []
     for eval_dir in eval_dirs:
         try:
-            evals.append(_build_eval(
-                eval_dir, issues, verdict_index, consumed, escalation_index,
-                linked_fingerprints, storm_suppressed, storm_block, resolved_now,
-            ))
+            row, claims = _build_eval(eval_dir, sources, claims, resolved_now, issues)
         except Exception as exc:  # noqa: BLE001 - per-eval half of the never-500 boundary
             logger.exception('memory-evals eval build failed for %s', eval_dir)
             _issue(
@@ -1595,6 +1608,8 @@ def _build_payload(
                     'artifact; see the dashboard log for the traceback'
                 ),
             )
+        else:
+            evals.append(row)
     payload['evals'] = evals
 
     # The reverse direction: an open eval_regression escalation that no metric
@@ -1604,10 +1619,10 @@ def _build_payload(
     payload['unmatched_escalations'] = [
         _unmatched_projection(
             record,
-            'storm_suppressed' if fingerprint in storm_suppressed else 'no_matching_verdict',
+            'storm_suppressed' if fingerprint in claims.suppressed else 'no_matching_verdict',
         )
         for fingerprint, record in escalation_index.items()
-        if fingerprint not in linked_fingerprints
+        if fingerprint not in claims.linked
     ] + [
         # Open, and unlinkable rather than merely unlinked: with no usable
         # fingerprint these never reached the index, so this is the only place
@@ -1619,7 +1634,7 @@ def _build_payload(
     # A verdict resolving onto nothing is contract drift between the evaluator
     # and the artifact tree — surfaced, not dropped.
     for eval_id, metric_id in verdict_index:
-        if (eval_id, metric_id) in consumed:
+        if (eval_id, metric_id) in claims.verdict_keys:
             continue
         _issue(
             issues,
