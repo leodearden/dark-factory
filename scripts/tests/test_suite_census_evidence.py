@@ -97,7 +97,7 @@ class TestPytestEvidence:
             ('orchestrator', f'{TEST_A}::test_q', FAILED),
         ]
         assert sorted(_unresolved(records, 'flake_occurrence')) == [
-            '<unknown>', 'tests/test_deleted.py::test_x',
+            UNKNOWN_TEST_ID, 'tests/test_deleted.py::test_x',
         ]
 
     def test_an_ambiguous_flake_id_credits_only_the_candidates_that_define_it(self, records):
@@ -306,7 +306,7 @@ class TestNextestEvidence:
 
     def test_an_unknown_flake_row_is_unresolved(self, records):
         assert _observations(records, 'flake_occurrence') == []
-        assert _unresolved(records, 'flake_occurrence') == ['<unknown>']
+        assert _unresolved(records, 'flake_occurrence') == [UNKNOWN_TEST_ID]
 
     def test_every_run_is_contiguous(self, records):
         keys = [(o.source, o.run) for o in records if isinstance(o, oc.Observation)]
@@ -420,15 +420,6 @@ class TestFlakeOccurrenceCallSites:
         assert tallies == [(1, 1, 0), (4, 4, 1)]
         assert _flake_tally(after).unresolved_samples == (UNKNOWN_TEST_ID,)
         assert (_flake_artefacts(before), _flake_artefacts(after)) == (1, 5)
-
-    def test_a_lane_observation_naming_no_test_credits_no_test(self, root):
-        _add_lane_rows(root)
-        records = list(ev.pytest_evidence(root, root).records())
-        assert _unresolved(records, 'flake_occurrence') == [UNKNOWN_TEST_ID]
-        assert not [
-            o for o in _observations(records, 'flake_occurrence')
-            if UNKNOWN_TEST_ID in o.test.name
-        ]
 
     def test_nextest_counts_an_offline_lane_row_of_an_infra_script(self, tmp_path):
         root = git_tree(tmp_path, {

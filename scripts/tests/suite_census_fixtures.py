@@ -18,6 +18,7 @@ from orchestrator.flake_ledger import (
     FlakeCallSite,
     FlakeSuppression,
     FlakeVerdict,
+    read_occurrences,
     record_flake_occurrence,
 )
 
@@ -93,26 +94,36 @@ def flake_db(
 ) -> Path:
     """Append (observed_at, test_id, verdict) rows to the runs.db at *path*.
 
-    Rows are written by the ledger's own writer at *call_site*; a None test_id is an
-    observation that named no test.
+    Rows are written by the ledger's own writer at *call_site*. A None test_id with the
+    ``unconfirmable`` verdict is an observation that named no test. The writer drops what
+    it refuses or has already recorded without raising, so a row that adds no
+    occurrence raises here.
     """
-    for observed_at, test_id, verdict in rows:
-        record_flake_occurrence(
-            path,
-            "fixture",
-            FlakeSuppression(
-                verdict=FlakeVerdict(verdict),
-                test_ids=() if test_id is None else (test_id,),
-                observed_at=observed_at,
-                call_site=call_site,
-                runner="local",
-                psi_cpu_some10=None,
-                unconfirmable_reason=None,
-            ),
-            merge_sha=None,
-            task_id=None,
-        )
+    for row in rows:
+        _record_one(path, row, call_site)
     return path
+
+
+def _record_one(path: Path, row: tuple[str, str | None, str], call_site: FlakeCallSite) -> None:
+    observed_at, test_id, verdict = row
+    recorded = len(read_occurrences(path))
+    record_flake_occurrence(
+        path,
+        "fixture",
+        FlakeSuppression(
+            verdict=FlakeVerdict(verdict),
+            test_ids=() if test_id is None else (test_id,),
+            observed_at=observed_at,
+            call_site=call_site,
+            runner="local",
+            psi_cpu_some10=None,
+            unconfirmable_reason=None,
+        ),
+        merge_sha=None,
+        task_id=None,
+    )
+    if len(read_occurrences(path)) != recorded + 1:
+        raise ValueError(f"flake_db: the ledger recorded no occurrence for {row!r} at {call_site}")
 
 
 def _set_mtime(path: Path, iso_utc: str) -> None:
