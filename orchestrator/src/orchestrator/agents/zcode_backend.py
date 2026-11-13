@@ -135,9 +135,10 @@ def zcode_run_home(
         cli_config_path.parent.mkdir(parents=True)
         cli_config_path.write_text(json.dumps(zcode_cli_config(mcp_config)))
         (zcode_dir / 'AGENTS.md').write_text(system_prompt)
+        workspace = _fenced_workspace(root, worktree)
         yield ZCodeRunHome(
             root=root, provider_config_path=provider_config_path, operator_home=operator_home,
-            workspace=_fenced_workspace(root, worktree),
+            workspace=workspace,
         )
 
 

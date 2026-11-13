@@ -194,23 +194,22 @@ def _home_at(path: Path) -> ZCodeRunHome:
 
 class TestZCodeArgv:
 
-    def test_the_headless_argv_always_removes_the_interactive_tools(self, tmp_path):
-        argv = zcode_argv('do step-1', _home_at(tmp_path), None)
+    def test_the_headless_argv_runs_in_the_home_s_workspace_without_the_interactive_tools(
+        self, tmp_path,
+    ):
+        home = _home_at(tmp_path)
+        argv = zcode_argv('do step-1', home, None)
         assert argv == [
-            'zcode', '--prompt=do step-1', '--cwd', str(tmp_path / 'workspace'), '--mode', 'yolo',
+            'zcode', '--prompt=do step-1', '--cwd', str(home.workspace), '--mode', 'yolo',
             '--output-format', 'json', '--no-color', '--disallowed-tools', ALWAYS_DISALLOWED,
         ]
 
     @pytest.mark.parametrize('prompt', ['- do step-1', '---\ntitle: x\n---\n', '--cwd=/', ''])
     def test_a_prompt_that_looks_like_an_option_stays_inline_in_one_token(self, tmp_path, prompt):
-        argv = zcode_argv(prompt, _home_at(tmp_path), None)
-        assert argv[1] == f'--prompt={prompt}'
-        assert argv[2:4] == ['--cwd', str(tmp_path / 'workspace')]
-
-    def test_zcode_runs_in_the_home_s_workspace(self, tmp_path):
         home = _home_at(tmp_path)
-        argv = zcode_argv('p', home, None)
-        assert argv[argv.index('--cwd') + 1] == str(home.workspace)
+        argv = zcode_argv(prompt, home, None)
+        assert argv[1] == f'--prompt={prompt}'
+        assert argv[2:4] == ['--cwd', str(home.workspace)]
 
     def test_plain_tool_names_are_appended_once(self, tmp_path):
         argv = zcode_argv('p', _home_at(tmp_path), [
