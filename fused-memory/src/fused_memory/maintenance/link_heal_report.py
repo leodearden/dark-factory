@@ -82,7 +82,12 @@ class CalibrationStatus:
 @dataclass(frozen=True)
 class SweepRunView:
     """Everything one sweep run's report says: its plan run and records, its apply
-    run or why it made none, its window and calibration, and the ledger."""
+    run or why it made none, its window and calibration, and the ledger.
+
+    *carried* are the records of the heals the apply run executed that an earlier
+    plan run staged, so the counts cover every heal the run wrote, not only those
+    of the links its own window examined.
+    """
 
     plan: LedgerRun
     apply: LedgerRun | None
@@ -91,9 +96,11 @@ class SweepRunView:
     calibration: CalibrationStatus
     withheld: WritesWithheld | None
     ledger_path: Path
+    carried: tuple[CandidateRecord, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'records', tuple(self.records))
+        object.__setattr__(self, 'carried', tuple(self.carried))
         if (self.apply is None) == (self.withheld is None):
             raise ValueError('a sweep run has an apply run exactly when no write was withheld')
 
@@ -157,7 +164,7 @@ def _document(view: SweepRunView) -> dict[str, Any]:
             'plan': view.plan.as_json(),
             'apply': None if view.apply is None else view.apply.as_json(),
         },
-        'counts': _counts(view.records),
+        'counts': _counts(view.records, view.carried),
         'escapes': {
             'filed': [
                 {'run_id': run.run_id, **entry} for run in view.runs for entry in run.counts.escaped
@@ -168,7 +175,11 @@ def _document(view: SweepRunView) -> dict[str, Any]:
                 for anchor in run.counts.would_escape
             ],
         },
-        'records_ref': {'ledger': str(view.ledger_path), 'plan_run_id': view.plan.run_id},
+        'records_ref': {
+            'ledger': str(view.ledger_path),
+            'plan_run_id': view.plan.run_id,
+            'apply_run_id': None if view.apply is None else view.apply.run_id,
+        },
     }
 
 
@@ -178,13 +189,17 @@ def _writes_mode(view: SweepRunView) -> str:
     return 'dry_run' if view.withheld.is_dry_run else 'withheld'
 
 
-def _counts(records: Sequence[CandidateRecord]) -> dict[str, Any]:
-    cells = Counter(_cells(record) for record in records)
+def _counts(
+    records: Sequence[CandidateRecord], carried: Sequence[CandidateRecord],
+) -> dict[str, Any]:
+    cells = Counter(_cells(record) for record in (*records, *carried))
     by_project: dict[str, Counter[str]] = {}
     for (project, decision, _verdict, _action, _state), count in cells.items():
         by_project.setdefault(project, Counter())[decision] += count
     return {
-        'records': len(records),
+        'records': len(records) + len(carried),
+        'examined': len(records),
+        'carried_from_earlier_plans': len(carried),
         'by_project': {project: dict(tally) for project, tally in by_project.items()},
         'by_verdict': dict(_tally(cells, 2)),
         'by_action': dict(_tally(cells, 3)),
@@ -218,7 +233,12 @@ def _markdown(view: SweepRunView, document: Mapping[str, Any]) -> str:
         *([] if view.undo_run_id is None else [
             f'- Undo: `{undo_command(view.undo_run_id)}`',
         ]),
-        f'- records: ledger `{view.ledger_path}`, plan run `{view.plan.run_id}`',
+        f'- records: ledger `{view.ledger_path}`, plan run `{view.plan.run_id}`'
+        + ('' if view.apply is None else f', apply run `{view.apply.run_id}`'),
+        *([] if not view.carried else [
+            f'- carried: {len(view.carried)} heal(s) this run executed were staged by '
+            'earlier plan runs; the tables count them too',
+        ]),
         '',
         '## Escapes',
         '',

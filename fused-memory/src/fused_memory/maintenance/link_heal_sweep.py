@@ -34,6 +34,7 @@ from fused_memory.maintenance.link_heal_executor import (
 )
 from fused_memory.maintenance.link_heal_ledger import (
     AdjudicatorCalibration,
+    CandidateRecord,
     LinkHealLedger,
     RunSource,
     plan_document_path,
@@ -217,14 +218,16 @@ async def run_sweep(
     applied = None if withheld is not None else await run_apply(
         store=store, ledger=ledger, limits=limits, filer=filer, source=RunSource.SWEEP,
     )
+    records = tuple(ledger.run_records(plan.run_id))
     view = SweepRunView(
         plan=_ledger_run(plan),
         apply=None if applied is None else _ledger_run(applied),
-        records=tuple(ledger.run_records(plan.run_id)),
+        records=records,
         window=window,
         calibration=_calibration_status(adjudicate, calibration),
         withheld=withheld,
         ledger_path=ledger.db_path,
+        carried=() if applied is None else _carried(ledger, applied.run_id, records),
     )
     json_path, report_path = report_paths(reports_dir, now, plan.run_id)
     json_text, markdown = render_run_report(view)
@@ -235,6 +238,17 @@ async def run_sweep(
     )
     return SweepReport(
         view=view, json_path=json_path, report_path=report_path, escalation_id=escalation_id,
+    )
+
+
+def _carried(
+    ledger: LinkHealLedger, apply_run_id: str, records: Sequence[CandidateRecord],
+) -> tuple[CandidateRecord, ...]:
+    """The heals apply run *apply_run_id* executed that none of *records* stands for."""
+    examined = {record.action_id for record in records if record.action_id is not None}
+    return tuple(
+        record for record in ledger.executed_records(apply_run_id)
+        if record.action_id not in examined
     )
 
 

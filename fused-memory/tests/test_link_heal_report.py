@@ -255,9 +255,9 @@ class TestIdentity:
         dry = _view(apply=None, withheld=WritesWithheld.DRY_RUN)
         assert _document(dry)['writes'] == {'mode': 'dry_run', 'withheld': 'dry_run'}
 
-    def test_the_records_ref_names_the_ledger_and_the_plan_run(self):
+    def test_the_records_ref_names_the_ledger_and_the_plan_and_apply_runs(self):
         assert _document(_view())['records_ref'] == {
-            'ledger': str(LEDGER), 'plan_run_id': PLAN_RUN,
+            'ledger': str(LEDGER), 'plan_run_id': PLAN_RUN, 'apply_run_id': APPLY_RUN,
         }
 
 

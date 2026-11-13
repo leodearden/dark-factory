@@ -656,17 +656,19 @@ class LinkHealLedger:
     def run_records(self, run_id: str) -> list[CandidateRecord]:
         """Every link plan run *run_id* examined, in the order it examined them."""
         rows = self._conn.execute(
-            'SELECT examinations.*, actions.action AS action_value, actions.state AS action_state, '
-            'actions.after_child_snapshot_id AS after_child_snapshot_id, '
-            'actions.undone_run_id AS action_undone_run_id, '
-            'adjudications.id AS adjudication_id, adjudications.verdict AS adjudicated_verdict, '
-            'adjudications.reason AS adjudicated_reason, adjudications.model AS adjudicated_model, '
-            'adjudications.prompt_sha256 AS adjudicated_prompt_sha256 FROM examinations '
-            'LEFT JOIN actions ON actions.id = examinations.action_id '
-            'LEFT JOIN adjudications ON examinations.basis_source = ? '
-            'AND adjudications.id = CAST(examinations.basis_key AS INTEGER) '
-            'WHERE examinations.run_id = ? ORDER BY examinations.id',
+            f'{_RECORD_SELECT} WHERE examinations.run_id = ? ORDER BY examinations.id',
             (BasisSource.ADJUDICATOR.value, run_id),
+        ).fetchall()
+        return [self._candidate_record(row) for row in rows]
+
+    def executed_records(self, executed_run_id: str) -> list[CandidateRecord]:
+        """Every heal run *executed_run_id* executed, each as the record of the
+        examination that first staged it, in the order the heals were staged."""
+        rows = self._conn.execute(
+            f'{_RECORD_SELECT} WHERE actions.executed_run_id = ? AND examinations.id = '
+            '(SELECT MIN(staging.id) FROM examinations AS staging '
+            'WHERE staging.action_id = actions.id) ORDER BY actions.id',
+            (BasisSource.ADJUDICATOR.value, executed_run_id),
         ).fetchall()
         return [self._candidate_record(row) for row in rows]
 
@@ -1029,16 +1031,21 @@ class LinkHealLedger:
             )
 
     def sweep_watermark(self, project_id: str) -> datetime | None:
-        """The end of the unbroken run of complete sweep windows from *project_id*'s
-        first sweep: where its next sweep starts."""
+        """Where *project_id*'s next sweep starts: the end of the unbroken run of
+        complete sweep windows from its first sweep, or that first window's start
+        when it was incomplete; ``None`` before any sweep."""
         rows = self._conn.execute(
-            'SELECT since, until FROM sweep_windows WHERE project_id = ? AND complete = 1 '
-            'ORDER BY id',
+            'SELECT since, until, complete FROM sweep_windows WHERE project_id = ? ORDER BY id',
             (project_id,),
         )
         return _contiguous_end(
-            CreatedWindow(since=datetime.fromisoformat(since), until=datetime.fromisoformat(until))
-            for since, until in rows
+            (
+                CreatedWindow(
+                    since=datetime.fromisoformat(since), until=datetime.fromisoformat(until),
+                ),
+                bool(complete),
+            )
+            for since, until, complete in rows
         )
 
     def snapshot(self, project_id: str, record: LiveRecord) -> int:
@@ -1079,15 +1086,31 @@ class LinkHealLedger:
         return [_action_row(row) for row in self._conn.execute(sql, params)]
 
 
-def _contiguous_end(windows: Iterable[CreatedWindow]) -> datetime | None:
-    """The end of the unbroken run of *windows*, taken in order from the first. A later
-    window extends it only when it starts at or before the end so far; one starting
-    after it leaves a gap, so it does not move it."""
+#: A :class:`CandidateRecord` row: an examination with its heal and its adjudication;
+#: binds the adjudicator basis source, then the caller's own parameters.
+_RECORD_SELECT = (
+    'SELECT examinations.*, actions.action AS action_value, actions.state AS action_state, '
+    'actions.after_child_snapshot_id AS after_child_snapshot_id, '
+    'actions.undone_run_id AS action_undone_run_id, '
+    'adjudications.id AS adjudication_id, adjudications.verdict AS adjudicated_verdict, '
+    'adjudications.reason AS adjudicated_reason, adjudications.model AS adjudicated_model, '
+    'adjudications.prompt_sha256 AS adjudicated_prompt_sha256 FROM examinations '
+    'LEFT JOIN actions ON actions.id = examinations.action_id '
+    'LEFT JOIN adjudications ON examinations.basis_source = ? '
+    'AND adjudications.id = CAST(examinations.basis_key AS INTEGER)'
+)
+
+def _contiguous_end(windows: Iterable[tuple[CreatedWindow, bool]]) -> datetime | None:
+    """The end of the unbroken run of complete *windows*, each paired with whether it
+    was complete, taken in order from the first. The first window starts the run at its
+    end when complete, else at its start, so the span it left undecided stays ahead. A
+    later window extends the run only when it is complete and starts at or before the
+    end so far; one starting after it leaves a gap, so it does not move it."""
     end: datetime | None = None
-    for window in windows:
+    for window, complete in windows:
         if end is None:
-            end = window.until
-        elif window.since <= end:
+            end = window.until if complete else window.since
+        elif complete and window.since <= end:
             end = max(end, window.until)
     return end
 

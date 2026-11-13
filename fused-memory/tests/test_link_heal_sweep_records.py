@@ -587,6 +587,31 @@ STAGED_HEALS = {
 }
 
 
+class TestAWritingSweepAfterDryRunNights:
+    @pytest.mark.asyncio
+    async def test_its_report_counts_the_heals_earlier_plans_staged(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        _calibrate(ledger, passed=True)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+            now=NOW + DAY,
+        )
+
+        assert ledger.run_records(report.plan_run_id) == []
+        counts = _report_json(report)['counts']
+        assert counts['examined'] == 0
+        assert counts['carried_from_earlier_plans'] == 3
+        assert counts['by_action'] == {'detach': 2, 'relabel': 1}
+        assert counts['by_verdict'] == {'RELATED': 2, 'EXTENDS': 1}
+        assert counts['by_project'] == {DF: {'detach': 2, 'relabel': 1}}
+        assert _report_json(report)['records_ref']['apply_run_id'] == report.apply_run_id
+        assert 'No links were examined.' not in report.report_path.read_text()
+
+
 class TestAWriteThatLandedButFailedVerification:
     @pytest.mark.asyncio
     async def test_its_record_shows_the_verification_read_and_the_failed_state(
@@ -877,6 +902,27 @@ class TestTheWindow:
         )
 
         assert _window(report) == (NOW, third)
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_first_sweep_leaves_its_whole_window_for_the_next(
+        self, harness, ledger, tmp_path,
+    ):
+        child = _seed_one(harness, 1, 'an unjudgeable sighting', INSIDE)
+        failing = FakeAdjudicator(lambda _text: AdjudicationFailure.CLI_FAILED)
+        first = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            adjudicate=failing,
+        )
+        assert not first.complete
+        second = NOW + DAY
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            adjudicate=FakeAdjudicator(lambda _text: Verdict.SAME), now=second,
+        )
+
+        assert _window(report) == (NOW - DAY, second)
+        assert child in {record.child_id for record in ledger.run_records(report.plan_run_id)}
 
     @pytest.mark.asyncio
     async def test_a_one_project_sweep_leaves_the_other_projects_window_open(

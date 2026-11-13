@@ -3287,7 +3287,9 @@ check.
   the end of its unbroken run of complete sweeps, or
   `link_heal.sweep_window_hours` back for a project no sweep has completed. A
   run with a read or adjudication failure does not move the window, so the
-  next run examines those links again. A run over fewer projects leaves the
+  next run examines those links again; when a project's first run was the
+  failed one, the next run starts from that run's start. A writing run's
+  report also counts the heals it wrote that earlier runs staged. A run over fewer projects leaves the
   other projects' windows for the next run. A run starting after a project's
   start (`--since`) leaves the gap before it, so the next run covers that gap.
   A parent missing from its child's project is looked for in every project of

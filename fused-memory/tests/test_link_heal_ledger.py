@@ -1064,10 +1064,18 @@ class TestPerProjectSweepWindows:
 
         assert ledger.sweep_watermark(PROJECT) == T2
 
-    def test_an_incomplete_window_never_moves_it(self, ledger):
+    def test_an_incomplete_first_window_holds_it_at_that_window_s_start(self, ledger):
         self._swept(ledger, T0, T1, complete=False)
-        assert ledger.sweep_watermark(PROJECT) is None
 
+        assert ledger.sweep_watermark(PROJECT) == T0
+
+    def test_a_complete_window_over_an_incomplete_first_one_moves_it(self, ledger):
+        self._swept(ledger, T0, T1, complete=False)
+        self._swept(ledger, T0, T2)
+
+        assert ledger.sweep_watermark(PROJECT) == T2
+
+    def test_an_incomplete_window_never_moves_it(self, ledger):
         self._swept(ledger, T0, T1)
         self._swept(ledger, T1, T2, complete=False)
 
