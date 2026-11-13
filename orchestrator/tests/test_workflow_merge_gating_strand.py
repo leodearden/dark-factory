@@ -30,7 +30,7 @@ Three boundaries, one per disposition:
   ``in-progress`` covers Path-A escalated-waiting).
 * **#2 — born-at-L2 / non-info level≥2 open.**  ``_wait_for_resolution``'s
   stop-the-line short-circuit (``workflow.py:12206-12217``) raises
-  ``_GatedByOpenL2`` (a ``_HumanHandoff``) BEFORE the wait loop, so a
+  ``_NoStewardApplicable`` (a ``_HumanHandoff``) BEFORE the wait loop, so a
   human-gated record is never waited on in-slot; the handler parks the row ``blocked`` via
   ``_mark_blocked(..., skip_escalation=True)`` and leaves the L2 untouched.
 * **#3 — the wait expires (silent producer).**  The existing give-up
@@ -975,7 +975,7 @@ class TestMergeGateL2ShortCircuits:
     entry parks the row ``blocked`` immediately — it is never waited on in-slot.
 
     ``_wait_for_resolution``'s stop-the-line check (``workflow.py:12206-12217``)
-    raises ``_GatedByOpenL2`` (a ``_HumanHandoff``) BEFORE the wait loop, so
+    raises ``_NoStewardApplicable`` (a ``_HumanHandoff``) BEFORE the wait loop, so
     the handler's ``except`` clause routes straight to ``_mark_blocked(...,
     skip_escalation=True)``.  Two properties matter equally: the row IS
     written (no strand, spec S1) and the human-facing L2 is NOT consumed
