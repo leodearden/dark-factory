@@ -170,9 +170,11 @@ ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
 })
 
 #: The write was stored as a new standalone memory. Also the fail-open
-#: outcome and the deliberate-stub outcome — from the caller's side those are
-#: indistinguishable from a genuine "nothing matched", which is the point.
-#: A fail-open ack also carries :data:`TRIAGE_FAIL_OPEN_KEY`.
+#: outcome and the deliberate-stub outcome: C1 keeps ``routed`` at ``stored``
+#: so the write stays unblocked. A fail-open is still told apart from a
+#: genuine "nothing matched": its decision names the stage in
+#: ``BandDecision.fail_open_stage`` and its ack carries
+#: :data:`TRIAGE_FAIL_OPEN_KEY`.
 OUTCOME_STORED = 'stored'
 
 #: The write restates an existing memory and was attached to it as a sighting.
@@ -964,9 +966,10 @@ async def triage_write(
     stage is wrapped after the force-store checks: any
     exception whatsoever yields :data:`OUTCOME_STORED` plus exactly one
     counted fail-open and a logged warning with ``exc_info``. Nothing escapes,
-    because C1 is absolute — from the caller's side a fail-open is
-    indistinguishable from "nothing matched", which is what keeps the write
-    unblocked.
+    because C1 is absolute: a fail-open keeps ``routed`` at ``stored`` and
+    the write unblocked. The decision still names where triage gave up, in
+    ``fail_open_stage``, which ``add_memory`` surfaces on the ack as
+    :data:`TRIAGE_FAIL_OPEN_KEY`.
 
     This is where the module deliberately DIVERGES from the retired guard's
     call site, which re-raises ``TypeError``/``AttributeError``/``NameError``
