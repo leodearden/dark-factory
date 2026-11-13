@@ -97,35 +97,31 @@ async def _context_complete_reviewer(b: BriefingAssembler, **kw) -> str:
 
 
 ACTION_SLOTTED = [
-    pytest.param(_architect, RulingAudience.PLAN, '# Action\n', id='architect'),
-    pytest.param(_completion, RulingAudience.PLAN, '## Action\n', id='completion'),
-    pytest.param(_revalidation, RulingAudience.PLAN, '## Action\n', id='revalidation'),
-    pytest.param(_replan, RulingAudience.PLAN, '## Action\n', id='replan'),
-    pytest.param(_simple, RulingAudience.PLAN, '# Action\n', id='simple_task'),
-    pytest.param(_implementer, RulingAudience.EXECUTE, '# Action\n', id='implementer'),
-    pytest.param(_debugger, RulingAudience.EXECUTE, '# Action\n', id='debugger'),
-    pytest.param(_amender, RulingAudience.EXECUTE, '# Action\n', id='amender'),
+    pytest.param(_architect, RulingAudience.PLAN, 1, id='architect'),
+    pytest.param(_completion, RulingAudience.PLAN, 2, id='completion'),
+    pytest.param(_revalidation, RulingAudience.PLAN, 2, id='revalidation'),
+    pytest.param(_replan, RulingAudience.PLAN, 2, id='replan'),
+    pytest.param(_simple, RulingAudience.PLAN_AND_EXECUTE, 1, id='simple_task'),
+    pytest.param(_implementer, RulingAudience.EXECUTE, 1, id='implementer'),
+    pytest.param(_debugger, RulingAudience.EXECUTE, 1, id='debugger'),
+    pytest.param(_amender, RulingAudience.EXECUTE, 1, id='amender'),
 ]
 REVIEWERS = [
     pytest.param(_diff_only_reviewer, id='diff_only_reviewer'),
     pytest.param(_context_complete_reviewer, id='context_complete_reviewer'),
 ]
-EVERY_BUILDER = [
-    *(pytest.param(p.values[0], id=p.id) for p in ACTION_SLOTTED),
-    *REVIEWERS,
-]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('build', 'audience', 'action_heading'), ACTION_SLOTTED)
-async def test_the_rulings_section_sits_directly_before_the_action_heading(
-    briefing, build: Build, audience: RulingAudience, action_heading: str,
+@pytest.mark.parametrize(('build', 'audience', 'heading_level'), ACTION_SLOTTED)
+async def test_the_rulings_section_sits_directly_before_the_action_heading_at_its_level(
+    briefing, build: Build, audience: RulingAudience, heading_level: int,
 ):
     prompt = await build(briefing, rulings=RULINGS)
 
-    section = render_rulings_section(RULINGS, audience)
+    section = render_rulings_section(RULINGS, audience, heading_level=heading_level)
     assert prompt.count(section) == 1
-    assert section + action_heading in prompt
+    assert section + '#' * heading_level + ' Action\n' in prompt
 
 
 @pytest.mark.asyncio
@@ -146,9 +142,23 @@ async def test_a_reviewer_s_open_info_notes_stay_after_the_rulings(briefing, bui
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('build', EVERY_BUILDER)
-async def test_no_rulings_leave_the_prompt_byte_identical(briefing, build: Build):
-    assert await build(briefing, rulings=()) == await build(briefing)
+@pytest.mark.parametrize(('build', 'audience', 'heading_level'), ACTION_SLOTTED)
+async def test_no_rulings_leave_nothing_in_the_action_slot(
+    briefing, build: Build, audience: RulingAudience, heading_level: int,
+):
+    with_rulings = await build(briefing, rulings=RULINGS)
+
+    section = render_rulings_section(RULINGS, audience, heading_level=heading_level)
+    assert with_rulings.replace(section, '') == await build(briefing, rulings=())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('build', REVIEWERS)
+async def test_no_rulings_append_nothing_to_a_reviewer_prompt(briefing, build: Build):
+    with_rulings = await build(briefing, rulings=RULINGS)
+
+    section = render_rulings_section(RULINGS, RulingAudience.REVIEW)
+    assert with_rulings == await build(briefing, rulings=()) + '\n' + section
 
 
 @pytest.mark.asyncio

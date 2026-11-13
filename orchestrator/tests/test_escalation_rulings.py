@@ -9,13 +9,13 @@ from escalation.models import Escalation, cascade_resolved_by
 
 from orchestrator.escalation_rulings import (
     RULING_INSTRUCTIONS,
-    RULINGS_HEADING,
     RULINGS_LIMIT,
+    RULINGS_TITLE,
     Ruling,
     RulingAudience,
-    is_ruling,
     plan_confirmed_at,
     render_rulings_section,
+    ruling_resolution,
     select_rulings,
 )
 from orchestrator.resume_resolution import select_carried_resolutions
@@ -60,15 +60,19 @@ def _ids(rulings: tuple[Ruling, ...]) -> list[str]:
     return [r.escalation_id for r in rulings]
 
 
-class TestIsRuling:
+def _is_ruling(record: Escalation) -> bool:
+    return ruling_resolution(record) is not None
+
+
+class TestRulingResolution:
     @pytest.mark.parametrize(('record', 'expected'), list(_RECORD_SHAPES.values()), ids=list(_RECORD_SHAPES))
     def test_only_a_resolved_record_with_resolution_text_is_a_ruling(self, record, expected):
-        assert is_ruling(record) is expected
+        assert _is_ruling(record) is expected
 
     @pytest.mark.parametrize(('record', 'expected'), list(_RECORD_SHAPES.values()), ids=list(_RECORD_SHAPES))
     def test_resume_carries_a_record_iff_it_is_a_ruling(self, record, expected):
         carried = select_carried_resolutions([record], resolved_before_round=frozenset())
-        assert bool(carried) is is_ruling(record) is expected
+        assert bool(carried) is _is_ruling(record) is expected
 
 
 class TestSelectRulings:
@@ -199,7 +203,7 @@ class TestRenderRulingsSection:
 
         section = render_rulings_section(rulings, RulingAudience.EXECUTE)
 
-        assert section.startswith(RULINGS_HEADING + '\n')
+        assert section.startswith(f'# {RULINGS_TITLE}\n')
         assert _entry_headings(section) == [
             '## `esc-4764-1` (level 1): first',
             '## `esc-4764-2` (level 2): second',
@@ -232,7 +236,23 @@ class TestRenderRulingsSection:
 
         assert '> KEEP the solver wrap.\n> # Not a heading\n> Widen scope if needed.\n' in section
         headings = [line for line in section.splitlines() if line.startswith('#')]
-        assert headings == [RULINGS_HEADING, '## `esc-4764-1` (level 2): keep or drop the solver wrap?']
+        assert headings == [f'# {RULINGS_TITLE}', '## `esc-4764-1` (level 2): keep or drop the solver wrap?']
+
+    def test_an_empty_resolution_is_quoted_as_none(self):
+        section = render_rulings_section((_ruling(resolution=''),), RulingAudience.EXECUTE)
+
+        assert '\n> (none)\n' in section
+
+    def test_a_deeper_heading_level_nests_the_section_and_its_entries(self):
+        section = render_rulings_section((_ruling(),), RulingAudience.PLAN, heading_level=2)
+
+        headings = [line for line in section.splitlines() if line.startswith('#')]
+        assert headings == [f'## {RULINGS_TITLE}', '### `esc-4764-1` (level 2): keep or drop the solver wrap?']
+
+    @pytest.mark.parametrize('heading_level', [0, 6])
+    def test_a_heading_level_its_entries_cannot_nest_under_is_refused(self, heading_level):
+        with pytest.raises(ValueError, match='heading_level'):
+            render_rulings_section((_ruling(),), RulingAudience.PLAN, heading_level=heading_level)
 
     def test_a_multi_line_summary_is_collapsed_into_its_heading(self):
         section = render_rulings_section(
@@ -245,6 +265,7 @@ class TestRenderRulingsSection:
         assert set(RULING_INSTRUCTIONS) == set(RulingAudience)
         assert len(set(RULING_INSTRUCTIONS.values())) == len(RulingAudience)
         assert '`escalate_blocker`' in RULING_INSTRUCTIONS[RulingAudience.EXECUTE]
+        assert '`escalate_blocker`' in RULING_INSTRUCTIONS[RulingAudience.PLAN_AND_EXECUTE]
 
     @pytest.mark.parametrize('audience', list(RulingAudience))
     def test_the_section_carries_its_audience_instruction(self, audience):

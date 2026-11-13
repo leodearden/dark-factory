@@ -24,7 +24,10 @@ if TYPE_CHECKING:
 
 _UNKNOWN_TIME = datetime.min.replace(tzinfo=UTC)
 
-RULINGS_HEADING = '# Escalation Rulings'
+RULINGS_TITLE = 'Escalation Rulings'
+
+_DEEPEST_SECTION_LEVEL = 5
+"""A section's entries sit one level below it, and markdown stops at six."""
 
 RULINGS_LIMIT = 10
 """Max rulings one briefing lists, the most recent kept; older ones are named by id."""
@@ -35,6 +38,7 @@ _RULINGS_INTRO = 'Each ruling below resolved an escalation filed on this task, a
 class RulingAudience(StrEnum):
     PLAN = 'plan'
     EXECUTE = 'execute'
+    PLAN_AND_EXECUTE = 'plan_and_execute'
     REVIEW = 'review'
 
 
@@ -48,6 +52,12 @@ RULING_INSTRUCTIONS: Mapping[RulingAudience, str] = MappingProxyType({
         'ruling, or describe its opposite as intentional. If honouring a ruling needs work '
         "outside the plan's files or steps, do not work around it: stop and call "
         "`escalate_blocker` naming the ruling's escalation id."
+    ),
+    RulingAudience.PLAN_AND_EXECUTE: (
+        'Plan and work consistently with every ruling above: add the files or steps a '
+        'ruling requires, never plan or implement its opposite, and never describe its '
+        "opposite as intentional. If honouring a ruling needs work outside this task's "
+        "files, stop and call `escalate_blocker` naming the ruling's escalation id."
     ),
     RulingAudience.REVIEW: (
         'Check the diff against every ruling above. A change that does the opposite of a '
@@ -72,10 +82,6 @@ class Ruling:
 def ruling_resolution(record: Escalation) -> str | None:
     """The resolution text that makes *record* a ruling, else None."""
     return record.resolution if record.status == 'resolved' else None
-
-
-def is_ruling(record: Escalation) -> bool:
-    return ruling_resolution(record) is not None
 
 
 def select_rulings(
@@ -105,13 +111,24 @@ def select_rulings(
     return tuple(sorted(kept, key=_chronological))
 
 
-def render_rulings_section(rulings: Sequence[Ruling], audience: RulingAudience) -> str:
-    """The briefing block for *rulings*, oldest first; empty for none, else ending in a blank line."""
+def render_rulings_section(
+    rulings: Sequence[Ruling], audience: RulingAudience, *, heading_level: int = 1,
+) -> str:
+    """The briefing block for *rulings*, oldest first; empty for none, else ending in a blank line.
+
+    The block is headed at *heading_level* and each ruling one level below it,
+    so it nests under the prompt section it sits in.
+    """
+    if not 1 <= heading_level <= _DEEPEST_SECTION_LEVEL:
+        raise ValueError(
+            f'heading_level must be 1..{_DEEPEST_SECTION_LEVEL}, got {heading_level}',
+        )
     if not rulings:
         return ''
+    marker = '#' * heading_level
     listed = rulings[-RULINGS_LIMIT:]
     omitted = rulings[:-RULINGS_LIMIT]
-    entries = '\n\n'.join(_ruling_entry(ruling) for ruling in listed)
+    entries = '\n\n'.join(_ruling_entry(ruling, marker + '#') for ruling in listed)
     overflow = (
         f'{len(omitted)} older ruling(s) are not listed: '
         + ', '.join(f'`{ruling.escalation_id}`' for ruling in omitted)
@@ -119,23 +136,24 @@ def render_rulings_section(rulings: Sequence[Ruling], audience: RulingAudience) 
         if omitted else ''
     )
     return (
-        f'{RULINGS_HEADING}\n\n{_RULINGS_INTRO}\n\n{entries}\n\n'
+        f'{marker} {RULINGS_TITLE}\n\n{_RULINGS_INTRO}\n\n{entries}\n\n'
         f'{overflow}{RULING_INSTRUCTIONS[audience]}\n\n'
     )
 
 
-def _ruling_entry(ruling: Ruling) -> str:
+def _ruling_entry(ruling: Ruling, marker: str) -> str:
     quoted = '\n'.join(f'> {line}' for line in ruling.resolution.splitlines()) or '> (none)'
     return (
-        f'## `{ruling.escalation_id}` (level {ruling.level}): {_one_line(ruling.summary)}\n'
-        f'- resolved by: {_one_line(ruling.resolved_by) or "unknown"}\n'
-        f'- resolved at: {_one_line(ruling.resolved_at) or "unknown"}\n'
-        f'- action: {_one_line(ruling.resolution_action) or "unknown"}\n'
+        f'{marker} `{ruling.escalation_id}` (level {ruling.level}): {one_line(ruling.summary)}\n'
+        f'- resolved by: {one_line(ruling.resolved_by) or "unknown"}\n'
+        f'- resolved at: {one_line(ruling.resolved_at) or "unknown"}\n'
+        f'- action: {one_line(ruling.resolution_action) or "unknown"}\n'
         f'\n{quoted}'
     )
 
 
-def _one_line(text: str | None) -> str:
+def one_line(text: str | None) -> str:
+    """*text* with its line breaks collapsed, so a field cannot start a heading of its own; null reads as empty."""
     return ' '.join((text or '').split())
 
 

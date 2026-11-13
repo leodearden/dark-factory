@@ -26,7 +26,12 @@ from orchestrator.agents.review_briefing import (
     review_action_section,
 )
 from orchestrator.config import OrchestratorConfig
-from orchestrator.escalation_rulings import Ruling, RulingAudience, render_rulings_section
+from orchestrator.escalation_rulings import (
+    Ruling,
+    RulingAudience,
+    one_line,
+    render_rulings_section,
+)
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
 
@@ -104,10 +109,10 @@ def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
     return f"""\
 ## {note.id}
 
-- filed by: {_one_line(note.agent_role)}
+- filed by: {one_line(note.agent_role)}
 - filed at: {note.timestamp}
-- summary: {_one_line(note.summary)}
-- suggested action: {_one_line(note.suggested_action) or '(none)'}
+- summary: {one_line(note.summary)}
+- suggested action: {one_line(note.suggested_action) or '(none)'}
 - detail:
 
 {quoted}
@@ -119,10 +124,6 @@ def _with_review_rulings(prompt: str, rulings: Sequence[Ruling]) -> str:
     section = render_rulings_section(rulings, RulingAudience.REVIEW)
     return prompt + '\n' + section if section else prompt
 
-
-def _one_line(text: str | None) -> str:
-    """*text* with its line breaks collapsed, so a field cannot start a heading of its own; null reads as empty."""
-    return ' '.join((text or '').split())
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -698,7 +699,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         notice = _TEXT_DRIFT_NOTICES[text_drift] if text_drift is not None else ''
         text_drift_section = f'{notice}\n\n' if notice else ''
         refusal_section = _integrity_refusal_section(integrity_refusal)
-        rulings_section = render_rulings_section(rulings, RulingAudience.PLAN)
+        rulings_section = render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)
         dispositions = ', '.join(f'`{d}`' for d in sorted(DESCOPE_DISPOSITIONS))
 
         return f"""\
@@ -788,7 +789,7 @@ to start over from nothing.
 {plan_json}
 ```
 
-{render_rulings_section(rulings, RulingAudience.PLAN)}## Action
+{render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)}## Action
 
 1. Read the relevant files to re-ground yourself in the task and verify the
    existing steps are still correct against the CURRENT state of the codebase
@@ -1001,7 +1002,7 @@ The implementation was reviewed and blocking issues were found.
 
 {review_feedback}
 
-{render_rulings_section(rulings, RulingAudience.PLAN)}## Action
+{render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)}## Action
 
 1. Read `.task/plan.json` for the current plan and each step's status — it
    is not reproduced here.
@@ -1030,7 +1031,8 @@ The implementation was reviewed and blocking issues were found.
         ``mark_step_done`` and stop. The orchestrator then advances to VERIFY
         without invoking the implementer.
 
-        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the
+        PLAN_AND_EXECUTE audience, since this one agent both plans and implements.
         """
         preamble = await self._task_preamble(task, 'simple_task', context)
 
@@ -1047,7 +1049,7 @@ The implementation was reviewed and blocking issues were found.
         return f"""\
 {preamble}
 
-{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
+{render_rulings_section(rulings, RulingAudience.PLAN_AND_EXECUTE)}# Action
 
 This task was routed to the SIMPLE_TASK path because its author declared
 complexity:simple. A simple task may be high-priority and may span several
