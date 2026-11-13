@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.models.scope import ProjectRoot
@@ -18,9 +19,6 @@ from fused_memory.reconciliation.reconciler_escalation import (
     file_reconciler_l1,
     pending_escalations,
 )
-
-pytest.importorskip('escalation.queue')
-from escalation.queue import EscalationQueue  # noqa: E402
 
 
 def _root(tmp_path: Path) -> ProjectRoot:
