@@ -48,11 +48,16 @@ STAMP_FIELDS: Mapping[str, tuple[type, ...]] = MappingProxyType({
 
 @dataclass(frozen=True)
 class QuarantineOutcome:
-    """Where a quarantine parked a lane, and the branch it parked with it.
+    """Where a quarantine parked a lane, and the task branch it renamed aside.
 
-    ``dest`` is None when nothing moved. ``branch`` is the parked full ref,
-    None when the lane did not hold its task's branch; ``unique_commit_count``
-    counts its commits not on main.
+    ``dest`` is None when nothing moved. ``branch`` is the task's branch
+    ``<prefix><bare>`` as renamed aside (full ref); None when no branch was
+    renamed, because it did not exist or another registered worktree held
+    it. It need not be the parking's checkout: a detached or foreign-branch
+    lane moves with its own HEAD. The rule's one home is
+    ``orchestrator/src/orchestrator/git_ops.py::GitOps.quarantine_worktree``.
+    ``tip_sha`` and ``unique_commit_count`` describe ``branch``; the count is
+    its commits not on main.
     """
 
     dest: Path | None
