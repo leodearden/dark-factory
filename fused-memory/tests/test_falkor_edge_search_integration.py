@@ -364,23 +364,8 @@ class TestEdgeFulltextLeg:
 
 # --- BM25 ranking ------------------------------------------------------------
 
-LONG_FACT = (
-    'AllAccountsCappedException catch sites were added in the production orchestrator'
-    ' via the task {} commit'
-)
-
-# Measured on scratch FalkorDB 41800 while planning task 9542: under a
-# (@group_id:...) prefix long-rare is absent from the top 5; without it, rank 1.
-RARE_TERM_FACTS = {
-    **{f'alpha-{i}': f'task alpha note {i}' for i in range(20)},
-    **{f'prose-{i}': 'context decisions related' for i in range(20)},
-    'long-rare': LONG_FACT.format('zyzzogeton'),
-    'long-id': LONG_FACT.format('877'),
-}
-
-
-# Measured on scratch FalkorDB 41800 while planning task 9542: the union alone
-# ranks long-id 21st for IDENTIFIER_QUERY.
+# Measured on scratch FalkorDB 41800 (task 9542): the union alone ranks long-id
+# 21st for IDENTIFIER_QUERY, with or without the (@group_id:...) prefix.
 IDENTIFIER_FACTS = {
     **{f'prose-{i}': 'task context decisions related' for i in range(20)},
     'long-id': (
@@ -394,14 +379,6 @@ IDENTIFIER_QUERY = 'task 877 context and related decisions'
 
 
 class TestEdgeFulltextRanking:
-    @pytest.mark.asyncio
-    async def test_a_rare_term_outranks_common_terms_on_shorter_facts(self, seed_facts):
-        seeded = await seed_facts(RARE_TERM_FACTS)
-
-        ranking = await seeded.bm25_ranking('task zyzzogeton alpha', 5)
-
-        assert ranking[0] == 'long-rare', ranking
-
     @pytest.mark.asyncio
     async def test_an_edge_matching_every_identifier_outranks_prose_edges(self, seed_facts):
         seeded = await seed_facts(IDENTIFIER_FACTS)

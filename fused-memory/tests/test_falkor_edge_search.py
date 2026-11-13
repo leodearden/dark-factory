@@ -189,14 +189,14 @@ class TestEdgeFulltextSearch:
         _, issued = await self._search()
 
         (query,) = issued
-        assert query.params['query'] == ' (alpha | beta)'
+        assert query.params['query'] == '(@group_id:"g") (alpha | beta)'
         assert query.params['group_ids'] == ['g']
         assert query.params['limit'] == 20
         assert 'e.group_id IN $group_ids' in query.cypher
 
     @pytest.mark.asyncio
     async def test_an_invalid_group_id_is_refused_before_any_query(self) -> None:
-        """The fulltext query carries no group filter, so the leg validates group ids itself."""
+        """As graphiti's own fulltext_query does; build_edge_queries escapes group ids, it does not validate them."""
         driver, issued = hardened_driver([CANNED_EDGE_RECORD])
 
         with pytest.raises(GroupIdValidationError):
@@ -261,7 +261,7 @@ class TestEdgeFulltextIdentifierTier:
     async def test_the_union_ranks_the_tier_first_then_by_score(self) -> None:
         _, union = await self._issued('alpha 877')
 
-        assert union.params['query'] == ' (alpha | 877)'
+        assert union.params['query'] == '(@group_id:"g") (alpha | 877)'
         assert union.params['promoted_uuids'] == ['edge-uuid']
         assert 'ORDER BY e.uuid IN $promoted_uuids DESC, score DESC' in union.cypher
 

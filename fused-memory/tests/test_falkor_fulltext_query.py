@@ -659,8 +659,8 @@ class TestIsIdentifierTerm:
 class TestBuildEdgeQueries:
     """The edge BM25 leg's two RediSearch queries, from ALREADY-sanitized text."""
 
-    def test_union_carries_no_group_filter(self) -> None:
-        assert build_edge_queries('alpha beta', 128).union == ' (alpha | beta)'
+    def test_union_carries_the_group_filter(self) -> None:
+        assert build_edge_queries('alpha beta', ['g'], 128).union == '(@group_id:"g") (alpha | beta)'
 
     @pytest.mark.parametrize(
         'text',
@@ -671,11 +671,12 @@ class TestBuildEdgeQueries:
             'café naïve 日本語 note',
         ],
     )
-    def test_union_is_the_ungrouped_build_query(self, text: str) -> None:
-        assert build_edge_queries(text, 128).union == build_query(text, None, 128)
+    @pytest.mark.parametrize('group_ids', [['dark_factory'], None])
+    def test_union_is_build_query(self, text: str, group_ids: list[str] | None) -> None:
+        assert build_edge_queries(text, group_ids, 128).union == build_query(text, group_ids, 128)
 
     def test_union_keeps_the_unsearchable_term_hardening(self) -> None:
-        assert build_edge_queries('note _ alpha', 128).union == ' (note | alpha)'
+        assert build_edge_queries('note _ alpha', None, 128).union == ' (note | alpha)'
 
     @pytest.mark.parametrize(
         ('text', 'identifiers'),
@@ -689,16 +690,18 @@ class TestBuildEdgeQueries:
     def test_identifiers_intersect_the_digit_bearing_terms_in_query_order(
         self, text: str, identifiers: str
     ) -> None:
-        assert build_edge_queries(text, 128).identifiers == identifiers
+        assert build_edge_queries(text, ['g'], 128).identifiers == identifiers
 
     def test_no_searchable_term_gives_no_queries(self) -> None:
-        assert build_edge_queries('the and of', 128) == EdgeFulltextQueries(union='', identifiers='')
+        assert build_edge_queries('the and of', ['g'], 128) == EdgeFulltextQueries(
+            union='', identifiers=''
+        )
 
-    def test_64_terms_survive_the_length_guard_without_a_group_filter(self) -> None:
-        queries = build_edge_queries(' '.join(f'w{i}' for i in range(64)), 128)
+    def test_63_terms_survive_the_length_guard_with_one_group(self) -> None:
+        queries = build_edge_queries(' '.join(f'w{i}' for i in range(63)), ['g'], 128)
         assert queries.union != ''
         assert queries.identifiers != ''
 
     def test_the_identifier_tier_dies_with_an_over_length_union(self) -> None:
-        queries = build_edge_queries(' '.join(f'w{i}' for i in range(65)), 128)
+        queries = build_edge_queries(' '.join(f'w{i}' for i in range(64)), ['g'], 128)
         assert queries == EdgeFulltextQueries(union='', identifiers='')

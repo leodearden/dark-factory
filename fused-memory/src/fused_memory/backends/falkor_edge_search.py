@@ -9,10 +9,10 @@ query TIMEOUT on production graphs.  Every edge leg here instead reads its edges
 through :func:`fused_memory.backends.falkor_entity_edges.read_entity_edges`,
 which FalkorDB plans with no per-row scan.
 
-The edge BM25 leg's fulltext query carries no group filter; its Cypher scopes
-by group instead (:func:`fused_memory.backends.falkor_fulltext.build_edge_queries`).
-It ranks first the edges matching every identifier term of the query, when they
-all fit in the leg (``plans/edge-bm25-leg-ranking-9542/README.md``).
+The edge BM25 leg ranks first the edges matching every identifier term of the
+query, when they all fit in the leg
+(:func:`fused_memory.backends.falkor_fulltext.build_edge_queries`,
+``plans/edge-bm25-leg-ranking-9542/README.md``).
 
 Dispatch contract: ``graphiti_core.search.search_utils`` hands five legs to
 ``driver.search_interface`` UNCONDITIONALLY, with no NotImplementedError
@@ -150,7 +150,9 @@ class FalkorEdgeSearch(SearchInterface):
         limit: int = 100,
     ) -> list[Any]:
         validate_group_ids(group_ids)
-        queries = build_edge_queries(driver.sanitize(query), search_utils.MAX_QUERY_LENGTH)
+        queries = build_edge_queries(
+            driver.sanitize(query), group_ids, search_utils.MAX_QUERY_LENGTH
+        )
         if queries.union == '':
             return []
 

@@ -226,18 +226,19 @@ class EdgeFulltextQueries:
             )
 
 
-def build_edge_queries(sanitized_text: str, max_query_length: int) -> EdgeFulltextQueries:
+def build_edge_queries(
+    sanitized_text: str,
+    group_ids: list[str] | None,
+    max_query_length: int,
+) -> EdgeFulltextQueries:
     """Assemble the edge BM25 leg's queries from ALREADY-sanitized text.
 
-    Two policies, measured in ``plans/edge-bm25-leg-ranking-9542/README.md``:
-
-    * the union carries no ``(@group_id:...)`` filter.  The leg's Cypher scopes
-      edges by group, and under that prefix FalkorDB scores the OR union
-      non-additively;
-    * the identifier tier, every searchable term carrying a digit, is a
-      precision signal: an edge holding all of them is what the query names.
+    The union is :func:`build_query`'s, group filter included.  The identifier
+    tier, every searchable term carrying a digit, is a precision signal: an edge
+    holding all of them is what the query names
+    (``plans/edge-bm25-leg-ranking-9542/README.md``).
     """
-    union = build_query(sanitized_text, None, max_query_length)
+    union = build_query(sanitized_text, group_ids, max_query_length)
     identifiers = [t for t in searchable_terms(sanitized_text) if is_identifier_term(t)]
     if not union or not identifiers:
         return EdgeFulltextQueries(union=union, identifiers='')

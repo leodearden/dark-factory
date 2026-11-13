@@ -26,7 +26,7 @@ from fused_memory.arm_harness.probe_set import (
     probe_set_sha,
     serialize_probe_set,
 )
-from fused_memory.backends.falkor_fulltext import build_edge_queries
+from fused_memory.backends.falkor_fulltext import build_query
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -131,17 +131,17 @@ def test_the_cutoff_is_graphitis_own_constant():
     assert FULLTEXT_TERM_CUTOFF == search_utils.MAX_QUERY_LENGTH
 
 
-def test_the_bm25_leg_dies_at_65_searchable_terms_not_128():
+def test_the_bm25_leg_dies_at_64_searchable_terms_not_128():
     alive = [
         count
         for count in range(1, FULLTEXT_TERM_CUTOFF)
-        if build_edge_queries(_words(count), FULLTEXT_TERM_CUTOFF).union
+        if build_query(_words(count), ['evalmem_probe'], FULLTEXT_TERM_CUTOFF)
     ]
 
-    assert max(alive) == 64
-    assert derive_query_words([_words(64)]) == 64
-    with pytest.raises(ProbeSetError, match='65'):
-        derive_query_words([_words(65)])
+    assert max(alive) == 63
+    assert derive_query_words([_words(63)]) == 63
+    with pytest.raises(ProbeSetError, match='64'):
+        derive_query_words([_words(64)])
 
 
 # --- build_probe_set ---------------------------------------------------------------------
@@ -195,7 +195,7 @@ def test_no_cited_episode_is_refused():
 
 
 def test_a_known_item_query_whose_tokens_split_past_the_cutoff_is_refused():
-    dotted = '.'.join('bcdefghijklmnopqr')
+    dotted = '.'.join('bcdefghijklmnopq')
     episodes = ((UUID_A, ' '.join([dotted] * 4)), *EPISODES[:1], *EPISODES[2:])
 
     with pytest.raises(ProbeSetError, match=UUID_A):
