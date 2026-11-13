@@ -114,6 +114,46 @@ prints 0.17.1.
   excludes, uv cache, uv Pythons and Rust toolchain as the commands of the
   `glm-5.3-endpoint` control.
 
+## Dotenv walk (task 9541)
+
+- Upstream `zai-org/ZCode` a9fe401eed loads one `.env` file into its own
+  process env at startup. `apps/zcode-cli/packages/cli/src/env.ts::findDotenv`
+  walks up from `--cwd` lexically (`path.resolve`, no realpath) to the first
+  regular file named `.env`, and `::loadCliDotenv` loads it with
+  `override: false`. `prompt-command.ts` does this unconditionally in
+  `--prompt` mode; no flag or env var disables it. What it loads reaches the
+  agent's Bash tool and stdio MCP children, as the section above describes.
+- Landlock cannot deny that read.
+  `orchestrator/src/orchestrator/agents/landlock_exec.py` grants read on `/`,
+  and landlock rules only add access.
+- Measured 2026-11-13 under landlock with the real CLI 0.17.1: with
+  `--cwd <worktree>` and the worktree nested inside a checkout, a canary in
+  the checkout's `.env` reached the stdio MCP child's environment.
+- The arm's remedy
+  (`orchestrator/src/orchestrator/agents/zcode_backend.py::zcode_run_home`,
+  `::zcode_argv`). ZCode runs with `--cwd <run home>/workspace`, a symlink to
+  the worktree, beside an empty `<run home>/.env`. The walk sees the
+  worktree's own `.env`, if any, then stops at the empty file in the run
+  home. The sentinel is needed on its own account: the run home lives under
+  `/tmp`, which every sandboxed agent can write, so without it a `.env`
+  planted in `/tmp` would be loaded. The subprocess cwd and the landlock
+  grants stay on the real worktree.
+- Measured with that layout: the canary was absent, and the MCP child's cwd
+  still resolved to the worktree. Upstream's
+  `core/src/tool/handlers/bash-cwd-policy.ts` accepts a symlinked session
+  root, comparing both the logical and the realpath pairs.
+- The regression probe is `orchestrator/tests/test_zcode_dotenv_live.py`. It
+  drives the real `zcode` under landlock against a local endpoint that
+  answers 401, which ends the run in about 3 s, after ZCode has started its
+  MCP children. It is skipped where `zcode` or landlock is missing.
+- Residuals:
+  - The worktree's own `.env` is still loaded. Dark-factory worktrees have
+    none: `.env` is gitignored and nothing provisions one.
+  - Any backend's agent can still read the checkout's `.env` deliberately
+    with its own tools, because landlock grants read on `/`.
+  - An implementer step committing under the symlinked workspace has not
+    been measured; see Not established.
+
 ## Protocol
 
 ZCode's built-in "Z.ai Coding Plan" provider template
@@ -148,7 +188,13 @@ providers were not verified upstream.
 ## Not established
 
 - A live GLM run. No agent holds `ZAI_API_KEY`, so no request reached Z.ai.
-- Behaviour under the landlock sandbox.
+- Behaviour under the landlock sandbox past startup. Under landlock ZCode
+  has been seen to start, spawn its stdio MCP children and exit on a refused
+  request (Dotenv walk above); no model turn or tool call has run there.
+- Whether an implementer step commits under the symlinked workspace. ZCode's
+  session root is now `<run home>/workspace`, a link to the worktree, so its
+  file tools, its Bash cwd policy and git all start from a symlinked path.
+  Task 8939's live-run commit check below must run with this layout.
 - Telemetry defaults. The environment variable
   `ZCODE_MODEL_TELEMETRY_ENABLED` exists; its default was not measured.
 - The cache-token arithmetic above, against a real provider. Task 8939's live
@@ -184,7 +230,7 @@ providers were not verified upstream.
     (`apps/zcode-cli/packages/cli/src/tui-runtime-loader.ts`). The arm runs
     the source-built `zcode.cjs`, so this does not arise today.
 
-All seven are left to task 8939 (from ticket `tkt_0RWSZ5GKKD78GK8FKD16G2X67J`),
+All eight are left to task 8939 (from ticket `tkt_0RWSZ5GKKD78GK8FKD16G2X67J`),
 the operator task that installs the ZCode CLI on the orchestrator host and runs
 the paired `glm-5.3-zcode` / `glm-5.3-endpoint` eval cells. Task 8939's live
 run should also confirm that an implementer step commits under the arm. Until
