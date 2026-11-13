@@ -56,6 +56,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.dangling_citation import dangling_citation_identity
 from fused_memory.reconciliation.drained_event_restore import (
+    restore_on_raise,
     restore_unless_completed_best_effort,
 )
 from fused_memory.reconciliation.episode_window import next_episode_window_anchor
@@ -3298,18 +3299,15 @@ class ReconciliationHarness:
         self, project_id: str, reason: str, tier: TierConfig | None,
     ) -> None:
         """Run one full cycle within cycle_timeout_seconds, under the injected
-        ``full_cycle_deadline``, as a caller-minted run; if it raises, the
-        timeout included, its own drained events are restored unless the
-        journal records it completed."""
+        ``full_cycle_deadline``, as a caller-minted run; if it raises or is
+        cancelled, a deadline or a shutdown, its own drained events are
+        restored unless the journal records it completed."""
         run_id = str(uuid4())
-        try:
-            async with self._full_cycle_deadline(self.config.cycle_timeout_seconds):
-                await self.run_full_cycle(project_id, reason, tier=tier, run_id=run_id)
-        except Exception:
-            await restore_unless_completed_best_effort(
-                self.journal, self.buffer, project_id, run_id,
-            )
-            raise
+        async with (
+            restore_on_raise(self.journal, self.buffer, project_id, run_id),
+            self._full_cycle_deadline(self.config.cycle_timeout_seconds),
+        ):
+            await self.run_full_cycle(project_id, reason, tier=tier, run_id=run_id)
 
     async def _heartbeat_loop(self, project_id: str) -> None:
         """Keep the reconciliation lock alive while a run is in progress."""
@@ -6320,9 +6318,11 @@ class BacklogIterator:
         events that fit.  Stops when no events remain before the cutoff.
 
         The whole invocation is bounded by cycle_timeout_seconds under the
-        injected ``iteration_deadline`` (task 2040).  On that deadline the
-        in-flight run's events are restored unless it completed, and
-        TimeoutError propagates to the caller's log (task 6453).
+        injected ``iteration_deadline`` (task 2040).  Each chunk and the final
+        consolidation restore their own events on any raise
+        (``restore_on_raise``), so on the deadline the in-flight run's events
+        come back unless it completed, and TimeoutError propagates to the
+        caller's log (tasks 6453, 6695).
         """
         from fused_memory.reconciliation.context_assembler import ContextAssembler
 
@@ -6345,129 +6345,111 @@ class BacklogIterator:
             project_root=scope.project_root,
         )
 
-        in_flight_run_id: str | None = None
-        try:
-            async with self._iteration_deadline(self.config.cycle_timeout_seconds):
-                watermark = await self.journal.get_watermark(project_id)
+        async with self._iteration_deadline(self.config.cycle_timeout_seconds):
+            watermark = await self.journal.get_watermark(project_id)
 
-                chunk_num = 0
-                start = self.time_provider()
-                yielded = False
-                while True:
-                    # Cumulative between-chunks budget (task 2040): once at least one
-                    # chunk has completed and the wall-clock budget is exhausted,
-                    # stop launching new chunks and leave the remainder buffered.
-                    # The per-project lock releases via _project_loop's finally, so
-                    # the next cycle / trigger_reconciliation keeps draining instead
-                    # of one iteration holding the lock forever.
-                    if (
-                        chunk_num > 0
-                        and self.time_provider() - start
-                        >= self.config.backlog_iteration_budget_seconds
-                    ):
-                        stats = await self.buffer.get_buffer_stats(project_id)
-                        logger.info(
-                            'reconciliation.backlog_iteration_yielded',
-                            extra={
-                                'project_id': project_id,
-                                'chunks_processed': chunk_num,
-                                'events_remaining': stats.get('size', 0),
-                            },
-                        )
-                        yielded = True
-                        break
-
-                    # Peek at up to 1000 events (far more than a single budget can hold)
-                    peeked = await self.buffer.peek_buffered(
-                        project_id, limit=1000, before=cutoff,
+            chunk_num = 0
+            start = self.time_provider()
+            yielded = False
+            while True:
+                # Cumulative between-chunks budget (task 2040): once at least one
+                # chunk has completed and the wall-clock budget is exhausted,
+                # stop launching new chunks and leave the remainder buffered.
+                # The per-project lock releases via _project_loop's finally, so
+                # the next cycle / trigger_reconciliation keeps draining instead
+                # of one iteration holding the lock forever.
+                if (
+                    chunk_num > 0
+                    and self.time_provider() - start
+                    >= self.config.backlog_iteration_budget_seconds
+                ):
+                    stats = await self.buffer.get_buffer_stats(project_id)
+                    logger.info(
+                        'reconciliation.backlog_iteration_yielded',
+                        extra={
+                            'project_id': project_id,
+                            'chunks_processed': chunk_num,
+                            'events_remaining': stats.get('size', 0),
+                        },
                     )
-                    if not peeked:
-                        break
+                    yielded = True
+                    break
 
-                    # Assemble token-budgeted payload
-                    assembled = await assembler.assemble(peeked, watermark, project_id)
-                    if not assembled.events:
-                        break
-
-                    chunk_num += 1
-                    in_flight_run_id = str(uuid4())
-                    if not await self._run_chunk(
-                        project_id, chunk_num, assembled, in_flight_run_id, opus_tier,
-                    ):
-                        return  # Stop iteration on failure
-                    in_flight_run_id = None
-
-                # Final consolidation pass — skipped when the loop yielded on the
-                # cumulative budget (task 2040): the remaining backlog stays
-                # buffered for the next cycle instead of forcing an extra
-                # consolidation cycle past the budget.
-                if chunk_num > 0 and not yielded:
-                    in_flight_run_id = str(uuid4())
-                    await self._run_final_consolidation(project_id, in_flight_run_id, opus_tier)
-                    in_flight_run_id = None
-        except TimeoutError:
-            if in_flight_run_id is not None:
-                await restore_unless_completed_best_effort(
-                    self.journal, self.buffer, project_id, in_flight_run_id,
+                # Peek at up to 1000 events (far more than a single budget can hold)
+                peeked = await self.buffer.peek_buffered(
+                    project_id, limit=1000, before=cutoff,
                 )
-            raise
+                if not peeked:
+                    break
+
+                # Assemble token-budgeted payload
+                assembled = await assembler.assemble(peeked, watermark, project_id)
+                if not assembled.events:
+                    break
+
+                chunk_num += 1
+                if not await self._run_chunk(project_id, chunk_num, assembled, opus_tier):
+                    return  # Stop iteration on failure
+
+            # Final consolidation pass — skipped when the loop yielded on the
+            # cumulative budget (task 2040): the remaining backlog stays
+            # buffered for the next cycle instead of forcing an extra
+            # consolidation cycle past the budget.
+            if chunk_num > 0 and not yielded:
+                await self._run_final_consolidation(project_id, opus_tier)
 
     async def _run_chunk(
         self,
         project_id: str,
         chunk_num: int,
         assembled: AssembledPayload,
-        run_id: str,
         tier: TierConfig,
     ) -> bool:
-        """Drain and process one chunk as run *run_id*; False when it failed,
-        its own events restored, and iteration must stop."""
+        """Drain and process one chunk as its own run; False when it failed
+        and iteration must stop. On any raise, cancellation included, its own
+        events are restored first."""
+        run_id = str(uuid4())
         chunk_id = str(uuid4())
         try:
-            await self.buffer.drain_by_ids(
-                project_id, [e.id for e in assembled.events], run_id=run_id,
-            )
-            await self.journal.record_chunk_boundary(
-                project_id, chunk_id, len(assembled.events),
-            )
+            async with restore_on_raise(self.journal, self.buffer, project_id, run_id):
+                await self.buffer.drain_by_ids(
+                    project_id, [e.id for e in assembled.events], run_id=run_id,
+                )
+                await self.journal.record_chunk_boundary(
+                    project_id, chunk_id, len(assembled.events),
+                )
 
-            logger.info(
-                f'Backlog chunk {chunk_num}: processing {len(assembled.events)} events '
-                f'({assembled.total_tokens} tokens, {len(assembled.context_items)} context items, '
-                f'{assembled.events_remaining} remaining) for {project_id}'
-            )
+                logger.info(
+                    f'Backlog chunk {chunk_num}: processing {len(assembled.events)} events '
+                    f'({assembled.total_tokens} tokens, {len(assembled.context_items)} context items, '
+                    f'{assembled.events_remaining} remaining) for {project_id}'
+                )
 
-            await self.harness.run_full_cycle(
-                project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
-                tier=tier,
-                events=assembled.events,
-                assembled_payload=assembled,
-                run_id=run_id,
-            )
+                await self.harness.run_full_cycle(
+                    project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
+                    tier=tier,
+                    events=assembled.events,
+                    assembled_payload=assembled,
+                    run_id=run_id,
+                )
         except Exception as e:
             logger.error(f'Backlog chunk {chunk_num} failed: {e}')
             self.harness._escalate(
                 'recon_backlog_overflow', chunk_id,
                 f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
             )
-            await restore_unless_completed_best_effort(
-                self.journal, self.buffer, project_id, run_id,
-            )
             return False
         return True
 
-    async def _run_final_consolidation(
-        self, project_id: str, run_id: str, tier: TierConfig,
-    ) -> None:
-        """One consolidation cycle after the chunks, as run *run_id*; on
-        failure its own events are restored."""
+    async def _run_final_consolidation(self, project_id: str, tier: TierConfig) -> None:
+        """One consolidation cycle after the chunks, as its own run; on any
+        raise, cancellation included, its own events are restored first."""
         logger.info(f'Backlog final consolidation for {project_id}')
+        run_id = str(uuid4())
         try:
-            await self.harness.run_full_cycle(
-                project_id, 'backlog_final_consolidation', tier=tier, run_id=run_id,
-            )
+            async with restore_on_raise(self.journal, self.buffer, project_id, run_id):
+                await self.harness.run_full_cycle(
+                    project_id, 'backlog_final_consolidation', tier=tier, run_id=run_id,
+                )
         except Exception as e:
             logger.error(f'Backlog final consolidation failed: {e}')
-            await restore_unless_completed_best_effort(
-                self.journal, self.buffer, project_id, run_id,
-            )
