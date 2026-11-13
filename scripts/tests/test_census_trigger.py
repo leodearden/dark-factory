@@ -342,7 +342,7 @@ def test_codebook_signal_collects_earliest_across_entries_and_candidates():
 
 # ---------------------------------------------------------------------------
 # extract_statuses() — the validated {task id: status} mapping census.py's
-# outcome feed reads once per run (census._read_statuses).
+# outcome feed reads once per run (census_run.py::_read_statuses).
 # ---------------------------------------------------------------------------
 
 # fused-memory's `_normalize_project_root` hard-rejects a relative path with
@@ -398,7 +398,7 @@ def test_extract_statuses_raises_on_non_dict_payload(payload):
 
 
 # ---------------------------------------------------------------------------
-# `_bounded_repr` / `_bounded_keys` (task 4085): every journal line they
+# `bounded_repr` / `bounded_keys` (task 4085): every journal line they
 # feed stays one bounded line. These pin that PROPERTY -- output bounded,
 # elision marked, true size still reported -- not a private format string.
 # The two constants are read from the module, so retuning them does not
@@ -409,14 +409,14 @@ def test_bounded_repr_bounds_an_arbitrarily_large_value():
     """The point of the helper: census-state.json and a get_statuses payload
     are both arbitrarily large, and neither may dump itself into a journal
     line. A value small enough to print in full is left alone."""
-    assert "repr truncated" not in ct._bounded_repr({"n": 1})
+    assert "repr truncated" not in ct.bounded_repr({"n": 1})
 
     value = "x" * 100_000
-    result = ct._bounded_repr(value)
+    result = ct.bounded_repr(value)
 
     # Bounded, marked as elided, and the TRUE size still stated -- that number
     # is how an operator tells "slightly over" from "a whole payload".
-    assert len(result) < ct._MAX_REPR_CHARS + 100
+    assert len(result) < ct.MAX_REPR_CHARS + 100
     assert "repr truncated" in result
     assert str(len(repr(value))) in result
 
@@ -424,13 +424,13 @@ def test_bounded_repr_bounds_an_arbitrarily_large_value():
 def test_bounded_keys_bounds_an_arbitrarily_wide_mapping():
     """Same property for the key list: a get_statuses payload over a big
     project has thousands of keys, and the shape is all diagnosis needs."""
-    count = ct._MAX_REPORTED_KEYS + 5
+    count = ct.MAX_REPORTED_KEYS + 5
     mapping = {f"k{i:02d}": i for i in range(count)}
 
-    result = ct._bounded_keys(mapping)
+    result = ct.bounded_keys(mapping)
 
     shown = sum(1 for i in range(count) if f"'k{i:02d}'" in result)
-    assert shown == ct._MAX_REPORTED_KEYS
+    assert shown == ct.MAX_REPORTED_KEYS
     # The suffix reports the TRUE key count, not the number shown.
     assert str(count) in result
 
@@ -441,7 +441,7 @@ def test_bounded_keys_survives_mixed_type_keys():
     str -- i.e. the error path would fail while reporting a failure, which is
     the worst possible place for it. get_statuses payloads are server-supplied,
     so a mixed-key dict is exactly the malformed shape this reports on."""
-    result = ct._bounded_keys({1: "a", "b": "c", None: "d"})
+    result = ct.bounded_keys({1: "a", "b": "c", None: "d"})
 
     assert "1" in result
     assert "'b'" in result

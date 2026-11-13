@@ -32,9 +32,8 @@ import json
 from typing import Any
 
 import pytest
-from legibility import census as mod
+from legibility import census_run, embeddings, landing_gate, unlanded
 from legibility import config as config_mod
-from legibility import embeddings, landing_gate, unlanded
 from legibility_census_scaffold import narrowing, with_seams
 from legibility_task_store_fake import FakeTaskStore
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -79,8 +78,8 @@ def _never_roll_back(**kwargs):
     raise AssertionError("roll_back must not run on a landed commit")
 
 
-_done = narrowing(mod.Done)
-_deferred = narrowing(mod.Deferred)
+_done = narrowing(census_run.Done)
+_deferred = narrowing(census_run.Deferred)
 
 
 def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
@@ -94,7 +93,7 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     zoo: ``batch_source=[]`` mines nothing, so the only LLM call any test
     here makes is the headroom probe.
     """
-    effects = mod.CensusEffects(
+    effects = census_run.CensusEffects(
         batch_source=[],
         selection_of=lambda: None,
         invoke=lambda prompt, model: "pong",
@@ -143,7 +142,7 @@ def test_run_census_creates_missing_report_parent_dir(tmp_path):
     kwargs = _run_census_kwargs(tmp_path)
     assert not (tmp_path / "plans").exists(), "precondition: no plans/ dir"
 
-    outcome = mod.run_census(**kwargs)
+    outcome = census_run.run_census(**kwargs)
 
     outcome = _done(outcome)
     assert kwargs["report_path"].exists()
@@ -157,7 +156,7 @@ def test_run_census_creates_missing_dry_run_payloads_parent_dir(tmp_path):
     kwargs = _run_census_kwargs(tmp_path, dry_run_payloads_path=payloads_path)
     assert not (tmp_path / "plans").exists(), "precondition: no plans/ dir"
 
-    outcome = mod.run_census(**kwargs)
+    outcome = census_run.run_census(**kwargs)
 
     outcome = _done(outcome)
     assert payloads_path.exists()
@@ -176,7 +175,7 @@ def test_run_census_creates_missing_codebook_and_state_parent_dirs(tmp_path):
     kwargs = _run_census_kwargs(tmp_path)
     assert not (tmp_path / "docs" / "legibility").exists(), "precondition"
 
-    outcome = mod.run_census(**kwargs)
+    outcome = census_run.run_census(**kwargs)
 
     outcome = _done(outcome)
     assert kwargs["codebook_path"].exists()
@@ -202,7 +201,7 @@ def test_run_census_creates_output_dirs_before_mining_begins(tmp_path):
         tmp_path, batch_source=_RecordingBatchSource(), report_path=report_path,
     )
 
-    outcome = mod.run_census(**kwargs)
+    outcome = census_run.run_census(**kwargs)
 
     outcome = _done(outcome)
     assert observed == [True], (
@@ -220,7 +219,7 @@ def test_run_census_deferred_at_headroom_creates_no_output_dirs(tmp_path):
         invoke=lambda prompt, model: "You have reached your usage limit for this period.",
     )
 
-    outcome = mod.run_census(**kwargs)
+    outcome = census_run.run_census(**kwargs)
 
     outcome = _deferred(outcome)
     assert not (tmp_path / "plans").exists()

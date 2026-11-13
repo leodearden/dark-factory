@@ -530,7 +530,7 @@ def evaluate_census_step(
         # YAML / pydantic error -- so it is truncated (and its newlines escaped) by
         # census_trigger's own log-hygiene helper rather than a second copy of
         # that logic here. Formatted once, so the two sinks cannot drift.
-        detail = f'{type(exc).__name__}: {census_trigger._bounded_repr(str(exc))}'
+        detail = f'{type(exc).__name__}: {census_trigger.bounded_repr(str(exc))}'
         logger.warning(
             'census trigger evaluation failed (%s) -- NO-FIRE; the nightly '
             'run is unaffected', detail,

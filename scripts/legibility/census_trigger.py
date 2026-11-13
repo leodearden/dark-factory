@@ -203,7 +203,7 @@ def _warn_not_applicable(completion: Completion, check_output: str = "") -> None
         "%s -- condition (a) fails safe (no fire on completion); the novelty spike "
         "still evaluates (plans/census-incremental-prd.md C7 (a))%s",
         completion.reason,
-        f"; check output: {_bounded_repr(check_output)}" if check_output else "",
+        f"; check output: {bounded_repr(check_output)}" if check_output else "",
     )
 
 
@@ -235,7 +235,7 @@ def check_completion(
             CompletionStatus.ERROR,
             run_id,
             threshold_pct,
-            detail=f"{type(exc).__name__}: {_bounded_repr(str(exc))}",
+            detail=f"{type(exc).__name__}: {bounded_repr(str(exc))}",
         )
         _warn_not_applicable(completion)
         return completion
@@ -405,30 +405,30 @@ def codebook_signal(codebook: dict) -> tuple[datetime | None, list[datetime]]:
 
 
 # ---------------------------------------------------------------------------
-# extract_statuses + default_status_fetcher — census.py's get_statuses
-# outcome feed (census._read_statuses)
+# extract_statuses + default_status_fetcher — the census run's get_statuses
+# outcome feed (census_run.py::_read_statuses)
 # ---------------------------------------------------------------------------
 
 class StatusFetchUnavailable(Exception):
     """Raised by a status_fetcher (in particular `default_status_fetcher`'s
     returned callable) or by `extract_statuses` when a usable get_statuses
     snapshot cannot be obtained -- no network, a non-2xx response, a
-    malformed payload. A dedicated exception lets census.py's outcome feed
-    (`census._read_statuses`) catch fetch failures deterministically."""
+    malformed payload. A dedicated exception lets the census run's outcome feed
+    (`census_run.py::_read_statuses`) catch fetch failures deterministically."""
 
 
-# A `StatusFetchUnavailable` message is re-emitted verbatim into census.py's
-# report and the nightly journal, and `_bounded_repr` also bounds this
+# A `StatusFetchUnavailable` message is re-emitted verbatim into the census
+# report and the nightly journal, and `bounded_repr` also bounds this
 # module's own WARNINGs. An unbounded `{payload!r}` would dump a whole
 # malformed-but-large body (get_statuses over a big project is thousands of
 # entries) into a single line. Diagnosis needs only the shape, so reprs are
 # truncated and the type name / key list, which identifies the fault, is
 # always reported outside the truncated part.
-_MAX_REPR_CHARS = 200
-_MAX_REPORTED_KEYS = 20
+MAX_REPR_CHARS = 200
+MAX_REPORTED_KEYS = 20
 
 
-def _bounded_repr(value, limit: int = _MAX_REPR_CHARS) -> str:
+def bounded_repr(value, limit: int = MAX_REPR_CHARS) -> str:
     """`repr(value)` truncated to *limit* chars with an explicit elision
     marker, so a log line stays one readable line regardless of payload size."""
     text = repr(value)
@@ -437,22 +437,22 @@ def _bounded_repr(value, limit: int = _MAX_REPR_CHARS) -> str:
     return f"{text[:limit]}... (repr truncated, {len(text)} chars total)"
 
 
-def _bounded_keys(mapping) -> str:
+def bounded_keys(mapping) -> str:
     """A bounded, order-stable summary of a mapping's keys. Sorts by `str` so
     a payload with mixed-type keys cannot raise `TypeError` from inside the
     error path itself -- a failure while reporting a failure is the worst
     possible place to be clever."""
     keys = sorted(mapping, key=str)
-    shown = keys[:_MAX_REPORTED_KEYS]
-    suffix = f", ... ({len(keys)} total)" if len(keys) > _MAX_REPORTED_KEYS else ""
+    shown = keys[:MAX_REPORTED_KEYS]
+    suffix = f", ... ({len(keys)} total)" if len(keys) > MAX_REPORTED_KEYS else ""
     return f"{shown}{suffix}"
 
 
 def extract_statuses(payload) -> Mapping[str, Any]:
     """The `{task id string: status}` mapping of a get_statuses payload, or
     raise `StatusFetchUnavailable` if *payload* is not a usable get_statuses
-    envelope. Its one consumer is census.py's outcome feed
-    (`census._read_statuses`).
+    envelope. Its one consumer is the census run's outcome feed
+    (`census_run.py::_read_statuses`).
 
     `{"statuses": {}}` is a valid, empty answer; only a non-dict payload, a
     missing or non-mapping `statuses`, or the tool-error envelope is
@@ -464,7 +464,7 @@ def extract_statuses(payload) -> Mapping[str, Any]:
     if not isinstance(payload, dict):
         raise StatusFetchUnavailable(
             f"get_statuses payload is not a dict (got {type(payload).__name__}): "
-            f"{_bounded_repr(payload)}"
+            f"{bounded_repr(payload)}"
         )
 
     # The fused-memory tool-error envelope, checked before the shape
@@ -475,12 +475,12 @@ def extract_statuses(payload) -> Mapping[str, Any]:
         raise StatusFetchUnavailable(
             f"get_statuses returned a tool-error envelope "
             f"({payload.get('error_type') or 'error'}): "
-            f"{_bounded_repr(payload.get('error'))}"
+            f"{bounded_repr(payload.get('error'))}"
         )
 
     if "statuses" not in payload:
         raise StatusFetchUnavailable(
-            f"get_statuses payload has no 'statuses' key (keys: {_bounded_keys(payload)})"
+            f"get_statuses payload has no 'statuses' key (keys: {bounded_keys(payload)})"
         )
 
     statuses = payload["statuses"]
@@ -488,7 +488,7 @@ def extract_statuses(payload) -> Mapping[str, Any]:
         sized = f", len={len(statuses)}" if hasattr(statuses, "__len__") else ""
         raise StatusFetchUnavailable(
             f"get_statuses 'statuses' is not a mapping "
-            f"(got {type(statuses).__name__}{sized}): {_bounded_repr(statuses)}"
+            f"(got {type(statuses).__name__}{sized}): {bounded_repr(statuses)}"
         )
 
     return statuses

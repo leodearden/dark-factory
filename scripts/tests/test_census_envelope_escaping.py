@@ -4,7 +4,7 @@ boundary markup guard (task 5907).
 Regression origin: the 2026-09-25 reify census (reify escalations
 esc-markup-residue-4 to -10). Verified clusters whose sighting evidence quoted
 the invoke, content and rationale closers were turned by
-``census.py::build_task_payloads`` into ``submit_task`` kwargs carrying those
+``census_filing.py::build_task_payloads`` into ``submit_task`` kwargs carrying those
 literals raw. The fused-memory boundary guard
 (``shared.mcp_markup_middleware.MarkupGuardMiddleware``) refused each call as
 ``mcp_markup_unrepairable`` and queued a residue escalation, so the candidates
@@ -28,10 +28,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any, NamedTuple
 
-import census as mod
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
+from legibility import census_filing
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import INVOKE_CLOSER, closer_for, detect_for
 
@@ -113,7 +113,7 @@ def _quoting_cluster(**overrides: Any) -> dict[str, Any]:
 
 
 def _payload_for(cluster: dict[str, Any]) -> dict[str, Any]:
-    return mod.build_task_payloads(
+    return census_filing.build_task_payloads(
         [cluster], project_root='/r', project_id='reify', run_id='census-reify-20260714',
     )[0]
 
