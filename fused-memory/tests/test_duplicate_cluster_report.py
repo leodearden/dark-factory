@@ -168,14 +168,15 @@ def _rec(record_id: str, family: str, rewrite: int, created_at: str | None = Non
 
 
 def _plan(records: list[dict], category: str = _PK, *, scanned: int | None = None,
-          truncated: int = 0, scan_limit: int = 5000, **kwargs: object) -> dict:
+          truncated: int = 0, scan_limit: int = 5000, threshold: float = 0.85,
+          **kwargs: object) -> dict:
     coverage = {category: {
         'scanned': len(records) if scanned is None else scanned,
         'truncated': truncated,
         'scan_limit': scan_limit,
     }}
     return detector.build_sweep_plan(
-        records, 0.85, categories=(category,), scan_coverage=coverage, **kwargs,
+        records, threshold, categories=(category,), scan_coverage=coverage, **kwargs,
     )
 
 
@@ -396,3 +397,291 @@ class TestChildRankings:
 
         assert rep['child_counts_known'] is False
         assert rep['child_rankings'] == {}
+
+
+# ---------------------------------------------------------------------------
+# The consecutive-run regrowth diff (task 3136 amendment D)
+# ---------------------------------------------------------------------------
+
+_PREV = '20261108T063000Z'
+_CUR = '20261115T063000Z'
+_BEFORE_PREV = '2026-11-01T00:00:00+00:00'
+_AFTER_PREV = '2026-11-10T00:00:00+00:00'
+
+
+def _family(ids: list[str], family: str = 'venv', created_at: str = _BEFORE_PREV,
+            **kwargs: object) -> list[dict]:
+    return [_rec(i, family, n, created_at, **kwargs) for n, i in enumerate(ids)]
+
+
+def _runs(config, prev_records, cur_records, *, prev_stamp=_PREV, cur_stamp=_CUR,
+          prev_plan_kwargs=None, cur_plan_kwargs=None):
+    prev = _build(config, [('prev.json', _plan(prev_records, **(prev_plan_kwargs or {})))],
+                  stamp=prev_stamp)
+    cur = _build(config, [('cur.json', _plan(cur_records, **(cur_plan_kwargs or {})))],
+                 previous=prev, stamp=cur_stamp)
+    return prev, cur
+
+
+class TestBaselineLineage:
+    def test_without_a_previous_report_every_cluster_is_a_baseline(self, config) -> None:
+        rep = _build(config, [('pk.json', _plan(
+            _family(['b', 'a']) + _family(['d', 'c'], 'stash'),
+        ))])
+
+        assert [c['lineage']['status'] for c in rep['clusters']] == ['baseline', 'baseline']
+        assert [c['cluster_key'] for c in rep['clusters']] == ['a', 'c']
+        assert rep['regrowth']['previous_run_stamp'] is None
+
+
+class TestMatchedLineage:
+    def test_an_unchanged_cluster_keeps_the_key_it_was_born_with(self, config) -> None:
+        prev = _build(config, [('prev.json', _plan(_family(['a', 'b'])))], stamp=_PREV)
+        prev['clusters'][0]['cluster_key'] = 'born-key'
+
+        cur = _build(config, [('cur.json', _plan(_family(['a', 'b'])))],
+                     previous=prev, stamp=_CUR)
+
+        (cluster,) = cur['clusters']
+        assert cluster['cluster_key'] == 'born-key'
+        assert cluster['lineage']['status'] == 'unchanged'
+        assert cluster['lineage']['size_delta'] == 0
+        assert cur['regrowth']['unchanged'] == 1
+
+    def test_a_grown_cluster_splits_its_added_members_by_age(self, config) -> None:
+        _prev, cur = _runs(config, _family(['a', 'b']), [
+            *_family(['a', 'b']),
+            _rec('c', 'venv', 2, _AFTER_PREV),
+            _rec('d', 'venv', 3, _BEFORE_PREV),
+            _rec('e', 'venv', 4, None),
+        ])
+
+        (cluster,) = cur['clusters']
+        lineage = cluster['lineage']
+        assert cluster['cluster_key'] == 'a'
+        assert lineage['status'] == 'grew'
+        assert lineage['previous_key'] == 'a'
+        assert lineage['added_member_ids'] == ['c', 'd', 'e']
+        assert lineage['size_delta'] == 3
+        assert lineage['added_by_age'] == {'re_emitted': 1, 'preexisting': 1, 'unknown': 1}
+        assert lineage['rate_per_day'] == pytest.approx(1 / 7)
+        regrowth = cur['regrowth']
+        assert regrowth['grew'] == 1
+        assert regrowth['re_emitted_members'] == 1
+        assert regrowth['elapsed_days'] == pytest.approx(7.0)
+        assert regrowth['previous_run_stamp'] == _PREV
+
+    def test_the_rate_is_none_when_no_time_has_elapsed(self, config) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b']),
+            [*_family(['a', 'b']), _rec('c', 'venv', 2, _AFTER_PREV)],
+            cur_stamp=_PREV,
+        )
+
+        assert cur['clusters'][0]['lineage']['rate_per_day'] is None
+        assert cur['regrowth']['rate_per_day'] is None
+
+    def test_a_shrunk_cluster_lists_its_departed_members(self, config) -> None:
+        _prev, cur = _runs(config, _family(['a', 'b', 'c']), _family(['a', 'b']))
+
+        lineage = cur['clusters'][0]['lineage']
+        assert lineage['status'] == 'shrank'
+        assert lineage['departed_member_ids'] == ['c']
+        assert lineage['size_delta'] == -1
+        assert cur['regrowth']['shrank'] == 1
+
+
+class TestAppearedAndDissolved:
+    def test_a_cluster_overlapping_nothing_is_new_with_a_fresh_key(self, config) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b']),
+            _family(['a', 'b']) + _family(['y', 'x'], 'stash', _AFTER_PREV),
+        )
+
+        fresh = _cluster_by_member(cur, 'x')
+        assert fresh['lineage']['status'] == 'new'
+        assert fresh['cluster_key'] == 'x'
+        assert fresh['lineage']['added_by_age']['re_emitted'] == 2
+        assert cur['regrowth']['appeared'] == 1
+
+    def test_a_previous_cluster_overlapped_by_nothing_has_dissolved(self, config) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b']) + _family(['c', 'd', 'e'], 'stash'),
+            _family(['a', 'b']),
+        )
+
+        assert cur['regrowth']['dissolved'] == [
+            {'cluster_key': 'c', 'category': _PK, 'size': 3},
+        ]
+
+    def test_an_unswept_category_dissolves_nothing(self, config) -> None:
+        prev = _build(config, [
+            ('prev-pk.json', _plan(_family(['a', 'b']))),
+            ('prev-pn.json', _plan(_family(['c', 'd'], category=_PN), _PN)),
+        ], stamp=_PREV)
+
+        cur = _build(config, [('cur-pk.json', _plan(_family(['a', 'b'])))],
+                     previous=prev, stamp=_CUR)
+
+        assert cur['regrowth']['dissolved'] == []
+
+
+class TestMergeAndSplit:
+    def test_a_merged_cluster_inherits_the_larger_overlap(self, config) -> None:
+        prev = _family(['a', 'b', 'c']) + _family(['d', 'e'], 'stash')
+        _prev, cur = _runs(config, prev, _family(['a', 'b', 'c', 'd', 'e']))
+
+        (cluster,) = cur['clusters']
+        assert cluster['cluster_key'] == 'a'
+        assert cluster['lineage']['merged_previous_keys'] == ['a', 'd']
+        assert cur['regrowth']['dissolved'] == []
+
+    def test_an_overlap_tie_goes_to_the_lower_previous_key(self, config) -> None:
+        prev = _family(['c', 'd']) + _family(['a', 'b'], 'stash')
+        _prev, cur = _runs(config, prev, _family(['a', 'b', 'c', 'd']))
+
+        assert cur['clusters'][0]['cluster_key'] == 'a'
+
+    def test_a_split_keeps_the_key_on_the_larger_piece(self, config) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b', 'c', 'd', 'e']),
+            _family(['a', 'b', 'c']) + _family(['d', 'e'], 'stash'),
+        )
+
+        larger, smaller = _cluster_by_member(cur, 'a'), _cluster_by_member(cur, 'd')
+        assert larger['cluster_key'] == 'a'
+        assert smaller['lineage']['split_from'] == 'a'
+        assert smaller['cluster_key'] != 'a'
+
+    def test_keys_stay_unique_when_a_split_piece_holds_the_old_key_member(
+        self, config,
+    ) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b', 'c']),
+            _family(['b', 'c']) + _family(['a', 'z'], 'stash'),
+        )
+
+        keys = [c['cluster_key'] for c in cur['clusters']]
+        assert _cluster_by_member(cur, 'b')['cluster_key'] == 'a'
+        assert len(set(keys)) == len(keys)
+
+    def test_matching_never_crosses_categories(self, config) -> None:
+        prev = _build(config, [('prev.json', _plan(_family(['a', 'b'])))], stamp=_PREV)
+
+        cur = _build(config, [
+            ('cur-pk.json', _plan([])),
+            ('cur-pn.json', _plan(_family(['a', 'b'], category=_PN), _PN)),
+        ], previous=prev, stamp=_CUR)
+
+        assert cur['clusters'][0]['lineage']['status'] == 'new'
+        assert cur['regrowth']['dissolved'] == [
+            {'cluster_key': 'a', 'category': _PK, 'size': 2},
+        ]
+
+
+class TestComparability:
+    def _reasons(self, config, prev_kwargs=None, cur_kwargs=None, prev_plans=None):
+        prev = _build(config, prev_plans or [
+            ('prev.json', _plan(_family(['a', 'b']), **(prev_kwargs or {}))),
+        ], stamp=_PREV)
+        cur = _build(config, [
+            ('cur.json', _plan(_family(['a', 'b']), **(cur_kwargs or {}))),
+        ], previous=prev, stamp=_CUR)
+        return cur['categories'][_PK]['incomparable_reasons'], cur
+
+    def test_matching_runs_are_comparable(self, config) -> None:
+        assert self._reasons(config)[0] == []
+
+    @pytest.mark.parametrize(('prev_kwargs', 'cur_kwargs', 'reason'), [
+        ({}, {'truncated': 1}, 'scan_truncated'),
+        ({'truncated': 1}, {}, 'scan_truncated'),
+        ({'scan_limit': 5000}, {'scan_limit': 4000}, 'scan_limit_changed'),
+        ({'threshold': 0.85}, {'threshold': 0.8}, 'lexical_threshold_changed'),
+        ({'ann_threshold_by_category': {_PK: 0.839}},
+         {'ann_threshold_by_category': {_PK: 0.85}}, 'ann_cutoff_changed'),
+    ])
+    def test_each_changed_condition_is_disclosed(
+        self, config, prev_kwargs, cur_kwargs, reason,
+    ) -> None:
+        assert self._reasons(config, prev_kwargs, cur_kwargs)[0] == [reason]
+
+    def test_a_legacy_previous_run_makes_coverage_unknown(self, config) -> None:
+        legacy = _legacy_plan(_PK, [{'member_ids': ['a', 'b']}], ann_cutoff=0.839)
+
+        reasons, _cur = self._reasons(
+            config, cur_kwargs={'ann_threshold_by_category': {_PK: 0.839}},
+            prev_plans=[('t0-pk.json', legacy)],
+        )
+
+        assert reasons == ['coverage_unknown']
+
+    def test_a_category_the_previous_run_lacks_is_disclosed(self, config) -> None:
+        prev = _build(config, [('prev.json', _plan(_family(['a', 'b'])))], stamp=_PREV)
+        cur = _build(config, [
+            ('cur-pk.json', _plan(_family(['a', 'b']))),
+            ('cur-pn.json', _plan(_family(['c', 'd'], category=_PN), _PN)),
+        ], previous=prev, stamp=_CUR)
+
+        assert cur['categories'][_PN]['incomparable_reasons'] == ['previous_missing_category']
+        assert cur['categories'][_PK]['incomparable_reasons'] == []
+
+    def test_reasons_are_sorted_and_the_diff_is_still_computed(self, config) -> None:
+        reasons, cur = self._reasons(
+            config, cur_kwargs={'truncated': 1, 'scan_limit': 4000, 'threshold': 0.8},
+        )
+
+        assert reasons == sorted(reasons) == [
+            'lexical_threshold_changed', 'scan_limit_changed', 'scan_truncated',
+        ]
+        assert cur['clusters'][0]['lineage']['status'] == 'unchanged'
+
+
+class TestOverdueAndChildDeltas:
+    def test_a_previous_report_older_than_twice_the_cadence_is_overdue(self, config) -> None:
+        _prev, late = _runs(config, _family(['a', 'b']), _family(['a', 'b']),
+                            prev_stamp='20261018T063000Z')
+        _prev, on_time = _runs(config, _family(['a', 'b']), _family(['a', 'b']))
+
+        assert late['regrowth']['previous_overdue'] is True
+        assert on_time['regrowth']['previous_overdue'] is False
+
+    def test_each_child_ranking_row_carries_its_previous_count_and_delta(
+        self, config,
+    ) -> None:
+        _prev, cur = _runs(
+            config,
+            [_rec('p', 'venv', 0, _BEFORE_PREV),
+             _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting')],
+            [_rec('p', 'venv', 0, _BEFORE_PREV),
+             _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting'),
+             _rec('s2', 'venv', 2, _AFTER_PREV, parent_id='p', kind='sighting'),
+             _rec('s3', 'stash', 0, _AFTER_PREV, parent_id='q', kind='sighting')],
+        )
+
+        assert cur['child_rankings']['sighting'] == [
+            {'parent_id': 'p', 'count': 2, 'previous_count': 1, 'delta': 1},
+            {'parent_id': 'q', 'count': 1, 'previous_count': 0, 'delta': 1},
+        ]
+
+
+class TestWarmLaneShape:
+    def test_an_unstamped_cluster_grows_beside_a_stamped_canonical_singleton(
+        self, config,
+    ) -> None:
+        canonical = _rec('w', 'stash', 0, _BEFORE_PREV, topic='warm-lane', canonical=True)
+        old = [f'r{n}' for n in range(7)]
+        _prev, cur = _runs(
+            config,
+            [canonical, *_family(old)],
+            [canonical, *_family(old),
+             _rec('r7', 'venv', 7, _AFTER_PREV), _rec('r8', 'venv', 8, _AFTER_PREV)],
+        )
+
+        (cluster,) = cur['clusters']
+        assert 'w' not in cluster['member_ids']
+        assert cluster['topics'] == []
+        assert cluster['size'] == 9
+        assert cluster['lineage']['status'] == 'grew'
+        assert cluster['lineage']['added_member_ids'] == ['r7', 'r8']
+        assert cluster['lineage']['added_by_age']['re_emitted'] == 2
+        assert cur['regrowth']['re_emitted_members'] == 2
