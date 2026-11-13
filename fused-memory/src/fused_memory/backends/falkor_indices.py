@@ -124,8 +124,9 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
@@ -352,7 +353,7 @@ class IndexHeaderShapeError(ValueError):
     """
 
 
-def resolve_header_positions(header, wanted: dict[str, str]) -> dict[str, int]:
+def resolve_header_positions(header, wanted: Mapping[str, str]) -> dict[str, int]:
     """Map each wanted output key to the position of its named FalkorDB column.
 
     The single home for by-name column resolution over a ``CALL db.indexes()``
@@ -411,13 +412,13 @@ INDEX_DEFINITION_QUERY = (
 
 #: The output keys of a ``list_indices()`` record, mapped to the FalkorDB
 #: ``CALL db.indexes()`` column names they are read from.
-INDEX_RECORD_COLUMNS = {
+INDEX_RECORD_COLUMNS: Mapping[str, str] = MappingProxyType({
     'label': 'label',
     'field': 'properties',
     'type': 'types',
     'entity_type': 'entitytype',
     'status': 'status',
-}
+})
 
 
 def index_records_from_rows(header, rows) -> list[dict]:
