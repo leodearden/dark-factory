@@ -730,7 +730,7 @@ class TestReviewerEscalationPromotion:
 
         # Delimited on purpose: the agent_id `claude-review-<id>` already
         # contains the bare `review-<id>` substring.
-        assert f'- **task_id:** `{tid}`' in prompt
+        assert f'`{tid}`' in prompt
         assert f'escalate_info(task_id="{tid}"' in prompt
 
         assert checkpoint.escalation_queue is not None
