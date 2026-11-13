@@ -30,6 +30,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from shared.project_id import fold_project_token
+from shared.task_statuses import TERMINAL as TERMINAL_TASK_STATUSES
 
 # Bind scripts/ and orchestrator/ to THIS checkout, never an editable install's (tasks 2881/2882).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -85,7 +86,7 @@ CARVEOUT_ACTION = 'resume'
 CARVEOUT_RESOLVED_BY = 'sitting-preparer'
 CARVEOUT_RESOLUTION_TURNS = 1
 """A carve-out close takes one preparer turn and no Leo turn."""
-OWNER_RELEASE_STATUSES: tuple[str, ...] = tuple(sorted(ownership.TERMINAL_TASK_STATUSES))
+OWNER_RELEASE_STATUSES: tuple[str, ...] = tuple(sorted(TERMINAL_TASK_STATUSES))
 PIN_RELEASE = Manual('a human spends the pin (acknowledge_declared_pins) or withdraws it')
 
 DEFAULT_PREPARATION = _REPO_ROOT / preparations.DEFAULT_PREPARATION_PATH
