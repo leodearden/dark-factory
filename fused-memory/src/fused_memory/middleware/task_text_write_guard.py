@@ -52,12 +52,24 @@ class PlannedTextWrite:
         )
 
     @property
-    def fields(self) -> tuple[str, ...]:
+    def appends_onto_description(self) -> bool:
+        return self.description is not None and self.details_appends
+
+    @property
+    def written(self) -> tuple[tuple[str, str, bool], ...]:
+        """``(field, payload, appended)`` per written field, description first."""
         return tuple(
-            name
-            for name, payload in (('description', self.description), ('details', self.details))
+            (name, payload, appended)
+            for name, payload, appended in (
+                ('description', self.description, False),
+                ('details', self.details, self.details_appends),
+            )
             if payload is not None
         )
+
+    @property
+    def fields(self) -> tuple[str, ...]:
+        return tuple(name for name, _payload, _appended in self.written)
 
 
 def plan_text_write(update_kwargs: Mapping[str, Any]) -> PlannedTextWrite:
@@ -108,7 +120,14 @@ def check_text_base(
     task_id: str,
     agent_id: str | None,
 ) -> TextBaseRejection | None:
-    if not write.writes_text:
+    """Judge a write's declared text base against the live ``before`` read.
+
+    ``append`` onto ``description`` is left to the backend floor, the single
+    home of that rule
+    (``backends/sqlite_task_backend.py::_reject_append_on_replace_only_fields``),
+    so the caller hears the real problem first.
+    """
+    if not write.writes_text or write.appends_onto_description:
         return None
     if expected_text_fp is not None and expected_text_fp != text_fp_of(before):
         return TextBaseRejection(
@@ -142,6 +161,7 @@ class TextFieldVerification:
     field: str
     confirmed: bool
     appended: bool
+    readback_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,14 +173,22 @@ class TextWriteVerification:
         return all(field.confirmed for field in self.fields)
 
     @property
+    def unconfirmed(self) -> tuple[TextFieldVerification, ...]:
+        return tuple(field for field in self.fields if not field.confirmed)
+
+    @property
     def unconfirmed_fields(self) -> tuple[str, ...]:
-        return tuple(field.field for field in self.fields if not field.confirmed)
+        return tuple(field.field for field in self.unconfirmed)
 
     def to_result_keys(self) -> dict[str, Any]:
         return {
             TEXT_VERIFIED_KEY: self.confirmed,
             'text_verification': {
-                field.field: {'confirmed': field.confirmed, 'appended': field.appended}
+                field.field: {
+                    'confirmed': field.confirmed,
+                    'appended': field.appended,
+                    'readback_error': field.readback_error,
+                }
                 for field in self.fields
             },
         }
@@ -189,10 +217,6 @@ def verify_text_write(after: object, write: PlannedTextWrite) -> TextWriteVerifi
     if not write.writes_text:
         return None
     stored = after if isinstance(after, Mapping) else {}
-    written = (
-        ('description', write.description, False),
-        ('details', write.details, write.details_appends),
-    )
     return TextWriteVerification(
         fields=tuple(
             TextFieldVerification(
@@ -200,8 +224,18 @@ def verify_text_write(after: object, write: PlannedTextWrite) -> TextWriteVerifi
                 confirmed=_landed(stored.get(field), payload, appended),
                 appended=appended,
             )
-            for field, payload, appended in written
-            if payload is not None
+            for field, payload, appended in write.written
+        ),
+    )
+
+
+def _unread(write: PlannedTextWrite) -> TextWriteVerification:
+    return TextWriteVerification(
+        fields=tuple(
+            TextFieldVerification(
+                field=field, confirmed=False, appended=appended, readback_error=True,
+            )
+            for field, _payload, appended in write.written
         ),
     )
 
@@ -211,11 +245,15 @@ class TextWriteUnconfirmedFinding:
     task_id: str
     project_id: str
     op: str
-    unconfirmed_fields: tuple[str, ...]
+    unconfirmed: tuple[TextFieldVerification, ...]
     flag_type: str = TEXT_WRITE_UNCONFIRMED_FLAG_TYPE
 
+    @property
+    def unconfirmed_fields(self) -> tuple[str, ...]:
+        return tuple(field.field for field in self.unconfirmed)
 
-GetTaskFn = Callable[[str, str], Awaitable[Any]]
+
+GetTaskFn = Callable[[str, str, str | None], Awaitable[Any]]
 FileTextFindingFn = Callable[[TextWriteUnconfirmedFinding], Awaitable[None]]
 
 
@@ -225,6 +263,7 @@ async def verify_text_write_landed(
     task_id: str,
     project_id: str,
     project_root: str,
+    tag: str | None,
     write: PlannedTextWrite,
     get_task: GetTaskFn,
     file_finding: FileTextFindingFn | None = None,
@@ -232,20 +271,24 @@ async def verify_text_write_landed(
     """Annotate an already-succeeded write with whether its text reads back.
 
     Best-effort by contract: an after-read or filer failure is logged and
-    swallowed, never turning a landed write into an error for the caller.
+    swallowed, never turning a landed write into an error for the caller. A
+    failed after-read is an unconfirmed write, reported and filed as one.
     """
     if not write.writes_text:
         return dict(result)
+    verification: TextWriteVerification | None
     try:
-        verification = verify_text_write(await get_task(task_id, project_root), write)
+        after = await get_task(task_id, project_root, tag)
     except Exception:
         logger.exception(
             'task_text_write_guard: readback failed for task_id=%r project_id=%r; '
-            'write already succeeded, returning it unverified',
+            'write already succeeded, reporting it unverified',
             task_id,
             project_id,
         )
-        return dict(result)
+        verification = _unread(write)
+    else:
+        verification = verify_text_write(after, write)
     if verification is None:
         return dict(result)
     annotated = {**result, **verification.to_result_keys()}
@@ -256,7 +299,7 @@ async def verify_text_write_landed(
                     task_id=task_id,
                     project_id=project_id,
                     op='update_task',
-                    unconfirmed_fields=verification.unconfirmed_fields,
+                    unconfirmed=verification.unconfirmed,
                 ),
             )
         except Exception:

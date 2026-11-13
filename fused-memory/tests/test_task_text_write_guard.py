@@ -26,6 +26,7 @@ from fused_memory.middleware.task_text_write_guard import (
     TEXT_BASE_REQUIRED,
     TEXT_BASE_STALE,
     TEXT_VERIFIED_KEY,
+    TextFieldVerification,
     TextWriteUnconfirmedFinding,
     check_text_base,
     plan_text_write,
@@ -118,6 +119,20 @@ class TestPlanTextWrite:
             _forwarded_kwargs(description='x', append=True),
         ).replaces_text is True
 
+    def test_only_append_alongside_a_description_appends_onto_it(self):
+        assert plan_text_write(
+            _forwarded_kwargs(description='x', append=True),
+        ).appends_onto_description is True
+        assert plan_text_write(_forwarded_kwargs(description='x')).appends_onto_description is False
+        assert plan_text_write(
+            _forwarded_kwargs(details='x', append=True),
+        ).appends_onto_description is False
+
+    def test_written_pairs_each_payload_with_its_mode(self):
+        write = plan_text_write(_forwarded_kwargs(description='s', details='d', append=True))
+
+        assert write.written == (('description', 's', False), ('details', 'd', True))
+
     def test_fields_are_listed_description_first(self):
         write = plan_text_write(_forwarded_kwargs(details='d', description='s'))
 
@@ -173,9 +188,14 @@ class TestCheckTextBase:
     def test_a_details_append_needs_no_token(self):
         assert _check(expected_text_fp=None, details='More.', append=True) is None
 
-    def test_a_description_write_needs_a_token_even_under_append(self):
+    def test_a_description_replace_needs_a_token(self):
         assert _check(expected_text_fp=None, description='New summary.') is not None
-        assert _check(expected_text_fp=None, description='New summary.', append=True) is not None
+
+    @pytest.mark.parametrize('expected_text_fp', [None, 'tfp:stale'])
+    def test_an_append_onto_description_is_left_to_the_backend_floor(self, expected_text_fp):
+        assert _check(
+            expected_text_fp=expected_text_fp, description='New summary.', append=True,
+        ) is None
 
     def test_a_prompt_replace_needs_a_token(self):
         assert _check(expected_text_fp=None, prompt='New body.') is not None
@@ -346,8 +366,8 @@ class TestVerifyTextWrite:
         assert verification.to_result_keys() == {
             'text_verified': False,
             'text_verification': {
-                'description': {'confirmed': True, 'appended': False},
-                'details': {'confirmed': False, 'appended': True},
+                'description': {'confirmed': True, 'appended': False, 'readback_error': False},
+                'details': {'confirmed': False, 'appended': True, 'readback_error': False},
             },
         }
 
@@ -361,6 +381,7 @@ async def _land(
     after: object = None,
     get_task: AsyncMock | None = None,
     file_finding: AsyncMock | None = None,
+    tag: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     return await verify_text_write_landed(
@@ -368,6 +389,7 @@ async def _land(
         task_id='3708',
         project_id='dark_factory',
         project_root='/project',
+        tag=tag,
         write=plan_text_write(_forwarded_kwargs(**kwargs)),
         get_task=get_task if get_task is not None else AsyncMock(return_value=after),
         file_finding=file_finding,
@@ -414,16 +436,27 @@ class TestVerifyTextWriteLanded:
         )
 
         assert landed['text_verified'] is False
-        get_task.assert_awaited_once_with('3708', '/project')
+        get_task.assert_awaited_once_with('3708', '/project', None)
         (filed,) = file_finding.await_args_list
         (finding,) = filed.args
         assert isinstance(finding, TextWriteUnconfirmedFinding)
         assert finding.task_id == '3708'
         assert finding.project_id == 'dark_factory'
         assert finding.op == 'update_task'
+        assert finding.unconfirmed == (
+            TextFieldVerification(field='details', confirmed=False, appended=False),
+        )
         assert finding.unconfirmed_fields == ('details',)
         assert finding.flag_type == 'task_text_write_unconfirmed'
         assert result == WRITE_RESULT
+
+    @pytest.mark.asyncio
+    async def test_the_readback_reads_the_written_tag(self):
+        get_task = AsyncMock(return_value={'details': NEW_PARAGRAPH})
+
+        await _land(dict(WRITE_RESULT), get_task=get_task, tag='feature', details=NEW_PARAGRAPH)
+
+        get_task.assert_awaited_once_with('3708', '/project', 'feature')
 
     @pytest.mark.asyncio
     async def test_an_unconfirmed_write_with_no_filer_is_still_annotated(self):
@@ -434,15 +467,29 @@ class TestVerifyTextWriteLanded:
         assert landed['text_verified'] is False
 
     @pytest.mark.asyncio
-    async def test_a_failing_after_read_returns_the_original_result(self, caplog):
+    async def test_a_failing_after_read_is_reported_and_filed_as_unconfirmed(self, caplog):
         result = dict(WRITE_RESULT)
+        file_finding = AsyncMock()
         get_task = AsyncMock(side_effect=RuntimeError('backend gone'))
 
         with caplog.at_level(logging.ERROR):
-            landed = await _land(result, get_task=get_task, details=NEW_PARAGRAPH)
+            landed = await _land(
+                result, get_task=get_task, file_finding=file_finding,
+                details=NEW_PARAGRAPH, append=True,
+            )
 
-        assert landed == WRITE_RESULT
+        assert landed['text_verified'] is False
+        assert landed['text_verification'] == {
+            'details': {'confirmed': False, 'appended': True, 'readback_error': True},
+        }
         assert 'backend gone' in caplog.text
+        (filed,) = file_finding.await_args_list
+        (finding,) = filed.args
+        assert finding.unconfirmed == (
+            TextFieldVerification(
+                field='details', confirmed=False, appended=True, readback_error=True,
+            ),
+        )
         assert result == WRITE_RESULT
 
     @pytest.mark.asyncio
@@ -629,6 +676,28 @@ class TestInterceptorTextBaseBoundary:
         taskmaster.update_task.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_a_recon_append_onto_description_reaches_the_backend_floor(
+        self, interceptor, taskmaster, live_row,
+    ):
+        await interceptor.update_task(
+            '4644', '/project', description='More.', append=True, agent_id=RECON_AGENT,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('agent_id', [RECON_AGENT, 'claude-interactive'])
+    async def test_the_before_read_reads_the_written_tag(
+        self, interceptor, taskmaster, live_row, agent_id,
+    ):
+        await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, tag='feature', agent_id=agent_id,
+            expected_text_fp=text_fp_of(live_row),
+        )
+
+        assert taskmaster.get_task.await_args_list[0].args == ('4644', '/project', 'feature')
+
+    @pytest.mark.asyncio
     async def test_the_token_reaches_neither_the_backend_nor_the_journal(
         self, interceptor, taskmaster, live_row,
     ):
@@ -666,6 +735,21 @@ class TestInterceptorTextVerificationBoundary:
 
         assert result['text_verified'] is True
         assert taskmaster.get_task.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_readback_reads_the_written_tag(self, interceptor, taskmaster):
+        before = _before_then_after(taskmaster, {**LIVE_ROW, 'details': NEW_PARAGRAPH})
+
+        result = await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, tag='feature', agent_id=RECON_AGENT,
+            expected_text_fp=text_fp_of(before),
+        )
+
+        assert result['text_verified'] is True
+        assert [call.args for call in taskmaster.get_task.await_args_list] == [
+            ('4644', '/project', 'feature'),
+            ('4644', '/project', 'feature'),
+        ]
 
     @pytest.mark.asyncio
     async def test_the_old_paragraph_reading_back_is_unverified(self, interceptor, taskmaster):

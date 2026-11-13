@@ -5764,6 +5764,7 @@ class TaskInterceptor:
         # outside the lock.
         is_recon_stage_write = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
         text_write = task_text_write_guard.plan_text_write(kwargs)
+        tag = kwargs.get('tag')
         before: dict[str, Any] | None = None
         async with self._write_lock(project_id):
             # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
@@ -5788,7 +5789,7 @@ class TaskInterceptor:
                 # boolean, matching the recon_write_policy.check(agent_id: str)
                 # signature below.
                 assert isinstance(agent_id, str)
-                before = await tm.get_task(task_id, project_root)
+                before = await tm.get_task(task_id, project_root, tag)
                 # Awaited, not inline (task 3778): check() is a coroutine
                 # function now, so an un-awaited call would evaluate
                 # `.is_rejection` on a coroutine object — never a rejection —
@@ -5857,7 +5858,7 @@ class TaskInterceptor:
                     return err
 
             if before is None and expected_text_fp is not None:
-                before = await tm.get_task(task_id, project_root)
+                before = await tm.get_task(task_id, project_root, tag)
             if rejection := task_text_write_guard.check_text_base(
                 before=before,
                 write=text_write,
@@ -5929,6 +5930,7 @@ class TaskInterceptor:
                     task_id=task_id,
                     project_id=project_id,
                     project_root=project_root,
+                    tag=tag,
                     write=text_write,
                     get_task=tm.get_task,
                     file_finding=self._text_write_unconfirmed_filer,
