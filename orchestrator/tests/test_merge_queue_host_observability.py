@@ -46,6 +46,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfi
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane.types import (
+    InflightStatus,
     LandingCandidate,
     PendingGate,
     QueuedBranch,
@@ -1123,6 +1124,16 @@ def _parked_gate(req: MergeRequest, task: asyncio.Task[Any], git_repo: Path) -> 
     )
 
 
+def _released_at_verdict(
+    req: MergeRequest, verdict_host: str, verify_task: asyncio.Task[Any],
+) -> InflightEntry:
+    """An entry whose verify returned its verdict and released its lease."""
+    entry = _make_entry(req, None, verify_task=verify_task)
+    entry.status = InflightStatus.VERIFIED_PENDING_LANDING
+    entry.verdict_host = verdict_host
+    return entry
+
+
 def _lease_wire(
     req: MergeRequest, host: str, activity: str, *, host_quarantined: bool = False,
 ) -> dict:
@@ -1172,6 +1183,59 @@ class TestOccupancyLeaseFidelity:
         assert occ['hosts_busy'] == 2
         assert occ['inflight_total'] == 2
         assert msg.endswith(' | verifying 1/2 hosts: local=occ-run laptop=occ-done(finished)'), msg
+
+    async def test_entry_released_at_verdict_reads_verified_pending_landing(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """Task 8526: a verdict releases its lease; the entry awaits landing.
+
+        It is still a frontier member, so it is a lease row and counts in
+        inflight_total, but its host is free: lease occupancy leaves it out.
+        """
+        worker, _alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'vpl')
+        req_local = _make_req('occ-run', 'task/occ-run', config, git_repo)
+        req_done = _make_req('occ-done', 'task/occ-done', config, git_repo)
+        async with _VerifyTasks() as tasks:
+            released = _released_at_verdict(req_done, 'laptop', await tasks.finished())
+            _seat(
+                worker,
+                _make_entry(req_local, _local_lease(), verify_task=tasks.running()),
+                released,
+            )
+            occ = worker.snapshot()['occupancy']
+            msg = _logged_heartbeat(worker, caplog)
+
+        assert occ['leases'] == [
+            _lease_wire(req_local, 'local', 'verifying'),
+            _lease_wire(req_done, 'laptop', 'verified_pending_landing'),
+        ]
+        assert occ['inflight_total'] == 2
+        assert occ['by_host'] == {'local': 'occ-run'}
+        assert occ['inflight_by_host'] == {'local': ['occ-run']}
+        assert occ['hosts_busy'] == 1
+        assert occ['verifying_by_host'] == {'local': ['occ-run']}
+        assert msg.endswith(
+            ' | verifying 1/2 hosts: local=occ-run laptop=occ-done(verified_pending_landing)'
+        ), msg
+
+    @pytest.mark.parametrize('benched', [False, True], ids=['host-up', 'host-benched'])
+    async def test_released_entry_flags_a_benched_verdict_host(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+        benched: bool,
+    ) -> None:
+        """The released row names its verdict host, so a bench since then shows."""
+        worker, alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'vplq')
+        if benched:
+            await _quarantine_remote(alloc, 'laptop')
+        req = _make_req('occ-vq', 'task/occ-vq', config, git_repo)
+        async with _VerifyTasks() as tasks:
+            _seat(worker, _released_at_verdict(req, 'laptop', await tasks.finished()))
+            occ = worker.snapshot()['occupancy']
+
+        assert occ['leases'] == [
+            _lease_wire(req, 'laptop', 'verified_pending_landing', host_quarantined=benched),
+        ]
+        assert occ['hosts_busy'] == 0
 
     @pytest.mark.parametrize(
         ('dispatch_in_flight', 'activity', 'verifying_by_host', 'segment'),
