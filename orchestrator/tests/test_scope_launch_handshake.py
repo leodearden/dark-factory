@@ -112,14 +112,13 @@ class TestLifecycle:
 
     def test_failed_spawn_leaks_no_fd(self, tmp_path) -> None:
         before = _open_fds()
-        with ScopeLaunchHandshake() as handshake:
-            with pytest.raises(FileNotFoundError):
-                subprocess.run(
-                    ['/bin/bash', '-c', handshake.payload('true')],
-                    pass_fds=handshake.pass_fds,
-                    cwd=tmp_path / 'missing',
-                    check=False,
-                )
+        with ScopeLaunchHandshake() as handshake, pytest.raises(FileNotFoundError):
+            subprocess.run(
+                ['/bin/bash', '-c', handshake.payload('true')],
+                pass_fds=handshake.pass_fds,
+                cwd=tmp_path / 'missing',
+                check=False,
+            )
         assert _open_fds() == before
 
     def test_release_writer_is_idempotent(self) -> None:
