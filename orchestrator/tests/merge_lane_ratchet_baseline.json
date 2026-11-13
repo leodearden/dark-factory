@@ -1498,6 +1498,7 @@
     "orchestrator/tests/test_merge_lane_no_progress_abort.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_package.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_parked_custody.py": {"patch_targets": [], "private_reads": 0},
+    "orchestrator/tests/test_merge_lane_pool_recording.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_rebased_head.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_relane.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_remerge_base.py": {"patch_targets": [], "private_reads": 0},
