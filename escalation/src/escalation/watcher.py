@@ -13,9 +13,9 @@ Exit-code contract:
   124  — --timeout expired; nothing printed (coreutils convention).
   0    — SIGTERM received (treated as a clean shutdown).
 
-Startup order: `main` arms the inotify watch BEFORE handing it to `watch`,
-which runs the initial filesystem scan before polling, so no events are
-missed in the gap between the two.  If a pending match is found during the
+Startup order: `main` arms the inotify watch (`armed_source`) BEFORE handing
+it to `watch`, which runs the initial filesystem scan before polling, so no
+events are missed in the gap between the two.  If a pending match is found during the
 scan, it is emitted immediately and the event loop is never entered.
 
 Load-bearing invariants (callers MUST rely on these):
@@ -44,7 +44,7 @@ Load-bearing invariants (callers MUST rely on these):
       `python -m escalation.watcher` run rather than by grace of
       `logging.lastResort` — which anything configuring a root handler
       in-process would take away.
-      That line is also the only way to COUNT an outage: `_emit` runs at most
+      That line is also the only way to COUNT an outage: `emit` runs at most
       once per process (its one call site in `main` exits on the next line), so a
       process-local integer could never read more than 1 — the aggregate is
       taken across the re-arm loop's stderr instead.  The marker deliberately
@@ -62,7 +62,8 @@ import signal
 import sys
 import time
 import urllib.request
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -230,7 +231,7 @@ def _send_ntfy(url: str, escalation: Escalation) -> None:
     urllib.request.urlopen(ntfy_request(url, escalation))
 
 
-def _emit(
+def emit(
     esc: Escalation,
     ntfy_url: str | None,
     *,
@@ -256,6 +257,18 @@ class EventSource(Protocol):
     def read(self, timeout: int | None = None) -> Iterable[Event]: ...
 
 
+@contextmanager
+def armed_source(queue_dir: Path) -> Iterator[INotify]:
+    """Yield an inotify source armed on `queue_dir` for every arrival.
+
+    An arrival is renamed in (MOVED_TO, as invariant (a)'s writers do) or
+    created in place (CREATE).
+    """
+    with INotify() as inotify:
+        inotify.add_watch(str(queue_dir), flags.CREATE | flags.MOVED_TO)
+        yield inotify
+
+
 def _read_timeout_ms(deadline: float | None, clock: Callable[[], float]) -> int | None:
     """Milliseconds left before `deadline`, floored at 0; None blocks indefinitely."""
     if deadline is None:
@@ -263,7 +276,7 @@ def _read_timeout_ms(deadline: float | None, clock: Callable[[], float]) -> int 
     return max(0, int((deadline - clock()) * 1000))
 
 
-def _first_matching_event(
+def _first_matching_escalation(
     queue_dir: Path,
     events: Iterable[Event],
     task_id: str | None,
@@ -299,8 +312,8 @@ def watch(
 ) -> Escalation | None:
     """Return the first pending escalation matching the filters, or None once `timeout` expires.
 
-    `source` must already be armed on `queue_dir`, so nothing filed during the
-    initial scan is missed.  `current_excludes` is called before the scan and
+    `source` must already be armed on `queue_dir` (see `armed_source`), so
+    nothing filed during the initial scan is missed.  `current_excludes` is called before the scan and
     once per poll, and the `timeout` deadline is measured from the end of the
     scan.
     """
@@ -318,7 +331,7 @@ def watch(
         if deadline is not None and not events:
             return None
 
-        match = _first_matching_event(queue_dir, events, task_id, level, current_excludes())
+        match = _first_matching_escalation(queue_dir, events, task_id, level, current_excludes())
         if match is not None:
             return match
 
@@ -375,11 +388,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # Baseline is frozen ONCE here, BEFORE inotify is armed, so the race
     # window falls on the safe side: an escalation filed between this
-    # snapshot and add_watch() below is absent from the snapshot (so it is
+    # snapshot and armed_source() below is absent from the snapshot (so it is
     # not permanently excluded) and, since no watch is armed yet, generates
     # no inotify event either -- but it is still on disk by the time the
     # initial scan below runs, so the scan's own directory glob picks it up
-    # and fires on it normally. Snapshotting AFTER add_watch() instead would
+    # and fires on it normally. Snapshotting AFTER arming instead would
     # let such an item be captured by the snapshot (permanently excluded)
     # while ALSO queuing an inotify event that gets silently dropped as an
     # excluded id -- i.e. a genuinely new item swallowed for the run's
@@ -391,16 +404,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     # ARM inotify so no events are missed between the scan and the watch.
-    with INotify() as inotify:
-        inotify.add_watch(str(queue_dir), flags.CREATE | flags.MOVED_TO)
+    with armed_source(queue_dir) as source:
         match = watch(
-            queue_dir, inotify, task_id=args.task_id, level=args.level, timeout=args.timeout,
+            queue_dir, source, task_id=args.task_id, level=args.level, timeout=args.timeout,
             current_excludes=current_excludes, clock=time.monotonic,
         )
 
     if match is None:
         sys.exit(124)
-    _emit(match, args.ntfy_url)
+    emit(match, args.ntfy_url)
     sys.exit(0)
 
 
