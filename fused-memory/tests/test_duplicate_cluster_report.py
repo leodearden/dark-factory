@@ -211,6 +211,11 @@ def _build(config, plans, previous=None, *, stamp=_STAMP, project_id='dark_facto
     return report.build_report(project_id, stamp, plans, config=config, previous=previous)
 
 
+def _project(entry: dict, keys: dict | set) -> dict:
+    """*entry* cut down to *keys*, so an inventory assertion ignores the diff's fields."""
+    return {k: entry[k] for k in keys if k in entry}
+
+
 def _cluster_by_member(rep: dict, member_id: str) -> dict:
     (cluster,) = [c for c in rep['clusters'] if member_id in c['member_ids']]
     return cluster
@@ -310,20 +315,22 @@ class TestCategoryCoverage:
 
         categories = _build(config, [('pk.json', pk), ('t0-os.json', legacy)])['categories']
 
-        assert categories[_PK] == {
+        expected_pk = {
             'scan_coverage': {'scanned': 5000, 'truncated': 1, 'scan_limit': 5000},
             'coverage_known': True,
             'lexical_threshold': 0.85,
             'ann_cutoff': 0.839,
             'source': 'pk.json',
         }
-        assert categories[_OS] == {
+        expected_os = {
             'scan_coverage': None,
             'coverage_known': False,
             'lexical_threshold': 0.85,
             'ann_cutoff': 0.8868,
             'source': 't0-os.json',
         }
+        assert _project(categories[_PK], expected_pk) == expected_pk
+        assert _project(categories[_OS], expected_os) == expected_os
 
     def test_a_swept_category_without_clusters_is_still_listed(self, config) -> None:
         rep = _build(config, [('pn.json', _plan([], _PN))])
@@ -381,13 +388,17 @@ class TestChildRankings:
 
         rep = _build(config, [('pk.json', pk), ('pn.json', pn)])
 
+        rankings = {
+            kind: [_project(row, {'parent_id', 'count'}) for row in rows]
+            for kind, rows in rep['child_rankings'].items()
+        }
         assert rep['child_counts_known'] is True
-        assert rep['child_rankings']['sighting'] == [
+        assert rankings['sighting'] == [
             {'parent_id': 'q', 'count': 3},
             {'parent_id': 'p', 'count': 2},
             {'parent_id': 'r', 'count': 1},
         ]
-        assert rep['child_rankings']['amendment'] == [{'parent_id': 'q', 'count': 1}]
+        assert rankings['amendment'] == [{'parent_id': 'q', 'count': 1}]
 
     def test_a_legacy_plan_makes_the_child_counts_unknown(self, config) -> None:
         rep = _build(config, [
@@ -410,8 +421,8 @@ _AFTER_PREV = '2026-11-10T00:00:00+00:00'
 
 
 def _family(ids: list[str], family: str = 'venv', created_at: str = _BEFORE_PREV,
-            **kwargs: object) -> list[dict]:
-    return [_rec(i, family, n, created_at, **kwargs) for n, i in enumerate(ids)]
+            *, category: str = _PK) -> list[dict]:
+    return [_rec(i, family, n, created_at, category=category) for n, i in enumerate(ids)]
 
 
 def _runs(config, prev_records, cur_records, *, prev_stamp=_PREV, cur_stamp=_CUR,

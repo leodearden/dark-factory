@@ -22,11 +22,15 @@ store access.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from shared.memory_eval_metrics import stamp_datetime
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'config' / 'duplicate-audit.yaml'
@@ -223,9 +227,13 @@ def build_report(
     config: DuplicateAuditConfig,
     previous: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Assemble one project's report from its per-category detector plans."""
+    """Assemble one project's report from its per-category detector plans.
+
+    With *previous* (that project's prior report) the report is also diffed
+    against it; see ``diff_against_previous``.
+    """
     bare_plans = [plan for _source, plan in plans]
-    return {
+    inventory = {
         'schema_version': SCHEMA_VERSION,
         'project_id': project_id,
         'run_stamp': stamp,
@@ -245,4 +253,354 @@ def build_report(
         'retained_carveout': _summed_retained_carveout(bare_plans),
         'child_rankings': merge_child_counts(bare_plans),
         'child_counts_known': all('child_counts' in plan for plan in bare_plans),
+    }
+    return {**inventory, **diff_against_previous(inventory, previous, config=config)}
+
+
+# ---------------------------------------------------------------------------
+# The consecutive-run regrowth diff: candidate-cluster lineage, not topics
+# ---------------------------------------------------------------------------
+
+class LineageStatus(Enum):
+    BASELINE = 'baseline'
+    """No previous report to diff against."""
+    NEW = 'new'
+    """Overlaps no previous cluster of its category."""
+    UNCHANGED = 'unchanged'
+    GREW = 'grew'
+    """Gained at least one member (it may also have lost some: size_delta is the net)."""
+    SHRANK = 'shrank'
+    """Lost members and gained none."""
+    SPLIT = 'split'
+    """Overlaps a previous cluster whose key a larger overlap inherited."""
+
+
+class MemberAge(Enum):
+    RE_EMITTED = 're_emitted'
+    """Created after the previous run: regrowth."""
+    PREEXISTING = 'preexisting'
+    """Created before the previous run and newly detected: not regrowth."""
+    UNKNOWN = 'unknown'
+
+
+class Incomparable(Enum):
+    PREVIOUS_MISSING_CATEGORY = 'previous_missing_category'
+    COVERAGE_UNKNOWN = 'coverage_unknown'
+    SCAN_TRUNCATED = 'scan_truncated'
+    SCAN_LIMIT_CHANGED = 'scan_limit_changed'
+    LEXICAL_THRESHOLD_CHANGED = 'lexical_threshold_changed'
+    ANN_CUTOFF_CHANGED = 'ann_cutoff_changed'
+
+
+@dataclass(frozen=True)
+class Lineage:
+    """One current cluster's relation to the previous report's clusters."""
+
+    cluster_key: str
+    status: LineageStatus
+    previous_key: str | None = None
+    split_from: str | None = None
+    overlapped_previous_keys: tuple[str, ...] = ()
+    added_member_ids: tuple[Any, ...] = ()
+    departed_member_ids: tuple[Any, ...] = ()
+    size_delta: int | None = None
+
+
+def _min_member_key(member_ids: Iterable[Any]) -> str:
+    return min(str(m) for m in member_ids)
+
+
+def _overlaps(
+    current: Sequence[Mapping[str, Any]], previous: Sequence[Mapping[str, Any]],
+) -> dict[int, list[tuple[int, str]]]:
+    """``{current index: [(overlap, previous key)]}``, within a category only, largest first."""
+    by_category: dict[Any, list[Mapping[str, Any]]] = {}
+    for cluster in previous:
+        by_category.setdefault(cluster['category'], []).append(cluster)
+    found: dict[int, list[tuple[int, str]]] = {}
+    for index, cluster in enumerate(current):
+        members = set(cluster['member_ids'])
+        hits = [
+            (len(members & set(prior['member_ids'])), prior['cluster_key'])
+            for prior in by_category.get(cluster['category'], ())
+        ]
+        found[index] = sorted(((n, key) for n, key in hits if n), key=lambda t: (-t[0], t[1]))
+    return found
+
+
+def _inherit_greedily(overlaps: Mapping[int, list[tuple[int, str]]]) -> dict[int, str]:
+    """Hand each previous key to at most one current cluster, largest overlap first."""
+    ranked = sorted(
+        ((n, key, index) for index, hits in overlaps.items() for n, key in hits),
+        key=lambda t: (-t[0], t[1], t[2]),
+    )
+    inherited: dict[int, str] = {}
+    taken: set[str] = set()
+    for _n, key, index in ranked:
+        if index not in inherited and key not in taken:
+            inherited[index] = key
+            taken.add(key)
+    return inherited
+
+
+def _fresh_key(member_ids: Iterable[Any], taken: set[str], stamp: str) -> str:
+    """A newborn cluster's key: its minimum member id, stamped if an inherited key holds it."""
+    key = _min_member_key(member_ids)
+    return key if key not in taken else f'{key}@{stamp}'
+
+
+def _compared_lineage(
+    cluster: Mapping[str, Any], reference: Mapping[str, Any], *, key: str, split: bool,
+    overlapped: tuple[str, ...],
+) -> Lineage:
+    """Compare *cluster* with the previous cluster it inherits from, or split off from.
+
+    ``size_delta`` is the net change against *reference*.
+    """
+    current_ids = list(cluster['member_ids'])
+    previous_ids = list(reference['member_ids'])
+    current_set, previous_set = set(current_ids), set(previous_ids)
+    added = tuple(m for m in current_ids if m not in previous_set)
+    size_delta = len(current_ids) - len(previous_ids)
+    if split:
+        return Lineage(
+            cluster_key=key, status=LineageStatus.SPLIT, split_from=reference['cluster_key'],
+            overlapped_previous_keys=overlapped, added_member_ids=added, size_delta=size_delta,
+        )
+    departed = tuple(m for m in previous_ids if m not in current_set)
+    status = (LineageStatus.GREW if added else
+              LineageStatus.SHRANK if departed else LineageStatus.UNCHANGED)
+    return Lineage(
+        cluster_key=key, status=status, previous_key=reference['cluster_key'],
+        overlapped_previous_keys=overlapped, added_member_ids=added,
+        departed_member_ids=departed, size_delta=size_delta,
+    )
+
+
+def match_lineage(
+    current: Sequence[Mapping[str, Any]],
+    previous: Sequence[Mapping[str, Any]] | None,
+    *,
+    stamp: str,
+) -> list[Lineage]:
+    """Relate each current cluster to the previous report's clusters, by member overlap.
+
+    Matching never crosses a category. Each previous key is inherited at most
+    once, greedily by descending overlap with ties to the lower key, so a
+    merge keeps the larger contributor's key and a split leaves the key on
+    its larger piece. A cluster keeps the key it was born with (its minimum
+    member id) for as long as the matches carry it forward.
+    """
+    if previous is None:
+        return [
+            Lineage(cluster_key=_min_member_key(c['member_ids']), status=LineageStatus.BASELINE)
+            for c in current
+        ]
+    by_key = {prior['cluster_key']: prior for prior in previous}
+    overlaps = _overlaps(current, previous)
+    inherited = _inherit_greedily(overlaps)
+    taken = set(inherited.values())
+    lineages = []
+    for index, cluster in enumerate(current):
+        overlapped = tuple(sorted(key for _n, key in overlaps[index]))
+        if index in inherited:
+            lineages.append(_compared_lineage(
+                cluster, by_key[inherited[index]], key=inherited[index], split=False,
+                overlapped=overlapped,
+            ))
+            continue
+        key = _fresh_key(cluster['member_ids'], taken, stamp)
+        taken.add(key)
+        if overlaps[index]:
+            lineages.append(_compared_lineage(
+                cluster, by_key[overlaps[index][0][1]], key=key, split=True,
+                overlapped=overlapped,
+            ))
+        else:
+            lineages.append(Lineage(
+                cluster_key=key, status=LineageStatus.NEW,
+                added_member_ids=tuple(cluster['member_ids']),
+                size_delta=len(cluster['member_ids']),
+            ))
+    return lineages
+
+
+def _created_moment(created_at: Any) -> datetime | None:
+    if not isinstance(created_at, str) or not created_at:
+        return None
+    try:
+        moment = datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def classify_added(
+    added_ids: Iterable[Any],
+    members: Sequence[Mapping[str, Any]] | None,
+    previous_stamp: datetime,
+) -> dict[str, int]:
+    """Count *added_ids* by age against the previous run's stamp."""
+    created = {m.get('id'): m.get('created_at') for m in members or ()}
+    counts = dict.fromkeys((age.value for age in MemberAge), 0)
+    for member_id in added_ids:
+        moment = _created_moment(created.get(member_id))
+        age = (MemberAge.UNKNOWN if moment is None else
+               MemberAge.RE_EMITTED if moment > previous_stamp else MemberAge.PREEXISTING)
+        counts[age.value] += 1
+    return counts
+
+
+def _per_day(count: int, elapsed_days: float | None) -> float | None:
+    return count / elapsed_days if elapsed_days else None
+
+
+def _lineage_dict(
+    lineage: Lineage,
+    cluster: Mapping[str, Any],
+    previous_stamp: datetime | None,
+    elapsed_days: float | None,
+) -> dict[str, Any]:
+    by_age = (
+        classify_added(lineage.added_member_ids, cluster.get('members'), previous_stamp)
+        if previous_stamp is not None else dict.fromkeys((a.value for a in MemberAge), 0)
+    )
+    overlapped = list(lineage.overlapped_previous_keys)
+    return {
+        'status': lineage.status.value,
+        'previous_key': lineage.previous_key,
+        'split_from': lineage.split_from,
+        'merged_previous_keys': overlapped if len(overlapped) > 1 else [],
+        'added_member_ids': list(lineage.added_member_ids),
+        'departed_member_ids': list(lineage.departed_member_ids),
+        'size_delta': lineage.size_delta,
+        'added_by_age': by_age,
+        'rate_per_day': _per_day(by_age[MemberAge.RE_EMITTED.value], elapsed_days),
+    }
+
+
+def category_comparability(
+    current: Mapping[str, Any], previous: Mapping[str, Any] | None,
+) -> list[str]:
+    """Why this category's diff may not compare like with like; empty means comparable.
+
+    A reason discloses; it never suppresses the diff.
+    """
+    reasons: set[Incomparable] = set()
+    if previous is None:
+        reasons.add(Incomparable.PREVIOUS_MISSING_CATEGORY)
+    for entry in (current,) if previous is None else (current, previous):
+        if not entry['coverage_known']:
+            reasons.add(Incomparable.COVERAGE_UNKNOWN)
+        elif entry['scan_coverage'].get('truncated'):
+            reasons.add(Incomparable.SCAN_TRUNCATED)
+    if previous is not None:
+        if (current['coverage_known'] and previous['coverage_known']
+                and current['scan_coverage'].get('scan_limit')
+                != previous['scan_coverage'].get('scan_limit')):
+            reasons.add(Incomparable.SCAN_LIMIT_CHANGED)
+        if current['lexical_threshold'] != previous['lexical_threshold']:
+            reasons.add(Incomparable.LEXICAL_THRESHOLD_CHANGED)
+        if current['ann_cutoff'] != previous['ann_cutoff']:
+            reasons.add(Incomparable.ANN_CUTOFF_CHANGED)
+    return sorted(reason.value for reason in reasons)
+
+
+def child_deltas(
+    current: Mapping[str, Sequence[Mapping[str, Any]]], previous: Mapping[str, Any] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Each ranking row with its previous count and delta.
+
+    Both are ``None`` when there is no previous report or it could not count
+    children (a legacy plan): an unknown count is not a zero.
+    """
+    known = previous is not None and previous.get('child_counts_known') is True
+    previous_rankings = previous['child_rankings'] if known and previous is not None else {}
+    prior = {
+        (kind, row['parent_id']): row['count']
+        for kind, rows in previous_rankings.items()
+        for row in rows
+    }
+    return {
+        kind: [
+            {
+                **row,
+                'previous_count': prior.get((kind, row['parent_id']), 0) if known else None,
+                'delta': row['count'] - prior.get((kind, row['parent_id']), 0) if known else None,
+            }
+            for row in rows
+        ]
+        for kind, rows in current.items()
+    }
+
+
+def _dissolved(
+    lineages: Iterable[Lineage], previous: Sequence[Mapping[str, Any]], swept: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Previous clusters no current cluster overlaps, in categories this run swept."""
+    overlapped = {key for lineage in lineages for key in lineage.overlapped_previous_keys}
+    swept_now = set(swept)
+    return [
+        {'cluster_key': c['cluster_key'], 'category': c['category'], 'size': len(c['member_ids'])}
+        for c in previous
+        if c['category'] in swept_now and c['cluster_key'] not in overlapped
+    ]
+
+
+def _regrowth_totals(
+    clusters: Sequence[Mapping[str, Any]], elapsed_days: float | None,
+) -> dict[str, Any]:
+    statuses = [c['lineage']['status'] for c in clusters]
+    re_emitted = sum(c['lineage']['added_by_age'][MemberAge.RE_EMITTED.value] for c in clusters)
+    return {
+        'appeared': statuses.count(LineageStatus.NEW.value),
+        'grew': statuses.count(LineageStatus.GREW.value),
+        'shrank': statuses.count(LineageStatus.SHRANK.value),
+        'unchanged': statuses.count(LineageStatus.UNCHANGED.value),
+        'split': statuses.count(LineageStatus.SPLIT.value),
+        're_emitted_members': re_emitted,
+        'rate_per_day': _per_day(re_emitted, elapsed_days),
+    }
+
+
+def diff_against_previous(
+    inventory: Mapping[str, Any],
+    previous: Mapping[str, Any] | None,
+    *,
+    config: DuplicateAuditConfig,
+) -> dict[str, Any]:
+    """The report keys the diff adds or extends: clusters, categories, child_rankings, regrowth."""
+    stamp = inventory['run_stamp']
+    previous_stamp = stamp_datetime(previous['run_stamp']) if previous is not None else None
+    elapsed_days = (
+        (stamp_datetime(stamp) - previous_stamp).total_seconds() / 86400.0
+        if previous_stamp is not None else None
+    )
+    previous_clusters = previous['clusters'] if previous is not None else None
+    lineages = match_lineage(inventory['clusters'], previous_clusters, stamp=stamp)
+    clusters = [
+        {**cluster, 'cluster_key': lineage.cluster_key,
+         'lineage': _lineage_dict(lineage, cluster, previous_stamp, elapsed_days)}
+        for cluster, lineage in zip(inventory['clusters'], lineages, strict=True)
+    ]
+    previous_categories = previous['categories'] if previous is not None else {}
+    return {
+        'clusters': clusters,
+        'categories': {
+            name: {**entry, 'incomparable_reasons': category_comparability(
+                entry, previous_categories.get(name),
+            )}
+            for name, entry in inventory['categories'].items()
+        },
+        'child_rankings': child_deltas(inventory['child_rankings'], previous),
+        'regrowth': {
+            'previous_run_stamp': previous['run_stamp'] if previous is not None else None,
+            'elapsed_days': elapsed_days,
+            'previous_overdue': (
+                elapsed_days > 2 * config.cadence.resweep_interval_days
+                if elapsed_days is not None else None
+            ),
+            'dissolved': _dissolved(lineages, previous_clusters or (), inventory['categories']),
+            **_regrowth_totals(clusters, elapsed_days),
+        },
     }
