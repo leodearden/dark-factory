@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _falkor_index_doubles import LIVE_HEADER, rows_for
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, await_index_operational, falkor_skipif
 from _fm_helpers import load_script_module
 from _fm_sockets import refused_port
@@ -27,6 +30,11 @@ from redis.exceptions import ResponseError
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.topology import read_topology, topology_hash
+from fused_memory.backends.falkor_indices import (
+    INDEX_CATALOG_QUERY,
+    INDEX_DEFINITION_QUERY,
+    IndexCatalogUnsettledError,
+)
 from fused_memory.config.falkordb_endpoints import PRODUCTION_FALKORDB
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -34,7 +42,6 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 SEED = load_script_module(
     Path(__file__).resolve().parents[1] / 'scripts' / 'seed_scratch_reference_graph.py'
 )
-INDEX_DEFINITION_QUERY = SEED.INDEX_DEFINITION_QUERY
 
 SEED_CYPHER = (
     'CREATE (a:Entity {uuid: "n-merge", name: "merge worker", group_id: $g, '
@@ -116,12 +123,33 @@ class _EmptyGraph:
         self.deleted = False
 
     async def ro_query(self, query: str, *args: object, **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(header=[[1, 'label'], [1, 'status']], result_set=[])
+        return SimpleNamespace(header=LIVE_HEADER, result_set=[])
 
     async def delete(self) -> None:
         if self.delete_error is not None:
             raise self.delete_error
         self.deleted = True
+
+
+_UNDER_CONSTRUCTION = '[Indexing] 1/2: UNDER CONSTRUCTION'
+_STATUS_POSITION = [name for _, name in LIVE_HEADER].index('status')
+
+
+class _IndexBuildingGraph(_EmptyGraph):
+    """An empty restored graph whose catalog reports one index, with each read taking the next of *statuses*."""
+
+    def __init__(self, statuses: Iterator[str]) -> None:
+        super().__init__()
+        self.statuses = statuses
+        self.catalog_reads = 0
+
+    async def ro_query(self, query: str, *args: object, **kwargs: object) -> SimpleNamespace:
+        if query != INDEX_CATALOG_QUERY:
+            return await super().ro_query(query, *args, **kwargs)
+        self.catalog_reads += 1
+        [row] = rows_for({('Entity', 'NODE', 'uuid', 'RANGE')})
+        row[_STATUS_POSITION] = next(self.statuses)
+        return SimpleNamespace(header=LIVE_HEADER, result_set=[row])
 
 
 class _EmptyScratchServer:
@@ -212,6 +240,42 @@ def test_a_verified_copy_is_saved():
     assert _restore(server, name, EMPTY_GRAPH_IDENTITY) == EMPTY_GRAPH_IDENTITY
     assert server.saves == 1
     assert not server.graph.deleted
+
+
+@pytest.fixture
+def fast_settle_poll(monkeypatch):
+    monkeypatch.setattr(SEED, 'SETTLE_POLL_INTERVAL_S', 0.001)
+
+
+def test_a_copy_whose_indexes_never_settle_is_deleted_and_never_saved(
+    fast_settle_poll, monkeypatch
+):
+    monkeypatch.setattr(SEED, 'SETTLE_TIMEOUT_S', 0.02)
+    name = _scratch_name()
+    graph = _IndexBuildingGraph(itertools.repeat(_UNDER_CONSTRUCTION))
+    server = _EmptyScratchServer(graph)
+
+    with pytest.raises(IndexCatalogUnsettledError) as raised:
+        _restore(server, name, EMPTY_GRAPH_IDENTITY)
+
+    message = str(raised.value)
+    assert name in message
+    assert '0.02s' in message
+    assert _UNDER_CONSTRUCTION in message
+    assert graph.catalog_reads >= 2
+    assert graph.deleted
+    assert server.saves == 0
+
+
+def test_a_copy_is_verified_and_saved_once_its_indexes_settle(fast_settle_poll):
+    name = _scratch_name()
+    graph = _IndexBuildingGraph(iter([_UNDER_CONSTRUCTION, 'OPERATIONAL']))
+    server = _EmptyScratchServer(graph)
+
+    assert _restore(server, name, EMPTY_GRAPH_IDENTITY) == EMPTY_GRAPH_IDENTITY
+    assert graph.catalog_reads == 2
+    assert server.saves == 1
+    assert not graph.deleted
 
 
 # --- live round trips on the scratch server -------------------------------------------

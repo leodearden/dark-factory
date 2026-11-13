@@ -45,16 +45,15 @@ from fused_memory.backends.falkor_entity_edges import bind_entity_endpoints
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.falkor_graph_operations import FalkorGraphOperations
 from fused_memory.backends.falkor_indices import (
-    IndexCatalogUnsettledError,
     IndexHeaderShapeError,
     IndexProvisionResult,
     IndexRecordShapeError,
     IndexSpec,
+    await_index_catalog_settled,
     expected_index_set,
     normalize_index_records,
     plan_index_statements,
-    resolve_header_positions,
-    unsettled_index_statuses,
+    read_index_records,
     vector_drop_statement,
     vector_index_properties,
 )
@@ -5014,14 +5013,14 @@ class GraphitiBackend:
         ``row[6]`` would repair today's symptom while leaving the same silent
         degradation armed for the next FalkorDB column reorder.
 
-        The resolution is delegated to
-        ``fused_memory.backends.falkor_indices.resolve_header_positions`` rather
-        than hand-rolled here, so the next reader of ``CALL db.indexes()``
-        (β's ``ensure_indices``, δ's ``summarize_index_health``) shares one
-        implementation instead of re-forking the build-names / check-missing /
-        ``.index()`` sequence — re-forking is how the positional read survived.
+        The record build is delegated to
+        ``fused_memory.backends.falkor_indices.index_records_from_rows`` rather
+        than hand-rolled here, so every reader of ``CALL db.indexes()`` shares
+        one column map and one by-name resolution instead of re-forking the
+        build-names / check-missing / ``.index()`` sequence — re-forking is how
+        the positional read survived.
         ``tests/_fm_falkor_live.await_index_operational`` resolves its
-        ``status`` column through the same helper.
+        ``status`` column through the same ``resolve_header_positions`` helper.
 
         A missing required column — or a header entry that is not a
         ``(type, name)`` pair — raises ``IndexHeaderShapeError`` (a ``ValueError``
@@ -5057,34 +5056,12 @@ class GraphitiBackend:
         The live verification is pinned in
         ``fused-memory/tests/test_list_indices_integration.py``
         (Task 530 / esc-486-49).  If a future FalkorDB upgrade rejects
-        ``CALL`` on the RO path, revert this call to ``graph.query(...)``
-        (the write-capable command) and update the integration test to pin
-        the new behavior.
+        ``CALL`` on the RO path, revert the call in
+        ``falkor_indices.read_index_records`` to ``graph.query(...)`` (the
+        write-capable command) and update the integration test to pin the new
+        behavior.
         """
-        graph = self._graph_for(group_id)
-        # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
-        # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
-        result = await graph.ro_query('CALL db.indexes()')
-
-        # Resolve columns by name, so a FalkorDB column reorder fails loudly
-        # here instead of silently reading the wrong column (see the docstring).
-        # The resolution itself lives in falkor_indices so this is not a second
-        # hand-rolled copy of it -- see resolve_header_positions.
-        positions = resolve_header_positions(
-            result.header,
-            {
-                'label': 'label',
-                'field': 'properties',
-                'type': 'types',
-                'entity_type': 'entitytype',
-                'status': 'status',
-            },
-        )
-
-        indices = []
-        for row in (result.result_set or []):
-            indices.append({key: row[idx] for key, idx in positions.items()})
-        return indices
+        return await read_index_records(self._graph_for(group_id))
 
     @_canonicalize_group_args
     async def ensure_indices(self, *, group_id: str) -> IndexProvisionResult:
@@ -5338,68 +5315,6 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         await graph.query(vector_drop_statement(label, field, entity_type=entity_type))
 
-    async def _await_index_catalog_settled(
-        self,
-        group_id: str,
-        *,
-        timeout_s: float,
-        interval: float = 0.05,
-    ) -> list[dict]:
-        """Poll *group_id*'s index catalog until every record is OPERATIONAL, and
-        return that settled read.
-
-        Undecorated, like :meth:`_ensure_indices_locked`: its caller is
-        decorated with ``@_canonicalize_group_args``, so *group_id* arrives
-        already canonical.
-
-        It RETURNS the certified records so the caller acts on the very read the
-        barrier validated.  Settling and then re-reading would leave a gap in
-        which another process's drop could open a new window, and would cost a
-        second round-trip.  The read goes through :meth:`list_indices`, so the
-        by-name header resolution stays in ``resolve_header_positions``; only
-        the poll loop lives here.
-
-        No ``try``/``except``: a driver error, an absent graph (measured:
-        ``Invalid graph operation on empty key``) or a fail-closed shape error
-        propagates untouched rather than becoming a full-budget block and a
-        misleading timeout.
-
-        Args:
-            group_id: The graph to settle.  Already canonical.
-            timeout_s: The settle budget; :meth:`drop_vector_indices` owns its
-                default.  The deadline is checked BEFORE each sleep, so a
-                settled catalog costs one ``CALL db.indexes()`` and no wait.
-            interval: Seconds between polls.  What matters is noticing the
-                window CLOSE promptly, not catching a millisecond-scale opening;
-                this matches ``tests/_fm_falkor_live.await_index_operational``.
-
-        Returns:
-            The settled ``list_indices()`` records, every one ``OPERATIONAL``.
-            Empty for an index-free graph, which counts as settled (see
-            ``falkor_indices.unsettled_index_statuses``).
-
-        Raises:
-            IndexCatalogUnsettledError: Records were still not ``OPERATIONAL``
-                when *timeout_s* expired.
-            IndexRecordShapeError: A record carried no ``status`` key.
-        """
-        deadline = time.monotonic() + timeout_s
-        while True:
-            records = await self.list_indices(group_id=group_id)
-            unsettled = unsettled_index_statuses(records)
-            if not unsettled:
-                return records
-            # Check BEFORE sleeping, so a settled catalog costs one round-trip
-            # and no wait at all.
-            if time.monotonic() >= deadline:
-                raise IndexCatalogUnsettledError(
-                    f'FalkorDB index catalog for graph {group_id!r} did not '
-                    f'settle within {timeout_s}s; still not OPERATIONAL: '
-                    f'{unsettled!r}. Refusing to act on an index state that was '
-                    'never determined.'
-                )
-            await asyncio.sleep(interval)
-
     @_canonicalize_group_args
     async def drop_vector_indices(
         self, *, group_id: str, settle_timeout_s: float = 30.0,
@@ -5539,8 +5454,10 @@ class GraphitiBackend:
             Exception: Whatever a failing DROP statement raised, re-raised
                 unchanged after the partial-``dropped`` ERROR line.
         """
-        indices = await self._await_index_catalog_settled(
-            group_id, timeout_s=settle_timeout_s,
+        indices = await await_index_catalog_settled(
+            functools.partial(self.list_indices, group_id=group_id),
+            graph_name=group_id,
+            timeout_s=settle_timeout_s,
         )
         dropped: list[dict] = []
         try:

@@ -31,9 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 import asyncio
 import contextlib
-import time
 from dataclasses import dataclass
 from enum import IntEnum
+from functools import partial
 from typing import Any
 
 from falkordb.asyncio import FalkorDB
@@ -48,21 +48,15 @@ from fused_memory.arm_harness.scratch_guard import (
 )
 from fused_memory.arm_harness.topology import read_topology, topology_hash
 from fused_memory.backends.falkor_indices import (
+    INDEX_DEFINITION_QUERY,
     IndexCatalogUnsettledError,
-    resolve_header_positions,
-    unsettled_index_statuses,
+    await_index_catalog_settled,
+    read_index_records,
 )
 from fused_memory.config.falkordb_endpoints import FalkorEndpoint, scratch_falkordb_from_env
 from fused_memory.config.schema import FusedMemoryConfig
 
 REFERENCE_GRAPH = 'evalmem_lme_ref_incumbent_a'
-INDEX_DEFINITION_QUERY = (
-    'CALL db.indexes() YIELD label, properties, types, options, language, stopwords, entitytype '
-    'RETURN label, properties, types, options, language, stopwords, entitytype '
-    'ORDER BY entitytype, label'
-)
-INDEX_CATALOG_QUERY = 'CALL db.indexes()'
-INDEX_STATUS_COLUMNS = {'label': 'label', 'status': 'status'}
 SETTLE_TIMEOUT_S = 120.0
 SETTLE_POLL_INTERVAL_S = 0.2
 
@@ -165,7 +159,12 @@ async def seed_graph(source_client: FalkorDB, target_client: FalkorDB, name: str
 
 
 async def _verified_identity(graph: AsyncGraph, source: SourceGraph) -> GraphIdentity:
-    await _await_indexes_serving(graph, source.name)
+    await await_index_catalog_settled(
+        partial(read_index_records, graph),
+        graph_name=source.name,
+        timeout_s=SETTLE_TIMEOUT_S,
+        interval=SETTLE_POLL_INTERVAL_S,
+    )
     identity = await _identity(graph, source.name)
     if identity != source.identity:
         raise SeedMismatch(
@@ -195,25 +194,6 @@ async def _identity(graph: AsyncGraph, name: str) -> GraphIdentity:
         topology_hash=topology_hash(*topology),
         index_definitions=tuple(tuple(row) for row in definitions),
     )
-
-
-async def _await_indexes_serving(graph: AsyncGraph, name: str) -> None:
-    deadline = time.monotonic() + SETTLE_TIMEOUT_S
-    while True:
-        response = await graph.ro_query(INDEX_CATALOG_QUERY)
-        positions = resolve_header_positions(response.header, INDEX_STATUS_COLUMNS)
-        unsettled = unsettled_index_statuses(
-            {key: row[position] for key, position in positions.items()}
-            for row in response.result_set
-        )
-        if not unsettled:
-            return
-        if time.monotonic() >= deadline:
-            raise IndexCatalogUnsettledError(
-                f'restored {name!r} still has indexes that are not OPERATIONAL after '
-                f'{SETTLE_TIMEOUT_S:.0f}s: {unsettled!r}'
-            )
-        await asyncio.sleep(SETTLE_POLL_INTERVAL_S)
 
 
 def _summary(identity: GraphIdentity) -> str:
