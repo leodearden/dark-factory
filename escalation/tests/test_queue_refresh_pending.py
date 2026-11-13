@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
 from _escalation_seed import seed_escalation
 
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue
+from escalation.queue import EscalationQueue, escalation_id_lock
 
 _SEEDED_UPDATED_AT = '2026-11-01T00:00:00+00:00'
 
@@ -79,6 +80,33 @@ class TestRefreshPending:
         assert stored.level == 2
         assert stored.dedupe_count == 0
         assert stored.summary == seeded.summary
+
+
+class TestRefreshPendingHoldsTheIdLock:
+    @pytest.mark.timeout(60)
+    def test_a_refresh_waits_for_the_record_lock(self, queue):
+        seeded = _seed_pending(queue)
+        refreshed: list[Escalation | None] = []
+        worker = threading.Thread(
+            target=lambda: refreshed.append(
+                queue.refresh_pending(seeded.id, level=1, summary='s2', detail='d2'),
+            ),
+        )
+
+        with escalation_id_lock(queue.queue_dir, seeded.id):
+            worker.start()
+            worker.join(timeout=0.5)
+            assert worker.is_alive()
+            held = queue.get(seeded.id)
+            assert held is not None
+            assert held.dedupe_count == 0
+
+        worker.join(timeout=30)
+        assert not worker.is_alive()
+        stored = queue.get(seeded.id)
+        assert stored is not None
+        assert stored.dedupe_count == 1
+        assert refreshed == [stored]
 
 
 class TestRefreshPendingNotify:

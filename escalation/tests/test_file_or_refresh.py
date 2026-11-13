@@ -37,6 +37,13 @@ class _SubmitFailsQueue(EscalationQueue):
         raise OSError('disk full')
 
 
+class _RefreshFailsQueue(EscalationQueue):
+    def refresh_pending(
+        self, escalation_id: str, *, level: int, summary: str, detail: str,
+    ) -> Escalation | None:
+        raise OSError('disk full')
+
+
 class _ResolvedAfterLookupQueue(EscalationQueue):
     def get_by_task(
         self, task_id: str, status: str | None = None, level: int | None = None,
@@ -224,3 +231,17 @@ class TestFailures:
                 queue, ALARM, summary='summary', detail='detail',
                 filing_claimant_run_id='run-a',
             )
+
+    def test_a_failing_refresh_propagates_and_files_nothing_afresh(self, queue, tmp_path):
+        file_or_refresh(
+            queue, ALARM, summary='first', detail='detail', filing_claimant_run_id='run-a',
+        )
+        failing = _RefreshFailsQueue(tmp_path / 'escalations')
+
+        with pytest.raises(OSError, match='disk full'):
+            file_or_refresh(
+                failing, ALARM, summary='second', detail='detail',
+                filing_claimant_run_id='run-b',
+            )
+
+        assert len(_pending(queue)) == 1
