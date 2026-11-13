@@ -458,7 +458,7 @@ def _read_limits(
             )
         return None, {}
 
-    # Scoped to the read+parse itself, exactly as ``_build_eval`` already does
+    # Scoped to the read+parse itself, exactly as ``_read_run`` already does
     # for each metrics run.  Wrapping the WHOLE function instead (as the caller
     # used to) meant a code bug anywhere below was reported as an unreadable
     # artifact.
@@ -1138,6 +1138,157 @@ def _verdict_row_fields(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _Run:
+    """One parsed metrics run; ``path`` names its file, since two runs may share a stamp."""
+
+    stamp: Any
+    metrics: dict[str, dict[str, Any]]
+    corpus: dict[str, Any] | None
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _RunSeries:
+    """The parsed trailing window of one eval's runs, oldest first, and how much of the disk it covers."""
+
+    runs: tuple[_Run, ...]
+    runs_on_disk: int
+    truncated: bool
+
+
+def _read_run(path: Path, eval_id: str, issues: list[dict[str, Any]]) -> _Run | None:
+    """Parse one metrics run, or name why it cannot be charted and return None.
+
+    Validates only what the reader must READ and RENDER; the M1 schema's
+    cross-field rules are the producer's to reject at emit time.
+    """
+    try:
+        body = _load_json(path)
+    except _ARTIFACT_ERRORS as exc:
+        _issue(issues, 'unreadable_metrics', eval_id=eval_id, path=path, detail=str(exc))
+        return None
+
+    if not isinstance(body, dict) or not isinstance(body.get('metrics'), list):
+        _issue(
+            issues, 'malformed_metrics', eval_id=eval_id, path=path,
+            detail=f'expected an object with a list "metrics" field, got {type(body).__name__}',
+        )
+        return None
+
+    stamp = body.get('run_stamp')
+    if stamp is None:
+        _issue(
+            issues, 'missing_run_stamp', eval_id=eval_id, path=path,
+            detail='run artifact carries no in-body run_stamp',
+        )
+    corpus = body.get('corpus')
+    return _Run(
+        stamp=stamp,
+        metrics=_by_metric_id(body, eval_id, path, issues),
+        corpus=dict(corpus) if isinstance(corpus, dict) else None,
+        path=path,
+    )
+
+
+def _read_run_series(eval_dir: Path, issues: list[dict[str, Any]]) -> _RunSeries:
+    """Parse the newest ``_TREND_RUN_CAP`` of *eval_dir*'s metrics runs, ordered by FILENAME.
+
+    Filename order is the producer's own (``shared.memory_eval_metrics.load_series_window``):
+    the stamp is zero-padded UTC.  A run the window drops is disclosed as ``truncated``.
+    """
+    all_paths = sorted(eval_dir.glob('metrics-*.json'))
+    window = all_paths[-_TREND_RUN_CAP:] if _TREND_RUN_CAP else all_paths
+    parsed = (_read_run(path, eval_dir.name, issues) for path in window)
+    return _RunSeries(
+        runs=tuple(run for run in parsed if run is not None),
+        runs_on_disk=len(all_paths),
+        truncated=len(window) < len(all_paths),
+    )
+
+
+def _run_age_seconds(
+    eval_dir: Path,
+    latest_run_stamp: Any,
+    now: datetime,
+    issues: list[dict[str, Any]],
+) -> float | None:
+    """How old the newest run is, for DISPLAY only; an unparseable stamp is named and reads as None."""
+    if not isinstance(latest_run_stamp, str):
+        return None
+    try:
+        run_at = datetime.strptime(latest_run_stamp, _RUN_STAMP_FORMAT).replace(tzinfo=UTC)
+    except ValueError:
+        _issue(
+            issues, 'unparseable_run_stamp', eval_id=eval_dir.name, path=eval_dir,
+            detail=f'run_stamp {_short_repr(latest_run_stamp)} is not in {_RUN_STAMP_FORMAT}',
+        )
+        return None
+    return (now - run_at).total_seconds()
+
+
+def _name_unrenderable_kinds(
+    eval_id: str,
+    metric_id: str,
+    runs: tuple[_Run, ...],
+    issues: list[dict[str, Any]],
+) -> None:
+    """Name each distinct absent or unknown kind *metric_id* carries anywhere in the window.
+
+    Deduped on the RAW ``repr``, never capped, so two oversized kinds sharing a
+    prefix stay distinct.  A run the metric is absent from is a trend hole, not a defect.
+    """
+    seen_kinds: set[str] = set()
+    for run in runs:
+        record = run.metrics.get(metric_id)
+        if record is None:
+            continue
+        run_kind = record.get('kind')
+        if isinstance(run_kind, str) and run_kind in _KNOWN_KINDS:
+            continue
+        if repr(run_kind) in seen_kinds:
+            continue
+        seen_kinds.add(repr(run_kind))
+        if run_kind is None:
+            _issue(
+                issues, 'missing_kind', eval_id=eval_id, path=run.path,
+                detail=(
+                    f'metric {_short_repr(metric_id)} carries no "kind" (a required M1 field), '
+                    'so it has no chart primitive'
+                ),
+            )
+        else:
+            _issue(
+                issues, 'unknown_kind', eval_id=eval_id, path=run.path,
+                detail=(
+                    f'metric {_short_repr(metric_id)} has kind {_short_repr(run_kind)}, '
+                    'which has no chart primitive'
+                ),
+            )
+
+
+def _metric_fields(metric_id: str, runs: tuple[_Run, ...], rule_kind: Any) -> dict[str, Any]:
+    """The metric half of one row: the latest run's fields and a full-width trend.
+
+    A run the metric is absent from is a ``None`` hole, keeping every series
+    index-aligned to the shared axis.
+    """
+    current = runs[-1].metrics.get(metric_id, {})
+    return {
+        'metric_id': metric_id,
+        'kind': current.get('kind'),
+        'rule_kind': rule_kind,
+        'current_value': current.get('value'),
+        'n': current.get('n'),
+        'denominator': current.get('denominator'),
+        'direction': current.get('direction'),
+        'trend': {
+            'labels': [run.stamp for run in runs],
+            'values': [run.metrics.get(metric_id, {}).get('value') for run in runs],
+        },
+    }
+
+
 def _build_eval(
     eval_dir: Path,
     sources: _JoinSources,
@@ -1145,199 +1296,31 @@ def _build_eval(
     now: datetime,
     issues: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], _RowClaims]:
-    """Assemble one eval's trend payload from its ``metrics-*.json`` series.
-
-    Runs are ordered by FILENAME — the producer's own contract
-    (``shared.memory_eval_metrics.load_series_window`` sorts the same way,
-    because the stamp is a zero-padded UTC string) — so the dashboard never
-    invents a second ordering rule.  The x-axis label for each run is the
-    artifact's in-body ``run_stamp``.
-
-    Each verdict entry gets its own row, so a tripwire's items are rows that
-    repeat the metric-level fields, each with its own ``trend`` object.
+    """Fold one eval in: returns the eval's payload row and *claims* extended by what its rows
+    claim.  Each verdict entry is its own metric row, so a tripwire's items repeat the
+    metric-level fields.
     """
     eval_id = eval_dir.name
-    all_paths = sorted(eval_dir.glob('metrics-*.json'))
-
-    # Trailing window: keep the MOST RECENT runs, drop the oldest.  Dropping
-    # the newest instead would leave a trend that ends N runs ago reading as
-    # current.  ``_TREND_RUN_CAP`` is looked up in the module namespace here
-    # (not captured at import) so it stays one adjustable knob.
-    #
-    # No silent caps: whenever this window drops anything, the count dropped
-    # is disclosed IN THE PAYLOAD (``truncated`` + ``runs_on_disk`` beside
-    # ``run_count``), never only in a log the operator will not read.
-    runs_on_disk = len(all_paths)
-    paths = all_paths[-_TREND_RUN_CAP:] if _TREND_RUN_CAP else all_paths
-    truncated = len(paths) < runs_on_disk
-
-    # (in-body stamp, metric_id -> record, source path).  The path is carried
-    # so a per-run issue can name the FILE that caused it: the committed
-    # ``malformed/`` exemplar's two runs share one in-body run_stamp, so the
-    # stamp alone would not identify which artifact is at fault.
-    runs: list[tuple[Any, dict[str, dict], Path]] = []
-    corpus: dict | None = None
-    for path in paths:
-        try:
-            body = _load_json(path)
-        except _ARTIFACT_ERRORS as exc:
-            # One unreadable run degrades one run, not the whole eval.
-            _issue(issues, 'unreadable_metrics', eval_id=eval_id, path=path, detail=str(exc))
-            continue
-
-        # The reader validates only what it needs to READ and RENDER.  The M1
-        # schema's cross-field rules (a proportion inside [0,1], a required
-        # denominator) are the producer's to reject at emit time — restating
-        # them here would be a second implementation of what the producer has
-        # already decided.
-        if not isinstance(body, dict) or not isinstance(body.get('metrics'), list):
-            _issue(
-                issues, 'malformed_metrics', eval_id=eval_id, path=path,
-                detail=f'expected an object with a list "metrics" field, got {type(body).__name__}',
-            )
-            continue
-
-        stamp = body.get('run_stamp')
-        if stamp is None:
-            _issue(
-                issues, 'missing_run_stamp', eval_id=eval_id, path=path,
-                detail='run artifact carries no in-body run_stamp',
-            )
-        # The corpus block describes THIS run, so the row carries the LATEST
-        # parsed run's block or none at all — never the newest run that merely
-        # HAPPENED to carry one.  Carrying it forward would present an older
-        # run's counts as current with nothing disclosing the skew, while every
-        # other latest-run field on this row (``current_value``, ``n``,
-        # ``denominator``, ``kind``) has no such fallback and the module
-        # elsewhere discloses drift explicitly (``limits.stale_for_latest_run``,
-        # ``truncated``/``runs_on_disk``).  ``corpus`` is optional in M1, so
-        # "this run reported none" is a truthful answer.  Assigning on every
-        # appended run keeps this field pinned to ``runs[-1]``, the same run
-        # ``latest_run_stamp`` and the latest-run scalars are read from.
-        run_corpus = body.get('corpus')
-        corpus = dict(run_corpus) if isinstance(run_corpus, dict) else None
-        runs.append((stamp, _by_metric_id(body, eval_id, path, issues), path))
-
-    run_stamps = [stamp for stamp, _, _ in runs]
-
-    # Metric identity is the metric_id, unioned across the whole window: a
-    # metric that appears only in some runs still gets a full-width series
-    # (with holes), so every series stays index-aligned to the shared axis.
-    metric_ids: list[str] = []
-    for _, by_id, _path in runs:
-        for metric_id in by_id:
-            if metric_id not in metric_ids:
-                metric_ids.append(metric_id)
-
+    series = _read_run_series(eval_dir, issues)
+    run_stamps = [run.stamp for run in series.runs]
     latest_run_stamp = run_stamps[-1] if run_stamps else None
-    # ``_read_limits`` owns its own read boundary and degrades to ``(None, {})``
-    # in place, so there is nothing for the caller to catch.
     limits, limits_by_metric = _read_limits(
-        eval_dir, latest_run_stamp, issues, has_runs=bool(all_paths),
+        eval_dir, latest_run_stamp, issues, has_runs=series.runs_on_disk > 0,
     )
+    age_seconds = _run_age_seconds(eval_dir, latest_run_stamp, now, issues)
 
-    # Staleness is DISPLAYED, never alarmed on.  An unparseable stamp degrades
-    # the age to None (and says so) rather than raising or guessing a date.
-    age_seconds: float | None = None
-    if isinstance(latest_run_stamp, str):
-        try:
-            run_at = datetime.strptime(latest_run_stamp, _RUN_STAMP_FORMAT).replace(tzinfo=UTC)
-        except ValueError:
-            _issue(
-                issues, 'unparseable_run_stamp', eval_id=eval_id, path=eval_dir,
-                detail=f'run_stamp {_short_repr(latest_run_stamp)} is not in {_RUN_STAMP_FORMAT}',
-            )
-        else:
-            age_seconds = (now - run_at).total_seconds()
-
-    latest = runs[-1][1] if runs else {}
     metrics: list[dict[str, Any]] = []
-    for metric_id in sorted(metric_ids):
-        # A metric missing from a run contributes a None hole at that index
-        # rather than being dropped — dropping would silently shift this
-        # metric's points against its neighbours'.
-        values = [by_id.get(metric_id, {}).get('value') for _, by_id, _p in runs]
-        current = latest.get(metric_id, {})
-
-        # A kind outside the closed vocabulary is a RENDERING failure: there is
-        # no chart primitive for it, so the dashboard genuinely cannot resolve
-        # it and says so.  The value itself is still real and is still shown.
-        # An ABSENT kind is exactly as unrenderable — ``kind`` is a required M1
-        # field — so it is named too, under its own issue kind because the
-        # operator-facing fix differs (a field to add, not a vocabulary to
-        # widen).
-        #
-        # Checked across the WHOLE window, not just the newest run: a trend
-        # line is drawn from every point, so an unrenderable kind anywhere in
-        # the series is a rendering failure even when the latest run is clean.
-        # The committed ``malformed/`` exemplar is exactly that shape — its
-        # bad-kind artifact sorts BEFORE its well-kinded one, so a latest-run
-        # check would have declared that fixture healthy.
-        #
-        # One issue per distinct (metric, kind): a kind that is wrong in every
-        # run of a 90-run window is one problem, not ninety.  Deduped on the
-        # repr so an unhashable value out of a malformed artifact cannot raise.
-        # This repr is an internal dedup key, never emitted into a detail, and
-        # deliberately NOT routed through `_short_repr`: capping it would make
-        # two distinct oversized kinds that differ only past the cap collide
-        # on their shared prefix, silently swallowing the second metric's
-        # `unknown_kind` issue (DD6/INV-2 forbids exactly that silent drop).
-        # The `unknown_kind` detail below IS capped — only the key stays raw.
-        kind = current.get('kind')
-        seen_kinds: set[str] = set()
-        for _stamp, by_id, run_path in runs:
-            record = by_id.get(metric_id)
-            if record is None:
-                # Absent from THIS run: a None hole in the trend, which is a
-                # legitimate shape (a metric introduced mid-window).  This is
-                # why an absent record cannot be conflated with a record whose
-                # ``kind`` is missing — both read as None off a ``.get`` chain,
-                # and only the second is a defect.
-                continue
-            run_kind = record.get('kind')
-            # ``isinstance`` before the set lookup: an unhashable kind out of a
-            # malformed artifact would make ``in _KNOWN_KINDS`` raise, and a
-            # non-string kind is unrenderable anyway.
-            if isinstance(run_kind, str) and run_kind in _KNOWN_KINDS:
-                continue
-            if repr(run_kind) in seen_kinds:
-                continue
-            seen_kinds.add(repr(run_kind))
-            if run_kind is None:
-                _issue(
-                    issues, 'missing_kind', eval_id=eval_id, path=run_path,
-                    detail=(
-                        f'metric {_short_repr(metric_id)} carries no "kind" (a required M1 field), '
-                        'so it has no chart primitive'
-                    ),
-                )
-            else:
-                _issue(
-                    issues, 'unknown_kind', eval_id=eval_id, path=run_path,
-                    detail=(
-                        f'metric {_short_repr(metric_id)} has kind {_short_repr(run_kind)}, '
-                        'which has no chart primitive'
-                    ),
-                )
-
+    for metric_id in sorted({metric_id for run in series.runs for metric_id in run.metrics}):
+        _name_unrenderable_kinds(eval_id, metric_id, series.runs, issues)
         entries = sources.verdicts.get((eval_id, metric_id), {})
         if entries:
             claims = claims.with_verdict_key((eval_id, metric_id))
+        rule_kind = limits_by_metric.get(metric_id, {}).get('rule_kind')
         # A metric no entry judges still gets its one (unjudged) row.
-        row_entries = [entries[item] for item in sorted(entries, key=_item_order)]
-        for entry in row_entries or [None]:
+        for entry in [entries[item] for item in sorted(entries, key=_item_order)] or [None]:
             matched, claims = _join_escalation((entry or {}).get('fingerprint'), sources, claims)
             metrics.append({
-                'metric_id': metric_id,
-                'kind': kind,
-                # Looked up by metric_id, never zipped positionally: the two lists
-                # are ordered independently and a metric may be absent from either.
-                'rule_kind': limits_by_metric.get(metric_id, {}).get('rule_kind'),
-                'current_value': current.get('value'),
-                'n': current.get('n'),
-                'denominator': current.get('denominator'),
-                'direction': current.get('direction'),
-                'trend': {'labels': list(run_stamps), 'values': list(values)},
+                **_metric_fields(metric_id, series.runs, rule_kind),
                 **_verdict_row_fields(
                     entry, metric_id, eval_dir, matched, sources.storm is not None, issues,
                 ),
@@ -1356,9 +1339,9 @@ def _build_eval(
         'storm_escape': sources.storm,
         'run_stamps': run_stamps,
         'run_count': len(run_stamps),
-        'runs_on_disk': runs_on_disk,
-        'truncated': truncated,
-        'corpus': corpus,
+        'runs_on_disk': series.runs_on_disk,
+        'truncated': series.truncated,
+        'corpus': series.runs[-1].corpus if series.runs else None,
         'metrics': metrics,
     }, claims
 
