@@ -69,8 +69,8 @@ def prune_archive(
 
     Takes no lock: another prune (a second startup sweep's pass 3, or a
     manual ``python -m escalation.archive``) may remove the same subdir
-    between the scan and the rmtree.  Such a subdir counts as already
-    pruned, so it is not counted and is logged at DEBUG; a
+    between the scan and the rmtree.  Such a subdir is treated as already
+    pruned: it is not counted and is logged at DEBUG; a
     ``FileNotFoundError`` while the subdir still exists is re-raised.
 
     Args:
@@ -99,7 +99,9 @@ def prune_archive(
             parsed = datetime.strptime(child.name, DATE_FORMAT).replace(tzinfo=UTC)
         except ValueError:
             continue
-        if parsed < cutoff and _prune_subdir(child):
+        if parsed >= cutoff:
+            continue
+        if _prune_subdir(child):
             removed += 1
             logger.info('Pruned archive subdir: %s', child)
 
