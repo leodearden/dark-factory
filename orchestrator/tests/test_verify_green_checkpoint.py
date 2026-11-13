@@ -119,10 +119,11 @@ def _stub_verify_and_review(
         suggestions=[],
         reviews={'analyst': {}},
     ))
-    wf._verify_debugfix_loop = verify_mock  # type: ignore[method-assign]
-    wf._review = review_mock  # type: ignore[method-assign]
-    wf._suggestions_in_scope = lambda s: []  # type: ignore[method-assign]
-    wf._write_suggestions_to_memory = AsyncMock()  # type: ignore[method-assign]
+    stubbed: Any = wf
+    stubbed._verify_debugfix_loop = verify_mock
+    stubbed._review = review_mock
+    stubbed._suggestions_in_scope = lambda s: []
+    stubbed._write_suggestions_to_memory = AsyncMock()
     return verify_mock, review_mock
 
 
@@ -337,11 +338,13 @@ class TestRedispatchBoundary:
         assert _verify_skips(second_store) == []
 
     @pytest.mark.asyncio
-    async def test_post_verify_tip_read_retries_once(self, tmp_path: Path) -> None:
+    async def test_post_verify_tip_read_retries_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         store = EventStore(tmp_path / 'runs.db', run_id='run-now')
         wf = _make_e2e_workflow(tmp_path, store)
         # No real fixture fails exactly once: checkpoint read, failed first capture, successful retry.
-        wf._get_head_commit = AsyncMock(side_effect=[GREEN_TIP, '', GREEN_TIP])  # type: ignore[method-assign]
+        monkeypatch.setattr(wf, '_get_head_commit', AsyncMock(side_effect=[GREEN_TIP, '', GREEN_TIP]))
         _stub_verify_and_review(wf)
 
         assert await wf._execute_verify_review_loop() == WorkflowOutcome.DONE
