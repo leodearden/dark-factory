@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import uuid as uuid_mod
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -586,6 +586,17 @@ def _with_derived_bundle_keys(metadata: Any) -> Any:
     return with_derived_bundle_keys(readable)
 
 
+def _provenance_stamp_now() -> str:
+    """The production clock for ``done_provenance.stamped_at`` (task 3576).
+
+    ``TaskInterceptor`` stamps with it unless constructed with another
+    ``provenance_stamp_clock``. Same convention as the module's other
+    timestamp sites (``reopen_at``, ``combined_at``):
+    ``datetime.now(UTC).isoformat()``.
+    """
+    return datetime.now(UTC).isoformat()
+
+
 class TaskInterceptor:
     """Wraps Taskmaster operations, intercepts state transitions for targeted reconciliation."""
 
@@ -616,10 +627,13 @@ class TaskInterceptor:
         curator: TaskCurator | None = None,
         proc_root: Path = process_identity.PROC_ROOT,
         git_runner: 'GitProbeRunner' = run_git,
+        provenance_stamp_clock: Callable[[], str] = _provenance_stamp_now,
     ):
         self.taskmaster = taskmaster
         # Runs the done-provenance git probes (see _git_probe).
         self._git_runner = git_runner
+        # Writes done_provenance.stamped_at for a found_on_main close.
+        self._provenance_stamp_clock = provenance_stamp_clock
         # Where the deferral gate reads a held_by_session holder's /proc entries.
         self._proc_root = proc_root
         self.reconciler = targeted_reconciler
@@ -1702,6 +1716,7 @@ class TaskInterceptor:
                         agent_id=agent_id,
                         config=self._config,
                         git_runner=self._git_runner,
+                        stamp_clock=self._provenance_stamp_clock,
                     )
                     # This seam had NO journal row at all before 5241: a
                     # repair of an already-`done` task was invisible to the
@@ -1824,6 +1839,7 @@ class TaskInterceptor:
                     agent_id=agent_id,
                     config=self._config,
                     git_runner=self._git_runner,
+                    stamp_clock=self._provenance_stamp_clock,
                 )
                 if validation_err is not None:
                     # Task 5241: the done-provenance VERDICT is journaled with
@@ -6599,19 +6615,6 @@ def _provenance_kind(raw: object) -> str | None:
     return kind.strip() or None
 
 
-def _provenance_stamp_now() -> str:
-    """Wall-clock for ``done_provenance.stamped_at`` (task 3576).
-
-    Same convention as the module's other timestamp sites (``reopen_at``,
-    ``combined_at``): ``datetime.now(UTC).isoformat()``. Broken out as a
-    named module-level function purely so tests can monkeypatch it and
-    assert an exact string — here the timestamp IS the artifact under test,
-    so a loose "is parseable / within a range" assertion would let a
-    wrong-timezone or wrong-format regression through.
-    """
-    return datetime.now(UTC).isoformat()
-
-
 def _provenance_caller_refusal(
     task_id: str,
     claimed_kind: str | None,
@@ -6689,6 +6692,7 @@ async def _validate_done_provenance(
     agent_id: str | None = None,
     config: Any = None,
     git_runner: GitProbeRunner,
+    stamp_clock: Callable[[], str],
 ) -> tuple[dict | None, dict | None]:
     """Authorize, parse and resolve done_provenance for set_task_status(done).
 
@@ -6858,7 +6862,7 @@ async def _validate_done_provenance(
                 supplied_stamp,
                 task_id,
             )
-        resolved['stamped_at'] = _provenance_stamp_now()
+        resolved['stamped_at'] = stamp_clock()
 
     return None, resolved
 
@@ -7224,6 +7228,7 @@ async def _repair_done_provenance_same_status(
     agent_id: str | None = None,
     config: Any = None,
     git_runner: GitProbeRunner,
+    stamp_clock: Callable[[], str],
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
@@ -7267,6 +7272,7 @@ async def _repair_done_provenance_same_status(
         agent_id=agent_id,
         config=config,
         git_runner=git_runner,
+        stamp_clock=stamp_clock,
     )
     if validation_err is not None:
         return validation_err
