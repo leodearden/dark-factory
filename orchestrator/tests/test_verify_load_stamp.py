@@ -606,6 +606,7 @@ class TestXdistWorkers:
 
         capped = _with_pytest_numprocesses_str(TESTS_SCRIPTS_TEST_COMMAND, '8')
 
+        assert capped is not None
         assert worker_count_values(shlex.split(capped)) == ['auto', '8']
         assert _xdist_workers(capped, {})['n_flag'] == '8'
 
