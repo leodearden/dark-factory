@@ -40,18 +40,19 @@ orchestrator/tests/test_prune_chokepoint_guard.py, whose
 from __future__ import annotations
 
 import ast
+import functools
 from pathlib import Path
 from typing import TypeGuard
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
-    ORCHESTRATOR_SRC,
     ORCHESTRATOR_SRC_DIR,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
     TreePass,
+    python_files,
 )
 
 # The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
@@ -230,7 +231,9 @@ def _release_sites(module: ParsedModule) -> tuple[tuple[int, bool, str], ...]:
     )
 
 
-ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_SRC, extract=_release_sites)
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem, files=functools.partial(python_files, _SRC_DIR), extract=_release_sites,
+)
 TREE_ANALYSES = (ANALYSIS,)
 
 

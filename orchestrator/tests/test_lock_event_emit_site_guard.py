@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
-    ORCHESTRATOR_SRC,
+    ORCHESTRATOR_SRC_DIR,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
@@ -35,6 +35,7 @@ pytestmark = [
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
 ]
 
+_SRC_DIR = ORCHESTRATOR_SRC_DIR.parent
 _CHOKEPOINT = '_emit_lock_event'
 _GUARDED_EVENTS = ('lock_acquired', 'lock_released')
 _EVENT_ENUM = 'EventType'
@@ -81,7 +82,9 @@ def _emit_sites(module: ParsedModule) -> tuple[tuple[str, int, str], ...]:
     return _emit_sites_in(tree)
 
 
-ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_SRC, extract=_emit_sites)
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem, files=functools.partial(python_files, _SRC_DIR), extract=_emit_sites,
+)
 TREE_ANALYSES = (ANALYSIS,)
 
 

@@ -28,18 +28,19 @@ orchestrator/tests/test_event_loop_antipattern_guard.py.
 from __future__ import annotations
 
 import ast
+import functools
 from pathlib import Path
 from typing import TypeGuard
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
-    ORCHESTRATOR_SRC,
     ORCHESTRATOR_SRC_DIR,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
     TreePass,
+    python_files,
 )
 
 # The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
@@ -49,6 +50,7 @@ pytestmark = [
 ]
 
 _THIS_FILE = Path(__file__).name
+_SRC_DIR = ORCHESTRATOR_SRC_DIR.parent
 
 _EXPECTED_ARGV = ('git', 'worktree', 'prune')
 _CHOKEPOINT_FUNCTION = '_prune_registrations'
@@ -164,7 +166,9 @@ def _prune_sites(module: ParsedModule) -> tuple[tuple[int, bool, str], ...]:
     )
 
 
-ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_SRC, extract=_prune_sites)
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem, files=functools.partial(python_files, _SRC_DIR), extract=_prune_sites,
+)
 TREE_ANALYSES = (ANALYSIS,)
 
 
@@ -172,7 +176,6 @@ def test_exactly_one_prune_argv_literal_inside_chokepoint(tree_pass: TreePass) -
     """Every raw ``['git', 'worktree', 'prune']`` argv must route through
     ``GitOps._prune_registrations`` — the single chokepoint.
     """
-    src_dir = ORCHESTRATOR_SRC_DIR.parent
     offenders: list[str] = []
     outside_chokepoint: list[str] = []
     total = 0
@@ -180,7 +183,7 @@ def test_exactly_one_prune_argv_literal_inside_chokepoint(tree_pass: TreePass) -
     for py_file, sites in tree_pass.facts(ANALYSIS).items():
         if py_file.name == _THIS_FILE:
             continue  # skip-self, in case this guard ever lives under src
-        rel = py_file.relative_to(src_dir)
+        rel = py_file.relative_to(_SRC_DIR)
         for lineno, inside, line_text in sites:
             total += 1
             entry = f'{rel}:{lineno}: {line_text}'
