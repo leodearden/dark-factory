@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,7 @@ from escalation.amendments import (
     MAX_AMENDMENTS,
     amendment_room,
 )
-from escalation.classify import effective_benign
+from escalation.classify import default_resolution_class_for_resolver, effective_benign
 from escalation.models import Escalation
 from escalation.queue import (
     _MAX_LATE_RESOLUTION_CHARS,
@@ -395,6 +396,89 @@ class TestDismissAllPendingKeep:
         level_1 = queue.get('esc-5-1')
         assert level_1 is not None
         assert level_1.status == 'pending'
+
+
+def _peer_resolves(
+    peer: EscalationQueue, esc_id: str, peer_wrote: list[Escalation],
+) -> Callable[[Escalation], bool]:
+    """A ``keep`` predicate through which *peer* resolves *esc_id* first, keeping nothing.
+
+    The record as the peer left it on disk is appended to *peer_wrote*.
+    """
+
+    def keep(esc: Escalation) -> bool:
+        if esc.id == esc_id:
+            peer.resolve(esc_id, 'Fixed by a peer process', resolved_by='steward')
+            written = peer.get(esc_id)
+            assert written is not None
+            peer_wrote.append(written)
+        return False
+
+    return keep
+
+
+class TestDismissAllPendingCountsOnlyAppliedDismissals:
+    """A record a concurrent writer resolves between get_pending() and resolve() is not counted.
+
+    ``keep`` is the injection point: it runs on each snapshot record before that
+    record's resolve(), so a real peer queue resolving there lands in the window.
+    """
+
+    def test_record_resolved_by_a_peer_mid_sweep_is_not_counted(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        peer = EscalationQueue(tmp_path / 'queue')
+        for task_id in ('1', '2', '3'):
+            queue.submit(_make_escalation(f'esc-{task_id}-1', task_id=task_id))
+
+        peer_wrote: list[Escalation] = []
+
+        count = queue.dismiss_all_pending(
+            'Stale from prior run', keep=_peer_resolves(peer, 'esc-2-1', peer_wrote),
+        )
+
+        assert count == 2, f'only the two records this sweep dismissed count: {count}'
+        assert [(e.status, e.resolved_by, e.resolution) for e in peer_wrote] == [
+            ('resolved', 'steward', 'Fixed by a peer process'),
+        ], peer_wrote
+        assert queue.get('esc-2-1') == peer_wrote[0], (
+            'the late sweep resolve left the peer-resolved record untouched'
+        )
+        for esc_id in ('esc-1-1', 'esc-3-1'):
+            swept = queue.get(esc_id)
+            assert swept is not None
+            assert (swept.status, swept.resolved_by) == ('dismissed', 'auto-dismissed'), (
+                f'{esc_id} was dismissed by this sweep: {swept}'
+            )
+
+    def test_peer_resolved_strand_is_not_tallied_as_a_stale_strand(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        peer = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=75480.0, task_id='1'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=90.0, task_id='3'))
+
+        peer_wrote: list[Escalation] = []
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            count = queue.dismiss_all_pending(
+                'Stale from prior run',
+                strand_age_secs=600.0,
+                keep=_peer_resolves(peer, 'esc-2-1', peer_wrote),
+            )
+
+        assert count == 2, f'only the two records this sweep dismissed count: {count}'
+        assert [(e.resolved_by, e.resolution_class) for e in peer_wrote] == [
+            ('steward', default_resolution_class_for_resolver('steward')),
+        ], peer_wrote
+        assert queue.get('esc-2-1') == peer_wrote[0], (
+            'the late sweep resolve neither re-stamped nor otherwise touched the peer-resolved strand'
+        )
+        sweep_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith('Dismissed ')]
+        assert len(sweep_lines) == 1, f'one sweep INFO line expected: {sweep_lines}'
+        assert 'Dismissed 2 stale L0 escalation(s)' in sweep_lines[0], sweep_lines
+        assert '(1 stale-strand)' in sweep_lines[0], sweep_lines
 
 
 class TestAmendmentRoom:
@@ -8222,8 +8306,8 @@ class TestResolveOutcomeOutParam:
         """(d) The out-param changed nothing for the callers that ignore it.
 
         `resolve()` has callers that pass positionally (`resolve(id, text,
-        dismiss)`), plus its own member cascade and `dismiss_all_pending` — none
-        of which want the out-param.  Keyword-only with a None default is what
+        dismiss)`), plus its own member cascade — none of which want the
+        out-param.  Keyword-only with a None default is what
         keeps them untouched, asserted the way those callers experience it: a
         third POSITIONAL argument still means `dismiss` (it would have meant
         `outcome` had the new parameter been added positionally), and a call
