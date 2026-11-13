@@ -1,7 +1,9 @@
 """Link-heal runs (plans/write-triage-link-healing-prd.md H1, H2).
 
 A plan run decides every live link, ledgers the heals it stands behind with one
-examination per decided link, and writes the plan document: a deterministic
+examination per decided link, supersedes each pending heal of its source that
+its ruling on the link, at the texts the heal rests on, no longer plans, and
+writes the plan document: a deterministic
 rendering of every pending heal, whose sha256 an operator can approve. It writes nothing to the store, and
 files nothing: every escape it would raise is recorded as ``would_escape``.
 Its verdicts come from the hand-link corpus (:func:`run_plan`) or from the
@@ -473,12 +475,38 @@ _STANDING = frozenset({Disposition.STAGED, Disposition.ALREADY_PENDING})
 def _stage(
     decisions: Iterable[LinkDecision],
     ledger: LinkHealLedger,
+    pending: Sequence[ActionRow],
     enabled_actions: frozenset[HealAction] | None = None,
 ) -> tuple[ExaminationRecord, ...]:
     """Each decision's examination: its heal dropped when it is not among
     *enabled_actions* (``None`` enables every action) or an undo took it back,
-    matched to its row when already pending, else staged as new."""
-    return tuple(_examine(decision, ledger, enabled_actions) for decision in decisions)
+    matched to its row when already pending, else staged as new. It supersedes
+    every other heal of *pending* that its ruling covers
+    (:meth:`LinkDecision.rules_on`), so only the newest ruling on a link at the
+    texts it shows stays pending."""
+    by_child: dict[tuple[str, str], list[ActionRow]] = {}
+    for row in pending:
+        by_child.setdefault((row.planned.project_id, row.planned.child_id), []).append(row)
+    return tuple(
+        _superseding(
+            _examine(decision, ledger, enabled_actions), decision,
+            by_child.get((decision.state.project_id, decision.state.child.memory_id), ()),
+        )
+        for decision in decisions
+    )
+
+
+def _superseding(
+    examination: ExaminationRecord, decision: LinkDecision, pending: Iterable[ActionRow],
+) -> ExaminationRecord:
+    """*examination*, superseding each heal of *pending* that *decision* rules on,
+    except the row it stands behind."""
+    supersedes = tuple(
+        row.action_id
+        for row in pending
+        if row.action_id != examination.pending_action_id and decision.rules_on(row.planned)
+    )
+    return replace(examination, supersedes=supersedes) if supersedes else examination
 
 
 def _examine(
@@ -536,6 +564,9 @@ def _staged_counts(counts: RunCounts, examinations: Sequence[ExaminationRecord])
         already_pending=dispositions[Disposition.ALREADY_PENDING],
         undo_suppressed=dispositions[Disposition.UNDO_SUPPRESSED],
         not_enabled=dispositions[Disposition.NOT_ENABLED],
+        superseded=len({
+            action_id for examination in examinations for action_id in examination.supersedes
+        }),
     )
 
 
@@ -584,7 +615,8 @@ async def _publish_plan(
 ) -> RunReport:
     """Stage *plan* against the ledger, write its document, and finish *run_id*.
 
-    Its examinations commit with its new heals, or roll back with them; a heal
+    Its examinations commit with its new heals and with the retirement of the
+    pending heals of *source* they supersede, or roll back with them; a heal
     outside *enabled_actions* is recorded and never staged. *escapes*, and the
     backlog and share escapes an apply of *source*'s pending heals would raise
     now, are recorded as ``would_escape``; *escaped* discloses the escapes the
@@ -599,7 +631,7 @@ async def _publish_plan(
         if withhold_uncalibrated
         else 0
     )
-    examinations = _stage(plan.decisions, ledger, enabled_actions)
+    examinations = _stage(plan.decisions, ledger, ledger.pending_actions(source), enabled_actions)
     counts = replace(
         _staged_counts(plan.counts, examinations),
         escaped=tuple(escaped), withheld_uncalibrated=withheld,

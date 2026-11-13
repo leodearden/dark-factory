@@ -3298,7 +3298,9 @@ check.
   `link_heal.projects` reads as absent, so list every project that hosts
   parents there.
   Examining a link again is harmless: verdicts are reused and pending heals are
-  deduped. Only the heals in `link_heal.sweep_actions` (default `detach`,
+  deduped. A pending heal that a later run's verdict on the same link, at the
+  same texts, no longer supports is recorded `superseded` and never written:
+  the newest ruling stands. Only the heals in `link_heal.sweep_actions` (default `detach`,
   `relabel`) are staged; every other heal is recorded as `not_enabled`.
 - **When it writes.** It writes only when `link_heal.writes: true` is set, no
   `--dry-run` is given, and the latest calibration of the adjudicator's exact

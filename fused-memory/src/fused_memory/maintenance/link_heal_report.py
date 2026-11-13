@@ -226,6 +226,7 @@ def _markdown(view: SweepRunView, document: Mapping[str, Any]) -> str:
         f'- window: `{document["window"]["since"]}` to `{document["window"]["until"]}`',
         f'- plan run: `{view.plan.run_id}`: examined {plan_counts.examined}, '
         f'staged {plan_counts.planned}, not enabled {plan_counts.not_enabled}, '
+        f'superseded {plan_counts.superseded}, '
         f'adjudication failed {plan_counts.adjudication_failed}, '
         f'read failed {plan_counts.read_failed}',
         f'- calibration: {_calibration_line(view.calibration)}',

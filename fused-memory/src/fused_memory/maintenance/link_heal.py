@@ -662,7 +662,9 @@ class RunCounts:
     about and gave no verdict. ``withheld_uncalibrated`` counts the heals a writing
     sweep's plan run or an apply run withheld because the adjudicator behind their
     verdict has no passing calibration: a policy refusal, not a failure, so it
-    leaves a run complete.
+    leaves a run complete. ``superseded`` counts the pending heals a plan run
+    retired because its own ruling on their link, at the texts they rest on, no
+    longer plans them.
     """
 
     links_total: int = 0
@@ -684,6 +686,7 @@ class RunCounts:
     failed: int = 0
     not_attempted: int = 0
     withheld_uncalibrated: int = 0
+    superseded: int = 0
     stale_rating: int = 0
     contested_reported: int = 0
     chain_reported: int = 0
@@ -754,6 +757,28 @@ class LinkDecision:
         if self.basis is not None:
             return self.basis.source, self.basis.key
         return None, None
+
+    def rules_on(self, heal: PlannedAction) -> bool:
+        """Whether this decision is a ruling on *heal*'s link at the texts *heal* rests
+        on: the same link, the child text read now, and the parent text read now unless
+        *heal* rests on the child alone. An unexamined link and a stale rating rule on
+        nothing."""
+        if self.decision in _NO_RULING:
+            return False
+        state = self.state
+        parent_sha256 = None if state.parent is None else state.parent.text_sha256
+        return (
+            heal.project_id == state.project_id
+            and heal.child_id == state.child.memory_id
+            and heal.pre_image.parent_id == state.link.parent_id
+            and heal.child_sha256 == state.child.text_sha256
+            and heal.parent_sha256 in (None, parent_sha256)
+        )
+
+
+#: The outcomes that judge nothing at the texts a link shows: no basis, or one
+#: that judges other texts.
+_NO_RULING = frozenset({Report.UNEXAMINED, Report.STALE_RATING})
 
 
 @dataclass(frozen=True)

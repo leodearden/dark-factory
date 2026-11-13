@@ -99,6 +99,9 @@ class ActionState(StrEnum):
     #: with no passing calibration. Terminal, so it never blocks a later heal of the
     #: same pair from being staged afresh.
     WITHHELD_UNCALIBRATED = 'withheld_uncalibrated'
+    #: A pending heal a later plan run of its source retired: that run's ruling on
+    #: the link, at the texts the heal rests on, no longer plans it. Terminal.
+    SUPERSEDED = 'superseded'
 
 
 PENDING_STATES = frozenset({ActionState.PLANNED, ActionState.SKIPPED_CAP})
@@ -459,6 +462,8 @@ class ExaminationRecord:
     ``staged`` is the heal this examination adds as a new pending row, set
     exactly for :attr:`Disposition.STAGED`; ``pending_action_id`` is the row its
     heal was already pending as, set exactly for :attr:`Disposition.ALREADY_PENDING`.
+    ``supersedes`` names the other pending rows of the run's source that this
+    examination's ruling retires; never the row it stands behind.
     """
 
     project_id: str
@@ -471,8 +476,12 @@ class ExaminationRecord:
     disposition: Disposition
     staged: PlannedAction | None = None
     pending_action_id: int | None = None
+    supersedes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, 'supersedes', tuple(self.supersedes))
+        if self.pending_action_id is not None and self.pending_action_id in self.supersedes:
+            raise ValueError('an examination never supersedes the row it stands behind')
         if (self.disposition is Disposition.STAGED) != (self.staged is not None):
             raise ValueError('an examination carries a staged heal exactly when it is staged')
         if (self.disposition is Disposition.ALREADY_PENDING) != (self.pending_action_id is not None):
@@ -620,9 +629,10 @@ class LinkHealLedger:
     def publishing_planned(
         self, run_id: str, examinations: Sequence[ExaminationRecord], source: RunSource,
     ) -> Iterator[list[ActionRow]]:
-        """Record *examinations* as *run_id*'s, adding each staged heal as a planned row,
-        and yield *source*'s pending rows, the new ones included. Everything commits
-        when the body returns and is rolled back when it raises."""
+        """Record *examinations* as *run_id*'s, adding each staged heal as a planned row
+        and retiring each pending row an examination supersedes, and yield *source*'s
+        pending rows, the new ones included. Everything commits when the body returns
+        and is rolled back when it raises."""
         with self._conn:
             at = _now()
             for examination in examinations:
@@ -631,15 +641,41 @@ class LinkHealLedger:
                     if examination.staged is None
                     else self._insert_planned(run_id, examination.staged, at)
                 )
-                self._insert_examination(run_id, examination, action_id, at)
+                examination_id = self._insert_examination(run_id, examination, action_id, at)
+                self._supersede(run_id, examination, examination_id, at)
             yield self.pending_actions(source)
+
+    def _supersede(
+        self, run_id: str, examination: ExaminationRecord, examination_id: int, at: str,
+    ) -> None:
+        """Retire the pending rows *examination* supersedes, naming the ruling that did."""
+        if not examination.supersedes:
+            return
+        detail = {
+            'superseded_by_run': run_id,
+            'examination_id': examination_id,
+            'decision': examination.decision.value,
+            'basis_source': (
+                None if examination.basis_source is None else examination.basis_source.value
+            ),
+            'basis_key': examination.basis_key,
+        }
+        ids = ', '.join('?' for _ in examination.supersedes)
+        self._conn.execute(
+            f'UPDATE actions SET state = ?, executed_run_id = ?, detail = ?, at = ? '
+            f'WHERE id IN ({ids}) AND state IN (?, ?)',
+            (
+                ActionState.SUPERSEDED.value, run_id, _json_or_none(detail), at,
+                *examination.supersedes, *_PENDING_VALUES,
+            ),
+        )
 
     def _insert_examination(
         self, run_id: str, examination: ExaminationRecord, action_id: int | None, at: str,
-    ) -> None:
+    ) -> int:
         project_id = examination.project_id
         parent = examination.parent
-        self._conn.execute(
+        cursor = self._conn.execute(
             'INSERT INTO examinations (run_id, project_id, child_id, parent_id, '
             'child_snapshot_id, parent_snapshot_id, basis_source, basis_key, decision, '
             'disposition, action_id, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -652,6 +688,7 @@ class LinkHealLedger:
                 examination.disposition.value, action_id, at,
             ),
         )
+        return _lastrowid(cursor)
 
     def run_records(self, run_id: str) -> list[CandidateRecord]:
         """Every link plan run *run_id* examined, in the order it examined them."""

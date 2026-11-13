@@ -138,7 +138,8 @@ def resolve_window(
     """``[since, now)``. With no *since*, the window starts at the earliest start over
     *projects*: each project's sweep watermark, or *window_hours* before *now* for a
     project no sweep has completed. Re-examining a project's links from an earlier
-    start is harmless: adjudications are reused and pending heals are deduped."""
+    start is harmless: adjudications are reused, pending heals are deduped, and a
+    pending heal the newest ruling no longer plans is superseded."""
     if since is not None:
         return CreatedWindow(since=since, until=now)
     fallback = now - timedelta(hours=window_hours)
@@ -189,7 +190,8 @@ async def run_sweep(
     plan run moves a project's watermark, so links a failed read or adjudication
     left undecided, a project the sweep did not cover, and a gap before an explicit
     *since* are all examined by a later sweep. Examining a link again is harmless:
-    adjudications are reused and pending heals are deduped. A sweep that may write
+    adjudications are reused, pending heals are deduped, and a pending heal the
+    newest ruling no longer plans is superseded. A sweep that may write
     files its adjudicator storm. One that may not only forecasts it.
     """
     window = resolve_window(

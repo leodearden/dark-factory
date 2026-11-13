@@ -857,6 +857,90 @@ class TestThePlanTimeCalibrationGate:
         assert all(row.state is ActionState.PLANNED for row in ledger.run_actions(first.run_id))
 
 
+def _second_prompt_answering(misfiled: Answer) -> FakeAdjudicator:
+    """The second calibrated prompt: it agrees with the first on every link but
+    MISFILED's, on which it answers *misfiled*."""
+    return FakeAdjudicator(
+        lambda text: misfiled if text == 'misfiled sighting' else ANSWERS[text],
+        prompt_sha256=SECOND_PROMPT_SHA256,
+    )
+
+
+class TestANewerRulingAtTheSameTexts:
+    """Two calibrated prompts disagree on MISFILED at the texts it shows: the first
+    staged a detach on a dry night, the second rules otherwise on a writing night."""
+
+    async def _two_nights(
+        self, harness, ledger, tmp_path, misfiled: Answer,
+    ) -> tuple[SweepReport, SweepReport]:
+        _seed(harness)
+        _calibrate(ledger, passed=True)
+        first = await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+        second = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+            adjudicate=_second_prompt_answering(misfiled), now=NOW + DAY, since=WINDOW.since,
+        )
+        return first, second
+
+    @staticmethod
+    def _first_detach(ledger: LinkHealLedger, first: SweepReport):
+        (detach,) = [
+            row for row in ledger.run_actions(first.plan_run_id) if row.planned.child_id == MISFILED
+        ]
+        return detach
+
+    @pytest.mark.asyncio
+    async def test_a_ruling_that_plans_no_heal_supersedes_the_pending_one(
+        self, harness, ledger, tmp_path,
+    ):
+        first, second = await self._two_nights(harness, ledger, tmp_path, Verdict.SAME)
+
+        detach = self._first_detach(ledger, first)
+        assert detach.state is ActionState.SUPERSEDED
+        assert detach.executed_run_id == second.plan_run_id
+        record = {r.child_id: r for r in ledger.run_records(second.plan_run_id)}[MISFILED]
+        assert (record.verdict, record.decision) == (Verdict.SAME, Report.NO_ACTION)
+        assert detach.detail is not None
+        assert detach.detail['superseded_by_run'] == second.plan_run_id
+        assert detach.detail['basis_key'] == str(record.adjudication_id)
+        assert detach.detail['decision'] == Report.NO_ACTION.value
+        assert second.apply_run_id is not None
+        applied = {row.planned.child_id for row in ledger.applied_actions(second.apply_run_id)}
+        assert MISFILED not in applied
+        assert applied == {EXTENDS, TRIAGE_CONTESTED}
+        assert harness.mem0.payload(DF, MISFILED)[PARENT_ID_KEY] == _id('bbbbbbbb', 0)
+        assert second.view.plan.counts.superseded == 1
+
+    @pytest.mark.asyncio
+    async def test_a_ruling_that_plans_another_heal_supersedes_the_pending_one_and_stages_its_own(
+        self, harness, ledger, tmp_path,
+    ):
+        first, second = await self._two_nights(harness, ledger, tmp_path, Verdict.EXTENDS)
+
+        assert self._first_detach(ledger, first).state is ActionState.SUPERSEDED
+        assert second.apply_run_id is not None
+        applied = {
+            (row.planned.child_id, row.planned.action)
+            for row in ledger.applied_actions(second.apply_run_id)
+        }
+        assert (MISFILED, HealAction.RELABEL) in applied
+        assert (MISFILED, HealAction.DETACH) not in applied
+
+    @pytest.mark.asyncio
+    async def test_no_verdict_rules_on_nothing_so_the_pending_heal_stands(
+        self, harness, ledger, tmp_path,
+    ):
+        first, second = await self._two_nights(
+            harness, ledger, tmp_path, AdjudicationFailure.CLI_FAILED,
+        )
+
+        detach = self._first_detach(ledger, first)
+        assert detach.state is ActionState.APPLIED
+        assert detach.executed_run_id == second.apply_run_id
+        assert second.view.plan.counts.superseded == 0
+
+
 def _seed_misfile_heavy(harness: LinkHealHarness) -> None:
     """Twenty in-window sighting links, eight of them misfiled: a 0.40 misfile share."""
     for n in range(20):

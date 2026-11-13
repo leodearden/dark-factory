@@ -133,7 +133,7 @@ EXIT_REFUSED = 2
 NO_WRITING_RUN = 'no link-heal run has written here'
 STATUS_COUNTS = (
     'planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap', 'adjudication_failed',
-    'withheld_uncalibrated',
+    'withheld_uncalibrated', 'superseded',
 )
 PLAN_SOURCES = (
     RunSource.CORPUS, RunSource.ADJUDICATOR, RunSource.DETERMINISTIC, RunSource.SWEEP,
