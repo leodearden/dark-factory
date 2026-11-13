@@ -214,7 +214,7 @@ class TestStampValidation:
         [
             ({k: v for k, v in _stamp().items() if k != 'tip_sha'}, "missing 'tip_sha'"),
             (_stamp(unique_commit_count=True), "'unique_commit_count' is a bool"),
-            (_stamp(reason=None), "'reason' is a NoneType"),
+            ({**_stamp(), 'reason': None}, "'reason' is a NoneType"),
         ],
     )
     def test_a_malformed_stamp_is_refused_and_writes_nothing(
