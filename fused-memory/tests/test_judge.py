@@ -676,7 +676,7 @@ async def test_review_run_unparseable_response_halts_when_enabled(mock_journal):
     ):
         verdict = await judge.review_run('run-parse-halt')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.serious
     assert verdict.action_taken == VerdictAction.halt
     assert judge.is_halted('test-project-parse-halt')
@@ -716,7 +716,7 @@ async def test_review_run_unparseable_response_no_halt_when_disabled(mock_journa
     ):
         verdict = await judge.review_run('run-parse-no-halt')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.serious
     assert verdict.action_taken == VerdictAction.none
     assert not judge.is_halted('test-project-parse-no-halt')
@@ -756,7 +756,7 @@ async def test_review_run_empty_response_does_not_halt_even_when_enabled(mock_jo
     with patch.object(judge, '_call_llm', AsyncMock(return_value='')):
         verdict = await judge.review_run('run-empty-no-halt')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.minor
     assert verdict.action_taken == VerdictAction.none
     assert not judge.is_halted('test-project-empty-no-halt')
@@ -3061,7 +3061,7 @@ class TestReviewRunNoStructuredVerdict:
         ):
             verdict = await judge.review_run('run-nostruct')
 
-        assert verdict is not None
+        assert isinstance(verdict, JudgeVerdict)
         assert verdict.severity == VerdictSeverity.serious
         assert verdict.action_taken == VerdictAction.halt
         mock_journal.add_verdict.assert_called_once()
@@ -3089,7 +3089,7 @@ class TestReviewRunNoStructuredVerdict:
         ):
             verdict = await judge.review_run('run-nostruct')
 
-        assert verdict is not None
+        assert isinstance(verdict, JudgeVerdict)
         assert verdict.severity == VerdictSeverity.moderate
         assert verdict.action_taken == VerdictAction.rollback
         assert judge.is_halted('proj-moderate-struct') is False
@@ -3509,7 +3509,7 @@ class TestARepeatedReviewErrorHaltsTruthfully:
         )
 
         for _ in range(3):
-            assert (await judge.review_run('run-x')).reason is NoVerdictReason.RUN_NOT_FOUND
+            assert await judge.review_run('run-x') == NoVerdict('run-x', NoVerdictReason.RUN_NOT_FOUND)
 
         mock_journal.set_halt.assert_not_called()
 
@@ -3522,7 +3522,7 @@ class TestARepeatedReviewErrorHaltsTruthfully:
         }])
         await judge.initialize()
         for _ in range(2):
-            assert (await judge.review_run('run-x')).reason is NoVerdictReason.PROJECT_HALTED
+            assert await judge.review_run('run-x') == NoVerdict('run-x', NoVerdictReason.PROJECT_HALTED)
         await judge.unhalt(self._PID)
         mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
 
@@ -3586,7 +3586,7 @@ async def test_review_run_unparseable_content_halts_with_unparseable_reason(mock
     ):
         verdict = await judge.review_run('run-unparseable')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.serious
     assert judge.is_halted('proj-unparseable')
     mock_journal.set_halt.assert_called_once()
@@ -3622,7 +3622,7 @@ async def test_review_run_genuine_serious_halts_with_serious_verdict_reason(mock
     with patch.object(judge, '_call_llm', AsyncMock(return_value=serious_json)):
         verdict = await judge.review_run('run-genuine-serious')
 
-    assert verdict is not None
+    assert isinstance(verdict, JudgeVerdict)
     assert verdict.severity == VerdictSeverity.serious
     assert judge.is_halted('proj-genuine-serious')
     mock_journal.set_halt.assert_called_once()
@@ -3790,7 +3790,7 @@ class TestJudgeCapRetryResumeKeepsVerdictContract:
         )
 
         # 2. A real, parseable verdict came back.
-        assert verdict is not None
+        assert isinstance(verdict, JudgeVerdict)
         assert verdict.severity == VerdictSeverity.ok
         assert verdict.action_taken == VerdictAction.none
 
