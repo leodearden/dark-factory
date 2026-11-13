@@ -4,7 +4,7 @@ signal_leaves:
 - ω
 tasks:
 - label: β0
-  task_id: null
+  task_id: 9689
   title: Shared config-field declarations (reload tier, legacy spelling, role-table pivot) and the generic hot-reload engine
   note: 'Contracts C3 (TableLegacy included) and C4. Carries fk-efae65b1f9af and fk-dae2a050b5d3 (tier-on-field half). Free: touches only new shared/ modules.'
   capabilities:
@@ -63,7 +63,7 @@ tasks:
       - shared/src/shared/config_fields.py
       expect: present
 - label: γ0
-  task_id: null
+  task_id: 9690
   title: 'Shared role and backend vocabulary: Backend, RoleName, config_role, RoleSettings'
   note: 'Contracts C1 (six CLI members: zcode and mimo landed by tasks 5399 and 7993) and C2. Carries fk-ba569525f6e0 and fk-5805ae6f97f1 (vocabulary half). Free. S20 ν holds on S16/C1 = this leaf.'
   capabilities:
@@ -131,7 +131,7 @@ tasks:
       - shared/src/shared/roles.py
       expect: present
 - label: α
-  task_id: null
+  task_id: 9691
   title: 'Config defaults have one home: field defaults are authoritative, defaults.yaml keeps only environment-layered leaves'
   note: 'Closes fk-2a67692ff456. Survivors per PRD D2 (the yaml value at α''s base); C7 guard; C8 cross-package defaults (OQ-4 option 2, ruled by the lead). Deps: 9229, 8375, 9146, S19 κ2 (no edge onto S24: it homes its restart defaults in shared/fleet_coordination.py).'
   capabilities:
@@ -207,7 +207,7 @@ tasks:
       - dashboard/src/dashboard/data/orchestrator.py
       expect: present
 - label: ι
-  task_id: null
+  task_id: 9692
   title: Promote the config-default-one-home design invariant through the four-site lockstep edit
   note: 'R22 item 5. The six wave-3 minting tasks take INV-18 to INV-23 in landing order (one-decision-partition-per-area last, INV-23), so ι takes one of INV-18 to INV-22; the lead wires the invariant-file chain at decompose; every check anchors on the slug. Deps: α, 9154 (same three invariant files).'
   capabilities:
@@ -242,7 +242,7 @@ tasks:
       - docs/legibility/design-invariants-fixtures.md
       expect: present
 - label: β2
-  task_id: null
+  task_id: 9693
   title: Fused-memory declares reload tiers and legacy spellings on its fields; its engine copy config/reload.py is deleted
   note: 'Carries fk-efae65b1f9af. Fused-memory pivot + deprecation report. Deps: β0, 9194, 9280, 9254, 9252, 8143, 8452, S15 ε1, S19 δ. Starts without 5040.'
   capabilities:
@@ -283,7 +283,7 @@ tasks:
       - fused-memory/src/fused_memory/config/schema.py
       expect: present
 - label: β1
-  task_id: null
+  task_id: 9694
   title: The orchestrator declares reload tiers and legacy spellings on its fields; its engine copy goes
   note: 'Closes fk-efae65b1f9af (the later engine deletion); carries fk-dae2a050b5d3. D6 translation phase: model_copy pivot; check-config (cli.py) prints the deprecated bucket. Deps: α, β0, β2, 9236, 9210, 3792, 5366.'
   capabilities:
@@ -339,7 +339,7 @@ tasks:
       kind: manual
       reason: bucket name is decided in the leaf; a reviewer confirms boundary row 5 (a declared legacy spelling is reported deprecated, never unknown, and files no L2)
 - label: γ1
-  task_id: null
+  task_id: 9695
   title: Orchestrator backend fields are Backend; invoke_agent dispatches through one total table
   note: 'Closes fk-ba569525f6e0 on the orchestrator side. Deps: β1, γ0, 9233.'
   capabilities:
@@ -371,7 +371,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: absent
 - label: γ2
-  task_id: null
+  task_id: 9696
   title: One role-keyed RoleSettings table replaces the knob-major submodels, the unblock-auto role knobs and the watcher role knobs
   note: 'Closes fk-5805ae6f97f1. Over the 15-file trigger as one codemod (both orientations must not be readable at once). Deps: γ1, 9232, 9188, 9150, 9202, 9235.'
   capabilities:
@@ -421,7 +421,7 @@ tasks:
       - shared/src/shared/task_metadata.py
       expect: present
 - label: δ
-  task_id: null
+  task_id: 9697
   title: The route resolver and the allowlist move to shared; orchestrator.routing keeps the availability probe
   note: 'Carries fk-dac0a2a67201 (orchestrator half). Deps: γ2, 6766 (S25 C4), 8373, 5366, S20 δ (S20 C6).'
   capabilities:
@@ -504,7 +504,7 @@ tasks:
       - orchestrator/src/orchestrator/routing.py
       expect: absent
 - label: ε1
-  task_id: null
+  task_id: 9698
   title: Recon agent and judge providers are Backend; the dead SDK arms go
   note: 'Closes fk-34d8da6424f4 and fk-709d4d84ee37. Deps: β2, γ0, S12 α. The judge becomes Claude-CLI-only (OQ-3, ruled by the lead, flagged). Starts without 5040.'
   capabilities:
@@ -563,7 +563,7 @@ tasks:
       - fused-memory/src/fused_memory/reconciliation/judge.py
       expect: absent
 - label: ε2a
-  task_id: null
+  task_id: 9699
   title: Recon LLM calls declare a role and receive a validated route
   note: 'Carries fk-dac0a2a67201. Complete fused-memory role table; five non-recon rows derived until ε2b; per-row reload tiers. Deps: δ, ε1, 9188, S12 β1.'
   capabilities:
@@ -607,7 +607,7 @@ tasks:
       - fused-memory/src/fused_memory/config/schema.py
       expect: present
 - label: ε2b
-  task_id: null
+  task_id: 9700
   title: Curator, adjudicators, write-triage judge and the memory LLM take their route from the role table
   note: 'Closes fk-dac0a2a67201. Deps: ε2a, 9204, 9203, S19 δ. Write-triage inheritance retired (OQ-8, ruled by the lead). Also moves the new replay_overreach_extraction script''s config.llm readers, and rewrites config-docker.yaml''s llm.provider/llm.model.'
   capabilities:
@@ -648,7 +648,7 @@ tasks:
       - fused-memory/src/fused_memory/middleware/task_curator.py
       expect: present
 - label: η
-  task_id: null
+  task_id: 9701
   title: Service-path knobs leave ReconciliationConfig; fused-memory consumers trust the validated schema
   note: 'Closes fk-c520d5374ba5 and fk-a3dfde6f0664. Deps: ε2b, 9174, 9245, 9247, 9282. Rewrites the one docs/task-authoring.md mention of a moved knob.'
   capabilities:
@@ -689,7 +689,7 @@ tasks:
       - fused-memory/src/fused_memory/config/schema.py
       expect: absent
 - label: ζ1
-  task_id: null
+  task_id: 9702
   title: 'Harness supervision knobs become submodels: service restart keyed by service, fleet redeploy, watcher, digest, escalation revalidation, info-L0 router'
   note: 'Carries fk-dae2a050b5d3. Deps: δ, 9173, 9251, 9272, S24 γ, S24 ζ. Carries S24 ζ''s restart-only fused_memory_restart_min_interval_secs into service_restart[fused_memory].'
   capabilities:
@@ -730,7 +730,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: ζ2
-  task_id: null
+  task_id: 9703
   title: Recovery sweeps become one submodel per sweep
   note: 'Carries fk-dae2a050b5d3. Deps: ζ1, 9160, S17 ζ (OQ-11, ruled by the lead). Picks up task 4082''s re-pend loop cap at the filing re-scan.'
   capabilities:
@@ -753,7 +753,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: ζ3
-  task_id: null
+  task_id: 9704
   title: The scheduler submodel, and the two double-duty knobs get their own fields
   note: 'Closes fk-da71e5bb1679; carries fk-dae2a050b5d3. Decides the tier of task 4602''s scalars. Deps: ζ2, 9234, S17 κ1 (OQ-11, ruled by the lead); also rewrites S17''s new scheduler modules.'
   capabilities:
@@ -814,7 +814,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: ζ4a
-  task_id: null
+  task_id: 9705
   title: Verify admission, clock-stop and cgroup knobs become submodels
   note: 'Carries fk-dae2a050b5d3. Deps: ζ3.'
   capabilities:
@@ -837,7 +837,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: ζ6a
-  task_id: null
+  task_id: 9706
   title: Workflow iteration caps and review cadence become the workflow submodel
   note: 'Carries fk-dae2a050b5d3. Deps: ζ4a, 9153, S20 β. Declares shared/cli_result.py (S20 β creates it); no longer declares shared/cli_invoke.py (S20''s ask).'
   capabilities:
@@ -861,7 +861,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: ζ6b
-  task_id: null
+  task_id: 9707
   title: Steward knobs become the steward submodel; rebase, revalidation and cleanup knobs join the workflow submodel
   note: 'Carries fk-dae2a050b5d3. Deps: ζ6a, 9284.'
   capabilities:
@@ -883,7 +883,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: ζ4b
-  task_id: null
+  task_id: 9708
   title: Verify timeouts, retries, cold commands and concurrency become the verify submodel; per-module overrides map onto it
   note: 'Carries fk-dae2a050b5d3. Declares merge_lane/worker.py: parked behind 8528 (R55). Deps: ζ6b, 8528, 9188, 9166, 9135.'
   capabilities:
@@ -923,7 +923,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: ζ5a
-  task_id: null
+  task_id: 9709
   title: Merge-lane knobs become the merge_lane submodel
   note: 'Carries fk-dae2a050b5d3. Declares merge_lane/worker.py: parked behind 8528 (R55). Deps: ζ4b, 8528.'
   capabilities:
@@ -945,7 +945,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: ζ5b
-  task_id: null
+  task_id: 9710
   title: Verify-host knobs become the verify_hosts submodel
   note: 'Closes fk-dae2a050b5d3 (last ζ). Declares merge_lane/worker.py: parked behind 8528 (R55). Deps: ζ5a, 8528.'
   capabilities:
@@ -967,7 +967,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
 - label: κ
-  task_id: null
+  task_id: 9711
   title: Dark-factory's operator yaml, its dashboard module yaml and its operator docs use the new setting names
   note: 'Carries fk-dae2a050b5d3. Filed after the clerk amends the yaml-anchored checks (PRD §Delivered checks on moved paths). Deps: ζ5b. 36 old names in dark-factory-orchestrator.yaml, 6 in dashboard/orchestrator.yaml, 94 prose lines in 10 files (measured at ce6673c7e1).'
   capabilities:
@@ -1017,7 +1017,7 @@ tasks:
       - docs/config-retune-gate.md
       expect: absent
 - label: χ
-  task_id: null
+  task_id: 9712
   title: The escalation watcher spawns the session of a gate Leo pre-authorised, in attended and AFK posture alike
   note: 'Fold-verify 2026-11-13: σ''s milestone_gate is otherwise always asked and never spawned while Leo is away (skill §Always ask; AFK shift 2). Third milestone-gate exception keyed on metadata.x_preauthorised_spawn; the watcher never resolves the gate. complexity=simple. No finding key. Deps: none (S2 μ''s stated R54 exception for this skill file). S2 ν carries the same key and depends on χ (lead ruling: the mechanism stays in S16; χ has no prerequisite inside S16).'
   capabilities:
@@ -1031,7 +1031,7 @@ tasks:
       - skills/escalation-watcher/SKILL.md
       expect: present
 - label: σ
-  task_id: null
+  task_id: 9718
   title: 'Operator gate: a pre-authorised /team session rewrites the nine project yamls and the two leo-laptop host yamls to the new setting names'
   note: 'Ruling OQ-2 = B (Leo, 2026-11-12; R-5 = B 2026-11-13). Cross-stream operator-sweep shape: task_kind=deterministic, always_escalates=true, no before_done; metadata.milestone delayed 259200 s (lead ruling); metadata.x_preauthorised_spawn, which the watcher rule χ keys on; born-at-L2; description carries the /team brief and Leo''s pre-authorisation (the spawn may run while he is away); the spawned session resumes the gate. No finding key; no files in this repo. Deps: ζ5b, κ, χ, 6754.'
   capabilities:
@@ -1054,7 +1054,7 @@ tasks:
       kind: manual
       reason: the nine project yamls are in other repositories and the two host yamls on leo-laptop; not a property of this tree
 - label: ξ
-  task_id: null
+  task_id: 9719
   title: Old setting names are refused at load and at hot reload in both services, with an error naming the new path; the translation path is deleted
   note: 'Ruling OQ-2 = B, R-5 = B: replaces the dated pivot-removal follow-up. Carries fk-dae2a050b5d3. Not extra=forbid. Deps: σ, η.'
   capabilities:
@@ -1110,7 +1110,7 @@ tasks:
       kind: manual
       reason: the files are in other repositories and on leo-laptop; the commit message records each result
 - label: π
-  task_id: null
+  task_id: 9720
   title: 'The scoped-cap model has one spelling: one shared Fable id, one alias decoder, and scope_for matches through it'
   note: 'Lead decision on the task-8253 investigation''s side finding (D15, C9). No finding key. Absorbs task 5407 (cancel). Deps: κ, S20 ι (which follows S20 ε, the creator of shared/account_state.py); S20 ν also edits that file and the lead orders it against π.'
   capabilities:
@@ -1179,7 +1179,7 @@ tasks:
       - orchestrator/src/orchestrator/routing.py
       expect: absent
 - label: ω
-  task_id: null
+  task_id: 9721
   title: 'Integration gate: both services load, reload, refuse old names and route through the shared config contracts'
   note: 'Signal leaf. Runs boundary rows 1-24 end to end, the translation-era rows in their refusal form. Deps: ξ, ι.'
   capabilities:

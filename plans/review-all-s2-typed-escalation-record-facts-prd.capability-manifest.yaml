@@ -4,7 +4,7 @@ signal_leaves:
 - ι
 tasks:
 - label: "α"
-  task_id: null
+  task_id: 9687
   title: "Typed escalation vocabulary: status, severity and resolve-action enums parsed at construction"
   note: "Closes fk-bbb0a7b3c8a8 and the evidence half of fk-479375564c2f. Lands C1 (incl. the reader-side skip of an unparseable record; EscalationStatus's terminal values from shared.escalation_layout, S19 C9) and C2's columns. Deps: S3 kappa 9173, task 8562, S19 theta0. Task 6390 has landed (bbaa5f91e4); its former edge onto alpha is dropped."
   capabilities:
@@ -85,7 +85,7 @@ tasks:
       kind: manual
       reason: a reviewer confirms the orchestrator and fused-memory journals show no UnknownEscalationValue WARNING after both restart on alpha; a live-store property, not a tree property
 - label: β1
-  task_id: null
+  task_id: 9714
   title: Persist the cascade parent on escalation records; every resolver-tier reader reads it
   note: "Closes the field and reader half of fk-8c48269c7363 and the cascade-field half of fk-5332d25b1702. Lands C3's beta1 part. Deps: alpha, S3 beta 9157, S3 gamma 9162. Cancels 8777."
   capabilities:
@@ -137,7 +137,7 @@ tasks:
       kind: manual
       reason: "a reviewer confirms, after the dark-factory orchestrator and fused-memory restart on beta1, that every data/escalations record whose parsed resolved_by starts with l2-cascade: carries cascade_parent_id, read by parsing each file (a grep also hits esc-8422-3, which carries the string in detail only)"
 - label: β2
-  task_id: null
+  task_id: 9717
   title: The resolve callback receives a frozen event; cascade attribution leaves resolved_by
   note: "Closes fk-8c48269c7363 and the cascade half of fk-5332d25b1702. Lands C3's beta2 part. Deps: beta1. Edges onto filed tasks: 9177 -> beta2 (sitting ruling S2-3 a), 9144 -> beta2 (lead ruling S2/OQ-5). Cancels 8784. 33 declared files, mechanical test migration onto two public seams, plus the L2 watcher skill's cascade passages."
   capabilities:
@@ -197,7 +197,7 @@ tasks:
       - skills/escalation-watcher/SKILL.md
       expect: absent
 - label: γ
-  task_id: null
+  task_id: 9724
   title: "Filer-declared escalation facts: filing site, failure signature, original severity, hypothesis"
   note: "Closes fk-638cca2f65bb (record half), the hypothesis half of fk-479375564c2f and the field half of fk-5332d25b1702. Lands C4, incl. declared_failure_identity/failure_identity (lead ruling S2/OQ-3) and the four fields on S1's EscalationDraft. Deps: beta2, S3 iota 9181, S1 beta (every other escalation-package filer; through it S1 alpha, the filing entry point)."
   capabilities:
@@ -268,7 +268,7 @@ tasks:
       - escalation/src/
       expect: absent
 - label: γ2
-  task_id: null
+  task_id: 9726
   title: The five readers of the stored dedupe fingerprint read the one declared failure identity
   note: "Closes the readers half of fk-638cca2f65bb and is the first half of the fingerprint retirement the lead's FINGERPRINT ruling (2026-11-13) gives this plan. Moves the Memory Evals join, the escalation-archive set, the recon harness's two re-file checks, EscalationQueue.has_open's filter and dedupe.py's fold keys onto declared_failure_identity; changes no write, so it can land before S1 omega. Deps: gamma, epsilon, eta, 9254. gamma3 (the field deleted) -> gamma2, S1 omega."
   capabilities:
@@ -302,7 +302,7 @@ tasks:
       kind: manual
       reason: a reviewer confirms boundary rows 24 and 25 run each of the five readers against both record shapes on a real queue dir
 - label: γ3
-  task_id: null
+  task_id: 9730
   title: "Retire the stored dedupe fingerprint: every filer declares the failure signature and the field is deleted"
   note: "Closes fk-638cca2f65bb: the second half of the fingerprint retirement (lead FINGERPRINT ruling, 2026-11-13). backfill_record_facts first copies a stored raw dedupe_fingerprint into failure_signature on every pending and archived record (Escalation.from_dict drops unknown keys); then every writer passes failure_signature, and Escalation.dedupe_fingerprint, EscalationDraft.dedupe_fingerprint and S1's fingerprint arguments (OpenAtLevel, has_open, Fingerprint) go. Deps: gamma2, S1 omega, theta1, theta2, task 8528 (declares merge_lane/worker.py; R55). About 66 files, mechanical; re-measured at dispatch."
   capabilities:
@@ -345,7 +345,7 @@ tasks:
       kind: manual
       reason: a reviewer compares the Memory Evals panel's linked escalations before and after the dark-factory orchestrator and fused-memory restart on gamma3; a live-store property, not a tree property
 - label: δ
-  task_id: null
+  task_id: 9758
   title: resolve_issue branches on ACTION_EFFECTS record disposition; persisted duplicate_of (C5)
   note: "Closes fk-e3b7459c681d and fk-d0e1094c99cb (high). Lands C5 for S25 xi 6770 (released onto delta). Deps: gamma, S3 iota 9181, S10 alpha 9180."
   capabilities:
@@ -406,7 +406,7 @@ tasks:
       - escalation/src/escalation/action_effects.py
       expect: present
 - label: ε
-  task_id: null
+  task_id: 9760
   title: One parse of escalation caller headers for every ladder tool, the channel stamped, and a self-explaining identity refusal (no denial yet)
   note: "Closes fk-755f786c32be; names fk-ece88b7661b7 (closed later by omicron). Lands C6 except mcp_config_json: parse_caller_identity, AUTHORITY_BEARING, identity_required_refusal and its message (warned, not refused, until omicron), filed_via/resolved_via, HUMAN_IDENTITIES, resolver_detail, promote identity-first (lead S2/OQ-9 amended by S2-2), and the check script xi runs. Deps: delta, S3 kappa 9173, S1 beta."
   capabilities:
@@ -486,7 +486,7 @@ tasks:
       - scripts/check_unidentified_escalation_actions.py
       expect: present
 - label: ε2
-  task_id: null
+  task_id: 9765
   title: "Corroborated L2 auto-close: the task store decides whether a stale-task L2 may be closed automatically"
   note: "Closes fk-48a76ee9f746 (high; sitting ruling S2-1 a-prime). Lands C7: PolicyRow.corroborate on both the watcher and the executor door. Deps: epsilon. Edges onto filed tasks: 9188 -> epsilon2, 5258 -> epsilon2, 8477/8478 -> epsilon2."
   capabilities:
@@ -509,7 +509,7 @@ tasks:
       - escalation/src/escalation/server.py
       expect: present
 - label: ζ
-  task_id: null
+  task_id: 9785
   title: The escalation ladder role prompt renders dedupe and downgrade facts from escalation code
   note: "Closes fk-89388166d3ca. Deps: gamma, S5 omicron0 9270 (lead ruling S2/OQ-11 a; an import-only codemod, droppable at decompose). Edges onto existing tasks: 7639 -> zeta, 7392 -> zeta."
   capabilities:
@@ -538,7 +538,7 @@ tasks:
       kind: manual
       reason: "a reviewer confirms the test mutates DedupeConfig's default and asserts the rendered prompt, rather than asserting prompt text"
 - label: η
-  task_id: null
+  task_id: 9790
   title: Dashboard and fused-memory readers compare escalation status through the shared vocabulary
   note: "Closes fk-a65731424439 and part of fk-60b7c33ea0ad. Deps: alpha, beta1. Edge onto a filed task: S10 omicron 9285 -> eta."
   capabilities:
@@ -577,7 +577,7 @@ tasks:
       kind: manual
       reason: "a reviewer confirms boundary row 20: all five readers agree on a corpus holding an unknown status"
 - label: θ1
-  task_id: null
+  task_id: 9798
   title: Harness and workflow read escalation record facts instead of summary text
   note: "Closes the reader half of fk-5332d25b1702 and part of fk-60b7c33ea0ad. Deps: beta2, gamma, epsilon, mu, S8 omega 9236, S8 kappa1 9232, S1 delta, S1 eta2 (sitting ruling S2-3 a; lead ruling S2/OQ-11 a)."
   capabilities:
@@ -618,7 +618,7 @@ tasks:
       - orchestrator/src/orchestrator/workflow.py
       expect: present
 - label: θ2
-  task_id: null
+  task_id: 9799
   title: Orchestrator modules compare escalation status, action and category through the vocabulary
   note: "Part of fk-60b7c33ea0ad. Deps: alpha, mu, 9287, 9231, 9191, 9283, 9270 (lead ruling S2/OQ-11 a), S1 gamma, S1 kappa1, S1 kappa3, S1 kappa4 (sitting ruling S2-3 a). Mechanical (complexity simple)."
   capabilities:
@@ -646,7 +646,7 @@ tasks:
       - orchestrator/src/
       expect: absent
 - label: ι
-  task_id: null
+  task_id: 9809
   title: "Escalation-vocabulary guard, the scripts' sites and invariant escalation-vocabulary-imported"
   note: "Integration gate and signal leaf. Gates fk-60b7c33ea0ad and fk-a65731424439. Deps: beta1..theta2, gamma2, epsilon2 and task 6770; the wave-3 invariant chain in the lead's order (lead ruling S2/OQ-10 b). Performs the four-site lockstep edit; the INV number is the next free one at landing, the slug is the id. The rule names escalation.models, escalation.categories and shared.escalation_layout. The guard lives in scripts/tests (run by the full test_command's last segment on every merge)."
   capabilities:
@@ -711,7 +711,7 @@ tasks:
       kind: manual
       reason: "rejection quality is judged by the guard's own fixture tests (boundary row 23), not a grep"
 - label: κ
-  task_id: null
+  task_id: 9814
   title: DedupeConfig fields named for what they configure, and the config frozen
   note: "Closes fk-9c7ebc2b50b2 (low). Deps: gamma, gamma2, epsilon, epsilon2, zeta, eta, theta1, theta2, task 8528 (declares merge_lane/worker.py; parked per R55), S1 theta2, S1 iota2, S1 omega (sitting ruling S2-3 a); 6348 cancelled into S1 theta2, kappa -> S1 theta2 carries it. Re-measures infra_dedupe_ users at dispatch. Data files under fused-memory/calibration, docs and plans keep their historical spellings."
   capabilities:
@@ -738,7 +738,7 @@ tasks:
       kind: manual
       reason: a reviewer confirms the DedupeConfig decorator is frozen=True; the decorator and class are on separate lines, which a single-line check cannot anchor
 - label: μ
-  task_id: null
+  task_id: 9817
   title: Every dark-factory escalation client and every spawned agent sends an identity header
   note: "Deploy step of sitting ruling S2-2 (names fk-ece88b7661b7). mcp_config_json requires an identity for an escalation entry; spawned agents send their dispatched agent id; .mcp.json, recon-watch/mcp.json and the two watcher skills send X-Escalation-Identity. Every spawned agent's environment also carries ESCALATION_IDENTITY=<its agent id>, so the ambient worktree .mcp.json entry sends the id too; cgl_eta_finalize_gate.py sends a header. Deps: epsilon. Per-file: a stated, measured exception to R54 for its one-line edits, confirmed by the lead 2026-11-13."
   capabilities:
@@ -809,7 +809,7 @@ tasks:
       kind: manual
       reason: a reviewer confirms, after the orchestrator restarts on mu, that a steward L0 close and an interactive resolve are archived with resolved_via identified and their identities in resolved_by
 - label: ν
-  task_id: null
+  task_id: 9843
   title: "Operator gate: deploy the escalation identity header to every other project's MCP configuration (pre-authorised session)"
   note: "Human gate in the program's operator-sweep shape (task_kind deterministic, always_escalates, no before_done, files []), carrying metadata.x_preauthorised_spawn, the key S16 chi's watcher rule reads. Its born-at-L2 escalation carries the /team brief and quotes Leo's 2026-11-12 pre-authorisation; one .mcp.json-only commit per repository and the twelve side checkouts fast-forwarded or edited in place; configuration only. reify/scripts/docs-truth-sweep.py gets its identity through a reify task the lead files at decompose (lead ruling 2026-11-13). Deps: epsilon, mu, S16 chi, reify:<id> (cross-project)."
   capabilities:

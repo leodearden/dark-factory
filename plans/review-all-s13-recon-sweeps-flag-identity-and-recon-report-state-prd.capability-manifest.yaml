@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ω"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 9732
     title: "Give recon flag identity one public module: fingerprint, normalizer, signatures, FlagTypeFamily, UUID extraction and the parsed flag subject"
     note: "Closes fk-e30ecd1f36b8, fk-e64ee986eeed. High. No dependency. Persisted forms are frozen byte-for-byte (D1); the golden fixture captures today's outputs. 20 declared paths, 6 of them one-line test import repoints of the moved signature functions."
     capabilities:
@@ -42,7 +42,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/reconciliation/flag_dedup.py::compute_marker_signature` substrate — is on main; α moves it"
         verdict: PASS
   - label: "β"
-    task_id: null
+    task_id: 9733
     title: "Make recon flag suppression match any component of a composite task id and record partial matches on the suppression row"
     note: "Closes fk-5d00812d5256 under R13 option 1. Deps δ1 (through it α); S19 α (lead ruling OQ-4). filter_suppressed gains a run_id keyword; the 8 test calls of is_suppressed move or go."
     capabilities:
@@ -74,7 +74,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/reconciliation/recon_ledger.py::ReconLedgerStore.upsert_if_state` substrate — exists on main; β writes partial hits through it so a lifted row is never revived"
         verdict: PASS
   - label: "γ"
-    task_id: null
+    task_id: 9734
     title: "Put every recon flag_type vocabulary on FlagTypeFamily with a drift log, and guard against ad-hoc flag_type matching"
     note: "Closes fk-65aeb80b161d. Dep β. Subsumes task 7388 (cancelled). EXACT mode for the absence filter, which gates delete_memory (D3)."
     capabilities:
@@ -102,7 +102,7 @@ tasks:
           paths: ["fused-memory/tests/reconciliation/test_flag_type_vocabulary_guard.py"]
           expect: present
   - label: "δ1"
-    task_id: null
+    task_id: 9735
     title: "Split task_filter.py: the recon prose grammar moves to recon_prose_grammar.py, task_filter keeps the task-tree renderer"
     note: "Closes fk-d9bfbf342b5b. Dep α. 23 declared paths, 16 of them one-line import repoints. Placement (lead ruling OQ-4): S19 β2 moves recon_prose_grammar.py in place of task_filter.py."
     capabilities:
@@ -123,7 +123,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/task_filter.py"]
           expect: absent
   - label: "δ2"
-    task_id: null
+    task_id: 9736
     title: "Derive the recon status lexicon and terminal sets from shared.task_statuses; make active-tree selection a typed value"
     note: "Closes fk-51ec1e4010af, fk-9f66b6f4420c. Dep θ2; shares only server/tools.py import lines with S12 δ (rebase-only). status_rank keeps today's ranks (infra-hold 3, cancelled 7), pinned by an order test. Task 9285 depends on δ2 (lead action); S19 β2 depends on δ2 (lead ruling OQ-4)."
     capabilities:
@@ -163,7 +163,7 @@ tasks:
         binding: "`grep:shared/src/shared/task_statuses.py::TaskStatus` `grep:shared/src/shared/task_statuses.py::TERMINAL` substrate — are on main"
         verdict: PASS
   - label: "ε"
-    task_id: null
+    task_id: 9737
     title: "Make the recon finding category a closed enum: refuse off-list categories at add_finding, record every refusal for analysis, and generate the stage schema from it"
     note: "Closes fk-7c13df0b988c. Deps ζ, θ3, S12 ι2 (prompts/fragments.py). OQ-2 ruled (a) by Leo, plus his additions: every refusal is recorded in the append-only rejected_findings table (server/recon_report_store.py, 180-day retention, untouched by run cleanup), a same-run accepted retry stamps retried_as, and the stage report counts findings_rejected_invalid_category (C11, D18). The five producer category constants become FindingCategory members."
     capabilities:
@@ -235,7 +235,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/models/reconciliation.py::FindingSeverity` `grep:fused-memory/src/fused_memory/models/reconciliation.py::FINDING_SEVERITY_VALUES` substrate — on main; the add_finding refusal mirrors ReconReportState.add_finding's invalid_severity arm"
         verdict: PASS
   - label: "ζ"
-    task_id: null
+    task_id: 9738
     title: "Give recon_report one RunFindingIndex per run that owns its session and dedup maps"
     note: "Closes fk-0791e9817b84. High. Dep α."
     capabilities:
@@ -259,7 +259,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/server/recon_report.py::ReconReportState._install_entry` substrate — is the existing single installer the index absorbs"
         verdict: PASS
   - label: "η"
-    task_id: null
+    task_id: 9739
     title: "Give both stale-edge sweeps one Graphiti edge-sweep primitive, take the agent id from StageId, and stop recon writing task status into memory (the sweep's replacement sentence and the Stage-1 prompt's status facts)"
     note: "Closes fk-917fdf32a542, fk-cdb8c20a3d0f. OQ-1 (b) and OQ-8 (b′) ruled by Leo: nothing writes task status into memory; the sweep invalidates and writes nothing, and the Stage-1 prompt's two status sections tell the agent to invalidate and write nothing for a task's status (D19). The detector stays as a backstop. Deps κ2, δ2; out of batch 9203 (S26 μ, C7 read surface), 6721 (S14 μ), 6718 (S14 θ, same sweep module and test), 7941, 5272 (6598 done)."
     capabilities:
@@ -337,7 +337,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/models/reconciliation.py::StageId` substrate — on main"
         verdict: PASS
   - label: "θ1"
-    task_id: null
+    task_id: 9740
     title: "Move flag_dedup's task-state refutation and systemic-pattern filters, with their shared lookup helpers, into flag_filters modules"
     note: "Part of fk-46514b4ef0cc. Dep γ; touches no file S12 edits. Subsumes task 5996 with θ2, θ3."
     capabilities:
@@ -361,7 +361,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/reconciliation/stage1_flag_chain.py::RESOLVING_FILTERS_BEFORE_SUPPRESSION` substrate — is the one statement of filter order; θ1 only repoints its imports"
         verdict: PASS
   - label: "θ2"
-    task_id: null
+    task_id: 9741
     title: "Move flag_dedup's count-snapshot, authorship and task-text accounting filters into flag_filters modules"
     note: "Part of fk-46514b4ef0cc. Dep θ1."
     capabilities:
@@ -382,7 +382,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/flag_dedup.py"]
           expect: absent
   - label: "θ3"
-    task_id: null
+    task_id: 9742
     title: "Move the phantom-creation filter, Hook A and the Stage-3 finding guards out of flag_dedup, leave it the ledger lifecycle, and rehome its prose"
     note: "Closes fk-46514b4ef0cc with θ1, θ2; carries fk-2868338d3cf3. Deps θ2, δ2, ι and S12 ι2 (lead ruling OQ-6). Repoints _select_proactive_sample onto task_filter.status_rank."
     capabilities:
@@ -418,7 +418,7 @@ tasks:
           paths: ["docs/recon-flag-dedup.md"]
           expect: present
   - label: "ι"
-    task_id: null
+    task_id: 9743
     title: "Split task_knowledge_sync.py: IntegrityCheck, the shared report formatters, snapshot I/O, the growth sweep and the reify briefing hook move to their own modules"
     note: "Closes fk-b1cda781c60e. Deps α, 9203; lands before S12's stage-interface, streak-alarm and task-write tasks, which depend on it (lead ruling OQ-6). Subsumes task 6846."
     capabilities:
@@ -446,7 +446,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/standing_decision_growth_sweep.py"]
           expect: present
   - label: "κ1"
-    task_id: null
+    task_id: 9744
     title: "Delete Stage 2's dormant flag-persistence and escalation markers and the dormant human-operator stall marker; give recon marker GC its own module"
     note: "Carries fk-9165ae3a1e72 (high) under OQ-7 (b), ruled by Leo. Dep ε; S19 β1 (lead ruling OQ-4). Subsumes task 7807. 16 declared paths, 4 of them prose-only."
     capabilities:
@@ -486,7 +486,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/reconciliation/recon_ledger.py::ReconLedgerStore.gc` `grep:fused-memory/src/fused_memory/reconciliation/recon_ledger.py::MARKER_KINDS` substrate — on main; gc_recon_markers keeps calling the ledger's own gc"
         verdict: PASS
   - label: "κ2"
-    task_id: null
+    task_id: 9745
     title: "Delete the dormant Stage-1→Stage-2 Mem0 flag relay and the Mem0 marker-pool sweeper"
     note: "Closes fk-9165ae3a1e72 with κ1, κ3, and fk-fa1fd33c7a9e, under OQ-7 (b), ruled by Leo. High. Dep κ1. 17 declared paths, almost all deletions."
     capabilities:
@@ -526,7 +526,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_query_recon_report_findings` substrate — on main; the one Stage-1→Stage-2 channel that stays"
         verdict: PASS
   - label: "κ3"
-    task_id: null
+    task_id: 9746
     title: "Refuse recon-stage writes to the retired Stage-1→Stage-2 Mem0 relay and retire the relay from guidance, vocabulary and operator scripts"
     note: "Closes fk-9165ae3a1e72 with κ1, κ2, under OQ-7 (b), ruled by Leo. High. Dep κ2; S19 β2 (lead ruling OQ-4) (moves flag_record_contract.py and consolidation_gate.py, so checks scan fused-memory/src/)."
     capabilities:
@@ -558,7 +558,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/reconciliation/flag_record_contract.py::recon_stage_flag_kind_refusal` substrate — is the recon-stage-only write boundary that gains the refusal"
         verdict: PASS
   - label: "ν"
-    task_id: null
+    task_id: 9747
     title: "Make TaskKnowledgeSync tests drive public seams: injected collaborators, no private imports or dotted-path patches"
     note: "Closes fk-90f374fcce21 (high). Deps κ2, S12 γ2 (S12/C2 StageCollaborators); id wired at decompose. The draft's ν → S12 θ is not wired (they share only test files; lead's test-file rule). Subsumes task 7065."
     capabilities:
@@ -584,7 +584,7 @@ tasks:
           kind: manual
           reason: "a reviewer confirms at decompose that ν depends on the filed S12 γ2 task and that S12/C2 names TaskKnowledgeSync's injected collaborators"
   - label: "λ"
-    task_id: null
+    task_id: 9748
     title: "Move per-project recon policy (snapshot-write block, contamination-ceiling retirement, briefing refresh) into config keyed by project id"
     note: "Closes fk-fbbf580e4e1d. Dep ν (through it ι, θ3, ε, κ2). Read seam ReconciliationConfig.policy_for; reload applies at the next cycle."
     capabilities:
@@ -623,7 +623,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/config/schema.py::ReconciliationConfig` substrate — on main, already keying per-project values by project_id"
         verdict: PASS
   - label: "μ"
-    task_id: null
+    task_id: 9749
     title: "Run EventJournal writes on one writer thread; EventQueue.enqueue awaits the durable append off the event loop"
     note: "Closes fk-4c8d19c64d99. No intra-batch dependency; S19 α (lead ruling OQ-4). Durability shape (lead ruling OQ-5 (a)); the dead-letter replay runs off the loop thread only."
     capabilities:
@@ -655,7 +655,7 @@ tasks:
         binding: "`grep:fused-memory/src/fused_memory/reconciliation/dead_letter_writer.py::DeadLetterWriter` substrate — is the single-thread writer precedent"
         verdict: PASS
   - label: "ξ"
-    task_id: null
+    task_id: 9750
     title: "The recon-report server takes the run id from the stage connection, refuses a differing run_id argument, and the stage prompts stop asking for run_id"
     note: "Unconditional (lead ruling S12/OQ-10 (a)) under Leo's S12-2 refusal rule: a run_id differing from CAUSATION_ID_HEADER is refused through S12/C3's stage_identity_refusal with StageIdentityRefusal (field='run_id'), one recon_stage_identity_refused log line, no override event; the echo-run_id prompt lines go in the same change. Consumes S12/C3; deps ζ, ε, κ3, η, λ and S12 δ. C10, D20."
     capabilities:
@@ -687,7 +687,7 @@ tasks:
         binding: "producer: S12 δ (S12/C3 stage_identity_refusal, StageIdentityRefusal, the headers on the recon-report connection); ξ → S12 δ is the gate"
         verdict: PASS
   - label: "π"
-    task_id: null
+    task_id: 9751
     title: "Add the recon finding-category candidate check script and its tests"
     note: "Leo's addition to OQ-2. Dep ε (C11's read_rejected_findings). Deterministic half of the analysis: exit 1 on a candidate label (≥ --min-refusals over ≥ --min-runs runs, mostly un-retried or retried as other, not --ruled-label) or a lost share above --max-lost-share over ≥ --min-sample refusals; exit 0 with a verdict; exit 75 when the table is not there yet. Thresholds are script arguments. Read-only."
     capabilities:
@@ -735,7 +735,7 @@ tasks:
           kind: manual
           reason: "the lead, filing the link once π's script is on main, reads it back with get_task and confirms the three metadata keys and the edge onto π; a malformed carrier, or a script that is missing or not executable, is rejected at submit_task and never persisted"
   - label: "ω"
-    task_id: null
+    task_id: 9752
     title: "Run the recon flag and report seams' two-way boundary suite and the live-run check (integration gate)"
     note: "Signal leaf. Depends on every other leaf except ρ (the recurring chain's seed link; its first link fires about 30 days after filing and its links recur after the program)."
     capabilities:
