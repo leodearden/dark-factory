@@ -13,9 +13,10 @@ Exit-code contract:
   124  — --timeout expired; nothing printed (coreutils convention).
   0    — SIGTERM received (treated as a clean shutdown).
 
-Startup order: inotify watch is armed BEFORE the initial filesystem scan so
-no events are missed in the gap between the two.  If a pending match is found
-during the scan, it is emitted immediately and the event loop is never entered.
+Startup order: `main` arms the inotify watch BEFORE handing it to `watch`,
+which runs the initial filesystem scan before polling, so no events are
+missed in the gap between the two.  If a pending match is found during the
+scan, it is emitted immediately and the event loop is never entered.
 
 Load-bearing invariants (callers MUST rely on these):
 
@@ -44,7 +45,7 @@ Load-bearing invariants (callers MUST rely on these):
       `logging.lastResort` — which anything configuring a root handler
       in-process would take away.
       That line is also the only way to COUNT an outage: `_emit` runs at most
-      once per process (both call sites `sys.exit(0)` on the next line), so a
+      once per process (its one call site in `main` exits on the next line), so a
       process-local integer could never read more than 1 — the aggregate is
       taken across the re-arm loop's stderr instead.  The marker deliberately
       copies `scripts/watcher-rearm.sh`'s `WATCHER_REARM_OUTCOME` idiom and
@@ -61,7 +62,7 @@ import signal
 import sys
 import time
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -303,17 +304,7 @@ def watch(
             return match
 
 
-def main() -> None:
-    # Invariant (c)'s marker is an operator-facing STDERR line, so this process
-    # has to own a handler: without one it reaches stderr only by grace of
-    # `logging.lastResort`, which anything configuring a root handler in-process
-    # silently takes away — and which emits the bare message with no level.
-    # basicConfig defaults to stderr, so stdout stays pure escalation JSON, and
-    # it is a no-op when a caller has already configured logging — the same call
-    # every sibling CLI here makes (submit, sweep, archive).
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Watch for escalation events')
     parser.add_argument('--queue-dir', required=True, help='Escalation queue directory')
     parser.add_argument('--task-id', default=None, help='Filter to a specific task ID')
@@ -341,7 +332,21 @@ def main() -> None:
             'that snapshot, instead of hand-listing every already-pending id'
         ),
     )
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    # Invariant (c)'s marker is an operator-facing STDERR line, so this process
+    # has to own a handler: without one it reaches stderr only by grace of
+    # `logging.lastResort`, which anything configuring a root handler in-process
+    # silently takes away — and which emits the bare message with no level.
+    # basicConfig defaults to stderr, so stdout stays pure escalation JSON, and
+    # it is a no-op when a caller has already configured logging — the same call
+    # every sibling CLI here makes (submit, sweep, archive).
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    args = _parse_args(argv)
 
     queue_dir = Path(args.queue_dir)
     queue_dir.mkdir(parents=True, exist_ok=True)
@@ -366,14 +371,13 @@ def main() -> None:
     baseline_ids = _snapshot_pending_ids(queue_dir) if args.baseline else frozenset()
 
     # ARM inotify so no events are missed between the scan and the watch.
-    inotify = INotify()
-    watch_flags = flags.CREATE | flags.MOVED_TO
-    inotify.add_watch(str(queue_dir), watch_flags)
+    with INotify() as inotify:
+        inotify.add_watch(str(queue_dir), flags.CREATE | flags.MOVED_TO)
+        match = watch(
+            queue_dir, inotify, task_id=args.task_id, level=args.level, timeout=args.timeout,
+            current_excludes=current_excludes, clock=time.monotonic,
+        )
 
-    match = watch(
-        queue_dir, inotify, task_id=args.task_id, level=args.level, timeout=args.timeout,
-        current_excludes=current_excludes, clock=time.monotonic,
-    )
     if match is None:
         sys.exit(124)
     _emit(match, args.ntfy_url)
