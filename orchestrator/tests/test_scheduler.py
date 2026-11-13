@@ -3,6 +3,7 @@
 
 import asyncio
 import dataclasses
+import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -7565,6 +7566,13 @@ class TestDeferredWatchDispatchGate:
 # Milestone time-gate (task 2335 β — docs/prds/milestone-tasks.md §6.2)
 # ---------------------------------------------------------------------------
 
+def _delayed_milestone_metadata(after_secs: object, anchor: object) -> dict:
+    return {
+        'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+        'milestone_deps_satisfied_at': anchor,
+    }
+
+
 class TestMilestoneTimeGate:
     """Unit tests for the pure predicate Scheduler._milestone_time_gated.
 
@@ -7702,8 +7710,6 @@ class TestMilestoneTimeGate:
 
     def test_delayed_without_anchor_withholds_silently(self, caplog):
         """An unset anchor means 'not due yet', not 'malformed': no WARNING."""
-        import logging
-
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         task = self._task_with({'milestone': {'mode': 'delayed', 'after_secs': 60}})
 
@@ -7712,40 +7718,40 @@ class TestMilestoneTimeGate:
 
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
-    @pytest.mark.parametrize('anchor', [12345, 'not-a-timestamp'])
-    def test_bad_delayed_anchor_fails_safe_and_warns_once(self, anchor, caplog):
-        import logging
-
+    @pytest.mark.parametrize('metadata', [
+        pytest.param(_delayed_milestone_metadata(60, 12345), id='non_str_anchor'),
+        pytest.param(_delayed_milestone_metadata(60, 0), id='falsy_non_str_anchor'),
+        pytest.param(
+            _delayed_milestone_metadata(60, 'not-a-timestamp'), id='unparseable_anchor'
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**12, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e12',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**15, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e15',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(0, '2026-11-01T00:00:00+00:00'),
+            id='milestone_rejects_zero_after_secs',
+        ),
+        pytest.param(
+            {'milestone': {
+                'mode': 'dated', 'at': '2026-11-01T00:00:00+00:00', 'after_secs': 60,
+            }},
+            id='milestone_rejects_dated_with_after_secs',
+        ),
+    ])
+    def test_malformed_input_fails_safe_and_warns_once(self, metadata, caplog):
+        """``now`` is after every anchor and ``at``, so a lenient read would dispatch."""
+        now = datetime(2026, 11, 13, tzinfo=UTC)
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
-        task = self._task_with({
-            'milestone': {'mode': 'delayed', 'after_secs': 60},
-            'milestone_deps_satisfied_at': anchor,
-        })
+        task = self._task_with(metadata)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
             for _ in range(3):
-                assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
-
-        warnings = [
-            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
-        ]
-        assert len(warnings) == 1
-
-    @pytest.mark.parametrize('after_secs', [10**12, 10**15])
-    def test_unrepresentable_delayed_deadline_fails_safe_and_warns_once(
-        self, after_secs, caplog
-    ):
-        import logging
-
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
-        task = self._task_with({
-            'milestone': {'mode': 'delayed', 'after_secs': after_secs},
-            'milestone_deps_satisfied_at': '2026-11-01T00:00:00+00:00',
-        })
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
-            for _ in range(3):
-                assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+                assert scheduler._milestone_time_gated(task, now) is True
 
         warnings = [
             r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
@@ -7934,6 +7940,45 @@ class TestMilestoneEligibilityGate:
         assert result_after is not None and result_after.task_id == '4005', (
             'Milestone must dispatch once now_wall >= at'
         )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_withholds_milestone_rejected_spec_and_warns_once(
+        self, monkeypatch, caplog
+    ):
+        """A delayed spec Milestone rejects (after_secs=0) whose anchor is long
+        past is withheld tick after tick, with exactly one WARNING."""
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        task = {
+            'id': '4008',
+            'title': 'Milestone-rejected delayed task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': _delayed_milestone_metadata(
+                0, (now - timedelta(days=1)).isoformat()
+            ),
+        }
+        task_response = {
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps({'tasks': [task]})}]
+            }
+        }
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1), wall_time_source=lambda: now
+        )
+        scheduler.finish_startup()
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert await scheduler.acquire_next() is None
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
 
 
 class TestClaimantLivenessDispatchGate:
