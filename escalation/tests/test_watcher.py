@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-import contextlib
-import itertools
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from inotify_simple import Event, INotify, flags
 
 from escalation.models import Escalation
-from escalation.watcher import _emit, _initial_scan, ntfy_request, watch
+from escalation.watcher import _emit, _initial_scan, main, ntfy_request, watch
 
 
 @pytest.fixture
@@ -845,592 +844,84 @@ class TestWatch:
         assert result is not None and result.id == esc.id
 
 
-class TestInitialScanMain:
-    """main() emits a pre-existing pending escalation without any inotify event."""
+@pytest.fixture
+def restore_sigterm():
+    """main installs a SIGTERM handler; keep it from leaking into the pytest process."""
+    saved = signal.getsignal(signal.SIGTERM)
+    yield
+    signal.signal(signal.SIGTERM, saved)
 
-    def test_emits_pre_existing_pending_without_inotify_event(
-        self, tmp_path, blocking_escalation: Escalation, capsys
+
+def _exit_code(argv: list[str]) -> int | str | None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    return exc_info.value.code
+
+
+@pytest.mark.usefixtures('restore_sigterm')
+class TestMain:
+    """main(argv) wires the CLI flags into watch() and maps its result to an exit code."""
+
+    def test_pending_escalation_exits_0_with_its_json_on_stdout(
+        self, queue_dir: Path, capsys: pytest.CaptureFixture[str],
     ):
-        """Pre-existing pending file is emitted at startup; inotify.read never called."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        esc_path = queue_dir / f'{blocking_escalation.id}.json'
-        esc_path.write_text(blocking_escalation.to_json())
+        esc = _esc('esc-70-1')
+        _write_esc(queue_dir, esc)
 
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-            ]),
-        ):
-            mock_inotify = MockINotify.return_value
-            # read must NOT be called — if it is, something is wrong
-            mock_inotify.read.side_effect = AssertionError('inotify.read should not be called')
+        assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '5']) == 0
+        assert json.loads(capsys.readouterr().out) == esc.to_dict()
 
-            from escalation.watcher import main
+    def test_empty_queue_exits_124_with_nothing_on_stdout(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ):
+        queue_dir = tmp_path / 'not-yet-created'
 
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-
-            assert exc_info.value.code == 0
-
-        # add_watch was armed before the scan
-        mock_inotify.add_watch.assert_called_once()
-
-        # stdout contains the escalation JSON
-        captured = capsys.readouterr()
-        assert blocking_escalation.id in captured.out
-        data = json.loads(captured.out)
-        assert data['id'] == blocking_escalation.id
-
-
-class TestExcludeId:
-    """--exclude-id flag: repeatable, honoured in initial scan AND event loop."""
-
-    def test_startup_excludes_both_pending_enters_event_loop(self, tmp_path, capsys):
-        """With two pending files both excluded, initial scan returns None -> event loop entered."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        esc1 = Escalation(
-            id='esc-20-1', task_id='20', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='first',
-        )
-        esc2 = Escalation(
-            id='esc-20-2', task_id='20', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='second',
-        )
-        (queue_dir / f'{esc1.id}.json').write_text(esc1.to_json())
-        (queue_dir / f'{esc2.id}.json').write_text(esc2.to_json())
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-                '--exclude-id', esc1.id,
-                '--exclude-id', esc2.id,
-            ]),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = KeyboardInterrupt
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-        captured = capsys.readouterr()
-        assert captured.out == ''
-        mock_inotify.read.assert_called_once()
-
-    def test_exclude_id_json_suffix_normalized(self, tmp_path, capsys):
-        """--exclude-id with .json suffix is normalized; esc-7-1.json excludes esc-7-1."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        esc = Escalation(
-            id='esc-7-1', task_id='7', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='pending',
-        )
-        (queue_dir / f'{esc.id}.json').write_text(esc.to_json())
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-                '--exclude-id', f'{esc.id}.json',
-            ]),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = KeyboardInterrupt
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-        captured = capsys.readouterr()
-        assert captured.out == ''
-        mock_inotify.read.assert_called_once()
-
-    def test_event_loop_suppresses_excluded_event(self, tmp_path, capsys):
-        """Event for an excluded file (e.g. dedupe MOVED_TO rewrite) is silently ignored."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        esc = Escalation(
-            id='esc-21-1', task_id='21', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='deliberately-pending',
-        )
-        (queue_dir / f'{esc.id}.json').write_text(esc.to_json())
-
-        mock_event = MagicMock()
-        mock_event.name = f'{esc.id}.json'
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.exit') as mock_exit,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-                '--exclude-id', esc.id,
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-        mock_exit.assert_not_called()
+        assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '0.05']) == 124
         assert capsys.readouterr().out == ''
+        assert queue_dir.is_dir()
 
-    def test_event_loop_fires_on_non_excluded_event(self, tmp_path, capsys):
-        """Event for a different (non-excluded) file fires normally."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        excluded_esc = Escalation(
-            id='esc-22-1', task_id='22', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='excluded',
-        )
-        live_esc = Escalation(
-            id='esc-22-2', task_id='22', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='live',
-        )
-        (queue_dir / f'{excluded_esc.id}.json').write_text(excluded_esc.to_json())
-        (queue_dir / f'{live_esc.id}.json').write_text(live_esc.to_json())
+    @pytest.mark.parametrize('suffix', ['', '.json'], ids=['bare', 'json-suffixed'])
+    def test_exclude_id_excludes_the_pending_item(self, queue_dir: Path, suffix: str):
+        esc = _esc('esc-71-1')
+        _write_esc(queue_dir, esc)
 
-        mock_event = MagicMock()
-        mock_event.name = f'{live_esc.id}.json'
+        assert _exit_code([
+            '--queue-dir', str(queue_dir), '--timeout', '0.05',
+            '--exclude-id', f'{esc.id}{suffix}',
+        ]) == 124
 
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.exit') as mock_exit,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-                '--exclude-id', excluded_esc.id,
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
+    def test_exclude_file_excludes_the_pending_item(self, queue_dir: Path, tmp_path: Path):
+        esc = _esc('esc-72-1')
+        _write_esc(queue_dir, esc)
+        exclude_file = tmp_path / 'excludes.txt'
+        exclude_file.write_text(f'{esc.id}\n')
 
-            from escalation.watcher import main
+        assert _exit_code([
+            '--queue-dir', str(queue_dir), '--timeout', '0.05',
+            '--exclude-file', str(exclude_file),
+        ]) == 124
 
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
+    def test_baseline_excludes_the_item_pending_at_launch(self, queue_dir: Path):
+        _write_esc(queue_dir, _esc('esc-73-1'))
 
-        mock_exit.assert_called_once_with(0)
-        assert live_esc.id in capsys.readouterr().out
+        assert _exit_code([
+            '--queue-dir', str(queue_dir), '--timeout', '0.05', '--baseline',
+        ]) == 124
 
-
-class TestMainLoop:
-    """CLI exit behavior after first match."""
-
-    def test_exits_after_first(self, tmp_path, blocking_escalation: Escalation):
-        """main() calls sys.exit(0) after first match (via inotify event loop)."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-
-        # Pre-create the escalation file so inotify fires on it
-        esc_path = queue_dir / f'{blocking_escalation.id}.json'
-        esc_path.write_text(blocking_escalation.to_json())
-
-        # Mock inotify to yield one event then stop
-        mock_event = MagicMock()
-        mock_event.name = f'{blocking_escalation.id}.json'
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.exit') as mock_exit,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-            ]),
-            # Neutralise initial scan so we test the event loop path
-            patch('escalation.watcher._initial_scan', return_value=None),
-        ):
-            mock_inotify = MockINotify.return_value
-            # read() returns events once, then raises to break the loop
-            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-            mock_exit.assert_called_once_with(0)
-
-
-class TestTimeout:
-    """--timeout arg: exit 124 on expiry; no timeout -> block indefinitely."""
-
-    def test_timeout_exits_124_on_expiry(self, tmp_path, capsys):
-        """--timeout 2 -> exit 124 when read returns empty (no events); stdout empty."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-
-        # Constant monotonic clock (task 2722): time.monotonic() always
-        # returns 0.0, regardless of caller or call count. deadline =
-        # 0.0 + 2 = 2.0; each loop check computes remaining_ms =
-        # max(0, int((2.0 - 0.0)*1000)) = 2000 -> read(timeout=2000).
-        # read returns [] -> exit 124 (empty events with deadline set).
-        # A constant return_value (vs. a position-sensitive itertools
-        # side_effect iterator) can't be partially drained by another
-        # caller of the patched, process-global time.monotonic() — e.g.
-        # an xdist/execnet background thread — which is what caused the
-        # task-2702 flake in the two sibling tests below.
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir), '--timeout', '2',
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-            patch('escalation.watcher.time.monotonic', return_value=0.0),
-        ):
-            mock_inotify = MockINotify.return_value
-            # read returns empty list -> no events -> timeout path
-            mock_inotify.read.return_value = []
-
-            from escalation.watcher import main
-
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-
-            assert exc_info.value.code == 124
-
-        # stdout must be empty (no escalation emitted)
-        captured = capsys.readouterr()
-        assert captured.out == ''
-
-        # read was called with timeout=2000ms
-        mock_inotify.read.assert_called_once_with(timeout=2000)
-
-    def test_no_timeout_blocks_indefinitely(self, tmp_path):
-        """Without --timeout, read is called with timeout=None (block forever)."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-        ):
-            mock_inotify = MockINotify.return_value
-            # No timeout -> read blocks; we break out with KeyboardInterrupt
-            mock_inotify.read.side_effect = KeyboardInterrupt
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-        mock_inotify.read.assert_called_once_with(timeout=None)
-
-    def test_timeout_with_matching_event_exits_0(
-        self, tmp_path, blocking_escalation: Escalation, capsys
+    @pytest.mark.parametrize(
+        ('fields', 'extra_argv', 'code'),
+        [
+            pytest.param({'level': 1}, ['--level', '0'], 124, id='level-mismatch'),
+            pytest.param({'level': 1}, ['--level', '1'], 0, id='level-match'),
+            pytest.param({'task_id': '42'}, ['--task-id', '99'], 124, id='task-mismatch'),
+        ],
+    )
+    def test_level_and_task_id_reach_the_filter(
+        self, queue_dir: Path, fields: dict, extra_argv: list[str], code: int,
     ):
-        """--timeout set AND matching event arrives before deadline -> exit 0 + JSON."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
+        _write_esc(queue_dir, _esc('esc-74-1', **fields))
 
-        # Pre-create the escalation file so the event loop can read it
-        esc_path = queue_dir / f'{blocking_escalation.id}.json'
-        esc_path.write_text(blocking_escalation.to_json())
-
-        mock_event = MagicMock()
-        mock_event.name = f'{blocking_escalation.id}.json'
-
-        # Constant monotonic clock (task 2722): time.monotonic() always
-        # returns 1000.0, regardless of caller or call count, so elapsed
-        # time between the deadline-call and any later loop-call is
-        # always 0. deadline = 1000.0 + 5 = 1005.0; remaining_ms =
-        # int((1005.0 - 1000.0) * 1000) = 5000 -> read(timeout=5000).
-        # A constant return_value (vs. a position-sensitive itertools
-        # side_effect iterator) can't be shifted by another caller of the
-        # patched, process-global time.monotonic() — e.g. an
-        # xdist/execnet background thread — which is what caused the
-        # task-2702 "expected 4500, got 5000" flake.
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-            patch('escalation.watcher.time.monotonic', return_value=1000.0),
-        ):
-            mock_inotify = MockINotify.return_value
-            # read returns a matching event on the first call
-            mock_inotify.read.return_value = [mock_event]
-
-            from escalation.watcher import main
-
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-
-            assert exc_info.value.code == 0
-
-        # stdout contains the escalation JSON
-        captured = capsys.readouterr()
-        assert blocking_escalation.id in captured.out
-        data = json.loads(captured.out)
-        assert data['id'] == blocking_escalation.id
-
-        # read was called with the constant-clock-derived timeout
-        assert mock_inotify.read.call_args.kwargs['timeout'] == 5000
-
-    def test_timeout_matching_event_after_nonmatching_survives_extra_polls(
-        self, tmp_path, blocking_escalation: Escalation, capsys
-    ):
-        """A non-matching event forces a 2nd loop iteration; the mock must not raise.
-
-        Regression guard for the esc-2286-class flake (task 2361) and the
-        task-2702 interloper flake (task 2722). A finite monotonic
-        ``side_effect`` sized to the happy path (one deadline-call, one
-        loop-call) raises StopIteration on this test's 3rd monotonic call
-        (the non-matching event forces a 2nd loop iteration). Task 2361
-        fixed that by making the stub non-exhausting
-        (``itertools.chain([prefix], itertools.repeat(tail))``); task 2722
-        replaced that with a constant ``return_value`` stub, which is both
-        non-exhausting AND immune to being partially drained, in any order,
-        by another caller of the patched, process-global
-        ``time.monotonic()`` — e.g. an xdist/execnet background thread.
-        This test is the executable proof that both the watcher's
-        multi-iteration emit path and the hardened mock pattern survive
-        more polls than the minimal happy path.
-        """
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-
-        # Pre-create the escalation file so the 2nd loop iteration's event
-        # handler can read it from disk.
-        esc_path = queue_dir / f'{blocking_escalation.id}.json'
-        esc_path.write_text(blocking_escalation.to_json())
-
-        nonmatching = MagicMock()
-        nonmatching.name = 'unrelated.json'  # fails the esc-*/.json prefix gate -> continue
-        matching = MagicMock()
-        matching.name = f'{blocking_escalation.id}.json'
-
-        # Constant monotonic clock (task 2722): every call (deadline-call
-        # and every loop-call, however many extra polls) returns 1000.0.
-        # deadline = 1000.0 + 5 = 1005.0; remaining_ms = int((1005.0 -
-        # 1000.0) * 1000) = 5000, stable regardless of call count/order.
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-            patch('escalation.watcher.time.monotonic', return_value=1000.0),
-        ):
-            mock_inotify = MockINotify.return_value
-            # 1st read -> non-matching event (loop re-iterates); 2nd -> match.
-            mock_inotify.read.side_effect = [[nonmatching], [matching]]
-
-            from escalation.watcher import main
-
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-
-            assert exc_info.value.code == 0
-
-        # stdout contains the escalation JSON
-        captured = capsys.readouterr()
-        assert blocking_escalation.id in captured.out
-        data = json.loads(captured.out)
-        assert data['id'] == blocking_escalation.id
-
-        # read was called exactly twice (nonmatching poll, then matching poll)
-        assert mock_inotify.read.call_count == 2
-        # last read used the timeout recomputed from the constant clock
-        assert mock_inotify.read.call_args.kwargs['timeout'] == 5000
-
-    def test_timeout_read_ms_unaffected_by_interloping_monotonic(
-        self, tmp_path, blocking_escalation: Escalation, capsys
-    ):
-        """Regression guard for the task-2702 "expected 4500, got 5000" flake.
-
-        Root cause: ``patch('escalation.watcher.time.monotonic', ...)``
-        patches the PROCESS-GLOBAL ``time`` module singleton (watcher.py
-        does a plain ``import time``), so under pytest-xdist an
-        execnet/pytest background thread calling ``time.monotonic()``
-        inside the patched window is served from the exact same shared,
-        position-sensitive ``itertools.chain([0.0], itertools.repeat(0.5))``
-        iterator the watcher itself consumes. Each interloping call shifts
-        which value the watcher's own calls receive: with 0 interlopers the
-        watcher's deadline-call gets 0.0 (deadline=5.0) and its loop-call
-        gets 0.5 (remaining=int((5.0-0.5)*1000)=4500); with 3 interlopers
-        those three leading values are drained first, so the watcher's
-        deadline-call gets 0.5 (deadline=5.5) and its loop-call gets 0.5
-        again (remaining=int((5.5-0.5)*1000)=5000) — exactly the observed
-        "expected 4500, got 5000" flake.
-
-        ``_run`` is parametrized on which monotonic stub to install so this
-        test can CONTRAST the two idioms instead of only asserting on the
-        fixed one in isolation: a bare ``_run(0) == _run(3)`` against a stub
-        that is *always* a constant ``return_value`` is tautological (it
-        cannot fail no matter what the watcher's arithmetic does, since
-        constant-in implies constant-out by construction). The
-        ``constant_stub=False`` arm reproduces the OLD, order-sensitive
-        idiom live — hardcoding the exact 4500-vs-5000 split across
-        interloper counts — which is the executable proof that the
-        ``constant_stub=True`` equality is a meaningful, falsifiable claim
-        about the fix, not an artifact of the stub shape.
-
-        The ``constant_stub=False`` arm is itself susceptible to the exact
-        flake it documents (it installs the same process-global,
-        position-sensitive patch a real interloper could partially drain),
-        so it only runs single-worker — see the ``PYTEST_XDIST_WORKER``
-        guard below. The ``constant_stub=True`` GREEN assertion is
-        interloper-immune by construction and always runs, including under
-        xdist.
-        """
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-
-        # Pre-create the escalation file so the event loop can read it.
-        esc_path = queue_dir / f'{blocking_escalation.id}.json'
-        esc_path.write_text(blocking_escalation.to_json())
-
-        mock_event = MagicMock()
-        mock_event.name = f'{blocking_escalation.id}.json'
-
-        def _run(n_interlopers, *, constant_stub):
-            # constant_stub=True: the task-2722 fix — a single value
-            # regardless of caller or call count, so an interloping
-            # time.monotonic() call can't shift what the watcher observes.
-            # constant_stub=False: the OLD idiom task 2722 replaced — a
-            # position-sensitive iterator that a prefix-consuming
-            # interloper (e.g. an xdist/execnet background thread) can
-            # partially drain, shifting the values the watcher receives.
-            monotonic_patch = (
-                patch('escalation.watcher.time.monotonic', return_value=1000.0)
-                if constant_stub
-                else patch(
-                    'escalation.watcher.time.monotonic',
-                    side_effect=itertools.chain([0.0], itertools.repeat(0.5)),
-                )
-            )
-            with (
-                patch('escalation.watcher.INotify') as MockINotify,
-                patch('escalation.watcher.sys.argv', [
-                    'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
-                ]),
-                patch('escalation.watcher._initial_scan', return_value=None),
-                monotonic_patch,
-            ):
-                mock_inotify = MockINotify.return_value
-                mock_inotify.read.return_value = [mock_event]
-
-                # Simulate n interloping time.monotonic() calls landing in
-                # the patched window BEFORE the watcher runs — e.g. an
-                # xdist/execnet background thread. patch() replaces the
-                # .monotonic attribute on the actual process-global `time`
-                # module object (watcher.py does a plain `import time`), so
-                # this call site and the watcher's internal calls draw from
-                # the exact same shared stub.
-                import escalation.watcher
-
-                for _ in range(n_interlopers):
-                    escalation.watcher.time.monotonic()
-
-                from escalation.watcher import main
-
-                with pytest.raises(SystemExit) as exc_info:
-                    main()
-
-                assert exc_info.value.code == 0
-
-            capsys.readouterr()  # drain stdout between runs
-            return mock_inotify.read.call_args.kwargs['timeout']
-
-        # GREEN (task 2722): the fixed constant stub's read timeout does
-        # not depend on how many interlopers ran first.
-        assert _run(0, constant_stub=True) == _run(3, constant_stub=True) == 5000
-
-        # Contrast: the OLD position-sensitive stub IS order-sensitive
-        # under the identical interloper simulation, reproducing the
-        # task-2702 "expected 4500, got 5000" flake directly. This is what
-        # makes the equality assertion above a meaningful, falsifiable
-        # claim rather than a tautology of a constant return_value.
-        #
-        # This reproduction installs the very process-global,
-        # position-sensitive time.monotonic() patch responsible for the
-        # original flake (see this test's docstring above), so a
-        # real xdist/execnet background thread calling time.monotonic()
-        # during this window could drain a leading value and shift these
-        # results — the identical self-inflicted risk the constant stub
-        # above was built to remove. Restrict it to single-worker runs,
-        # where no other thread can interlope, so the falsifiability
-        # demonstration stays deterministic instead of reintroducing the
-        # flake it exists to document.
-        if not os.environ.get('PYTEST_XDIST_WORKER'):
-            assert _run(0, constant_stub=False) == 4500
-            assert _run(3, constant_stub=False) == 5000
-
-
-class TestLevelFilter:
-    """--level argument filters by escalation level."""
-
-    def _run_watcher(self, tmp_path, escalation, argv_extra=None):
-        """Run main() with a single inotify event, return whether sys.exit was called."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir(exist_ok=True)
-
-        esc_path = queue_dir / f'{escalation.id}.json'
-        esc_path.write_text(escalation.to_json())
-
-        mock_event = MagicMock()
-        mock_event.name = f'{escalation.id}.json'
-
-        argv = ['watcher', '--queue-dir', str(queue_dir)]
-        if argv_extra:
-            argv.extend(argv_extra)
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.exit') as mock_exit,
-            patch('escalation.watcher.sys.argv', argv),
-            # Neutralise initial scan so we test the event loop path
-            patch('escalation.watcher._initial_scan', return_value=None),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-            return mock_exit.called
-
-    def test_level_filter_matches(self, tmp_path):
-        """--level 0 passes level-0 escalation."""
-        esc = Escalation(
-            id='esc-10-1', task_id='10', agent_role='implementer',
-            severity='blocking', category='task_failure', summary='fail',
-            level=0,
-        )
-        assert self._run_watcher(tmp_path, esc, ['--level', '0']) is True
-
-    def test_level_filter_skips_non_matching(self, tmp_path):
-        """--level 0 skips level-1 escalation (no exit)."""
-        esc = Escalation(
-            id='esc-10-2', task_id='10', agent_role='steward',
-            severity='blocking', category='task_failure', summary='reesc',
-            level=1,
-        )
-        assert self._run_watcher(tmp_path, esc, ['--level', '0']) is False
-
-    def test_no_level_filter_passes_all(self, tmp_path):
-        """Without --level, level-1 escalation is returned (backward compat)."""
-        esc = Escalation(
-            id='esc-10-3', task_id='10', agent_role='steward',
-            severity='blocking', category='task_failure', summary='reesc',
-            level=1,
-        )
-        assert self._run_watcher(tmp_path, esc) is True
+        assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '0.05', *extra_argv]) == code
 
 
 class TestExcludeFile:
@@ -1454,165 +945,3 @@ class TestExcludeFile:
             '  esc-3-1  \n'
         )
         assert _read_exclude_file(exclude_file) == frozenset({'esc-1-1', 'esc-2-1', 'esc-3-1'})
-
-    def test_exclude_file_honored_in_initial_scan(self, tmp_path, capsys):
-        """Sole pending escalation's id listed in --exclude-file -> initial
-        scan excludes it, event loop entered (no inotify event needed)."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        esc = Escalation(
-            id='esc-23-1', task_id='23', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='pending',
-        )
-        _write_esc(queue_dir, esc)
-
-        exclude_file = tmp_path / 'excludes.txt'
-        exclude_file.write_text(f'{esc.id}\n')
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-                '--exclude-file', str(exclude_file),
-            ]),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = KeyboardInterrupt
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-        captured = capsys.readouterr()
-        assert captured.out == ''
-        mock_inotify.read.assert_called_once()
-
-    def test_exclude_file_reread_each_poll(self, tmp_path, capsys):
-        """The exclude-file is re-read on every poll: a loop caller can
-        append a deliberately-pending id mid-wait without restarting the
-        watcher, and the very next event for it is suppressed."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        esc = Escalation(
-            id='esc-24-1', task_id='24', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='deliberately-pending',
-        )
-        _write_esc(queue_dir, esc)
-
-        exclude_file = tmp_path / 'excludes.txt'
-        exclude_file.write_text('')  # empty at launch
-
-        mock_event = MagicMock()
-        mock_event.name = f'{esc.id}.json'
-
-        def _read_side_effect(*args, **kwargs):
-            if not hasattr(_read_side_effect, 'called'):
-                _read_side_effect.called = True
-                # Append the id to the exclude-file BETWEEN polls, then
-                # return an event for it on this same poll.
-                exclude_file.write_text(f'{esc.id}\n')
-                return [mock_event]
-            raise KeyboardInterrupt
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.exit') as mock_exit,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir),
-                '--exclude-file', str(exclude_file),
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = _read_side_effect
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-        mock_exit.assert_not_called()
-        assert capsys.readouterr().out == ''
-
-
-class TestBaseline:
-    """--baseline flag: snapshot pending esc-ids at launch; fire only on
-    items NOT present in that launch-time snapshot."""
-
-    def test_baseline_launch_pending_never_fires(self, tmp_path, capsys):
-        """A pending escalation present at launch is excluded from BOTH the
-        initial scan and the event loop for the lifetime of this run."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        esc = Escalation(
-            id='esc-40-1', task_id='40', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='pending-at-launch',
-        )
-        _write_esc(queue_dir, esc)
-
-        mock_event = MagicMock()
-        mock_event.name = f'{esc.id}.json'
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.exit') as mock_exit,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir), '--baseline',
-            ]),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-        mock_exit.assert_not_called()
-        assert capsys.readouterr().out == ''
-
-    def test_baseline_new_item_fires(self, tmp_path, capsys):
-        """An escalation filed AFTER launch (absent from the baseline
-        snapshot) still fires normally."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-        baselined_esc = Escalation(
-            id='esc-40-1', task_id='40', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='pending-at-launch',
-        )
-        _write_esc(queue_dir, baselined_esc)
-
-        new_esc = Escalation(
-            id='esc-40-2', task_id='40', agent_role='orchestrator',
-            severity='blocking', category='task_failure', summary='filed-after-launch',
-        )
-
-        mock_event = MagicMock()
-        mock_event.name = f'{new_esc.id}.json'
-
-        def _read_side_effect(*args, **kwargs):
-            # Absent from the queue dir at launch -> absent from the
-            # baseline snapshot -> must still fire.
-            _write_esc(queue_dir, new_esc)
-            return [mock_event]
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir), '--baseline',
-            ]),
-            patch('escalation.watcher._initial_scan', return_value=None),
-        ):
-            mock_inotify = MockINotify.return_value
-            mock_inotify.read.side_effect = _read_side_effect
-
-            from escalation.watcher import main
-
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-
-            assert exc_info.value.code == 0
-
-        captured = capsys.readouterr()
-        assert new_esc.id in captured.out
