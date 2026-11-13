@@ -140,15 +140,15 @@ class TestTheSummaryCarriesTheRole:
         assert _read_worktree_summary(tmp_path)['role'] == 'task'
 
     def test_the_merge_writer_stamps_merge(self, tmp_path):
-        """``_archive_merge_verify_logs`` is the merge-path writer by definition.
+        """``archive_verify_logs`` is the merge-path writer by definition.
 
         It serves both the local merge lane and ``verify_runner.RemoteRunner``,
         so its role cannot be anything but 'merge'.
         """
-        from orchestrator.verify import _archive_merge_verify_logs  # noqa: PLC0415
+        from orchestrator.verify import archive_verify_logs  # noqa: PLC0415
 
         archive_root = tmp_path / 'archive'
-        _archive_merge_verify_logs(
+        archive_verify_logs(
             [_run('test', rc=1)], archive_root, '5671', 1, 'test_failure', '',
         )
 

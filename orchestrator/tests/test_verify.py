@@ -6508,7 +6508,7 @@ class TestRunVerificationMergeArchival:
 
     These tests use a fake worktree with NO .task/ dir (mimicking a merge
     worktree) and verify that passing role='merge' + archive_root causes
-    _archive_merge_verify_logs to be called directly.
+    archive_verify_logs to be called directly.
 
     Tests are RED until step-4 adds the role=='merge' branch to run_verification.
     """
@@ -9755,7 +9755,7 @@ class TestRoleThreading:
 
 
 # ---------------------------------------------------------------------------
-# Step-1 (task 1768): _build_summary_payload + _archive_merge_verify_logs
+# Step-1 (task 1768): _build_summary_payload + archive_verify_logs
 # ---------------------------------------------------------------------------
 
 
@@ -9855,7 +9855,7 @@ class TestBuildSummaryPayload:
 
 
 class TestArchiveMergeVerifyLogs:
-    """Tests for the new _archive_merge_verify_logs helper (task 1768).
+    """Tests for the new archive_verify_logs helper (task 1768).
 
     These tests import the symbol directly and will fail with ImportError /
     AttributeError until step-2 implements the function — that is the RED state.
@@ -9872,8 +9872,8 @@ class TestArchiveMergeVerifyLogs:
         *,
         module_prefix=None,
     ):
-        from orchestrator.verify import _archive_merge_verify_logs  # noqa: PLC0415
-        return _archive_merge_verify_logs(
+        from orchestrator.verify import archive_verify_logs  # noqa: PLC0415
+        return archive_verify_logs(
             runs, archive_root, task_id, attempt_id, category, cause_hint,
             module_prefix=module_prefix,
         )

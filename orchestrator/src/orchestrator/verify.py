@@ -3676,7 +3676,7 @@ def _archive_attempt_summary(
     )
 
 
-def _archive_merge_verify_logs(
+def archive_verify_logs(
     runs: list[dict],
     archive_root: 'Path | None',
     task_id: str,
@@ -3719,7 +3719,7 @@ def _archive_merge_verify_logs(
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        logger.warning('_archive_merge_verify_logs: could not create %s: %s', target_dir, exc)
+        logger.warning('archive_verify_logs: could not create %s: %s', target_dir, exc)
         return []
 
     infix = _make_infix(module_prefix)
@@ -3733,7 +3733,7 @@ def _archive_merge_verify_logs(
             continue
         path = _write_run_log(
             target_dir, attempt_id, infix, run,
-            ts_suffix=ts_suffix, caller='_archive_merge_verify_logs',
+            ts_suffix=ts_suffix, caller='archive_verify_logs',
         )
         if path is not None:
             archived.append(path)
@@ -4731,7 +4731,7 @@ class CheckRun:
 
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
-        ``_build_summary_payload``/``_archive_merge_verify_logs``
+        ``_build_summary_payload``/``archive_verify_logs``
         (all take ``list[dict]``) — the exact 12-key shape (label/cmd/rc/output/
         timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission/
         carried_over), 7 of which were previously hand-built inline in
@@ -8301,7 +8301,7 @@ async def run_verification(
     # editing it would be an unrequested blast radius for a purely additive
     # verdict detail. Placed here — after BOTH `_summarize_checks` calls and
     # before `runs`/persistence — so the augmented hint reaches
-    # `_persist_attempt_logs`/`_archive_merge_verify_logs` too, not just the
+    # `_persist_attempt_logs`/`archive_verify_logs` too, not just the
     # returned VerifyResult.
     _not_run_labels = [
         seg['label']
@@ -8327,7 +8327,7 @@ async def run_verification(
         # that auto-excludes cold-shadow / drift paths (left at None).
         if archive_root is not None and task_id is not None and not passed:
             try:
-                arch_paths = _archive_merge_verify_logs(
+                arch_paths = archive_verify_logs(
                     runs, archive_root, task_id, _archive_attempt_id(attempt_id),
                     category, cause_hint, module_prefix=module_prefix,
                 )
