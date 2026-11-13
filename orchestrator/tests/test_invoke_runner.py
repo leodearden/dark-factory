@@ -15,14 +15,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from _operator_home_fixture import OPERATOR_ENV_VARS, write_operator_home
 from _zcode_fixture import BASE_URL as ZCODE_BASE_URL
-from shared.cli_invoke import SubprocessResult, run_cli_subprocess
+from shared.cli_invoke import SubprocessResult, TranscriptWatch, run_cli_subprocess
+from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.mimo_backend import SESSION_READ_TIMEOUT_SECS
+from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
 
 pytestmark = pytest.mark.asyncio
 
@@ -226,3 +229,127 @@ async def test_the_agent_result_is_the_parsers_reading_of_the_runner_result(
     assert agent.input_tokens == 10
     assert agent.output_tokens == 5
     assert agent.cost_usd == pytest.approx((10 * 100.0 + 5 * 100.0) / 1_000_000)
+
+
+SANDBOX_PREFIX = ['SANDBOX', '--']
+CANNED_CLAUDE_SESSION = 'canned-session'
+CLAUDE_TRANSCRIPT = dict(startup_grace_secs=7.0, working_idle_secs=60.0, absolute_cap_secs=600.0)
+
+
+def _canned_claude_result(**fields: Any) -> SubprocessResult:
+    payload = {
+        'result': 'ok', 'is_error': False, 'subtype': 'success',
+        'session_id': CANNED_CLAUDE_SESSION, 'num_turns': 1, 'duration_ms': 10,
+        **fields,
+    }
+    return SubprocessResult(stdout=json.dumps(payload), stderr='', returncode=0, duration_ms=10)
+
+
+class _RecordingRunner:
+    def __init__(self, result: SubprocessResult) -> None:
+        self.result = result
+        self.calls: list[tuple[list[str], dict[str, str], dict[str, Any]]] = []
+
+    async def __call__(
+        self, cmd: list[str], cwd: Path, env: dict[str, str], **kw: Any,
+    ) -> SubprocessResult:
+        self.calls.append((list(cmd), dict(env), kw))
+        return self.result
+
+
+@pytest.fixture
+def pinned_claude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    executable = tmp_path / 'claude'
+    executable.write_text('#!/bin/sh\nexit 0\n')
+    executable.chmod(0o755)
+    monkeypatch.setenv('CLAUDE_BINARY', str(executable))
+    monkeypatch.delenv('GIT_CONFIG_COUNT', raising=False)
+    return str(executable)
+
+
+@pytest.fixture
+def sandboxed():
+    def wrap_command(
+        cmd: list[str], cwd: Path, sandbox_modules: list[str],
+        writable_extras: list[str] | None = None,
+    ) -> list[str]:
+        return [*SANDBOX_PREFIX, *cmd]
+
+    with (
+        patch('orchestrator.agents.sandbox_dispatch.resolve_active_backend', return_value='bwrap'),
+        patch('orchestrator.agents.sandbox_dispatch.wrap_command', side_effect=wrap_command),
+    ):
+        yield
+
+
+async def _invoke_claude(worktree: Path, runner: Any, **overrides: Any):
+    kwargs: dict[str, Any] = {
+        'prompt': 'do step-1',
+        'system_prompt': 'SYS',
+        'cwd': worktree,
+        'backend': 'claude',
+        'session_id': 's1',
+        'timeout_seconds': TIMEOUT_SECS,
+        'runner': runner,
+        **CLAUDE_TRANSCRIPT,
+    }
+    kwargs.update(overrides)
+    return await invoke_agent(**kwargs)
+
+
+class TestClaudeSpawnsThroughTheRunner:
+    @pytest.mark.usefixtures('sandboxed')
+    async def test_the_sandboxed_path_hands_the_runner_the_unwrapped_argv_and_the_wrap(
+        self, worktree: Path, tmp_path: Path, pinned_claude: str,
+    ) -> None:
+        rec = _RecordingRunner(_canned_claude_result())
+
+        agent = await _invoke_claude(
+            worktree, rec, sandbox_modules=['shared'], sandbox_extras=['/x'], config_dir=tmp_path,
+        )
+
+        [(cmd, env, kw)] = rec.calls
+        assert cmd[0] == pinned_claude
+        assert kw['wrap_argv'](cmd) == [*SANDBOX_PREFIX, *cmd]
+        assert kw['backend'] == 'claude'
+        assert kw['stdin_data'] == b'do step-1'
+        assert kw['transcript'] == TranscriptWatch(
+            session_id='s1', config_dir=tmp_path, **CLAUDE_TRANSCRIPT,
+        )
+        assert sandbox_git_config_env({}).items() <= env.items()
+        assert agent.output == 'ok'
+        assert agent.session_id == CANNED_CLAUDE_SESSION
+
+    async def test_the_unsandboxed_path_reaches_the_runner_through_invoke_claude_agent(
+        self, worktree: Path, tmp_path: Path, pinned_claude: str,
+    ) -> None:
+        rec = _RecordingRunner(_canned_claude_result())
+
+        agent = await _invoke_claude(worktree, rec, sandbox_modules=None, config_dir=tmp_path)
+
+        [(cmd, _env, kw)] = rec.calls
+        assert cmd[0] == pinned_claude
+        assert kw['wrap_argv'] is None
+        assert kw['transcript'] == TranscriptWatch(
+            session_id='s1', config_dir=tmp_path, **CLAUDE_TRANSCRIPT,
+        )
+        assert agent.output == 'ok'
+        assert agent.session_id == CANNED_CLAUDE_SESSION
+
+    @pytest.mark.usefixtures('sandboxed')
+    async def test_a_sandboxed_resume_watches_the_resumed_session_and_costs_its_delta(
+        self, worktree: Path, tmp_path: Path, pinned_claude: str,
+    ) -> None:
+        rec = _RecordingRunner(_canned_claude_result(total_cost_usd=3.0))
+
+        agent = await _invoke_claude(
+            worktree, rec, sandbox_modules=['shared'], config_dir=tmp_path,
+            resume_session_id='r1', resume_prior_total_cost_usd=1.0,
+        )
+
+        [(cmd, _env, kw)] = rec.calls
+        assert cmd[cmd.index('--resume') + 1] == 'r1'
+        assert kw['transcript'].session_id == 'r1'
+        assert agent.cost_usd == pytest.approx(2.0)
+        assert agent.cost_basis is ProcessCostBasis.SESSION_DELTA
+        assert agent.reported_total_cost_usd == pytest.approx(3.0)
