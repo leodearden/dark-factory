@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import types
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,27 @@ def _journal(
 class _UnreadableJournal(MergeQueueStore):
     def load(self) -> list[Any]:
         raise OSError('journal unreadable')
+
+
+class _HistoryUnreadable(EventStore):
+    """A runs.db whose prior-run read fails while this run's rows still read."""
+
+    def latest_merge_finalized(
+        self,
+        request_id: str | None = None,
+        branch: str | None = None,
+        task_id: str | None = None,
+        *,
+        cross_run: bool = False,
+        fire_safe: bool = True,
+    ) -> dict | None:
+        if cross_run and not fire_safe:
+            raise sqlite3.OperationalError('disk I/O error')
+        if cross_run:
+            return None
+        return super().latest_merge_finalized(
+            request_id, branch, task_id, cross_run=cross_run, fire_safe=fire_safe,
+        )
 
 
 def _unreadable(store: Any) -> Any:
@@ -452,6 +474,58 @@ class TestProbeFailureEndsTheWalk:
         assert response['reason'] == MergeReason.probe_failed
         assert response['source'] == 'event_store'
         assert response['hint'] == hint_for(MergeReason.probe_failed)
+        assert response['last_outcome'] is None
+
+    @pytest.mark.parametrize(
+        'key', [{'task_id': _TASK}, {'request_id': 'mr-x'}], ids=['task_id', 'request_id'],
+    )
+    async def test_unreadable_history_is_a_cross_run_probe_failure(
+        self, tmp_path: Path, key: dict[str, str]
+    ) -> None:
+        store = _HistoryUnreadable(tmp_path / 'runs.db', _CURRENT)
+
+        response = await _poll(_server(tmp_path, store), **key)
+
+        assert response['state'] is MergeState.unknown
+        assert response['reason'] == MergeReason.probe_failed
+        assert response['source'] == 'event_store_cross_run'
+        assert response['last_outcome'] is None
+
+    async def test_unreadable_history_does_not_preempt_the_current_run_tier(
+        self, tmp_path: Path
+    ) -> None:
+        store = _HistoryUnreadable(tmp_path / 'runs.db', _CURRENT)
+        _finalize(store, request_id='mr-1', state='done')
+
+        response = await _poll(_server(tmp_path, store), request_id='mr-1')
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert response['last_outcome'] is None
+
+    async def test_unreadable_history_does_not_preempt_the_journal_tier(
+        self, tmp_path: Path
+    ) -> None:
+        store = _HistoryUnreadable(tmp_path / 'runs.db', _CURRENT)
+        journal = _journal(tmp_path, _journal_entry('mr-j'))
+
+        response = await _poll(_server(tmp_path, store, journal=journal), task_id=_TASK)
+
+        assert response['state'] is MergeState.journaled
+        assert response['source'] == 'journal'
+
+    async def test_an_unreadable_event_store_does_not_preempt_a_live_answer(
+        self, tmp_path: Path
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        server = _server(
+            tmp_path, _unreadable(current), worker=_live_worker(_live_entry('mr-new')),
+        )
+
+        response = await _poll(server, branch=_BRANCH)
+
+        assert response['state'] == 'queued'
+        assert response['source'] == 'live'
         assert response['last_outcome'] is None
 
 
