@@ -22,6 +22,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _fake_systemd_run import scope_payload_command
 from shared.verify_admission import nice_prefix
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig, apply_reload
@@ -159,7 +160,9 @@ class TestScopeSpawnCarriesRoleWeight:
         test_leg = [r for r in _recorded(fake_systemd_run) if 'test-leg' in r[-1]]
         assert len(test_leg) == 1
         _assert_carries_weight(test_leg[0], 33)
-        assert test_leg[0][-1].startswith(shlex.join(nice_prefix('task'))), test_leg[0]
+        assert scope_payload_command(test_leg[0]).startswith(
+            shlex.join(nice_prefix('task')),
+        ), test_leg[0]
 
 
 @functools.cache
