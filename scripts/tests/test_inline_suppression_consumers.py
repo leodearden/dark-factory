@@ -4,13 +4,15 @@ One subject: D8's consumer model — whether pyright, ruff (through the nearest
 ``pyproject.toml``), a first-party checker, or nothing at all reads a given
 suppression.  ``plans/inv12-exceptions-owned-or-ratified-prd.md``, D8.
 
-ONE SUBPROCESS, deliberately.  The first-party code drift guard runs
-``fused-memory/scripts/check_bare_magicmock_config.py`` as a subprocess and
-reads the violation messages it EMITS, rather than importing its private
-``_RULE_A_CODE`` / ``_RULE_B_CODE`` constants — ``docs/code-quality.md``'s
-Tests stance (a test that reads another module's private attributes pins
-implementation rather than behaviour).  Every other test here is in-process,
-over a plain tree of files from ``inline_suppression_fixtures.write_files``.
+SUBPROCESSES IN ONE TEST ONLY, deliberately.  The first-party code drift guard
+runs every checker ``FIRST_PARTY_CODES`` names (today
+``fused-memory/scripts/check_bare_magicmock_config.py`` and
+``fused-memory/scripts/check_module_local_testclient.py``) as a subprocess and
+reads the violation messages each EMITS, rather than importing any private
+``_RULE_*CODE`` constant — ``docs/code-quality.md``'s Tests stance (a test that
+reads another module's private attributes pins implementation rather than
+behaviour).  Every other test here is in-process, over a plain tree of files
+from ``inline_suppression_fixtures.write_files``.
 """
 
 import re
@@ -394,24 +396,52 @@ def test_a_ruff_section_that_declares_no_select_is_an_instrument_failure(
 # ---------------------------------------------------------------------------
 # D8, first-party half — the codes no ruff selector can ever match.
 
-#: The checker whose private rule-code constants this scanner necessarily
-#: copies.  Its path is named once here, and the guard below runs it.
-_FIRST_PARTY_CHECKER = REPO_ROOT / 'fused-memory' / 'scripts' / 'check_bare_magicmock_config.py'
-
-#: One fixture per rule, each written to trigger exactly one of them, so the
-#: guard below sees every code the checker can name.  Kept as SOURCE rather
-#: than as a list of expected codes: the point is to read the codes back out of
-#: what the checker emits, never to restate them.
-_FIRST_PARTY_TRIGGERS: Mapping[str, str] = {
-    'rule_a.py': 'from unittest.mock import MagicMock\n\nconfig = MagicMock()\n',
-    'rule_b.py': (
-        'from unittest.mock import MagicMock\n\ndouble = MagicMock(passed=True, summary=\'ok\')\n'
-    ),
-    'rule_c.py': (
-        'import asyncio\n\n\nasync def run(req):\n'
-        '    return await asyncio.wait_for(req.result, timeout=5)\n'
-    ),
+#: Every first-party checker, keyed by its repo-relative path spelled exactly as
+#: `FIRST_PARTY_CODES`'s values spell it, mapped to one fixture per rule, each
+#: written to trigger exactly one of them, so the guard below sees every code
+#: each checker can name.  Kept as SOURCE rather than as a list of expected
+#: codes: the point is to read the codes back out of what each checker emits,
+#: never to restate them.
+#:
+#: Fixture FILENAMES can be load-bearing: check_module_local_testclient.py's
+#: `is_scannable` keeps only `test_*.py`, and under any other name it exits 0
+#: with no output, so its fixture would silently stop triggering.
+_FIRST_PARTY_TRIGGERS: Mapping[str, Mapping[str, str]] = {
+    'fused-memory/scripts/check_bare_magicmock_config.py': {
+        'rule_a.py': 'from unittest.mock import MagicMock\n\nconfig = MagicMock()\n',
+        'rule_b.py': (
+            'from unittest.mock import MagicMock\n\ndouble = MagicMock(passed=True, summary=\'ok\')\n'
+        ),
+        'rule_c.py': (
+            'import asyncio\n\n\nasync def run(req):\n'
+            '    return await asyncio.wait_for(req.result, timeout=5)\n'
+        ),
+    },
+    'fused-memory/scripts/check_module_local_testclient.py': {
+        'test_module_local_client.py': (
+            'import pytest\nfrom starlette.testclient import TestClient\n\n\n'
+            '@pytest.fixture\ndef client(app):\n    return TestClient(app)\n'
+        ),
+    },
 }
+
+
+def _codes_emitted_by(checker: str, triggers: Mapping[str, str], directory: Path) -> set[str]:
+    """The suppression codes *checker* names in the remedies it prints for
+    *triggers*, each written under *directory* and run as its own subprocess."""
+    write_files(directory, triggers)
+
+    emitted: set[str] = set()
+    for name in triggers:
+        completed = subprocess.run(
+            [sys.executable, str(REPO_ROOT / checker), str(directory / name)],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT_SECS,
+        )
+        emitted.update(re.findall(r'#\s*noqa:\s*([a-z0-9]+(?:-[a-z0-9]+)+)', completed.stdout))
+    return emitted
 
 
 def test_a_first_party_code_resolves_to_the_first_party_consumer(tmp_path: Path):
@@ -436,41 +466,47 @@ def test_an_invented_neighbouring_code_has_no_consumer(tmp_path: Path):
     )
 
 
-def test_the_first_party_table_matches_the_codes_that_checker_actually_emits(tmp_path: Path):
+def test_the_first_party_table_matches_the_codes_each_checker_actually_emits(tmp_path: Path):
     """THE DRIFT GUARD, and it is BEHAVIOURAL IN BOTH DIRECTIONS.
 
-    The source of truth is a private constant in another package's
-    stdlib-only script, so there is no public seam to import and a second copy
-    is unavoidable.  Heuristic 11 then asks that the copy's drift be made loud
-    rather than that the copy be hidden.
+    The source of truth is a private constant in each of several stdlib-only
+    scripts in another package, so there is no public seam to import and a
+    second copy is unavoidable.  Heuristic 11 then asks that the copy's drift
+    be made loud rather than that the copy be hidden.
 
-    It asserts on the violation messages the checker EMITS, never on its
-    private ``_RULE_A_CODE`` / ``_RULE_B_CODE`` / ``_RULE_C_CODE`` — reading
-    those would pin implementation rather than behaviour
-    (``docs/code-quality.md``, Tests stance), and the emitted message is
-    strictly the stronger assertion: a checker that renamed its constant while
-    still emitting the old code would remain correctly modelled.
+    It runs EVERY checker the table names and asserts on the violation
+    messages each one EMITS — the ``# noqa: <code> — <reason>`` remedy —
+    never on any private ``_RULE_*CODE`` constant.  Reading those would pin
+    implementation rather than behaviour (``docs/code-quality.md``, Tests
+    stance), and the emitted message is strictly the stronger assertion: a
+    checker that renamed its constant while still emitting the old code would
+    remain correctly modelled.
 
-    SET EQUALITY, not containment, and that direction is load-bearing.  A
+    EQUALITY, not containment, and that direction is load-bearing.  A
     containment check ("every code in our table is real") passes happily while
-    the table MISSES a code the checker honours — which is exactly the defect
-    this test found: ``wall-clock-deadline`` (Rule C, task 4246) is a live
-    first-party code that both the PRD's D8 prose and this task's plan omit.
-    Missing a code is the expensive direction: the scanner would tell an author
-    to delete a marker a live checker genuinely reads.
+    the table MISSES a code a checker honours — which is exactly the defect
+    this test found twice: ``wall-clock-deadline`` (Rule C, task 4246), and
+    then ``module-local-testclient`` (task 6651), a second checker's code that
+    a guard running only one checker could never see.  Both are live
+    first-party codes the PRD's D8 prose omits.  Missing a code is the
+    expensive direction: the scanner would tell an author to delete a marker a
+    live checker genuinely reads.
+
+    PER-CHECKER, not one flat code set: the comparison is ``{checker: codes}``
+    against the table inverted, so it also verifies that each code is
+    attributed to the checker that actually honours it, and that the trigger
+    table names exactly the table's checkers.
     """
-    write_files(tmp_path, _FIRST_PARTY_TRIGGERS)
+    emitted = {
+        checker: _codes_emitted_by(checker, triggers, tmp_path / Path(checker).stem)
+        for checker, triggers in _FIRST_PARTY_TRIGGERS.items()
+    }
+    expected: dict[str, set[str]] = {}
+    for code, checker in FIRST_PARTY_CODES.items():
+        expected.setdefault(checker, set()).add(code)
 
-    emitted = set()
-    for name in _FIRST_PARTY_TRIGGERS:
-        completed = subprocess.run(
-            [sys.executable, str(_FIRST_PARTY_CHECKER), str(tmp_path / name)],
-            cwd=tmp_path,
-            capture_output=True,
-            text=True,
-            timeout=SUBPROCESS_TIMEOUT_SECS,
-        )
-        emitted.update(re.findall(r'#\s*noqa:\s*([a-z0-9]+(?:-[a-z0-9]+)+)', completed.stdout))
-
-    assert emitted, 'the checker emitted no suppression remedy at all — fixtures stopped triggering'
-    assert emitted == set(FIRST_PARTY_CODES)
+    silent = sorted(checker for checker, codes in emitted.items() if not codes)
+    assert not silent, (
+        f'{silent} emitted no suppression remedy at all — fixtures stopped triggering'
+    )
+    assert emitted == expected
