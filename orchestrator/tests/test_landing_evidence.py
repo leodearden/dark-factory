@@ -3371,3 +3371,116 @@ class TestContentEquivalenceFallbackRealGit:
         assert verdict.probe['content_fallback'] == 'unanchored'
         assert verdict.probe['evidence_source'] == 'no_equivalent_on_main'
         assert verdict.evidence_sha is None
+
+
+def _build_reverted_capability(repo: _Repo) -> str:
+    """A commit citing task 42 whose added lines a later rewrite removed.
+
+    Returns the cited sha.  Its effect is genuinely ABSENT at main, so the
+    survival check rejects and only the delivered-checks rescue can accept.
+    """
+    cited = repo.commit('feat(42): add the capability', {'pkg/cap.py': _numbered('cap', 30)})
+    repo.commit('refactor: rewrite pkg/cap.py', {'pkg/cap.py': _numbered('gone', 30)})
+    return cited
+
+
+@pytest.mark.asyncio
+class TestDeliveredChecksLeafIsTheCallers:
+    """The rescue's kill switch has ONE source: the caller's
+    ``delivered_checks.enabled`` leaf (task 6276).
+
+    A real ``GitOps.config`` is the ``git`` sub-config, which has no such
+    field, so a caller that supplies checks without the leaf would leave the
+    rescue armed with the feature switched off.  Supplying checks without it
+    is therefore refused outright.
+    """
+
+    @pytest.mark.parametrize('checks_enabled', [True, False])
+    async def test_a_real_gitops_obeys_the_callers_leaf(
+        self, real_git_ops: GitOps, real_git_repo: Path, checks_enabled: bool,
+    ) -> None:
+        assert 'delivered_checks' not in GitConfig.model_fields, (
+            'premise: production GitOps.config cannot carry the kill switch'
+        )
+        cited = _build_reverted_capability(_Repo(real_git_repo))
+        assert await real_git_ops.commit_effect_present_in_main(cited) is False
+        stub, calls = _check_runner({
+            f'{cited}^1': DeliveredCheckResult.FAILED,
+            cited: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                real_git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=cited,
+                delivered_checks=[_grep_check()], checks_enabled=checks_enabled,
+            )
+
+        if checks_enabled:
+            assert verdict.accepted is True
+            assert verdict.rescued_by_delivered_checks is True
+            return
+        assert calls == [], 'no declared check may run while the feature is off'
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+        assert 'delivered_checks.enabled is false' in detail, (
+            'an operator must see the path was switched off, not merely unlucky'
+        )
+
+    @pytest.mark.parametrize('delivered_checks', [
+        pytest.param([], id='none_declared'),
+        pytest.param([_grep_check()], id='declared'),
+    ])
+    async def test_supplying_checks_without_the_leaf_is_refused(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+        delivered_checks: list[dict[str, object]],
+    ) -> None:
+        """``[]`` counts as supplied: a wired site states the leaf even when
+        its task declares nothing."""
+        cited = _build_reverted_capability(_Repo(real_git_repo))
+        stub, calls = _check_runner({
+            f'{cited}^1': DeliveredCheckResult.FAILED,
+            cited: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with (
+            patch('orchestrator.delivered_checks.run_delivered_check', stub),
+            pytest.raises(TypeError, match='checks_enabled'),
+        ):
+            await validate_landing_evidence(
+                real_git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=cited,
+                delivered_checks=delivered_checks,
+            )
+
+        assert calls == []
+
+    async def test_a_stand_in_git_ops_config_is_never_consulted(self) -> None:
+        """A stand-in whose config says DISABLED cannot override a caller
+        that says ENABLED: nothing is read off ``git_ops.config``."""
+        sha = 'c' * 40
+        git_ops = _git_ops(
+            citation=None,
+            is_ancestor_map={},
+            effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=False,
+                diverged_paths=('shared/manifest.py',),
+                anchor_sha=sha,
+                failure='effect_not_survived',
+                aggregate_survival=0.42,
+            ),
+        )
+        git_ops.config = SimpleNamespace(
+            main_branch='main', delivered_checks=SimpleNamespace(enabled=False),
+        )
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', differential_confirms):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()], checks_enabled=True,
+            )
+
+        assert verdict.accepted is True
+        assert verdict.rescued_by_delivered_checks is True
