@@ -512,7 +512,9 @@ class TestSuppressionStormStreak:
         q = _FakeEscalationQueue(open_l2=None)
 
         for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+            vm._bump_suppression_streak_and_maybe_escalate(
+                q, '2768', _MERGE_SHA, call_site=FlakeCallSite.merge_gate,
+            )
 
         assert len(q.submitted) == 1, q.submitted
         esc = q.submitted[0]
@@ -529,7 +531,9 @@ class TestSuppressionStormStreak:
         q = _FakeEscalationQueue(open_l2=None)
 
         for _ in range(threshold - 1):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+            vm._bump_suppression_streak_and_maybe_escalate(
+                q, '2768', _MERGE_SHA, call_site=FlakeCallSite.merge_gate,
+            )
 
         assert q.submitted == []
         assert vm._merge_flake_suppression_streak == threshold - 1
@@ -540,7 +544,9 @@ class TestSuppressionStormStreak:
         q = _FakeEscalationQueue(open_l2=object())  # a truthy open L2
 
         for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+            vm._bump_suppression_streak_and_maybe_escalate(
+                q, '2768', _MERGE_SHA, call_site=FlakeCallSite.merge_gate,
+            )
 
         assert q.submitted == []
         # get_by_task consulted for dedup on the same sentinel, at level=2.
@@ -553,10 +559,25 @@ class TestSuppressionStormStreak:
         threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
 
         for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(None, '2768', _MERGE_SHA)
+            vm._bump_suppression_streak_and_maybe_escalate(
+                None, '2768', _MERGE_SHA, call_site=FlakeCallSite.merge_gate,
+            )
 
         # No crash; window resets without filing (no queue to file into).
         assert vm._merge_flake_suppression_streak == 0
+
+    def test_a_call_site_without_live_signals_is_refused(self) -> None:
+        vm = self._reset()
+        q = _FakeEscalationQueue(open_l2=None)
+
+        with pytest.raises(ValueError, match='offline_lane'):
+            vm._bump_suppression_streak_and_maybe_escalate(
+                q, '2768', _MERGE_SHA, call_site=FlakeCallSite.offline_lane,
+            )
+
+        # A refused call site neither opens nor advances a window.
+        assert vm._merge_flake_suppression_streak == 0
+        assert q.submitted == []
 
 
 @pytest.mark.asyncio
