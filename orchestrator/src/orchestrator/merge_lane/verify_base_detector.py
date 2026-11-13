@@ -125,7 +125,7 @@ def alarm_verify_base_divergence(
     if event_store is not None:
         event_store.emit(
             EventType.escalation_created,
-            task_id=divergence.task_id,
+            task_id=esc.task_id,
             data={
                 **wire,
                 'escalation_id': esc.id,
