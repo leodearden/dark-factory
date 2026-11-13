@@ -8292,8 +8292,8 @@ class TestResolveOutcomeOutParam:
         """(d) The out-param changed nothing for the callers that ignore it.
 
         `resolve()` has callers that pass positionally (`resolve(id, text,
-        dismiss)`), plus its own member cascade and `dismiss_all_pending` — none
-        of which want the out-param.  Keyword-only with a None default is what
+        dismiss)`), plus its own member cascade — none of which want the
+        out-param.  Keyword-only with a None default is what
         keeps them untouched, asserted the way those callers experience it: a
         third POSITIONAL argument still means `dismiss` (it would have meant
         `outcome` had the new parameter been added positionally), and a call
