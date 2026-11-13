@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -395,6 +396,75 @@ class TestDismissAllPendingKeep:
         level_1 = queue.get('esc-5-1')
         assert level_1 is not None
         assert level_1.status == 'pending'
+
+
+def _peer_resolves(peer: EscalationQueue, esc_id: str) -> Callable[[Escalation], bool]:
+    """A ``keep`` predicate through which *peer* resolves *esc_id* first, keeping nothing."""
+
+    def keep(esc: Escalation) -> bool:
+        if esc.id == esc_id:
+            peer.resolve(esc_id, 'Fixed by a peer process', resolved_by='steward')
+        return False
+
+    return keep
+
+
+class TestDismissAllPendingCountsOnlyAppliedDismissals:
+    """A record a concurrent writer resolves between get_pending() and resolve() is not counted.
+
+    ``keep`` is the injection point: it runs on each snapshot record before that
+    record's resolve(), so a real peer queue resolving there lands in the window.
+    """
+
+    def test_record_resolved_by_a_peer_mid_sweep_is_not_counted(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        peer = EscalationQueue(tmp_path / 'queue')
+        for task_id in ('1', '2', '3'):
+            queue.submit(_make_escalation(f'esc-{task_id}-1', task_id=task_id))
+
+        count = queue.dismiss_all_pending(
+            'Stale from prior run', keep=_peer_resolves(peer, 'esc-2-1'),
+        )
+
+        assert count == 2, f'only the two records this sweep dismissed count: {count}'
+        won = queue.get('esc-2-1')
+        assert won is not None
+        assert (won.status, won.resolved_by, won.resolution) == (
+            'resolved', 'steward', 'Fixed by a peer process',
+        ), f'the peer won and the late sweep resolve was a no-op: {won}'
+        for esc_id in ('esc-1-1', 'esc-3-1'):
+            swept = queue.get(esc_id)
+            assert swept is not None
+            assert (swept.status, swept.resolved_by) == ('dismissed', 'auto-dismissed'), (
+                f'{esc_id} was dismissed by this sweep: {swept}'
+            )
+
+    def test_peer_resolved_strand_is_not_tallied_as_a_stale_strand(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        peer = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=75480.0, task_id='1'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=90.0, task_id='3'))
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            count = queue.dismiss_all_pending(
+                'Stale from prior run',
+                strand_age_secs=600.0,
+                keep=_peer_resolves(peer, 'esc-2-1'),
+            )
+
+        assert count == 2, f'only the two records this sweep dismissed count: {count}'
+        won = queue.get('esc-2-1')
+        assert won is not None
+        assert won.resolution_class != 'stale-strand' and won.resolved_by == 'steward', (
+            f'the peer-resolved strand keeps the peer resolution: {won}'
+        )
+        sweep_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith('Dismissed ')]
+        assert len(sweep_lines) == 1, f'one sweep INFO line expected: {sweep_lines}'
+        assert 'Dismissed 2 stale L0 escalation(s)' in sweep_lines[0], sweep_lines
+        assert '(1 stale-strand)' in sweep_lines[0], sweep_lines
 
 
 class TestAmendmentRoom:
