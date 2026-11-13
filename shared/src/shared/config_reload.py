@@ -88,14 +88,14 @@ def apply_reload(
     if reloadable is None:
         reloadable = reloadable_paths(type(live))
     diff, write_points = _planned_reload(live, fresh, reloadable)
-    undo: list[tuple[_Slot, object]] = []
+    undo: list[_Undo] = []
     try:
         for point in write_points:
             _put(_slots(live, point), _fresh_value(fresh, point), undo)
         type(live).model_validate(live.model_dump())
     except BaseException as exc:
-        for slot, previous in reversed(undo):
-            _assign(slot, previous)
+        for entry in reversed(undo):
+            _assign(entry.slot, entry.previous, entry.key_order)
         if not isinstance(exc, ValueError):
             raise
         return _report(False, {}, diff, deprecated, error=f'hybrid-invariant: {exc}')
@@ -180,6 +180,14 @@ def _is_hole(node: object) -> bool:
 class _Slot:
     container: BaseModel | MutableMapping[str, object]
     key: str
+    row_order: tuple[StrEnum, ...] = ()
+
+
+@dataclass(frozen=True)
+class _Undo:
+    slot: _Slot
+    previous: object
+    key_order: tuple[object, ...]
 
 
 def _slots(live: BaseModel, point: tuple[str, ...]) -> list[_Slot]:
@@ -190,7 +198,8 @@ def _slots(live: BaseModel, point: tuple[str, ...]) -> list[_Slot]:
         if isinstance(node, BaseModel):
             slots.append(_Slot(node, name))
         elif isinstance(node, MutableMapping):
-            slots.append(_Slot(node, key_enums[point[:depth]](name)))
+            key_enum = key_enums[point[:depth]]
+            slots.append(_Slot(node, key_enum(name), tuple(key_enum)))
         else:
             raise TypeError(
                 f'{".".join(point[:depth])} holds a {type(node).__qualname__}, '
@@ -214,26 +223,39 @@ def _fresh_value(fresh: BaseModel, point: tuple[str, ...]) -> object:
     return value.model_copy(deep=True) if isinstance(value, BaseModel) else value
 
 
-def _put(slots: list[_Slot], value: object, undo: list[tuple[_Slot, object]]) -> None:
+def _put(slots: list[_Slot], value: object, undo: list[_Undo]) -> None:
     slot = slots[-1]
-    if isinstance(slot.container, BaseModel) and slot.container.model_config.get('frozen'):
+    container = slot.container
+    if isinstance(container, BaseModel) and container.model_config.get('frozen'):
         if len(slots) == 1:
-            raise TypeError(
-                f'cannot reload into the frozen root {type(slot.container).__qualname__}'
-            )
-        _put(slots[:-1], slot.container.model_copy(update={slot.key: value}), undo)
+            raise TypeError(f'cannot reload into the frozen root {type(container).__qualname__}')
+        _put(slots[:-1], container.model_copy(update={slot.key: value}), undo)
         return
-    undo.append((slot, _child(slot.container, slot.key)))
-    _assign(slot, value)
+    key_order = () if isinstance(container, BaseModel) else tuple(container)
+    undo.append(_Undo(slot, _child(container, slot.key), key_order))
+    _assign(slot, value, slot.row_order)
 
 
-def _assign(slot: _Slot, value: object) -> None:
-    if isinstance(slot.container, BaseModel):
-        object.__setattr__(slot.container, slot.key, value)
-    elif value is ABSENT:
-        del slot.container[slot.key]
+def _assign(slot: _Slot, value: object, key_order: Sequence[object]) -> None:
+    container = slot.container
+    if isinstance(container, BaseModel):
+        object.__setattr__(container, slot.key, value)
+        return
+    if value is ABSENT:
+        del container[slot.key]
     else:
-        slot.container[slot.key] = value
+        container[slot.key] = value
+    _reorder(container, key_order)
+
+
+def _reorder(table: MutableMapping[str, object], key_order: Sequence[object]) -> None:
+    rank = {key: index for index, key in enumerate(key_order)}
+    ordered = sorted(table, key=lambda key: rank.get(key, len(rank)))
+    if ordered == list(table):
+        return
+    rows = {key: table[key] for key in ordered}
+    table.clear()
+    table.update(rows)
 
 
 def _report(

@@ -149,6 +149,10 @@ class MarkerInsideUnionArm(BaseModel):
     opt: Annotated[Sub, Reload.GREEN] | None = None
 
 
+class MarkerInsideListArgument(BaseModel):
+    items: list[Annotated[Sub, Reload.GREEN]] = Field(default_factory=list)
+
+
 @pytest.mark.parametrize(
     ('model_cls', 'named'),
     [
@@ -157,6 +161,7 @@ class MarkerInsideUnionArm(BaseModel):
         (RestartRowsNamingAStranger, ('roles', 'nope', 'architect', 'reviewer', 'unblock_auto')),
         (TableLegacyOnScalar, ('slots', 'models')),
         (MarkerInsideUnionArm, ('opt', 'Reload.GREEN')),
+        (MarkerInsideListArgument, ('items', 'Reload.GREEN')),
     ],
     ids=[
         'restart-rows-on-unmarked-table',
@@ -164,6 +169,7 @@ class MarkerInsideUnionArm(BaseModel):
         'restart-rows-naming-unknown-row',
         'table-legacy-on-non-table',
         'marker-inside-union-arm',
+        'marker-inside-list-argument',
     ],
 )
 def test_a_misplaced_marker_is_a_declaration_error_naming_path_and_value(model_cls, named):
