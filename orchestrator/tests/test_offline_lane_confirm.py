@@ -84,7 +84,7 @@ from orchestrator.verify_cmd import ToolKind, parse_config_command
 T0 = datetime(2026, 10, 16, 9, 0, 0, tzinfo=UTC)
 JUNIT_PATH = Path('/records/unit/pass/confirm.junit.xml')
 FUSED_MEMORY_ADDOPTS = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not integration'"
-TASK_TEXT_EXAMPLE = (
+NARROWED_CONFIRM_UNDER_XDIST_ADDOPTS = (
     "pytest -m integration -n 0 --timeout 300 --junitxml {junit} 'tests/test_a.py::TestX::test_b[1]'"
 )
 
@@ -250,7 +250,7 @@ class TestConfirmMode:
 
 
 class TestSerialConfirmCommand:
-    def test_the_narrowed_command_renders_the_task_texts_example(self, tmp_path: Path) -> None:
+    def test_the_narrowed_command_pins_zero_workers_under_xdist_addopts(self, tmp_path: Path) -> None:
         worktree = _project(tmp_path)
         command = serial_confirm_command(
             _lane_command(),
@@ -258,7 +258,7 @@ class TestSerialConfirmCommand:
             invocation_dir=worktree / 'fused-memory',
             junit_path=JUNIT_PATH,
         )
-        assert command == TASK_TEXT_EXAMPLE.format(junit=JUNIT_PATH)
+        assert command == NARROWED_CONFIRM_UNDER_XDIST_ADDOPTS.format(junit=JUNIT_PATH)
 
     @staticmethod
     def _tokens(tmp_path: Path, addopts: str) -> list[str]:
