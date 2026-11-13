@@ -217,6 +217,20 @@ FANOUT_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
     ValueError,
 )
 
+# The transport failures raised before a request byte leaves the client: no
+# connection was established, the connect timed out, or no pool slot was ever
+# acquired. Only these prove a mutating call was not delivered.
+_UNDELIVERED_FAILURES: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+
+def _delivery_ruled_out(exc: BaseException) -> bool:
+    subject = exc.__cause__ if isinstance(exc, PreformattedFanoutError) else exc
+    return isinstance(subject, _UNDELIVERED_FAILURES)
+
 
 # ── per-URL whole-operation deadline (task 4958) ────────────────────
 #
@@ -328,6 +342,9 @@ class PreformattedFanoutError(ValueError):
     legitimate message whose first token happened to look like an identifier
     followed by ``': '`` would be silently stripped of its real type name,
     with no way for a call site to opt out.
+
+    Raise it ``from`` the real cause: :func:`first_success` reads
+    ``__cause__`` to decide whether delivery was ruled out.
     """
 
 
@@ -502,6 +519,7 @@ async def first_success(
     offline_result: Callable[[list[str]], V],
     log_failures: bool = True,
     per_url_timeout: float | None = None,
+    ambiguous_result: Callable[[list[str]], V] | None = None,
 ) -> V:
     """Call *call(url)* for each URL in order; return the first success.
 
@@ -525,6 +543,16 @@ async def first_success(
     caller reproduce its own existing offline shape (e.g.
     ``{'offline': True, 'error': '; '.join(errors)}``) while preserving the
     per-URL error detail.
+
+    ``ambiguous_result=None`` means every caught failure fails over, which is
+    right for reads. A callable is for MUTATING calls: a failure that may have
+    reached the server ends the fan-out with ``ambiguous_result(errors)``,
+    because every URL reaches the same store and repeating the call on another
+    one could apply it twice (DESIGN.md "Curator Tickets & Routing
+    Invariant"). Only ``httpx.ConnectError``, ``httpx.ConnectTimeout`` and
+    ``httpx.PoolTimeout`` rule delivery out and still fail over. The
+    whole-operation deadline counts as ambiguous, because the abandoned
+    exchange keeps running (``memory.py::_post``).
 
     **Per-URL failures are surfaced at WARNING on transition only** — see
     :func:`log_fanout_failure`. The fall-through is silent to the caller (a
@@ -610,6 +638,8 @@ async def first_success(
                 log_fanout_failure(log_label, url, e)
             errors.append(f'{url}: {describe_exc(e)}')
             invalidate_session(url)
+            if ambiguous_result is not None and not _delivery_ruled_out(e):
+                return ambiguous_result(errors)
         else:
             # Unconditional, unlike the failure report: a timeout can open a
             # streak even at a log_failures=False site, and a streak left open
