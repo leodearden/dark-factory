@@ -736,6 +736,11 @@ class TestMilestoneFired:
         with pytest.raises(ValueError):
             self._delayed().fired('not-a-timestamp', self.NOW)
 
+    @pytest.mark.parametrize('anchor', [12345, 0], ids=['int', 'falsy_int'])
+    def test_delayed_non_string_anchor_raises_value_error(self, anchor):
+        with pytest.raises(ValueError):
+            self._delayed().fired(anchor, self.NOW)
+
     @pytest.mark.parametrize(
         ('after_secs', 'anchor'),
         [

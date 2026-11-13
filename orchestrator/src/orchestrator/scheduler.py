@@ -4567,7 +4567,7 @@ class Scheduler:
         anchor = metadata.get('milestone_deps_satisfied_at')
         try:
             return not Milestone.model_validate(raw).fired(anchor, now_wall)
-        except (ValueError, TypeError):
+        except ValueError:
             self._note_milestone_malformed(
                 task_id, f'invalid:{raw!r}:{anchor!r}',
                 'Task %s: malformed metadata.milestone %r — fail-safe withhold '
