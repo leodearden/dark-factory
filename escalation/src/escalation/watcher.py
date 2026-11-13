@@ -191,6 +191,25 @@ def _snapshot_pending_ids(queue_dir: Path) -> frozenset[str]:
     return frozenset(p.stem for p in queue_dir.glob('esc-*.json'))
 
 
+def exclusions(
+    *,
+    static: frozenset[str],
+    baseline: frozenset[str],
+    exclude_file: Path | None,
+) -> Callable[[], frozenset[str]]:
+    """Return the `current_excludes` callable `watch` polls.
+
+    `static` and `baseline` are fixed for the run, and `exclude_file` is
+    re-read on every call so an appended id is excluded from the next poll on.
+    """
+    fixed = static | baseline
+
+    def current() -> frozenset[str]:
+        return fixed | _read_exclude_file(exclude_file)
+
+    return current
+
+
 def ntfy_request(url: str, escalation: Escalation) -> urllib.request.Request:
     """Build the ntfy.sh push-notification POST for an escalation."""
     is_urgent = escalation.severity in (BORN_AT_L2_SEVERITIES | {'blocking'})
@@ -354,9 +373,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     static_exclude = frozenset(_normalize_esc_id(e) for e in (args.exclude_id or []))
     exclude_file_path = Path(args.exclude_file) if args.exclude_file else None
 
-    def current_excludes() -> frozenset[str]:
-        return static_exclude | baseline_ids | _read_exclude_file(exclude_file_path)
-
     # Baseline is frozen ONCE here, BEFORE inotify is armed, so the race
     # window falls on the safe side: an escalation filed between this
     # snapshot and add_watch() below is absent from the snapshot (so it is
@@ -367,8 +383,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     # let such an item be captured by the snapshot (permanently excluded)
     # while ALSO queuing an inotify event that gets silently dropped as an
     # excluded id -- i.e. a genuinely new item swallowed for the run's
-    # lifetime. Unlike --exclude-file, the baseline is never re-read.
+    # lifetime. Unlike --exclude-file, the baseline is never re-read (see
+    # `exclusions`).
     baseline_ids = _snapshot_pending_ids(queue_dir) if args.baseline else frozenset()
+    current_excludes = exclusions(
+        static=static_exclude, baseline=baseline_ids, exclude_file=exclude_file_path,
+    )
 
     # ARM inotify so no events are missed between the scan and the watch.
     with INotify() as inotify:
