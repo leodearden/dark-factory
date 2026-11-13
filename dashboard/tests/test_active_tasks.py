@@ -1687,7 +1687,7 @@ class TestShapeOneProjectNarrowing:
 
         ``test_tasks_budget.py`` machine-checks
         ``PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <=
-        _TASKS_PER_PROJECT_BUDGET``.  That arithmetic is only a true statement
+        TASKS_PER_PROJECT_BUDGET``.  That arithmetic is only a true statement
         ABOUT THIS SYSTEM if every enumerated operation actually threads the
         term.  ``fetch_statuses`` shipped without it, so one of the three ran
         on ``mcp_tool_call``'s 10 s default and could alone overrun the
@@ -2725,7 +2725,7 @@ class TestCollectTasksWithCountsConcurrency:
     so the same trailing roots were reported degraded on every render
     (``project pump-web-ui: skipped — the 20.0s Tasks budget was already
     spent``). Concurrency at width W turns the worst case into roughly
-    ``ceil(N / W) * _TASKS_PER_PROJECT_BUDGET``.
+    ``ceil(N / W) * TASKS_PER_PROJECT_BUDGET``.
 
     (a) and (b) are the fix. (c)-(f) are the REGRESSION FENCE around it: the
     offline/degraded/order semantics are load-bearing product facts and

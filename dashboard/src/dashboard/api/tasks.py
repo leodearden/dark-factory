@@ -265,9 +265,9 @@ async def api_tasks(
       outage. The no-root-measured conjunct is why the test is *not* the
       tighter ``len(offline) == total_roots``: the handler's own budget caps
       how many roots can even reach the offline state. In the hang case each
-      root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before ``wait_for`` cuts
+      root burns up to ``TASKS_PER_PROJECT_BUDGET`` before ``wait_for`` cuts
       it, and a cut root lands in ``degraded``, not ``offline`` — so with
-      ``_TASKS_TOTAL_BUDGET / _TASKS_PER_PROJECT_BUDGET`` under three, at most
+      ``_TASKS_TOTAL_BUDGET / TASKS_PER_PROJECT_BUDGET`` under three, at most
       a couple of roots per render can ever be marked offline. Requiring ALL
       of them to be would have made this flag unreachable on a nine-root
       config for the most likely total outage, leaving the payload to say

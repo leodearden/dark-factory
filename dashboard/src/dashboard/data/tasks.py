@@ -97,7 +97,7 @@ Derivation: ``DEFAULT_PER_CALL_TIMEOUT`` (2.0) * ``len(COLD_SESSION_POSTS)``
 (3) = 6.0 <= 7.0, leaving 1.0 s of slack so the bound is a real backstop for
 non-MCP overhead (JSON decode, row shaping, event-loop scheduling) rather
 than coinciding exactly with the sum of its parts. It deliberately equals
-``active_tasks._TASKS_PER_PROJECT_BUDGET`` because both fall out of the same
+``active_tasks.TASKS_PER_PROJECT_BUDGET`` because both fall out of the same
 arithmetic — the two are not coupled in code, so either may be tightened
 independently.
 
@@ -113,7 +113,7 @@ nevertheless operator-configurable (a comma-separated env var), and for that
 case this budget deliberately CAPS the fan-out rather than accommodating it.
 Capping exactly this residual is why the caller-side ``wait_for`` layer
 exists: the two layers are complementary, not redundant — the same
-disclosure ``active_tasks._TASKS_PER_PROJECT_BUDGET`` carries for its own
+disclosure ``active_tasks.TASKS_PER_PROJECT_BUDGET`` carries for its own
 budget. Without this note, ``6.0 <= 7.0`` reads as a total-worst-case
 guarantee it is not.
 """
