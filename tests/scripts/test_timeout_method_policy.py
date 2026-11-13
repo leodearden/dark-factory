@@ -143,9 +143,9 @@ from pytest_config_discovery import (
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
 from df_pytest_isolation import wait_pid_gone
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SIGNAL_METHOD = 'signal'
 THREAD_METHOD = 'thread'
