@@ -58,6 +58,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
 from orchestrator.relocated_scopes import relocated_scopes
+from orchestrator.scope_launch_handshake import ScopeLaunchHandshake
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_admission_gate import (
     AdmissionGrant,
@@ -2789,16 +2790,34 @@ def _red_gate_category(slot: LegSlot) -> FailureCategory:
             assert_never(slot)
 
 
+def _require_launch_refusal_is_red(
+    label: str, rc: int, timed_out: bool, cmd: str | None,
+) -> None:
+    if cmd is None or rc == 0 or timed_out:
+        raise ValueError(
+            f'leg {str(label)!r}: scope_launch_refused requires a red leg whose '
+            'launch was attempted (cmd set, rc != 0, not timed out); '
+            f'got cmd={cmd!r}, rc={rc}, timed_out={timed_out}'
+        )
+
+
 def classify_leg(
     slot: LegSlot, rc: int, output: str, timed_out: bool, cmd: str | None, *,
     event_channel: VerifyEventChannel | None = None,
+    scope_launch_refused: bool = False,
 ) -> FailureCategory:
     """The ONE per-leg classifier. ``classify_failure`` answers what the tool's
     OUTPUT says (and the leg's *event_channel*, when present); this adds what
-    only verify knows: the leg's slot, and that verify interposed the shell.
-    It rewrites only the UNKNOWN_TEST_FAILURE fall-through, so every more
-    specific diagnosis survives.
+    only verify knows: the leg's slot, that verify interposed the shell, and
+    that verify's scope launcher refused to start the command
+    (*scope_launch_refused*, from ``ScopeLaunchRefused``). A refused leg is
+    ENV_TRANSIENT before any output is read: the output is the launcher's, not
+    the command's. Otherwise this rewrites only the UNKNOWN_TEST_FAILURE
+    fall-through, so every more specific diagnosis survives.
     """
+    if scope_launch_refused:
+        _require_launch_refusal_is_red(slot, rc, timed_out, cmd)
+        return FailureCategory.ENV_TRANSIENT
     tool = _tool_for_cmd(cmd)
     category = classify_failure(tool, rc, output, timed_out, event_channel=event_channel)
     if category != FailureCategory.UNKNOWN_TEST_FAILURE:
@@ -2809,7 +2828,7 @@ def classify_leg(
 
 
 def _classify_failing_legs(
-    legs: Iterable[tuple[LegSlot, int, str, bool, str | None, VerifyEventChannel | None]],
+    legs: Iterable[tuple[LegSlot, int, str, bool, str | None, VerifyEventChannel | None, bool]],
 ) -> dict[LegSlot, FailureCategory]:
     """Each failing leg's own category, keyed by slot, in *legs* order.
 
@@ -2818,19 +2837,24 @@ def _classify_failing_legs(
     provisioned venv is ENV_TRANSIENT, not TYPE_ERROR.
     """
     by_slot = {leg[0]: leg for leg in legs}
-    _, test_rc, _, _, test_cmd, _ = by_slot[LegSlot.TEST]
+    _, test_rc, _, _, test_cmd, _, _ = by_slot[LegSlot.TEST]
     categories: dict[LegSlot, FailureCategory] = {}
-    for slot, rc, output, timed_out, cmd, event_channel in by_slot.values():
+    for slot, rc, output, timed_out, cmd, event_channel, scope_launch_refused in by_slot.values():
         if rc == 0:
             continue
-        if slot is LegSlot.TYPE and _type_leg_read_partially_provisioned_venv(
-            rc, output, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
-            event_channel=event_channel,
+        if (
+            slot is LegSlot.TYPE
+            and not scope_launch_refused
+            and _type_leg_read_partially_provisioned_venv(
+                rc, output, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
+                event_channel=event_channel,
+            )
         ):
             categories[slot] = FailureCategory.ENV_TRANSIENT
         else:
             categories[slot] = classify_leg(
                 slot, rc, output, timed_out, cmd, event_channel=event_channel,
+                scope_launch_refused=scope_launch_refused,
             )
     return categories
 
@@ -2972,9 +2996,9 @@ def _summarize_checks(
         return True, 'passed', '', 'All checks passed', []
 
     legs = (
-        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd, None),
-        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd, None),
-        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd, None),
+        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd, None, False),
+        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd, None, False),
+        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd, None, False),
     )
     if leg_categories is None:
         leg_categories = _classify_failing_legs(legs)
@@ -4716,6 +4740,9 @@ class CheckRun:
     # result, started_at and duration_secs are that attempt's first pass's
     # (the env-recovery retry, task 5624). LAST field, as above.
     carried_over: bool = False
+    # True when verify's scope launcher refused to start this leg's command
+    # (task 7339). LAST field, as above, and kept out of ``to_dict``.
+    scope_launch_refused: bool = False
 
     def __post_init__(self) -> None:
         if self.carried_over and self.cmd is None:
@@ -4723,6 +4750,8 @@ class CheckRun:
                 f'CheckRun {str(self.label)!r}: a check that never ran (cmd=None) '
                 'cannot be carried over'
             )
+        if self.scope_launch_refused:
+            _require_launch_refusal_is_red(self.label, self.rc, self.timed_out, self.cmd)
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -4879,7 +4908,10 @@ class VerifyAttempt:
         """Each failing check's own category (``classify_leg``), keyed by slot."""
         checks = ((slot, self._by_label(slot)) for slot in LegSlot)
         return _classify_failing_legs(
-            (slot, check.rc, check.output, check.timed_out, check.cmd, check.event_channel)
+            (
+                slot, check.rc, check.output, check.timed_out, check.cmd,
+                check.event_channel, check.scope_launch_refused,
+            )
             for slot, check in checks
         )
 
@@ -6186,6 +6218,23 @@ async def _discover_relocated_scopes(
     return relocated
 
 
+class ScopeLaunchRefused(NamedTuple):
+    """The triple ``_run_cmd`` returns when its systemd-run scope launcher exited
+    without exec'ing the command; *output* is the launcher's own."""
+
+    rc: int
+    output: str
+    timed_out: bool = False
+
+
+def _exited_outcome(
+    rc: int, output: str, handshake: ScopeLaunchHandshake | None,
+) -> tuple[int, str, bool]:
+    if rc != 0 and handshake is not None and handshake.launcher_exited_before_exec():
+        return ScopeLaunchRefused(rc, output)
+    return rc, output, False
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -6200,6 +6249,9 @@ async def _run_cmd(
     clock_stop: ClockStopConfig | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
+
+    The triple is a ``ScopeLaunchRefused`` when the scope launcher exited
+    without ever starting the command (``scope_launch_handshake.py``).
 
     When *env* is non-None, it is merged on top of ``os.environ`` and passed
     to the subprocess so callers can inject build accelerators like
@@ -6298,6 +6350,7 @@ async def _run_cmd(
     proc = None
     pgid: int | None = None
     scope_unit: str | None = None
+    handshake: ScopeLaunchHandshake | None = None
     if use_cgroup_scope and shutil.which('systemd-run') is not None:
         scope_unit = _verify_scope_name(scope_tag)
     # Populated by the clock-stop loop, via _clock_stop_reason evaluated AT
@@ -6316,15 +6369,20 @@ async def _run_cmd(
             # bash as a direct child of systemd-run, inheriting our cwd/env and
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
-            proc = await asyncio.create_subprocess_exec(
-                *_scope_launch_argv(scope_unit, cpu_weight, memory_properties),
-                '/bin/bash', '-c', cmd,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=subprocess_env,
-                start_new_session=True,
-            )
+            handshake = ScopeLaunchHandshake()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *_scope_launch_argv(scope_unit, cpu_weight, memory_properties),
+                    '/bin/bash', '-c', handshake.payload(cmd),
+                    cwd=str(cwd),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=subprocess_env,
+                    start_new_session=True,
+                    pass_fds=handshake.pass_fds,
+                )
+            finally:
+                handshake.release_writer()
         else:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -6343,7 +6401,7 @@ async def _run_cmd(
                 proc.communicate(), timeout=wall_deadline - clock(),
             )
             rc = proc.returncode if proc.returncode is not None else 1
-            return rc, stdout.decode(errors='replace'), False
+            return _exited_outcome(rc, stdout.decode(errors='replace'), handshake)
 
         # Streamed path: chunked read + per-chunk flush so the kill on timeout
         # cannot strand the partial output in kernel buffers.  The ``with``
@@ -6497,7 +6555,7 @@ async def _run_cmd(
                                 state = _CS_RUNNING
 
         rc = proc.returncode if proc.returncode is not None else 1
-        return rc, buf.decode(errors='replace'), False
+        return _exited_outcome(rc, buf.decode(errors='replace'), handshake)
     except TimeoutError:
         await _reap_command_subtree(proc, pgid, scope_unit)
         if _cs_timeout_msg:
@@ -6513,6 +6571,9 @@ async def _run_cmd(
     except Exception as e:
         await _reap_command_subtree(proc, pgid, scope_unit)
         return 1, f'Command failed: {e}', False
+    finally:
+        if handshake is not None:
+            handshake.close()
 
 
 _CHAIN_BUDGET_EXHAUSTED = 'chain wall-clock budget exhausted before this segment started'
@@ -7942,9 +8003,10 @@ async def run_verification(
                     {**seg, 'xdist': segment_xdist.get(seg['label'])}
                     for seg in segment_dicts
                 ]
+                scope_launch_refused = False
             else:
                 segment_dicts = None
-                rc, out, timed_out_flag = await _run_cmd(
+                outcome = await _run_cmd(
                     cmd,
                     worktree,
                     timeout,
@@ -7953,6 +8015,8 @@ async def run_verification(
                     **_scope_kw,
                     **_clock_kw,
                 )
+                rc, out, timed_out_flag = outcome
+                scope_launch_refused = isinstance(outcome, ScopeLaunchRefused)
             # Both branches converge here, still INSIDE the slot and one
             # statement after the command returned. The clock and the load
             # window close at the SAME instant, so `duration_secs` and
@@ -8071,6 +8135,7 @@ async def run_verification(
                 grant, slot_taken=slot_taken, released=slot_released,
                 rc=rc, timed_out=timed_out_flag,
             ),
+            scope_launch_refused=scope_launch_refused,
         )
 
     async def _run_or_skip_timed(
