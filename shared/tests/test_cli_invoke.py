@@ -5443,9 +5443,8 @@ class TestUnreadableTranscriptEscapeWiring:
 # parent's stdin write", so the tests inject exactly that gap.
 
 # The stubs and the loop-starving exec fake live in shared.testing_stdin —
-# ONE definition, imported by this suite and by orchestrator's sibling suite
-# for _run_subprocess_local.  Their stderr is coupled to
-# CLI_INPUT_REQUIRED_MARKERS by an import-time check in that module.
+# ONE definition, importable from either package's suite.  Their stderr is
+# coupled to CLI_INPUT_REQUIRED_MARKERS by an import-time check in that module.
 
 
 @pytest.mark.asyncio
@@ -5599,8 +5598,7 @@ class TestStdinStarvationRace:
         """stdin_data=None must still spawn with stdin=None (inherited).
 
         Pins the contract run_cli_subprocess's own docstring states — "``None``
-        leaves stdin inherited from the parent" — and mirrors the sibling
-        assertion on orchestrator's _run_subprocess_local.  Without it, a
+        leaves stdin inherited from the parent".  Without it, a
         refactor that unconditionally materialized (handing the child an EMPTY
         temp file) would hand every stdin_data=None caller instant EOF on fd 0
         instead of the parent's own stdin, and nothing here would notice:
