@@ -238,3 +238,12 @@ a retired edge spends a leg slot on a row the read path discards after fusion.
   `test_falkor_edge_search_integration.py -m integration`, 25 passed. These include
   `test_retired_edges_are_not_promoted` and
   `test_the_tier_fits_the_leg_on_its_live_edges`.
+* Default fused-memory suite (`-n 8`) at `7f33813f09`, in the dispatched agent
+  sandbox: 35481 passed, 9 failed, 12 skipped, 14 xfailed. All nine failures are
+  sandbox environment refusals in files that do not touch the edge leg:
+  * `test_lane_dependency_probe.py` x6: `/home/leo/.mem0` is not writable;
+  * `test_predicate_contradiction.py` x1: `/usr/bin/python` has no pytest;
+  * `test_roll_up_journal_reads_script.py` x2: "unable to open database file".
+
+  The same three files failed at `51d7bab3f5`. Not reproduced outside the
+  sandbox.
