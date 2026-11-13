@@ -1,34 +1,15 @@
 """Tests for shared.config_reload: leaf iteration, diff and apply between two configs of one class."""
 
 import json
-from enum import StrEnum
 from typing import Annotated, Self
 
 import pytest
+from _config_fixtures import Role, Row, Sub, assign_item
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from shared.config_fields import DeprecatedSpelling, Reload, RestartOnlyRows, reloadable_paths
 from shared.config_reload import ABSENT, Change, apply_reload, diff_config, iter_leaves
-
-
-class Role(StrEnum):
-    ARCHITECT = 'architect'
-    REVIEWER = 'reviewer'
-    UNBLOCK_AUTO = 'unblock_auto'
-
-
-class Row(BaseModel):
-    model_config = ConfigDict(frozen=True, extra='forbid')
-
-    model: str = 'sonnet'
-    budget_usd: float = 1.0
-    max_turns: int = 10
-
-
-class Sub(BaseModel):
-    alpha: int = 1
-    beta: str = 'b'
 
 
 class MixedSub(BaseModel):
@@ -112,10 +93,6 @@ def _leaf_paths(model_cls, model) -> list[str]:
 
 def _diff(live, fresh):
     return diff_config(live, fresh, reloadable_paths(type(live)))
-
-
-def _assign_item(container, key, value) -> None:
-    container[key] = value
 
 
 def test_the_leaf_paths_depend_only_on_the_class():
@@ -211,7 +188,7 @@ def test_unchanged_counts_the_equal_leaves():
 def test_the_diff_maps_are_read_only():
     diff = _diff(OrchestratorShaped(), OrchestratorShaped(max_slots=8))
     with pytest.raises(TypeError):
-        _assign_item(diff.restart_required, 'max_slots', Change(4, 9))
+        assign_item(diff.restart_required, 'max_slots', Change(4, 9))
 
 
 def test_diffing_two_classes_is_a_type_error_naming_both():

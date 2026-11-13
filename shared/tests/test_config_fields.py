@@ -2,10 +2,10 @@
 
 import copy
 from collections.abc import Mapping
-from enum import StrEnum
 from typing import Annotated
 
 import pytest
+from _config_fixtures import ROW_KNOBS, Role, Row, Sub, assign_item
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from shared.config_fields import (
@@ -21,28 +21,6 @@ from shared.config_fields import (
     pivot_legacy_spellings,
     reloadable_paths,
 )
-
-
-class Role(StrEnum):
-    ARCHITECT = 'architect'
-    REVIEWER = 'reviewer'
-    UNBLOCK_AUTO = 'unblock_auto'
-
-
-class Row(BaseModel):
-    model_config = ConfigDict(frozen=True, extra='forbid')
-
-    model: str = 'sonnet'
-    budget_usd: float = 1.0
-    max_turns: int = 10
-
-
-ROW_KNOBS = ('model', 'budget_usd', 'max_turns')
-
-
-class Sub(BaseModel):
-    alpha: int = 1
-    beta: str = 'b'
 
 
 class SubPlusOne(BaseModel):
@@ -260,13 +238,9 @@ def test_several_table_markers_on_one_field_union():
     assert dict(legacy_spellings(UnionedTable)) == expected
 
 
-def _assign_item(container, key, value) -> None:
-    container[key] = value
-
-
 def test_the_spelling_map_is_read_only():
     with pytest.raises(TypeError):
-        _assign_item(legacy_spellings(ScalarSpelled), 'another', 'admission.slots')
+        assign_item(legacy_spellings(ScalarSpelled), 'another', 'admission.slots')
 
 
 class DoublyClaimed(BaseModel):
