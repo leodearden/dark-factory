@@ -574,6 +574,7 @@ async def _publish_plan(
     escapes: Sequence[Escape] = (),
     escaped: Sequence[Mapping[str, Any]] = (),
     enabled_actions: frozenset[HealAction] | None = None,
+    withhold_uncalibrated: bool = False,
 ) -> RunReport:
     """Stage *plan* against the ledger, write its document, and finish *run_id*.
 
@@ -582,9 +583,21 @@ async def _publish_plan(
     backlog and share escapes an apply of *source*'s pending heals would raise
     now, are recorded as ``would_escape``; *escaped* discloses the escapes the
     run has already filed.
+
+    With *withhold_uncalibrated*, every pending heal of *source* whose verdict came
+    from an adjudicator with no passing calibration is withheld first, so a fresh
+    verdict's identical heal is staged as new rather than matched to it.
     """
+    withheld = (
+        _withhold_uncalibrated(ledger.pending_actions(source), ledger=ledger, run_id=run_id)[1]
+        if withhold_uncalibrated
+        else 0
+    )
     examinations = _stage(plan.decisions, ledger, enabled_actions)
-    counts = replace(_staged_counts(plan.counts, examinations), escaped=tuple(escaped))
+    counts = replace(
+        _staged_counts(plan.counts, examinations),
+        escaped=tuple(escaped), withheld_uncalibrated=withheld,
+    )
     try:
         with ledger.publishing_planned(run_id, examinations, source) as pending:
             document = render_plan_document(pending)
@@ -727,11 +740,14 @@ async def run_adjudicator_plan(
     created_in: CreatedWindow | None = None,
     filer: EscapeFiler | None = None,
     presence_projects: Sequence[str] = (),
+    withhold_uncalibrated: bool = False,
 ) -> RunReport:
     """A non-writing run of *source* planning heals from the link adjudicator's verdicts.
 
     Only the links whose child *created_in* admits are read, when it is given.
     A parent is looked for in *presence_projects* as well as *projects*.
+    *withhold_uncalibrated* is passed to :func:`_publish_plan`: a run about to be
+    applied withholds stale-basis heals before staging its own.
     The adjudicator is asked only about the links the verdict rows decide and
     that this adjudicator (model and prompt version) has not judged at their
     current texts, so a model or brief change asks again. Every read
@@ -771,6 +787,7 @@ async def run_adjudicator_plan(
         ledger=ledger, limits=limits, projects=projects, source=source,
         plan_path=plan_path_for(run_id), escapes=storms if filer is None else (),
         escaped=escaped, enabled_actions=enabled_actions,
+        withhold_uncalibrated=withhold_uncalibrated,
     )
 
 

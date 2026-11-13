@@ -709,7 +709,7 @@ class TestTheWriteTimeCalibrationGate:
         assert {(row.planned.child_id, row.planned.action) for row in staged} == STAGED_HEALS
         for row in staged:
             assert row.state is ActionState.WITHHELD_UNCALIBRATED
-            assert row.executed_run_id == second.apply_run_id
+            assert row.executed_run_id == second.plan_run_id
             assert row.detail == {
                 'model': FAKE_ADJUDICATOR_MODEL,
                 'prompt_sha256': FAKE_PROMPT_SHA256,
@@ -717,9 +717,41 @@ class TestTheWriteTimeCalibrationGate:
                 'calibration_run_id': failed,
             }
         assert ledger.pending_actions(RunSource.SWEEP) == []
-        assert second.view.apply is not None
-        assert second.view.apply.counts.withheld_uncalibrated == len(staged)
+        assert second.view.plan.counts.withheld_uncalibrated == len(staged)
         assert f'withheld {len(staged)} heal(s)' in second.report_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_a_recalibrated_adjudicator_s_verdicts_heal_links_a_stale_basis_had_staged(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        _calibrate(ledger, passed=False)
+        first = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+        assert first.apply_run_id is None
+        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+
+        second = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+            adjudicate=FakeAdjudicator(ANSWERS.__getitem__, prompt_sha256=SECOND_PROMPT_SHA256),
+            now=NOW + DAY, since=WINDOW.since,
+        )
+
+        assert second.apply_run_id is not None
+        applied = {
+            (row.planned.child_id, row.planned.action)
+            for row in ledger.applied_actions(second.apply_run_id)
+        }
+        assert applied == STAGED_HEALS
+        assert all(
+            row.state is ActionState.WITHHELD_UNCALIBRATED
+            for row in ledger.run_actions(first.plan_run_id)
+        )
+        records = {r.child_id: r for r in ledger.run_records(second.plan_run_id)}
+        assert records[MISFILED].prompt_sha256 == SECOND_PROMPT_SHA256
+        assert records[MISFILED].disposition is Disposition.STAGED
+        assert records[MISFILED].action_state is ActionState.APPLIED
 
     @pytest.mark.asyncio
     async def test_staged_heals_apply_once_their_own_adjudicator_passes(

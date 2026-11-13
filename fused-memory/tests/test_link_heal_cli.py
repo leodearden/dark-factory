@@ -41,7 +41,6 @@ from _link_heal_harness import (
     build_harness,
 )
 from escalation.queue import EscalationQueue
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
 from fused_memory.maintenance.link_heal import RunCounts, Verdict
@@ -72,10 +71,7 @@ from fused_memory.maintenance.link_heal_store import (
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'link_heal.py'
-REPO_ROOT = SCRIPT_PATH.parents[2]
 
 cli = load_script_module(SCRIPT_PATH, mod_name='link_heal_cli')
 
@@ -628,7 +624,7 @@ class TestTheUndoCommandOperatorsAreShown:
     def test_it_names_this_script_from_the_repo_root(self):
         script, *_arguments = shlex.split(undo_command(self.RUN_ID))
 
-        assert (REPO_ROOT / script).resolve() == SCRIPT_PATH.resolve()
+        assert Path(script).parts == SCRIPT_PATH.resolve().parts[-3:]
 
     def test_this_script_parses_it_as_an_undo_of_that_run(self):
         _script, *arguments = shlex.split(undo_command(self.RUN_ID))

@@ -3313,7 +3313,11 @@ check.
   every sweep heal whose verdict came from an adjudicator without a passing
   calibration is withheld, not written. That includes a heal staged before a
   model or brief change. Each one is recorded as `withheld_uncalibrated`, and the
-  report's Writes line counts them.
+  report's Writes line counts them. A writing sweep withholds them before it
+  stages its own heals, so a link its window re-examines under a newly
+  calibrated adjudicator is staged afresh and written in the same run. A link
+  outside the window is not re-examined: after a recalibration, run
+  `link_heal.py sweep --since <the oldest withheld child's created_at>`.
 - **Calibrate first, and again after any model or brief change.** From the
   main checkout (the soak data is gitignored there):
 

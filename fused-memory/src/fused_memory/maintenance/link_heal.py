@@ -659,9 +659,10 @@ class RunCounts:
     ``unexamined`` counts the examined links that reached the verdict rows with no basis.
     ``adjudications_reused`` counts the adjudicator verdicts already ledgered at the
     texts a link shows; ``adjudication_failed`` the links the adjudicator was asked
-    about and gave no verdict. ``withheld_uncalibrated`` counts the heals an apply
-    run withheld because the adjudicator behind their verdict has no passing
-    calibration: a policy refusal, not a failure, so it leaves a run complete.
+    about and gave no verdict. ``withheld_uncalibrated`` counts the heals a writing
+    sweep's plan run or an apply run withheld because the adjudicator behind their
+    verdict has no passing calibration: a policy refusal, not a failure, so it
+    leaves a run complete.
     """
 
     links_total: int = 0

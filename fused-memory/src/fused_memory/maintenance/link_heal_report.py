@@ -261,7 +261,7 @@ def _writes_line(view: SweepRunView) -> str:
     apply, withheld = view.apply, view.withheld
     if apply is not None:
         applied = f'applied: apply run `{apply.run_id}` applied {apply.counts.applied} heal(s)'
-        withheld_heals = apply.counts.withheld_uncalibrated
+        withheld_heals = sum(run.counts.withheld_uncalibrated for run in view.runs)
         if not withheld_heals:
             return applied
         return f'{applied}, withheld {withheld_heals} heal(s) whose adjudicator is uncalibrated'

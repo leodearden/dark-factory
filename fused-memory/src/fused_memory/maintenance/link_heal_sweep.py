@@ -210,6 +210,7 @@ async def run_sweep(
         enabled_actions=settings.actions,
         created_in=window,
         filer=filer if withheld is None else None,
+        withhold_uncalibrated=withheld is None,
         presence_projects=settings.presence_projects,
     )
     ledger.record_sweep_window(
