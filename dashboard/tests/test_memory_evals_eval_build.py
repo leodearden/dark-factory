@@ -162,3 +162,34 @@ class TestRowClaimsShipWithTheirRow:
             ('unknown_kind', 'eval-a'),
             ('internal_error', 'eval-a'),
         ]
+
+
+class TestIssueOrder:
+    def test_one_evals_issues_are_named_in_build_order(self, tmp_path: Path) -> None:
+        root, esc_dir = tmp_path / 'memory-evals', tmp_path / 'escalations'
+        eval_dir = root / 'eval-a'
+        eval_dir.mkdir(parents=True)
+        (eval_dir / 'metrics-20260703T031500Z.json').write_text('{"metrics": [ not json')
+        dump_artifact(eval_dir / 'metrics-20260704T031500Z.json', {
+            'run_stamp': '20260704T031500Z',
+            'metrics': [_metric('m-a'), _metric('m-a'), _metric('m-kind', kind='histogram')],
+        })
+        dump_artifact(eval_dir / 'metrics-20260705T031500Z.json', {
+            'run_stamp': 'not-a-stamp',
+            'metrics': [_metric('m-verdict')],
+        })
+        _write_verdicts(root, [
+            {'eval_id': 'eval-a', 'metric_id': 'm-verdict', 'verdict': 'bogus', 'fingerprint': 'fp-x'},
+        ])
+        esc_dir.mkdir()
+
+        payload = _build(tmp_path, root, esc_dir)
+
+        assert [i['kind'] for i in payload['issues']] == [
+            'unreadable_metrics',
+            'duplicate_metric_id',
+            'missing_limits',
+            'unparseable_run_stamp',
+            'unknown_kind',
+            'unknown_verdict',
+        ]
