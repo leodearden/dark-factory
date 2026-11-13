@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -357,10 +358,10 @@ class TestSnapshots:
         assert ledger.snapshot('reify', _live_record()) != first
 
     def test_a_snapshot_is_frozen_and_reads_its_link(self, ledger):
-        snapshot = ledger.read_snapshot(ledger.snapshot(PROJECT, _live_record()))
+        snapshot: Any = ledger.read_snapshot(ledger.snapshot(PROJECT, _live_record()))
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            snapshot.content = 'changed'  # type: ignore[misc]
+            snapshot.content = 'changed'
         assert snapshot.link_image() == LinkImage.from_metadata(SNAPSHOT_META)
 
     def test_an_unknown_snapshot_id_is_refused(self, ledger):

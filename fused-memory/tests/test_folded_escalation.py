@@ -180,7 +180,7 @@ class TestTheLinkHealCalibrationAndRunReportRoutes:
 
     @staticmethod
     def _file(tmp_path, anchor: str, summary: str, report: str) -> str | None:
-        from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+        from fused_memory.maintenance.link_heal_executor import (
             Escape,
             FoldedEscapeFiler,
         )
@@ -190,7 +190,7 @@ class TestTheLinkHealCalibrationAndRunReportRoutes:
         )
 
     def test_a_failed_calibration_files_a_blocking_risk_and_folds(self, tmp_path):
-        from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+        from fused_memory.maintenance.link_heal_executor import (
             CALIBRATION_ANCHOR,
         )
 
@@ -206,7 +206,7 @@ class TestTheLinkHealCalibrationAndRunReportRoutes:
         )
 
     def test_a_run_report_files_info_and_never_folds(self, tmp_path):
-        from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+        from fused_memory.maintenance.link_heal_executor import (
             RUN_REPORT_ANCHOR,
         )
 
@@ -228,7 +228,7 @@ class TestTheLinkHealCalibrationAndRunReportRoutes:
             )
 
     def test_the_run_report_category_is_registered(self):
-        from escalation.categories import require_registered_category  # noqa: PLC0415
+        from escalation.categories import require_registered_category
 
         require_registered_category('link_heal_run_report')
 
