@@ -1,0 +1,428 @@
+prd: plans/review-all-s19-package-layering-and-private-seams-prd.md
+schema_version: 1
+signal_leaves: ["ε", "θ2", "ι", "κ2"]
+tasks:
+  - label: "α"
+    task_id: null
+    title: "Create fused_memory.recon_state and move the reconciliation event and journal stores into it"
+    note: "Closes part of fk-4fb8ffbb0141 (with β1, β2, γ, ε). Codemod (R57 class, 24 h hand-carry trigger under S19/Q-C6 (a); 158 declared files at 565d15a06f (157 at 7848173a7d); watched for lock starvation). Deps: none; α opens the plan (it shares only a test file with ζ, and test-file edges are not wired: lead ruling). Downstream: S12 α, ζ, κ1; S13 β, μ; S15 κ. Cuts journal→services.write_journal (Protocol) and audit_trail_rotation→context_assembler (constant moves down)."
+    capabilities:
+      - name: "recon-state-journal-moved"
+        binding: "anti-orphan (α) — reconciliation/journal.py present and recon_state/ absent at 1f240e6da2; the moved journal is read by services.memory_service and reconciliation.harness"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/recon_state/journal.py"]
+          expect: present
+      - name: "store-dotted-paths-gone"
+        binding: "anti-inversion (α) — 148 files name the nine store modules by their reconciliation path at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused_memory\\.reconciliation\\.(event_buffer|event_queue|journal|recon_ledger|audit_trail_rotation|coalescing|throughput|dead_letter_writer|event_journal)\\b"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "journal-imports-no-service-substrate"
+        binding: "substrate — services.write_journal::WriteJournal exists at 1f240e6da2; α replaces journal's TYPE_CHECKING import of it with a Protocol, so no check is copied"
+        verdict: PASS
+  - label: "β1"
+    task_id: null
+    title: "Move the recon self-model, pool map and backlog/bulk-reset policies into recon_state; orchestrator_detector into utils"
+    note: "Closes part of fk-4fb8ffbb0141. Codemod (R57 class, hand-carry trigger under S19/Q-C6 (a); 91 declared files at 1b106418da; harness.py and test_pid_alive_contract.py not declared: task 6615 deleted the only hit and the test). Deps: α. The edge onto task 6615 (orchestrator_detector body) is satisfied: done, f750373949."
+    capabilities:
+      - name: "self-model-moved"
+        binding: "anti-orphan (β1) — the five middleware guards import reconciliation.recon_self_model at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/recon_state/recon_self_model.py"]
+          expect: present
+      - name: "orchestrator-detector-out-of-services"
+        binding: "anti-inversion (β1) — services/orchestrator_detector.py present at 1f240e6da2 and imported by reconciliation.backlog_policy"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/services/orchestrator_detector.py"]
+          expect: absent
+      - name: "policy-dotted-paths-gone"
+        binding: "anti-inversion (β1) — 86 files name the six modules at their reconciliation path at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused_memory\\.reconciliation\\.(recon_self_model|graphiti_degradation_probe|standing_decision_constants|recon_pool_map|bulk_reset_guard|backlog_policy)\\b"
+          paths: ["fused-memory/src/"]
+          expect: absent
+  - label: "β2"
+    task_id: null
+    title: "Move task_filter, consolidation_gate and the flag/standing-decision contracts into recon_state"
+    note: "Closes part of fk-4fb8ffbb0141. Codemod (hand-carry trigger under S19/Q-C6 (a); 96 declared files at 1b106418da, the two test importers task 6621 left included). Also moves recon_prose_grammar.py, created by S13 δ1 (S19/Q-C5 (a)). Deps: β1, γ; tasks 6599, 6721, 9203, 9240, 9254 land first (S19/OQ-5 (a); 6621 is done, edge satisfied); S13 δ2 (held on S13/δ2); 9285 depends on β2 (it waits on 8528); S13 κ3 depends on β2, never the reverse."
+    capabilities:
+      - name: "task-filter-moved"
+        binding: "anti-orphan (β2) — services.completion_claim_gate and middleware.dependency_direction_check import reconciliation.task_filter at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/recon_state/task_filter.py"]
+          expect: present
+      - name: "contract-dotted-paths-gone"
+        binding: "anti-inversion (β2) — 81 files name the five modules at their reconciliation path at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused_memory\\.reconciliation\\.(task_filter|consolidation_gate|flag_record_contract|stale_gate_citation_guard|standing_decision_writer)\\b"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "middleware-imports-no-reconciliation"
+        binding: "anti-inversion (β2, the last of α β1 γ β2 to land) — middleware imports reconciliation in 16 statements at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^[[:space:]]*(from|import) fused_memory\\.reconciliation"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: absent
+      - name: "program-edits-carried"
+        binding: "ordering (β2) — the five pending program tasks editing these bodies and S13 δ2 (the recon prose-grammar split) land first (S19/OQ-5 (a), S19/Q-C5 (a)); a reviewer confirms each is done or that the lead reversed its edge before β2 dispatches"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "reviewer confirms tasks 6599, 6721, 9203, 9240, 9254 and S13 δ2 are done (or re-ordered by the lead under S19/OQ-5 or S19/Q-C5) and that the move carried their code, recon_prose_grammar.py included; 6621 was done on 2026-11-12"
+  - label: "γ"
+    task_id: null
+    title: "A low fused_memory.escalators package for the write-path escalation filers; cut the remaining middleware and backends upward edges"
+    note: "Closes part of fk-4fb8ffbb0141 (contract C10). 69 declared files at 565d15a06f. Five filers move to escalators (S19/OQ-4 (b)); dead_letter_escalator moves to services, because since task 9143 it imports services.durable_queue and services.queued_writes at module level (D5). Deps: β1; tasks 6622, 6633, 9204, 9147 land first (S19/OQ-5 (a)); 9143 is done, edge satisfied."
+    capabilities:
+      - name: "escalators-package-exists"
+        binding: "anti-orphan (γ) — 11 modules import middleware._folded_escalation at 1b106418da; escalators/ absent"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/escalators/folded_escalation.py"]
+          expect: present
+      - name: "services-and-backends-import-no-middleware"
+        binding: "anti-inversion (γ) — services import middleware in 11 statements and backends in 2 (13) at 1b106418da, unchanged since 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^[[:space:]]*(from|import) fused_memory\\.middleware"
+          paths: ["fused-memory/src/fused_memory/services/", "fused-memory/src/fused_memory/backends/"]
+          expect: absent
+  - label: "δ"
+    task_id: null
+    title: "Demote server/: grouped-read assembly, consolidation and mem0-update authz into services"
+    note: "Closes fk-420bc8f9a425 (vocabulary half delivered by S14 ν task 6720; the deferred prompts→server.recon_report edge is cut by S12 ι1, S19/Q-C4 (a); the storm_counter shim arm is fixed:0f86a2cdcc by task 6547). Subsumes task 5983. 66 declared files at 1b106418da. Deps: β2 (shared server and recon files), task 6720; tasks 9243, 6721 (S19/OQ-5 (a)); S12 ι1 conditionally (held on S12/ι1, only if ι1 keeps its server/grouped_read.py re-bind, which δ then carries)."
+    capabilities:
+      - name: "storm-counter-shim-gone-substrate"
+        binding: "substrate — server/storm_counter.py was deleted by task 6547 (0f86a2cdcc, merged d614ee408b) and is absent at 1b106418da; δ no longer deletes it, so no check is copied"
+        verdict: PASS
+      - name: "grouped-read-in-services"
+        binding: "anti-orphan (δ) — server/grouped_read.py imported by server.tools, write_triage and write_triage_judge at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/services/grouped_read.py"]
+          expect: present
+      - name: "moved-server-modules-unimported"
+        binding: "anti-inversion (δ) — 13 import statements in 9 files across fused-memory/src name server.grouped_read, server.consolidation or server.mem0_update_authz at 1b106418da (the deferred server.recon_report edge is S12 ι1's under S19/Q-C4 (a), so it is not in this check)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^[[:space:]]*(from|import) fused_memory\\.server\\.(grouped_read|consolidation|mem0_update_authz)\\b"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "child-vocabulary-substrate"
+        binding: "substrate — S14 ν (task 6720) lands memory_metadata.child_parent_id first; δ depends on it, so no check is copied here"
+        verdict: PASS
+  - label: "ε"
+    task_id: null
+    title: "Invariant fused-memory-subpackage-dag: declared layers, the guard, and the four-site lockstep edit"
+    note: "Integration gate of the fused-memory cluster; R22 item 3. Number: the six wave-3 minting tasks take INV-18 to INV-23 in landing order (one-decision-partition-per-area last as INV-23), so ε takes one of INV-18 to INV-22; every check anchors on the slug, never the number. Promotes the snapshot's edge builder and SCC to source_measures (R17: the snapshot's typed edge list). Deps: δ; S12 ι1 (held on S12/ι1; S19/Q-C4 (a)). Invariant-file chain: wired by the lead at decompose (R51/R54); no edge onto 9154 proposed."
+    capabilities:
+      - name: "layers-declared"
+        binding: "anti-orphan (ε) — no declared order exists at 1f240e6da2; the guard reads it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^LAYERS: tuple\\[frozenset\\[str\\], \\.\\.\\.\\] = \\("
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "layering-guard-exists"
+        binding: "anti-orphan (ε) — fused-memory/tests/test_package_layering.py absent at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/test_package_layering.py"]
+          expect: present
+      - name: "snapshot-edge-builder-public"
+        binding: "anti-orphan (ε) — the snapshot resolves import targets in scripts/quality_metrics_snapshot.py::_targets and finds cycles in ::_cycles, private, at 97be1d71fa; the guard and the snapshot both consume the public pair"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def (import_targets|strongly_connected_components)\\("
+          paths: ["scripts/source_measures.py"]
+          expect: present
+      - name: "invariant-registered"
+        binding: "anti-orphan (ε) — the slug is absent from docs/legibility/design-invariants.md at 1f240e6da2 (INV-14 is the highest)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^## INV-[0-9]+ `fused-memory-subpackage-dag`"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+  - label: "ζ"
+    task_id: null
+    title: "shared.sandbox: landlock, bwrap and backend resolution in one stdlib-only package"
+    note: "Closes fk-64e06774ee0e (contract C4). Deps: none. α, θ1 and ι share only test files with ζ and take no edge on it (lead ruling on test-file edges). Tasks 5345, 4444 and 9232 depend on ζ (lead actions; 5345 folds into 4444 after ζ). Moves test_landlock.py and test_sandbox.py (to test_bwrap.py) into shared/tests."
+    capabilities:
+      - name: "fm-imports-no-orchestrator"
+        binding: "anti-inversion (ζ) — sandbox_guard.py::resolve_recon_sandbox_wrap makes the only two fused_memory→orchestrator imports at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^[[:space:]]*from orchestrator\\."
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "shared-resolution-exists"
+        binding: "anti-orphan (ζ) — resolution lives only in orchestrator.agents.sandbox_dispatch at 1f240e6da2; sandbox_dispatch and sandbox_guard both consume the shared one"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def resolve_available_backend\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "orchestrator-landlock-moved"
+        binding: "anti-inversion (ζ) — orchestrator/agents/landlock.py present at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/agents/landlock.py"]
+          expect: absent
+  - label: "η1"
+    task_id: null
+    title: "Split session_registry.py in place, step 1: session records and identity modules"
+    note: "Closes part of fk-cfcf00669c46 (with η2 and task 6179). Subsumes 9100 and, with η2, 6955. Deps: task 6179 (the edge onto 6615 is satisfied: done, f750373949). 24 h hand-carry trigger (59 files) under S19/Q-C6 (a)."
+    capabilities:
+      - name: "session-record-class-out-of-cli-module"
+        binding: "anti-inversion (η1) — session_registry.py::SessionRecord defined in the 6,724-line CLI module at 1f240e6da2; the check holds after θ1's move too"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class SessionRecord\\b"
+          paths: ["orchestrator/src/orchestrator/session_registry.py"]
+          expect: absent
+      - name: "run-by-path-substrate"
+        binding: "substrate — session_registry.py appends this checkout's shared/src at import and is run by absolute path from spawn-claude.sh, 4 SKILL.md files and OPERATIONS.md (1f240e6da2); the command lines do not change"
+        verdict: PASS
+  - label: "η2"
+    task_id: null
+    title: "Split session_registry.py in place, step 2: leases, reaper and one window-helper module; the hook window probe as a seam"
+    note: "Closes fk-cfcf00669c46 (with η1) and the orchestrator half of fk-57599c7fd907; closes fk-ea4463b19d86 (its /proc half fixed by 702445cca6; the residual is the 8 _resolve_wm_window_id patches). Deps: η1. Task 7902 depends on η2 (lead action). The window sweep moves to session_reaper."
+    capabilities:
+      - name: "wmctrl-private-copies-gone"
+        binding: "anti-inversion (η2) — _wmctrl_list defined twice (session_hooks, session_registry) and _normalize_wm_window_id once at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def (_wmctrl_list|_normalize_wm_window_id|_canonical_window_id)\\("
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "leases-out-of-cli-module"
+        binding: "anti-inversion (η2) — session_registry.py::claim_lease defined in the CLI module at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def claim_lease\\("
+          paths: ["orchestrator/src/orchestrator/session_registry.py"]
+          expect: absent
+      - name: "window-probe-patches-gone"
+        binding: "anti-inversion (η2) — 8 monkeypatches of session_hooks._resolve_wm_window_id in orchestrator/tests at 1f240e6da2; the term appears in 3 test files (display 27, ownership 2, launch_window 1, a comment) at 97be1d71fa, all declared by η2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_resolve_wm_window_id"
+          paths: ["orchestrator/"]
+          expect: absent
+  - label: "θ1"
+    task_id: null
+    title: "Move the stdlib-only session modules to shared.session; repoint every consumer"
+    note: "Closes part of fk-d91317f88f21 (contract C5). Codemod (R57 class, hand-carry trigger under S19/Q-C6 (a); 105 declared files, docs/session-hook-ownership.md included). Also moves shared/session_liveness.py to shared/session/liveness.py. Deps: η2; task 6760 (S25 ε)."
+    capabilities:
+      - name: "shared-session-records"
+        binding: "anti-orphan (θ1) — shared/src/shared/session/ absent at 1f240e6da2; cockpit, scripts and orchestrator consume it"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/session/records.py"]
+          expect: present
+      - name: "cockpit-imports-no-orchestrator"
+        binding: "anti-inversion (θ1) — 19 import statements in 17 cockpit src and test files import an orchestrator module at 1b106418da; after 6179, η1 and η2 they name the new orchestrator session modules, so the check names any orchestrator module"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^[[:space:]]*(from|import) orchestrator\\b"
+          paths: ["cockpit/"]
+          expect: absent
+  - label: "θ0"
+    task_id: null
+    title: "Create shared.escalation_layout: the archive layout constants and the terminal status names"
+    note: "Contributes to fk-e8c835c3f412 (θ2 closes it). complexity simple, priority low, 3 declared files. Deps: none. θ2 and S2 α (the typed-escalation-facts plan's vocabulary leaf) depend on θ0 (S19/Q-C8 (a)). No importer is repointed here."
+    capabilities:
+      - name: "escalation-layout-module-exists"
+        binding: "anti-orphan (θ0) — shared/src/shared/escalation_layout.py absent at 1b106418da; θ2 (decision registry, escalation.archive, the ladder) and S2 α consume it"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/escalation_layout.py"]
+          expect: present
+  - label: "θ2"
+    task_id: null
+    title: "cockpit depends on shared only; one encode_cwd, one window-id parse and one escalation archive layout"
+    note: "Integration gate of the session cluster. Closes fk-d91317f88f21, the cockpit half of fk-57599c7fd907 and fk-e8c835c3f412 under S19/OQ-3 (a), ruled by Leo (its one disposition; the ω acceptance carries no key and names gate λ). Subsumes task 6603. 31 declared files at 1b106418da: the 11 readers of the layout through escalation.archive are repointed, so archive is not a re-export, and the settle check's hand copy goes. Deps: θ1; θ0; task 9177."
+    capabilities:
+      - name: "cockpit-orchestrator-dependency-dropped"
+        binding: "anti-inversion (θ2) — cockpit/pyproject.toml declares the orchestrator member as a runtime dependency at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\"orchestrator\""
+          paths: ["cockpit/pyproject.toml"]
+          expect: absent
+      - name: "encode-cwd-copies-gone"
+        binding: "anti-inversion (θ2) — scripts/legibility/inventory.py::encode_cwd and digest.py::_encode_cwd copy session_registry.encode_cwd at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def _?encode_cwd\\("
+          paths: ["scripts/legibility/"]
+          expect: absent
+      - name: "cockpit-window-parse-copy-gone"
+        binding: "anti-inversion (θ2) — cockpit/backends/wm.py::_window_id_int mirrors the canonicaliser at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def _window_id_int\\("
+          paths: ["cockpit/src/"]
+          expect: absent
+      - name: "archive-layout-mirror-gone"
+        binding: "anti-inversion (θ2), S19/OQ-3 (a) — at 1b106418da the archive subdir is spelled in four places: escalation/archive.py::ARCHIVE_SUBDIR, session_registry.py::ESCALATION_ARCHIVE_SUBDIR (read by scripts/backfill_decision_queue_stamp.py), scripts/escalation_ladder.py::ARCHIVE_SUBDIR and scripts/check_l0_settle_outcomes.py::ARCHIVE_SUBDIR with ARCHIVE_DAY_FORMAT (two Mirrors copies); after θ2 only shared/escalation_layout.py defines them"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ESCALATION_ARCHIVE_SUBDIR|^ARCHIVE_SUBDIR[:= ]|^ARCHIVE_DAY_FORMAT[:= ]"
+          paths: ["orchestrator/src/", "shared/src/shared/session/", "scripts/", "escalation/src/"]
+          expect: absent
+  - label: "λ"
+    task_id: null
+    title: "Operator gate: explore, assess and discuss moving cockpit decision closing into the escalation package, after the review-all capstone"
+    note: "Leo's addition to S19-2 (2026-11-12). Deterministic pure gate: task_kind=deterministic, always_escalates=true, no before_done, metadata.milestone delayed after_secs 604800 (the lead may shorten it). Priority medium; source review-all; x_finding_run review-all-dark_factory-20261008; no finding key and no files. Deps: gate task 6698 (ruled_by: lead) and θ2. Its description is the session brief: options B and D, the facts measured 2026-11-12, the three questions; output a ruling, and a /prd if B or D is chosen."
+    capabilities:
+      - name: "capstone-gate-substrate"
+        binding: "substrate — gate task 6698 ('Run /review-all on dark_factory') is pending on 2026-11-12, a deterministic human gate with a delayed milestone; λ depends on it, so no check is copied"
+        verdict: PASS
+      - name: "layout-home-first"
+        binding: "producer = θ2 (shared.escalation_layout.locate_record; the decision registry repointed) upstream — the dependency edge is the gate"
+        verdict: PASS
+      - name: "session-ruling-recorded"
+        binding: "the session answers the brief's three questions with Leo; the gate's escalation is resolved with a ruling, and a /prd path if B or D is chosen; the resume marks λ done"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a human design sitting; closed by resume with done_provenance deterministic-gate citing the escalation"
+  - label: "ν"
+    task_id: null
+    title: "process_identity asks the portable liveness check whether a pid exists; its zombie arm goes"
+    note: "Contributes to fk-e22732500172 (filed:6615 + ν). Leo 2026-11-13: zombie detection negligible until evidence to the contrary; the portable check (shared.proc_liveness.pid_alive) is used throughout. complexity simple, priority medium, 2 declared files. Deps: none. Task 6918 is amended to drop its exited-state half (lead action)."
+    capabilities:
+      - name: "zombie-arm-gone"
+        binding: "anti-inversion (ν) — shared/process_identity.py::_running_stat reads a /proc state of Z or X as death through _EXITED_STATES at 565d15a06f"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_EXITED_STATES"
+          paths: ["shared/src/shared/process_identity.py"]
+          expect: absent
+      - name: "identity-asks-pid-alive"
+        binding: "anti-orphan (ν) — process_identity imports nothing from shared.proc_liveness at 565d15a06f; capture and liveness answer existence through pid_alive after ν"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from shared\\.proc_liveness import pid_alive"
+          paths: ["shared/src/shared/process_identity.py"]
+          expect: present
+  - label: "ι"
+    task_id: null
+    title: "A public CLI runner in shared.cli_invoke; invoke.py drops its four private imports and its second runner"
+    note: "Closes fk-ad5323d27142 (contract C7). 20 declared files at 565d15a06f (the ZCode backend module and test of task 5399 and the MiMo backend module and test of task 7993 included). Deps: none (only test files shared with ζ). Tasks 9232, 9233 depend on ι (lead actions, under S19/Q-C2 (a)). S20 β and θ depend on ι and carry its public names (S19/Q-C2 (a)). Signal leaf of the CLI-runner cluster."
+    capabilities:
+      - name: "second-runner-deleted"
+        binding: "anti-inversion (ι) — invoke.py::_run_subprocess_local present at 1f240e6da2 (19 test patch sites)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_run_subprocess_local"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "public-runner-exists"
+        binding: "anti-orphan (ι) — shared.cli_invoke exposes only the private _run_subprocess at 1b106418da; invoke's six backends (claude, codex, gemini, pi, zcode, mimo) consume the public runner"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def run_cli_subprocess\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "no-private-cli-invoke-import"
+        binding: "anti-inversion (ι) — invoke.py imports _materialize_stdin, _parse_claude_output, _run_subprocess and _SubprocessResult under noqa F401, and zcode_backend.py and mimo_backend.py import _SubprocessResult, at 565d15a06f"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\b_(materialize_stdin|parse_claude_output|run_subprocess|SubprocessResult)\\b"
+          paths: ["orchestrator/src/orchestrator/agents/invoke.py", "orchestrator/src/orchestrator/agents/zcode_backend.py", "orchestrator/src/orchestrator/agents/mimo_backend.py"]
+          expect: absent
+  - label: "κ1"
+    task_id: null
+    title: "Dashboard MCP egress module below memory and mcp_fanout; the import cycle cut"
+    note: "Closes fk-99f44f47a6cc (contract C8, today's mcp_tool_call signature; today's two eviction rules, D13). 58 declared files. Deps: task 6722 (S14 κ). S22 γ1, γ2, δ1 depend on κ1 (S19/Q-C3 (a))."
+    capabilities:
+      - name: "mcp-client-module-exists"
+        binding: "anti-orphan (κ1) — dashboard/data/mcp_client.py absent at 1b106418da; seven data modules and app.py consume it"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["dashboard/src/dashboard/data/mcp_client.py"]
+          expect: present
+      - name: "fanout-reach-back-gone"
+        binding: "anti-inversion (κ1) — mcp_fanout.first_success imports invalidate_session from data.memory inside the function at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from dashboard\\.data\\.memory import invalidate_session"
+          paths: ["dashboard/src/"]
+          expect: absent
+      - name: "egress-not-in-memory"
+        binding: "anti-inversion (κ1) — memory.py defines mcp_tool_call at 1b106418da; seven modules import it from there (metrics.py through a multi-line import) and app.py calls memory_data.mcp_tool_call, which an import-line pattern cannot see"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def mcp_tool_call\\("
+          paths: ["dashboard/src/dashboard/data/memory.py"]
+          expect: absent
+  - label: "κ2"
+    task_id: null
+    title: "Dashboard cross-module underscore names become public; the vestigial-underscore paragraphs go"
+    note: "Closes fk-3ddc73250c64. Deps: κ1; task 6722; task 6879 (makes _LOCK_ACQUIRE_TIMEOUT_SECONDS public first). Signal leaf of the dashboard cluster. S22 δ1, ν, λ depend on κ2 (S19/Q-C3 (a))."
+    capabilities:
+      - name: "vestigial-paragraphs-gone"
+        binding: "anti-inversion (κ2) — three docstrings (project_dbs.py, loops.py, api/window.py) tell readers the underscore is vestigial at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "vestigial"
+          paths: ["dashboard/src/"]
+          expect: absent
+      - name: "project-dbs-interface-public"
+        binding: "anti-inversion (κ2) — project_dbs.py's whole interface is underscore-named (_project_scoped_dbs and four more) at 1f240e6da2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def _(project_scoped_dbs|project_scoped_dbs_labeled|cost_dbs|cost_sources|burndown_dbs)\\("
+          paths: ["dashboard/src/dashboard/project_dbs.py"]
+          expect: absent

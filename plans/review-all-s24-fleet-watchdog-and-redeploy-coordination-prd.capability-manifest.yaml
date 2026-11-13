@@ -1,0 +1,724 @@
+prd: plans/review-all-s24-fleet-watchdog-and-redeploy-coordination-prd.md
+schema_version: 1
+signal_leaves: ["ω", "γ", "η"]
+tasks:
+  - label: "α"
+    task_id: null
+    title: "Fleet state paths and lease ages get one home, shared/fleet_coordination.py (C1), and every Python reader uses it"
+    note: "Closes fk-63633270af4e (weakened; re-verified present at 1f240e6da2: lease path 4 copies, deploy clock 4, heartbeat dir 4, lease max-age 3). Priority low; prerequisite of every high leaf (inversion recorded, no override). 8295 is ordered after α (lead action). resolve_fleet_dir stays as a delegate; DEFAULT_FLEET_DIR goes. service_restart.py's two relpaths and the bash script's three defaults stay until γ, pinned to C1 by one interim test in tests/scripts/test_orchestrator_watchdog.py."
+    capabilities:
+      - name: "fleet-coordination-leaf-exists"
+        binding: "capability→producer (α) — C1, shared/src/shared/fleet_coordination.py, absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/fleet_coordination.py"]
+          expect: present
+      - name: "supervision-state-files-tabulated"
+        binding: "capability→producer (α) — C1 SUPERVISION_STATE gives each watchdog tier's state file a FleetFile (env override + df_pytest_isolation redirect); absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SUPERVISION_STATE"
+          paths: ["shared/src/shared/fleet_coordination.py"]
+          expect: present
+      - name: "watchdog-fleet-path-literals-gone"
+        binding: "anti-inversion (α) — the watchdog spells the three fleet JSON names inside os.path.join at a85cb1ad78 (FLEET_DEPLOY_CLOCK_PATH, FLEET_LEASE_PATH, FM_DEPLOY_CLOCK_PATH)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\"(last_redeploy_orchestrator|fleet_redeploy_lease|last_redeploy_fused_memory)\\.json\""
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: absent
+      - name: "isolation-fleet-literals-gone"
+        binding: "anti-inversion (α) — df_pytest_isolation.py assigns FLEET_DEPLOY_CLOCK_RELPATH, FM_DEPLOY_CLOCK_RELPATH, FLEET_LEASE_RELPATH and LIVE_FLEET_DIR as literals at a85cb1ad78; after α they derive from C1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^(FLEET_DEPLOY_CLOCK_RELPATH|FM_DEPLOY_CLOCK_RELPATH|FLEET_LEASE_RELPATH) = '|^LIVE_FLEET_DIR = Path\\("
+          paths: ["df_pytest_isolation.py"]
+          expect: absent
+      - name: "fleet-dir-default-single-home"
+        binding: "anti-inversion (α) — DEFAULT_FLEET_DIR assigned in scripts/drain_check.py and orchestrator/fleet_heartbeat.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^DEFAULT_FLEET_DIR = "
+          paths: ["scripts/drain_check.py", "orchestrator/src/orchestrator/fleet_heartbeat.py"]
+          expect: absent
+      - name: "four-way-drift-pins-collapsed"
+        binding: "anti-inversion (α) — tests/scripts/test_orchestrator_watchdog.py holds the three across-tiers pins at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_fleet_(lease_path|deploy_clock_path|dir_default)_matches_across_tiers"
+          paths: ["tests/scripts/"]
+          expect: absent
+      - name: "checkout-bootstrap-substrate"
+        binding: "substrate — passes today: scripts/_checkout.py (S25 C1, task 6758 done) binds shared/src for /usr/bin/python3; measured: a stdlib shared leaf imports through it with no third-party module loaded"
+        verdict: PASS
+      - name: "escalation-stub-resolves-shared-submodules-substrate"
+        binding: "substrate — passes today: escalation/tests/conftest.py installs its shared stub (with __path__ = shared/src/shared) before importing df_pytest_isolation; measured with the stub reproduced: shared.project_layout and shared.proc_group import"
+        verdict: PASS
+  - label: "γ"
+    task_id: null
+    title: "Redeploy lease keyed by tier and acquired under flock; a second concurrent sweep is refused at the writer (C2)"
+    note: "Closes fk-4c21aaf01b82. Subsumes tasks 5719 (fm-tier lease) and 9389 (a --rebind-socket refusal after SIGUSR1 that leaves reconciliation drained). Deps: α, 9140 (R54: S6 α first on config.py, harness.py and OPERATIONS.md), 6615 (done, merged 2026-11-11 f750373949; satisfied). Ruled: lead OQ-8 D (each restart script holds a kernel flock on its tier's sweep lock for its whole life; readers test the same lock; OVERRUN only pages) and lead OQ-9 B (--lease-wait). restart-fused-memory.sh publishes fused-memory.service as its current unit only for the restart step (at most 120 s), never for the drain wait, and loses refuse_while_staleness_redeploy_runs to the lock. Ordered before ζ, 7307, 7314 (lead OQ-6 A), 9263 (S5 ε) and S16 ζ1 (lead OQ-7 A). Deletes the config field orchestrator_restart_lease_max_age_secs (S16-m14). Band exception: 19 files. Transition: legacy single-tier body read as the fleet entry until ω."
+    capabilities:
+      - name: "sweep-acquires-lease-through-leaf"
+        binding: "capability→producer (γ) — restart-all-orchestrators.sh calls the C2 CLI; absent at a85cb1ad78 (lease_acquire stamps unconditionally)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lease acquire --tier orchestrator-fleet"
+          paths: ["scripts/restart-all-orchestrators.sh"]
+          expect: present
+      - name: "fm-restart-acquires-lease-through-leaf"
+        binding: "capability→producer (γ) — restart-fused-memory.sh acquires the fused-memory tier; it has no lease at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lease acquire --tier fused-memory"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: present
+      - name: "fm-restart-publishes-its-unit"
+        binding: "capability→producer (γ) — restart-fused-memory.sh names fused-memory.service as its lease's current unit just before its restart step, so C4's current-units gate skips fm only for that step; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lease set-units --tier fused-memory"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: present
+      - name: "fm-restart-staleness-probe-replaced-by-lock"
+        binding: "anti-inversion (γ) — restart-fused-memory.sh::refuse_while_staleness_redeploy_runs (task 8129; the probe task 9389 reports) present at a85cb1ad78; the fused-memory sweep lock, taken before any SIGUSR1, replaces it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "refuse_while_staleness_redeploy_runs"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: absent
+      - name: "sweep-cli-failure-exits-70"
+        binding: "capability→producer (γ) — restart-all-orchestrators.sh exits 70 on a lease/path CLI infrastructure failure (decision 2); it exits only 0, 1, 130 and 143 at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "exit 70"
+          paths: ["scripts/restart-all-orchestrators.sh"]
+          expect: present
+      - name: "fm-restart-cli-failure-exits-70"
+        binding: "capability→producer (γ) — restart-fused-memory.sh exits 70 on a lease CLI infrastructure failure; at a85cb1ad78 it exits only 0, 1 (health), 2 (usage), 3 (--rebind-socket refusal, task 8129) and the exposure check's status"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "exit 70"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: present
+      - name: "sweep-holds-kernel-lock"
+        binding: "capability→producer (γ) — restart-all-orchestrators.sh holds an exclusive flock on the orchestrator-fleet sweep lock for its whole life (lead OQ-8 D); the script has no flock at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "flock -w"
+          paths: ["scripts/restart-all-orchestrators.sh"]
+          expect: present
+      - name: "fm-restart-holds-kernel-lock"
+        binding: "capability→producer (γ) — restart-fused-memory.sh holds an exclusive flock on the fused-memory sweep lock for its whole life (lead OQ-8 D); the script has no flock at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "flock -w"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: present
+      - name: "sweep-accepts-lease-wait"
+        binding: "capability→producer (γ) — restart-all-orchestrators.sh's argument parser accepts --lease-wait SECS (lead OQ-9 B); today it rejects any extra argument ('ERROR: unexpected argument'), measured at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "--lease-wait"
+          paths: ["scripts/restart-all-orchestrators.sh"]
+          expect: present
+      - name: "fm-restart-accepts-lease-wait"
+        binding: "capability→producer (γ) — restart-fused-memory.sh's two-axis parser (task 8129) accepts --lease-wait SECS (lead OQ-9 B); today it accepts only --now, --drain and --rebind-socket, measured at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "--lease-wait"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: present
+      - name: "bash-fleet-defaults-read-from-leaf"
+        binding: "anti-inversion (γ) — restart-all-orchestrators.sh hard-codes the FLEET_DIR, CLOCK_FILE and LEASE_FILE defaults at a85cb1ad78; after γ it asks python3 -m shared.fleet_coordination path"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ORCH_FLEET_DIR:-/home|ORCH_FLEET_DEPLOY_CLOCK:-\\$REPO_DIR|ORCH_FLEET_LEASE:-\\$REPO_DIR"
+          paths: ["scripts/restart-all-orchestrators.sh"]
+          expect: absent
+      - name: "lease-exclusion-under-flock"
+        binding: "capability→producer (γ) — C2 acquire/set_current_units/release hold fcntl.flock on <lease>.lock; no flock anywhere in the fleet at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fcntl\\.flock"
+          paths: ["shared/src/shared/fleet_coordination.py"]
+          expect: present
+      - name: "unconditional-lease-writer-gone"
+        binding: "anti-inversion (γ) — restart-all-orchestrators.sh::lease_set_current_unit's mktemp + mv -f writer present at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fleet_redeploy_lease\\.XXXXXX"
+          paths: ["scripts/restart-all-orchestrators.sh"]
+          expect: absent
+      - name: "service-restart-fleet-literals-gone"
+        binding: "anti-inversion (γ) — service_restart.py assigns FLEET_LEASE_RELPATH, FLEET_DEPLOY_CLOCK_RELPATH and DEFAULT_FLEET_LEASE_MAX_AGE_SECS at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^(FLEET_LEASE_RELPATH|FLEET_DEPLOY_CLOCK_RELPATH|DEFAULT_FLEET_LEASE_MAX_AGE_SECS) = "
+          paths: ["orchestrator/src/orchestrator/service_restart.py"]
+          expect: absent
+      - name: "service-restart-lease-predicate-gone"
+        binding: "anti-inversion (γ) — service_restart.py::lease_is_live (its own lease reader and pid predicate) present at a85cb1ad78; after γ the coordinator reads C2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def lease_is_live\\("
+          paths: ["orchestrator/src/orchestrator/service_restart.py"]
+          expect: absent
+      - name: "lease-max-age-config-field-gone"
+        binding: "anti-inversion (γ) — OrchestratorConfig.orchestrator_restart_lease_max_age_secs and harness.py's two reads of it present at a85cb1ad78; after γ the coordinator and DrainIdentity read C1's lease_max_age_secs"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "orchestrator_restart_lease_max_age_secs"
+          paths: ["orchestrator/src/orchestrator/config.py", "orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "watchdog-pid-copy-gone"
+        binding: "anti-inversion (γ) — scripts/orchestrator-watchdog.py::_pid_alive present at a85cb1ad78, a declared copy since task 6615, pinned by tests/scripts/test_watchdog_pid_alive_parity.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def _pid_alive\\("
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: absent
+      - name: "proc-liveness-predicate-substrate"
+        binding: "substrate — passes today: task 6615 (done, merged 2026-11-11 f750373949) landed shared/src/shared/proc_liveness.py::pid_alive, public, stdlib-only (imports os), never raises, rejects non-int, bool and pid <= 0 before os.kill; service_restart.py already imports it at a85cb1ad78"
+        verdict: PASS
+      - name: "second-sweep-refused-live"
+        binding: "INV-1 producer proof — on the host, during a live --drain sweep, the orchestrator-fleet sweep lock is held, and --report's orchestrator-fleet FLEET-LEASE line shows the holder"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "during a live sweep, a reviewer runs `flock -n \"$(python3 -m shared.fleet_coordination path sweep-lock --tier orchestrator-fleet)\" true` and confirms exit 1 (the kernel lock is held), then reads the holder on the FLEET-LEASE line in --report; a concurrent live sweep is not a tree property"
+  - label: "β"
+    task_id: null
+    title: "scripts/_systemd.py: one host reader for both watchdogs (C3); the dashboard watchdog's copies and the four hand parsers go"
+    note: "Closes the parser, same-named-def and stale-prose measurements of fk-906957d2ec84 (δ3 closes the key). Subsumes tasks 5700 and 4253. Deps: ζ (same file), task 8270 (done, merged 7ddc80450e; satisfied). Burns down the _unit_start_elapsed_secs silent-fallthrough entry and decrements the governed list's default_covers, 12 at a85cb1ad78 (7139 amended)."
+    capabilities:
+      - name: "host-reader-exists"
+        binding: "capability→producer (β) — C3, scripts/_systemd.py, absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/_systemd.py"]
+          expect: present
+      - name: "hand-show-parsers-gone"
+        binding: "anti-inversion (β) — 5 split(\"=\", 1) systemctl-show parsers at a85cb1ad78 (4 in orchestrator-watchdog.py, 8270's _unit_restart_status among them, 1 in dashboard-watchdog.py); the pattern matches either quote style"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "split\\([\"']=[\"'], ?1\\)"
+          paths: ["scripts/orchestrator-watchdog.py", "scripts/dashboard-watchdog.py"]
+          expect: absent
+      - name: "dashboard-copies-gone"
+        binding: "anti-inversion (β) — dashboard-watchdog.py defines log, _JournalLog, restart_unit and _unit_active_enter_epoch at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def (log|restart_unit|_unit_active_enter_epoch)\\(|^class _JournalLog"
+          paths: ["scripts/dashboard-watchdog.py"]
+          expect: absent
+      - name: "watchdog-journal-copy-gone"
+        binding: "anti-inversion (β) — orchestrator-watchdog.py defines log and _JournalLog at a85cb1ad78; both become _systemd.JournalLog"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def log\\(|^class _JournalLog"
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: absent
+      - name: "stale-three-phase-prose-gone"
+        binding: "anti-inversion (β) — dashboard-watchdog.py::restart_unit still describes a stop phase retired by b481d598aa at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "three-phase"
+          paths: ["scripts/dashboard-watchdog.py"]
+          expect: absent
+      - name: "allowlist-entry-retired"
+        binding: "anti-inversion (β) — shared/tests/silent_fallthrough_allowlist.py carries the orchestrator-watchdog _unit_start_elapsed_secs entry at a85cb1ad78; C3 logs the failure instead"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\"_unit_start_elapsed_secs\""
+          paths: ["shared/tests/silent_fallthrough_allowlist.py"]
+          expect: absent
+  - label: "δ1"
+    task_id: null
+    title: "Supervision engine with one liveness and one staleness pass (C4); the fused-memory tier moves onto it"
+    note: "Fm halves of fk-906957d2ec84 and fk-3830e2a6de79. Deps: β, η (OPERATIONS.md; η follows ι). The fm row's watched paths are WATCH_CLOSURE[FUSED_MEMORY] (landed in ζ). Edits test_watchdog_dashboard_parity.py for its three _print_fused_memory_liveness patches. Band exception: 132 fm-only tests (2,599 lines) rewritten or retired, measured at ba17934861."
+    capabilities:
+      - name: "engine-exists"
+        binding: "capability→producer (δ1) — C4, scripts/_supervision.py, absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/_supervision.py"]
+          expect: present
+      - name: "fake-host-exists"
+        binding: "capability→producer (δ1) — the test double the passes are driven through (tests stance), absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["tests/scripts/fake_watchdog_host.py"]
+          expect: present
+      - name: "fm-sibling-functions-gone"
+        binding: "anti-inversion (δ1) — the fm halves of the sibling pairs present in orchestrator-watchdog.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def (fused_memory_liveness_pass|fused_memory_staleness_pass|_delegate_fm_restart|_newest_fm_watched_commit_epoch|_within_fm_staleness_head_start|_within_fm_deploy_min_interval|_read_last_fm_deploy_epoch|_record_fm_liveness_failure)\\("
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: absent
+      - name: "fm-private-patches-gone"
+        binding: "anti-inversion (δ1) — tests patch fm private helpers on the watchdog module at a85cb1ad78 (e.g. _read_last_fm_deploy_epoch 15 sites, _print_fused_memory_liveness 7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "wdog, \"_[a-z_]*(fm|fused_memory)"
+          paths: ["tests/scripts/"]
+          expect: absent
+  - label: "δ2a"
+    task_id: null
+    title: "The orchestrator fleet's liveness runs on the engine; its unit set is derived from installed orchestrator-*.socket units and WATCHED goes"
+    note: "Closes fk-c9390bf37295; fleet-liveness halves of fk-906957d2ec84 and fk-3830e2a6de79. Deps: δ1, task 8270 (done; ported as ReviveCap + CrashLoopPolicy, the crash-loop step ahead of the grace gate; the engine reuses scripts/_watchdog_crash_loop.py::observe_unit and deletes that module's file I/O and filer). Adds the --report LIVENESS column and the socket-port ↔ escalation.port test (7517's watchdog half). Task 9321's interim WATCHED pairs, if landed, go with WATCHED. Band exception: 14 files; 39 fleet-liveness-only tests (1,022 lines, ba17934861) plus the liveness half of 51 mixed and 8270's 18 main() tests."
+    capabilities:
+      - name: "watched-list-gone"
+        binding: "anti-inversion (δ2a) — scripts/orchestrator-watchdog.py::WATCHED (7 pairs; 9 sockets installed) present at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^WATCHED = "
+          paths: ["scripts/"]
+          expect: absent
+      - name: "watched-pins-gone"
+        binding: "anti-inversion (δ2a) — test_main_targets_expected_pairs, test_watched_ports_match_configured_escalation_ports and test_orchestrator_socket_units.py's module.WATCHED present at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_main_targets_expected_pairs|def test_watched_ports_match_configured_escalation_ports|module\\.WATCHED"
+          paths: ["tests/scripts/"]
+          expect: absent
+      - name: "socket-port-matches-escalation-port-test"
+        binding: "capability→producer (δ2a) — each committed orchestrator service's socket-template ListenStream port equals the escalation.port of the yaml its ExecStart --config names; absent at a85cb1ad78 (today only the WATCHED chain checks it)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_socket_port_matches_configured_escalation_port"
+          paths: ["tests/scripts/test_orchestrator_socket_units.py"]
+          expect: present
+      - name: "report-liveness-column"
+        binding: "capability→producer (δ2a) — --report's LIVENESS column, fed by the installed-socket derivation; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "'LIVENESS'"
+          paths: ["scripts/orchestrator-watchdog.py", "scripts/_supervision.py"]
+          expect: present
+      - name: "crash-loop-io-folded-into-tier-state"
+        binding: "anti-inversion (δ2a) — scripts/_watchdog_crash_loop.py defines crash_loop_pass, load_restart_histories, save_restart_histories and file_crash_loop_escalation at a85cb1ad78 (task 8270); after δ2a the history lives in the fleet tier's TierState and the page goes through Host.file_page, while observe_unit stays"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def (crash_loop_pass|load_restart_histories|save_restart_histories|file_crash_loop_escalation)\\("
+          paths: ["scripts/_watchdog_crash_loop.py"]
+          expect: absent
+      - name: "factory-init-watched-step-gone"
+        binding: "anti-inversion (δ2a) — skills/factory-init/SKILL.md and references/supervised-unit.md tell an onboarding agent to edit WATCHED at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "WATCHED"
+          paths: ["skills/factory-init/SKILL.md", "skills/factory-init/references/supervised-unit.md"]
+          expect: absent
+      - name: "installed-sockets-on-host-substrate"
+        binding: "substrate — passes today: 9 orchestrator-*.socket units installed and enabled on the host, each with one 127.0.0.1 ListenStream (8100-8110 except 8103/8104); systemctl --user show <socket> -p Listen --value answers '127.0.0.1:<port> (Stream)'"
+        verdict: PASS
+      - name: "report-liveness-lists-every-installed-unit"
+        binding: "user-observable signal — scripts/orchestrator-watchdog.py --report's LIVENESS column shows orchestrator-scoping-intake.service and orchestrator-stream-touch.service as probed (today main()'s WATCHED loop never probes them)"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer runs --report on the host after merge and confirms the LIVENESS column shows orchestrator-scoping-intake.service and orchestrator-stream-touch.service as probed; the installed unit set is host state, not a tree property"
+  - label: "δ2b"
+    task_id: null
+    title: "The orchestrator fleet's staleness and --report run on the engine; the fleet sibling helpers and the remaining private patches go"
+    note: "Closes fk-3830e2a6de79; fleet-staleness half of fk-906957d2ec84. Deps: δ2a. The fleet row and the removal waiver read WATCH_CLOSURE[ORCHESTRATOR_FLEET] (landed in ζ). Band exception: 56 fleet-staleness/report-only tests (1,780 lines) plus the staleness half of 51 mixed, measured at ba17934861."
+    capabilities:
+      - name: "fleet-sibling-functions-gone"
+        binding: "anti-inversion (δ2b) — the fleet halves of the sibling pairs and the systemctl helpers present in orchestrator-watchdog.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def (staleness_pass|_delegate_fleet_restart|_newest_watched_commit_epoch|_read_last_fleet_deploy_epoch|_within_fleet_deploy_min_interval|_within_fleet_staleness_head_start|_unit_start_epoch|_unit_start_elapsed_secs|_enumerate_running_units)\\("
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: absent
+      - name: "private-watchdog-patches-gone"
+        binding: "anti-inversion (δ2b) — 220 wdog, \"_…\" private patch sites across the watchdog test files at a85cb1ad78 (213 + 4 + 3)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "wdog, \"_"
+          paths: ["tests/scripts/"]
+          expect: absent
+  - label: "δ3"
+    task_id: null
+    title: "The dashboard watchdog runs on the engine; its tick, state and ceiling code go"
+    note: "Closes fk-906957d2ec84 (last part: probe_health and the tick/ceiling copies). Deps: δ2b. FAIL_STREAK and MAX_RESTARTS stay spelled in dashboard-watchdog.py (a landed task's delivered check greps scripts/ for FAIL_STREAK). Keeps state.json's path and reads today's body once."
+    capabilities:
+      - name: "dashboard-tick-replaced"
+        binding: "anti-inversion (δ3) — dashboard-watchdog.py's tick, state and ceiling functions present at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def (tick|load_state|save_state|default_state|_normalise_state|_prune_restarts|file_ceiling_escalation|probe_health)\\("
+          paths: ["scripts/dashboard-watchdog.py"]
+          expect: absent
+      - name: "dashboard-renamer-allowance-retired"
+        binding: "anti-inversion (δ3) — tests/scripts/test_atomic_write_regrowth.py::_ALLOWED_RENAMERS carries ('scripts/dashboard-watchdog.py', 'save_state') at a85cb1ad78; a stale entry fails test_no_unapproved_renamers_in_source_trees"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "'scripts/dashboard-watchdog\\.py', 'save_state'"
+          paths: ["tests/scripts/test_atomic_write_regrowth.py"]
+          expect: absent
+      - name: "dashboard-fail-streak-name-kept-substrate"
+        binding: "substrate — passes today and must keep passing: FAIL_STREAK spelled in scripts/dashboard-watchdog.py"
+        verdict: PASS
+  - label: "ε"
+    task_id: null
+    title: "The watchdog restarts an orchestrator whose event loop has wedged, filing one escalation per restart, and every liveness tier escalates a revive storm (INV-4)"
+    note: "Closes fk-1cc71283157c. Deps: δ3; not ordered after task 9492 (R-3 = A). Ruled OQ-1 B by Leo (R-3 = A): HeartbeatProbe(900, 3) with its own streak, age counted from the later of ts_epoch and the instance start; at the third stale one-minute check the unit takes the dead-unit path (storm escape, 8270's 900 s revive cap, revive) and files one orchestrator-liveness-heartbeat-<unit> escalation in the revive's finally, also when the restart raises. No orchestrator unit-file change; no soak, no flip task. After a wedge revive both streaks are consumed. OQ-4 A: orchestrator stops at the ceiling, fm keeps reviving under its cap. Dead units keep Streak(1, 300). Heartbeat producer measured live on 9 of 9 units (ages 4.7-14.9 s at a85cb1ad78)."
+    capabilities:
+      - name: "heartbeat-probe-exists"
+        binding: "capability→producer (ε) — C4 HeartbeatProbe; no watchdog pass reads the fleet heartbeat at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class HeartbeatProbe"
+          paths: ["scripts/_supervision.py"]
+          expect: present
+      - name: "orchestrator-tier-storm-escape"
+        binding: "capability→producer (ε) — the fleet row's StormEscape page sentinel; orchestrator liveness has no escape at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "orchestrator-liveness-ceiling"
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: present
+      - name: "fm-tier-storm-escape"
+        binding: "capability→producer (ε) — the fm row's StormEscape page sentinel; fm liveness has a cap but no escape at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused-memory-liveness-ceiling"
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: present
+      - name: "heartbeat-page-sentinel"
+        binding: "capability→producer (ε) — the wedge-revive escalation's sentinel prefix in the fleet row; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "orchestrator-liveness-heartbeat"
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: present
+      - name: "wedge-revive-escalates-once-test"
+        binding: "capability→producer (ε) — boundary row 22: on the third stale check exactly one revive and one escalation; tests/scripts/test_supervision.py absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_third_stale_heartbeat_check_revives_once_and_escalates_once"
+          paths: ["tests/scripts/test_supervision.py"]
+          expect: present
+      - name: "wedge-escalation-survives-raising-restart-test"
+        binding: "capability→producer (ε) — boundary row 22b: a revive whose restart raises still files its escalation; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_wedge_escalation_is_filed_when_the_restart_raises"
+          paths: ["tests/scripts/test_supervision.py"]
+          expect: present
+  - label: "ζ"
+    task_id: null
+    title: "One code closure per tier feeds the watchdog and both on-merge coordinators; the fused-memory coordinator watches fused-memory's full import closure at most once per 4 hours, with a drain restart (C5)"
+    note: "Closes fk-68efae8a36fc. Subsumes task 6543. Deps: γ, 9140, 8270 (done; satisfied); third in the chain so S16 ζ1 waits only on γ and ζ (lead OQ-7 A) and carries the new field. Ruled OQ-2 B by Leo, interval R-4 = C with changes: fm coordinator default = WATCH_CLOSURE[FUSED_MEMORY]; new restart-only fused_memory_restart_min_interval_secs, default FM_ON_MERGE_MIN_INTERVAL_SECS = 14400 in shared/fleet_coordination.py (θ lowers it to 3600 after 9521); FM_ON_MERGE_CLOCK fleet file; the harness builder passes interval, clock, script_args=['--drain'] and a cgroup-escaping restart_executor (transient unit fm-on-merge-restart-<n>.service with an on-failure escalation, the orchestrator coordinator's shape); fused_memory_restart_on_merge_enabled defaults false and the dark-factory yaml sets true. Band exception: 14 files (9 tests/docs). Orchestrator-tier cadence impact measured at zero (10 of 10 72 h windows had an orchestrator-tier commit, 1f240e6da2)."
+    capabilities:
+      - name: "yaml-watch-prefix-override-gone"
+        binding: "anti-inversion (ζ) — dark-factory-orchestrator.yaml sets orchestrator_restart_watch_prefixes (5 entries, no shared/src) at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^orchestrator_restart_watch_prefixes:"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: absent
+      - name: "config-default-derives-from-closure"
+        binding: "capability→producer (ζ) — OrchestratorConfig.orchestrator_restart_watch_prefixes defaults to WATCH_CLOSURE[ORCHESTRATOR_FLEET]; default is ['orchestrator/src/'] at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "WATCH_CLOSURE"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "watchdog-path-lists-gone"
+        binding: "anti-inversion (ζ) — WATCHED_PATHS, FM_WATCHED_PATHS and MODULE_REMOVAL_WATCHED_PATHS assigned in orchestrator-watchdog.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^(WATCHED_PATHS|FM_WATCHED_PATHS|MODULE_REMOVAL_WATCHED_PATHS) = "
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: absent
+      - name: "closure-guard-generalized"
+        binding: "capability→producer (ζ) — one closure guard for both tiers; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["tests/scripts/test_watched_paths_import_closure.py"]
+          expect: present
+      - name: "fm-coordinator-closure-default"
+        binding: "anti-inversion (ζ) — OrchestratorConfig.fused_memory_restart_watch_prefixes defaults to ['fused-memory/src/'] at a85cb1ad78; after ζ it is list(WATCH_CLOSURE[Tier.FUSED_MEMORY])"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\['fused-memory/src/'\\]"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: absent
+      - name: "fm-coordinator-interval-field"
+        binding: "capability→producer (ζ) — the restart-only field fused_memory_restart_min_interval_secs; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused_memory_restart_min_interval_secs"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "fm-coordinator-interval-wired"
+        binding: "capability→producer (ζ) — Harness._build_service_restart_coordinator passes the interval (and the clock); it passes neither at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused_memory_restart_min_interval_secs"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "fm-coordinator-drain-explicit"
+        binding: "capability→producer (ζ) — the fm builder passes script_args=['--drain'] explicitly instead of inheriting the class default; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "script_args=\\['--drain'\\]"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "fm-coordinator-restart-escapes-cgroup"
+        binding: "capability→producer (ζ) — the fm builder's restart_executor registers a transient user unit fm-on-merge-restart-<n>.service through schedule_detached_systemd_restart with an on-failure escalation, so an orchestrator stop during a drain cannot kill the script after SIGUSR1; at fceb951e7e the fm coordinator spawns the script as a plain child in the orchestrator's cgroup (KillMode=control-group)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fm-on-merge-restart-"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "fm-on-merge-interval-and-clock-homed"
+        binding: "capability→producer (ζ) — FM_ON_MERGE_MIN_INTERVAL_SECS and the FM_ON_MERGE_CLOCK fleet file in the shared leaf (name only: θ changes the value); absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FM_ON_MERGE_CLOCK"
+          paths: ["shared/src/shared/fleet_coordination.py"]
+          expect: present
+      - name: "fm-coordinator-default-off"
+        binding: "anti-inversion (ζ) — fused_memory_restart_on_merge_enabled defaults to True at a85cb1ad78, so every project's orchestrator runs a coordinator that cannot restart fused-memory outside dark-factory"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused_memory_restart_on_merge_enabled: bool = Field\\(default=True\\)"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: absent
+      - name: "fm-coordinator-enabled-in-df-yaml"
+        binding: "capability→producer (ζ) — dark-factory-orchestrator.yaml turns the fm coordinator on; the key is absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^fused_memory_restart_on_merge_enabled: true"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+      - name: "fm-coordinator-restarts-live"
+        binding: "user-observable signal — after a shared/src-only merge, the orchestrator journal shows the fm coordinator firing restart-fused-memory.sh --drain once, and data/fused-memory/last_on_merge_restart_fused_memory.json holds that fire's epoch"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer reads the dark-factory orchestrator journal and the clock file on the host after the first shared/src-only merge following ζ's deploy; host and journal state, not a tree property"
+      - name: "fm-only-closure-guard-retired"
+        binding: "anti-inversion (ζ) — tests/scripts/test_fm_watched_paths_import_closure.py present at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["tests/scripts/test_fm_watched_paths_import_closure.py"]
+          expect: absent
+  - label: "ι"
+    task_id: null
+    title: "fused-memory's drain restart waits for every measured reconciliation run, and a drain that still times out files an escalation"
+    note: "Leo's R-4 addition (a drain restart that lets reconciliation runs finish). Deps: ζ (shared leaf; restart-fused-memory.sh after γ through ζ), 9140 (OPERATIONS.md). FM_DRAIN_MAX_WAIT_SECS = 7200 (covers every completed full run in the 30 days to 2026-11-13, max 6407 s; today's 2100 s cut 7 of 81 drains since 2026-11-01); restart-fused-memory.sh reads it through `drain max-wait`; the fm lease max-age rises 3600 -> 7800 (>= bound + 60 s submit + 90 s stop + 30 s health); a drain still running at the bound restarts and files one fused-memory-drain-timeout escalation, its submit bounded by timeout 60. A drain is never abandoned: once SIGUSR1 is sent, any exit short of the restart step (TERM, INT, set -e error) issues systemctl --user restart --no-block fused-memory. Runs beside β; η and then δ1 follow it on OPERATIONS.md. Bound re-measured by the fold-verifier over 2026-10-14T07:00Z..11-13T07:00Z: 1,766 completed full runs (longest 6,407 s) and 27 remediation runs (longest 6,897 s); starting the window a day earlier adds 5 runs of 7,386-16,890 s, all finishing on the morning of 2026-10-14."
+    capabilities:
+      - name: "fm-drain-bound-from-leaf"
+        binding: "capability→producer (ι) — restart-fused-memory.sh reads its drain bound through python3 -m shared.fleet_coordination drain max-wait; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "drain max-wait"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: present
+      - name: "fm-drain-literal-bound-gone"
+        binding: "anti-inversion (ι) — restart-fused-memory.sh defaults DRAIN_TIMEOUT to 2100 at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "DRAIN_TIMEOUT:-2100"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: absent
+      - name: "fm-drain-timeout-escalates"
+        binding: "capability→producer (ι) — a drain that times out files one escalation with this sentinel; absent at a85cb1ad78 (today only a WARNING)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused-memory-drain-timeout"
+          paths: ["scripts/restart-fused-memory.sh"]
+          expect: present
+      - name: "fm-drain-never-abandoned-test"
+        binding: "capability→producer (ι) — boundary row 26b: after SIGUSR1, a TERM, an INT or a set -e error still issues systemctl --user restart --no-block fused-memory; absent at fceb951e7e"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_drain_is_never_abandoned_after_the_signal"
+          paths: ["scripts/tests/test_restart_fused_memory.py"]
+          expect: present
+      - name: "fm-drain-bound-constant"
+        binding: "capability→producer (ι) — FM_DRAIN_MAX_WAIT_SECS in the shared leaf; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FM_DRAIN_MAX_WAIT_SECS"
+          paths: ["shared/src/shared/fleet_coordination.py"]
+          expect: present
+      - name: "fm-drain-waits-for-run-live"
+        binding: "user-observable signal — the next coordinator-fired drain that overlaps a running full reconciliation run logs Harness fully drained after that run completes, with no Drain timed out line"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer pairs a drain's start and its drained marker in the fused-memory and orchestrator journals on the host against the run's completion in data/reconciliation/reconciliation.db; host state, not a tree property"
+  - label: "θ"
+    task_id: null
+    title: "fused-memory's on-merge restart interval drops from 4 hours to 1 hour once its stop fix is in effect on the host"
+    note: "Leo's R-4 follow-up ('until the shutdown fix (then A)'). Deps: ζ, ι, 9493 (done, 1d0ae21e44), 9521 (operator reinstall with KillMode=mixed and its live check; deterministic human gate, blocked at L2; at a85cb1ad78 and fceb951e7e the installed unit still reads KillMode=control-group). 'In effect' is known by 9521 being done (its step-4 KillMode=mixed check and step-6 live one-SIGTERM restart). Its one-line OPERATIONS.md edit is exempt from the same-file chain (lead ruling after the wave-3 fold-verifiers), so it lands as soon as 9521 is done; it follows ι on the shared leaf, and ω follows it there (ω → θ). complexity=simple. A task, not a config value: one shared constant, test-pinned, no second home in yaml."
+    capabilities:
+      - name: "fm-on-merge-interval-one-hour"
+        binding: "capability→producer (θ) — FM_ON_MERGE_MIN_INTERVAL_SECS is 3600; the shared leaf does not exist at a85cb1ad78, and ζ sets 14400"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FM_ON_MERGE_MIN_INTERVAL_SECS[^=]*= *3600"
+          paths: ["shared/src/shared/fleet_coordination.py"]
+          expect: present
+  - label: "η"
+    task_id: null
+    title: "The orphan-worktree reclaim sweeps every known project root"
+    note: "Closes fk-47a7eb8c020d. Deps: ι, 9140 (OPERATIONS.md order only: η follows ι, and γ and ζ through ι; δ1 waits on η; S14 α 6710 landed). Lead OQ-3 A (S14 known_project_roots + a host drop-in the lead files as an operator step). Live parkings at a85cb1ad78 (unchanged since 1f240e6da2): solar-challenge-platform 16 (1.4 G), solar-challenge 5 (1.4 G), scoping-intake 1 (110 M)."
+    capabilities:
+      - name: "reclaim-loops-known-roots"
+        binding: "capability→producer (η) — reclaim_orphaned_worktrees.py reads shared.project_layout.known_project_roots; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "known_project_roots"
+          paths: ["scripts/reclaim_orphaned_worktrees.py"]
+          expect: present
+      - name: "single-root-pin-gone"
+        binding: "anti-inversion (η) — reclaim-orphaned-worktrees.sh defaults REPO to the dark-factory root at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "REPO:-/home/leo/src/dark-factory"
+          paths: ["scripts/reclaim-orphaned-worktrees.sh"]
+          expect: absent
+      - name: "known-roots-leaf-substrate"
+        binding: "substrate — passes today: shared.project_layout.known_project_roots (S14 α 6710) is the one DASHBOARD_KNOWN_PROJECT_ROOTS parser"
+        verdict: PASS
+      - name: "per-root-reclaim-live"
+        binding: "user-observable signal — after the operator installs the known-roots drop-in, a timer run journals one report per root and reclaims solar-challenge-platform's parkings older than 48 h"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms the per-root journal report and the reclaimed parkings on the host; depends on the host drop-in, not a tree property"
+  - label: "ω"
+    task_id: null
+    title: "Integration gate: cross-seam boundary tests, the supervision invariants' one home, the legacy lease branch and the spelling-guard family"
+    note: "Closes fk-ed19c0c4d4df. Subsumes task 8362 (orchestrator and dashboard loaders). Deps: ε, task 6726 (lead OQ-5 A); η and ι precede it through δ1. Deletes C2's legacy-body branch (decision 3) once --report shows no legacy body. Deps also θ: ω follows θ on the shared leaf (θ's exemption covers only its OPERATIONS.md line), so ω waits on operator gate 9521 through θ."
+    capabilities:
+      - name: "boundary-suite-exists"
+        binding: "capability→producer (ω) — boundary rows 23-24 across real processes; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["tests/scripts/test_fleet_supervision_boundary.py"]
+          expect: present
+      - name: "measurement-copies-gone"
+        binding: "anti-inversion (ω) — the 2026-08-25 'ZERO watched-path commits' measurement appears 4 times in scripts/orchestrator-watchdog.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "[Zz][Ee][Rr][Oo] watched-path commits"
+          paths: ["scripts/"]
+          expect: absent
+      - name: "false-claims-gone"
+        binding: "anti-inversion (ω) — three of the four false claims ('ONLY by main()', 'dark-factory + reify', 'orchestrator/config.yaml') present in scripts/orchestrator-watchdog.py at a85cb1ad78; 'only uncapped' went with task 8270 and stays in the pattern"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ONLY by main\\(\\)|only uncapped|dark-factory \\+ reify|orchestrator/config\\.yaml"
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: absent
+      - name: "single-watchdog-loader"
+        binding: "anti-inversion (ω) — six _load_watchdog copies in tests/scripts at a85cb1ad78 (five orchestrator loaders, one added by 6615's parity test that γ deletes and one in the fm closure guard that ζ deletes, and test_dashboard_watchdog.py's dashboard loader; task 8362)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def _load_watchdog\\("
+          paths: ["tests/scripts/"]
+          expect: absent
+      - name: "dashboard-watchdog-shared-loader"
+        binding: "capability→producer (ω) — one load_dashboard_watchdog() in tests/scripts/conftest.py; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def load_dashboard_watchdog\\("
+          paths: ["tests/scripts/conftest.py"]
+          expect: present
+      - name: "supervision-invariants-home"
+        binding: "capability→producer (ω) — OPERATIONS.md §8 states I5, I6, I7 and the fail directions once; absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^### Supervision invariants"
+          paths: ["OPERATIONS.md"]
+          expect: present
+      - name: "live-report-end-to-end"
+        binding: "user-observable signal — --report on the host shows 9 units, one FLEET-LEASE line per tier, the LIVENESS column and the HEARTBEAT-AGE column"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer runs --report on the host after merge; live host state, not a tree property"
