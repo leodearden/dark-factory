@@ -5565,7 +5565,7 @@ def create_server(
             'outcome': row['state'],
             'finished_at': row['finished_at'],
         }
-        for name in ('superseded_by', 'reason'):
+        for name in ('merge_sha', 'superseded_by', 'reason'):
             if row.get(name) is not None:
                 fields[name] = row[name]
         return MergeStatusAnswer.outcome(source=MergeStatusSource.event_store, fields=fields)
