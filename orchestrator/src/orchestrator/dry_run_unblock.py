@@ -117,8 +117,7 @@ _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
 # covering both its cap-retry loop and the gate's park on a pool frozen at
 # spawn. This is a fire-and-forget, best-effort block-time investigation — it
 # must NOT inherit the 14-day default, which would leave a background task
-# pending for weeks under a sustained cap storm. Mirrors the 1800s
-# reconciliation-stage precedent.
+# pending for weeks under a sustained cap storm.
 _DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 
