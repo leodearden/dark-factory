@@ -469,18 +469,24 @@ class TestDiscoverOrchestrators:
 class TestDiscoverOrchestratorsConfigParseCache:
     """``--config`` roots are parsed once per file version, not once per request."""
 
+    @pytest.fixture
+    def dashboard_config(self, tmp_path):
+        """Built before any test body, so its own startup discovery parses nothing a spy counts."""
+        from dashboard.config import DashboardConfig
+
+        return DashboardConfig(project_root=tmp_path)
+
     @staticmethod
-    async def _discover(tmp_path, config_file):
+    async def _discover(dashboard_config, config_file):
         from unittest.mock import patch
 
-        from dashboard.config import DashboardConfig
         from dashboard.data.orchestrator import discover_orchestrators
 
         procs = [{'pid': 1, 'prd': None, 'config_path': str(config_file), 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=procs):
-            return await discover_orchestrators(DashboardConfig(project_root=tmp_path))
+            return await discover_orchestrators(dashboard_config)
 
-    async def test_unchanged_config_is_parsed_once(self, tmp_path, no_mcp):
+    async def test_unchanged_config_is_parsed_once(self, tmp_path, dashboard_config, no_mcp):
         from unittest.mock import patch
 
         import yaml
@@ -491,36 +497,36 @@ class TestDiscoverOrchestratorsConfigParseCache:
         config_file.write_text(f'project_root: {root}\n')
 
         with patch('yaml.safe_load', wraps=yaml.safe_load) as parse:
-            first = await self._discover(tmp_path, config_file)
-            second = await self._discover(tmp_path, config_file)
+            first = await self._discover(dashboard_config, config_file)
+            second = await self._discover(dashboard_config, config_file)
 
         assert first[0]['project_root'] == second[0]['project_root'] == str(root.resolve())
         assert parse.call_count == 1
 
-    async def test_edited_config_is_picked_up(self, tmp_path, no_mcp):
+    async def test_edited_config_is_picked_up(self, tmp_path, dashboard_config, no_mcp):
         root_a = tmp_path / 'proj_a'
         root_b = tmp_path / 'proj_b_longer_name'
         root_a.mkdir()
         root_b.mkdir()
         config_file = tmp_path / 'cfg-edited.yaml'
         config_file.write_text(f'project_root: {root_a}\n')
-        before = await self._discover(tmp_path, config_file)
+        before = await self._discover(dashboard_config, config_file)
 
         config_file.write_text(f'project_root: {root_b}\n')
-        after = await self._discover(tmp_path, config_file)
+        after = await self._discover(dashboard_config, config_file)
 
         assert before[0]['project_root'] == str(root_a.resolve())
         assert after[0]['project_root'] == str(root_b.resolve())
 
-    async def test_fixed_config_replaces_cached_failure(self, tmp_path, no_mcp):
+    async def test_fixed_config_replaces_cached_failure(self, tmp_path, dashboard_config, no_mcp):
         root = tmp_path / 'proj'
         root.mkdir()
         config_file = tmp_path / 'cfg-fixed.yaml'
         config_file.write_text('project_root: [unclosed\n')
-        broken = await self._discover(tmp_path, config_file)
+        broken = await self._discover(dashboard_config, config_file)
 
         config_file.write_text(f'project_root: {root}\n')
-        fixed = await self._discover(tmp_path, config_file)
+        fixed = await self._discover(dashboard_config, config_file)
 
         assert broken[0]['project_root'] == str(tmp_path.resolve())
         assert fixed[0]['project_root'] == str(root.resolve())
@@ -839,6 +845,28 @@ class TestReadMaxConcurrentTasks:
         self._write(tmp_path / 'dark-factory-orchestrator.yaml', 'max_concurrent_tasks: 8\n')
 
         assert read_max_concurrent_tasks(str(tmp_path)) == 8
+
+    def test_same_size_edit_is_picked_up(self, tmp_path):
+        """An edit that keeps the file's size, as ``24`` -> ``16`` does, is still seen.
+
+        Each snapshot must pair with the cap in force at that instant, so a
+        reader blind to same-size edits would mislabel every later snapshot
+        until the dashboard restarted.
+        """
+        import os
+
+        from dashboard.data.orchestrator import read_max_concurrent_tasks
+
+        config_file = tmp_path / 'dark-factory-orchestrator.yaml'
+        self._write(config_file, 'max_concurrent_tasks: 24\n')
+        before = read_max_concurrent_tasks(tmp_path)
+
+        later_ns = config_file.stat().st_mtime_ns + 1_000_000
+        config_file.write_text('max_concurrent_tasks: 16\n')
+        os.utime(config_file, ns=(later_ns, later_ns))
+        after = read_max_concurrent_tasks(tmp_path)
+
+        assert (before, after) == (24, 16)
 
     def test_ignores_unrelated_top_level_keys(self, tmp_path):
         """A real config carries many keys; only max_concurrent_tasks is read."""

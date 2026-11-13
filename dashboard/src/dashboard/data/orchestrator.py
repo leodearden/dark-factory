@@ -62,7 +62,9 @@ import asyncio
 import logging
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 from dashboard.config import DashboardConfig
 
@@ -125,7 +127,7 @@ def _read_project_root_from_config(config_path: str) -> Path | None:
     return p.resolve() if p.is_absolute() else None
 
 
-_config_mapping_cache: dict[Path, tuple[tuple[int, int], dict | None]] = {}
+_config_mapping_cache: dict[Path, tuple[tuple[int, int], Mapping[str, object] | None]] = {}
 """Parsed config per path, valid while the file's ``(st_mtime_ns, st_size)`` holds.
 
 One entry per path (a changed file replaces its entry), so the cache is bounded
@@ -134,7 +136,7 @@ under the same key as a success: fixing the file changes the key.
 """
 
 
-def _load_config_mapping(path: Path) -> dict | None:
+def _load_config_mapping(path: Path) -> Mapping[str, object] | None:
     """Parse *path* as YAML and return it if it is a mapping, else ``None``.
 
     The parse is cached on the file's ``(st_mtime_ns, st_size)``: this is
@@ -142,7 +144,8 @@ def _load_config_mapping(path: Path) -> dict | None:
     :func:`_read_project_root_from_config`) as well as the burndown collector,
     and the pure-Python YAML parse is measurable on the event loop. An edited
     file is re-parsed on the next call. A file that cannot be stat-ed is never
-    cached. Callers must treat the returned mapping as read-only.
+    cached. Every caller shares the cached mapping, so it is returned as a
+    read-only view.
 
     Never raises: this runs inside the burndown collector loop, where an
     exception would take down a whole collection cycle — strictly worse than
@@ -171,7 +174,7 @@ def _load_config_mapping(path: Path) -> dict | None:
     except (ValueError, yaml.YAMLError) as exc:
         logger.debug('Unparseable orchestrator config %s: %s', path, exc)
         raw = None
-    mapping = raw if isinstance(raw, dict) else None
+    mapping = MappingProxyType(raw) if isinstance(raw, dict) else None
     _config_mapping_cache[path] = (key, mapping)
     return mapping
 
