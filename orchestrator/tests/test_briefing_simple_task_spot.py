@@ -10,12 +10,46 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from typing import Any
 
+import pytest
+from _briefing_helpers import briefing as briefing
 from _role_splice_contract import assert_nonempty
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, observed_item
 
+from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import ROLES, SIMPLE_TASK, SIMPLE_TASK_WORKFLOW
 
 _TOOL_CALL = re.compile(r'`(?:mcp__plan-tools__)?(\w+)\(')
+
+_FOLLOWUP_SUMMARY = 'The retry loop swallows the timeout'
+_DELIVERED_CHECK_NAME = 'cap'
+
+
+def _task(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'id': '6564',
+        'title': 'A simple change',
+        'description': 'A mechanically simple change.',
+        'metadata': metadata,
+    }
+
+
+_RENDER_VARIANTS: dict[str, dict[str, Any]] = {
+    'files_listed': _task({'files': ['a.py', 'b.py']}),
+    'no_files': _task({}),
+    'every_optional_section': _task({
+        'files': ['a.py', 'b.py'],
+        'delivered_checks': [
+            {'name': _DELIVERED_CHECK_NAME, 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
+        ],
+        FOLLOWUP_ITEMS_METADATA_KEY: [
+            observed_item(
+                summary=_FOLLOWUP_SUMMARY, files=['a.py'], origin_task='8000',
+            ).model_dump(mode='json'),
+        ],
+    }),
+}
 
 
 def _workflow_tool_names() -> list[str]:
@@ -77,3 +111,28 @@ class TestSimpleTaskWorkflowSingleHome:
             f'SIMPLE_TASK_WORKFLOW spells these tools more than once: {repeated}. '
             'Spell each signature once in the home and name the tool bare elsewhere.'
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('variant', sorted(_RENDER_VARIANTS))
+async def test_dispatch_spells_each_workflow_signature_once(
+    briefing: BriefingAssembler, variant: str,
+):
+    rendered = await briefing.build_simple_task_prompt(
+        _RENDER_VARIANTS[variant], worktree=None, context='',
+    )
+    if variant == 'every_optional_section':
+        assert _FOLLOWUP_SUMMARY in rendered, rendered
+        assert _DELIVERED_CHECK_NAME in rendered, rendered
+
+    dispatched = Counter(_signature_spellings(SIMPLE_TASK.system_prompt + '\n' + rendered))
+    home = Counter(_signature_spellings(SIMPLE_TASK_WORKFLOW))
+    assert dispatched == home, (
+        f'Re-spelled outside the home: {sorted((dispatched - home).elements())}; '
+        f'missing from the dispatch: {sorted((home - dispatched).elements())}. '
+        "SIMPLE_TASK's workflow has one home, roles.py::SIMPLE_TASK_WORKFLOW, which "
+        'SIMPLE_TASK.system_prompt carries into every simple-task dispatch. A briefing '
+        'or another spliced block that re-spells a signature shows the agent a second '
+        'copy that can drift (task 6564). Name the tool without its signature '
+        '(`tool(...)`) or point at the role instructions instead.'
+    )
