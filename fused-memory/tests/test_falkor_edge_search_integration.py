@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeVar
 
 import pytest
@@ -102,15 +102,23 @@ def seed_edges_cypher(endpoint_label: str) -> str:
     )
 
 
+def canary_fact(edge: SeededEdge) -> str:
+    return f'{CANARY_TOKEN} fact {edge.uuid}'
+
+
 async def seed_edges(
-    graph: AsyncGraph, group_id: str, endpoint_label: str, edges: list[SeededEdge]
+    graph: AsyncGraph,
+    group_id: str,
+    endpoint_label: str,
+    edges: list[SeededEdge],
+    fact_of: Callable[[SeededEdge], str] = canary_fact,
 ) -> None:
     rows = [
         {
             'uuid': edge.uuid,
             'source_node_uuid': edge.source_node_uuid,
             'target_node_uuid': edge.target_node_uuid,
-            'fact': f'{CANARY_TOKEN} fact {edge.uuid}',
+            'fact': fact_of(edge),
             'fact_embedding': list(edge.fact_embedding),
         }
         for edge in edges
@@ -161,26 +169,65 @@ async def live_backend_factory(mock_config):
 
 
 @pytest_asyncio.fixture
-async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[SeededGraph]]:
+async def provision(live_backend_factory) -> Callable[[str, AsyncGraph], Awaitable[GraphDriver]]:
+    """``provision(name, graph)``: the production index sweep over a seeded graph, and its hardened driver.
+
+    Seeding creates the graph KEY, which the provisioning sweep requires.
+    """
+
+    async def provisioned(name: str, graph: AsyncGraph) -> GraphDriver:
+        backend = live_backend_factory({name})
+        await backend.provision_registered_graphs()
+        await await_index_operational(graph)
+        return live_backend_factory.driver_of(backend).clone(name)
+
+    return provisioned
+
+
+@pytest_asyncio.fixture
+async def seed_ring(scratch, provision) -> Callable[[int], Awaitable[SeededGraph]]:
     """``seed(count)``: a ring of *count* Entity edges plus an off-label twin, production-provisioned."""
 
     async def seed(count: int) -> SeededGraph:
         name, graph = scratch('ring')
         ring = ring_edges(count)
         off_label_edge = off_label_twin(ring[0])
-        # Seeding also creates the graph KEY, which the provisioning sweep requires.
         await seed_edges(graph, name, 'Entity', ring)
         await seed_edges(graph, name, 'CanaryEndpoint', [off_label_edge])
-        backend = live_backend_factory({name})
-        await backend.provision_registered_graphs()
-        await await_index_operational(graph)
         return SeededGraph(
             name=name,
             graph=graph,
-            driver=live_backend_factory.driver_of(backend).clone(name),
+            driver=await provision(name, graph),
             entity_edges={edge.uuid: edge for edge in ring},
             off_label_edge=off_label_edge,
         )
+
+    return seed
+
+
+@dataclass(frozen=True)
+class FactGraph:
+    name: str
+    graph: AsyncGraph
+    driver: GraphDriver
+
+    async def bm25_ranking(self, query: str, limit: int) -> list[str]:
+        """The uuids graphiti's edge BM25 leg returns for *query*, best first."""
+        edges = await search_utils.edge_fulltext_search(
+            self.driver, query, SearchFilters(), [self.name], limit
+        )
+        return [edge.uuid for edge in edges]
+
+
+@pytest_asyncio.fixture
+async def seed_facts(scratch, provision) -> Callable[[dict[str, str]], Awaitable[FactGraph]]:
+    """``seed(facts)``: one ring Entity edge per ``{uuid: fact}`` item, production-provisioned."""
+
+    async def seed(facts: dict[str, str]) -> FactGraph:
+        name, graph = scratch('facts')
+        edges = [replace(edge, uuid=uuid) for edge, uuid in zip(ring_edges(len(facts)), facts, strict=True)]
+        await seed_edges(graph, name, 'Entity', edges, lambda edge: facts[edge.uuid])
+        return FactGraph(name=name, graph=graph, driver=await provision(name, graph))
 
     return seed
 
@@ -313,6 +360,33 @@ class TestEdgeFulltextLeg:
         rewritten = {edge.uuid for edge in edges}
         assert rewritten == {edge.uuid for edge in builtin_edges} == set(seeded.entity_edges)
         assert seeded.off_label_edge.uuid not in rewritten
+
+
+# --- BM25 ranking ------------------------------------------------------------
+
+LONG_FACT = (
+    'AllAccountsCappedException catch sites were added in the production orchestrator'
+    ' via the task {} commit'
+)
+
+# Measured on scratch FalkorDB 41800 while planning task 9542: under a
+# (@group_id:...) prefix long-rare is absent from the top 5; without it, rank 1.
+RARE_TERM_FACTS = {
+    **{f'alpha-{i}': f'task alpha note {i}' for i in range(20)},
+    **{f'prose-{i}': 'context decisions related' for i in range(20)},
+    'long-rare': LONG_FACT.format('zyzzogeton'),
+    'long-id': LONG_FACT.format('877'),
+}
+
+
+class TestEdgeFulltextRanking:
+    @pytest.mark.asyncio
+    async def test_a_rare_term_outranks_common_terms_on_shorter_facts(self, seed_facts):
+        seeded = await seed_facts(RARE_TERM_FACTS)
+
+        ranking = await seeded.bm25_ranking('task zyzzogeton alpha', 5)
+
+        assert ranking[0] == 'long-rare', ranking
 
 
 # --- Cosine leg ---------------------------------------------------------------

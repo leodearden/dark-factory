@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from _query_recorder import IssuedQuery, recording_driver
 from graphiti_core.driver.search_interface.search_interface import SearchInterface
+from graphiti_core.errors import GroupIdValidationError
 from graphiti_core.search import search_utils
 from graphiti_core.search.search_filters import SearchFilters
 
@@ -187,10 +188,22 @@ class TestEdgeFulltextSearch:
     async def test_forwards_graphiti_params(self) -> None:
         _, issued = await self._search()
 
-        params = issued[0].params
-        assert params['query'] == '(@group_id:"g") (alpha | beta)'
-        assert params['group_ids'] == ['g']
-        assert params['limit'] == 20
+        (query,) = issued
+        assert query.params['query'] == ' (alpha | beta)'
+        assert query.params['group_ids'] == ['g']
+        assert query.params['limit'] == 20
+        assert 'e.group_id IN $group_ids' in query.cypher
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_group_id_is_refused_before_any_query(self) -> None:
+        """The fulltext query carries no group filter, so the leg validates group ids itself."""
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+
+        with pytest.raises(GroupIdValidationError):
+            await search_utils.edge_fulltext_search(
+                driver, 'alpha beta', SearchFilters(), ['bad group'], 20
+            )
+        assert issued == []
 
     @pytest.mark.asyncio
     async def test_applies_graphiti_search_filter_predicates(self) -> None:
