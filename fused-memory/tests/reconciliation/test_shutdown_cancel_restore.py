@@ -6,14 +6,13 @@ import contextlib
 from collections.abc import Coroutine
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import EventSource, EventType, ReconciliationEvent
-from fused_memory.reconciliation.context_assembler import AssembledPayload
 from fused_memory.reconciliation.harness import BacklogIterator
 from reconciliation.harness_fixtures import make_harness_config, open_harness
 
@@ -64,8 +63,7 @@ async def _cancel_once_entered(
     task = asyncio.create_task(coro)
     entered_wait = asyncio.ensure_future(entered.wait())
     try:
-        async with asyncio.timeout(10):
-            await asyncio.wait({entered_wait, task}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait({entered_wait, task}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         entered_wait.cancel()
     assert entered.is_set(), f'the blocked call was never reached; task: {task!r}'
@@ -73,19 +71,6 @@ async def _cancel_once_entered(
     with contextlib.suppress(asyncio.CancelledError):
         await task
     return task
-
-
-def _one_event_per_chunk_assembler(memory_service, taskmaster, config, project_root=''):
-    """A ContextAssembler stand-in whose every chunk is the oldest peeked event."""
-    inst = MagicMock()
-
-    async def assemble(peeked, watermark, project_id):
-        if not peeked:
-            return AssembledPayload(events=[])
-        return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
-
-    inst.assemble = assemble
-    return inst
 
 
 @pytest.mark.asyncio
@@ -108,10 +93,6 @@ async def test_backlog_iterator_shutdown_cancel_before_the_run_row_restores_the_
     harness, monkeypatch, blocked,
 ):
     await _push_events(harness, 3)
-    monkeypatch.setattr(
-        'fused_memory.reconciliation.context_assembler.ContextAssembler',
-        _one_event_per_chunk_assembler,
-    )
     entered = _block_first_call(monkeypatch, harness.journal, blocked)
     iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
 

@@ -207,10 +207,12 @@ async def test_restore_on_raise_lands_despite_a_second_cancellation(
         async with restore_on_raise(journal, buffer, PROJECT_ID, 'B'):
             raise asyncio.CancelledError()
 
+    tasks_before = asyncio.all_tasks()
     outer_task = asyncio.create_task(cancelled_body())
     outer_task_ref.append(outer_task)
     with contextlib.suppress(asyncio.CancelledError):
         await outer_task
+    await asyncio.gather(*(asyncio.all_tasks() - tasks_before))
 
-    await restored.wait()
+    assert restored.is_set()
     assert await buffer.count_buffered(PROJECT_ID) == 1
