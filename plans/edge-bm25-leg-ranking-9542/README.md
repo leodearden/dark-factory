@@ -140,11 +140,14 @@ term, because its `1` is a digit.
 ### The 877 query
 
 `task 877 context and related decisions`, C, 16 rows. The tier holds 10 edges, so all of them
-are promoted. Six are invalidated "Task 877 ..." facts (`invalid_at` set), and
-they rank above the live ones on union score. `SearchFilters()` does not exclude
+are promoted. Five have `invalid_at` set: `5bf20c42`, `4acfcebd`, `1330ec7b`,
+`5d8b1c36` and `8813cc31`. Four of them are "Task 877 ..." facts, and they rank
+above the live ones on union score. `SearchFilters()` does not exclude
 invalidated edges. `memory_service` drops them after fusion
-(`fused-memory/src/fused_memory/services/memory_service.py::_edge_is_retired`),
-but inside the leg they take ranks 1-4. Since planning, a fifth live 877 edge
+(`fused-memory/src/fused_memory/services/memory_service.py::_edge_is_retired`,
+which reads `invalid_at` only), but inside the leg they take ranks 1-4. The
+other five have `invalid_at` null. `bba24b78` carries an `expired_at`, which
+`_edge_is_retired` deliberately ignores. Since planning, a fifth live 877 edge
 has appeared (`4effe5d2`, a fact about this task's plan). Under A and B, none of
 the four named edges is in the top 16.
 
