@@ -3282,19 +3282,31 @@ check.
 
 - **What one run examines.** `fused-memory/scripts/link_heal.py sweep` plans
   over every link in each project of `link_heal.projects` (else the home
-  project) whose child was created inside the run window. The window runs from
-  the end of the last complete sweep, or `link_heal.sweep_window_hours` back
-  from the first one, up to now. A run with a read or adjudication failure
-  does not move the window, so the next run examines those links again. Only
-  the heals in `link_heal.sweep_actions` (default `detach`, `relabel`) are
-  staged; every other heal is recorded as `not_enabled`.
+  project) whose child was created inside the run window. The window runs up
+  to now from the earliest start over the run's projects. A project's start is
+  the end of its unbroken run of complete sweeps, or
+  `link_heal.sweep_window_hours` back for a project no sweep has completed. A
+  run with a read or adjudication failure does not move the window, so the
+  next run examines those links again. A run over fewer projects leaves the
+  other projects' windows for the next run. A run starting after a project's
+  start (`--since`) leaves the gap before it, so the next run covers that gap.
+  Examining a link again is harmless: verdicts are reused and pending heals are
+  deduped. Only the heals in `link_heal.sweep_actions` (default `detach`,
+  `relabel`) are staged; every other heal is recorded as `not_enabled`.
 - **When it writes.** It writes only when `link_heal.writes: true` is set, no
   `--dry-run` is given, and the latest calibration of the adjudicator's exact
   model and prompt version (the sha256 of the rendered system prompt) passed.
   Otherwise the report's Writes line says `dry-run` or
   `withheld (uncalibrated)` / `withheld (calibration_failed)`. A writing run
   keeps the per-run cap and the backlog, share-ceiling and write-failure
-  escapes, and also files the adjudicator failure storm.
+  escapes, and also files the adjudicator failure storm. A verdict is reused
+  only by the same model and prompt version, so a model or brief change asks
+  again. At write time
+  (`fused-memory/src/fused_memory/maintenance/link_heal_executor.py::run_apply`)
+  every sweep heal whose verdict came from an adjudicator without a passing
+  calibration is withheld, not written. That includes a heal staged before a
+  model or brief change. Each one is recorded as `withheld_uncalibrated`, and the
+  report's Writes line counts them.
 - **Calibrate first, and again after any model or brief change.** From the
   main checkout (the soak data is gitignored there):
 
@@ -3318,10 +3330,14 @@ check.
   `link_heal.py sweep --since 2026-10-11T00:00:00+00:00`. `--since` needs a UTC
   offset. The cap drains a large backlog over several nights. To drain it at
   once, review the latest sweep plan document that `status` lists, then run
-  `link_heal.py apply --sweep --approved-plan-sha <its sha>`.
+  `link_heal.py apply --sweep --approved-plan-sha <its sha>`. `apply --sweep`
+  is refused (exit 2) while `link_heal.writes` is off, and applies the same
+  write-time calibration gate.
 - **Undo.** A report whose run applied anything names that apply run as
   `undo_run_id`, with the literal command
-  `link_heal.py undo --run <apply run id>`.
+  `fused-memory/scripts/link_heal.py undo --run <apply run id>`. The run-report
+  escalation prints the same command, from
+  `fused-memory/src/fused_memory/maintenance/link_heal_executor.py::undo_command`.
 - **What it leaves.**
   - A JSON and a Markdown report,
     `<reconciliation.data_dir>/link-heal-reports/link-heal-sweep-<date>-<run8>.{json,md}`.
@@ -3333,8 +3349,9 @@ check.
   - The records, in `<reconciliation.data_dir>/link_heal.db`. Each examined
     link has its child and parent exactly as read, the verdict with its
     model, prompt version and reason, the decision and its disposition, and
-    each write's before and after snapshots. The records are append-only and
-    never pruned.
+    each write's before and after snapshots. An undone heal keeps its action
+    and after-state and names the undo run that took it back. The records are
+    append-only and never pruned.
 - **Exit codes.** 0 when the run is complete, or partial only by the cap or
   stale skips. 1 on a read, adjudication or write failure, or a stopped run.
   2 when the run was refused before it started.
