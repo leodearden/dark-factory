@@ -11,6 +11,8 @@ which FalkorDB plans with no per-row scan.
 
 The edge BM25 leg's fulltext query carries no group filter; its Cypher scopes
 by group instead (:func:`fused_memory.backends.falkor_fulltext.build_edge_queries`).
+It ranks first the edges matching every identifier term of the query, when they
+all fit in the leg (``plans/edge-bm25-leg-ranking-9542/README.md``).
 
 Dispatch contract: ``graphiti_core.search.search_utils`` hands five legs to
 ``driver.search_interface`` UNCONDITIONALLY, with no NotImplementedError
@@ -39,7 +41,7 @@ from graphiti_core.search.search_filters import (
     node_search_filter_query_constructor,
 )
 
-from fused_memory.backends.falkor_entity_edges import read_entity_edges
+from fused_memory.backends.falkor_entity_edges import bind_entity_endpoints, read_entity_edges
 from fused_memory.backends.falkor_fulltext import build_edge_queries
 
 # The origin labels graphiti's SearchInterface.edge_bfs_search documents; edge
@@ -97,6 +99,35 @@ def _bfs_reached_nodes(depth: int, filter_queries: list[str]) -> str:
     return _union_over_origin_labels(leg)
 
 
+async def _promoted_uuids(
+    driver: Any,
+    identifiers: str,
+    filter_queries: list[str],
+    limit: int,
+    params: dict[str, Any],
+) -> list[str]:
+    """The edges matching every identifier term, promoted only when all of them fit in the leg.
+
+    Under the leg's own filters; ``limit + 1`` rows are read so an overflowing
+    tier is told apart from one that fits.
+    """
+    if identifiers == '':
+        return []
+    fulltext_hits = get_relationships_query(
+        'edge_name_and_fact', limit=limit, provider=driver.provider
+    )
+    records, _, _ = await driver.execute_query(
+        bind_entity_endpoints(f'{fulltext_hits} YIELD relationship AS e', filter_queries)
+        + ' RETURN e.uuid AS uuid LIMIT $tier_cap',
+        query=identifiers,
+        tier_cap=limit + 1,
+        routing_='r',
+        **params,
+    )
+    uuids = [record['uuid'] for record in records]
+    return uuids if len(uuids) <= limit else []
+
+
 def _builtin_search_driver(driver: GraphDriver) -> GraphDriver:
     """A shallow copy of *driver* on which graphiti takes its built-in branch.
 
@@ -130,6 +161,9 @@ class FalkorEdgeSearch(SearchInterface):
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
 
+        promoted_uuids = await _promoted_uuids(
+            driver, queries.identifiers, filter_queries, limit, filter_params
+        )
         fulltext_hits = get_relationships_query(
             'edge_name_and_fact', limit=limit, provider=driver.provider
         )
@@ -137,9 +171,10 @@ class FalkorEdgeSearch(SearchInterface):
             driver,
             f'{fulltext_hits} YIELD relationship AS e, score',
             filter_queries,
-            order_by='score DESC',
+            order_by='e.uuid IN $promoted_uuids DESC, score DESC',
             query=queries.union,
             limit=limit,
+            promoted_uuids=promoted_uuids,
             **filter_params,
         )
 
