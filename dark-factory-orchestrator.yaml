@@ -1764,7 +1764,16 @@ convert_to_blocked_enforce: true
 # window. Restart-only, so it goes live at the next fleet restart.
 workflow_exit_contract_enforce: true
 
-psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
+# INTERIM (Leo 2026-11-13): raise the starvation watchdog's lock_refused/dual
+# threshold from the default 50 so a task must be refused in more scans before
+# it is announced. That cuts the post-restart bursts of the auto-pin cap L1
+# (plans/starvation-cap-study-2026-11-12.md). The cap itself stays 3. Task 9636
+# makes that L1 change-driven and restart-safe, and DELETES this block when it
+# lands. Green tier: applied with reload_config.
+starvation_watchdog:
+  skip_threshold: 150
+
+psi_admission:           # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
   mem_some_avg10: 15.0
   mem_full_avg10: 3.0
   io_some_avg10: 40.0
