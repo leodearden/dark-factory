@@ -170,7 +170,22 @@ def _collapse_ws(text: object) -> str:
     return ' '.join(text.split()) if isinstance(text, str) else ''
 
 
+def _landed(stored: object, payload: str, appended: bool) -> bool:
+    if not isinstance(stored, str):
+        return False
+    if appended:
+        return _collapse_ws(stored).endswith(_collapse_ws(payload))
+    return _collapse_ws(stored) == _collapse_ws(payload)
+
+
 def verify_text_write(after: object, write: PlannedTextWrite) -> TextWriteVerification | None:
+    """Check each written field against the invariant its write mode establishes.
+
+    A replace leaves the stored field equal to the payload; an append leaves it
+    ending with the payload, whether joined onto an existing body or written
+    alone onto an empty one
+    (``backends/sqlite_task_backend.py::SqliteTaskBackend.update_task``).
+    """
     if not write.writes_text:
         return None
     stored = after if isinstance(after, Mapping) else {}
@@ -182,7 +197,7 @@ def verify_text_write(after: object, write: PlannedTextWrite) -> TextWriteVerifi
         fields=tuple(
             TextFieldVerification(
                 field=field,
-                confirmed=_collapse_ws(payload) in _collapse_ws(stored.get(field)),
+                confirmed=_landed(stored.get(field), payload, appended),
                 appended=appended,
             )
             for field, payload, appended in written

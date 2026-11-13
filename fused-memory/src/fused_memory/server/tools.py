@@ -10592,7 +10592,8 @@ def create_mcp_server(
                 changed since your read, so re-read, recompose against the
                 returned text and resend with the fresh token. A recon-stage
                 text write's response carries ``text_verified``: True only when
-                a fresh read under the write lock shows the written text.
+                a fresh read under the write lock shows the stored field equal
+                to the written text or, under ``append=True``, ending with it.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
