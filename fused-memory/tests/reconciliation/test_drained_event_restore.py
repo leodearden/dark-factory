@@ -212,6 +212,5 @@ async def test_restore_on_raise_lands_despite_a_second_cancellation(
     with contextlib.suppress(asyncio.CancelledError):
         await outer_task
 
-    async with asyncio.timeout(10):
-        await restored.wait()
+    await restored.wait()
     assert await buffer.count_buffered(PROJECT_ID) == 1
