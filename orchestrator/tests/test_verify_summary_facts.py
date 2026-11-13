@@ -139,11 +139,25 @@ class TestTheSummaryCarriesTheRole:
 
         assert _read_worktree_summary(tmp_path)['role'] == 'task'
 
-    def test_the_merge_writer_stamps_merge(self, tmp_path):
-        """``archive_verify_logs`` is the merge-path writer by definition.
+    @pytest.mark.parametrize('role', ['merge', 'task'])
+    def test_the_archive_writer_stamps_the_role_it_is_given(self, tmp_path, role):
+        """``archive_verify_logs`` serves both roles: the local merge lane archives
+        as 'merge', and ``verify_runner.RemoteRunner.run_task_verify`` passes 'task'
+        through ``RemoteRunner._archive_failure_streams``.
+        """
+        from orchestrator.verify import archive_verify_logs  # noqa: PLC0415
 
-        It serves both the local merge lane and ``verify_runner.RemoteRunner``,
-        so its role cannot be anything but 'merge'.
+        archive_root = tmp_path / 'archive'
+        archive_verify_logs(
+            [_run('test', rc=1)], archive_root, '5671', 1, 'test_failure', '',
+            role=role,
+        )
+
+        assert _read_archived_summary(archive_root)['role'] == role
+
+    def test_the_archive_writer_defaults_to_merge(self, tmp_path):
+        """'merge' is the DEFAULT, for the local merge-lane call site in
+        ``run_verification``, which passes no role.
         """
         from orchestrator.verify import archive_verify_logs  # noqa: PLC0415
 
