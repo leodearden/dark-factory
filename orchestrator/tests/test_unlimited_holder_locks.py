@@ -175,6 +175,17 @@ class TestPrefixValidation:
         with pytest.raises(ValidationError, match=named):
             load_config(config_file)
 
+    def test_a_prefix_as_deep_as_lock_depth_is_accepted(self):
+        rule = UnlimitedHolderLocksConfig(prefixes=('docs/prds/',))
+
+        assert OrchestratorConfig(lock_depth=2, unlimited_holder_locks=rule).unlimited_holder_locks == rule
+
+    def test_a_prefix_deeper_than_lock_depth_is_refused_naming_it_and_the_depth(self):
+        rule = UnlimitedHolderLocksConfig(prefixes=('docs/prds/old/',))
+
+        with pytest.raises(ValidationError, match=r"'docs/prds/old/'.*lock_depth 2"):
+            OrchestratorConfig(lock_depth=2, unlimited_holder_locks=rule)
+
     def test_a_nested_well_formed_prefix_is_accepted(self):
         assert UnlimitedHolderLocksConfig(prefixes=('docs/prds/',)).prefixes == ('docs/prds/',)
 

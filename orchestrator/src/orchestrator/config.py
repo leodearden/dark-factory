@@ -6090,6 +6090,18 @@ class OrchestratorConfig(BaseSettings):
         return self
 
     @model_validator(mode='after')
+    def _unlimited_holder_prefixes_within_lock_depth(self) -> 'OrchestratorConfig':
+        too_deep = [
+            p for p in self.unlimited_holder_locks.prefixes if p.count('/') > self.lock_depth
+        ]
+        if too_deep:
+            raise ValueError(
+                f'unlimited_holder_locks.prefixes {too_deep} have more path components '
+                f'than lock_depth {self.lock_depth}, so no lock key can ever match them'
+            )
+        return self
+
+    @model_validator(mode='after')
     def _validate_verify_task_remote_modules(self) -> 'OrchestratorConfig':
         if self.verify_task_host_policy == 'remote_modules' and not self.verify_task_remote_modules:
             raise ValueError(
