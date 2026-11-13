@@ -694,8 +694,8 @@ class Milestone(BaseModel):
 
         A malformed spec cannot be a ``Milestone``, so "never fires" for
         malformed metadata belongs to the caller; an unparseable *anchor*
-        raises ``ValueError``. ``Scheduler._milestone_time_gated`` keeps its
-        own copy of these rules until a follow-up repoints it here.
+        raises ``ValueError``. ``Scheduler._milestone_time_gated`` delegates here
+        and owns the fail-safe withhold plus its deduplicated WARNING.
         """
         if self.mode == 'dated':
             assert self.at is not None

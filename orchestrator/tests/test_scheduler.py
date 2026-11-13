@@ -7685,6 +7685,52 @@ class TestMilestoneTimeGate:
             task, datetime(2026, 9, 1, tzinfo=UTC)
         ) is False
 
+    def test_tz_naive_anchor_is_treated_as_utc(self):
+        naive_anchor = datetime(2026, 7, 25, 9, 0, 0)  # no tzinfo
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': 3600},
+            'milestone_deps_satisfied_at': naive_anchor.isoformat(),
+        })
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 9, 59, tzinfo=UTC)
+        ) is True
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
+        ) is False
+
+    def test_delayed_without_anchor_withholds_silently(self, caplog):
+        """An unset anchor means 'not due yet', not 'malformed': no WARNING."""
+        import logging
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with({'milestone': {'mode': 'delayed', 'after_secs': 60}})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.parametrize('anchor', [12345, 'not-a-timestamp'])
+    def test_bad_delayed_anchor_fails_safe_and_warns_once(self, anchor, caplog):
+        import logging
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': 60},
+            'milestone_deps_satisfied_at': anchor,
+        })
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
     def test_malformed_milestone_warning_deduped_per_task_and_cause(self, caplog):
         """reviewer_comprehensive observability finding (task 2335 β
         amendment): _milestone_time_gated is invoked once per candidate loop
@@ -7718,7 +7764,7 @@ class TestMilestoneTimeGate:
             assert scheduler._milestone_time_gated(task_changed, datetime.now(UTC)) is True
 
         unknown_mode_warnings = [
-            r for r in caplog.records if 'unknown mode' in r.getMessage()
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
         ]
         assert len(unknown_mode_warnings) == 1, (
             f'Expected a fresh WARNING when the malformed cause changes; '
