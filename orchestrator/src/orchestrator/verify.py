@@ -103,6 +103,7 @@ from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
     _unspliceable_pytest_spans,
+    applied_worker_count,
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
@@ -115,7 +116,6 @@ from orchestrator.verify_cmd import (
     split_chain_tail,
     with_junitxml,
     with_pytest_timeout,
-    worker_count_values,
 )
 from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
 
@@ -11839,18 +11839,20 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
 
     So two orthogonal facts, separately sourced:
 
-    - ``n_flag`` — the FIRST worker count the command NAMES, AS PARSED, or
-      ``None`` when it names none. Read off the STRUCTURED ``base_flags``,
-      never by regex over the string: a regex would find the ``-n`` inside a
-      cpu-governed ``<exec> -- /bin/bash -c '...'`` payload and report it as
-      this command's flag. The spellings, and the flag/value pairing that
-      keeps a ``-k '-n'`` from being mistaken for a worker count, are
-      ``verify_cmd.py::worker_count_values``'s, the one decoder the admission
-      guard also reads. A stamp that bound ``-n`` alone would report
-      ``n_flag: null`` for a module config using the long spelling, which the
-      census reads as "no flag on argv, so addopts decided the count" — a
-      wrong fact, silently, in the corpus this deliverable exists to make
-      trustworthy.
+    - ``n_flag`` — the worker count the command's argv APPLIES, AS PARSED, or
+      ``None`` when it names none. argparse is last-wins, so that is the LAST
+      one named, and a role cap verify appends after an earlier ``-n`` (for
+      example ``-n auto ... -n 8``) is the one recorded. Read off the
+      STRUCTURED ``base_flags``, never by regex over the string: a regex would
+      find the ``-n`` inside a cpu-governed ``<exec> -- /bin/bash -c '...'``
+      payload and report it as this command's flag. The spellings, and the
+      flag/value pairing that keeps a ``-k '-n'`` from being mistaken for a
+      worker count, are ``verify_cmd.py::applied_worker_count``'s (built on the
+      one decoder), which the admission guard also reads. A stamp that bound
+      ``-n`` alone would report ``n_flag: null`` for a module config using the
+      long spelling, which the census reads as "no flag on argv, so addopts
+      decided the count" — a wrong fact, silently, in the corpus this
+      deliverable exists to make trustworthy.
     - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
       own subprocess will see it, or ``None`` when nothing sets it. Resolved by
       asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
@@ -11886,7 +11888,7 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
         ).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
         parsed = parse_config_command(cmd)
         if parsed.tool is ToolKind.PYTEST and parsed.raw is None:
-            n_flag = next(iter(worker_count_values(parsed.base_flags)), None)
+            n_flag = applied_worker_count(parsed.base_flags)
     except Exception:
         logger.warning(
             '_xdist_workers: could not read the worker facts off %r; '
