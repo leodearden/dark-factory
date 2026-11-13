@@ -3930,8 +3930,7 @@ class TaskWorkflow:
         # The enqueue-boundary clear in _submit_to_merge_queue covers the normal
         # path, but ghost-loop / eval-mode successes reach DONE without passing
         # through it — so clear here too, keeping a DONE task from carrying a
-        # fresh stamp that would briefly defer an unrelated stranded divergence
-        # orphan in the reaper. Idempotent no-op when unstamped.
+        # fresh stamp. Idempotent no-op when unstamped.
         await self._clear_merge_phase_entered()
 
         # SUCCESS — write completion knowledge (best-effort after merge)
@@ -4194,16 +4193,11 @@ class TaskWorkflow:
 
         self._enter_phase(WorkflowState.MERGE)
 
-        # task 2991: write the durable, restart-survivable merge-phase liveness
-        # stamp immediately on merge entry — BEFORE _check_scope_invariant files
-        # its plan.files/metadata.files divergence L0 and BEFORE the gating bail
-        # below. The orphan-L0 divergence reaper's _has_fresh_merge_phase gate
-        # reads it to DEFER (not promote) a live merge-stage task, which the
-        # pre-enqueue loop (no LLM calls) would otherwise fail the task-2931
-        # routing.latest freshness gate. Placed here so it is refreshed on every
-        # (re-)dispatch into merge phase, including passes that immediately bail
-        # to ESCALATED — exactly the passes a live-but-wedged task cycles
-        # through. (Distinct from the in-memory note_merge_phase_entered at the
+        # task 2991: write the durable merge-phase liveness stamp on merge
+        # entry, BEFORE _check_scope_invariant, which reuses the returned
+        # metadata. The stamp currently has no in-tree reader, since the
+        # orphan-L0 reaper's merge-phase gate was retired (task 3002).
+        # (Distinct from the in-memory note_merge_phase_entered at the
         # retry-loop top, which is the self-redeploy coordinator's signal.)
         _entry_metadata = await self._stamp_merge_phase_entered()
 
@@ -4286,24 +4280,19 @@ class TaskWorkflow:
             # and defensively in the harness _run_slot finally.
             self.scheduler.note_merge_phase_entered(self.task_id)
             # task 2991 (review-fix R2-B): refresh the DURABLE liveness stamp
-            # alongside the in-memory one above, for the same reason. Each
-            # REQUEUED retry re-runs a full vulnerable pre-enqueue window
-            # (Phase-1 rebase, and the rollback-only re-verify
-            # `pre_merge_reverify`; zero LLM calls)
-            # AFTER _submit_to_merge_queue discharged the stamp at the enqueue
-            # boundary. Without this re-stamp that window has neither a durable
-            # merge_phase_liveness nor a fresh routing.latest, so the task
-            # 2931/2991 divergence false positive recurs on every merge retry
-            # (a REQUEUED retry goes through a steward resolution first, so the
-            # merge-entry L0 is already older than orphan_l0_timeout_secs when
-            # attempt 2 begins). The merge-entry stamp above is KEPT — it must
-            # precede _check_scope_invariant and the gating bail, both of which
-            # sit above this loop — so attempt 1 writes twice: an accepted cost
-            # (two cheap best-effort metadata writes, bounded by
-            # max_merge_retries+1 per merge entry) for the simple invariant "a
-            # fresh durable stamp exists at the start of every pre-enqueue
-            # window", which an `if _merge_attempt > 0` would make dependent on
-            # loop-index reasoning.
+            # alongside the in-memory one above, at the start of every
+            # pre-enqueue window: each REQUEUED retry runs after
+            # _submit_to_merge_queue discharged the stamp at the enqueue
+            # boundary. The stamp currently has no in-tree reader, since the
+            # orphan-L0 reaper's merge-phase gate was retired (task 3002).
+            # The merge-entry stamp above is KEPT — it must precede
+            # _check_scope_invariant, which reuses its returned metadata — so
+            # attempt 1 writes twice: an accepted cost (two cheap best-effort
+            # metadata writes, bounded by max_merge_retries+1 per merge entry)
+            # for the simple invariant "a fresh durable stamp exists at the
+            # start of every pre-enqueue window", which an
+            # `if _merge_attempt > 0` would make dependent on loop-index
+            # reasoning.
             await self._stamp_merge_phase_entered()
             # Phase 1: pre-merge rebase (no lock, no queue slot); see
             # _rebase_before_enqueue.
@@ -7496,18 +7485,9 @@ class TaskWorkflow:
     async def _stamp_merge_phase_entered(self) -> dict | None:
         """Persist a durable merge-phase-liveness stamp into task metadata.
 
-        Task 2991: the restart-survivable analog of ``routing.latest`` for the
-        orphan-L0 divergence reaper. The pre-enqueue MERGE loop (rebase +
-        scoped verify + queue submit) makes NO LLM calls, so it never refreshes
-        ``metadata.routing.latest.decided_at`` — the reaper's task-2931
-        ``_has_fresh_dispatch`` gate cannot see a legitimately-live merge-stage
-        task and false-promotes its scope-invariant L0 to a human-facing L1
-        (cluster esc-2789-22). This stamp records ``{'entered_at': <iso>}``;
-        the reaper's ``_has_fresh_merge_phase`` gate defers a divergence L0
-        whose task carries a fresh stamp. Being durable task metadata it
-        survives an orchestrator restart (unlike the per-process
-        ``Scheduler._merge_phase_at``), covering the exact redispatch window in
-        which the false positive wedged 2789/2885.
+        Task 2991: the stamp records ``{'entered_at': <iso>}``. It currently
+        has no in-tree reader, since the orphan-L0 reaper's merge-phase gate
+        was retired (task 3002).
 
         Written at TWO points in :meth:`_run_merge_phase`, so a fresh stamp
         exists at the start of every pre-enqueue window: (1) on merge entry,
@@ -7526,8 +7506,7 @@ class TaskWorkflow:
         (``retry_ledger``, ``memory_hints``) is not clobbered, update the
         in-memory task, and persist via ``scheduler.update_task`` inside a
         logged try/except. A persistence failure must never crash the merge
-        path — a lost stamp is self-healing (re-written on the next merge entry,
-        and at worst the reaper promotes rather than silently suppresses).
+        path — a lost stamp is self-healing (re-written on the next merge entry).
 
         Returns:
             The backend metadata blob this stamp just read (``{}`` when the
@@ -7567,8 +7546,7 @@ class TaskWorkflow:
         called at the durable-enqueue boundary in
         :meth:`_submit_to_merge_queue` (alongside ``scheduler.clear_merge_phase``)
         and on merge SUCCESS in :meth:`_merge_and_finalise`, so a just-enqueued
-        / just-merged task does not carry a fresh stamp that would briefly defer
-        an unrelated stranded divergence orphan.
+        / just-merged task does not carry a fresh stamp.
 
         Deletion requires ``metadata_mode='replace'`` (review-fix R2-A). A plain
         ``scheduler.update_task(metadata=...)`` resolves to
@@ -7583,9 +7561,8 @@ class TaskWorkflow:
         write is SKIPPED (in-memory clear only), because a ``'replace'`` built
         from in-memory-only metadata would delete backend-only keys
         (``memory_hints``, ``_causation_id``) — the #4271 sibling-clobber bug.
-        The bounded cost of skipping is that the reaper may keep deferring for
-        up to ``orphan_l0_merge_phase_freshness_secs`` before the stale stamp
-        ages out (deferral, never suppression).
+        Skipping leaves a stale stamp, which currently has no in-tree reader,
+        since the orphan-L0 reaper's merge-phase gate was retired (task 3002).
 
         ACCEPTED residual race (review amendment) — ``'replace'`` is NOT
         unconditionally safe once the read succeeded. This is a
@@ -7593,9 +7570,7 @@ class TaskWorkflow:
         and a whole-blob overwrite drops any key another process wrote in
         between; ``'merge'`` mode could not lose an unsupplied key that way.
         At risk in that window: ``memory_hints`` re-attached by Stage-2
-        reconciliation, ``_causation_id``, and ``routing.latest`` — the input
-        to the reaper's SIBLING ``_has_fresh_dispatch`` gate, so a clobber
-        there would re-open the task-2931 false positive. Mitigations, in
+        reconciliation, ``_causation_id``, and ``routing.latest``. Mitigations, in
         order: (1) read and write are back-to-back with no intervening awaits,
         which is the narrowest this can be without a new backend primitive;
         (2) this workflow issues no LLM call while the clear runs, so its own
@@ -7610,9 +7585,8 @@ class TaskWorkflow:
         ``test_clear_replace_loses_concurrent_backend_write_in_read_window``.
 
         Deliberately NOT cleared defensively in the harness ``_run_slot``
-        finally (unlike the in-memory ``clear_merge_phase`` grace stamp): an
-        abnormal exit must LEAVE the durable stamp so the reaper keeps deferring
-        across the crash/restart/redispatch window (fix-direction b). A
+        finally (unlike the in-memory ``clear_merge_phase`` grace stamp), so an
+        abnormal exit leaves the durable stamp in place. A
         persistence failure must never crash the merge path; a subsequent merge
         (re-)entry re-stamps, so a lost clear is self-healing.
 
@@ -12760,34 +12734,8 @@ class TaskWorkflow:
         # abnormal exits before this point.)
         self.scheduler.clear_merge_phase(self.task_id)
         # Task 2991: discharge the DURABLE merge-phase-liveness stamp at the same
-        # boundary — the pre-enqueue window the orphan reaper's
-        # _has_fresh_merge_phase gate protects is over, so a lingering fresh
-        # stamp would briefly defer an unrelated stranded divergence orphan.
-        # Unlike the in-memory grace stamp above, this one is deliberately NOT
-        # cleared defensively in the harness _run_slot finally: an abnormal exit
-        # before this point must LEAVE the stamp so the reaper keeps deferring
-        # across the crash/restart/redispatch window.
-        #
-        # KNOWN, ACCEPTED GAP (review amendment): discharging here leaves the
-        # POST-enqueue window (queue wait + worker rebase/verify/merge) with no
-        # durable liveness signal — the stamp is gone and routing.latest stays
-        # stale, since the merge worker makes no LLM calls either. In-process
-        # that window IS covered: the task is still in _dispatched, so
-        # is_actively_held short-circuits the reaper. After a restart it is
-        # NOT: Harness._recover_pending_merges rebuilds the request from the
-        # merge journal and hands it to the WORKER, which never re-enters
-        # _run_merge_phase (nothing re-stamps), and _reconcile_stranded_in_
-        # progress LEAVEs — does not re-dispatch — a task that has an open
-        # escalation, which the merge-entry divergence L0 is. So a restart
-        # while the merge is queued/in-flight still promotes that L0.
-        # Accepted here rather than fixed: closing it means moving the
-        # discharge to the merge terminal outcome, which changes the
-        # stamp/clear pairing this task deliberately co-located with task
-        # 2753's in-memory clear_merge_phase (pinned by TestEnqueueClearWiring)
-        # — filed as follow-up work. The gap is pinned meanwhile by
-        # test_orphan_l0_reaper.py::...::
-        # test_post_enqueue_restart_still_promotes_known_accepted_gap, so it is
-        # visible in the suite instead of silently absent from it.
+        # boundary. The stamp currently has no in-tree reader, since the
+        # orphan-L0 reaper's merge-phase gate was retired (task 3002).
         await self._clear_merge_phase_entered()
 
         # Soft-cancel hook: detach the workflow waiter instead of cancelling
@@ -17346,11 +17294,6 @@ class TaskWorkflow:
         alpha-stripped and thus unverifiable as a safe metadata.files
         superset (review amendment, task 3429). Mirrors
         :meth:`_escalate_plan_overwrite`'s submission shape.
-
-        The ``summary`` string is load-bearing: ``harness._is_scope_divergence_orphan``
-        discriminates this entire escalation class on the substring
-        ``'plan.files/metadata.files divergence detected'``. Keep it verbatim;
-        only ``detail`` is free to evolve.
         """
         summary = (
             f'plan.files/metadata.files divergence detected for task {self.task_id}'
