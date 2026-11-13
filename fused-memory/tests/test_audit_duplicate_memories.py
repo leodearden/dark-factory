@@ -6212,6 +6212,10 @@ _LIVENESS_PLAN_KEYS = frozenset({
 # stays attributable to the task that caused it.
 _PER_CATEGORY_PLAN_KEYS = frozenset({'ann_threshold_by_category'})
 
+# Task 3136: the per-member retention counts the weekly duplicate-cluster
+# report reads beside the clusters.
+_REPORT_FEED_PLAN_KEYS = frozenset({'retained_carveout'})
+
 
 class TestBuildSweepPlanLivenessRecurrences:
     """The third class reaches the plan -- and never reaches a delete."""
@@ -6280,6 +6284,7 @@ class TestBuildSweepPlanLivenessRecurrences:
 
         assert set(plan) == (
             _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS | _PER_CATEGORY_PLAN_KEYS
+            | _REPORT_FEED_PLAN_KEYS
         )
         assert plan['ann_threshold_by_category'] == {}, (
             'a caller that ran no ANN path reports an empty map, not a null'

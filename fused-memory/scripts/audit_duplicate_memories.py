@@ -162,6 +162,11 @@ Safety carve-outs:
     (see "Only chain-free evidence may DELETE" above).
   - A cluster whose members all share one ``metadata.topic`` is task 3136's
     Option-C carve-out: an expected shape, never a delete candidate.
+  - In any other cluster, a member carrying a non-empty ``metadata.topic``
+    (a retained Option-C peer) or ``metadata.parent_id`` (an amendment or
+    sighting child) is never a delete candidate either: it is reported in
+    ``retained_member_ids`` and counted in ``retained_carveout`` (see
+    ``split_retained``).
   - Liveness-snapshot recurrence groups are report-only BY CONSTRUCTION --
     they are never added to the delete lists, rather than filtered out of
     them downstream where a later refactor could drop the filter.
@@ -1348,10 +1353,11 @@ def partition_topic_carveout(
     survivor selection, so carved-out clusters never reach ``pick_survivor``,
     whose contract is untouched. Do NOT re-derive this rule elsewhere.
 
-    The boundary is deliberately narrow: only a FULLY shared, non-empty topic
-    carves out. Differing topics, a partially-missing topic, or an
-    empty-string topic all stay actionable — a cluster is only exempt when
-    every member was deliberately tagged the same way.
+    This is the CLUSTER half of the carve-out: only a FULLY shared, non-empty
+    topic removes a whole cluster from the report. A cluster with differing
+    or partially-missing topics stays actionable and reported, and
+    ``split_retained`` is the per-member half that still keeps each of its
+    stamped (and child) members out of the delete lists.
 
     Note ``metadata.topic`` has zero corpus footprint until 3195/3201 land,
     so this is inert-but-correct today by design: implemented now so it is
@@ -1362,6 +1368,46 @@ def partition_topic_carveout(
     for group in groups:
         (carved_out if _shared_topic(group) else actionable).append(group)
     return actionable, carved_out
+
+
+_RETAINED_CHILD_RECORD = 'child_record'
+_RETAINED_TOPIC_STAMPED = 'topic_stamped'
+_RETENTION_REASONS = (_RETAINED_TOPIC_STAMPED, _RETAINED_CHILD_RECORD)
+
+
+def _retention_reason(record: dict) -> str | None:
+    """Why ``--apply`` may never delete *record*, or None when it may.
+
+    The ONE definition. A record attached to a parent (``metadata.parent_id``,
+    an amendment or sighting child) would be orphaned from its parent's
+    lineage, and a topic-stamped record is a deliberately retained Option-C
+    peer whose siblings need not sit in the same cluster. ``child_record`` is
+    checked first, so a stamped child is reported once.
+    """
+    metadata = record.get('metadata') or {}
+    if metadata.get('parent_id'):
+        return _RETAINED_CHILD_RECORD
+    if metadata.get('topic'):
+        return _RETAINED_TOPIC_STAMPED
+    return None
+
+
+def split_retained(losers: list[dict]) -> tuple[list[dict], list[dict[str, Any]]]:
+    """Split a cluster's *losers* into ``(deletable, retained)``.
+
+    The per-member half of task 3136's carve-out (``partition_topic_carveout``
+    is the whole-cluster half). Retained entries are ``{'id', 'reason'}``
+    with the reason from ``_retention_reason``, in *losers* order.
+    """
+    deletable: list[dict] = []
+    retained: list[dict[str, Any]] = []
+    for loser in losers:
+        reason = _retention_reason(loser)
+        if reason is None:
+            deletable.append(loser)
+        else:
+            retained.append({'id': loser.get('id'), 'reason': reason})
+    return deletable, retained
 
 
 _MAX_LEXICAL_RATIO_MEMBERS = 40
@@ -1672,10 +1718,13 @@ def build_sweep_plan(
         ``found_by`` (``['ann']``, ``['lexical']`` or both),
         ``lexical_clustered``, ``lexical_spanning``, ``ann_clique``,
         ``ann_max_score``, ``lexical_max_ratio``,
-        ``lexical_max_ratio_sampled`` and ``delete_candidate_ids``; the plan
-        additionally carries ``threshold``, ``ann_threshold``,
-        ``ann_disclosure``, ``topic_carveout_clusters`` /
-        ``topic_carveout_groups`` (see ``partition_topic_carveout``),
+        ``lexical_max_ratio_sampled``, ``delete_candidate_ids`` and
+        ``retained_member_ids`` (losers ``split_retained`` keeps out of every
+        delete list, as ``{'id', 'reason'}``); the plan additionally carries
+        ``threshold``, ``ann_threshold``, ``ann_disclosure``,
+        ``topic_carveout_clusters`` / ``topic_carveout_groups`` (see
+        ``partition_topic_carveout``), ``retained_carveout`` (retained losers
+        counted per reason, every reason always present),
         ``apply_delete_candidates`` / ``apply_withheld_clusters`` /
         ``apply_withheld_groups`` (see
         ``restrict_delete_candidates_for_apply``) and ``path_verdicts``
@@ -1699,6 +1748,7 @@ def build_sweep_plan(
     lexical_only = ann_only = both_paths = 0
     clusters_total = 0
     topic_carveout_groups: list[dict[str, Any]] = []
+    retained_carveout = dict.fromkeys(_RETENTION_REASONS, 0)
 
     # Cluster PER CATEGORY. Widening the filter must not merge the corpus: a
     # preference and a procedure that happen to read alike are different
@@ -1804,7 +1854,10 @@ def build_sweep_plan(
             )
 
             survivor, losers = pick_survivor(group)
-            loser_ids = [m.get('id') for m in losers]
+            deletable, retained = split_retained(losers)
+            deletable_ids = [m.get('id') for m in deletable]
+            for entry in retained:
+                retained_carveout[entry['reason']] += 1
             near_duplicate_groups.append({
                 'survivor_id': survivor.get('id'),
                 'survivor_content': survivor.get('content'),
@@ -1820,9 +1873,10 @@ def build_sweep_plan(
                 'ann_max_score': max(scores) if scores else None,
                 'lexical_max_ratio': max_ratio,
                 'lexical_max_ratio_sampled': ratio_sampled,
-                'delete_candidate_ids': loser_ids,
+                'delete_candidate_ids': deletable_ids,
+                'retained_member_ids': retained,
             })
-            delete_candidates.extend(loser_ids)
+            delete_candidates.extend(deletable_ids)
 
     # The THIRD candidate class, run ONCE over the whole list rather than
     # inside the per-category loop above: it does its own
@@ -1859,6 +1913,7 @@ def build_sweep_plan(
         'ann_disclosure': echoed_disclosure,
         'topic_carveout_clusters': len(topic_carveout_groups),
         'topic_carveout_groups': topic_carveout_groups,
+        'retained_carveout': retained_carveout,
         'liveness_snapshot_recurrence_clusters': len(liveness_groups),
         'liveness_snapshot_recurrence_groups': liveness_groups,
         'liveness_snapshot_disclosure': liveness_disclosure,
