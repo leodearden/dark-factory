@@ -11,6 +11,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -117,6 +118,13 @@ _MEMORY_CLOSE_STEP_TIMEOUT = 20.0
 # Worst case (Fix A): drain(5)+close(5)+sqlite_watchdog(5)+event_queue(5)
 # +harness_cancel(25)+memory_close(20)+journal_close(5) = 70s; +5s headroom = 75.
 _FORCE_EXIT_BUDGET = 75.0
+
+# A repeat stop signal this soon after the first is the same stop delivered
+# twice; the measurement behind the value is in the module docstring of
+# fused-memory/tests/test_server_shutdown.py. Must stay below the drain, or a
+# deliberate second signal could not force exit during it. Enforced by
+# TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
+_OPERATOR_STOP_REPEAT_WINDOW_SECS = 3.0
 
 # Mirrors TimeoutStopSec=90 in the committed systemd unit template
 # (scripts/fused-memory.service.template). Invariant (survey finding D1):
@@ -2317,45 +2325,45 @@ def _build_recon_report_components(
     return state, mcp, uv_config
 
 
-def _make_operator_stop_callback(*servers: Any) -> Callable[[], None]:
-    """Return a callback implementing graceful-then-forced shutdown escalation.
+def _make_operator_stop_callback(
+    *servers: Any,
+    clock: Callable[[], float] = time.monotonic,
+    repeat_window_secs: float = _OPERATOR_STOP_REPEAT_WINDOW_SECS,
+) -> Callable[[], None]:
+    """Return the ``on_operator_stop`` callback that stops every server together.
 
-    Used as the ``on_operator_stop`` argument to :func:`_install_operator_stop_handler`
-    so that a SIGTERM/SIGINT signal stops **both** the primary uvicorn.Server
-    and the recon_report uvicorn.Server simultaneously.
-
-    Without this, ``asyncio.gather(server.serve(), recon_server.serve())`` never
-    resolves on operator shutdown because only the primary server's ``should_exit``
-    flag was flipped — the recon_report server kept running, blocking the gather,
-    and ``run_server()`` hung until SIGKILL.
-
-    Stateful second-signal escalation (survey finding D1, second gap): the 1st
-    invocation sets only ``should_exit = True`` (graceful). The 2nd and every
-    subsequent invocation additionally sets ``force_exit = True``. This mirrors
-    uvicorn's own default signal handler contract (1st SIGINT/SIGTERM graceful,
-    2nd forces immediate exit) — a contract otherwise lost here because
-    ``install_signal_handlers`` is neutered, leaving an operator with no way to
-    force-exit a wedged shutdown without this escalation.
-
-    Args:
-        *servers: Zero or more server objects exposing writable ``should_exit``
-            and ``force_exit`` attributes (typically :class:`uvicorn.Server`
-            instances, but any object with the attributes works — including
-            test fakes).
-
-    Returns:
-        A zero-argument callable that flips ``should_exit`` (and, from the 2nd
-        call onward, ``force_exit``) to ``True`` on each server.
+    The first signal drains: it sets ``should_exit`` on each server. A repeat
+    arriving within ``repeat_window_secs`` of the FIRST signal is the same stop
+    delivered twice and is ignored. A later signal also sets ``force_exit``,
+    keeping uvicorn's deliberate-second-Ctrl-C escape hatch, which is otherwise
+    lost because ``install_signal_handlers`` is neutered. Contract pinned by
+    fused-memory/tests/test_operator_signal_handler.py::TestOperatorStopCallbackForceExit.
     """
-    call_count = 0
+    first_signal_at: float | None = None
 
     def _stop() -> None:
-        nonlocal call_count
-        call_count += 1
+        nonlocal first_signal_at
+        now = clock()
+        if first_signal_at is None:
+            first_signal_at = now
+            for s in servers:
+                s.should_exit = True
+            return
+        since_first = now - first_signal_at
+        if since_first < repeat_window_secs:
+            logger.info(
+                'Repeat stop signal %.3f s after the first ignored as a duplicate delivery',
+                since_first,
+            )
+            return
+        logger.warning(
+            'Second stop signal %.3f s after the first: forcing exit without '
+            'draining in-flight requests',
+            since_first,
+        )
         for s in servers:
             s.should_exit = True
-            if call_count >= 2:
-                s.force_exit = True
+            s.force_exit = True
 
     return _stop
 

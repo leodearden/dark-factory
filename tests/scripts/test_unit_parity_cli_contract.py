@@ -483,6 +483,7 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
             '[fused_memory_unit_parity]   - RestartSteps=4\n'
             '[fused_memory_unit_parity]   - TimeoutStartSec=300\n'
             '[fused_memory_unit_parity]   - TimeoutStopSec=90\n'
+            '[fused_memory_unit_parity]   - KillMode=mixed\n'
             '[fused_memory_unit_parity]   - ExecStopPost=\n'
         ),
         (
@@ -520,6 +521,7 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
             '[fused_memory_unit_parity]   - RestartSteps=4\n'
             '[fused_memory_unit_parity]   - TimeoutStartSec=300\n'
             '[fused_memory_unit_parity]   - TimeoutStopSec=90\n'
+            '[fused_memory_unit_parity]   - KillMode=mixed\n'
             '[fused_memory_unit_parity]   - ExecStopPost=\n'
         ),
         (

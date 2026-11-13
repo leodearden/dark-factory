@@ -271,6 +271,22 @@ class TestSocketActivation:
         assert hooks[0].endswith("/scripts/stop-socket-unless-restarting.sh %n")
 
 
+@pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
+class TestKillModeMixed:
+    """A stop must signal only the main process, so the server receives one
+    SIGTERM and drains its in-flight tool calls (task 9493)."""
+
+    def test_service_kill_mode_is_mixed(self, unit_path: Path) -> None:
+        service = _parse_systemd_unit(unit_path)["Service"]
+        kill_modes = [d for d in service if d.startswith("KillMode=")]
+        assert kill_modes == ["KillMode=mixed"], (
+            f"{unit_path.name} must declare exactly one KillMode=mixed under [Service]; "
+            f"found {kill_modes}. With the default control-group, systemd SIGTERMs "
+            "every process in the cgroup, so the server receives 2+ stop signals and "
+            "the curator/judge subprocesses behind live tool calls are killed."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Local embedder start hooks and cutover hold (task 6797)
 # ---------------------------------------------------------------------------
