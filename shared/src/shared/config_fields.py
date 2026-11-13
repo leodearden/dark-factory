@@ -104,71 +104,6 @@ def reloadable_paths(model_cls: type[BaseModel]) -> frozenset[str]:
     )
 
 
-@functools.cache
-def legacy_spellings(model_cls: type[BaseModel]) -> Mapping[str, str]:
-    spellings: dict[str, str] = {}
-    for declared in declared_fields(model_cls):
-        for old_path, new_path in _declared_moves(declared):
-            if old_path in spellings:
-                raise ConfigDeclarationError(
-                    f'{old_path!r} is declared as the old spelling of both '
-                    f'{spellings[old_path]} and {new_path}'
-                )
-            spellings[old_path] = new_path
-    for old_path, new_path in spellings.items():
-        if old_path in _declared_paths(model_cls):
-            raise ConfigDeclarationError(
-                f'{old_path!r} is declared as the old spelling of {new_path}, '
-                f'but {old_path} is still a declared path of {model_cls.__name__}'
-            )
-    return MappingProxyType(spellings)
-
-
-@functools.cache
-def _declared_paths(model_cls: type[BaseModel]) -> frozenset[str]:
-    paths = {declared.path for declared in declared_fields(model_cls)}
-    for declared in declared_fields(model_cls):
-        if isinstance(declared.shape, Table):
-            paths |= {f'{declared.path}.{member.value}' for member in declared.shape.key_enum}
-    return frozenset(paths)
-
-
-def _declared_moves(declared: DeclaredField) -> Iterator[tuple[str, str]]:
-    for marker in declared.info.metadata:
-        if not isinstance(marker, (LegacySpelling, TableLegacy)):
-            continue
-        if declared.in_table_row:
-            raise ConfigDeclarationError(
-                f'{declared.path}: {marker!r} sits inside a table-row class, which is '
-                f'mounted once per row; declare the move as TableLegacy on the table field'
-            )
-        if isinstance(marker, LegacySpelling):
-            yield marker.path, declared.path
-        elif isinstance(declared.shape, Table):
-            for old_path, (row, knob) in _table_moves(declared.path, declared.shape, marker):
-                yield old_path, f'{declared.path}.{row}.{knob}'
-
-
-def _table_moves(
-    path: str, table: Table, marker: TableLegacy
-) -> list[tuple[str, tuple[str, str]]]:
-    moves = [
-        (f'{old_block}.{member.value}', (member.value, knob))
-        for old_block, knob in marker.knob_major_blocks
-        for member in table.key_enum
-    ]
-    moves += marker.rows.items()
-    _require_rows(path, table, frozenset(row for _, (row, _) in moves), 'TableLegacy')
-    knobs = list(table.row_cls.model_fields)
-    unknown = sorted({knob for _, (_, knob) in moves} - set(knobs))
-    if unknown:
-        raise ConfigDeclarationError(
-            f'{path}: TableLegacy names {unknown}, which are not fields of '
-            f'{table.row_cls.__name__}; fields: {knobs}'
-        )
-    return moves
-
-
 def _walk(
     model_cls: type[BaseModel],
     prefix: tuple[str, ...],
@@ -280,3 +215,179 @@ def _require_rows(path: str, table: Table, rows: frozenset[str], named_by: str) 
 
 def _describe(marker: object) -> str:
     return 'Reload.GREEN' if marker is Reload.GREEN else repr(marker)
+
+
+@functools.cache
+def legacy_spellings(model_cls: type[BaseModel]) -> Mapping[str, str]:
+    spellings = (move.spelling for move in _legacy_moves(model_cls))
+    return MappingProxyType({spelling.old_path: spelling.new_path for spelling in spellings})
+
+
+@dataclass(frozen=True)
+class DeprecatedSpelling:
+    old_path: str
+    new_path: str
+
+
+class ConflictingSpellings(ValueError):
+    def __init__(self, old_path: str, new_path: str, old_value: object, new_value: object) -> None:
+        super().__init__(
+            f'{old_path}={old_value!r} and {new_path}={new_value!r} disagree: {old_path} '
+            f'is the old spelling of {new_path}; set only {new_path}'
+        )
+        self.old_path = old_path
+        self.new_path = new_path
+        self.old_value = old_value
+        self.new_value = new_value
+
+
+def pivot_legacy_spellings(
+    model_cls: type[BaseModel], data: Mapping[str, object]
+) -> tuple[dict[str, object], tuple[DeprecatedSpelling, ...]]:
+    pivoted = _copy_mappings(data)
+    deprecated: list[DeprecatedSpelling] = []
+    for move in _legacy_moves(model_cls):
+        old_chain = _container_chain(pivoted, move.old)
+        if old_chain is None:
+            continue
+        old_value = old_chain[-1][move.old[-1]]
+        new_chain = _container_chain(pivoted, move.new)
+        if new_chain is not None:
+            new_value = new_chain[-1][move.new[-1]]
+            if new_value != old_value:
+                spelling = move.spelling
+                raise ConflictingSpellings(
+                    spelling.old_path, spelling.new_path, old_value, new_value
+                )
+        elif not _place(pivoted, move.new, old_value):
+            continue
+        _prune(old_chain, move.old, keep=_declared_segments(model_cls))
+        deprecated.append(move.spelling)
+    return pivoted, tuple(deprecated)
+
+
+@dataclass(frozen=True)
+class _Move:
+    old: tuple[str, ...]
+    new: tuple[str, ...]
+
+    @property
+    def spelling(self) -> DeprecatedSpelling:
+        return DeprecatedSpelling('.'.join(self.old), '.'.join(self.new))
+
+
+@functools.cache
+def _legacy_moves(model_cls: type[BaseModel]) -> tuple[_Move, ...]:
+    moves: dict[tuple[str, ...], _Move] = {}
+    for declared in declared_fields(model_cls):
+        for move in _declared_moves(declared):
+            if move.old in moves:
+                claimed = moves[move.old].spelling
+                raise ConfigDeclarationError(
+                    f'{claimed.old_path!r} is declared as the old spelling of both '
+                    f'{claimed.new_path} and {move.spelling.new_path}'
+                )
+            moves[move.old] = move
+    for move in moves.values():
+        if move.old in _declared_segments(model_cls):
+            spelling = move.spelling
+            raise ConfigDeclarationError(
+                f'{spelling.old_path!r} is declared as the old spelling of {spelling.new_path}, '
+                f'but {spelling.old_path} is still a declared path of {model_cls.__name__}'
+            )
+    return tuple(moves.values())
+
+
+@functools.cache
+def _declared_segments(model_cls: type[BaseModel]) -> frozenset[tuple[str, ...]]:
+    segments = {declared.segments for declared in declared_fields(model_cls)}
+    for declared in declared_fields(model_cls):
+        if isinstance(declared.shape, Table):
+            segments |= {(*declared.segments, member.value) for member in declared.shape.key_enum}
+    return frozenset(segments)
+
+
+def _declared_moves(declared: DeclaredField) -> Iterator[_Move]:
+    for marker in declared.info.metadata:
+        if not isinstance(marker, (LegacySpelling, TableLegacy)):
+            continue
+        if declared.in_table_row:
+            raise ConfigDeclarationError(
+                f'{declared.path}: {marker!r} sits inside a table-row class, which is '
+                f'mounted once per row; declare the move as TableLegacy on the table field'
+            )
+        if isinstance(marker, LegacySpelling):
+            yield _Move(_marker_path_segments(marker.path), declared.segments)
+        elif isinstance(declared.shape, Table):
+            for old, row, knob in _table_moves(declared.path, declared.shape, marker):
+                yield _Move(old, (*declared.segments, row, knob))
+
+
+def _table_moves(
+    path: str, table: Table, marker: TableLegacy
+) -> list[tuple[tuple[str, ...], str, str]]:
+    moves = [
+        ((*_marker_path_segments(old_block), member.value), member.value, knob)
+        for old_block, knob in marker.knob_major_blocks
+        for member in table.key_enum
+    ]
+    moves += [
+        (_marker_path_segments(old_path), row, knob)
+        for old_path, (row, knob) in marker.rows.items()
+    ]
+    _require_rows(path, table, frozenset(row for _, row, _ in moves), 'TableLegacy')
+    knobs = list(table.row_cls.model_fields)
+    unknown = sorted({knob for _, _, knob in moves} - set(knobs))
+    if unknown:
+        raise ConfigDeclarationError(
+            f'{path}: TableLegacy names {unknown}, which are not fields of '
+            f'{table.row_cls.__name__}; fields: {knobs}'
+        )
+    return moves
+
+
+def _marker_path_segments(dotted: str) -> tuple[str, ...]:
+    return tuple(dotted.split('.'))
+
+
+def _copy_mappings(tree: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: _copy_mappings(value) if isinstance(value, Mapping) else value
+        for key, value in tree.items()
+    }
+
+
+def _container_chain(
+    tree: dict[str, object], segments: tuple[str, ...]
+) -> list[dict[str, object]] | None:
+    chain = [tree]
+    for name in segments[:-1]:
+        child = chain[-1].get(name)
+        if not isinstance(child, dict):
+            return None
+        chain.append(child)
+    return chain if segments[-1] in chain[-1] else None
+
+
+def _place(tree: dict[str, object], segments: tuple[str, ...], value: object) -> bool:
+    node = tree
+    for name in segments[:-1]:
+        child = node.setdefault(name, {})
+        if not isinstance(child, dict):
+            return False
+        node = child
+    node[segments[-1]] = value
+    return True
+
+
+def _prune(
+    chain: list[dict[str, object]],
+    segments: tuple[str, ...],
+    *,
+    keep: frozenset[tuple[str, ...]],
+) -> None:
+    del chain[-1][segments[-1]]
+    for depth in range(len(segments) - 1, 0, -1):
+        if chain[depth] or segments[:depth] in keep:
+            return
+        del chain[depth - 1][segments[depth - 1]]
