@@ -16529,7 +16529,8 @@ class GitOps:
         When *rename_branch*, the branch is renamed first and renamed back if
         the move fails, so the two stay together. ``os.rename`` never copies:
         a cross-device *dest* fails rather than duplicating a warm lane's
-        build tree.
+        build tree. The dir's gitfile is repointed first
+        (:meth:`_sever_parked_gitfile`) and restored if the move fails.
         """
         prefix = self.config.branch_prefix
         full_old, full_new = f'{prefix}{bare}', f'{prefix}{parked}'
@@ -16538,16 +16539,43 @@ class GitOps:
             rc, _, err = await _run(['git', 'branch', '-m', full_old, full_new], cwd=self.project_root)
             if rc != 0:
                 raise RuntimeError(f'git branch -m {full_old} -> {full_new} failed (rc={rc}): {err}')
+        original_gitfile: str | None = None
         try:
             if dest.exists():
                 raise FileExistsError(f'quarantine destination {dest} already exists')
+            original_gitfile = await self._sever_parked_gitfile(worktree, parked)
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.rename(worktree, dest)
-        except OSError:
+        except (OSError, RuntimeError):
+            if original_gitfile is not None:
+                (worktree / '.git').write_text(original_gitfile)
             if has_branch:
                 await _run(['git', 'branch', '-m', full_new, full_old], cwd=self.project_root)
             raise
         return full_new if has_branch else None
+
+    async def _sever_parked_gitfile(self, worktree: Path, parked: str) -> str | None:
+        """Repoint *worktree*'s ``.git`` gitfile at ``<common-dir>/worktrees/<parked>``, an admin entry git never creates.
+
+        An unregistered dir's gitfile still names its ORIGINAL admin entry,
+        which the next ``git worktree add`` at the same slot recreates; git in
+        the parking would then report and commit onto that live task's
+        checkout. Pointed at a parking-unique, absent entry, git there fails
+        closed (``not a git repository``). Returns the original gitfile text,
+        or None when there is no gitfile to repoint.
+        """
+        gitfile = worktree / '.git'
+        if not gitfile.is_file():
+            return None
+        rc, common_dir, err = await _run(
+            ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(f'git rev-parse --git-common-dir failed (rc={rc}): {err}')
+        original = gitfile.read_text()
+        gitfile.write_text(f'gitdir: {Path(common_dir.strip()) / "worktrees" / parked}\n')
+        return original
 
     async def _parked_outcome(self, dest: Path, parked_branch: str | None) -> QuarantineOutcome:
         if parked_branch is None:

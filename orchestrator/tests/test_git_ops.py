@@ -7501,6 +7501,25 @@ class TestOrphanWorktreeHelpers:
         assert outcome.dest.is_dir()
         assert outcome.branch is None
 
+    async def test_an_unregistered_parking_never_aliases_the_reused_slot(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-alias')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        (info.path / 'wip.py').write_text('uncommitted\n')
+        await _drop_admin_entry(git_ops, info.path)
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-alias', 'unit-test')
+        assert outcome.dest is not None
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', 'task/q-alias-next', str(info.path)],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+
+        rc, head, _ = await _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=outcome.dest)
+        assert rc != 0, f'git in the parking resolved to a checkout: {head!r}'
+        assert (outcome.dest / 'wip.py').read_text() == 'uncommitted\n'
+
     async def test_quarantine_snapshots_and_stamps_provenance(self, git_ops: GitOps):
         info = await git_ops.create_worktree('q-prov')
         ta = TaskArtifacts.for_task(info.path, 'q-prov')
