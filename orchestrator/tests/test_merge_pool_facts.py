@@ -32,7 +32,7 @@ def test_a_long_waiting_list_is_capped_and_counts_what_it_left_out() -> None:
 
     records.record(_req(0), 'normal', {'high': [], 'normal': waiting}, EMPTY_SUFFIX_CONFLICT_GRAPH)
 
-    record = records.take('mr-0')
+    record: dict[str, Any] = records.take('mr-0')
     assert len(record['waiting']) == WAITING_CAP
     assert record['waiting_dropped'] == 5
     assert record['waiting'][0]['first_enqueued_at'] == 1.0
