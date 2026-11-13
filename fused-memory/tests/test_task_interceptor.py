@@ -4960,6 +4960,7 @@ async def test_validate_done_provenance_accepts_operational_verified(tmp_path):
         require=False,
         is_recon_stage=False,
         git_runner=run_git,
+        stamp_clock=_fixed_stamp_clock,
     )
 
     assert err is None
@@ -4984,6 +4985,7 @@ async def test_validate_done_provenance_operational_verified_requires_escalation
         require=False,
         is_recon_stage=False,
         git_runner=run_git,
+        stamp_clock=_fixed_stamp_clock,
     )
 
     assert resolved is None
@@ -5004,6 +5006,7 @@ async def test_validate_done_provenance_operational_verified_requires_note(tmp_p
         require=False,
         is_recon_stage=False,
         git_runner=run_git,
+        stamp_clock=_fixed_stamp_clock,
     )
 
     assert resolved is None
@@ -5025,6 +5028,7 @@ async def test_validate_done_provenance_operational_verified_rejects_recon_stage
         require=False,
         is_recon_stage=True,
         git_runner=run_git,
+        stamp_clock=_fixed_stamp_clock,
     )
 
     assert resolved is None
@@ -5096,6 +5100,7 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
             # which TestDeterministicProvenanceCallerBar owns.
             agent_id='orchestrator', config=FusedMemoryConfig(),
             git_runner=run_git,
+            stamp_clock=_fixed_stamp_clock,
         )
         assert err is None, f'kind={kind!r} minimal payload rejected: {err}'
         assert resolved is not None, f'kind={kind!r} resolved to None with no error'
@@ -5798,17 +5803,13 @@ async def test_nul_commit_is_refused_as_unresolved_not_raised(
 _FIXED_STAMP = '2026-08-06T01:23:45.678901+00:00'
 
 
-@pytest.fixture
-def frozen_provenance_stamp(monkeypatch):
-    """Pin the stamp clock so assertions are exact, not range checks."""
-    import fused_memory.middleware.task_interceptor as ti_mod
-
-    monkeypatch.setattr(ti_mod, '_provenance_stamp_now', lambda: _FIXED_STAMP)
+def _fixed_stamp_clock() -> str:
+    """A stamp clock pinned so assertions are exact, not range checks."""
     return _FIXED_STAMP
 
 
 @pytest.mark.asyncio
-async def test_validate_done_provenance_stamps_found_on_main(tmp_path, frozen_provenance_stamp):
+async def test_validate_done_provenance_stamps_found_on_main(tmp_path):
     """Direct-call: a valid found_on_main blob comes back carrying stamped_at."""
     from fused_memory.middleware.task_interceptor import _validate_done_provenance
 
@@ -5820,37 +5821,44 @@ async def test_validate_done_provenance_stamps_found_on_main(tmp_path, frozen_pr
         str(tmp_path),
         require=False,
         git_runner=run_git,
+        stamp_clock=_fixed_stamp_clock,
     )
 
     assert err is None
     assert resolved is not None
-    assert resolved['stamped_at'] == frozen_provenance_stamp
+    assert resolved['stamped_at'] == _FIXED_STAMP
 
 
 @pytest.mark.asyncio
-async def test_validate_done_provenance_stamp_is_tz_aware_utc_iso8601(tmp_path):
-    """The real (un-patched) clock emits a tz-aware UTC ISO-8601 string.
+async def test_default_provenance_stamp_clock_is_tz_aware_utc_iso8601(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """TaskInterceptor's default stamp clock emits a tz-aware UTC ISO-8601 string.
 
-    Guards the format itself — a naive or local-time stamp would compare
-    wrongly against the predicate's `--since` cutoff.
+    Built with no clock argument, so this pins the production wiring as
+    well as the format — a naive or local-time stamp would compare wrongly
+    against the predicate's `--since` cutoff.
     """
     from datetime import UTC, datetime
 
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
-    err, resolved = await _validate_done_provenance(
+    result = await interceptor.set_task_status(
         '1',
-        {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
+        'done',
         str(tmp_path),
-        require=False,
-        git_runner=run_git,
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': sha,
+            'note': 'sibling task 99 landed this',
+        },
     )
 
-    assert err is None
-    assert resolved is not None
-    stamp = resolved['stamped_at']
+    assert 'error' not in result
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    dp = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
+    stamp = dp['stamped_at']
     assert isinstance(stamp, str)
     parsed = datetime.fromisoformat(stamp)
     assert parsed.tzinfo is not None, 'stamp must be tz-aware'
@@ -5858,7 +5866,7 @@ async def test_validate_done_provenance_stamp_is_tz_aware_utc_iso8601(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_validate_done_provenance_does_not_stamp_merged(tmp_path, frozen_provenance_stamp):
+async def test_validate_done_provenance_does_not_stamp_merged(tmp_path):
     """kind='merged' is deliberately NOT stamped — the field is found_on_main-scoped.
 
     A leak here would perturb the exact-equality merged-kind assertions
@@ -5874,6 +5882,7 @@ async def test_validate_done_provenance_does_not_stamp_merged(tmp_path, frozen_p
         str(tmp_path),
         require=False,
         git_runner=run_git,
+        stamp_clock=_fixed_stamp_clock,
     )
 
     assert err is None
@@ -5899,7 +5908,7 @@ async def test_validate_done_provenance_does_not_stamp_merged(tmp_path, frozen_p
     ids=['deploy', 'deploy-scheduled', 'gate', 'milestone', 'operational-verified'],
 )
 async def test_validate_done_provenance_does_not_stamp_other_kinds(
-    tmp_path, frozen_provenance_stamp, raw
+    tmp_path, raw
 ):
     """Every non-found_on_main kind omits stamped_at."""
     from fused_memory.middleware.task_interceptor import _validate_done_provenance
@@ -5913,6 +5922,7 @@ async def test_validate_done_provenance_does_not_stamp_other_kinds(
         agent_id='orchestrator',
         config=FusedMemoryConfig(),
         git_runner=run_git,
+        stamp_clock=_fixed_stamp_clock,
     )
 
     assert err is None, f'expected acceptance but got: {err}'
@@ -5922,7 +5932,7 @@ async def test_validate_done_provenance_does_not_stamp_other_kinds(
 
 @pytest.mark.asyncio
 async def test_validate_done_provenance_discards_caller_supplied_stamp(
-    tmp_path, frozen_provenance_stamp, caplog
+    tmp_path, caplog
 ):
     """A caller-supplied stamped_at is overwritten by the server value — loudly.
 
@@ -5948,11 +5958,12 @@ async def test_validate_done_provenance_discards_caller_supplied_stamp(
             str(tmp_path),
             require=False,
             git_runner=run_git,
+            stamp_clock=_fixed_stamp_clock,
         )
 
     assert err is None
     assert resolved is not None
-    assert resolved['stamped_at'] == frozen_provenance_stamp
+    assert resolved['stamped_at'] == _FIXED_STAMP
     assert resolved['stamped_at'] != forged
 
     warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
@@ -5964,7 +5975,7 @@ async def test_validate_done_provenance_discards_caller_supplied_stamp(
 
 @pytest.mark.asyncio
 async def test_validate_done_provenance_no_stamp_warning_when_absent(
-    tmp_path, frozen_provenance_stamp, caplog
+    tmp_path, caplog
 ):
     """The ordinary path (no caller-supplied stamp) stays quiet."""
     from fused_memory.middleware.task_interceptor import _validate_done_provenance
@@ -5978,6 +5989,7 @@ async def test_validate_done_provenance_no_stamp_warning_when_absent(
             str(tmp_path),
             require=False,
             git_runner=run_git,
+            stamp_clock=_fixed_stamp_clock,
         )
 
     assert err is None
@@ -5991,7 +6003,7 @@ async def test_validate_done_provenance_no_stamp_warning_when_absent(
 
 @pytest.mark.asyncio
 async def test_done_provenance_found_on_main_stamp_reaches_storage(
-    taskmaster, reconciler, event_buffer, tmp_path, frozen_provenance_stamp
+    taskmaster, reconciler, event_buffer, tmp_path
 ):
     """End-to-end: stamped_at survives into the persisted done_provenance blob.
 
@@ -5999,7 +6011,9 @@ async def test_done_provenance_found_on_main_stamp_reaches_storage(
     the predicate reads it back off stored task metadata.
     """
     sha = _init_git_repo(tmp_path)
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, provenance_stamp_clock=_fixed_stamp_clock,
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -6015,7 +6029,7 @@ async def test_done_provenance_found_on_main_stamp_reaches_storage(
     assert 'error' not in result
     taskmaster.set_status_and_stamp_audit.assert_called_once()
     dp = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
-    assert dp['stamped_at'] == frozen_provenance_stamp
+    assert dp['stamped_at'] == _FIXED_STAMP
     # The stamp is additive — it must not displace the existing evidence.
     assert dp['kind'] == 'found_on_main'
     assert dp['commit'] == sha
@@ -6024,7 +6038,7 @@ async def test_done_provenance_found_on_main_stamp_reaches_storage(
 
 @pytest.mark.asyncio
 async def test_done_to_done_repair_of_an_already_stamped_blob_refreshes_the_stamp(
-    taskmaster, reconciler, event_buffer, tmp_path, frozen_provenance_stamp
+    taskmaster, reconciler, event_buffer, tmp_path
 ):
     """The same-status repair seam accepts a POST-3576 (already-stamped) blob.
 
@@ -6059,7 +6073,9 @@ async def test_done_to_done_repair_of_an_already_stamped_blob_refreshes_the_stam
             }),
         }
     )
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, provenance_stamp_clock=_fixed_stamp_clock,
+    )
 
     # Exactly what the repair seam does: re-submit the stored blob verbatim,
     # stale stamped_at and all.
@@ -6082,7 +6098,7 @@ async def test_done_to_done_repair_of_an_already_stamped_blob_refreshes_the_stam
     taskmaster.update_task.assert_not_called()
     taskmaster.stamp_audit_metadata.assert_called_once()
     persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
-    assert persisted['stamped_at'] == frozen_provenance_stamp, (
+    assert persisted['stamped_at'] == _FIXED_STAMP, (
         'the repair must REFRESH the stamp, not carry the stored one through'
     )
     assert persisted['stamped_at'] != stale_stamp
@@ -6094,7 +6110,7 @@ async def test_done_to_done_repair_of_an_already_stamped_blob_refreshes_the_stam
 
 @pytest.mark.asyncio
 async def test_done_to_done_repair_refreshed_stamp_persists_against_real_backend(
-    tmp_path, event_buffer, frozen_provenance_stamp
+    tmp_path, event_buffer
 ):
     """End-to-end: the refreshed stamp survives the real SqliteTaskBackend.
 
@@ -6132,7 +6148,9 @@ async def test_done_to_done_repair_refreshed_stamp_persists_against_real_backend
         )
         await backend.set_task_status('1', 'done', str(tmp_path))
 
-        interceptor = TaskInterceptor(backend, None, event_buffer)
+        interceptor = TaskInterceptor(
+            backend, None, event_buffer, provenance_stamp_clock=_fixed_stamp_clock,
+        )
         result = await interceptor.set_task_status(
             '1',
             'done',
@@ -6149,7 +6167,7 @@ async def test_done_to_done_repair_refreshed_stamp_persists_against_real_backend
         assert result.get('done_provenance_repaired') is True
 
         md = (await backend.get_task('1', project_root=str(tmp_path)))['metadata']
-        assert md['done_provenance']['stamped_at'] == frozen_provenance_stamp
+        assert md['done_provenance']['stamped_at'] == _FIXED_STAMP
         assert md['files'] == ['x.py'], 'sibling keys survive the seam merge'
     finally:
         await backend.close()
