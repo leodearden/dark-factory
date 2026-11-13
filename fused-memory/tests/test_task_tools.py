@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 import yaml
 
+from fused_memory.middleware.task_text_write_guard import text_fp_of
 from fused_memory.server.tools import create_mcp_server
 
 _TOOLS_LOGGER = 'fused_memory.server.tools'
@@ -1044,57 +1045,6 @@ async def test_update_task_forwards_expected_text_fp_verbatim(
     assert kwargs['expected_text_fp'] == 'tfp:abc'
 
 
-@pytest.mark.asyncio
-async def test_two_recon_writers_on_one_read_cannot_clobber_each_other(
-    real_task_stack, tmp_path,
-):
-    """Task 4650's user-observable signal: two writers compose against the
-    same read; the first lands and reads back, the second is refused instead
-    of overwriting it, and lands only after re-reading."""
-    from _fm_helpers import _init_git_repo
-
-    server, interceptor = real_task_stack
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    _init_git_repo(repo)
-    root = str(repo)
-    await interceptor.taskmaster.add_task(
-        project_root=root, title='T', description='Summary.', details='Original body.',
-    )
-    recon = 'recon-stage-task_knowledge_sync'
-
-    async def read() -> dict:
-        return await server._tool_manager.call_tool(
-            'get_task', {'id': '1', 'project_root': root},
-        )
-
-    async def write(details: str, token: str) -> dict:
-        return await server._tool_manager.call_tool(
-            'update_task',
-            {
-                'id': '1', 'project_root': root, 'details': details,
-                'agent_id': recon, 'expected_text_fp': token,
-            },
-        )
-
-    token_a = (await read())['task_text_fp']
-    token_b = (await read())['task_text_fp']
-
-    landed_a = await write('Body from writer A.', token_a)
-    assert landed_a['text_verified'] is True, landed_a
-
-    refused_b = await write('Body from writer B.', token_b)
-    assert refused_b['error_type'] == 'TaskTextBaseStale', refused_b
-    assert (await read())['details'] == 'Body from writer A.'
-
-    reread = await read()
-    landed_b = await write(
-        reread['details'] + ' Amended by writer B.', reread['task_text_fp'],
-    )
-    assert landed_b['text_verified'] is True, landed_b
-    assert (await read())['details'] == 'Body from writer A. Amended by writer B.'
-
-
 async def _real_backend_task(real_task_stack, tmp_path, details: str):
     from _fm_helpers import _init_git_repo
 
@@ -1122,6 +1072,46 @@ async def _real_backend_task(real_task_stack, tmp_path, details: str):
         )
 
     return read, write
+
+
+@pytest.mark.asyncio
+async def test_two_recon_writers_on_one_read_cannot_clobber_each_other(
+    real_task_stack, tmp_path,
+):
+    """Task 4650's user-observable signal: two writers compose against the
+    same read; the first lands and reads back, the second is refused instead
+    of overwriting it, and lands only after re-reading."""
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    token_a = (await read())['task_text_fp']
+    token_b = (await read())['task_text_fp']
+
+    landed_a = await write(details='Body from writer A.', expected_text_fp=token_a)
+    assert landed_a['text_verified'] is True, landed_a
+
+    refused_b = await write(details='Body from writer B.', expected_text_fp=token_b)
+    assert refused_b['error_type'] == 'TaskTextBaseStale', refused_b
+    assert (await read())['details'] == 'Body from writer A.'
+
+    reread = await read()
+    landed_b = await write(
+        details=reread['details'] + ' Amended by writer B.',
+        expected_text_fp=reread['task_text_fp'],
+    )
+    assert landed_b['text_verified'] is True, landed_b
+    assert (await read())['details'] == 'Body from writer A. Amended by writer B.'
+
+
+@pytest.mark.asyncio
+async def test_a_recon_append_onto_description_hears_the_backend_floor_first(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    refused = await write(description='More summary.', append=True)
+
+    assert refused['error_type'] == 'AppendUnsupportedFieldError', refused
+    assert (await read())['description'] == 'Summary.'
 
 
 @pytest.mark.asyncio
@@ -2240,8 +2230,6 @@ async def test_get_task_stamps_project_id(mcp_server_with_tasks, task_intercepto
 async def test_get_task_carries_the_task_text_fingerprint(
     mcp_server_with_tasks, task_interceptor,
 ):
-    from fused_memory.middleware.task_text_write_guard import text_fp_of
-
     row = {'id': '4650', 'description': 'Summary.', 'details': 'Body.', 'status': 'pending'}
     task_interceptor.get_task = AsyncMock(return_value=row)
 
