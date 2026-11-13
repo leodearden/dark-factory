@@ -683,27 +683,39 @@ class Milestone(BaseModel):
                 raise ValueError("Milestone: at must not be set when mode='delayed'.")
         return self
 
-    def fired(self, anchor: str | None, now: datetime) -> bool:
+    def fired(self, anchor: object, now: datetime) -> bool:
         """Return whether this milestone has fired at *now* (tz-aware).
 
         This is the home of milestone semantics. A ``'dated'`` milestone fires
         once ``now >= at``; *anchor* is ignored. A ``'delayed'`` milestone
         fires once ``now >= anchor + after_secs``, where *anchor* is the raw
-        ``metadata.milestone_deps_satisfied_at`` string; a falsy anchor never
-        fires. A tz-naive ``at`` or anchor is read as UTC.
+        ``metadata.milestone_deps_satisfied_at`` value; ``None`` or ``''``
+        means not due yet, so never fires. A tz-naive ``at`` or anchor is read
+        as UTC.
 
         A malformed spec cannot be a ``Milestone``, so "never fires" for
-        malformed metadata belongs to the caller; an unparseable *anchor*
-        raises ``ValueError``. ``Scheduler._milestone_time_gated`` keeps its
-        own copy of these rules until a follow-up repoints it here.
+        malformed metadata belongs to the caller. For a ``'delayed'``
+        milestone, an *anchor* that is not a string, is unparseable, or cannot
+        be combined with ``after_secs`` into a representable datetime raises
+        ``ValueError``, the only exception malformed input raises here.
         """
         if self.mode == 'dated':
             assert self.at is not None
             return now >= _as_utc(datetime.fromisoformat(self.at))
+        if anchor is not None and not isinstance(anchor, str):
+            raise ValueError(f'Milestone: anchor={anchor!r} is not an ISO-8601 string.')
         if not anchor:
             return False
         assert self.after_secs is not None
-        deadline = _as_utc(datetime.fromisoformat(anchor)) + timedelta(seconds=self.after_secs)
+        try:
+            deadline = _as_utc(datetime.fromisoformat(anchor)) + timedelta(
+                seconds=self.after_secs
+            )
+        except OverflowError as exc:
+            raise ValueError(
+                f'Milestone: anchor={anchor!r} + after_secs={self.after_secs} is not a '
+                f'representable datetime: {exc}'
+            ) from exc
         return deadline <= now
 
 

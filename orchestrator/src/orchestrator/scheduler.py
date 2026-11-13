@@ -51,6 +51,7 @@ from shared.scheduler_state import (
     SchedulerStateSnapshot,
 )
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
+from shared.task_metadata import Milestone
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_read import (
     TaskAbsent,
@@ -4531,98 +4532,48 @@ class Scheduler:
         """Return True when *task* must be withheld from dispatch by its
         ``metadata.milestone`` time gate (task 2335 β).
 
-        Pure predicate — sibling to :meth:`_deferred_watch_gated`.  Reads the
-        RAW ``metadata.milestone`` dict directly, NOT the heavier
-        :func:`~shared.task_metadata.parse_metadata` pipeline used by
-        ``dependency_verdict.py::task_external_deps``: the α ``Milestone``
-        model-validator and δ's submit guard already validate at write time,
-        so this gate is defense-in-depth, not the primary validation path.
-
-        Modes (``metadata.milestone['mode']``):
-        - ``'dated'``: withhold while ``now_wall < milestone['at']``.
-        - ``'delayed'``: withhold while
-          ``metadata.milestone_deps_satisfied_at`` is unset, OR while
-          ``now_wall < anchor + after_secs``.  The anchor is stamped once,
-          frozen-once, by :meth:`_stamp_milestone_deps_satisfied`.
+        Pure predicate — sibling to :meth:`_deferred_watch_gated`.  The rule
+        itself lives in :meth:`shared.task_metadata.Milestone.fired`; this
+        method only parses the raw ``metadata.milestone`` dict into a
+        ``Milestone``, hands it the frozen-once
+        ``metadata.milestone_deps_satisfied_at`` anchor (stamped by
+        :meth:`_stamp_milestone_deps_satisfied`) and *now_wall*, and maps the
+        outcome onto a withhold decision.
 
         No ``metadata.milestone`` (missing/falsy) → not gated (``False``).
-        Any malformed or unrecognised value — a non-dict milestone, an
-        unknown mode, an unparseable ``at``/anchor timestamp, or an
-        ``after_secs`` that can't combine with a timestamp — fails safe:
-        withhold (``True``) plus a WARNING log, rather than crash the
-        dispatch tick or let a broken milestone spec dispatch early.  The
-        WARNING is deduped per (task_id, malformed value) by
-        :meth:`_note_milestone_malformed` so a permanently-broken spec logs
-        once instead of spamming every tick; it re-fires if the malformed
-        value actually changes.  A task that fails safe here has no other
-        path to human attention (no automatic escalation) — this is a
-        known, deliberately deferred gap (task 2335 β amendment: reviewer_
-        comprehensive robustness finding; see commit message for rationale).
-
-        ``at``/anchor timestamps that parse as tz-naive are normalized to
-        UTC (``.replace(tzinfo=UTC)``): the α model only requires
-        ``datetime.fromisoformat``-parseable, not tz-aware, but comparing a
-        tz-naive and tz-aware datetime directly raises ``TypeError`` — left
-        unhandled that would otherwise fall into the fail-safe branch and
-        withhold the task forever.
+        A delayed milestone whose anchor is still unset is withheld without a
+        warning (it is simply not due yet).  Anything malformed — a non-dict
+        milestone, a spec ``Milestone`` rejects, a non-string or unparseable
+        anchor, an anchor + ``after_secs`` deadline that cannot be
+        represented — fails safe: withhold (``True``) plus a WARNING deduped per
+        (task_id, malformed value) by :meth:`_note_milestone_malformed`.
+        That WARNING is a malformed spec's only route to human attention.
         """
         metadata = task.get('metadata') or {}
-        milestone = metadata.get('milestone')
-        if not milestone:
+        raw = metadata.get('milestone')
+        if not raw:
             return False
         task_id = str(task.get('id', '?'))
-        if not isinstance(milestone, dict):
+        if not isinstance(raw, dict):
             self._note_milestone_malformed(
-                task_id, f'not-a-dict:{milestone!r}',
+                task_id, f'not-a-dict:{raw!r}',
                 'Task %s: metadata.milestone is not a dict (%r) — fail-safe '
                 'withhold (this task will remain pending indefinitely until '
                 'metadata.milestone is corrected)',
-                task_id, milestone,
+                task_id, raw,
             )
             return True
 
-        mode = milestone.get('mode')
+        anchor = metadata.get('milestone_deps_satisfied_at')
         try:
-            if mode == 'dated':
-                at_raw = milestone.get('at')
-                if not isinstance(at_raw, str):
-                    raise ValueError(f'milestone.at must be a string, got {at_raw!r}')
-                at_dt = datetime.fromisoformat(at_raw)
-                if at_dt.tzinfo is None:
-                    at_dt = at_dt.replace(tzinfo=UTC)
-                return now_wall < at_dt
-            elif mode == 'delayed':
-                anchor_raw = metadata.get('milestone_deps_satisfied_at')
-                if not anchor_raw:
-                    return True
-                if not isinstance(anchor_raw, str):
-                    raise ValueError(
-                        f'milestone_deps_satisfied_at must be a string, got {anchor_raw!r}'
-                    )
-                anchor_dt = datetime.fromisoformat(anchor_raw)
-                if anchor_dt.tzinfo is None:
-                    anchor_dt = anchor_dt.replace(tzinfo=UTC)
-                after_secs = milestone.get('after_secs')
-                if not isinstance(after_secs, int):
-                    raise ValueError(f'milestone.after_secs must be an int, got {after_secs!r}')
-                fire_at = anchor_dt + timedelta(seconds=after_secs)
-                return now_wall < fire_at
-            else:
-                self._note_milestone_malformed(
-                    task_id, f'unknown-mode:{mode!r}',
-                    'Task %s: metadata.milestone has unknown mode %r — fail-safe '
-                    'withhold (this task will remain pending indefinitely until '
-                    'metadata.milestone is corrected)',
-                    task_id, mode,
-                )
-                return True
-        except Exception:
+            return not Milestone.model_validate(raw).fired(anchor, now_wall)
+        except ValueError:
             self._note_milestone_malformed(
-                task_id, f'exception:{milestone!r}',
+                task_id, f'invalid:{raw!r}:{anchor!r}',
                 'Task %s: malformed metadata.milestone %r — fail-safe withhold '
                 '(this task will remain pending indefinitely until '
                 'metadata.milestone is corrected)',
-                task_id, milestone,
+                task_id, raw,
                 exc_info=True,
             )
             return True
