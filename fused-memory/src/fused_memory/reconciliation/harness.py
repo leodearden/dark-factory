@@ -2735,6 +2735,8 @@ class ReconciliationHarness:
         finding: dict,
         persistence: int,
         task_id: str | None = None,
+        *,
+        liveness_unknown: bool = False,
     ) -> str | None:
         """File a level-0 record for *finding* on its named task's ORCHESTRATOR queue.
 
@@ -2779,6 +2781,10 @@ class ReconciliationHarness:
         A7b note: this WRITES but never RESOLVES, and the queue it writes is
         NOT the recon queue the A7b invariant governs — see the contract block
         at the top of this module.
+
+        *liveness_unknown* says the target is filed because its liveness probe
+        failed, not because it was confirmed not live (task 5370). It marks the
+        WARNING-level filed log line; the record's detail does not carry it.
         """
         # Mirrors _escalate's guard: on ImportError the module-level names are
         # left UNBOUND (not set to None as in targeted.py), so `HAS_ESCALATION`
@@ -2889,7 +2895,8 @@ class ReconciliationHarness:
                 task_id, project_id, run_id, e,
             )
             return None
-        logger.info(
+        logger.log(
+            logging.WARNING if liveness_unknown else logging.INFO,
             'reconciliation.finding_task_escalation_filed',
             extra={
                 'project_id': project_id,
@@ -2898,6 +2905,7 @@ class ReconciliationHarness:
                 'escalation_id': esc_id,
                 'finding_category': finding.get('category', ''),
                 'persistence': persistence,
+                'liveness_unknown': liveness_unknown,
             },
         )
         return esc_id
@@ -6156,9 +6164,17 @@ class ReconciliationHarness:
                                 # per DISTINCT persistent finding per task, and
                                 # none filed behind an open routed L1 — see
                                 # `finding_task_escalation.py::routed_record_covers_finding`.
+                                # Memoised: the cited loop or the gate above
+                                # has already probed this id.
+                                routed_liveness = await _task_liveness_memoised(
+                                    routed_task_id
+                                )
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
                                     task_id=routed_task_id,
+                                    liveness_unknown=(
+                                        routed_liveness is TaskLiveness.UNKNOWN
+                                    ),
                                 )
                     else:
                         logger.info(

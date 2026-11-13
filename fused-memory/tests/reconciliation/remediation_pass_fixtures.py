@@ -44,14 +44,18 @@ PROJECT_ID = 'test-project'
 PROJECT_ROOT = '/tmp/test-project'
 
 
-def make_remediation_harness(journal, event_buffer, memory_service, **harness_kwargs):
+def make_remediation_harness(
+    journal, event_buffer, memory_service, *, project_root: str = PROJECT_ROOT,
+    **harness_kwargs,
+):
+    """A harness that knows ``PROJECT_ID`` as *project_root*."""
     return make_harness(
         journal=journal,
         event_buffer=event_buffer,
         memory_service=memory_service,
         taskmaster=AsyncMock(),
         config=make_harness_config(judge_enabled=False),
-        known_projects={PROJECT_ID: PROJECT_ROOT},
+        known_projects={PROJECT_ID: project_root},
         **harness_kwargs,
     )
 
@@ -129,8 +133,12 @@ async def seed_persistence(journal, findings: list[dict]) -> None:
 async def prepare_remediation_pass(
     *, journal, event_buffer, memory_service, tmp_path, monkeypatch,
     findings: list[dict], cited_tasks: list[dict] | None = None,
+    project_root: str = PROJECT_ROOT,
 ):
     """Wire a harness to drive ``_run_remediation_pass`` over *findings*.
+
+    The pass runs for ``PROJECT_ID`` rooted at *project_root*, which is where
+    the routed-finding filer writes its orchestrator queue.
 
     Returns ``(harness, esc_queue, run_pass)`` where ``run_pass()`` returns a
     fresh coroutine for the pass, so a caller can await it or hand it to a
@@ -138,12 +146,13 @@ async def prepare_remediation_pass(
     """
     esc_queue = EscalationQueue(tmp_path / 'esc')
     harness = make_remediation_harness(
-        journal, event_buffer, memory_service, escalation_queue=esc_queue,
+        journal, event_buffer, memory_service,
+        project_root=project_root, escalation_queue=esc_queue,
     )
 
     # Pin the two on-disk corroboration inputs to their empty forms so neither
-    # of the other corroboration signals can fire against the shared,
-    # pytest-unmanaged /tmp/test-project root.
+    # of the other corroboration signals can fire against whatever lives at
+    # the project root (by default the shared, pytest-unmanaged PROJECT_ROOT).
     monkeypatch.setattr(
         harness_module, 'read_scheduler_state',
         lambda _root: SchedulerStateSnapshot.empty(),
@@ -171,7 +180,7 @@ async def prepare_remediation_pass(
     def run_pass():
         return harness._run_remediation_pass(
             PROJECT_ID, 'parent-run-id', findings, tier,
-            scope=make_scope(PROJECT_ID, PROJECT_ROOT),
+            scope=make_scope(PROJECT_ID, project_root),
             filtered_task_tree=tree,
             filtered_task_tree_fetched_at=datetime.now(UTC),
         )

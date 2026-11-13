@@ -3,9 +3,11 @@
 In ``_run_remediation_pass``'s live-workflow gate a LIVE cited task SUPPRESSES
 the persistent-finding escalation, so LIVE is the permissive answer there. A
 probe that could not run — corroboration raised, the detector raised, or the
-corroboration inputs could not be read — is UNKNOWN: it never suppresses, and
-the escalation it lets through names the tasks whose liveness is unknown
-rather than claiming they were confirmed not live.
+corroboration inputs could not be read — is UNKNOWN: it never suppresses.
+The recon escalation it lets through names the CITED tasks whose liveness is
+unknown, rather than claiming they were confirmed not live. A routed target's
+unknown liveness is marked on the routed filing's log line; the routed
+record's own detail does not carry it.
 
 The fake detector models the lingering shape task 2963 exists for: a worktree
 registration or orchestrator lock that keeps asserting liveness with no recent
@@ -30,7 +32,6 @@ from reconciliation.harness_fixtures import (
     open_journal,
 )
 from reconciliation.remediation_pass_fixtures import (
-    PROJECT_ID,
     finding_citing,
     in_progress_task,
     prepare_remediation_pass,
@@ -61,14 +62,15 @@ def drive(journal, event_buffer, memory_service, tmp_path, monkeypatch):
     """Run one remediation pass over *findings*; return its recon escalation queue.
 
     *before_run* receives the wired harness after ``prepare_remediation_pass``
-    has pinned its inputs, so a test can override one of them.
+    has pinned its inputs, so a test can override one of them. *project_root*
+    is forwarded to ``prepare_remediation_pass``.
     """
 
-    async def _drive(findings, cited_tasks, *, before_run=None):
+    async def _drive(findings, cited_tasks, *, before_run=None, **pass_kwargs):
         harness, esc_queue, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
-            findings=findings, cited_tasks=cited_tasks,
+            findings=findings, cited_tasks=cited_tasks, **pass_kwargs,
         )
         if before_run is not None:
             before_run(harness)
@@ -221,27 +223,48 @@ class TestAHealthyProbeIsUnchanged:
 
 
 class TestTheRoutedTargetGateFailsClosedToo:
+    """901 is confirmed not live; the finding is routed to 777, which lingers."""
+
+    @staticmethod
+    async def _drive_routed(drive, tmp_path, monkeypatch, caplog):
+        orchestrator_root = tmp_path / 'orchestrator-root'
+        monkeypatch.setattr(harness_module, 'is_orchestrator_live_for', lambda _root: True)
+        with caplog.at_level(logging.INFO, logger=_HARNESS_LOGGER):
+            await drive(
+                [finding_citing('901', routed_to='777')],
+                [in_progress_task('901'), in_progress_task('777')],
+                project_root=str(orchestrator_root),
+            )
+        routed = EscalationQueue(escalation_queue_dir(orchestrator_root)).get_pending()
+        filed = [
+            r for r in caplog.records
+            if r.name == _HARNESS_LOGGER
+            and r.getMessage() == 'reconciliation.finding_task_escalation_filed'
+        ]
+        return routed, filed
 
     @pytest.mark.asyncio
-    async def test_a_routed_target_whose_corroboration_raised_is_still_filed(
-        self, drive, tmp_path, monkeypatch,
+    async def test_a_routed_target_whose_corroboration_raised_is_filed_marked_unknown(
+        self, drive, tmp_path, monkeypatch, caplog,
     ):
-        """901 is confirmed not live; routed target 777 lingers and its corroboration raised."""
         _stub_corroboration(monkeypatch, raising_for=frozenset({'777'}))
         _stub_detector(monkeypatch, lingering=frozenset({'777'}))
-        orchestrator_root = tmp_path / 'orchestrator-root'
 
-        def _wire_orchestrator_queue(harness):
-            harness._known_projects = {
-                **harness._known_projects, PROJECT_ID: str(orchestrator_root),
-            }
-            monkeypatch.setattr(harness_module, 'is_orchestrator_live_for', lambda _root: True)
+        routed, [filed] = await self._drive_routed(drive, tmp_path, monkeypatch, caplog)
 
-        await drive(
-            [finding_citing('901', routed_to='777')],
-            [in_progress_task('901'), in_progress_task('777')],
-            before_run=_wire_orchestrator_queue,
-        )
-
-        routed = EscalationQueue(escalation_queue_dir(orchestrator_root)).get_pending()
         assert [e.task_id for e in routed] == ['777']
+        assert (filed.task_id, filed.liveness_unknown) == ('777', True)
+        assert filed.levelno == logging.WARNING
+
+    @pytest.mark.asyncio
+    async def test_a_confirmed_not_live_routed_target_is_filed_unmarked(
+        self, drive, tmp_path, monkeypatch, caplog,
+    ):
+        _stub_corroboration(monkeypatch)
+        _stub_detector(monkeypatch, lingering=frozenset({'777'}))
+
+        routed, [filed] = await self._drive_routed(drive, tmp_path, monkeypatch, caplog)
+
+        assert [e.task_id for e in routed] == ['777']
+        assert (filed.task_id, filed.liveness_unknown) == ('777', False)
+        assert filed.levelno == logging.INFO
