@@ -111,7 +111,7 @@ _failure_streaks: KeyedStreaks[tuple[str, str]] = KeyedStreaks(threshold=1)
 # Whether this bound is reachable on that lock depends on the caller's
 # enclosing deadline. The Tasks tab and the census projection
 # (active_tasks.collect_tasks_with_counts, collect_census_snapshots) admit
-# each root under active_tasks.TASKS_PER_PROJECT_BUDGET (14.0 s), shorter
+# each root under active_tasks.TASKS_BUDGET.per_project (14.0 s), shorter
 # than this bound, so their callers are cancelled before it can fire and a
 # wedge surfaces as the snapshot unit's stale/unknown state — its documented
 # degradation story — never as a bypass. task_lookup._lookup_cache is
@@ -123,7 +123,7 @@ _failure_streaks: KeyedStreaks[tuple[str, str]] = KeyedStreaks(threshold=1)
 # scheduler._scheduler_cache, escalation_corpus._corpus_cache and
 # api.escalations._analytics_memo.
 LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
-"""How long a caller waits on a per-key refresh lock before bypassing it; callers under a shorter enclosing deadline never reach it."""
+"""Bound on each wait a caller makes on a key's refresh (lock acquisition, or joining an inherited bypass), and the age past which a bypass is treated as dead; callers under a shorter enclosing deadline never reach it."""
 
 # A bypass must leave its own journal trace — reusing the SAME
 # transition-only policy as _FANOUT_REWARN_EVERY above rather than
