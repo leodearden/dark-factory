@@ -11,6 +11,7 @@ fixture that could drift from it.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pydantic
@@ -896,3 +897,209 @@ class TestPlanModeCli:
         assert code == report.EXIT_RUN_FAILED == 1
         assert 'ABORT: cannot write the report' in caplog.text
         assert 'Traceback' not in caplog.text + capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Scheduled mode: one detector subprocess per (project, category)
+# ---------------------------------------------------------------------------
+
+_FAKE_DETECTOR_SOURCE = '''
+import json
+import sys
+import time
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+control = json.loads((here / 'control.json').read_text(encoding='utf-8'))
+argv = sys.argv[1:]
+with open(here / 'calls.jsonl', 'a', encoding='utf-8') as log:
+    log.write(json.dumps(argv) + '\\n')
+target = argv[argv.index('--project-id') + 1] + '/' + argv[argv.index('--categories') + 1]
+sys.stderr.write('fake detector ' + target + '\\n')
+behaviour = control['behaviour'].get(target, 'ok')
+if behaviour == 'exit':
+    sys.stderr.write('boom\\n')
+    sys.exit(3)
+if behaviour == 'sleep':
+    time.sleep(60)
+if behaviour == 'garbage':
+    print('this is not a plan')
+    sys.exit(0)
+print(json.dumps(control['plans'][target]))
+'''
+
+
+class _FakeDetector:
+    """A detector stand-in run as a real subprocess; it records each argv it is given."""
+
+    def __init__(self, root: Path, config) -> None:
+        self.root = root
+        self.script = root / 'fake_detector.py'
+        self.script.write_text(_FAKE_DETECTOR_SOURCE, encoding='utf-8')
+        self.argv = (sys.executable, str(self.script))
+        self.plans = {
+            f'{project}/{category}': _plan(
+                _family([f'{project}-{category}-a', f'{project}-{category}-b'],
+                        category=category),
+                category,
+            )
+            for project in config.projects
+            for category in config.categories
+        }
+        self.behave({})
+
+    def behave(self, behaviour: dict[str, str]) -> None:
+        (self.root / 'control.json').write_text(
+            json.dumps({'plans': self.plans, 'behaviour': behaviour}), encoding='utf-8',
+        )
+
+    def calls(self) -> list[list[str]]:
+        log = self.root / 'calls.jsonl'
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+
+
+@pytest.fixture
+def fake_detector(tmp_path: Path, config) -> _FakeDetector:
+    root = tmp_path / 'fake'
+    root.mkdir()
+    return _FakeDetector(root, config)
+
+
+def _schedule(config, fake: _FakeDetector, out_root: Path, *, stamp: str = _CUR,
+              projects=None) -> int:
+    return report.run_scheduled(
+        config, out_root=out_root, stamp=stamp,
+        projects=tuple(config.projects if projects is None else projects),
+        detector_argv=fake.argv,
+    )
+
+
+class TestScheduledInvocations:
+    def test_the_detector_runs_once_per_project_and_category_in_config_order(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        assert _schedule(config, fake_detector, tmp_path / 'out') == report.EXIT_OK
+
+        expected = [
+            ['--project-id', project, '--categories', category,
+             '--scan-limit', str(config.scan_limit), '--no-metrics']
+            for project in config.projects
+            for category in config.categories
+        ]
+        assert fake_detector.calls() == expected
+        assert not any('--apply' in call for call in fake_detector.calls())
+
+    def test_each_plan_is_persisted_and_named_as_its_categorys_source(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        _schedule(config, fake_detector, out_root)
+
+        for project in config.projects:
+            rep = json.loads(report.report_path(out_root, project, _CUR).read_text())
+            assert list(rep['categories']) == list(config.categories)
+            for category in config.categories:
+                plan_path = out_root / project / f'plan-{_CUR}-{category}.json'
+                assert json.loads(plan_path.read_text()) == json.loads(
+                    json.dumps(fake_detector.plans[f'{project}/{category}']),
+                )
+                assert rep['categories'][category]['source'] == str(plan_path)
+
+    def test_the_detectors_stderr_is_relayed(
+        self, config, fake_detector, tmp_path: Path, capsys,
+    ) -> None:
+        _schedule(config, fake_detector, tmp_path / 'out', projects=['dark_factory'])
+        assert f'fake detector dark_factory/{_PK}' in capsys.readouterr().err
+
+    def test_each_project_report_diffs_against_its_own_previous_report(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        _schedule(config, fake_detector, out_root, stamp=_PREV)
+        _schedule(config, fake_detector, out_root, stamp=_CUR)
+
+        for project in config.projects:
+            rep = json.loads(report.report_path(out_root, project, _CUR).read_text())
+            assert rep['project_id'] == project
+            assert rep['regrowth']['previous_run_stamp'] == _PREV
+            assert {c['lineage']['status'] for c in rep['clusters']} == {'unchanged'}
+
+
+class TestScheduledFailures:
+    @pytest.mark.parametrize(('behaviour', 'error_type', 'exit_code', 'tail'), [
+        ('exit', 'DetectorExit', 3, 'boom'),
+        ('sleep', 'TimeoutExpired', None, 'fake detector'),
+        ('garbage', 'BadPlanOutput', 0, 'fake detector'),
+    ])
+    def test_a_failed_category_is_listed_and_the_rest_is_still_reported(
+        self, config, fake_detector, tmp_path: Path, behaviour, error_type, exit_code, tail,
+    ) -> None:
+        quick = config.model_copy(update={'detector_timeout_secs': 0.5})
+        fake_detector.behave({f'dark_factory/{_PN}': behaviour})
+        out_root = tmp_path / 'out'
+
+        code = _schedule(quick, fake_detector, out_root)
+
+        assert code == report.EXIT_RUN_FAILED
+        rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
+        (failure,) = rep['failed_categories']
+        assert set(failure) == {'category', 'error_type', 'exit_code', 'stderr_tail'}
+        assert failure['category'] == _PN
+        assert failure['error_type'] == error_type
+        assert failure['exit_code'] == exit_code
+        assert tail in failure['stderr_tail']
+        assert _PN not in rep['categories']
+        assert set(rep['categories']) == {_PK, _OS}
+        assert not (out_root / 'dark_factory' / f'plan-{_CUR}-{_PN}.json').exists()
+        other = json.loads(report.report_path(out_root, 'reify', _CUR).read_text())
+        assert other['failed_categories'] == []
+
+
+class TestScheduledThroughMain:
+    def _spy(self, monkeypatch) -> list[dict]:
+        calls: list[dict] = []
+
+        def _record(config, **kwargs):
+            calls.append(kwargs)
+            return report.EXIT_OK
+
+        monkeypatch.setattr(report, 'run_scheduled', _record)
+        return calls
+
+    def test_without_plans_every_configured_project_runs(
+        self, config_path: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        calls = self._spy(monkeypatch)
+
+        code = report.main(['--config', str(config_path), '--out-root', str(tmp_path),
+                            '--run-stamp', _CUR])
+
+        assert code == report.EXIT_OK
+        (call,) = calls
+        assert call['projects'] == ('dark_factory', 'reify')
+        assert call['stamp'] == _CUR
+        assert call['out_root'] == tmp_path
+
+    def test_a_project_id_restricts_the_run_to_that_project(
+        self, config_path: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        calls = self._spy(monkeypatch)
+
+        report.main(['--config', str(config_path), '--out-root', str(tmp_path),
+                     '--project-id', 'reify'])
+
+        assert calls[0]['projects'] == ('reify',)
+
+    def test_an_unconfigured_project_is_bad_input_before_any_run(
+        self, config_path: Path, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        calls = self._spy(monkeypatch)
+
+        code = report.main(['--config', str(config_path), '--out-root', str(tmp_path),
+                            '--project-id', 'elsewhere'])
+
+        assert code == report.EXIT_BAD_INPUT
+        assert calls == []
+        assert 'elsewhere' in caplog.text
