@@ -15,12 +15,15 @@ from _import_closure import SRC, modules_loaded_by_importing
 from _provenance_stamp_clock import FIXED_STAMP, fixed_stamp_clock
 from shared.git_async import run_git
 from shared.task_metadata import DoneProvenance
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.middleware.done_provenance import (
     StaleEvidenceMode,
     validate_done_provenance,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ── Layering of middleware/done_provenance.py (task 6236) ──
 
