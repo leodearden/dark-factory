@@ -1862,16 +1862,17 @@ class ReconciliationConfig(BaseModel):
     # Restart-tier: read from config each cycle; deliberately NOT in
     # RELOADABLE_FIELDS.
     auto_unhalt_after_cooldown: bool = Field(default=False)
-    # Judge transport/infra-failure tolerance (task 2947 ask a). Bounds the
-    # number of CONSECUTIVE judge CLI transport/infra failures (api_error,
-    # timeout, cap-wait exhaustion, etc. — NOT genuinely-malformed reachable
-    # content) a project may accumulate before review_run applies a truthful
-    # judge-unreachable halt and routes an infra_issue escalation. Below this
-    # threshold each infra failure is bounded backoff: no verdict is stamped
-    # and no halt fires (the transient outage is given room to recover). Any
-    # successful transport (a parsed verdict) resets the per-project counter.
+    # Judge no-verdict tolerance (task 2947 ask a; task 5370). Bounds the
+    # number of CONSECUTIVE no-verdict failures on a loaded run — judge CLI
+    # transport/infra failures (api_error, timeout, cap-wait exhaustion, etc. —
+    # NOT genuinely-malformed reachable content) and review errors — a project
+    # may accumulate before review_run applies a truthful halt (judge-unreachable
+    # or judge-review-error, after the last failure) and routes an infra_issue
+    # escalation. Below this threshold each failure is bounded backoff: no
+    # verdict is stamped and no halt fires (the transient outage is given room
+    # to recover). A completed review resets the per-project counter.
     # Gated on halt_on_judge_serious, same master switch as the serious-verdict
-    # halt. ge=1 → a value of 1 halts on the first infra failure.
+    # halt. ge=1 → a value of 1 halts on the first no-verdict failure.
     judge_infra_max_consecutive_failures: int = Field(default=3, ge=1)
 
     # Escalation

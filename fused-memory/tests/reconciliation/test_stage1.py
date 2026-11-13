@@ -49,6 +49,7 @@ from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
+    ContextFetchFailure,
     EventSource,
     EventType,
     ReconciliationEvent,
@@ -62,6 +63,10 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
 )
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     CANONICAL_HUMAN_GATE_ACTION,
+)
+from fused_memory.reconciliation.stage1_payload_format import (
+    CONTEXT_FETCH_FAILED_HEADING,
+    format_context_fetch_failures,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -2374,6 +2379,89 @@ class TestConsolidatorRunFetchDegradedStat:
             f"got: {report.stats.get('stage1_fetch_degraded')!r}. "
             "RED: _format_assembled_payload does not append 'status' to _fetch_degraded_sources."
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5370 (S8-24): Stage 1 reads a failed context fetch as unknown, not empty
+# ---------------------------------------------------------------------------
+
+
+class TestAFailedContextFetchIsUnknownToStage1:
+    """INV-11: an event whose context could not be fetched is not an event with none.
+
+    The assembled payload names it, the Stage-1 text says its context is
+    unknown, and the run's ``stage1_fetch_degraded`` stat names the source.
+    """
+
+    _FAILURE = ContextFetchFailure('ev1', 'task_status_changed', 'RuntimeError: taskmaster down')
+
+    @staticmethod
+    def _event() -> ReconciliationEvent:
+        return ReconciliationEvent(
+            id='ev1',
+            type=EventType.task_status_changed,
+            source=EventSource.agent,
+            project_id='test_project',
+            timestamp=datetime.now(UTC),
+            payload={'task_id': '42'},
+        )
+
+    async def _assemble_and_run(
+        self, failures: tuple[ContextFetchFailure, ...],
+    ) -> tuple[str, StageReport]:
+        stage = make_consolidator(project_root='/tmp/test_ctx_fetch_failed')
+        stage.assembled_payload = AssembledPayload(
+            events=[self._event()], context_items={}, context_fetch_failures=failures,
+        )
+        watermark = Watermark(project_id='test_project')
+        text = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='run-ctx-fetch',
+            )
+        return text, report
+
+    @pytest.mark.asyncio
+    async def test_the_payload_names_the_event_whose_context_is_unknown(self):
+        text, _ = await self._assemble_and_run((self._FAILURE,))
+
+        assert CONTEXT_FETCH_FAILED_HEADING in text
+        note = text[text.index(CONTEXT_FETCH_FAILED_HEADING):]
+        assert 'ev1' in note
+        assert 'task_status_changed' in note
+        assert 'RuntimeError' in note
+
+    @pytest.mark.asyncio
+    async def test_the_run_reports_event_context_as_degraded(self):
+        _, report = await self._assemble_and_run((self._FAILURE,))
+
+        assert 'event_context' in report.stats['stage1_fetch_degraded']
+
+    @pytest.mark.asyncio
+    async def test_no_failure_leaves_the_payload_and_stat_unchanged(self):
+        text, report = await self._assemble_and_run(())
+
+        assert CONTEXT_FETCH_FAILED_HEADING not in text
+        assert 'No related context.' in text
+        assert 'event_context' not in report.stats['stage1_fetch_degraded']
+
+    def test_the_renderer_lists_each_failure_and_renders_nothing_without_one(self):
+        second = ContextFetchFailure('ev2', 'memory_added', 'TimeoutError: mem0')
+
+        note = format_context_fetch_failures([self._FAILURE, second])
+
+        assert format_context_fetch_failures([]) == ''
+        assert CONTEXT_FETCH_FAILED_HEADING in note
+        assert '(2)' in note
+        assert '[task_status_changed] ev1: RuntimeError: taskmaster down' in note
+        assert '[memory_added] ev2: TimeoutError: mem0' in note
 
 
 # ---------------------------------------------------------------------------

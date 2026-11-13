@@ -506,7 +506,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
-        '58434c3060da',
+        'edd9a8720cf9',
         'filed',
         'ROOT CAUSE: _file_finding_task_escalation, the orchestrator-queue '
         'counterpart of _escalate that task 4821 added after this census '
@@ -524,7 +524,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
-        '920dc9ba5dbb',
+        'a4c939b65449',
         'filed',
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
