@@ -7364,6 +7364,12 @@ async def _branches_matching(git_ops: GitOps, pattern: str) -> str:
     return branches.strip()
 
 
+async def _checked_out_ref(worktree: Path) -> str:
+    rc, ref, err = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=worktree)
+    assert rc == 0, err
+    return ref.strip()
+
+
 @pytest.mark.asyncio
 class TestOrphanWorktreeHelpers:
     """Fix B git_ops helpers: quarantine_worktree, worktree_has_unsaved_work."""
@@ -7537,6 +7543,75 @@ class TestOrphanWorktreeHelpers:
 
         assert outcome.dest is not None
         assert not TaskArtifacts.for_task(info.path, 'q-noplan').artifact_path('plan.json').exists()
+
+    async def test_quarantine_never_renames_a_branch_another_worktree_holds(
+        self, git_ops: GitOps,
+    ):
+        holder = await git_ops.create_worktree('q-held')
+        (holder.path / 'held.py').write_text('h = 1\n')
+        await git_ops.commit(holder.path, 'held work')
+        held_tip = await git_ops.resolve_branch_sha('task/q-held')
+        foreign = await git_ops.create_worktree('q-foreign')
+        (foreign.path / 'wip.py').write_text('w = 1\n')
+
+        outcome = await git_ops.quarantine_worktree(
+            foreign.path, 'q-held', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert outcome.dest.parent == git_ops.quarantine_base
+        assert not foreign.path.exists()
+        assert outcome.branch is None
+        assert outcome.tip_sha is None
+        assert outcome.unique_commit_count is None
+        assert await _checked_out_ref(holder.path) == 'refs/heads/task/q-held'
+        assert await git_ops.resolve_branch_sha('task/q-held') == held_tip
+        assert await _branches_matching(git_ops, 'task/q-held-*') == ''
+        assert await _checked_out_ref(outcome.dest) == 'refs/heads/task/q-foreign'
+        assert (outcome.dest / 'wip.py').exists()
+        assert await git_ops.commits_beyond_main('task/q-foreign') == 0
+
+    async def test_quarantine_relocates_a_registered_worktree_without_the_branch(
+        self, git_ops: GitOps,
+    ):
+        other = await git_ops.create_worktree('q-other')
+
+        outcome = await git_ops.quarantine_worktree(
+            other.path, 'q-absent', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert not other.path.exists()
+        assert outcome.branch is None
+        rc, listing, err = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        assert f'worktree {outcome.dest}' in listing.splitlines()
+
+    async def test_quarantine_unregistered_dir_leaves_a_branch_checked_out_elsewhere(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        orphan = await git_ops.create_worktree('q-split')
+        (orphan.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(orphan.path, 'committed work')
+        await _drop_admin_entry(git_ops, orphan.path)
+        live = tmp_path / 'live-q-split'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', str(live), 'task/q-split'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(
+            orphan.path, 'q-split', 'recovery-record-divergence',
+        )
+
+        assert outcome.dest is not None
+        assert not orphan.path.exists()
+        assert outcome.branch is None
+        assert await _checked_out_ref(live) == 'refs/heads/task/q-split'
+        assert await git_ops.resolve_branch_sha('task/q-split') is not None
+        assert await _branches_matching(git_ops, 'task/q-split-*') == ''
 
     async def test_unsaved_work_false_when_clean_no_commits(self, git_ops: GitOps):
         info = await git_ops.create_worktree('clean-wt')
