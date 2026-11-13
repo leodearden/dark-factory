@@ -96,7 +96,9 @@ from orchestrator.verify_classify import (
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
-    _PYTEST_VALUE_FLAGS,
+    _XDIST_N_FLAGS as _XDIST_N_FLAGS,  # re-exported for test_verify_load_stamp.py
+)
+from orchestrator.verify_cmd import (
     ChainSegment,
     ToolKind,
     VerifyCmd,
@@ -113,6 +115,7 @@ from orchestrator.verify_cmd import (
     split_chain_tail,
     with_junitxml,
     with_pytest_timeout,
+    worker_count_values,
 )
 from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
 
@@ -2405,34 +2408,42 @@ def _serial_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str |
     so it never reaches ``rewritten is parsed`` at all, and a non-PYTEST or
     OPAQUE command is an expected, benign no-op.
     """
-    if cmd is None:
-        return None
-    parsed = parse_config_command(cmd)
-    ini_addopts = verify_plan.governing_addopts(parsed, _worktree_reader(invocation_dir))
-    rewritten = serial_pytest(parsed, ini_addopts)
-    if rewritten is parsed:
-        if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
-            _warn_serial_flags_unapplied(cmd, parsed.raw, flags='-p no:xdist -o addopts=')
-        return cmd
-    return render(rewritten)
+    return _apply_serial_form(
+        cmd, invocation_dir=invocation_dir, mutator=serial_pytest, flags='-p no:xdist -o addopts=',
+    )
 
 
 def _serial_confirm_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str | None:
-    """``_serial_pytest_str`` for a confirm re-run: ``verify_cmd.py::serial_confirm_pytest``.
+    """``_serial_pytest_str`` for a confirm re-run: ``verify_cmd.py::serial_confirm_pytest``."""
+    return _apply_serial_form(
+        cmd,
+        invocation_dir=invocation_dir,
+        mutator=serial_confirm_pytest,
+        flags='-n 0 (or -p no:xdist -o addopts= where xdist is not in play)',
+    )
 
-    Same shape, *invocation_dir* contract and raw-chain WARNING as
-    ``_serial_pytest_str``; only the mutator differs.
+
+def _apply_serial_form(
+    cmd: str | None,
+    *,
+    invocation_dir: Path | None,
+    mutator: Callable[[VerifyCmd, Sequence[str]], VerifyCmd],
+    flags: str,
+) -> str | None:
+    """Apply a serial-form *mutator* to *cmd* under the addopts governing *invocation_dir*.
+
+    The one body behind ``_serial_pytest_str`` and ``_serial_confirm_pytest_str``,
+    whose docstring holds the contract: an unchanged raw PYTEST chain WARNs,
+    naming the *flags* that could not be placed, and comes back as *cmd* itself.
     """
     if cmd is None:
         return None
     parsed = parse_config_command(cmd)
     ini_addopts = verify_plan.governing_addopts(parsed, _worktree_reader(invocation_dir))
-    rewritten = serial_confirm_pytest(parsed, ini_addopts)
+    rewritten = mutator(parsed, ini_addopts)
     if rewritten is parsed:
         if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
-            _warn_serial_flags_unapplied(
-                cmd, parsed.raw, flags='-n 0 (or -p no:xdist -o addopts= where xdist is not in play)',
-            )
+            _warn_serial_flags_unapplied(cmd, parsed.raw, flags=flags)
         return cmd
     return render(rewritten)
 
@@ -11804,20 +11815,6 @@ def _loadavg1_or_none(loadavg: Callable[[], tuple[float, float, float]]) -> 'flo
         return None
 
 
-# The spellings of the xdist WORKER-COUNT flag this stamp must recognise.
-#
-# DELIBERATELY NARROWER than ``verify_cmd._XDIST_OPTIONS``, and not a
-# drifting copy of it: that set is xdist's whole option surface, which a serial
-# recovery must SHED, so it also carries ``--dist`` (a distribution MODE),
-# ``--maxprocesses`` (a CAP) and more. None of those is a worker count, and
-# reporting any one's value as ``n_flag`` would put a fabricated count in the
-# corpus this stamp exists to make trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
-# the pair-binding walk below needs no special case for them;
-# test_verify_load_stamp.py asserts BOTH containments, so the narrowing stays a
-# stated choice rather than becoming drift the day either set moves.
-_XDIST_N_FLAGS = frozenset({'-n', '--numprocesses'})
-
-
 def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
     """The xdist worker facts for *cmd*, as two independently-nullable fields.
 
@@ -11833,27 +11830,18 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
 
     So two orthogonal facts, separately sourced:
 
-    - ``n_flag`` — the worker count the command NAMES, AS PARSED, or ``None``
-      when it names none. Read off the STRUCTURED ``base_flags``, never by
-      regex over the string: a regex would find the ``-n`` inside a
+    - ``n_flag`` — the FIRST worker count the command NAMES, AS PARSED, or
+      ``None`` when it names none. Read off the STRUCTURED ``base_flags``,
+      never by regex over the string: a regex would find the ``-n`` inside a
       cpu-governed ``<exec> -- /bin/bash -c '...'`` payload and report it as
-      this command's flag. ``_PYTEST_VALUE_FLAGS`` is read rather than
-      re-derived so the flag/value pairing has one home, which is also what
-      keeps a ``-k '-n'`` from being mistaken for a worker count.
-
-      SPELLINGS, tested rather than assumed equal to one literal: both ``-n 8``
-      and its long form ``--numprocesses 8`` (``_XDIST_N_FLAGS``), each also in
-      the attached one-token form (``--numprocesses=8``, ``-n=8`` — argparse
-      accepts both). A set that bound ``-n`` alone would report ``n_flag: null``
-      for a module config using the long spelling, which the census reads as
-      "no flag on argv, so addopts decided the count" — a wrong fact, silently,
-      in the corpus this deliverable exists to make trustworthy. No live config
-      uses the long spelling today, so that was latent rather than active.
-
-      The CONCATENATED short form (``-n8``) is reported as absent. The serial
-      recovery's strip (``verify_cmd._is_xdist_option``) does shed it, because
-      there a surviving xdist token is a hard usage error; here the miss only
-      under-reports, and no live config uses that spelling.
+      this command's flag. The spellings, and the flag/value pairing that
+      keeps a ``-k '-n'`` from being mistaken for a worker count, are
+      ``verify_cmd.py::worker_count_values``'s, the one decoder the admission
+      guard also reads. A stamp that bound ``-n`` alone would report
+      ``n_flag: null`` for a module config using the long spelling, which the
+      census reads as "no flag on argv, so addopts decided the count" — a
+      wrong fact, silently, in the corpus this deliverable exists to make
+      trustworthy.
     - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
       own subprocess will see it, or ``None`` when nothing sets it. Resolved by
       asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
@@ -11889,28 +11877,7 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
         ).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
         parsed = parse_config_command(cmd)
         if parsed.tool is ToolKind.PYTEST and parsed.raw is None:
-            flags = parsed.base_flags
-            i = 0
-            while i < len(flags):
-                # One partition covers both spellings of "this flag's value":
-                # attached (`--numprocesses=8` -> sep is '=') or the adjacent
-                # token (`-n 8`), which `_PYTEST_VALUE_FLAGS` has already bound
-                # next to its flag. An attached form with an EMPTY value
-                # (`--numprocesses=`) names no count — pytest rejects that
-                # command outright — so it falls through and reports absent
-                # rather than recording `''` as a worker count.
-                head, sep, attached = flags[i].partition('=')
-                if head in _XDIST_N_FLAGS:
-                    if sep and attached:
-                        n_flag = attached
-                        break
-                    if not sep and i + 1 < len(flags):
-                        n_flag = flags[i + 1]
-                        break
-                if flags[i] in _PYTEST_VALUE_FLAGS and i + 1 < len(flags):
-                    i += 2
-                else:
-                    i += 1
+            n_flag = next(iter(worker_count_values(parsed.base_flags)), None)
     except Exception:
         logger.warning(
             '_xdist_workers: could not read the worker facts off %r; '

@@ -133,6 +133,14 @@ _XDIST_VALUE_OPTIONS = frozenset({
 })
 _XDIST_OPTIONS = _XDIST_VALUE_OPTIONS | {'-d', '--loadscope-reorder', '--no-loadscope-reorder'}
 
+# The spellings of the xdist WORKER-COUNT flag, read by ``worker_count_values``.
+# DELIBERATELY NARROWER than ``_XDIST_OPTIONS``: that set is the surface a serial
+# recovery must SHED, so it also carries ``--dist`` (a distribution MODE) and
+# ``--maxprocesses`` (a CAP), and reading either one's value as a worker count
+# would fabricate one. test_verify_load_stamp.py asserts this set is contained
+# in both ``_XDIST_OPTIONS`` and ``_PYTEST_VALUE_FLAGS``.
+_XDIST_N_FLAGS = frozenset({'-n', '--numprocesses'})
+
 # Genuinely value-taking pytest flags that consume a SEPARATE following
 # token (as opposed to a boolean flag, or a `--flag=value` single token).
 # THE COMPLETE parse-side declaration: _split_pytest_args binds each of these
@@ -1784,8 +1792,9 @@ def _has_unspliceable_pytest_invocation(raw: str) -> bool:
 def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     """Return *raw* with *suffix* appended to every pytest invocation.
 
-    Shared rewrite closure for ``serial_pytest``/``apply_pytest_numprocesses``'s
-    raw-retained (chained) path: takes each ``_pytest_invocation_spans`` span,
+    Shared rewrite closure for the raw-retained (chained) path of
+    ``serial_pytest``, ``serial_confirm_pytest`` and
+    ``apply_pytest_numprocesses``: takes each ``_pytest_invocation_spans`` span,
     then anchors the append to the end of the pytest invocation's own
     ARGUMENTS rather than to the end of the span — the span can run past a
     subshell-closing ')' (see ``_PYTEST_TOKEN_RE``'s comment), and
@@ -1813,9 +1822,10 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
 
     3478's independently-derived regression tests are retained in
     ``TestRawRewriteDoesNotSwallowSubshellTerminator`` and pass against this
-    implementation — the operational impact they pin (``serial_pytest``
-    drives the env-transient and flaky-scoped recovery re-runs, so this
-    fired at shipped defaults with no knob set) is recorded there.
+    implementation — the operational impact they pin (the serial re-runs,
+    ``serial_pytest`` for the env-transient recovery and
+    ``serial_confirm_pytest`` for the confirms, go through it, so this fired
+    at shipped defaults with no knob set) is recorded there.
 
     REFUSAL CONTRACT (task 4121; defence in depth since the scan became
     quote-aware — see ``_unspliceable_pytest_spans``). Returns *raw*
@@ -2046,32 +2056,47 @@ def _disables_xdist_plugin(cmd: VerifyCmd) -> bool:
     return 'no:xdist' in cmd.base_flags or 'no:xdist' in cmd.targets
 
 
-_WORKER_COUNT_OPTIONS = frozenset({'-n', '--numprocesses'})
+def worker_count_values(tokens: Sequence[str]) -> list[str]:
+    """Every xdist worker count argv *tokens* names, in argv order.
 
-
-def _pins_zero_workers(tokens: Sequence[str]) -> bool:
-    """True when the LAST xdist worker count in argv *tokens* is ``0``.
-
-    The last one is what argparse applies. The walk pairs every
-    ``_PYTEST_VALUE_FLAGS`` member with its value, as ``_strip_xdist_options``
-    does, so a value such as the ``-n0`` in ``-k -n0`` is never read as a
-    count.
+    THE one decoder of the worker-count spellings: ``-n V``, ``-nV``,
+    ``-n=V``, ``--numprocesses V`` and ``--numprocesses=V`` (``_XDIST_N_FLAGS``).
+    argparse applies the LAST, which ``_pins_zero_workers`` reads; the verify
+    load stamp reports the FIRST (``verify.py::_xdist_workers``). The walk
+    pairs every ``_PYTEST_VALUE_FLAGS`` member with its value, as
+    ``_strip_xdist_options`` does, so the ``-n0`` in ``-k -n0`` is never read
+    as a count. An empty attached value (``--numprocesses=``) is a pytest
+    usage error, not a count.
     """
-    count = None
+    values: list[str] = []
     i = 0
     while i < len(tokens):
         token = tokens[i]
         if token in _PYTEST_VALUE_FLAGS and i + 1 < len(tokens):
-            if token in _WORKER_COUNT_OPTIONS:
-                count = tokens[i + 1]
+            if token in _XDIST_N_FLAGS:
+                values.append(tokens[i + 1])
             i += 2
             continue
-        if token.startswith('--numprocesses='):
-            count = token.removeprefix('--numprocesses=')
-        elif token.startswith('-n') and not token.startswith('--') and len(token) > 2:
-            count = token[2:]
+        attached = _attached_worker_count(token)
+        if attached:
+            values.append(attached)
         i += 1
-    return count == '0'
+    return values
+
+
+def _attached_worker_count(token: str) -> str:
+    """The count a one-token spelling (``-nV``, ``-n=V``, ``--numprocesses=V``) attaches, else ``''``."""
+    head, sep, value = token.partition('=')
+    if sep and head in _XDIST_N_FLAGS:
+        return value
+    if token.startswith('-n') and not token.startswith('--'):
+        return token[2:]
+    return ''
+
+
+def _pins_zero_workers(tokens: Sequence[str]) -> bool:
+    """True when the LAST xdist worker count in argv *tokens* is ``0``."""
+    return worker_count_values(tokens)[-1:] == ['0']
 
 
 def _raw_pytest_pins_zero_workers(raw: str) -> bool:
@@ -2099,7 +2124,11 @@ def _is_serial_forced(cmd: VerifyCmd) -> bool:
     ``-n`` injected after it would re-parallelise the confirm.
     ``apply_pytest_numprocesses`` consults this to stay a no-op on any
     already-serial command (the env-transient recovery and every confirm
-    re-run pass such commands back through the injection site).
+    re-run pass such commands back through the injection site). A raw chain
+    counts as forced when ANY one of its invocations is, in either form, so
+    ``cd a && pytest -n 0 tests/ && cd b && pytest tests/`` leaves b's
+    invocation uncapped. Both serial forms mark every invocation, so only an
+    operator's hand-written chain can be partly serial.
 
     That is one direction of the interaction. The other — an xdist option
     already on argv when the command is forced serial — is closed in
@@ -2136,13 +2165,13 @@ def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
     (covers OPAQUE and every other tool — P1), and also when *n* is ``''`` or
     ``'auto'`` — the byte-identical guard: the pyproject ``-n auto`` addopts
     already picks a worker count, so there is nothing to override — and when
-    the command has already been forced serial (``-p no:xdist``): with xdist
-    disabled the ``-n`` option is unregistered, so injecting it would fail the
-    run with ``unrecognized arguments: -n``. The serial-recovery re-runs
-    (env-transient at verify.py's env-recovery retry, flaky-scoped isolated
-    re-run) build their command via ``serial_pytest`` and then pass it back
-    through the same injection site, so this guard is what keeps the ``-n``
-    knob from breaking those recovery paths.
+    the command has already been forced serial in either form
+    (``_is_serial_forced``): under ``-p no:xdist`` an injected ``-n`` is an
+    ``unrecognized arguments`` failure, and after ``-n 0`` it re-parallelises
+    the run. The env-transient recovery builds its command via
+    ``serial_pytest`` and every confirm re-run via ``serial_confirm_pytest``;
+    both pass it back through the same injection site, so this guard is what
+    keeps the ``-n`` knob off those re-runs.
 
     One further no-op on the raw path: the appender finds no invocation
     outside quotes, or REFUSES (task 4121; defence in depth — see

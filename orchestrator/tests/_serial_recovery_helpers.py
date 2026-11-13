@@ -100,14 +100,14 @@ def effective_worker_count(tokens: Sequence[str]) -> str | None:
 
     argparse keeps the last value, so this is the count pytest applies. Reads
     the separate-token (``-n 0``, ``--numprocesses 0``) and attached
-    (``-n0``, ``--numprocesses=0``) spellings.
+    (``-n0``, ``-n=0``, ``--numprocesses=0``) spellings.
     """
     count = None
     for index, token in enumerate(tokens):
         if token in _WORKER_COUNT_OPTIONS and index + 1 < len(tokens):
             count = tokens[index + 1]
-        elif token.startswith('--numprocesses='):
-            count = token.removeprefix('--numprocesses=')
+        elif token.startswith(('--numprocesses=', '-n=')):
+            count = token.partition('=')[2]
         elif token.startswith('-n') and not token.startswith('--') and len(token) > 2:
             count = token[2:]
     return count
