@@ -854,7 +854,7 @@ class TestWatch:
         assert _watch(queue_dir, source, timeout=5, clock=clock) is None
         assert source.reads == [5000]
 
-    def test_deadline_starts_after_the_scan(self, queue_dir: Path):
+    def test_deadline_is_taken_after_the_pre_scan_excludes_call(self, queue_dir: Path):
         clock = FakeClock()
         scans: list[None] = []
 
@@ -897,6 +897,30 @@ def restore_sigterm():
     saved = signal.getsignal(signal.SIGTERM)
     yield
     signal.signal(signal.SIGTERM, saved)
+
+
+def _deliver_while_scan_reads(gate: Path, deliver: Callable[[], None]) -> threading.Thread:
+    """Run `deliver` on a thread while the initial scan is blocked reading `gate`.
+
+    `gate` is created as a FIFO in the queue dir. Opening it for writing
+    returns only once the scan has opened it for reading, and the scan lists
+    the directory before reading any entry, so the delivery is invisible to
+    the scan. The gate then yields a resolved record, which the scan skips.
+    """
+    os.mkfifo(gate)
+    record = _esc(gate.stem, status='resolved').to_json().encode()
+
+    def run() -> None:
+        fd = os.open(gate, os.O_WRONLY)
+        try:
+            deliver()
+            os.write(fd, record)
+        finally:
+            os.close(fd)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 
 
 def _exit_code(argv: list[str]) -> int | str | None:
@@ -971,38 +995,36 @@ class TestMain:
         assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '0.05', *extra_argv]) == code
 
     @pytest.mark.parametrize('deliver', [os.rename, os.link], ids=['moved-to', 'create'])
-    def test_arrival_after_launch_is_delivered_by_mains_armed_watch(
+    def test_arrival_the_scan_cannot_see_is_delivered_by_mains_armed_watch(
         self,
         queue_dir: Path,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
         deliver: Callable[[Path, Path], None],
     ):
-        """Without --baseline, an arrival at any moment must exit 0.
+        """An arrival after the scan has listed the queue dir must still exit 0.
 
         The staged file sits outside the queue dir, so its only queue event is
         the delivery itself: a rename (MOVED_TO) or a hard link (CREATE, with
         the content already complete). A main that arms no watch, or arms it
-        without that flag, misses a post-scan arrival and exits 124.
+        without that flag, exits 124.
         """
         esc = _esc('esc-75-1')
         staged = tmp_path / f'{esc.id}.json'
         staged.write_text(esc.to_json())
-        timer = threading.Timer(0.3, deliver, (staged, queue_dir / staged.name))
-        timer.start()
-        try:
-            assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '5']) == 0
-        finally:
-            timer.cancel()
-            timer.join()
+        delivery = _deliver_while_scan_reads(
+            queue_dir / 'esc-75-0.json', lambda: deliver(staged, queue_dir / staged.name),
+        )
 
+        assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '5']) == 0
+        delivery.join(timeout=5)
         assert json.loads(capsys.readouterr().out) == esc.to_dict()
 
 
 class TestExclusions:
     """exclusions() keeps static and baseline fixed and re-reads the exclude file per call."""
 
-    def test_exclude_file_is_reread_on_every_call_and_baseline_is_not(self, tmp_path: Path):
+    def test_exclude_file_is_reread_on_every_call(self, tmp_path: Path):
         exclude_file = tmp_path / 'excludes.txt'
         current = exclusions(
             static=frozenset({'esc-1-1'}), baseline=frozenset({'esc-2-1'}),
