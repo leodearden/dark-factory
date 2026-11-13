@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -54,6 +55,8 @@ from shared.safe_io import atomic_write_text
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'config' / 'duplicate-audit.yaml'
 DEFAULT_OUT_ROOT = REPO_ROOT / 'fused-memory' / 'data' / 'duplicate-cluster-reports'
+AUDIT_SCRIPT = REPO_ROOT / 'fused-memory' / 'scripts' / 'audit_duplicate_memories.py'
+_STDERR_TAIL_CHARS = 2000
 
 EXIT_OK = 0
 EXIT_RUN_FAILED = 1
@@ -658,6 +661,10 @@ def summary_path(out_root: Path, project_id: str, stamp: str) -> Path:
     return Path(out_root) / project_id / f'summary-{stamp}.txt'
 
 
+def plan_path(out_root: Path, project_id: str, stamp: str, category: str) -> Path:
+    return Path(out_root) / project_id / f'plan-{stamp}-{category}.json'
+
+
 def _fitness_line(caveat: Mapping[str, Any]) -> str:
     fitness = caveat['fitness']
     return (
@@ -839,6 +846,143 @@ def _run_plan_mode(args: Any, config: DuplicateAuditConfig, stamp: str) -> int:
     return _publish(args.out_root, args.project_id, stamp, built)
 
 
+@dataclass(frozen=True)
+class DetectorFailure:
+    """One (project, category) detector run that produced no plan."""
+
+    category: str
+    error_type: str
+    exit_code: int | None
+    stderr_tail: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            'category': self.category, 'error_type': self.error_type,
+            'exit_code': self.exit_code, 'stderr_tail': self.stderr_tail,
+        }
+
+
+def _text(stream: str | bytes | None) -> str:
+    if isinstance(stream, bytes):
+        return stream.decode('utf-8', 'replace')
+    return stream or ''
+
+
+def _relay(stderr: str | bytes | None) -> None:
+    """Pass the detector's stderr through, so it lands in this unit's journal."""
+    text = _text(stderr)
+    if text:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+
+def detector_command(
+    detector_argv: Sequence[str], project_id: str, category: str, config: DuplicateAuditConfig,
+) -> list[str]:
+    """One read-only, metrics-free detector run: never --apply, never a second e6 series."""
+    return [
+        *detector_argv, '--project-id', project_id, '--categories', category,
+        '--scan-limit', str(config.scan_limit), '--no-metrics',
+    ]
+
+
+def run_detector(
+    project_id: str,
+    category: str,
+    *,
+    config: DuplicateAuditConfig,
+    detector_argv: Sequence[str],
+    out_path: Path,
+) -> DetectorFailure | None:
+    """Run the detector for one category and persist its stdout plan at *out_path*.
+
+    None when the plan landed. The failure arms follow
+    ``fused-memory/scripts/memory_eval_runner.py::run_producer``.
+    """
+    def failure(error_type: str, stderr: str | bytes | None, exit_code: int | None) -> DetectorFailure:
+        tail = _text(stderr)[-_STDERR_TAIL_CHARS:].strip()
+        return DetectorFailure(category, error_type, exit_code, tail)
+
+    argv = detector_command(detector_argv, project_id, category, config)
+    try:
+        completed = subprocess.run(
+            argv, cwd=REPO_ROOT, capture_output=True, text=True,
+            timeout=config.detector_timeout_secs, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _relay(exc.stderr)
+        return failure('TimeoutExpired', exc.stderr, None)
+    except OSError as exc:
+        return failure(type(exc).__name__, f'could not start {argv[0]}: {exc}', None)
+    _relay(completed.stderr)
+    if completed.returncode != 0:
+        return failure('DetectorExit', completed.stderr, completed.returncode)
+    try:
+        parsed = json.loads(completed.stdout)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        return failure('BadPlanOutput', completed.stderr, completed.returncode)
+    try:
+        atomic_write_text(out_path, completed.stdout, mkdir=True)
+    except OSError as exc:
+        return failure('PlanWriteFailed', str(exc), completed.returncode)
+    return None
+
+
+def _project_plans(
+    project_id: str, stamp: str, *, config: DuplicateAuditConfig, out_root: Path,
+    detector_argv: Sequence[str],
+) -> tuple[list[LabelledPlan], list[DetectorFailure]]:
+    plans: list[LabelledPlan] = []
+    failures: list[DetectorFailure] = []
+    for category in config.categories:
+        out_path = plan_path(out_root, project_id, stamp, category)
+        failure = run_detector(
+            project_id, category, config=config, detector_argv=detector_argv, out_path=out_path,
+        )
+        if failure is None:
+            try:
+                plans.extend(_load_plans([str(out_path)]))
+                continue
+            except PlanInputError as exc:
+                failure = DetectorFailure(category, 'PlanReadFailed', 0, str(exc))
+        logger.error('detector run failed for %s/%s: %s (exit %s)',
+                     project_id, category, failure.error_type, failure.exit_code)
+        failures.append(failure)
+    return plans, failures
+
+
+def run_scheduled(
+    config: DuplicateAuditConfig,
+    *,
+    out_root: Path,
+    stamp: str,
+    projects: Sequence[str],
+    detector_argv: Sequence[str] = (sys.executable, str(AUDIT_SCRIPT)),
+) -> int:
+    """Sweep each project category by category, then write its report.
+
+    Sequential by design: one detector run is the whole Qdrant load. A failed
+    category is reported, never fatal to the others.
+    """
+    worst = EXIT_OK
+    for project_id in projects:
+        plans, failures = _project_plans(
+            project_id, stamp, config=config, out_root=out_root, detector_argv=detector_argv,
+        )
+        try:
+            built = _report_for(project_id, stamp, plans, config=config, out_root=out_root,
+                                failed=[f.as_dict() for f in failures])
+        except PreviousReportError as exc:
+            logger.error('ABORT: %s', exc)
+            worst = EXIT_RUN_FAILED
+            continue
+        published = _publish(out_root, project_id, stamp, built)
+        worst = max(worst, published, EXIT_RUN_FAILED if failures else EXIT_OK)
+    return worst
+
+
 def _build_parser() -> LoudArgumentParser:
     parser = LoudArgumentParser(
         description='Build the duplicate-cluster report and diff it against the previous one.',
@@ -867,10 +1011,14 @@ def main(argv: list[str] | None = None) -> int:
     except (DuplicateAuditConfigError, MetricSchemaError) as exc:
         logger.error('%s', exc)
         return EXIT_BAD_INPUT
-    if not args.plan:
-        logger.error('no --plan given: the scheduled mode is not wired yet')
+    if args.plan:
+        return _run_plan_mode(args, config, stamp)
+    if args.project_id is not None and args.project_id not in config.projects:
+        logger.error('--project-id %r is not a configured project (%s: %s)',
+                     args.project_id, args.config, ', '.join(config.projects))
         return EXIT_BAD_INPUT
-    return _run_plan_mode(args, config, stamp)
+    projects = (args.project_id,) if args.project_id is not None else config.projects
+    return run_scheduled(config, out_root=args.out_root, stamp=stamp, projects=projects)
 
 
 if __name__ == '__main__':

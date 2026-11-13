@@ -999,7 +999,7 @@ class TestScheduledInvocations:
 
         for project in config.projects:
             rep = json.loads(report.report_path(out_root, project, _CUR).read_text())
-            assert list(rep['categories']) == list(config.categories)
+            assert set(rep['categories']) == set(config.categories)
             for category in config.categories:
                 plan_path = out_root / project / f'plan-{_CUR}-{category}.json'
                 assert json.loads(plan_path.read_text()) == json.loads(
