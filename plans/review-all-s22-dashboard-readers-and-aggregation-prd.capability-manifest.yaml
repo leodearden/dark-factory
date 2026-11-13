@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ω", "π8"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 9766
     title: "Move the run-event and merge-outcome vocabularies into shared"
     note: "Contributes fk-c927adb040e9 (θ closes). C4. α → 9140 (7612 landed, 3b1f243a9b); lead edges 9152 → α and 9144 → α; the 22 amends ruled at the sitting (OQ-1)."
     capabilities:
@@ -53,7 +53,7 @@ tasks:
           kind: manual
           reason: "a reviewer confirms 9152 and 9144 depend on α, α depends on 9140 and 7612, and the 22 open tasks expected to add an EventType or OutcomeKind member were amended to declare the shared file"
   - label: "β"
-    task_id: null
+    task_id: 9800
     title: "Shared runs.db read model: query values, three-state results, the shared read-only opener"
     note: "R36 deliverable (no key). C5, D3, D4, D4b. β → α. Priority inversion with θ (high) recorded, not overridden. Lead edge 8661 → β (8460 landed before its edge, 5a1f289e91; ρ3 takes its reads)."
     capabilities:
@@ -135,7 +135,7 @@ tasks:
           paths: ["shared/src/shared/tasks_db_readonly.py"]
           expect: present
   - label: "γ1"
-    task_id: null
+    task_id: 9791
     title: "One fan-out failure classification; memory's queue and WAL reads fail over"
     note: "Closes fk-f3a5a34831e9; contributes fk-70e1ee9218a7 (tasks.py prose). C2a, D6, D7. γ1 → 6722, 8558, S19 κ1, S19 κ2 (lead ruling S19/Q-C3 = OQ-6; κ2 shares mcp_fanout.py and metrics.py). Subsumes 6872, 8119."
     capabilities:
@@ -162,7 +162,7 @@ tasks:
           kind: manual
           reason: "a reviewer confirms S19 κ1 is on main (mcp_client.py holds mcp_tool_call and invalidate_session; mcp_fanout imports nothing from memory) and γ1 uses those names"
   - label: "γ2"
-    task_id: null
+    task_id: 9802
     title: "One concurrent escalation-URL probe; the four probes become projectors"
     note: "Closes fk-ad49b80c5554 (high). C2b. γ2 → γ1, 6722, 9162, S19 κ1, S19 κ2 (merge_queue.py, api/merge_queue.py); lead edge 8561 → γ2 (8561 is parked behind 8528). Subsumes 7628, 7503."
     capabilities:
@@ -197,7 +197,7 @@ tasks:
           kind: manual
           reason: "behavioural; asserted by test_escalation_probe.py and the merge-queue route test (row 2)"
   - label: "δ1"
-    task_id: null
+    task_id: 9807
     title: "TTLCache in its own module, one slot per key, policy at construction"
     note: "Closes fk-b5760d0dfe85 (high), fk-c51423b7b7e5; contributes fk-70e1ee9218a7 (mcp_fanout prose). C3 invariants 1–5, D8. δ1 → γ1, ν, 9162, 8559, 8563, S19 κ1, S19 κ2; lead edges 9285 → δ1, 8564 → δ1 (both already wait on 8528)."
     capabilities:
@@ -241,7 +241,7 @@ tasks:
           paths: ["dashboard/src/dashboard/data/burndown.py"]
           expect: absent
   - label: "δ2"
-    task_id: null
+    task_id: 9816
     title: "The dashboard's caches are app-scoped; tests construct cache policies"
     note: "Contributes fk-b5760d0dfe85 (tests stance). C3 CacheRegistry, D8. δ2 → δ1, θ, ξ1."
     capabilities:
@@ -270,7 +270,7 @@ tasks:
           paths: ["dashboard/tests/_boundary_payloads.py", "dashboard/tests/test_active_tasks.py", "dashboard/tests/test_api_prds.py", "dashboard/tests/test_app.py", "dashboard/tests/test_burndown_data.py", "dashboard/tests/test_escalation_corpus.py", "dashboard/tests/test_prd_signal.py", "dashboard/tests/test_scheduler_page.py", "dashboard/tests/test_scheduler_state_access.py", "dashboard/tests/test_task_activity.py", "dashboard/tests/test_tasks_census_projection.py", "dashboard/tests/test_task_snapshot.py"]
           expect: absent
   - label: "ε"
-    task_id: null
+    task_id: 9818
     title: "Recon and memory-ops panels read fused-memory's read model; the dashboard's fused-memory SQL goes"
     note: "Closes fk-1c1d247caaa7. Consumes S15 C4 (S15 κ). ε → ζ, ν, θ, 6722, 8563, S15 κ."
     capabilities:
@@ -321,7 +321,7 @@ tasks:
           kind: manual
           reason: "a reviewer confirms S15 κ is on main and ε parses PanelsReply rather than reading SQLite"
   - label: "ζ"
-    task_id: null
+    task_id: 9820
     title: "The curator panel reports a fused-memory outage as one; samplers write NULL"
     note: "Closes fk-4afbeb684a22 (high); contributes fk-1c1d247caaa7 (tickets). ζ → γ1, ν, S15 κ. Subsumes 7815."
     capabilities:
@@ -356,7 +356,7 @@ tasks:
           kind: manual
           reason: "live metrics.db read after a sampler tick with fused-memory stopped; not a tree property"
   - label: "η"
-    task_id: null
+    task_id: 9847
     title: "Performance: additive per-DB tallies, one merge, one partial-tally rule"
     note: "Closes fk-a9e45ca0eb10 (weakened, re-verified). η → β, ε, ν, 9162."
     capabilities:
@@ -393,7 +393,7 @@ tasks:
           paths: ["dashboard/tests/test_performance.py"]
           expect: absent
   - label: "θ"
-    task_id: null
+    task_id: 9852
     title: "Dashboard event readers on the read model; outcome families keyed by the imported members"
     note: "Closes fk-af4ba730a48a (high), fk-c927adb040e9. θ → β, γ2, 8563 (8460 landed, 5a1f289e91)."
     capabilities:
@@ -445,7 +445,7 @@ tasks:
           paths: ["dashboard/tests/test_datum_access_paths.py"]
           expect: absent
   - label: "ι"
-    task_id: null
+    task_id: 9853
     title: "Cost, cap, model-role and load readers typed; with_db deleted"
     note: "Closes fk-9979f1b771de. ι → β, η, ε, S20 ζ (no edge onto θ: they share only a test file); lead edge 8564 → ι."
     capabilities:
@@ -481,7 +481,7 @@ tasks:
           paths: ["shared/src/shared/runs_read/model_role.py"]
           expect: present
   - label: "κ"
-    task_id: null
+    task_id: 9859
     title: "Scheduler collector: fetch plus a pure shaper, a named record, raw task ids on rows"
     note: "Closes fk-6aee6c49fa2e, fk-d21f64525e52, fk-70e1ee9218a7. κ → δ2, ι, α, ρ2, 8558, 8559, 8563. Subsumes 6842."
     capabilities:
@@ -510,7 +510,7 @@ tasks:
           paths: ["dashboard/src/dashboard/data/scheduler.py"]
           expect: absent
   - label: "λ"
-    task_id: null
+    task_id: 9864
     title: "Orchestrator discovery and the orchestrator-yaml read, one function each"
     note: "Closes fk-d0a7ebc4a4f1, fk-9cf2a161c9c0 (weakened; part c retired 3f78c8a09c). λ → ε, δ1, 6722, 8563, S16 α, S19 κ2. Subsumes 6875. Defaults from S16 C8 (lead rulings S16/OQ-4 option 2, OQ-5)."
     capabilities:
@@ -547,7 +547,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/config.py"]
           expect: present
   - label: "μ"
-    task_id: null
+    task_id: 9865
     title: "/healthz probe as a HealthProbe on app.state"
     note: "Closes fk-166cacf84a18. D9. μ → 6722, S19 κ2 (app.py)."
     capabilities:
@@ -576,7 +576,7 @@ tasks:
           paths: ["dashboard/src/dashboard/app.py"]
           expect: absent
   - label: "ν"
-    task_id: null
+    task_id: 9868
     title: "Remaining app.py routes into api/ routers with typed bodies"
     note: "Closes fk-1b8c06cd8b2f, fk-ce66d4da9b0f. D10. ν → μ, S19 κ2. Subsumes 8700."
     capabilities:
@@ -604,7 +604,7 @@ tasks:
           paths: ["dashboard/src/dashboard/app.py"]
           expect: absent
   - label: "ξ1"
-    task_id: null
+    task_id: 9871
     title: "Static assets revalidate; the tests stop pinning a ?v= floor"
     note: "Contributes fk-94fc76e7a123 (ξ2 closes); priority inversion with ξ2 recorded. D11. ξ1 → ν, δ1, 8558 (no edge onto 8461: they share only test files)."
     capabilities:
@@ -624,7 +624,7 @@ tasks:
           paths: ["dashboard/tests/test_charts_axis_labels.py", "dashboard/tests/test_esc_flow_diagram.py", "dashboard/tests/test_tab_memory_evals.py", "dashboard/tests/test_tab_scheduler.py", "dashboard/tests/test_tab_tasks_invariant_chip.py"]
           expect: absent
   - label: "ξ2"
-    task_id: null
+    task_id: 9874
     title: "Strip the ?v= stamps; the cache-buster freshness test goes"
     note: "Closes fk-94fc76e7a123 (high); revalidation only, ruled at the sitting (OQ-3). D11. ξ2 → ξ1. Moves the four served-module body checks into a node test before ο lands (D14 Scope), recording the narrowed pin in its commit message."
     capabilities:
@@ -673,7 +673,7 @@ tasks:
           paths: ["dashboard/tests/js/classic_script_scope.test.mjs", "dashboard/tests/test_index_html.py"]
           expect: present
   - label: "ο"
-    task_id: null
+    task_id: 9892
     title: "Guard: no new dashboard test reads frontend source text; each exempted module is owned by its conversion task"
     note: "Contributes fk-1bdd95e804cb (π8 closes). C6, D14; option B ruled at the sitting (OQ-4). ο → ξ2. Owned debt (INV-12), no ratification row."
     capabilities:
@@ -701,7 +701,7 @@ tasks:
           paths: ["shared/src/shared/ratchet.py"]
           expect: present
   - label: "π1"
-    task_id: null
+    task_id: 9879
     title: "Tasks-tab source-text tests become render tests: runtime, status counts, focus header, staleness banner, layout memo, terminal window, prose, module locks"
     note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π1 → ξ2, 8461. Subsumes 7907, 8703. Records every dropped pin with its reason in its commit message."
     capabilities:
@@ -720,7 +720,7 @@ tasks:
           paths: ["dashboard/tests/test_tab_tasks_runtime.py", "dashboard/tests/test_tab_tasks_status_counts.py", "dashboard/tests/test_tab_tasks_focus_header.py", "dashboard/tests/test_tab_staleness_indicator.py", "dashboard/tests/test_tab_tasks_layout_memo.py", "dashboard/tests/test_tab_tasks_terminal_window.py", "dashboard/tests/test_tab_tasks_prose.py", "dashboard/tests/test_tab_tasks_module_locks.py"]
           expect: absent
   - label: "π2"
-    task_id: null
+    task_id: 9881
     title: "Overview and Orchestrators tabs and the app-chrome census become render tests"
     note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π2 → θ, 8461. Records every dropped pin with its reason in its commit message."
     capabilities:
@@ -739,7 +739,7 @@ tasks:
           paths: ["dashboard/tests/test_tab_overview.py", "dashboard/tests/test_tab_orchestrators.py", "dashboard/tests/test_app_chrome_census.py"]
           expect: absent
   - label: "π3"
-    task_id: null
+    task_id: 9884
     title: "Burndown tab and chart source-text tests become render tests: axis labels, null samples, census tones, chart consumer bindings"
     note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π3 → ξ2, 8461, 8563. Absorbs 4351, 7971. Records every dropped pin with its reason in its commit message."
     capabilities:
@@ -758,7 +758,7 @@ tasks:
           paths: ["dashboard/tests/test_tab_burndown.py", "dashboard/tests/test_charts_axis_labels.py", "dashboard/tests/test_charts_null_samples.py", "dashboard/tests/test_census_tone_bindings.py", "dashboard/tests/test_charts_consumer_bindings.py"]
           expect: absent
   - label: "π4"
-    task_id: null
+    task_id: 9885
     title: "Memory and Memory-evals tab source-text tests become render tests"
     note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π4 → ξ2, γ1, 8461. Records every dropped pin with its reason in its commit message."
     capabilities:
@@ -777,7 +777,7 @@ tasks:
           paths: ["dashboard/tests/test_tab_memory.py", "dashboard/tests/test_tab_memory_evals.py"]
           expect: absent
   - label: "π5"
-    task_id: null
+    task_id: 9886
     title: "Escalations and Escalation-analytics tabs, the flow diagram and the persisted-state consumers become render tests"
     note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π5 → ξ2, 8461. Records every dropped pin with its reason in its commit message."
     capabilities:
@@ -796,7 +796,7 @@ tasks:
           paths: ["dashboard/tests/test_tab_escalations.py", "dashboard/tests/test_tab_escalation_analytics.py", "dashboard/tests/test_esc_flow_diagram.py", "dashboard/tests/test_persisted_state_consumers.py"]
           expect: absent
   - label: "π6"
-    task_id: null
+    task_id: 9887
     title: "Scheduler, Recon, Curator and Merge tabs, the park label and the chip-list hooks become render tests"
     note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π6 → ξ2, κ, ζ, ε, 8461. Also rewires the two importers of _lock_chip_matrix.py outside the six modules (D14 Scope). Records every dropped pin with its reason in its commit message."
     capabilities:
@@ -823,7 +823,7 @@ tasks:
           paths: ["dashboard/tests/test_tab_scheduler.py", "dashboard/tests/test_tab_recon.py", "dashboard/tests/test_tab_curator.py", "dashboard/tests/test_tab_merge_queue.py", "dashboard/tests/test_park_entry_label.py", "dashboard/tests/test_chip_list_hooks.py"]
           expect: absent
   - label: "π7"
-    task_id: null
+    task_id: 9888
     title: "App-shell source-text tests become render tests: Datum components, poll scope, tab error boundary, the browser abort timeout"
     note: "Contributes fk-1bdd95e804cb (π8 closes). D14; option B ruled at the sitting (OQ-4). π7 → 8461. Subsumes 7566; absorbs 7004. Records every dropped pin with its reason in its commit message."
     capabilities:
@@ -850,7 +850,7 @@ tasks:
           paths: ["dashboard/tests/test_prds_budget.py", "dashboard/tests/test_tasks_budget.py"]
           expect: absent
   - label: "π8"
-    task_id: null
+    task_id: 9889
     title: "Delete the source-text helper layer; the last served-script reads become node tests; the exemption list ends empty"
     note: "Closes fk-1bdd95e804cb. D14, C6; option B ruled at the sitting (OQ-4). π8 → π1, π2, π3, π4, π5, π6, π7, ο. Absorbs 4244, 4287, 4461, 6562, 9046 (and 9037 with π3, π5, π7). Signal leaf for the Goal's source-text bullet. Records every dropped pin with its reason in its commit message."
     capabilities:
@@ -885,7 +885,7 @@ tasks:
           paths: ["dashboard/tests/js/retired_globals.test.mjs"]
           expect: present
   - label: "ρ1"
-    task_id: null
+    task_id: 9894
     title: "Quality series on the read model"
     note: "R36 deliverable (no key). ρ1 → β, S20 ζ (lead ruling OQ-8: run_query on the caller's connection)."
     capabilities:
@@ -913,7 +913,7 @@ tasks:
           paths: ["shared/src/shared/runs_read/quality.py"]
           expect: present
   - label: "ρ2"
-    task_id: null
+    task_id: 9895
     title: "Client feed and fused-memory's scheduler reads on the read model"
     note: "R36 deliverable (no key). ρ2 → β, 8559."
     capabilities:
@@ -941,7 +941,7 @@ tasks:
           paths: ["shared/src/shared/runs_read/scheduler.py"]
           expect: present
   - label: "ρ3"
-    task_id: null
+    task_id: 9897
     title: "Quality markers read runs.db through the read model"
     note: "R36 deliverable (no key); the reads landed with task 8460 (5a1f289e91). ρ3 → β, S20 ζ, 8465."
     capabilities:
@@ -969,7 +969,7 @@ tasks:
           paths: ["dashboard/src/dashboard/data/quality_marker_sampler.py"]
           expect: absent
   - label: "σ"
-    task_id: null
+    task_id: 9899
     title: "Merge-lane scripts on the read model"
     note: "R36 deliverable (no key). σ → β, θ, 6765; lead edges 9144 → σ, 9146 → σ, 7838 → σ."
     capabilities:
@@ -990,7 +990,7 @@ tasks:
           paths: ["scripts/verify_admission_cancel_on_red_census.py"]
           expect: absent
   - label: "τ"
-    task_id: null
+    task_id: 9901
     title: "Audit and operator scripts on the read model; query-events.sh deleted"
     note: "R36 deliverable (no key). τ → β, ι, ρ2, 9162, 8563, 6759, 6761, 6762, 6765, 6766, S20 ζ; lead edge 7838 → τ."
     capabilities:
@@ -1025,7 +1025,7 @@ tasks:
           paths: ["shared/src/shared/runs_read/audit.py"]
           expect: present
   - label: "υ"
-    task_id: null
+    task_id: 9902
     title: "EventStore's typed reads delegate their SQL to the read model; one model-role query"
     note: "No key. υ → 9231, β, θ (runs_read/events.py), ι, 8563, S20 ζ. Delegation ruled by the lead (OQ-2)."
     capabilities:
@@ -1052,7 +1052,7 @@ tasks:
           kind: manual
           reason: "a reviewer confirms the digest's model-role rollup and the dashboard's cells run one query (boundary row 19)"
   - label: "ω"
-    task_id: null
+    task_id: 9903
     title: "Integration gate: the dashboard's readers end to end; the runs.db read encapsulation guard"
     note: "Signal leaf. ω → α β γ1 γ2 δ1 δ2 ε ζ η θ ι κ λ μ ν ξ1 ξ2 ο ρ1 ρ2 ρ3 σ τ, 8563 (not π1–π8; 8460 landed)."
     capabilities:

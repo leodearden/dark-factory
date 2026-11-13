@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ω"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 9729
     title: "Typed reconciliation run record: StageId-keyed reports, a RunError field, the journal as sole decoder"
     note: "Closes fk-377a7036ac7f. Deps: 7876, 6721 (stats_verifier.py), S10 λ 9254 (harness.py), S19 α (recon_state/journal.py, lead ruling OQ-12). Subsumes task 5912 (cancel)."
     capabilities:
@@ -32,7 +32,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
           expect: absent
   - label: "β1"
-    task_id: null
+    task_id: 9757
     title: "One reconciliation run driver for full and backlog-chunk runs; the run row before any drain"
     note: "Closes fk-0485729893fe; builds C1 for fk-8621784d79d3 (closed by β2). Deps: α, 6695 (lands the narrow fix first)."
     capabilities:
@@ -61,7 +61,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/drained_event_restore.py"]
           expect: present
   - label: "β2"
-    task_id: null
+    task_id: 9762
     title: "Remediation is RunKind.remediation on the one driver; the second run lifecycle is deleted"
     note: "Closes fk-8621784d79d3 (high), fk-2571f7726184. High: dependency of gate 6698. Deps: β1. _maybe_remediate calls drive outside its own try, so a remediation failure is filed once (boundary row 17)."
     capabilities:
@@ -82,7 +82,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
           expect: absent
   - label: "γ0"
-    task_id: null
+    task_id: 9788
     title: "Reconciliation stage tests build and run stages through one test helper"
     note: "Contributes to fk-63b65973bd33 and fk-0cce86f5dbfe (test side); closes none. Deps: S13 ι (stage_builders.py imports IntegrityCheck, lead ruling OQ-8) only; the test files it shares with β2 and S10 μ1 9278 / μ2 9280 are rebase-only (lead's test-file rule). Test-only, uniform substitution over 34 modules."
     capabilities:
@@ -94,7 +94,7 @@ tasks:
           paths: ["fused-memory/tests/reconciliation/stage_builders.py"]
           expect: present
   - label: "γ1"
-    task_id: null
+    task_id: 9796
     title: "Stage payload interface: assemble_payload(..., run) returns PayloadResult; the per-run stashes go"
     note: "Closes fk-0cce86f5dbfe. Deps: β2 (harness.py), γ0 (stage_builders.py, which γ0 creates), S10 α 9180 (task_knowledge_sync.py), S26 μ 9203 (memory_consolidator.py), S13 ι (verbatim task_knowledge_sync.py split; stages/integrity_check.py, lead ruling OQ-8)."
     capabilities:
@@ -115,7 +115,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py"]
           expect: absent
   - label: "γ2"
-    task_id: null
+    task_id: 9803
     title: "Reconciliation stages constructed with their collaborators and per-cycle inputs"
     note: "Closes fk-63b65973bd33; contributes to fk-16baf39b1db6. Subsumes tasks 7343, 8835 and 7604 (cancel; θ finishes 7604's tests). Deps: γ1."
     capabilities:
@@ -136,7 +136,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
           expect: absent
   - label: "δ"
-    task_id: null
+    task_id: 9813
     title: "Recon stage identity and run id bound on the MCP transport; a differing value refused; the stage instructions swept; fused-memory URL from server config"
     note: "Closes fk-a3598aec7dca (high), fk-d2c7f1b902ac. High: dependency of gate 6698. Deps: γ2, 6721 (S14 μ), S10 μ2 9280 (server/tools.py), S10 ν 9282 (middleware/task_interceptor.py, added by the OQ-3 ruling), S15 α (server/tool_context.py, lead ruling OQ-11), S19 β1 (recon_state/recon_self_model.py, lead ruling OQ-12). The recon-report MCP entry carries the same headers (lead ruling OQ-10). Sitting ruling OQ-3: a differing agent_id or _causation_id is refused (structured error naming both values, one log line per refusal); task filing reads the run id from the header; the instruction sweep (including the server's MCP instructions string, added at fold-verify) lands in the same commit; search's agent_id is an authoring-agent filter and is outside the refusal. Supersedes task 6895 (cancel)."
     capabilities:
@@ -245,7 +245,7 @@ tasks:
           paths: ["CLAUDE.md", "docs/task-authoring.md"]
           expect: absent
   - label: "ι1"
-    task_id: null
+    task_id: 9844
     title: "Stage prompts render capabilities and the dedup rule from code; prompts and the harness import nothing from server"
     note: "Closes fk-10c8c43d9e89 (high), fk-9850339b610c; the upward-import half of fk-20cb93d17ff3. High: dependency of gate 6698. Deps: δ, S10 μ2 9280 (server/main.py); S19 β1 (recon_state/recon_self_model.py, lead ruling OQ-12) is reached through δ."
     capabilities:
@@ -290,7 +290,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/prompts/", "fused-memory/src/fused_memory/reconciliation/harness.py"]
           expect: absent
   - label: "ι2"
-    task_id: null
+    task_id: 9869
     title: "Prompt fragment library moves out of the package __init__ into prompts/fragments.py"
     note: "Closes fk-20cb93d17ff3 (library half). Deps: ι1, κ2. Also repoints fused-memory/scripts/freeze_write_triage_population.py."
     capabilities:
@@ -310,7 +310,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py", "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py", "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py"]
           expect: absent
   - label: "ε"
-    task_id: null
+    task_id: 9851
     title: "Consecutive-cycle recon alarms as RunStreak declarations over shared.streak.KeyedStreaks"
     note: "Closes fk-90e488a174b7. Deps: ι1 (harness.py), γ2 (task_knowledge_sync.py), S1 ι1 (recon escalation registry C8 + FilingPolicy C1, lead ruling OQ-7), S13 ι (standing_decision_growth_sweep.py, lead ruling OQ-8). S14 λ 6712 is done. Fires at count >= threshold, repeats fold (sitting ruling OQ-1)."
     capabilities:
@@ -355,7 +355,7 @@ tasks:
           paths: ["shared/src/shared/streak.py"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 9858
     title: "Cycle-summary write state as a typed StageReport field"
     note: "Closes fk-f23c6e137ce5. Deps: ε, 7877."
     capabilities:
@@ -376,7 +376,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
           expect: absent
   - label: "κ1"
-    task_id: null
+    task_id: 9862
     title: "Targeted reconciler: one gated write path, classified outcomes, an event per fail-open arm; deferred writes replayed with causation"
     note: "Closes fk-05443fb78da6, fk-be8ed2cd9ce9, fk-2bb6c913d747, fk-147a9951edc7. Deps: ζ, S10 μ2 9280, S10 ν 9282, 8144. Not S10 ο 9285 (it waits on 8528; different symbols of targeted.py, file locks order them). The reconciler factory is a provider member of S10 μ2's InterceptorCollaborators (lead ruling OQ-2); S15 D12 consumes it."
     capabilities:
@@ -413,7 +413,7 @@ tasks:
           paths: ["shared/src/shared/mcp_envelope.py"]
           expect: present
   - label: "κ2"
-    task_id: null
+    task_id: 9866
     title: "Reconciliation stages and harness write tasks only through the TaskInterceptor"
     note: "Closes fk-875cca636438. Deps: κ1, S13 ι (policies/briefing_refresh.py, lead ruling OQ-8). The guard's one exemption, consolidation_auto_executor.py's hazard-gate filer, carries an INV-12 Policy row (lead ruling OQ-9)."
     capabilities:
@@ -434,7 +434,7 @@ tasks:
           paths: ["docs/legibility/exception-ratifications.yaml"]
           expect: present
   - label: "η1"
-    task_id: null
+    task_id: 9873
     title: "harness.py partition I: the cycle-summary backstop and run recovery in their own modules"
     note: "Contributes to fk-a88506a1e327 and fk-16baf39b1db6. Deps: κ2."
     capabilities:
@@ -453,7 +453,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/cycle_summary_backstop.py"]
           expect: present
   - label: "η2"
-    task_id: null
+    task_id: 9876
     title: "harness.py partition II: cycle diagnostics, the finding gate and BacklogIterator in their own modules; prose rehomed"
     note: "Closes fk-a88506a1e327; contributes to fk-16baf39b1db6. Subsumes task 6783 (cancel). Deps: η1."
     capabilities:
@@ -473,7 +473,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
           expect: absent
   - label: "θ"
-    task_id: null
+    task_id: 9877
     title: "Reconciliation harness tests drive public seams; the remaining private test seams are deleted"
     note: "Closes fk-16baf39b1db6. Finishes task 7604's tests (7604 is cancelled onto γ2). Deps: η2 (not ι2: test files only, rebase-only)."
     capabilities:
@@ -494,7 +494,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
           expect: absent
   - label: "ω"
-    task_id: null
+    task_id: 9880
     title: "Integration gate: the run-lifecycle boundary suite and the live journal check"
     note: "Signal leaf. No key. Deps: θ, ι2."
     capabilities:

@@ -10,7 +10,7 @@ signal_leaves:
 - ο3
 tasks:
 - label: α
-  task_id: null
+  task_id: 9756
   title: 'Shared sidecar surface for the commit_planning stamper and manifest audits: SIDECAR_SUFFIX, sidecar_for,
     tracked_sidecar_paths'
   note: Delivers C3, the seam held task 6764 (S25 ι) waits on; closes no S20 key.
@@ -70,7 +70,7 @@ tasks:
       reason: B1 expected values are pinned from main; a reviewer confirms the table covers the eight shapes C3
         lists
 - label: β
-  task_id: null
+  task_id: 9761
   title: 'Result leaf: AgentResult and CliSubtype in shared/cli_result.py; failure projection in shared/agent_failure.py;
     the import cycle goes'
   note: 'Contributes fk-1778eb482209, fk-aacd5e9381f6, fk-3ae32b390a81 (closers: ο2, ε, ο3). Depends on S19 ι (S19/C7,
@@ -146,7 +146,7 @@ tasks:
       - shared/tests/test_cli_subtype_spelling.py
       expect: present
 - label: γ
-  task_id: null
+  task_id: 9787
   title: 'Transcript leaf shared/transcript.py: public locator, content_blocks, fixtures instead of patches'
   note: 'Contributes fk-e59c30a25d27, fk-fede65204150, fk-3ae32b390a81 (closers: ο2, θ, ο3).'
   capabilities:
@@ -195,7 +195,7 @@ tasks:
       - shared/tests/
       expect: absent
 - label: δ
-  task_id: null
+  task_id: 9793
   title: Argv leaf shared/claude_argv.py and the invocation cost floor
   note: Closes fk-2f4b8655fb3c; contributes fk-3ae32b390a81. Raises the ten sub-floor test budgets (eight files).
   capabilities:
@@ -252,7 +252,7 @@ tasks:
       - shared/tests/test_wildcard_deny_live_inventory.py
       expect: absent
 - label: ε
-  task_id: null
+  task_id: 9804
   title: 'UsageGate partition: vocabulary, probe verdict, scope overlay; one resets_at writer; one cap-event writer
     and its resumed dual'
   note: Closes fk-377f5a42e8be, fk-f7f1747302dc, fk-ae6cd7600d0e, fk-aacd5e9381f6; contributes fk-8805d20c0c4c,
@@ -346,7 +346,7 @@ tasks:
       - shared/src/shared/account_state.py
       expect: present
 - label: ζ
-  task_id: null
+  task_id: 9812
   title: 'invocations rows per attempt: invocation_id, attempt, returned; count readers filter returned'
   note: Contributes fk-b8cba955b358 (closer ο2). Row shape per lead ruling S20/OQ-4.
   capabilities:
@@ -367,7 +367,7 @@ tasks:
       reason: a reviewer confirms each reader in the re-measured list is classified sum-only or row-as-invocation
         and the latter filter returned = 1
 - label: η
-  task_id: null
+  task_id: 9846
   title: Slot observe returns a Decision; the cap-retry state machine; one classification and one cost row per attempt
     for callers that pass a cost store
   note: Closes fk-dcc5dce60bb6, fk-2a5d97aeb64d, fk-005378a1b462; contributes fk-8805d20c0c4c, fk-b8cba955b358,
@@ -476,7 +476,7 @@ tasks:
       - orchestrator/tests/test_invoke.py
       expect: absent
 - label: θ
-  task_id: null
+  task_id: 9850
   title: Runner leaf shared/claude_runner.py; cli_invoke is the state machine; loop suites onto invoke_fn and clock
   note: Closes fk-fede65204150; contributes fk-3ae32b390a81, fk-2a5d97aeb64d. Carries S19/C7 public runner names
     unchanged (lead ruling S20/OQ-7). Absorbs task 6996.
@@ -552,7 +552,7 @@ tasks:
       kind: manual
       reason: wc -l shared/src/shared/cli_invoke.py ≤ 1,000, recorded in the task record
 - label: ι
-  task_id: null
+  task_id: 9857
   title: UsageGate public test seam; AccountState setters and the probe-dir alias go
   note: Closes fk-db060c262575; contributes fk-25c96d016239.
   capabilities:
@@ -593,7 +593,7 @@ tasks:
       - shared/src/shared/usage_gate.py
       expect: present
 - label: κ1
-  task_id: null
+  task_id: 9860
   title: Move the probe and exhaustive UsageGate suites onto the public seam; private-reach ratchet
   note: Contributes fk-25c96d016239. Lead ruling S20/OQ-5.
   capabilities:
@@ -615,7 +615,7 @@ tasks:
       - shared/tests/test_usage_gate_private_reach_ratchet.py
       expect: present
 - label: κ2
-  task_id: null
+  task_id: 9863
   title: Move the remaining large UsageGate suites onto the public seam and lower the private-reach ratchet
   note: Contributes fk-25c96d016239. The slot verdict methods are deleted later, in ο3.
   capabilities:
@@ -641,7 +641,7 @@ tasks:
       - shared/tests/test_usage_gate_scope_attribution.py
       expect: absent
 - label: ξ1
-  task_id: null
+  task_id: 9870
   title: Repoint shared test importers onto shared.cli_result, shared.transcript, shared.claude_argv, shared.claude_runner
     and shared.account_state; shared tests stop calling the old slot verdict methods
   note: Contributes fk-3ae32b390a81. Files enumerated at 97be1d71fa, re-checked at 1b106418da (count rule in the PRD).
@@ -695,7 +695,7 @@ tasks:
       - shared/tests/test_usage_gate_test_helpers.py
       expect: absent
 - label: ξ2
-  task_id: null
+  task_id: 9872
   title: Repoint fused-memory and scripts importers in files no wave-2 task holds; scripts adopt CliSubtype
   note: Contributes fk-1778eb482209, fk-3ae32b390a81.
   capabilities:
@@ -719,7 +719,7 @@ tasks:
       - scripts/review_model_admission.py
       expect: absent
 - label: ξ3
-  task_id: null
+  task_id: 9875
   title: Repoint orchestrator importers in files no wave-2 task holds (the tests and the zcode backend) onto shared.cli_result,
     shared.transcript, shared.claude_argv, shared.claude_runner and shared.account_state
   note: Contributes fk-3ae32b390a81. Files enumerated at 97be1d71fa, re-checked at 1b106418da (test_reviewer_note_dispositions.py
@@ -768,7 +768,7 @@ tasks:
       - orchestrator/tests/test_zero_work_failure.py
       expect: absent
 - label: ξ4
-  task_id: null
+  task_id: 9878
   title: Repoint the orchestrator test importers that wave-2 tasks also hold, rebase-only under file locks
   note: Contributes fk-3ae32b390a81. Every file is a test file, so no edge onto 9236 or any wave-2 holder (lead
     ruling of 2026-11-12).
@@ -801,7 +801,7 @@ tasks:
       - orchestrator/tests/test_workflow_ready_to_merge.py
       expect: absent
 - label: λ
-  task_id: null
+  task_id: 9882
   title: Thread the scratch root as a parameter; the sweep interception point goes
   note: Closes fk-734bc1fc18bf (weakened, re-verified). Absorbs task 8234.
   capabilities:
@@ -833,7 +833,7 @@ tasks:
       - shared/tests/
       expect: absent
 - label: μ
-  task_id: null
+  task_id: 9883
   title: Delivered-check kinds as a discriminated union; consumers dispatch on the model
   note: Closes fk-240df0521f83 (weakened, re-verified). Absorbs task 7376. Depends on S10 η 9240 (S10 C3) and θ
     9242 (INV-16), and on S16 ζ1 (agents/briefing.py).
@@ -881,7 +881,7 @@ tasks:
       - orchestrator/src/
       expect: absent
 - label: ν
-  task_id: null
+  task_id: 9891
   title: Type the invocation backend with the shared Backend enum (S16's role-and-backend vocabulary, S16/C1)
   note: HELD on S16/C1 (shared/backends.py Backend, S16 γ0; x_seam_wait), unless γ0 already has a task id at decompose.
     Closes no key. Follows S16 π on shared/account_state.py through ο3 → ο2 → S16 π.
@@ -898,7 +898,7 @@ tasks:
       - shared/src/shared/cli_invoke.py
       expect: present
 - label: ο1
-  task_id: null
+  task_id: 9893
   title: Fused-memory files that wave-2 tasks hold adopt the new shared homes
   note: Contributes fk-3ae32b390a81. Waits on λ and 9188 (the non-test files' wave-2 holders) and on S16 ε2a and
     ε2b (cli_stage_runner.py, task_curator.py); test files take no edge (lead ruling of 2026-11-12).
@@ -923,7 +923,7 @@ tasks:
       - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
       expect: present
 - label: ο2
-  task_id: null
+  task_id: 9896
   title: The orchestrator adopts CliSubtype, the transcript leaf and the retry loop as the one writer of invocation
     cost rows
   note: Closes fk-1778eb482209, fk-e59c30a25d27, fk-b8cba955b358. Signal leaf (task-workflow cost rows). Lead ruling
@@ -979,7 +979,7 @@ tasks:
       - orchestrator/src/orchestrator/review_checkpoint.py
       expect: absent
 - label: ο3
-  task_id: null
+  task_id: 9898
   title: Transitional re-exports, the old slot verdict methods and the __new__ gate builder go
   note: Closes fk-3ae32b390a81, fk-25c96d016239, fk-8805d20c0c4c; contributes fk-1778eb482209 (the spelling allow-list's
     last entries). Signal leaf (end state).
@@ -1021,7 +1021,7 @@ tasks:
       - shared/src/shared/usage_gate.py
       expect: absent
 - label: π
-  task_id: null
+  task_id: 9890
   title: The cap classifier also recognises the CLI's structured usage-limit field, not only banner text
   note: No S20 key (side finding of the task-8253 investigation, 2026-11-12; heuristic 12). Priority low; after η.
     The reset time and cap scope still come from the banner text.

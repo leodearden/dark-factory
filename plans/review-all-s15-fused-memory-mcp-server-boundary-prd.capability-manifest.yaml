@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ω"]
 tasks:
   - label: "κ"
-    task_id: null
+    task_id: 9821
     title: "Dashboard panel read model served by fused-memory get_status(panels=...)"
     note: "Produces C4. Contributes to S22's fk-1c1d247caaa7 (S22's consumer leaf closes it). Depends on 9280 and S19 α (the journal and event-buffer modules move to recon_state)."
     capabilities:
@@ -40,7 +40,7 @@ tasks:
           paths: ["shared/src/shared/phantom_verdict.py"]
           expect: present
   - label: "α0"
-    task_id: null
+    task_id: 9822
     title: "fused-memory project-root normalization takes an injected checkout resolver and runs off the event loop; tests stop patching server.tools"
     note: "Contributes to fk-a9f21093207e. Depends on κ. Offloads the 23 inline resolver calls (INV-8) and deletes their 23 allowlist rows as fixed; narrows task 5071. Codemod over 24 test files (32 patch sites, measured at 7848173a7d); hand-carry if lock-starved > 24 h."
     capabilities:
@@ -77,7 +77,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/models/scope.py"]
           expect: present
   - label: "α"
-    task_id: null
+    task_id: 9823
     title: "fused-memory ToolContext: interceptor bound once, one not-configured error code, journaled reads"
     note: "Produces C1. Closes fk-22ab8d1f3a42 (tools half; λ the interceptor half) and fk-1509bcd45e2a. Absorbs 4044. Depends on α0. Moves the identity helpers verbatim; S12 δ edits them at their new home afterwards (S12's edge), refusing a differing agent_id or _causation_id on writes and on get_entity, get_entity_by_uuid and get_episodes, never on search's agent_id filter."
     capabilities:
@@ -122,7 +122,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/write_triage.py"]
           expect: present
   - label: "β0"
-    task_id: null
+    task_id: 9825
     title: "fused-memory's tool-call guard stack is installed once, by create_mcp_server"
     note: "Contributes to fk-a9f21093207e. Depends on α, ζ and task 4643. Moves main.py's guard installation (safe wrapper, 4867's unknown-argument guard, markup guard; and the recon-report pair) into boundary_guards, called by create_mcp_server (OQ-2 ruled as recommended, 2026-11-12)."
     capabilities:
@@ -143,7 +143,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/"]
           expect: absent
   - label: "β"
-    task_id: null
+    task_id: 9826
     title: "fused-memory tools declare their project scope; one dispatch scope gate parses it"
     note: "Produces C2. Closes fk-a9f21093207e. Depends on β0 and 6815. R14 option 1; every declared scope validates (OQ-10) and the six graph mutators gain the known-project gate (OQ-3), both ruled 2026-11-12."
     capabilities:
@@ -204,7 +204,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/utils/validation.py"]
           expect: present
   - label: "ε1"
-    task_id: null
+    task_id: 9827
     title: "Move fused-memory's ops, scheduler and defects tool families out of create_mcp_server"
     note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on β and S12 δ (OQ-11 ruled (b): the moves carry S12 δ's call-site edits and every per-tool identity call verbatim, search's exclusion included). Creates the tools/list snapshot. S16 β2 waits on ε1 for reload_config (S16's edge); never ε1 → S16 β2, which would park it behind 8528 and 5040."
     capabilities:
@@ -237,7 +237,7 @@ tasks:
           paths: ["fused-memory/tests/data/mcp_tool_surface.json"]
           expect: present
   - label: "ε2"
-    task_id: null
+    task_id: 9828
     title: "Move fused-memory's task-read and task-write tool families"
     note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on ε1."
     capabilities:
@@ -256,7 +256,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/tool_families/task_write.py"]
           expect: present
   - label: "ε3"
-    task_id: null
+    task_id: 9829
     title: "Move fused-memory's memory-read and graph-admin tool families"
     note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on ε2. Moves search, get_entity, get_entity_by_uuid and get_episodes with their identity calls as S12 δ left them: the three reads keep the refusal, search keeps its exclusion."
     capabilities:
@@ -282,7 +282,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/task_status_facts.py"]
           expect: present
   - label: "ε4"
-    task_id: null
+    task_id: 9830
     title: "Move fused-memory's memory-write tool family"
     note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on ε3 and S1 θ1a (which makes _report_unverified_claims async before it moves)."
     capabilities:
@@ -294,7 +294,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/tool_families/memory_write.py"]
           expect: present
   - label: "ε5"
-    task_id: null
+    task_id: 9831
     title: "Move fused-memory's memory-curation family; create_mcp_server becomes a composition of family registrars"
     note: "Produces C6. Closes fk-45cf67bff540, fk-9214f842ca92. Depends on ε4 and S19 δ (which subsumes task 5983)."
     capabilities:
@@ -322,7 +322,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/tool_families/memory_curation.py"]
           expect: present
   - label: "δ"
-    task_id: null
+    task_id: 9832
     title: "fused-memory write-gate protocol, one write-time control-key registry, and submit_task as an ordered gate list"
     note: "Produces C5's protocol half. Closes fk-1cadfcc36cfa; carries fk-358e8dfe8d02 (absorbs task 4469). Depends on ε5 and S12 δ (OQ-11 ruled (b): δ reads the causation header through S12 δ's resolver, which refuses a differing _causation_id). Priority inversion δ low before γ high recorded."
     capabilities:
@@ -359,7 +359,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/tools.py", "fused-memory/src/fused_memory/server/tool_families/"]
           expect: absent
   - label: "γ"
-    task_id: null
+    task_id: 9833
     title: "fused-memory add_memory as an ordered gate list; sibling write entry points declare their gate sets"
     note: "Closes fk-330a60eef271 (high; gate 6698 depends on γ). Depends on δ."
     capabilities:
@@ -380,7 +380,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/"]
           expect: present
   - label: "ι"
-    task_id: null
+    task_id: 9834
     title: "fused-memory tool descriptions carry the agent-facing contract only"
     note: "Closes fk-009fbbf855e7; absorbs tasks 5511 and 6235 and the tools.py docstring halves of 5717 and 6295. Depends on γ."
     capabilities:
@@ -400,7 +400,7 @@ tasks:
           paths: ["fused-memory/tests/test_tool_descriptions.py"]
           expect: present
   - label: "λ"
-    task_id: null
+    task_id: 9835
     title: "fused-memory's TaskInterceptor raises the declared not-configured error"
     note: "Completes fk-22ab8d1f3a42 with α. Depends on α and 9282 (last wave-2 editor of task_interceptor.py). complexity='simple'."
     capabilities:
@@ -421,7 +421,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/middleware/"]
           expect: absent
   - label: "ζ"
-    task_id: null
+    task_id: 9824
     title: "fused-memory's shutdown runs declared phases of concurrent closes; the force-exit budget is computed from them and the drain is sized from measured tool-call durations"
     note: "Produces C3. Closes fk-d085b903f01c. Depends on κ and task 9493 (one stop signal; filed 2026-11-12 outside this plan; done, merged 1d0ae21e44, so the edge is satisfied). OQ-1 ruled option D: TimeoutStopSec stays 90; budget = sum of each phase's largest timeout (55 s at the draft table); drain sized from 9493's recorded tool-call durations, under 33 s."
     capabilities:
@@ -504,7 +504,7 @@ tasks:
           kind: manual
           reason: "a reviewer runs the live restart against the deployed unit and reads the journal; a live service property, not a tree property"
   - label: "θ1"
-    task_id: null
+    task_id: 9836
     title: "fused-memory process lifecycle is a ProcessLifecycle object, not module globals"
     note: "Closes fk-b3d95cdaa0d3. Depends on ζ, β0 and 8804."
     capabilities:
@@ -533,7 +533,7 @@ tasks:
           paths: ["fused-memory/tests/"]
           expect: absent
   - label: "θ2"
-    task_id: null
+    task_id: 9837
     title: "fused-memory's HTTP/ASGI boundary leaves server/main.py"
     note: "Contributes to fk-b3d95cdaa0d3. Depends on θ1."
     capabilities:
@@ -553,7 +553,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/main.py"]
           expect: absent
   - label: "η"
-    task_id: null
+    task_id: 9838
     title: "fused-memory collaborators via constructors; one TaskInterceptor builder in server/composition.py"
     note: "Closes fk-db357b64fcae with S26 γ 9158, S10 μ2 9280 and S12 κ1 (OQ-9 ruled (a)). Depends on θ2, S12 κ1 (C6: the InterceptorCollaborators.reconciler provider) and 5462. set_event_buffer stays (S26 C3)."
     capabilities:
@@ -590,7 +590,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/"]
           expect: absent
   - label: "σ"
-    task_id: null
+    task_id: 9839
     title: "fused-memory add_memory and add_system_record replies carry a typed per-store error map"
     note: "Produces C7 (extends S26 C2's AddMemoryResponse). Closes fk-05a87fd1777d (OQ-5 ruled option B; also stamped onto 9147). Depends on 9252 (S26's last memory_service.py task; its closure holds 9147) and 9147."
     capabilities:
@@ -611,7 +611,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
           expect: present
   - label: "ω"
-    task_id: null
+    task_id: 9840
     title: "fused-memory MCP server boundary integration gate"
     note: "Integration gate and signal leaf; no key of its own. Depends on ι, γ, η, θ2, λ, κ, σ."
     capabilities:

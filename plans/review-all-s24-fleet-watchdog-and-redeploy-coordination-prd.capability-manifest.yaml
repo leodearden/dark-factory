@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ω", "γ", "η"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 9728
     title: "Fleet state paths and lease ages get one home, shared/fleet_coordination.py (C1), and every Python reader uses it"
     note: "Closes fk-63633270af4e (weakened; re-verified present at 1f240e6da2: lease path 4 copies, deploy clock 4, heartbeat dir 4, lease max-age 3). Priority low; prerequisite of every high leaf (inversion recorded, no override). 8295 is ordered after α (lead action). resolve_fleet_dir stays as a delegate; DEFAULT_FLEET_DIR goes. service_restart.py's two relpaths and the bash script's three defaults stay until γ, pinned to C1 by one interim test in tests/scripts/test_orchestrator_watchdog.py."
     capabilities:
@@ -61,7 +61,7 @@ tasks:
         binding: "substrate — passes today: escalation/tests/conftest.py installs its shared stub (with __path__ = shared/src/shared) before importing df_pytest_isolation; measured with the stub reproduced: shared.project_layout and shared.proc_group import"
         verdict: PASS
   - label: "γ"
-    task_id: null
+    task_id: 9754
     title: "Redeploy lease keyed by tier and acquired under flock; a second concurrent sweep is refused at the writer (C2)"
     note: "Closes fk-4c21aaf01b82. Subsumes tasks 5719 (fm-tier lease) and 9389 (a --rebind-socket refusal after SIGUSR1 that leaves reconciliation drained). Deps: α, 9140 (R54: S6 α first on config.py, harness.py and OPERATIONS.md), 6615 (done, merged 2026-11-11 f750373949; satisfied). Ruled: lead OQ-8 D (each restart script holds a kernel flock on its tier's sweep lock for its whole life; readers test the same lock; OVERRUN only pages) and lead OQ-9 B (--lease-wait). restart-fused-memory.sh publishes fused-memory.service as its current unit only for the restart step (at most 120 s), never for the drain wait, and loses refuse_while_staleness_redeploy_runs to the lock. Ordered before ζ, 7307, 7314 (lead OQ-6 A), 9263 (S5 ε) and S16 ζ1 (lead OQ-7 A). Deletes the config field orchestrator_restart_lease_max_age_secs (S16-m14). Band exception: 19 files. Transition: legacy single-tier body read as the fleet entry until ω."
     capabilities:
@@ -211,7 +211,7 @@ tasks:
           kind: manual
           reason: "during a live sweep, a reviewer runs `flock -n \"$(python3 -m shared.fleet_coordination path sweep-lock --tier orchestrator-fleet)\" true` and confirms exit 1 (the kernel lock is held), then reads the holder on the FLEET-LEASE line in --report; a concurrent live sweep is not a tree property"
   - label: "β"
-    task_id: null
+    task_id: 9786
     title: "scripts/_systemd.py: one host reader for both watchdogs (C3); the dashboard watchdog's copies and the four hand parsers go"
     note: "Closes the parser, same-named-def and stale-prose measurements of fk-906957d2ec84 (δ3 closes the key). Subsumes tasks 5700 and 4253. Deps: ζ (same file), task 8270 (done, merged 7ddc80450e; satisfied). Burns down the _unit_start_elapsed_secs silent-fallthrough entry and decrements the governed list's default_covers, 12 at a85cb1ad78 (7139 amended)."
     capabilities:
@@ -263,7 +263,7 @@ tasks:
           paths: ["shared/tests/silent_fallthrough_allowlist.py"]
           expect: absent
   - label: "δ1"
-    task_id: null
+    task_id: 9805
     title: "Supervision engine with one liveness and one staleness pass (C4); the fused-memory tier moves onto it"
     note: "Fm halves of fk-906957d2ec84 and fk-3830e2a6de79. Deps: β, η (OPERATIONS.md; η follows ι). The fm row's watched paths are WATCH_CLOSURE[FUSED_MEMORY] (landed in ζ). Edits test_watchdog_dashboard_parity.py for its three _print_fused_memory_liveness patches. Band exception: 132 fm-only tests (2,599 lines) rewritten or retired, measured at ba17934861."
     capabilities:
@@ -298,7 +298,7 @@ tasks:
           paths: ["tests/scripts/"]
           expect: absent
   - label: "δ2a"
-    task_id: null
+    task_id: 9815
     title: "The orchestrator fleet's liveness runs on the engine; its unit set is derived from installed orchestrator-*.socket units and WATCHED goes"
     note: "Closes fk-c9390bf37295; fleet-liveness halves of fk-906957d2ec84 and fk-3830e2a6de79. Deps: δ1, task 8270 (done; ported as ReviveCap + CrashLoopPolicy, the crash-loop step ahead of the grace gate; the engine reuses scripts/_watchdog_crash_loop.py::observe_unit and deletes that module's file I/O and filer). Adds the --report LIVENESS column and the socket-port ↔ escalation.port test (7517's watchdog half). Task 9321's interim WATCHED pairs, if landed, go with WATCHED. Band exception: 14 files; 39 fleet-liveness-only tests (1,022 lines, ba17934861) plus the liveness half of 51 mixed and 8270's 18 main() tests."
     capabilities:
@@ -360,7 +360,7 @@ tasks:
           kind: manual
           reason: "a reviewer runs --report on the host after merge and confirms the LIVENESS column shows orchestrator-scoping-intake.service and orchestrator-stream-touch.service as probed; the installed unit set is host state, not a tree property"
   - label: "δ2b"
-    task_id: null
+    task_id: 9842
     title: "The orchestrator fleet's staleness and --report run on the engine; the fleet sibling helpers and the remaining private patches go"
     note: "Closes fk-3830e2a6de79; fleet-staleness half of fk-906957d2ec84. Deps: δ2a. The fleet row and the removal waiver read WATCH_CLOSURE[ORCHESTRATOR_FLEET] (landed in ζ). Band exception: 56 fleet-staleness/report-only tests (1,780 lines) plus the staleness half of 51 mixed, measured at ba17934861."
     capabilities:
@@ -381,7 +381,7 @@ tasks:
           paths: ["tests/scripts/"]
           expect: absent
   - label: "δ3"
-    task_id: null
+    task_id: 9848
     title: "The dashboard watchdog runs on the engine; its tick, state and ceiling code go"
     note: "Closes fk-906957d2ec84 (last part: probe_health and the tick/ceiling copies). Deps: δ2b. FAIL_STREAK and MAX_RESTARTS stay spelled in dashboard-watchdog.py (a landed task's delivered check greps scripts/ for FAIL_STREAK). Keeps state.json's path and reads today's body once."
     capabilities:
@@ -405,7 +405,7 @@ tasks:
         binding: "substrate — passes today and must keep passing: FAIL_STREAK spelled in scripts/dashboard-watchdog.py"
         verdict: PASS
   - label: "ε"
-    task_id: null
+    task_id: 9854
     title: "The watchdog restarts an orchestrator whose event loop has wedged, filing one escalation per restart, and every liveness tier escalates a revive storm (INV-4)"
     note: "Closes fk-1cc71283157c. Deps: δ3; not ordered after task 9492 (R-3 = A). Ruled OQ-1 B by Leo (R-3 = A): HeartbeatProbe(900, 3) with its own streak, age counted from the later of ts_epoch and the instance start; at the third stale one-minute check the unit takes the dead-unit path (storm escape, 8270's 900 s revive cap, revive) and files one orchestrator-liveness-heartbeat-<unit> escalation in the revive's finally, also when the restart raises. No orchestrator unit-file change; no soak, no flip task. After a wedge revive both streaks are consumed. OQ-4 A: orchestrator stops at the ceiling, fm keeps reviving under its cap. Dead units keep Streak(1, 300). Heartbeat producer measured live on 9 of 9 units (ages 4.7-14.9 s at a85cb1ad78)."
     capabilities:
@@ -458,7 +458,7 @@ tasks:
           paths: ["tests/scripts/test_supervision.py"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 9764
     title: "One code closure per tier feeds the watchdog and both on-merge coordinators; the fused-memory coordinator watches fused-memory's full import closure at most once per 4 hours, with a drain restart (C5)"
     note: "Closes fk-68efae8a36fc. Subsumes task 6543. Deps: γ, 9140, 8270 (done; satisfied); third in the chain so S16 ζ1 waits only on γ and ζ (lead OQ-7 A) and carries the new field. Ruled OQ-2 B by Leo, interval R-4 = C with changes: fm coordinator default = WATCH_CLOSURE[FUSED_MEMORY]; new restart-only fused_memory_restart_min_interval_secs, default FM_ON_MERGE_MIN_INTERVAL_SECS = 14400 in shared/fleet_coordination.py (θ lowers it to 3600 after 9521); FM_ON_MERGE_CLOCK fleet file; the harness builder passes interval, clock, script_args=['--drain'] and a cgroup-escaping restart_executor (transient unit fm-on-merge-restart-<n>.service with an on-failure escalation, the orchestrator coordinator's shape); fused_memory_restart_on_merge_enabled defaults false and the dark-factory yaml sets true. Band exception: 14 files (9 tests/docs). Orchestrator-tier cadence impact measured at zero (10 of 10 72 h windows had an orchestrator-tier commit, 1f240e6da2)."
     capabilities:
@@ -571,7 +571,7 @@ tasks:
           paths: ["tests/scripts/test_fm_watched_paths_import_closure.py"]
           expect: absent
   - label: "ι"
-    task_id: null
+    task_id: 9795
     title: "fused-memory's drain restart waits for every measured reconciliation run, and a drain that still times out files an escalation"
     note: "Leo's R-4 addition (a drain restart that lets reconciliation runs finish). Deps: ζ (shared leaf; restart-fused-memory.sh after γ through ζ), 9140 (OPERATIONS.md). FM_DRAIN_MAX_WAIT_SECS = 7200 (covers every completed full run in the 30 days to 2026-11-13, max 6407 s; today's 2100 s cut 7 of 81 drains since 2026-11-01); restart-fused-memory.sh reads it through `drain max-wait`; the fm lease max-age rises 3600 -> 7800 (>= bound + 60 s submit + 90 s stop + 30 s health); a drain still running at the bound restarts and files one fused-memory-drain-timeout escalation, its submit bounded by timeout 60. A drain is never abandoned: once SIGUSR1 is sent, any exit short of the restart step (TERM, INT, set -e error) issues systemctl --user restart --no-block fused-memory. Runs beside β; η and then δ1 follow it on OPERATIONS.md. Bound re-measured by the fold-verifier over 2026-10-14T07:00Z..11-13T07:00Z: 1,766 completed full runs (longest 6,407 s) and 27 remediation runs (longest 6,897 s); starting the window a day earlier adds 5 runs of 7,386-16,890 s, all finishing on the morning of 2026-10-14."
     capabilities:
@@ -622,7 +622,7 @@ tasks:
           kind: manual
           reason: "a reviewer pairs a drain's start and its drained marker in the fused-memory and orchestrator journals on the host against the run's completion in data/reconciliation/reconciliation.db; host state, not a tree property"
   - label: "θ"
-    task_id: null
+    task_id: 9861
     title: "fused-memory's on-merge restart interval drops from 4 hours to 1 hour once its stop fix is in effect on the host"
     note: "Leo's R-4 follow-up ('until the shutdown fix (then A)'). Deps: ζ, ι, 9493 (done, 1d0ae21e44), 9521 (operator reinstall with KillMode=mixed and its live check; deterministic human gate, blocked at L2; at a85cb1ad78 and fceb951e7e the installed unit still reads KillMode=control-group). 'In effect' is known by 9521 being done (its step-4 KillMode=mixed check and step-6 live one-SIGTERM restart). Its one-line OPERATIONS.md edit is exempt from the same-file chain (lead ruling after the wave-3 fold-verifiers), so it lands as soon as 9521 is done; it follows ι on the shared leaf, and ω follows it there (ω → θ). complexity=simple. A task, not a config value: one shared constant, test-pinned, no second home in yaml."
     capabilities:
@@ -635,7 +635,7 @@ tasks:
           paths: ["shared/src/shared/fleet_coordination.py"]
           expect: present
   - label: "η"
-    task_id: null
+    task_id: 9801
     title: "The orphan-worktree reclaim sweeps every known project root"
     note: "Closes fk-47a7eb8c020d. Deps: ι, 9140 (OPERATIONS.md order only: η follows ι, and γ and ζ through ι; δ1 waits on η; S14 α 6710 landed). Lead OQ-3 A (S14 known_project_roots + a host drop-in the lead files as an operator step). Live parkings at a85cb1ad78 (unchanged since 1f240e6da2): solar-challenge-platform 16 (1.4 G), solar-challenge 5 (1.4 G), scoping-intake 1 (110 M)."
     capabilities:
@@ -665,7 +665,7 @@ tasks:
           kind: manual
           reason: "a reviewer confirms the per-root journal report and the reclaimed parkings on the host; depends on the host drop-in, not a tree property"
   - label: "ω"
-    task_id: null
+    task_id: 9867
     title: "Integration gate: cross-seam boundary tests, the supervision invariants' one home, the legacy lease branch and the spelling-guard family"
     note: "Closes fk-ed19c0c4d4df. Subsumes task 8362 (orchestrator and dashboard loaders). Deps: ε, task 6726 (lead OQ-5 A); η and ι precede it through δ1. Deletes C2's legacy-body branch (decision 3) once --report shows no legacy body. Deps also θ: ω follows θ on the shared leaf (θ's exemption covers only its OPERATIONS.md line), so ω waits on operator gate 9521 through θ."
     capabilities:

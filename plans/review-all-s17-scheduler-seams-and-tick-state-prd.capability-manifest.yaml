@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ω", "ζ", "δ2", "ν"]
 tasks:
   - label: "α0"
-    task_id: null
+    task_id: 9664
     title: "One shared reader for a task's dependency ids, train id and deterministic kind; fused-memory's own copy is deleted"
     note: "complexity=simple, low. Contributes to fk-a2bc16e5812c (α and ξ1 repoint the scheduler-side readers). Lands C11: dependency_ids is the union of the scheduler's and fused-memory's tolerances and returns a fresh list; fused-memory's utils/task_dependency_ids.py and its test are deleted and the four importers change only their import line (lead S17/OQ-4, as changed: no re-export). No dependency: import-line edits are rebase-only under S19/Q-C6."
     capabilities:
@@ -38,7 +38,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/middleware/recon_write_policy.py", "fused-memory/src/fused_memory/middleware/task_curator.py", "fused-memory/src/fused_memory/reconciliation/targeted.py", "fused-memory/src/fused_memory/services/live_workflow_detector.py"]
           expect: present
   - label: "β"
-    task_id: null
+    task_id: 9665
     title: "Scheduler test builder over public calls, an in-memory task store, a per-task snapshot section, and the private-reach guard"
     note: "high. Contributes to fk-a571802ee4ea. Lands C1 (task section bounded to live dispatch state, lead S17/OQ-7) and C2; D2-D4. Depends on 9234 (tail of the wave-2 scheduler.py chain: brings S8 β0 9217 make_scheduler and β 9218 C3) and 6718 (S14 θ shared override store). Subsumes the PSI-reader and hold-history items of task 6143. Records the 68,002-byte scheduler_state.json baseline (2026-11-13) row 3b is stated against."
     capabilities:
@@ -90,7 +90,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/scheduler.py"]
           expect: present
   - label: "ι1"
-    task_id: null
+    task_id: 9666
     title: "Move test_scheduler.py's lifecycle, constructor and streak reaches onto the scenario builder"
     note: "high, tests only. Contributes to fk-a571802ee4ea. 318 lines under PRIVATE_REACH_PATTERN (measured at 97be1d71fa). Depends on β."
     capabilities:
@@ -111,7 +111,7 @@ tasks:
           paths: ["orchestrator/tests/test_scheduler.py"]
           expect: absent
   - label: "ι2"
-    task_id: null
+    task_id: 9667
     title: "Move the other lifecycle-heavy scheduler test files onto the scenario builder"
     note: "high, tests only, 16 files (mechanical), including test_scheduler_deterministic.py's real_scheduler._x reaches. Contributes to fk-a571802ee4ea. 314 lines under PRIVATE_REACH_PATTERN (measured at 97be1d71fa, unchanged at a85cb1ad78). Depends on β only (lead test-file rule: no edge onto ι1, which shares only the baseline json)."
     capabilities:
@@ -140,7 +140,7 @@ tasks:
           paths: ["orchestrator/tests/test_scheduler_deterministic.py"]
           expect: absent
   - label: "ι3"
-    task_id: null
+    task_id: 9668
     title: "Move the remaining lifecycle, alias and dependency reaches outside the scheduler's own test files onto the scenario builder"
     note: "high, tests only, 32 files (mechanical). Contributes to fk-a571802ee4ea. Every orchestrator/tests file whose code reaches a name γ, δ1, δ2, ε, η or θ deletes and that neither the deleting leaf nor ι2 declares, plus test_harness_deterministic_dispatch.py: 30 files, 70 code lines (measured at a85cb1ad78, upper bound incl. mocks; test_agent_session_reaper.py is new), plus 2. Depends on β only (lead test-file rule); γ depends on it (D1)."
     capabilities:
@@ -161,7 +161,7 @@ tasks:
           paths: ["orchestrator/tests/test_harness_deterministic_dispatch.py"]
           expect: absent
   - label: "α"
-    task_id: null
+    task_id: 9671
     title: "Every scheduler-side reader of dependency ids, train ids and the deterministic kind uses the shared readers"
     note: "low (priority inheritance from ζ). Closes fk-a2bc16e5812c. Depends on β (scheduler.py chain), α0, ξ1 and 9236 (tail of harness.py; implies 9235 briefing.py and 9283 dependency_verdict.py)."
     capabilities:
@@ -190,7 +190,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/scheduler.py"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 9672
     title: "The scheduler stops re-pending stranded blocked tasks; the recovery table's rows decide them"
     note: "high. Closes fk-cc01eb7b143f. Ruled by Leo (S17-1 option D, S17-4 A plus a third row; R-2 = A): task 4082, re-scoped, adds the blocked rows (three code leave rows, the owned-record hold, the clean re-pend row with a recovery_applied event carrying its outcome, the loop cap with its over-cap level-1 and the once-per-window leave that keeps the cap from looping) and ζ deletes the scheduler's step. Depends on α (chain), 9219 (S8 δ C2), 9223 (S8 ε2a), 9229 (config.py tail), 9232 (workflow.py tail), 9236 (harness.py tail) and 4082. S16 ζ2 depends on ζ (S16's draft); ζ adds no edge onto S16. Task 6145 is done (2b044c36ca); its follow-up 9529 is cancelled into ζ and 4082. Re-points task 5247's hard-constraint test at the reconciler's blocked partition."
     capabilities:
@@ -233,7 +233,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/task_ground_truth.py"]
           expect: present
   - label: "ζ2"
-    task_id: null
+    task_id: 9673
     title: "Correct every document that says the scheduler re-pends stranded blocked tasks, and name deferred as the park"
     note: "complexity=simple, low, prose and comments only; no key (companion of ζ). Carries task 4082's former item 4 (ruled): the blocked partition stated once in ARCHITECTURE.md, one sentence in docs/task-authoring.md §9 'Deferring a task', the set_task_status/update_task descriptions pointing at it. Depends on ζ, 9200 (S3 ζ, escalation/server.py), 9210 (S3 μ, ARCHITECTURE.md/OPERATIONS.md), 9248 (S10 κ1, task_transitions.py), 9285 (S10 ο, targeted.py), 9280 (S10 μ2, server/tools.py); S15 ε2/ι if filed first."
     capabilities:
@@ -254,7 +254,7 @@ tasks:
           paths: ["shared/src/shared/task_transitions.py"]
           expect: absent
   - label: "γ"
-    task_id: null
+    task_id: 9674
     title: "Dependency readiness is one predicate over a required DepGates value"
     note: "high. Closes fk-4b35b1adea0d. Lands C3; D5; the delayed-milestone clock waits for delivered checks (S17-3, ruled as recommended; affects trigger gate 6698). Depends on ζ (chain) and ι1, ι2, ι3 (D1: the migrations precede the first leaf that deletes a name tests reach outside its own files). Also rewrites DeliveredChecksConfig.enabled's description in config.py."
     capabilities:
@@ -289,7 +289,7 @@ tasks:
           kind: manual
           reason: "behavioural; asserted by test_dep_gates.py over the golden table built from today's deps_verdict"
   - label: "δ1"
-    task_id: null
+    task_id: 9675
     title: "Every delivered-check evaluation goes through delivered_checks.run"
     note: "medium. Closes fk-8af92edd6f38. Lands C4 (incl. ErroredReason with author_fixable); D6 (b); owns the G4 seam 'delivered_checks.run as the one evaluator'. Depends on γ (chain), 9263 (S5 ε, delivered_checks.py tail), 9201 (S6 μ, landing_evidence.py tail); δ1 ↔ S20 μ (whichever stream files second). The decompose return lists verify_delivered_checks_on_main and DeliveredChecksVerdict.main_sha under moves."
     capabilities:
@@ -334,7 +334,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/landing_evidence.py"]
           expect: absent
   - label: "δ2"
-    task_id: null
+    task_id: 9676
     title: "A delivered check that cannot be evaluated is reported and escalated, never held silently"
     note: "high. Closes fk-6c103745c784; contributes to fk-09bf639213ca. Lands C5 under S17-2 option B (Leo) and the lead's reading under one-decision-partition-per-area (INV-23): an author-fixable cause files born-at-L2 at the first window end and blocks the dependent; a transient cause is counted by the gate in grace windows, cleared by the gate when the check runs again, and filed as the same born-at-L2 on the third consecutive window; no watcher playbook section. Windows 1-2 file no queue record (S17-OQ-9 ruled A by the lead 2026-11-13). Files through S1 C5 SchedulerEscalations.file_and_block; errored_grace_sweeps is green-tier. Depends on δ1 (chain), 6724 (S14 ο, error streak on KeyedStreaks), 9231 (event_store.py tail, implied), 4700, S1 ζ2 (wave-3 leaf; task id wired at decompose). Delivers task 6035 item 4 (DeliveredCheckGate resolves GATE_REF)."
     capabilities:
@@ -385,7 +385,7 @@ tasks:
           paths: ["shared/src/shared/streak.py"]
           expect: present
   - label: "λ"
-    task_id: null
+    task_id: 9677
     title: "Escalate to a human when a tick's delivered-check phase takes more than 30 seconds"
     note: "low (ruled by Leo 2026-11-13 under S17-2). No finding key. Lands C13; D15: Scheduler._emit_tick_telemetry hands phases['delivered_check_gate'] to DeliveredCheckGate.observe_phase_time; above delivered_checks.phase_alarm_secs (default 30, green tier) one born-at-L2 infra_issue per project at severity critical (lead 2026-11-13, confirmed: critical is the floor of BORN_AT_L2_SEVERITIES, the lowest severity that reaches Leo's queue at main) under the sentinel __delivered_check_phase_slow__ (a Sentinel member in S1's registry, escalation/models.py), naming the phase time and the checks run, remedy a wall-clock budget for the phase. Offloading is not built. Depends on δ2 (scheduler.py chain); ε depends on it."
     capabilities:
@@ -428,7 +428,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/scheduler.py"]
           expect: present
   - label: "ε"
-    task_id: null
+    task_id: 9678
     title: "The tick's phases are a validated table of method references over a context with required fields"
     note: "medium. Closes fk-3e1e7c5129b5. Lands C6; D7 (read/write sets derived from each phase's body by AST, helpers receiving ctx included; status_map produced by backfill_dep_status). Depends on λ (chain); keeps λ's observe_phase_time call in the phase table's telemetry."
     capabilities:
@@ -455,7 +455,7 @@ tasks:
           kind: manual
           reason: "behavioural; asserted by test_tick_phase_order.py (stamp_milestone moved before external_dep_policy raises PhaseOrderError; declared sets cover the AST-derived sets; an early read raises TickFieldUnset)"
   - label: "η"
-    task_id: null
+    task_id: 9679
     title: "One frozen record per task in a dispatch ledger; the streak aliases go"
     note: "medium. Closes fk-b2cd27267851; contributes to fk-09bf639213ca. Lands C7; D8. Depends on ε (chain) and 6821 (age-anchor extraction). Leaves the age-anchor maps to task 6821, backfill grants to θ, the ERRORED streak to δ2."
     capabilities:
@@ -484,7 +484,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/scheduler.py"]
           expect: absent
   - label: "θ"
-    task_id: null
+    task_id: 9680
     title: "Backfill admission and the warm-base hard-down watchdog become collaborators the scheduler constructs"
     note: "medium. Closes fk-09bf639213ca (ModuleLockTable part fixed:0112c8fde0). Lands C8; D9. Depends on η (chain) and S1 ζ2 (both collaborators file through C5 SchedulerEscalations; wave-3 task id wired at decompose). S16 ζ3 depends on S17 κ1 (S16's draft); θ adds no edge onto S16. Carries the heuristic-14 record of scheduler.py in its task record."
     capabilities:
@@ -513,7 +513,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/scheduler.py"]
           expect: absent
   - label: "κ1"
-    task_id: null
+    task_id: 9681
     title: "The scheduler's shadow protocol goes: TaskWorkflow and its peers type the scheduler they use"
     note: "medium. Contributes to fk-4b3eb71db017; R16 rules the remedy (shadow protocol and hand fakes replaced). Depends on θ (chain), 9232 (S8 κ1, workflow.py tail), 9253 and 9279 (S9 μ1, μ2). SchedulerFacade has 17 methods (measured at a85cb1ad78). Declares test_port_conformance.py, dry_run_unblock.py and test_scheduler_acquire_uncontested.py (task 3090's conformance assert)."
     capabilities:
@@ -534,7 +534,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/workflow.py"]
           expect: absent
   - label: "κ2"
-    task_id: null
+    task_id: 9682
     title: "Workflow tests use the real scheduler over the in-memory task store; the hand-written FakeScheduler and TaskStoreDouble go"
     note: "medium, tests only, 45 files (mechanical; the 42 FakeScheduler files enumerated in the PRD, measured at a85cb1ad78, plus _task_store_doubles.py and its 2 users). Closes fk-4b3eb71db017. Depends on κ1. No edge onto 8778 (it would rest only on test files, lead test-file rule); the lead amends 8778's item 4 onto InMemoryTaskStore."
     capabilities:
@@ -555,7 +555,7 @@ tasks:
           paths: ["orchestrator/tests/"]
           expect: absent
   - label: "ω"
-    task_id: null
+    task_id: 9683
     title: "No test reaches a private Scheduler name: the long tail moves and the baseline is deleted (integration gate)"
     note: "high, tests only (mechanical; 32 files with residual reaches enumerated in the PRD, measured at a85cb1ad78, plus the guard and the baseline). Closes fk-a571802ee4ea. Stream integration gate and signal leaf. Its zero check greps PRIVATE_REACH_PATTERN, the same pattern the D2 guard counts. Depends on κ2 (integration gate)."
     capabilities:
@@ -574,7 +574,7 @@ tasks:
           kind: manual
           reason: "integration gate; a reviewer confirms the merge-gate run of orchestrator/tests includes every boundary-row test named in the PRD and test_scheduler_private_reach.py asserts zero"
   - label: "ξ1"
-    task_id: null
+    task_id: 9669
     title: "The deterministic runner parses a task once into RunnerState and dispatches to gate and predicate steps"
     note: "medium, behaviour-neutral. Contributes to fk-ebce5e23048a (and repoints the runner's fk-a2bc16e5812c copy). Lands C10 (state, gate and predicate steps); D11. Depends on α0, S1 γ (S1's decompose cancels 8355 and 3887 into γ; γ's status_write.py::file_and_block is the lower-module filer; wave-3 task id wired at decompose), 9191 (S10 β2, deterministic_runner.py tail), 9254 and 9285 (S10, live_workflow_detector.py), and 7827, 3638 (live tasks changing the moved branches). Golden capture regenerated on the rebased base. Subsumes task 8356 with ξ2."
     capabilities:
@@ -610,7 +610,7 @@ tasks:
           paths: ["shared/src/shared/task_metadata.py"]
           expect: present
   - label: "ξ2"
-    task_id: null
+    task_id: 9670
     title: "A deterministic deploy resumes after a crash from its recorded deploy phase"
     note: "medium. Closes fk-5a5d08e775de and fk-ebce5e23048a. Lands C10 (deploy step; module-level deploy_state.from_legacy_stamps); D10. Depends on ξ1 and 5312 (live task changing the deploy path)."
     capabilities:
@@ -644,7 +644,7 @@ tasks:
           kind: manual
           reason: "behavioural; asserted by test_deterministic_deploy_resume.py over the golden table; disagreeing rows listed in the task record"
   - label: "μ"
-    task_id: null
+    task_id: 9684
     title: "Plan-tools and verdict-tools receive their markup channels as one bundle"
     note: "low. Closes fk-6e7e9bb942d6. Lands C9; D12. Depends on 9170 (S9 α, plan_tools.py; done) and S1 κ2 (markup_sink.py; wave-3 leaf, task id wired at decompose). Subsumes task 7627."
     capabilities:
@@ -681,7 +681,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/mcp/markup_sink.py"]
           expect: present
   - label: "ν"
-    task_id: null
+    task_id: 9685
     title: "Record Leo's principle as the design invariant one-decision-partition-per-area (four-site lockstep edit)"
     note: "medium (ruled by Leo 2026-11-13). No finding key. The four-site lockstep edit (CONTRIBUTING.md §6): design-invariants.md (section, header dating paragraph, Fixtures date list), design-invariants-fixtures.md (INV-N-PRD, INV-N-CODE, both violating, and a dated addendum walk), gates.md (family-inventory row, inv-trigger-shapes span); CONTRIBUTING.md and code_quality.md untouched. Rule text from digests/discussion/S17.md 'The principle, recorded'; checkable form: every row of a recovery or policy table names who decides it (code, an LLM or a human). House pattern: task 4082's RECOVERY_RULES.decided_by and validate_recovery_rules. INV-23 fixtures: INV-23-CODE has a row with no decided_by, and the addendum walk shows the checkable question failing on it and passing on the house pattern. Depends on task 4082; the lead chains it among the wave-3 invariant leaves at decompose (S2/OQ-10); INV-23, minted last of the six wave-3 invariant tasks (lead 2026-11-13). Checks anchor on the slug."
     capabilities:
