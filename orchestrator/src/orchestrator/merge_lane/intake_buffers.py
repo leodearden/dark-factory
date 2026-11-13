@@ -27,7 +27,7 @@ from orchestrator.merge_lane.types import (
     MergeRequest,
     SpeculativeItem,
 )
-from orchestrator.merge_pool_facts import PickRecords, first_enqueued_at
+from orchestrator.merge_pool_facts import PickRecords
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
 from orchestrator.task_priority import TaskPriorityLookup
 
@@ -188,7 +188,7 @@ def _aging_key(req: MergeRequest) -> tuple[float, str]:
     clique-minimal item within a footprint clique — the buffered item whose
     footprint-clique peers all have an equal-or-larger aging key.
     """
-    return (first_enqueued_at(req), req.request_id)
+    return (req.first_enqueued_at, req.request_id)
 
 
 def answers_to(req: MergeRequest, request_id: str | None, task_id: str | None) -> bool:

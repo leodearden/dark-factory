@@ -15,7 +15,7 @@ from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH
 def _req(n: int) -> Any:
     return SimpleNamespace(
         request_id=f'mr-{n}', task_id=str(n), lane='normal',
-        merge_first_enqueued_at=None, enqueued_at=float(n),
+        merge_first_enqueued_at=None, enqueued_at=float(n), first_enqueued_at=float(n),
     )
 
 

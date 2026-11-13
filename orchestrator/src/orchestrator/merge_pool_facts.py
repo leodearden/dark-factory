@@ -1,10 +1,13 @@
 """The facts the merge lane records for calibrating a priority-ordered merge pool offline.
 
 Each is an additive key on an existing event: who was queued at which tier
-(``merge_queued``), what was waiting and which waiting pairs truly conflict at
-each pick (``merge_dequeued``), and which requests one verify covered
-(``merge_verify``). Nothing here decides anything; a would-be pick order is
-computed offline from these rows, never in-process.
+(``merge_queued``), what was waiting at each pick and which of those pairs the
+suffix conflict graph held as conflicting (``merge_dequeued``), and which
+requests one verify covered (``merge_verify``). The graph is fail-open and may
+predate the pick, so each request also says whether the graph covered it
+(``in_graph``); pairs are counted only among the listed requests. Nothing here
+decides anything; a would-be pick order is computed offline from these rows,
+never in-process.
 """
 from __future__ import annotations
 
@@ -28,11 +31,6 @@ PICK_RECORD_CAP = 16
 """Most pick records held for an emit that never comes (an abandoned pick)."""
 
 
-def first_enqueued_at(req: MergeRequest) -> float:
-    """When *req*'s lineage was first submitted, else when this request was."""
-    return req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
-
-
 def queued_request_fields(req: MergeRequest, priority: TaskPriority) -> dict[str, object]:
     """The keys ``merge_queued`` adds for *req*: its identity, lane, tier, pin and age."""
     return {
@@ -41,7 +39,7 @@ def queued_request_fields(req: MergeRequest, priority: TaskPriority) -> dict[str
         'tier': priority.tier,
         'pinned': priority.pinned,
         'head_sha': req.snapshot_tip,
-        'first_enqueued_at': first_enqueued_at(req),
+        'first_enqueued_at': req.first_enqueued_at,
     }
 
 
@@ -102,19 +100,23 @@ class PickRecords:
         listed = waiting[:WAITING_CAP]
         members = frozenset({picked.request_id, *(req.request_id for _, req in listed)})
         priority = self._priority(picked)
+        in_graph = frozenset(graph.nodes)
         return {
             'request_id': picked.request_id,
             'lane': lane,
             'tier': priority.tier,
             'pinned': priority.pinned,
-            'waiting': [self._waiting_entry(ln, req) for ln, req in listed],
+            'in_graph': picked.request_id in in_graph,
+            'waiting': [self._waiting_entry(ln, req, in_graph) for ln, req in listed],
             'waiting_dropped': len(waiting) - len(listed),
             'halted_lanes': [ln for ln in self._lanes if self._is_lane_halted(ln)],
             'textual_conflict_pairs': _pairs_within(graph.textual_edges, members),
             'footprint_pair_count': sum(1 for pair in graph.footprint_edges if pair <= members),
         }
 
-    def _waiting_entry(self, lane: str, req: MergeRequest) -> dict[str, object]:
+    def _waiting_entry(
+        self, lane: str, req: MergeRequest, in_graph: frozenset[str],
+    ) -> dict[str, object]:
         priority = self._priority(req)
         return {
             'request_id': req.request_id,
@@ -122,8 +124,9 @@ class PickRecords:
             'lane': lane,
             'tier': priority.tier,
             'pinned': priority.pinned,
-            'first_enqueued_at': first_enqueued_at(req),
+            'first_enqueued_at': req.first_enqueued_at,
             'reserved': self._is_reserved(req.request_id),
+            'in_graph': req.request_id in in_graph,
         }
 
     def _priority(self, req: MergeRequest) -> TaskPriority:

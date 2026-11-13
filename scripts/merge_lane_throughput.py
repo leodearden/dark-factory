@@ -351,9 +351,9 @@ def _series(values: Sequence[float]) -> dict[str, Any]:
 def _by_task(events: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Index events by their ``task_id`` COLUMN, preserving row order.
 
-    The COLUMN is the only join key available: `merge_queued` / `merge_dequeued`
-    carry just ``{branch, queue_depth}``, with no ``request_id`` (that key
-    exists on `merge_finalized` alone), so a request-scoped join is impossible.
+    The COLUMN is the join key used here: rows written before task 9908 carry
+    just ``{branch, queue_depth}`` on `merge_queued` / `merge_dequeued`, with no
+    ``request_id``, so a request-scoped join covers only newer rows.
     Rows with a NULL task_id (e.g. `merge_heartbeat`) are dropped.
     """
     index: dict[str, list[dict[str, Any]]] = defaultdict(list)

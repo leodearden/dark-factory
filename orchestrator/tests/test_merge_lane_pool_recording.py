@@ -282,9 +282,10 @@ class TestWaitingSetAtThePick:
         assert by_task['wb'] == {
             'request_id': left.request_id, 'task_id': 'wb', 'lane': 'normal',
             'tier': 'medium', 'pinned': False, 'first_enqueued_at': _FIRST_SUBMITTED,
-            'reserved': False,
+            'reserved': False, 'in_graph': True,
         }
         assert by_task['wx']['tier'] is None
+        assert first['in_graph'] and all(w['in_graph'] for w in first['waiting'])
         assert (first['tier'], first['pinned'], first['lane']) == ('high', True, 'high')
         assert first['textual_conflict_pairs'] == [sorted([left.request_id, right.request_id])]
         assert first['footprint_pair_count'] == 1
