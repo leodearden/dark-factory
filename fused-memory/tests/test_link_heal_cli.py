@@ -41,6 +41,7 @@ from _link_heal_harness import (
     build_harness,
 )
 from escalation.queue import EscalationQueue
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
 from fused_memory.maintenance.link_heal import RunCounts, Verdict
@@ -70,6 +71,8 @@ from fused_memory.maintenance.link_heal_store import (
 )
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'link_heal.py'
 REPO_ROOT = SCRIPT_PATH.parents[2]
