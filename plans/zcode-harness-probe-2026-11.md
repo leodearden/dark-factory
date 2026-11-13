@@ -363,3 +363,63 @@ reached review. `review_blocking_issues=0` in every result therefore means
 - A paired comparison of cost and quality. That needs a fixture whose task
   gate is green at `pre_task_commit`, a cache-aware GLM price entry, and
   Z.ai quota for both arms in the same window.
+
+### 2026-11-13 attempt 3
+
+Run at 13:10Z to 16:13Z after a one-request Z.ai probe returned 200, with
+`--timeout 180 --force`, endpoint first and zcode after it finished, on main
+`399f8b6481`. No 429 hit either cell. Host load ran 32 to 88. Logs are
+`/tmp/gate-8939/cell-{endpoint,zcode}-20261113-r3.log`; each review is
+persisted under
+`dark-factory-eval-worktrees/df_task_12/.task-meta/run-<id>/reviews*/`.
+
+| Cell | Outcome | Impl. turns, wall | Total turns | Tokens | cost_usd | Arm log (agents) | Debugger | Review | Diff | Scoring verify |
+|---|---|---|---|---|---|---|---|---|---|---|
+| endpoint (`de587cd7`) | done | 39, 28m21s | 84 | 1,870 / 40,974 / 3,616,717 / 133,630 | $0.183 | impl $0.64 + dbg $0.72 | 1 cycle, ok, 36 turns | 1 round: 0 blocking, 5 suggestions | 6 files, 2,286 lines | pass |
+| zcode (`8e020a21`) | done | 31, 5m17s | 103 | 178,117 / 61,254 / 5,266,172 / 177,585 | $0.519 | impl $1.93 + dbg $1.59 + amend $2.36 | 1 cycle, ok, 24 turns | 2 rounds: 1 blocking, then 0 blocking, 7 suggestions | 6 files, 2,268 lines | pass |
+
+Both results carry `role_under_test='implementer'`, `plan_completion_pct=1.0`,
+`composite_score=0.95` and one judge early exit (Sonnet, about $0.17).
+`cost_usd` is still uncached input plus output only, so the cost column is not
+a paired comparison.
+
+**Reviewer verdicts (Claude Opus, `reviewer_comprehensive`).**
+
+- **endpoint:** ISSUES_FOUND, suggestions only. "The core fix is correct
+  and minimal": `executable='/bin/bash'` plus a guard on the unbound `proc`,
+  with tests that discriminate the fix. The concerns are scope: about 2,100
+  lines of guard scripts vendored from a later main, with a debt table that
+  differs from main's, and the harness's own pyright asserts in unrelated
+  modules. Robustness suggestions: the hard-coded `/bin/bash` and the
+  pre-existing kill-without-reap on timeout.
+- **zcode, round 1:** ISSUES_FOUND with one blocker. Two `run_verification`
+  tests patch the private `orchestrator.verify._run_cmd` by dotted path and pin
+  its signature, although the public seam (config command strings) is used by a
+  sibling test (Tests stance, heuristic 13). Seven suggestions, including an
+  unclosed transport on timeout (a ResourceWarning under `-W error`), a comment
+  describing an unreachable path, a test named for bash that passes under dash,
+  and the same scope findings.
+- **zcode, round 2 (after one amend):** ISSUES_FOUND, suggestions only. The
+  tests now drive the public seam, and the timeout path reaps the process group
+  (`start_new_session` plus `killpg` plus `wait`). The new suggestions are that
+  the detached process groups survive a SIGINT to the orchestrator and that the
+  killpg path has no compound-command test.
+
+**What attempt 3 adds.**
+
+- **The pair is complete.** Both arms reached a reviewer verdict on the same
+  fixture, HEAD and quota window. Neither arm hit Z.ai 429.
+- **ZCode's implementer was faster again,** 5m17s against 28m21s, on the same
+  model and endpoint. Across n=3 per arm that is 9m39s, 9m17s and 5m17s against
+  22m35s, 20m44s and 28m21s.
+- **Only ZCode's first pass drew a blocker,** and its single amend cleared it.
+  This is n=1 per arm.
+- **The two arms' diffs are now the same shape.** Both debuggers vendored the
+  four guard scripts, about 2,100 lines, so the fixture-noise distortion noted
+  above now hits both arms equally on this fixture.
+- **A review blocker in eval mode is invisible in the result.**
+  `review_blocking_issues` records only the final round (0 for zcode), and
+  `review_state.json` reports `amendment_rounds_total: 0` after an amend round.
+  The amend briefing told the agent "This task was paused because an agent
+  escalated a blocking issue … No resolution text was recorded", because
+  `_wait_for_resolution` returns immediately without an escalation queue.
