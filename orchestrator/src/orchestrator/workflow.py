@@ -16486,6 +16486,7 @@ class TaskWorkflow:
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
                 delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+                checks_enabled=self.config.delivered_checks.enabled,
             )
         except Exception:
             logger.warning(
