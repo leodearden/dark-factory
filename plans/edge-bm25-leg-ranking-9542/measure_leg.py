@@ -6,11 +6,14 @@ which the server refuses to run if it would write.  The shipped leg is
 ``_MultiTenantFalkorDriver`` whose ``execute_query`` replays each issued query
 with ``ro_query``, as ``tests/_query_recorder.py`` records them.
 
-Variants, all on the leg's own union Cypher:
+Variants, both on the leg's own union Cypher:
 
 * A, pre-change: the query ``build_query(sanitize(q), [graph], 128)``, no promotion;
-* B, union only: the shipped union query, no promotion;
-* C, the shipped leg, identifier tier included.
+* C, the shipped leg: the same union query (checked per query), with the live
+  identifier tier promoted.
+
+The rejected ungrouped union (variant B at ``51d7bab3f5``) is in this file's
+history at ``dceb4cb329``, with its output ``m1-m2-results-51d7bab3f5.json``.
 
 Usage: ``.venv/bin/python plans/edge-bm25-leg-ranking-9542/measure_leg.py OUT.json``
 """
@@ -40,11 +43,17 @@ M1_SAMPLE = 200
 QUERY_SAMPLE = Path('fused-memory/tests/fixtures/production_query_sample.jsonl')
 TICKET_877_QUERY = 'task 877 context and related decisions'
 TICKET_877_EDGES = ('f0465663', 'dbf74612', '38241d9e', 'bba24b78')
+TICKET_877_TERM = '877'
+TICKET_877_GATE_RANKS = 5
 
 LIVE_EDGES = (
     'MATCH ()-[e:RELATES_TO]->() WHERE e.invalid_at IS NULL AND e.group_id = $group'
     ' WITH e, startNode(e) AS n, endNode(e) AS m WHERE n:Entity AND m:Entity'
-    ' RETURN e.uuid AS uuid, e.fact AS fact ORDER BY uuid SKIP $skip LIMIT $page'
+    ' RETURN e.uuid AS uuid, e.name AS name, e.fact AS fact ORDER BY uuid SKIP $skip LIMIT $page'
+)
+RETIRED_OF = (
+    'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids'
+    ' RETURN e.uuid AS uuid, e.invalid_at IS NOT NULL AS retired'
 )
 # FalkorDB caps a result set at 10000 rows, so the live edges are read in pages.
 LIVE_EDGE_PAGE = 5000
@@ -76,7 +85,6 @@ class ReadOnlyGraph:
 @dataclass(frozen=True)
 class Variants:
     a: list[str]
-    b: list[str]
     c: list[str]
     tier_rows: int | None
     promoted: list[str]
@@ -92,21 +100,17 @@ async def variants(ro: ReadOnlyGraph, query: str, limit: int) -> Variants:
     seconds_c = time.perf_counter() - started
     issued = list(ro.issued)
     if not issued:
-        return Variants([], [], [], None, [], {}, seconds_c)
+        return Variants([], [], None, [], {}, seconds_c)
     union_cypher, union_params, _ = issued[-1]
     tier_rows = issued[0][2] if len(issued) == 2 else None
-    b_rows = ro.rows(union_cypher, {**union_params, 'promoted_uuids': []})
     a_query = build_query(driver.sanitize(query), [GRAPH], search_utils.MAX_QUERY_LENGTH)
-    a_rows = (
-        []
-        if a_query == ''
-        else ro.rows(union_cypher, {**union_params, 'query': a_query, 'promoted_uuids': []})
-    )
-    facts = {row['uuid']: row['fact'] for row in [*a_rows, *b_rows]}
+    if union_params['query'] != a_query:
+        raise AssertionError(f'shipped union {union_params["query"]!r} is not A\'s {a_query!r}')
+    a_rows = ro.rows(union_cypher, {**union_params, 'promoted_uuids': []})
+    facts = {row['uuid']: row['fact'] for row in a_rows}
     facts.update({edge.uuid: edge.fact for edge in edges})
     return Variants(
         a=[row['uuid'] for row in a_rows],
-        b=[row['uuid'] for row in b_rows],
         c=[edge.uuid for edge in edges],
         tier_rows=tier_rows,
         promoted=list(union_params['promoted_uuids']),
@@ -139,8 +143,7 @@ def live_edges(ro: ReadOnlyGraph) -> list[dict[str, Any]]:
             return edges
 
 
-async def measure_write_path(ro: ReadOnlyGraph) -> dict[str, Any]:
-    live = live_edges(ro)
+async def measure_write_path(ro: ReadOnlyGraph, live: list[dict[str, Any]]) -> dict[str, Any]:
     stride = len(live) // M1_SAMPLE
     sample = live[::stride][:M1_SAMPLE]
     per_fact = []
@@ -151,10 +154,9 @@ async def measure_write_path(ro: ReadOnlyGraph) -> dict[str, Any]:
                 'uuid': edge['uuid'],
                 'rank': {
                     name: rank_of(edge['uuid'], ranking)
-                    for name, ranking in (('A', result.a), ('B', result.b), ('C', result.c))
+                    for name, ranking in (('A', result.a), ('C', result.c))
                 },
-                'overlap_ab': overlap(result.a, result.b),
-                'overlap_bc': overlap(result.b, result.c),
+                'overlap_ac': overlap(result.a, result.c),
                 'tier_rows': result.tier_rows,
                 'tier_fired': bool(result.promoted),
                 'seconds_c': result.seconds_c,
@@ -166,16 +168,59 @@ async def measure_write_path(ro: ReadOnlyGraph) -> dict[str, Any]:
         'sample': len(sample),
         'rule': f'every {stride}-th live edge in uuid order, starting at the first, first {M1_SAMPLE}',
     }
-    for name in ('A', 'B', 'C'):
+    for name in ('A', 'C'):
         ranks = [row['rank'][name] for row in per_fact if row['rank'][name] is not None]
         summary[f'self_recall_at_20_{name}'] = len(ranks) / len(per_fact)
         summary[f'mean_self_rank_{name}'] = mean([float(rank) for rank in ranks])
-    summary['mean_overlap_ab'] = mean([row['overlap_ab'] for row in per_fact])
-    summary['mean_overlap_bc'] = mean([row['overlap_bc'] for row in per_fact])
+    summary['mean_overlap_ac'] = mean([row['overlap_ac'] for row in per_fact])
+    fired = [row for row in per_fact if row['tier_fired']]
+    summary['tier_fired_found'] = {
+        name: sum(row['rank'][name] is not None for row in fired) for name in ('A', 'C')
+    }
+    summary['gate_c_at_least_a'] = summary['self_recall_at_20_C'] >= summary['self_recall_at_20_A']
     summary['tier_issued_share'] = sum(row['tier_rows'] is not None for row in per_fact) / len(per_fact)
     summary['tier_fired_share'] = sum(row['tier_fired'] for row in per_fact) / len(per_fact)
     summary['max_seconds_c'] = max(row['seconds_c'] for row in per_fact)
     return {'summary': summary, 'per_fact': per_fact}
+
+
+def tokens(driver: _MultiTenantFalkorDriver, text: str | None) -> set[str]:
+    return set(driver.sanitize(text or '').lower().split())
+
+
+def term_edges(live: list[dict[str, Any]], term: str) -> list[str]:
+    """The live edges whose name or fact holds *term* as a token, found without RediSearch."""
+    driver = object.__new__(_MultiTenantFalkorDriver)
+    return [
+        edge['uuid']
+        for edge in live
+        if term in tokens(driver, edge['fact']) | tokens(driver, edge['name'])
+    ]
+
+
+def retired_of(ro: ReadOnlyGraph, uuids: list[str]) -> dict[str, bool]:
+    return {row['uuid']: row['retired'] for row in ro.rows(RETIRED_OF, {'uuids': uuids})}
+
+
+async def measure_ticket_877(ro: ReadOnlyGraph, live: list[dict[str, Any]]) -> dict[str, Any]:
+    ticket = await variants(ro, TICKET_877_QUERY, READ_PATH_LIMIT)
+    live_877 = term_edges(live, TICKET_877_TERM)
+    retired = retired_of(ro, [*ticket.c, *ticket.a])
+    top = ticket.c[:TICKET_877_GATE_RANKS]
+    return {
+        'query': TICKET_877_QUERY,
+        'live_877_edges': live_877,
+        'tier_rows': ticket.tier_rows,
+        'promoted': ticket.promoted,
+        'ranking_c': [
+            {'uuid': uuid, 'retired': retired[uuid], 'fact': ticket.facts[uuid]} for uuid in ticket.c
+        ],
+        'ranking_a': [{'uuid': uuid, 'retired': retired[uuid]} for uuid in ticket.a],
+        'ranks_a': {prefix: rank_of_prefix(prefix, ticket.a) for prefix in TICKET_877_EDGES},
+        'ranks_c': {prefix: rank_of_prefix(prefix, ticket.c) for prefix in TICKET_877_EDGES},
+        'gate_live_877_in_top_5': set(live_877) <= set(top),
+        'gate_no_retired_promoted': not any(retired[uuid] for uuid in ticket.promoted),
+    }
 
 
 async def measure_read_path(ro: ReadOnlyGraph) -> dict[str, Any]:
@@ -188,9 +233,7 @@ async def measure_read_path(ro: ReadOnlyGraph) -> dict[str, Any]:
                 'query_id': row['query_id'],
                 'text': row['text'],
                 'observed_count': row['observed_count'],
-                'overlap_ab': overlap(result.a, result.b),
-                'overlap_bc': overlap(result.b, result.c),
-                'changed_b': result.b != result.a,
+                'overlap_ac': overlap(result.a, result.c),
                 'changed_c': result.c != result.a,
                 'tier_rows': result.tier_rows,
                 'promoted_facts': [result.facts[uuid] for uuid in result.promoted],
@@ -199,22 +242,9 @@ async def measure_read_path(ro: ReadOnlyGraph) -> dict[str, Any]:
     total = sum(row['observed_count'] for row in per_query)
     summary = {
         'queries': len(per_query),
-        'weighted_share_changed_b': sum(r['observed_count'] for r in per_query if r['changed_b']) / total,
         'weighted_share_changed_c': sum(r['observed_count'] for r in per_query if r['changed_c']) / total,
     }
-    ticket = await variants(ro, TICKET_877_QUERY, READ_PATH_LIMIT)
-    top4 = ticket.c[:4]
-    ticket_877 = {
-        'query': TICKET_877_QUERY,
-        'tier_rows': ticket.tier_rows,
-        'promoted': ticket.promoted,
-        'ranking_c': [{'uuid': uuid, 'fact': ticket.facts[uuid]} for uuid in ticket.c],
-        'ranks_a': {prefix: rank_of_prefix(prefix, ticket.a) for prefix in TICKET_877_EDGES},
-        'ranks_b': {prefix: rank_of_prefix(prefix, ticket.b) for prefix in TICKET_877_EDGES},
-        'ranks_c': {prefix: rank_of_prefix(prefix, ticket.c) for prefix in TICKET_877_EDGES},
-        'gate_top4_are_the_877_edges': sorted(uuid[:8] for uuid in top4) == sorted(TICKET_877_EDGES),
-    }
-    return {'summary': summary, 'per_query': per_query, 'ticket_877': ticket_877}
+    return {'summary': summary, 'per_query': per_query}
 
 
 def rank_of_prefix(prefix: str, ranking: list[str]) -> int | None:
@@ -233,7 +263,13 @@ async def main(out: Path) -> None:
     ro = ReadOnlyGraph(client.select_graph(GRAPH))
     head = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True)
     context = {'host': f'{HOST}:{PORT}', 'graph': GRAPH, 'head': head.stdout.strip(), 'start': now()}
-    report = {'context': context, 'm1': await measure_write_path(ro), 'm2': await measure_read_path(ro)}
+    live = live_edges(ro)
+    report = {
+        'context': context,
+        'm1': await measure_write_path(ro, live),
+        'm2': await measure_read_path(ro),
+        'ticket_877': await measure_ticket_877(ro, live),
+    }
     context['end'] = now()
     out.write_text(json.dumps(report, indent=1, ensure_ascii=False) + '\n')
 

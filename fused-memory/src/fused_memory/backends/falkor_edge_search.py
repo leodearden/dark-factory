@@ -9,8 +9,8 @@ query TIMEOUT on production graphs.  Every edge leg here instead reads its edges
 through :func:`fused_memory.backends.falkor_entity_edges.read_entity_edges`,
 which FalkorDB plans with no per-row scan.
 
-The edge BM25 leg ranks first the edges matching every identifier term of the
-query, when they all fit in the leg
+The edge BM25 leg ranks first the live edges matching every identifier term of
+the query, when they all fit in the leg
 (:func:`fused_memory.backends.falkor_fulltext.build_edge_queries`,
 ``plans/edge-bm25-leg-ranking-9542/README.md``).
 
