@@ -18,7 +18,7 @@ import pytest
 from inotify_simple import Event, INotify, flags
 
 from escalation.models import Escalation
-from escalation.watcher import _emit, _initial_scan, main, ntfy_request, watch
+from escalation.watcher import _emit, _initial_scan, exclusions, main, ntfy_request, watch
 
 
 @pytest.fixture
@@ -728,6 +728,46 @@ class TestWatch:
 
         assert result is None
 
+    def test_id_appended_to_exclude_file_mid_wait_is_suppressed(
+        self, queue_dir: Path, tmp_path: Path,
+    ):
+        esc = _esc('esc-80-1')
+        exclude_file = tmp_path / 'excludes.txt'
+        exclude_file.write_text('')
+
+        def append_then_arrive() -> list[str]:
+            with exclude_file.open('a') as f:
+                f.write(f'{esc.id}\n')
+            return [_arrive(queue_dir, esc)]
+
+        source = ScriptedSource([append_then_arrive])
+
+        result = _watch(
+            queue_dir, source, timeout=5,
+            current_excludes=exclusions(
+                static=frozenset(), baseline=frozenset(), exclude_file=exclude_file,
+            ),
+        )
+
+        assert result is None
+        assert source.reads == [5000, 5000]
+
+    def test_arrival_absent_from_baseline_is_returned(self, queue_dir: Path):
+        baselined = _esc('esc-81-1')
+        new = _esc('esc-81-2')
+        _write_esc(queue_dir, baselined)
+        source = ScriptedSource([lambda: [_arrive(queue_dir, new)]])
+
+        result = _watch(
+            queue_dir, source,
+            current_excludes=exclusions(
+                static=frozenset(), baseline=frozenset({baselined.id}), exclude_file=None,
+            ),
+        )
+
+        assert result is not None and result.id == new.id
+        assert source.reads == [None]
+
     @pytest.mark.parametrize(
         ('fields', 'filters', 'returned'),
         [
@@ -922,6 +962,33 @@ class TestMain:
         _write_esc(queue_dir, _esc('esc-74-1', **fields))
 
         assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '0.05', *extra_argv]) == code
+
+
+class TestExclusions:
+    """exclusions() keeps static and baseline fixed and re-reads the exclude file per call."""
+
+    def test_exclude_file_is_reread_on_every_call_and_baseline_is_not(self, tmp_path: Path):
+        exclude_file = tmp_path / 'excludes.txt'
+        current = exclusions(
+            static=frozenset({'esc-1-1'}), baseline=frozenset({'esc-2-1'}),
+            exclude_file=exclude_file,
+        )
+
+        assert current() == {'esc-1-1', 'esc-2-1'}
+
+        exclude_file.write_text('esc-3-1\n')
+        assert current() == {'esc-1-1', 'esc-2-1', 'esc-3-1'}
+
+        with exclude_file.open('a') as f:
+            f.write('esc-4-1\n')
+        assert current() == {'esc-1-1', 'esc-2-1', 'esc-3-1', 'esc-4-1'}
+
+    def test_without_exclude_file_is_static_union_baseline(self):
+        current = exclusions(
+            static=frozenset({'esc-1-1'}), baseline=frozenset({'esc-2-1'}), exclude_file=None,
+        )
+
+        assert current() == {'esc-1-1', 'esc-2-1'}
 
 
 class TestExcludeFile:
