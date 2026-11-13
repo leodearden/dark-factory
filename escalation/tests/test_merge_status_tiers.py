@@ -350,10 +350,13 @@ class TestHistoryNeverSetsAnOutcomeState:
 
 class TestCurrentRunTierCarriesTheRowsMergeSha:
     async def _finalize_through_the_lane(
-        self, tmp_path: Path, current: Any, outcome: MergeOutcome,
+        self,
+        current: Any,
+        request: MergeRequest,
+        outcome: MergeOutcome,
+        registry: InFlightMergeRegistry | None = None,
     ) -> None:
-        request = _lane_request(tmp_path, request_id='mr-1')
-        await enqueue_merge_request(asyncio.Queue(), request, current)
+        await enqueue_merge_request(asyncio.Queue(), request, current, registry=registry)
         request.result.set_result(outcome)
         await asyncio.sleep(0)
 
@@ -367,7 +370,9 @@ class TestCurrentRunTierCarriesTheRowsMergeSha:
     ) -> None:
         _, current = _event_stores(tmp_path)
         await self._finalize_through_the_lane(
-            tmp_path, current, MergeOutcome('done', merge_sha=_MERGE_SHA),
+            current,
+            _lane_request(tmp_path, request_id='mr-1'),
+            MergeOutcome('done', merge_sha=_MERGE_SHA),
         )
 
         response = await _poll(_server(tmp_path, current), **key)
@@ -378,9 +383,53 @@ class TestCurrentRunTierCarriesTheRowsMergeSha:
         assert response['last_outcome']['merge_sha'] == _MERGE_SHA
         assert 'kind' not in response, 'only the git tier is kind: found_on_main'
 
-    async def test_a_row_without_a_merge_sha_renders_none(self, tmp_path: Path) -> None:
+    async def test_a_superseded_row_answers_with_its_merge_sha(self, tmp_path: Path) -> None:
         _, current = _event_stores(tmp_path)
-        await self._finalize_through_the_lane(tmp_path, current, MergeOutcome('done'))
+        await self._finalize_through_the_lane(
+            current,
+            _lane_request(tmp_path, request_id='mr-1'),
+            MergeOutcome('superseded', superseded_by='mr-2', merge_sha=_MERGE_SHA),
+        )
+
+        response = await _poll(_server(tmp_path, current), request_id='mr-1')
+
+        assert response['state'] is MergeState.superseded
+        assert response['source'] == 'event_store'
+        assert response['superseded_by'] == 'mr-2'
+        assert response['merge_sha'] == _MERGE_SHA
+
+    async def test_an_absorbed_loser_answers_with_its_primarys_merge_sha(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        request = _lane_request(tmp_path, request_id='mr-1')
+        registry = InFlightMergeRegistry()
+        registry.acquire(
+            request.branch.bare_id, _TASK, request.result, request_id=request.request_id,
+        )
+        registry.attach(request.branch.bare_id, WaiterRecord(
+            request_id='mr-loser',
+            future=asyncio.get_running_loop().create_future(),
+            source='workflow',
+        ))
+        await self._finalize_through_the_lane(
+            current, request, MergeOutcome('done', merge_sha=_MERGE_SHA), registry,
+        )
+
+        response = await _poll(_server(tmp_path, current), request_id='mr-loser')
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert response['request_id'] == 'mr-1'
+        assert response['merge_sha'] == _MERGE_SHA
+
+    async def test_a_row_without_a_merge_sha_renders_no_merge_sha_key(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        await self._finalize_through_the_lane(
+            current, _lane_request(tmp_path, request_id='mr-1'), MergeOutcome('done'),
+        )
 
         response = await _poll(_server(tmp_path, current), request_id='mr-1')
 

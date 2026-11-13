@@ -274,8 +274,8 @@ The outcome arrives from either the submit call (terminal at submit time) or the
     safe to record as `kind: "merged"`.** A terminal-at-submit-time `merge_request` response carries
     the true merge SHA in `commit` — safe to use directly. A *polled* `done` does not, unless it
     is the git-authority tier's `kind: "found_on_main"` shape (`source: "git"`). A
-    `request_id`-arm event-store `done` (`source: "event_store"`) carries `source` and
-    `last_outcome`, plus a top-level `merge_sha` when its finalize row recorded one
+    `request_id`-arm event-store `done` (`source: "event_store"`) carries `last_outcome`,
+    plus a top-level `merge_sha` when its finalize row recorded one
     (`escalation/src/escalation/server.py::merge_status`), and its `outcome` is the raw state
     string `"done"`, not a commit hash. That `merge_sha` is the request's recorded landing sha.
     It is not safe to record bare: it is the input to the
