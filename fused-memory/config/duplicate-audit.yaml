@@ -1,0 +1,63 @@
+# Weekly duplicate-cluster report (fused-memory/scripts/duplicate_cluster_report.py).
+# Every key is required: the report script has no code defaults. OPERATIONS.md
+# section 12 describes the run and its artifacts.
+
+# Projects swept, one detector run per (project, category), in this order.
+projects:
+  - dark_factory
+  - reify
+
+# The detector's own Mem0 categories (audit_duplicate_memories.py::_ALL_CATEGORIES).
+categories:
+  - procedural_knowledge
+  - preferences_and_norms
+  - observations_and_summaries
+
+# Records scanned per category: the detector's default, which the 2026-08-11
+# T0 baseline also used, so cluster-count deltas stay comparable to it.
+scan_limit: 5000
+
+# Wall-clock bound on one detector run, in seconds. The longest T0 category
+# (reify procedural_knowledge) took about 54 minutes.
+detector_timeout_secs: 7200
+
+cadence:
+  # Must equal OnCalendar in scripts/fused-memory-duplicate-audit.timer; a
+  # scripts/tests parity test enforces it.
+  on_calendar: 'Sun *-*-* 06:30:00'
+  # Expected days between consecutive reports. A previous report more than
+  # twice this old is flagged overdue in the regrowth diff.
+  resweep_interval_days: 7
+
+# metadata.kind values written by machines rather than agents. A cluster whose
+# members all carry one of these is flagged machine_written in the report.
+machine_written_kinds:
+  - cycle_summary
+
+# The detector's measured recall, carried verbatim into every report. This file
+# is the single home of these numbers.
+recall_caveat:
+  measured_at: '2026-08-11'
+  fixture: >-
+    task 3130 curator-labelled fixture
+    (fused-memory/tests/fixtures/write_triage_calibration.jsonl):
+    301 true duplicate pairs out of 5,356 labelled pairs
+  paraphrase_band_recall:
+    ann:
+      caught: 25
+      of: 301
+    lexical:
+      caught: 0
+      of: 301
+  # Below 0.5: the ANN score ranks hard negatives ABOVE true duplicates.
+  auc_true_vs_hard_negative: 0.2534
+  source: >-
+    fused-memory/data/memory-evals/ann-threshold-calibration-20260811/
+    (main checkout only; gitignored); task 3136 amendment C
+  fitness:
+    # Re-emissions are near-verbatim, which the detector catches, so the
+    # consecutive-run regrowth diff is supported.
+    regrowth_measurement: supported
+    # Paraphrase recall is too low to enumerate a gate's members from.
+    gate_filing: blocked
+  gate_filing_owner_task: 4916
