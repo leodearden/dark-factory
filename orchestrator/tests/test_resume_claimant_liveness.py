@@ -52,7 +52,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, UnlimitedHolderLocksConfig
 from orchestrator.harness import _REBLOCK_GUARD_THRESHOLD, Harness
 from orchestrator.lock_table import ModuleLockTable
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
@@ -1806,6 +1806,28 @@ class TestGrantDeliveryOnALiveWorkflow:
         assert plan_path.read_text() == before
         assert _files_updates(harness) == []
         assert event.is_set(), 'The synchronous wake path must still fire'
+
+    @pytest.mark.parametrize('order', [('3438', '9999'), ('9999', '3438')])
+    async def test_a_grant_in_a_key_another_task_also_holds_is_delivered(
+        self, harness: Harness, tmp_path: Path, order: tuple[str, str]
+    ):
+        """A key with room for many holders is still the slot's own lock (task 5467).
+
+        Whichever of the two holders took it last, the live slot counts as
+        holding it, so a grant inside it widens the plan."""
+        esc, _event, _queue = _live_slot_grant(harness, tmp_path, ['docs/guide/b.md'])
+        lock_table = ModuleLockTable(OrchestratorConfig(
+            max_per_module=1, lock_depth=_LOCK_DEPTH,
+            unlimited_holder_locks=UnlimitedHolderLocksConfig(prefixes=('docs/',)),
+        ))
+        for holder in order:
+            assert lock_table.try_acquire(holder, ['docs/guide/a.md'])
+        harness.scheduler.lock_table = lock_table
+        plan_path = _seed_plan(harness, files=['docs/guide/a.md'])
+
+        await _drive(harness, esc)
+
+        assert json.loads(plan_path.read_text())['files'] == ['docs/guide/a.md', 'docs/guide/b.md']
 
     async def test_a_grantless_resolve_on_a_live_workflow_schedules_nothing(
         self, harness: Harness, tmp_path: Path

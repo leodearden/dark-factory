@@ -18203,10 +18203,7 @@ class Harness:
 
     def _modules_locked_by(self, task_id: str) -> set[str]:
         """The module locks *task_id* holds in this process's lock table."""
-        return {
-            module for module, holder in self.scheduler.lock_table.snapshot_holders().items()
-            if holder == task_id
-        }
+        return set(self.scheduler.lock_table.held_modules(task_id))
 
     def _modules_unlocked_by_live_slot(self, task_id: str, files: list[str]) -> list[str]:
         """Modules *files* need that *task_id*'s LIVE slot does not lock; [] with no live slot."""
