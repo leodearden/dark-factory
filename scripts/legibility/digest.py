@@ -945,15 +945,12 @@ what :func:`_cap_item` actually did (see :func:`_build_sections`), never
 re-derived by scanning the rendered body."""
 
 DEFAULT_MAX_BYTES = 15360
-"""The PRD §7.2 per-digest soft cap, in UTF-8 bytes -- the single definition;
-``sampling.DEFAULT_DIGEST_MAX_BYTES`` and ``nightly.DEFAULT_MAX_DIGEST_BYTES``
-alias it.
+"""The PRD §7.2 per-digest soft cap, in UTF-8 bytes.
 
 SOFT because :func:`_truncate_sections` stops trimming once every section is
 empty: a soft cap cannot shrink the frontmatter itself, so a digest whose
 frontmatter alone exceeds *max_bytes* (a pathological ``cwd``/``session``
-value, or a very small injected cap) renders LARGER than the cap. Neither this
-value nor a flat per-record charge of it is a hard bound."""
+value, or a very small injected cap) renders LARGER than the cap."""
 
 MAX_ITEM_BYTES = 2048
 """Hard ceiling on a single rendered item's UTF-8 byte length, regardless

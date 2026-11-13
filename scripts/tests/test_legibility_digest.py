@@ -2919,15 +2919,15 @@ class TestDefaultMaxBytes:
 # point, so ONE oversized item (an enormous pasted user turn, a huge
 # tool_result echo, ...) can never evict every sibling section before
 # being popped itself. Capping is byte-wise and UTF-8-safe: the whole
-# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the 15360
-# soft cap), so a naive character-wise slice would not actually bound it
+# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the
+# DEFAULT_MAX_BYTES soft cap), so a naive character-wise slice would not actually bound it
 # for non-ASCII content, and a naive byte slice can split a multi-byte
 # codepoint mid-sequence.
 # ---------------------------------------------------------------------------
 
 def _oversized_user_correction_records():
     """One ORDINARY (non-briefing-shaped) human user turn whose text alone
-    exceeds the default 15360-byte soft cap, plus a genuine is_error
+    exceeds the DEFAULT_MAX_BYTES soft cap, plus a genuine is_error
     tool_result error neighborhood and a 'command not found' not-found
     hit. Deliberately NOT briefing-shaped: R2 (whole-item truncation
     eviction) is a distinct pathology from R1 (harness-turn exclusion), so
@@ -3103,7 +3103,7 @@ def _multiple_oversized_items_records():
 
 class TestTruncatedItemsFrontmatter:
     def test_truncated_items_is_zero_when_nothing_was_truncated(self):
-        # _all_signals_records() is well under the 15360 default cap, so
+        # _all_signals_records() is well under the DEFAULT_MAX_BYTES cap, so
         # nothing is truncated and the key must say so rather than be absent.
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
 
