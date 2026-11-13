@@ -4772,35 +4772,6 @@ class OrchestratorConfig(BaseSettings):
     orphan_l0_reaper_enabled: bool = Field(default=True)
     orphan_l0_timeout_secs: float = Field(default=600.0)
     orphan_l0_check_interval_secs: float = Field(default=60.0)
-    # Task 2931: freshness grace (seconds) for the divergence-class
-    # ``routing.latest`` liveness gate in the orphan-L0 reaper. The
-    # plan.files/metadata.files divergence false positive recurred after task
-    # 2878 because the lock-free ``reviewer_comprehensive`` /
-    # ``resettled_adjudicator`` stages hold no module locks and are absent
-    # from ``_dispatched``, so ``Scheduler.is_actively_held`` cannot see a task
-    # that is genuinely live mid-dispatch. Those stages DO stamp
-    # ``metadata.routing.latest.decided_at`` fresh per LLM invocation; if that
-    # timestamp is within this grace of the reaper's sweep ``now`` snapshot the
-    # task is live mid-dispatch and its divergence L0 is deferred (not
-    # promoted). Default 300s covers a single long reviewer/adjudicator
-    # invocation while staying well under ``orphan_l0_timeout_secs``=600, so a
-    # genuinely stranded task's stale decision still ages out and promotes.
-    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
-    orphan_l0_dispatch_freshness_secs: float = Field(default=300.0)
-    # Task 2991: freshness grace (seconds) for the merge-phase-liveness gate in
-    # the orphan-L0 divergence reaper. The divergence false positive recurred
-    # for MERGE-stage tasks (successor to task 2931): the pre-enqueue merge
-    # loop (rebase + scoped verify + queue submit) makes NO LLM calls, so it
-    # never refreshes ``metadata.routing.latest.decided_at`` — a legitimately
-    # live merge-stage task therefore fails the ``_has_fresh_dispatch`` gate
-    # and gets false-promoted. A durable ``metadata.merge_phase_liveness.
-    # entered_at`` stamp (restart-survivable, written at merge entry) is read
-    # by ``_has_fresh_merge_phase``; if within this grace of the sweep ``now``
-    # the divergence L0 is deferred (not promoted). Default 600.0 anchored to
-    # ``orchestrator_restart_merge_phase_grace_secs`` (the existing legitimate
-    # pre-enqueue merge-phase duration bound), not a guessed threshold.
-    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
-    orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
     # Info-L0 disposition router (plans/info-l0-disposition-router-prd.md
     # D5/D9/D12, plus beta's reviewer block): routes info-severity L0s at
@@ -6960,15 +6931,6 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # failure-mode family and stay restart-only)
         'idle_poll_secs',
         'orphan_l0_timeout_secs',
-        # Task 2931: sibling of orphan_l0_timeout_secs — freshness grace for
-        # the divergence-class routing.latest liveness gate; hot-reloadable so
-        # the FP-suppression window can be tuned without a redeploy.
-        'orphan_l0_dispatch_freshness_secs',
-        # Task 2991: sibling of orphan_l0_dispatch_freshness_secs — freshness
-        # grace for the merge-phase-liveness gate in the divergence reaper;
-        # hot-reloadable so the merge-phase FP-suppression window can be tuned
-        # without a redeploy.
-        'orphan_l0_merge_phase_freshness_secs',
         # Siblings of orphan_l0_timeout_secs, read live on each sweep or exit:
         # a retune lands on the next routing pass, and the kill switch must not need a restart.
         'info_l0_router_enabled',

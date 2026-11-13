@@ -265,7 +265,6 @@ def router_reaper_config(
     config.orphan_l0_reaper_enabled = True
     config.orphan_l0_timeout_secs = orphan_timeout_secs
     config.orphan_l0_check_interval_secs = 1.0
-    config.orphan_l0_dispatch_freshness_secs = 120.0
     config.info_l0_router_enabled = router_enabled
     config.info_l0_router_ticket_timeout_secs = ticket_timeout_secs
     config.info_l0_router_max_conversions_per_sweep = max_conversions

@@ -29,12 +29,6 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     mock_orch_config.orphan_l0_reaper_enabled = True
     mock_orch_config.orphan_l0_timeout_secs = 60.0
     mock_orch_config.orphan_l0_check_interval_secs = 1.0
-    # Task 2931: crisp test grace for the divergence-class routing.latest
-    # freshness gate, decoupled from the 300.0 source default.
-    mock_orch_config.orphan_l0_dispatch_freshness_secs = 120.0
-    # Task 2991's merge-phase gate at its 600.0 source default, so a fresh
-    # merge_phase_liveness stamp is compared against a number.
-    mock_orch_config.orphan_l0_merge_phase_freshness_secs = 600.0
     mock_orch_config.info_l0_router_enabled = True
     mock_orch_config.info_l0_router_ticket_timeout_secs = 900.0
     mock_orch_config.info_l0_router_max_conversions_per_sweep = 20
