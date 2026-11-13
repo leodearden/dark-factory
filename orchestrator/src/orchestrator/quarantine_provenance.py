@@ -51,8 +51,8 @@ class QuarantineOutcome:
     """Where a quarantine parked a lane, and the branch it parked with it.
 
     ``dest`` is None when nothing moved. ``branch`` is the parked full ref,
-    None when the lane had no branch; ``unique_commit_count`` counts its
-    commits not on main.
+    None when the lane did not hold its task's branch; ``unique_commit_count``
+    counts its commits not on main.
     """
 
     dest: Path | None

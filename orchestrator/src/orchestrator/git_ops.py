@@ -16168,17 +16168,7 @@ class GitOps:
         full_old = f'{self.config.branch_prefix}{old_branch}'
         full_new = f'{self.config.branch_prefix}{new_branch}'
 
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-
-        rc, _, err = await _run(
-            ['git', 'worktree', 'move', str(old_path), str(new_path)],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            raise RuntimeError(
-                f'rename_worktree: git worktree move {old_path} -> '
-                f'{new_path} failed (rc={rc}): {err}'
-            )
+        await self._move_registered_worktree(old_path, new_path)
 
         rc, _, err = await _run(
             ['git', 'branch', '-m', full_old, full_new],
@@ -16434,10 +16424,14 @@ class GitOps:
         *branch* may be a bare id (``42``) or a full ref (``task/42``): it is
         normalized here, once, through
         ``shared/src/shared/branch_names.py::bare_queued_branch_id``. The
-        worktree moves to ``quarantine_base/<bare>-<UTC-ts>`` and its branch
-        to ``task/<bare>-<ts>``. A registered worktree first has any
-        uncommitted WIP committed, so it is preserved on the renamed branch;
-        a dir git no longer lists as a worktree is moved with a plain rename.
+        worktree moves to ``quarantine_base/<bare>-<UTC-ts>``. The branch
+        ``<prefix><bare>`` is renamed to ``<prefix><bare>-<ts>`` only when the
+        moved worktree is the one holding it, and WIP is committed only onto
+        that branch being parked. A registered worktree holding another
+        branch, or none, is moved with that checkout and its WIP intact, and
+        ``outcome.branch`` is None. A dir git no longer lists as a worktree is
+        moved with a plain rename; its branch is left alone when a registered
+        worktree elsewhere holds it.
 
         A relocation is recorded before this returns
         (``orchestrator/src/orchestrator/quarantine_provenance.py::record_quarantine_provenance``):
@@ -16475,12 +16469,20 @@ class GitOps:
     async def _relocate_into_quarantine(
         self, worktree: Path, dest: Path, bare: str, parked: str, *, reason: str,
     ) -> str | None:
-        """Move *worktree* to *dest* and branch ``<prefix><bare>`` to ``<prefix><parked>``.
+        """Move *worktree* to *dest*, and branch ``<prefix><bare>`` to ``<prefix><parked>`` when *worktree* holds it.
 
         Returns the parked full ref, or None when there was no branch to park.
         """
-        if not await self._is_registered_worktree(worktree):
-            return await self._relocate_unregistered(worktree, dest, bare, parked)
+        checkouts = await self._worktree_checkouts()
+        held = f'refs/heads/{self.config.branch_prefix}{bare}'
+        here = worktree.resolve()
+        if here not in checkouts:
+            return await self._relocate_unregistered(
+                worktree, dest, bare, parked, rename_branch=held not in checkouts.values(),
+            )
+        if checkouts[here] != held:
+            await self._move_registered_worktree(worktree, dest)
+            return None
         try:
             await self.commit(worktree, f'chore: quarantine WIP ({reason})')
         except Exception as e:
@@ -16491,18 +16493,47 @@ class GitOps:
         await self.rename_worktree(worktree, dest, bare, parked)
         return f'{self.config.branch_prefix}{parked}'
 
+    async def _worktree_checkouts(self) -> dict[Path, str | None]:
+        """Every registered worktree's resolved path, mapped to its checked-out ref (None when detached); raises when git cannot list them."""
+        rc, out, err = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(f'git worktree list failed (rc={rc}): {err}')
+        checkouts: dict[Path, str | None] = {}
+        current: Path | None = None
+        for line in out.splitlines():
+            if line.startswith('worktree '):
+                current = Path(line[len('worktree '):].strip()).resolve()
+                checkouts[current] = None
+            elif line.startswith('branch ') and current is not None:
+                checkouts[current] = line[len('branch '):].strip()
+        return checkouts
+
+    async def _move_registered_worktree(self, old_path: Path, new_path: Path) -> None:
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'move', str(old_path), str(new_path)],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'git worktree move {old_path} -> {new_path} failed (rc={rc}): {err}'
+            )
+
     async def _relocate_unregistered(
-        self, worktree: Path, dest: Path, bare: str, parked: str,
+        self, worktree: Path, dest: Path, bare: str, parked: str, *, rename_branch: bool,
     ) -> str | None:
         """Rename a dir ``git worktree move`` refuses (its admin entry is gone) to *dest*.
 
-        The branch is renamed first and renamed back if the move fails, so the
-        two stay together. ``os.rename`` never copies: a cross-device *dest*
-        fails rather than duplicating a warm lane's build tree.
+        When *rename_branch*, the branch is renamed first and renamed back if
+        the move fails, so the two stay together. ``os.rename`` never copies:
+        a cross-device *dest* fails rather than duplicating a warm lane's
+        build tree.
         """
         prefix = self.config.branch_prefix
         full_old, full_new = f'{prefix}{bare}', f'{prefix}{parked}'
-        has_branch = await self.resolve_branch_sha(full_old) is not None
+        has_branch = rename_branch and await self.resolve_branch_sha(full_old) is not None
         if has_branch:
             rc, _, err = await _run(['git', 'branch', '-m', full_old, full_new], cwd=self.project_root)
             if rc != 0:
