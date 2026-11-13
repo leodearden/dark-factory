@@ -611,6 +611,23 @@ class _ProbeFailed(Exception):
         )
 
 
+@dataclass(frozen=True)
+class _HistoryRead:
+    """merge_status's one up-front cross-run read: the newest durable row, or that it failed."""
+
+    history: _DurableHistory | None
+    failed: bool = False
+
+    def require(self) -> _DurableHistory | None:
+        """The cross-run tier's own answer: a failed read ends the walk at this tier."""
+        if self.failed:
+            raise _ProbeFailed(MergeStatusSource.event_store_cross_run)
+        return self.history
+
+    def last_outcome(self) -> LastOutcome | None:
+        return LastOutcome.from_row(self.history.row) if self.history is not None else None
+
+
 def _require_matching_project_root(wired_root: Path, project_root: str) -> str | None:
     """Return an error message if *project_root* doesn't match *wired_root*.
 
@@ -5561,26 +5578,34 @@ def create_server(
         matches = [e for e in entries if key.matches(e.request_id, e.branch, e.task_id)]
         return max(matches, key=lambda e: e.enqueued_at) if matches else None
 
-    def _durable_history(key: _PollKey) -> _DurableHistory | None:
+    def _durable_history(key: _PollKey) -> _HistoryRead:
         if event_store is None:
-            return None
-        row = event_store.latest_merge_finalized(
-            request_id=key.request_id, branch=key.branch, task_id=key.task_id,
-            cross_run=True,
-        )
-        if row is None and key.request_id is not None:
-            row = event_store.merge_finalized_absorbing(key.request_id, cross_run=True)
-        if row is not None:
-            return _DurableHistory(row, MergeReason.prior_run_terminal)
-        if key.request_id is not None:
-            members = event_store.merge_finalized_superseded_by(key.request_id, cross_run=True)
-            if members:
-                return _DurableHistory(members[-1], MergeReason.coalesce_train_id)
-        return None
+            return _HistoryRead(None)
+        try:
+            row = event_store.latest_merge_finalized(
+                request_id=key.request_id, branch=key.branch, task_id=key.task_id,
+                cross_run=True, fire_safe=False,
+            )
+            if row is None and key.request_id is not None:
+                row = event_store.merge_finalized_absorbing(
+                    key.request_id, cross_run=True, fire_safe=False,
+                )
+            if row is not None:
+                return _HistoryRead(_DurableHistory(row, MergeReason.prior_run_terminal))
+            if key.request_id is not None:
+                members = event_store.merge_finalized_superseded_by(
+                    key.request_id, cross_run=True, fire_safe=False,
+                )
+                if members:
+                    return _HistoryRead(
+                        _DurableHistory(members[-1], MergeReason.coalesce_train_id),
+                    )
+            return _HistoryRead(None)
+        except Exception:
+            logger.warning('merge_status: event store (cross run) read failed', exc_info=True)
+            return _HistoryRead(None, failed=True)
 
-    async def _walk_durable(
-        key: _PollKey, history: _DurableHistory | None,
-    ) -> MergeStatusAnswer:
+    async def _walk_durable(key: _PollKey, history_read: _HistoryRead) -> MergeStatusAnswer:
         current = _current_run_answer(key)
         if current is not None:
             return current
@@ -5606,6 +5631,7 @@ def create_server(
                 MergeState.journaled, reason(MergeReason.journaled_not_live),
                 entry.request_id, fields={'enqueued_at': entry.enqueued_at},
             )
+        history = history_read.require()
         if history is not None:
             return MergeStatusAnswer.epistemic(
                 MergeState.stale_record, reason(history.reason), key.request_id,
@@ -5616,13 +5642,12 @@ def create_server(
 
     async def _resolve(key: _PollKey) -> MergeStatusAnswer:
         """Walk the tiers, live first; the first probe that raises ends it as unknown."""
-        history = _durable_history(key)
+        history_read = _durable_history(key)
         try:
-            answer = _live_answer(key) or await _walk_durable(key, history)
+            answer = _live_answer(key) or await _walk_durable(key, history_read)
         except _ProbeFailed as failure:
             answer = failure.answer_for(key)
-        last_outcome = LastOutcome.from_row(history.row) if history is not None else None
-        return answer.with_last_outcome(last_outcome)
+        return answer.with_last_outcome(history_read.last_outcome())
 
     @mcp.tool()
     async def merge_status(
@@ -5642,7 +5667,10 @@ def create_server(
             → durable journal → event store (prior runs) → no_record
 
         The first tier that answers wins; the first probe that RAISES ends the
-        walk as ``unknown`` with ``source`` naming that tier.  The git tier
+        walk as ``unknown`` with ``source`` naming that tier.  The prior-run
+        history is read once, up front, for ``last_outcome``; if that read
+        fails it ends the walk only on reaching its own tier, and
+        ``last_outcome`` is None.  The git tier
         only consumes ``escalation/src/escalation/git_authority.py::probe_landing``'s
         verdict and needs a branch or task_id plus ``harness.git_ops`` and
         ``orch_config``.  The newest durable row of ANY run is attached to every
