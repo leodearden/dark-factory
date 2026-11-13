@@ -5,6 +5,10 @@ Markdown; the lock table gives such a key no holder limit, an exact
 ``module_overrides`` entry still wins, and the rule is off unless a project
 sets it.  Everything goes through ``ModuleLockTable`` and
 ``OrchestratorConfig``'s public seams.
+
+Every test runs on the code defaults, not the operational yaml: pydantic-settings
+merges a dict field such as ``module_overrides`` across the kwarg and the yaml,
+so the yaml's own entries would otherwise leak into each table.
 """
 
 from __future__ import annotations
@@ -23,6 +27,8 @@ from orchestrator.config import (
     load_config,
 )
 from orchestrator.lock_table import ModuleLockTable
+
+pytestmark = pytest.mark.usefixtures('code_default_config')
 
 DOCS_AND_ROOT_MARKDOWN = UnlimitedHolderLocksConfig(prefixes=('docs/',), root_markdown=True)
 OFF = UnlimitedHolderLocksConfig()
@@ -62,7 +68,6 @@ def _is_exclusive(table: ModuleLockTable, key: str) -> bool:
 
 
 class TestOffUnlessSet:
-    @pytest.mark.usefixtures('code_default_config')
     def test_the_code_default_rule_is_empty_and_off(self):
         assert OrchestratorConfig().unlimited_holder_locks == OFF
 
