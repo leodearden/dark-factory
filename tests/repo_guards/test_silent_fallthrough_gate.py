@@ -825,7 +825,7 @@ class TestGateSelfIntegrity:
 
         Keyed on ``SCOPE_ROOTS`` rather than on named files, so renaming a
         module in a sibling package cannot red this self-check. Its complement,
-        ``test_auth_failed.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root``,
+        ``tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root``,
         checks the DISCOVERED ``<pkg>/src`` roots with the same relpath idiom.
         """
         silent = [

@@ -175,11 +175,12 @@ def _lists_tracked_plans(node: ast.expr) -> bool:
     ) and any(_is_plans_literal(element) for element in node.elts)
 
 
-def plans_reads(source: str) -> list[str]:
-    """Every site in *source* that reads the committed ``plans/`` tree.
+def plans_tree_references(source: str) -> list[str]:
+    """Every site in *source* that names the committed ``plans/`` tree.
 
     Three shapes: a repository-root anchor joined to ``plans``, a corpus walk
-    over the real tree, and a ``git ls-files`` argv naming ``plans``.
+    over the real tree, and a ``git ls-files`` argv naming ``plans``. A site is
+    flagged for how its path is built, whether or not anything reads it.
     """
     return [
         f'line {node.lineno}: {ast.unparse(node)}'
@@ -254,8 +255,8 @@ def test_no_moved_file_remains_at_its_old_path() -> None:
         "subprocess.run(['git', '-C', str(root), 'ls-files', '-z', 'plans/'])",
     ],
 )
-def test_plans_reads_flags_a_read_of_the_committed_plans_tree(source: str) -> None:
-    assert plans_reads(source), source
+def test_plans_tree_references_flags_a_committed_plans_path(source: str) -> None:
+    assert plans_tree_references(source), source
 
 
 @pytest.mark.parametrize(
@@ -269,8 +270,8 @@ def test_plans_reads_flags_a_read_of_the_committed_plans_tree(source: str) -> No
         "subprocess.run(['git', 'ls-files', '--', 'docs'])",
     ],
 )
-def test_plans_reads_passes_synthetic_plans_data(source: str) -> None:
-    assert plans_reads(source) == [], source
+def test_plans_tree_references_passes_synthetic_plans_data(source: str) -> None:
+    assert plans_tree_references(source) == [], source
 
 
 def _absolute_imports(source: str) -> set[str]:
@@ -295,13 +296,13 @@ def test_no_shared_test_imports_the_first_party_tree_scanner() -> None:
     )
 
 
-def test_shared_tests_read_no_committed_plans() -> None:
-    reads = {
+def test_shared_tests_reference_no_committed_plans() -> None:
+    references = {
         str(path.relative_to(REPO_ROOT)): found
         for path in sorted(SHARED_TESTS_DIR.rglob('*.py'))
-        if (found := plans_reads(path.read_text(encoding='utf-8')))
+        if (found := plans_tree_references(path.read_text(encoding='utf-8')))
     }
-    assert not reads, (
-        f'shared/tests reads the committed plans/ tree, which its cache key does '
-        f'not cover; move the reader into {MODULE_PREFIX}/: {reads}'
+    assert not references, (
+        f'shared/tests names the committed plans/ tree, which its cache key does '
+        f'not cover; move that test into {MODULE_PREFIX}/: {references}'
     )
