@@ -395,6 +395,33 @@ def resolve_header_positions(header, wanted: dict[str, str]) -> dict[str, int]:
     return {key: names.index(column) for key, column in wanted.items()}
 
 
+INDEX_CATALOG_QUERY = 'CALL db.indexes()'
+
+#: The output keys of a ``list_indices()`` record, mapped to the FalkorDB
+#: ``CALL db.indexes()`` column names they are read from.
+INDEX_RECORD_COLUMNS = {
+    'label': 'label',
+    'field': 'properties',
+    'type': 'types',
+    'entity_type': 'entitytype',
+    'status': 'status',
+}
+
+
+def index_records_from_rows(header, rows) -> list[dict]:
+    """Build ``list_indices()`` records from a ``CALL db.indexes()`` result.
+
+    The single home of the row-to-record build: re-forking it is how the
+    positional read survived.  Columns are resolved by name through
+    :func:`resolve_header_positions` against :data:`INDEX_RECORD_COLUMNS`.
+
+    Raises:
+        IndexHeaderShapeError: The header is malformed or lacks a mapped column.
+    """
+    positions = resolve_header_positions(header, INDEX_RECORD_COLUMNS)
+    return [{key: row[pos] for key, pos in positions.items()} for row in rows or ()]
+
+
 # --- The ACTUAL side: the records ------------------------------------------
 
 #: The index types the PRD's normal form can represent.  Anything else (VECTOR
