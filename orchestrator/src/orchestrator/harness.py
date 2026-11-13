@@ -1666,7 +1666,8 @@ class Harness:
                 (config.max_concurrent_tasks + config.git.spare_warm_lanes)
                 if config.git.warm_lane_pool else 0
             ),
-            # Spec-pool size: K (same as speculation_depth) when knob on, else 0.
+            # Spec-pool size: K (same as speculation_depth), one warm lane per
+            # frontier entry, when the knob is on; else 0.
             # self._speculation_k is safe here — self.config is already set above.
             merge_spec_warm_lane_pool_size=(
                 self._speculation_k if config.git.merge_spec_warm_lane_pool else 0
@@ -2289,17 +2290,25 @@ class Harness:
         return tid in self._action_teardown_tasks
 
     @property
-    def _speculation_k(self) -> int:
-        """Single shared K source: 1 + len(enabled_verify_runners).
+    def _verify_hosts(self) -> int:
+        """Verify hosts the merge lane's allocator manages, one lease slot each.
 
-        Used by BOTH GitOps spec-pool sizing (harness.__init__) and
-        _start_merge_worker (speculation_depth + enforce_persistent_worktree_serial_lane)
-        so the spec pool size and the worker cap cannot drift as verify_runners grows.
-
-        Mirrors the invariant comment at _start_merge_worker: all three Lever-C knobs
-        derive from ONE expression.
+        The local trust-anchor plus every enabled remote verify runner.  It
+        bounds concurrently leased verifies, so it is what the persistent
+        merge worktree's serial-lane guard is fed in _start_merge_worker.
         """
         return 1 + len(self.config.enabled_verify_runners)
+
+    @property
+    def _speculation_k(self) -> int:
+        """The merge lane's speculation depth K = verify hosts + 1.
+
+        The frontier holds one verified entry awaiting landing beyond the
+        hosts verifying (plans/merge-lane-policy-prd.md D4).  K sizes both the
+        GitOps spec warm-lane pool (harness.__init__) and the worker's
+        speculation_depth (_start_merge_worker), so the two cannot drift.
+        """
+        return self._verify_hosts + 1
 
     def _init_digest_state(self) -> None:
         """Initialise task-1327 AFK-hardening digest counters.
@@ -12290,13 +12299,10 @@ class Harness:
         )
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-        # K = 1 (local trust-anchor) + number of enabled remote verify runners.
-        # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
-        # serial-lane bound (num_hosts), and the worker's speculation cap
-        # (speculation_depth).  All three knobs derive from ONE expression so
-        # they cannot drift apart as verify_runners grows.  num_hosts=K makes
-        # the per-host bound ceil(K/num_hosts)=ceil(K/K)=1, so each of the K
-        # hosts runs at most one in-flight merge-verify at a time.
+        # K = verify hosts + 1 counts the frontier and sizes the worker's
+        # speculation cap (speculation_depth).  Leased verifies are bounded by
+        # the hosts (one allocator slot each), so the serial-lane guard below
+        # takes the host count and its per-host bound stays 1.
         #
         # NOTE: K was previously pinned to _MERGE_AHEAD_BOUND (=1).  Wired from
         # config.verify_runners by task 1716 (Lever C operator-enable path).
@@ -12319,9 +12325,9 @@ class Harness:
         # changed, not because the guard weakened.
         #
         # Intentional asymmetry: enforce_persistent_worktree_serial_lane below
-        # still receives num_hosts=_k (per-host serial-lane bound is genuinely
+        # still receives the host count (per-host serial-lane bound is genuinely
         # per-host; that guard's model did not change).  Only the liveness guard
-        # drops _k: the two guards describe independent physical constraints.
+        # takes no bound: the two guards describe independent physical constraints.
         #
         # Any OTHER exception (e.g. config resolution failure in a mock or
         # misconfigured environment) is still fail-OPEN (non-fatal warning),
@@ -12334,12 +12340,14 @@ class Harness:
             logger.warning('enforce_merge_liveness_margin failed (non-fatal): %s', e)
 
         # Fail-CLOSED: persistent warm worktree is serial-lane-only (PRD §10
-        # invariant 3).  If the knob is on and _k > 1, refuse startup rather
-        # than risk concurrent cargo on a shared target/.
-        # num_hosts=_k: each of the K hosts gets its own serial lane so
-        # per-host lane bound = ceil(K/num_hosts) = 1.
+        # invariant 3).  If the knob is on and more than one leased verify could
+        # share a host, refuse startup rather than risk concurrent cargo on a
+        # shared target/.  Leased verifies are bounded by the hosts, so each
+        # host gets its own serial lane: per-host bound = hosts/hosts = 1.
         enforce_persistent_worktree_serial_lane(
-            self.config, merge_ahead_bound=_k, num_hosts=_k,
+            self.config,
+            merge_ahead_bound=self._verify_hosts,
+            num_hosts=self._verify_hosts,
         )
 
         self._service_restart_coordinators = [
