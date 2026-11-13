@@ -188,8 +188,8 @@ def _snapshot_pending_ids(queue_dir: Path) -> frozenset[str]:
     return frozenset(p.stem for p in queue_dir.glob('esc-*.json'))
 
 
-def _send_ntfy(url: str, escalation: Escalation) -> None:
-    """POST an escalation as a push notification to an ntfy.sh endpoint."""
+def ntfy_request(url: str, escalation: Escalation) -> urllib.request.Request:
+    """Build the ntfy.sh push-notification POST for an escalation."""
     is_urgent = escalation.severity in (BORN_AT_L2_SEVERITIES | {'blocking'})
     title = f'[{escalation.severity.upper()}] Task {escalation.task_id}: {escalation.category}'
     body = escalation.summary
@@ -200,7 +200,12 @@ def _send_ntfy(url: str, escalation: Escalation) -> None:
     req.add_header('Title', title)
     req.add_header('Priority', 'urgent' if is_urgent else 'default')
     req.add_header('Tags', 'rotating_light' if is_urgent else 'information_source')
-    urllib.request.urlopen(req)
+    return req
+
+
+def _send_ntfy(url: str, escalation: Escalation) -> None:
+    """POST an escalation as a push notification to an ntfy.sh endpoint."""
+    urllib.request.urlopen(ntfy_request(url, escalation))
 
 
 def _emit(esc: Escalation, ntfy_url: str | None) -> None:
