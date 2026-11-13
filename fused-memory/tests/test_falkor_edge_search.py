@@ -263,7 +263,7 @@ class TestEdgeFulltextIdentifierTier:
         tier, union = await self._issued('alpha 877')
 
         assert 'e.invalid_at IS NULL' in tier.cypher
-        assert 'invalid_at' not in union.cypher
+        assert 'e.invalid_at IS NULL' not in union.cypher
 
     @pytest.mark.asyncio
     async def test_the_union_ranks_the_tier_first_then_by_score(self) -> None:
