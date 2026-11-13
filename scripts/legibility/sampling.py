@@ -269,14 +269,6 @@ def dedupe_shapes(records: Sequence[ScoredRecord]) -> list[ScoredRecord]:
 # stratified_sample — budget-after-stratification sampler (PRD §5.2 point 2, §8.4)
 # ---------------------------------------------------------------------------
 
-DEFAULT_DIGEST_MAX_BYTES = digest.DEFAULT_MAX_BYTES
-"""An alias of :data:`legibility.digest.DEFAULT_MAX_BYTES`, the PRD §7.2
-per-digest soft cap. :func:`stratified_sample` charges it flat per record when
-no ``cost_fn`` is injected, and it is :func:`digest_byte_cost_fn`'s default
-render cap. The flat charge over-estimates any realistic digest but is not a
-bound: see :data:`legibility.digest.DEFAULT_MAX_BYTES` on the cap being soft."""
-
-
 def render_cache_key(path: Path, max_bytes: int, renderer) -> tuple:
     """The shared key for a rendered-digest cache entry.
 
@@ -292,7 +284,7 @@ def render_cache_key(path: Path, max_bytes: int, renderer) -> tuple:
 
 
 def digest_byte_cost_fn(
-    *, max_bytes: int = DEFAULT_DIGEST_MAX_BYTES, build=None,
+    *, max_bytes: int = digest.DEFAULT_MAX_BYTES, build=None,
     rendered: dict[tuple, str] | None = None,
 ) -> Callable[[ScoredRecord], int]:
     """Build the production ``cost_fn`` for :func:`stratified_sample`:
@@ -303,7 +295,7 @@ def digest_byte_cost_fn(
     UTF-8 byte length of ``build(record.path,
     agent_class_override=record.stratum, max_bytes=max_bytes)``. Passing
     *max_bytes* straight through matters — a caller that renders with the
-    same constant it charges with (``nightly.DEFAULT_MAX_DIGEST_BYTES``)
+    same constant it charges with (:data:`legibility.digest.DEFAULT_MAX_BYTES`)
     gets a ``bytes_used`` that provably describes the digests actually
     produced, not a parallel estimate free to drift from them. Beta's
     ``record.stratum`` is already authoritative, so alpha never re-guesses
@@ -450,7 +442,7 @@ class SampleResult:
     cap, not count cap"), so this is the sum of what
     :func:`stratified_sample`'s cost basis charged: the real rendered digest
     size when a ``cost_fn`` is injected, and a conservative flat
-    :data:`DEFAULT_DIGEST_MAX_BYTES` per record otherwise. It is NEVER
+    :data:`legibility.digest.DEFAULT_MAX_BYTES` per record otherwise. It is NEVER
     ``inventory.SessionRecord.size_bytes`` — a 0.5-6.5MB transcript renders
     to a §7.2-capped ~15KB digest, so charging raw size over-charged the
     budget by 20x-500x and selected nothing at all."""
@@ -517,10 +509,10 @@ def stratified_sample(
     *cost_fn* is the per-record BYTE-COST seam every budget charge routes
     through. Real callers inject :func:`digest_byte_cost_fn`, which charges
     the ACTUAL rendered digest size. When *cost_fn* is None each record is
-    charged a flat :data:`DEFAULT_DIGEST_MAX_BYTES` — correct UNITS and an
+    charged a flat :data:`legibility.digest.DEFAULT_MAX_BYTES` — correct UNITS and an
     over-estimate for any realistic digest, so the daily cap holds in
     practice. It is NOT a hard bound: §7.2 is a soft cap and the frontmatter
-    is not trimmable, so see :data:`DEFAULT_DIGEST_MAX_BYTES` before relying
+    is not trimmable, so see :data:`legibility.digest.DEFAULT_MAX_BYTES` before relying
     on it as one. That fallback is deliberately
     conservative, NOT the intended production basis: the PRD rules out a
     pure count cap, and a flat charge is exactly a count cap in disguise. It
@@ -585,7 +577,7 @@ def stratified_sample(
         cached = cost_memo.get(record.path)
         if cached is not None:
             return cached
-        charged = cost_fn(record) if cost_fn is not None else DEFAULT_DIGEST_MAX_BYTES
+        charged = cost_fn(record) if cost_fn is not None else digest.DEFAULT_MAX_BYTES
         cost_memo[record.path] = charged
         return charged
 
@@ -741,7 +733,7 @@ def main(argv: Sequence[str]) -> int:
     ``~/.claude/projects`` is the observable, not a pytest.
 
     Samples with the same real-digest-byte cost basis
-    (:func:`digest_byte_cost_fn` at :data:`DEFAULT_DIGEST_MAX_BYTES`) that
+    (:func:`digest_byte_cost_fn` at :data:`legibility.digest.DEFAULT_MAX_BYTES`) that
     ``nightly.select_digest_sessions`` uses, so this diagnostic and the
     pipeline can never disagree about what the budget was spent on — the
     whole point of reading this CLI is to find out whether the budget is
@@ -785,7 +777,7 @@ def main(argv: Sequence[str]) -> int:
     scored = [score_session(session) for session in sessions]
 
     result = stratified_sample(
-        scored, cfg, cost_fn=digest_byte_cost_fn(max_bytes=DEFAULT_DIGEST_MAX_BYTES),
+        scored, cfg, cost_fn=digest_byte_cost_fn(max_bytes=digest.DEFAULT_MAX_BYTES),
     )
 
     print(render_manifest(result.selected))

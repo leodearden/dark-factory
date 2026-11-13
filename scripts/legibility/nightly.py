@@ -189,14 +189,6 @@ def select_scored_records(
     return [sampling.score_session(session) for session in sessions]
 
 
-DEFAULT_MAX_DIGEST_BYTES = digest.DEFAULT_MAX_BYTES
-"""Per-digest soft byte cap (PRD §7.2), an alias of
-:data:`legibility.digest.DEFAULT_MAX_BYTES`. Both the cost basis
-(:func:`select_digest_sessions`) and the render basis (:func:`build_digests`)
-read this one name, so what the sampler charged is the digest that gets
-produced."""
-
-
 def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
     *, rendered: dict[tuple, str] | None = None,
@@ -221,7 +213,7 @@ def select_digest_sessions(
 
     The byte budget (``cfg.budgets.max_daily_digest_bytes``) is charged
     against each candidate's ACTUAL rendered digest size, at exactly the
-    :data:`DEFAULT_MAX_DIGEST_BYTES` cap :func:`build_digests` will render
+    :data:`legibility.digest.DEFAULT_MAX_BYTES` cap :func:`build_digests` will render
     with -- the same constant on both sides, so ``bytes_used`` describes the
     digests this night actually produces. Charging the RAW transcript size
     instead over-charged the budget by 20x-500x (a 0.5-6.5MB session renders
@@ -264,7 +256,7 @@ def select_digest_sessions(
     return sampling.stratified_sample(
         scored, cfg,
         cost_fn=sampling.digest_byte_cost_fn(
-            max_bytes=DEFAULT_MAX_DIGEST_BYTES, build=build, rendered=rendered,
+            max_bytes=digest.DEFAULT_MAX_BYTES, build=build, rendered=rendered,
         ),
     )
 
@@ -277,7 +269,7 @@ def select_digest_sessions(
 def build_digests(
     selected: Sequence[sampling.ScoredRecord],
     *,
-    max_bytes: int = DEFAULT_MAX_DIGEST_BYTES,
+    max_bytes: int = digest.DEFAULT_MAX_BYTES,
     build=digest.build_digest,
     rendered: dict[tuple, str] | None = None,
 ) -> tuple[list[str], list[tuple[str, str]]]:
@@ -290,7 +282,7 @@ def build_digests(
     while COSTING these same records against the byte budget. A record whose
     digest is already in it is emitted from the cache rather than rendered a
     second time -- the cost basis and the render basis are the same constant
-    by construction (:data:`DEFAULT_MAX_DIGEST_BYTES`), so the cached text is
+    by construction (:data:`legibility.digest.DEFAULT_MAX_BYTES`), so the cached text is
     byte-identical to what a re-render would produce, and
     :func:`sampling.render_cache_key` makes a mismatched cap or builder a
     structural MISS rather than a wrong digest. Skipping the re-render matters
