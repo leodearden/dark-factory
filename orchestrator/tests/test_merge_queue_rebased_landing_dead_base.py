@@ -276,7 +276,11 @@ def _awaiting_host(lane: MergeLane) -> list[str]:
 
 
 def _leased_task_ids(lane: MergeLane) -> list[str]:
-    return [row['task_id'] for row in lane.snapshot()['occupancy']['leases']]
+    """The task ids holding a host lease; an entry released at its verdict holds none."""
+    return [
+        row['task_id'] for row in lane.snapshot()['occupancy']['leases']
+        if row['activity'] != 'verified_pending_landing'
+    ]
 
 
 async def _stacked_base(store: _LateArrivalFakeEventStore, task_id: str) -> str:

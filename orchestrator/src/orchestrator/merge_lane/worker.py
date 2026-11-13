@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import enum
 import functools
+import itertools
 import json
 import logging
 import math
@@ -9138,6 +9139,49 @@ class SpeculativeMergeWorker:
         await self._host_allocator.quarantine_and_release(entry.lease)
         entry.lease = None
 
+    async def _verify_releasing_at_verdict(
+        self,
+        verify: Coroutine[Any, Any, InflightVerifyResult],
+        entry_slot: InflightEntrySlot,
+    ) -> InflightVerifyResult:
+        """Run *verify*, then release its host at the verdict (task 8526).
+
+        A raise or a cancellation releases nothing: the canceller owns the lease.
+        """
+        vr = await verify
+        await self._release_lease_at_verdict(entry_slot, vr)
+        return vr
+
+    async def _release_lease_at_verdict(
+        self, entry_slot: InflightEntrySlot, vr: InflightVerifyResult,
+    ) -> None:
+        """Free the host of the entry in *entry_slot* once *vr* is a verdict
+        and an earlier entry is still to land ahead of it.
+
+        The entry keeps its ``_inflight`` place for its in-order landing, as
+        VERIFIED_PENDING_LANDING.  The head keeps its lease to its finalize,
+        which follows at once: a head whose CAS meets a moved main holds it
+        through its parked gate, which keeps the host for its rebased head.
+        A DROPPED, REQUEUED or RUNNER_UNAVAILABLE exit has already vacated or
+        benched it.  The lease is cleared before the release, so no finalize,
+        cascade or ``stop()`` releases it again.
+        """
+        entry = entry_slot.entry
+        if (
+            vr.status is not None or entry is None or entry.lease is None
+            or self._host_allocator is None or not self._lands_behind_another(entry)
+        ):
+            return
+        lease = entry.lease
+        entry.lease = None
+        entry.verdict_host = lease.name
+        entry.status = InflightStatus.VERIFIED_PENDING_LANDING
+        await self._host_allocator.release(lease)
+
+    def _lands_behind_another(self, entry: InflightEntry) -> bool:
+        """Whether an earlier ``_inflight`` entry is still to land ahead of *entry*."""
+        return any(e is entry for e in itertools.islice(self._inflight, 1, None))
+
     # ── task 3204 sweep: two neighbouring candidates, deliberately REJECTED ──
     # Recorded here because this is where a future author would be tempted.
     # The bar an extraction had to clear: (a) 3+ genuinely identical
@@ -16185,8 +16229,9 @@ class SpeculativeMergeWorker:
                     logger.exception(
                         'Task %s: unexpected finalize error', head.item.request.task_id
                     )
-                    # _finalize_inflight's finally already released the lease
-                    # and speculation permit; the chokepoint's own release is
+                    # The verify released its lease at the verdict, or
+                    # _finalize_inflight's finally released the lease still
+                    # held and the speculation permit; the chokepoint's own release is
                     # a no-op here (idempotent lease FREE-check + permit
                     # .released guard) — it just resolves the future and
                     # marks the chain as failed.
@@ -19596,7 +19641,9 @@ class SpeculativeMergeWorker:
           PASS          — vr.outcome is None (or verify_task=None for compat shim):
                           CAS advance_main loop.
 
-        Lease release and speculation-slot release happen in the single finally:
+        A lease still held at finalize (a verdict kept on the persistent merge
+        lane, or a pre-verdict exit) and the speculation slot are released in
+        the single finally:
           · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED,
                                     unless vacated: lease is None; and a gate
                                     re-verify interrupted mid-run, as an
@@ -21556,10 +21603,13 @@ class SpeculativeMergeWorker:
         verify_wt = VerifyWorktreeHandle(merge_wt=item.merge_wt, spec_warm=False)
         entry_slot = InflightEntrySlot()
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
-            self._run_inflight_verify(
-                item, lease, depth=depth, probe_base=probe_base,
-                chain_items=chain_items, chain=chain, verify_wt=verify_wt,
-                entry_slot=entry_slot, dispatch_facts=dispatch_facts,
+            self._verify_releasing_at_verdict(
+                self._run_inflight_verify(
+                    item, lease, depth=depth, probe_base=probe_base,
+                    chain_items=chain_items, chain=chain, verify_wt=verify_wt,
+                    entry_slot=entry_slot, dispatch_facts=dispatch_facts,
+                ),
+                entry_slot,
             )
         )
 

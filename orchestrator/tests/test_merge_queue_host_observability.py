@@ -1151,8 +1151,9 @@ def _lease_wire(
 class TestOccupancyLeaseFidelity:
     """occupancy.leases / verifying_by_host: what each held lease is doing.
 
-    by_host and inflight_by_host report LEASES, and a lease outlives its
-    verify: a finished verify holds it until finalize, a remote whose dispatch
+    by_host and inflight_by_host report LEASES, and a lease can outlive its
+    verify: a verdict kept on the persistent merge lane holds it until
+    finalize (any other verdict releases it, task 8526), a remote whose dispatch
     returned runs its tail on THIS host, and a lease can sit on a host benched
     since.  The heartbeat's 'verifying N/M' counts none of the three.
     """

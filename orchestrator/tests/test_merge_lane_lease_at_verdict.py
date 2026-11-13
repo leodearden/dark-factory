@@ -129,10 +129,11 @@ def _rows(store: _LateArrivalFakeEventStore, kind: EventType, task_id: str) -> l
     return [e['data'] for e in store.speculative_events(kind) if e['task_id'] == task_id]
 
 
-def _finalized_done(store: _LateArrivalFakeEventStore) -> list[str]:
+def _landings(store: _LateArrivalFakeEventStore) -> list[str]:
+    """Task ids in the order the lane landed them (its ``merge_attempt`` done rows)."""
     return [
         e['task_id'] for e in store.events
-        if e['type'] is EventType.merge_finalized and e['data'].get('state') == 'done'
+        if e['type'] is EventType.merge_attempt and e['data'].get('outcome') == 'done'
     ]
 
 
@@ -205,7 +206,7 @@ class TestLaptopReleasedAtVerdict:
                 laptop.release_all()
 
         assert [o.status for o in outcomes] == ['done', 'done', 'done'], outcomes
-        assert _finalized_done(store) == ['lv-a', 'lv-b', 'lv-c']
+        assert _landings(store) == ['lv-a', 'lv-b', 'lv-c']
         assert await _first_parent_chain(git_repo, 3) == [o.merge_sha for o in reversed(outcomes)]
         assert [
             row for row in _rows(store, EventType.merge_attempt, 'lv-b')
@@ -273,9 +274,5 @@ class TestRebasedHeadWaitsForAHostAtKHostsPlusOne:
 
             assert (outcome_a.status, outcome_x.status) == ('done', 'done'), (outcome_a, outcome_x)
             assert verifier.verified == ['wk-a', 'wk-a', 'wk-x'], verifier.verified
-            landings = [
-                e['task_id'] for e in store.events
-                if e['type'] is EventType.merge_attempt and e['data'].get('outcome') == 'done'
-            ]
-            assert landings == ['wk-a', 'wk-x'], landings
+            assert _landings(store) == ['wk-a', 'wk-x']
             remote.run_merge_verify.assert_not_awaited()
