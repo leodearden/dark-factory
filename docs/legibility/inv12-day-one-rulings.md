@@ -31,7 +31,7 @@ committed alongside this file. ζb does not edit the ratification table.
 | `fused_memory_scripts.check_bare_magicmock_config._WALL_CLOCK_DEADLINE_DEBT` | `default` | `Debt(TaskRef(6201))` |
 | `shared.task_metadata._LEGACY_RETRY_LEDGER_COUNTER_KEYS` | `default` | `Debt(TaskRef(7135))` |
 | `scripts.check_dashboard_unit_parity.DIVERGENCE_ALLOWLIST` | `default` | `Policy('inv12-dashboard-unit-divergence')` |
-| `scripts.tests.test_design_invariants_consistency.PINNED_SITES` | `default` | `Debt(TaskRef(7136))` |
+| `tests.repo_guards.test_design_invariants_consistency.PINNED_SITES` | `default` | `Debt(TaskRef(7136))` |
 | `scripts.tests.test_merge_state_vocabulary_consistency.PINNED_SITES` | `default` | `Debt(TaskRef(7136))` |
 | `shared.task_metadata._BLESSED_METADATA_KEYS` | `default` | `Policy('inv12-task-metadata-blessed-keys')` |
 | `fused_memory.memory_metadata.BLESSED_METADATA_KEYS` | `default` | `Policy('inv12-memory-metadata-blessed-keys')` |
