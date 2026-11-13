@@ -291,9 +291,8 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
           `commit` field (the merge sha) — use
           `done_provenance={"kind": "merged", "commit": "<commit field from merge_request response>"}`.
         - **Polled** (`merge_status` returned `done`): the `merge_status` terminal response
-          carries **no `commit` field** — never assume one is present. It may carry
-          `last_outcome.merge_sha`, the request's recorded landing sha, valid when
-          `last_outcome.state` is `done` and `last_outcome.branch` names `task/<task_id>`.
+          carries **no `commit` field** — never assume one is present. An event-store `done`
+          (`source: "event_store"`) may carry `merge_sha`, the request's recorded landing sha.
           **Never stamp it bare.** Run the ladder marker-first (see [Deriving the landed
           sha](#deriving-the-landed-sha) below): the **task-scoped merge-marker search** stays
           the first rung, and a marker sha it yields is the one you use, as
@@ -301,7 +300,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
           ancestor-checks it) or `done_provenance={"kind": "found_on_main",
           "commit": "<recovered sha>", "note": "merge completed per polled merge_status;
           sha recovered via merge-marker search"}`. On an empty marker plus ancestry rc=1,
-          `last_outcome.merge_sha` is the input to the ladder's [rebased-solo-landing
+          that `merge_sha` is the input to the ladder's [rebased-solo-landing
           arm](../_shared/deriving-landed-sha.md#rebased-solo-landing). An empty search is
           **not** by itself a not-landed verdict — you are holding a server-issued polled
           `done`. Run the ancestry disposition in [Deriving the landed
