@@ -59,6 +59,7 @@ from fused_memory.maintenance.link_heal_ledger import (
 from fused_memory.maintenance.link_heal_report import WritesWithheld
 from fused_memory.maintenance.link_heal_store import CreatedWindow
 from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
+from fused_memory.models.scope import Scope
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CONTESTED_METADATA_KEY,
@@ -619,11 +620,12 @@ def _tamper_every_write(harness: LinkHealHarness) -> None:
     for route in ('set_payload', 'delete_payload'):
         original = getattr(mem0, route)
 
-        async def tampered(memory_id, *args, _original=original, **kwargs):
-            scope = kwargs.get('scope', args[-1] if args else None)
+        async def tampered(
+            memory_id: str, change: object, scope: Scope, _original=original,
+        ) -> None:
             key = (scope.project_id, memory_id)
             before = dict(mem0.points[key])
-            await _original(memory_id, *args, **kwargs)
+            await _original(memory_id, change, scope)
             mem0.points[key] = {**before, TAMPER_KEY: True}
 
         setattr(mem0, route, tampered)
