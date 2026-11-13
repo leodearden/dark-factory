@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _curator_fake import FakeCurator
 from _orch_helpers import pydantic_spec
-from escalation.classify import DONE_STEP_COMMIT_ORPHAN_CLASS
+from escalation.classify import (
+    DONE_STEP_COMMIT_ORPHAN_CLASS,
+    HARNESS_ROLE,
+    is_done_step_commit_orphan,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -259,25 +263,9 @@ class TestOrphanL0Reaper:
         aged out, so count == 1 and an L1 is filed instead of 0/none.
         """
         assert harness._escalation_queue is not None
-        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
-        original = Escalation(
-            id=harness._escalation_queue.make_id('task-42'),
-            task_id='task-42',
-            agent_role='orchestrator',
-            severity='blocking',
-            category='infra_issue',
-            summary=(
-                'plan.files/metadata.files divergence detected for task task-42'
-            ),
-            detail='detail',
-            # MUST NOT be 'verify_wip_reconciliation' — that would route
-            # through is_done_step_commit_orphan's get_task branch, which
-            # this test does not stub.
-            suggested_action='investigate_and_retry',
-            timestamp=ts,
-            level=0,
+        original = _submit_aged_divergence(
+            harness, 'task-42', 300.0, filing_claimant_run_id=None,
         )
-        harness._escalation_queue.submit(original)
         # Deliberately NOT added to harness._escalation_events, so the
         # stale-snapshot gate alone would not skip it.
 
@@ -297,56 +285,6 @@ class TestOrphanL0Reaper:
         ]
         l1s = [e for e in all_escs if e and e.level == 1]
         assert len(l1s) == 0
-
-    @pytest.mark.asyncio
-    async def test_genuine_orphan_with_divergence_still_promoted(
-        self, harness: Harness,
-    ):
-        """Task 2878 boundary guard: the live-recheck gate must not
-        over-suppress a genuinely stranded orphan.
-
-        Same divergence-class aged L0 as
-        ``test_live_holder_l0_not_promoted``, but here the task has no
-        live holder (``is_actively_held`` stays at the pre-1 fixture
-        default of False — no dispatch slot, no module lock, no recent
-        cancel stamp): a genuinely dead workflow. It must still be
-        promoted, both before and after the step-2 impl — this pins that
-        the gate defers only live tasks, never drops a genuine orphan.
-        """
-        assert harness._escalation_queue is not None
-        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
-        original = Escalation(
-            id=harness._escalation_queue.make_id('task-77'),
-            task_id='task-77',
-            agent_role='orchestrator',
-            severity='blocking',
-            category='infra_issue',
-            summary=(
-                'plan.files/metadata.files divergence detected for task task-77'
-            ),
-            detail='detail',
-            suggested_action='investigate_and_retry',
-            timestamp=ts,
-            level=0,
-        )
-        harness._escalation_queue.submit(original)
-        # Not in _escalation_events, and is_actively_held stays False (the
-        # pre-1 fixture default) — genuinely stranded, no live holder.
-
-        assert await harness._reap_orphan_l0_escalations() == 1
-
-        refreshed = harness._escalation_queue.get(original.id)
-        assert refreshed is not None
-        assert refreshed.status == 'dismissed'
-        assert refreshed.resolved_by == 'harness-orphan-reaper'
-
-        all_escs = [
-            harness._escalation_queue.get(p.stem)
-            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
-        ]
-        l1s = [e for e in all_escs if e and e.level == 1]
-        assert len(l1s) == 1
-        assert l1s[0].task_id == 'task-77'
 
     @pytest.mark.asyncio
     async def test_l1_not_touched(self, harness: Harness):
@@ -809,6 +747,10 @@ def _submit_aged_blocking(
     *,
     filing_claimant_run_id: str | None = None,
     severity: str = 'blocking',
+    agent_role: str = 'implementer',
+    category: str = 'design_concern',
+    summary: str | None = None,
+    suggested_action: str = 'investigate',
 ) -> Escalation:
     """An aged L0 that is L0-LEGAL and non-info, so link 4 can decide it.
 
@@ -824,12 +766,12 @@ def _submit_aged_blocking(
     esc = Escalation(
         id=queue.make_id(task_id),
         task_id=task_id,
-        agent_role='implementer',
+        agent_role=agent_role,
         severity=severity,
-        category='design_concern',
-        summary=f'aged {seconds_ago}s',
+        category=category,
+        summary=summary or f'aged {seconds_ago}s',
         detail='detail',
-        suggested_action='investigate',
+        suggested_action=suggested_action,
         timestamp=ts,
         level=0,
         filing_claimant_run_id=filing_claimant_run_id,
@@ -850,23 +792,14 @@ def _submit_aged_divergence(
     `suggested_action='investigate_and_retry'` keeps it off the
     done-step-commit arm.
     """
-    queue = _bound_queue(harness)
-    ts = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role='orchestrator',
-        severity='blocking',
+    return _submit_aged_blocking(
+        harness, task_id, seconds_ago,
+        filing_claimant_run_id=filing_claimant_run_id,
+        agent_role=HARNESS_ROLE,
         category='infra_issue',
         summary=f'plan.files/metadata.files divergence detected for task {task_id}',
-        detail='detail',
         suggested_action='investigate_and_retry',
-        timestamp=ts,
-        level=0,
-        filing_claimant_run_id=filing_claimant_run_id,
     )
-    queue.submit(esc)
-    return esc
 
 
 def _make_live(
@@ -979,17 +912,27 @@ class TestOrphanL0PromotesOnFilingIncarnationDeath:
     async def test_at_most_one_task_read_per_record(
         self, harness: Harness,
     ) -> None:
-        """Later branches reuse the row this arm already fetched."""
-        _submit_aged_blocking(
+        """The done-step-commit arm reuses the row the liveness arm fetched.
+
+        A dead filer under a live signal is the one record shape that reaches
+        BOTH readers: the liveness arm reads the row to name the current
+        claimant, then the done-step-commit arm reads it to rule out a
+        rebase-superseded subject.
+        """
+        esc = _submit_aged_blocking(
             harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID,
+            agent_role=HARNESS_ROLE,
+            category='infra_issue',
+            suggested_action='verify_wip_reconciliation',
         )
+        assert is_done_step_commit_orphan(esc)
         getter = _make_live(harness, 'T1', claimant_run_id=_LIVE_ID)
 
-        await harness._reap_orphan_l0_escalations()
+        assert await harness._reap_orphan_l0_escalations() == 1
 
-        assert getter.await_count <= 1, (
-            f'one record must cost at most one get_task, got '
+        assert getter.await_count == 1, (
+            f'one record must cost exactly one get_task, got '
             f'{getter.await_count}'
         )
 
@@ -1058,6 +1001,7 @@ class TestDivergenceL0FollowsTheFilingIncarnationAlone:
     @pytest.mark.parametrize(
         'stamp',
         [
+            pytest.param(_no_stamp, id='no-stamp'),
             pytest.param(_routing_stamp, id='fresh-routing'),
             pytest.param(_merge_phase_stamp, id='fresh-merge-phase'),
         ],
@@ -1065,13 +1009,18 @@ class TestDivergenceL0FollowsTheFilingIncarnationAlone:
     async def test_a_signal_less_divergence_l0_is_promoted_without_reading_its_stamps(
         self, harness: Harness, stamp,
     ) -> None:
-        _submit_aged_divergence(
+        esc = _submit_aged_divergence(
             harness, 'T1', 120.0, filing_claimant_run_id=_FILER_ID,
         )
         getter = AsyncMock(return_value={'status': 'in-progress', 'metadata': stamp()})
         harness.scheduler.get_task = getter
 
         assert await harness._reap_orphan_l0_escalations() == 1
+
+        refreshed = _bound_queue(harness).get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
         assert len(_pending_l1s(harness, 'T1')) == 1
         getter.assert_not_awaited()
 
