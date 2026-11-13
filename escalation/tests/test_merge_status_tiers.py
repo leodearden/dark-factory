@@ -23,7 +23,7 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from _merge_tool_calls import call_merge_cancel, call_merge_status
+from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
 from orchestrator.config import (
     GitConfig,
     OrchestratorConfig,
@@ -248,6 +248,7 @@ def _server(
     worker: Any = None,
     journal: Any = None,
     git_ops: Any = None,
+    merge_queue: asyncio.Queue[Any] | None = None,
 ) -> Any:
     harness = types.SimpleNamespace(
         _merge_worker=worker,
@@ -259,6 +260,7 @@ def _server(
         orch_config=_config(tmp_path),
         event_store=current,
         harness=harness,
+        merge_queue=merge_queue,
     )
 
 
@@ -935,6 +937,36 @@ class TestLiveTier:
         assert cancelled['cancelled'] is False
         assert cancelled['state'] == 'abandoned'
         assert cancelled['reason'] == 'Request already finalized; cannot cancel.'
+
+    async def test_the_live_eta_reads_the_registry_merge_request_filled(
+        self, tmp_path: Path,
+    ) -> None:
+        """With a merge queue wired and no registry injected, merge_status's live ETA
+        comes from the same lazily-created registry merge_request acquired (task 6610).
+        """
+        _, current = _event_stores(tmp_path)
+        git_ops = _git_ops_spies()
+        git_ops.find_inflight_merge_worktree = AsyncMock(return_value=None)
+        entries: list[dict[str, Any]] = []
+        worker = types.SimpleNamespace(snapshot=lambda: {'entries': list(entries)})
+        mq: asyncio.Queue[Any] = asyncio.Queue()
+        server = _server(tmp_path, current, worker=worker, git_ops=git_ops, merge_queue=mq)
+
+        submitted = await call_merge_request(
+            server, task_id=_TASK, branch=_TASK, worktree=str(tmp_path), lane='normal',
+        )
+        try:
+            entries.append(_live_entry(submitted['request_id']))
+            polled = await _poll(server, request_id=submitted['request_id'])
+        finally:
+            mq.get_nowait().result.cancel()
+
+        assert submitted['status'] == 'queued'
+        assert submitted['eta_seconds'] is not None
+        assert polled['source'] == 'live'
+        assert polled['request_id'] == submitted['request_id']
+        assert polled['eta_seconds'] is not None
+        assert 0 < polled['eta_seconds'] <= submitted['eta_seconds']
 
 
 class TestMergeCancelThroughTheLane:
