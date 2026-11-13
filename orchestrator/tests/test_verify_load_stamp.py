@@ -576,22 +576,20 @@ class TestXdistWorkers:
         [
             (TESTS_SCRIPTS_TEST_COMMAND + ' -n 8', '8'),
             ('uv run pytest tests/ --numprocesses=auto -n8', '8'),
-            ('uv run pytest tests/ -n 8 -n auto', 'auto'),
             ('uv run pytest tests/ -n 0 -n 4', '4'),
-            ('uv run pytest tests/ -n 4 -k -n0', '4'),
         ],
         ids=[
             'tests-scripts-leg-as-capped',
             'mixed-spellings',
-            'position-not-value-decides',
             'a-zero-count-outvoted',
-            'a-later-k-value-is-not-a-count',
         ],
     )
     def test_a_later_worker_count_outvotes_an_earlier_one(self, cmd, expected):
-        """argparse is last-wins, so the stamp records the count pytest runs with, not an overridden one.
+        """The stamp records the count pytest runs with, not an overridden one.
 
-        Ruling D17 (task 3353) wants the count in effect.
+        Ruling D17 (task 3353) wants the count in effect. Which count argv
+        applies, and the flag/value pairing, are pinned at the decoder seam:
+        ``test_serial_confirm_pytest.py::TestTheWorkerCountDecoder``.
         """
         from orchestrator.verify import _xdist_workers
 

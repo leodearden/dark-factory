@@ -11840,15 +11840,11 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
     So two orthogonal facts, separately sourced:
 
     - ``n_flag`` — the worker count the command's argv APPLIES, AS PARSED, or
-      ``None`` when it names none. argparse is last-wins, so that is the LAST
-      one named, and a role cap verify appends after an earlier ``-n`` (for
-      example ``-n auto ... -n 8``) is the one recorded. Read off the
+      ``None`` when it names none; which count that is, in every spelling, is
+      ``verify_cmd.py::applied_worker_count``'s to decide. Read off the
       STRUCTURED ``base_flags``, never by regex over the string: a regex would
       find the ``-n`` inside a cpu-governed ``<exec> -- /bin/bash -c '...'``
-      payload and report it as this command's flag. The spellings, and the
-      flag/value pairing that keeps a ``-k '-n'`` from being mistaken for a
-      worker count, are ``verify_cmd.py::applied_worker_count``'s (built on the
-      one decoder), which the admission guard also reads. A stamp that bound
+      payload and report it as this command's flag. A stamp that bound
       ``-n`` alone would report ``n_flag: null`` for a module config using the
       long spelling, which the census reads as "no flag on argv, so addopts
       decided the count" — a wrong fact, silently, in the corpus this

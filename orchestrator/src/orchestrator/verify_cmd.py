@@ -2061,12 +2061,11 @@ def worker_count_values(tokens: Sequence[str]) -> list[str]:
 
     THE one decoder of the worker-count spellings: ``-n V``, ``-nV``,
     ``-n=V``, ``--numprocesses V`` and ``--numprocesses=V`` (``_XDIST_N_FLAGS``).
-    argparse applies the LAST; ``applied_worker_count`` is the one reader of
-    that rule, and both ``_pins_zero_workers`` and the verify load stamp
-    (``verify.py::_xdist_workers``) go through it. The walk pairs every
-    ``_PYTEST_VALUE_FLAGS`` member with its value, as ``_strip_xdist_options``
-    does, so the ``-n0`` in ``-k -n0`` is never read as a count. An empty
-    attached value (``--numprocesses=``) is a pytest usage error, not a count.
+    argparse applies the LAST; read it through ``applied_worker_count``. The
+    walk pairs every ``_PYTEST_VALUE_FLAGS`` member with its value, as
+    ``_strip_xdist_options`` does, so the ``-n0`` in ``-k -n0`` is never read
+    as a count. An empty attached value (``--numprocesses=``) is a pytest usage
+    error, not a count.
     """
     values: list[str] = []
     i = 0
@@ -2101,7 +2100,7 @@ def _attached_worker_count(token: str) -> str:
 
 
 def _pins_zero_workers(tokens: Sequence[str]) -> bool:
-    """True when the LAST xdist worker count in argv *tokens* is ``0``."""
+    """True when the worker count argv *tokens* applies (``applied_worker_count``) is ``0``."""
     return applied_worker_count(tokens) == '0'
 
 
