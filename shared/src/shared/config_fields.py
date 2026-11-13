@@ -104,6 +104,71 @@ def reloadable_paths(model_cls: type[BaseModel]) -> frozenset[str]:
     )
 
 
+@functools.cache
+def legacy_spellings(model_cls: type[BaseModel]) -> Mapping[str, str]:
+    spellings: dict[str, str] = {}
+    for declared in declared_fields(model_cls):
+        for old_path, new_path in _declared_moves(declared):
+            if old_path in spellings:
+                raise ConfigDeclarationError(
+                    f'{old_path!r} is declared as the old spelling of both '
+                    f'{spellings[old_path]} and {new_path}'
+                )
+            spellings[old_path] = new_path
+    for old_path, new_path in spellings.items():
+        if old_path in _declared_paths(model_cls):
+            raise ConfigDeclarationError(
+                f'{old_path!r} is declared as the old spelling of {new_path}, '
+                f'but {old_path} is still a declared path of {model_cls.__name__}'
+            )
+    return MappingProxyType(spellings)
+
+
+@functools.cache
+def _declared_paths(model_cls: type[BaseModel]) -> frozenset[str]:
+    paths = {declared.path for declared in declared_fields(model_cls)}
+    for declared in declared_fields(model_cls):
+        if isinstance(declared.shape, Table):
+            paths |= {f'{declared.path}.{member.value}' for member in declared.shape.key_enum}
+    return frozenset(paths)
+
+
+def _declared_moves(declared: DeclaredField) -> Iterator[tuple[str, str]]:
+    for marker in declared.info.metadata:
+        if not isinstance(marker, (LegacySpelling, TableLegacy)):
+            continue
+        if declared.in_table_row:
+            raise ConfigDeclarationError(
+                f'{declared.path}: {marker!r} sits inside a table-row class, which is '
+                f'mounted once per row; declare the move as TableLegacy on the table field'
+            )
+        if isinstance(marker, LegacySpelling):
+            yield marker.path, declared.path
+        elif isinstance(declared.shape, Table):
+            for old_path, (row, knob) in _table_moves(declared.path, declared.shape, marker):
+                yield old_path, f'{declared.path}.{row}.{knob}'
+
+
+def _table_moves(
+    path: str, table: Table, marker: TableLegacy
+) -> list[tuple[str, tuple[str, str]]]:
+    moves = [
+        (f'{old_block}.{member.value}', (member.value, knob))
+        for old_block, knob in marker.knob_major_blocks
+        for member in table.key_enum
+    ]
+    moves += marker.rows.items()
+    _require_rows(path, table, frozenset(row for _, (row, _) in moves), 'TableLegacy')
+    knobs = list(table.row_cls.model_fields)
+    unknown = sorted({knob for _, (_, knob) in moves} - set(knobs))
+    if unknown:
+        raise ConfigDeclarationError(
+            f'{path}: TableLegacy names {unknown}, which are not fields of '
+            f'{table.row_cls.__name__}; fields: {knobs}'
+        )
+    return moves
+
+
 def _walk(
     model_cls: type[BaseModel],
     prefix: tuple[str, ...],
