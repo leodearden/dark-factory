@@ -28,10 +28,10 @@ Three boundaries, one per disposition:
   the merge retry loop **in-slot**.  No re-dispatch is burned and the row
   stays ``in-progress`` under the live claimant for the whole wait (spec §4:
   ``in-progress`` covers Path-A escalated-waiting).
-* **#2 — born-at-L2 / level≥2 open.**  ``_wait_for_resolution``'s
+* **#2 — born-at-L2 / non-info level≥2 open.**  ``_wait_for_resolution``'s
   stop-the-line short-circuit (``workflow.py:12206-12217``) raises
-  ``_StewardReescalated`` BEFORE the wait loop, so a human-gated record is
-  never waited on in-slot; the handler parks the row ``blocked`` via
+  ``_GatedByOpenL2`` (a ``_HumanHandoff``) BEFORE the wait loop, so a
+  human-gated record is never waited on in-slot; the handler parks the row ``blocked`` via
   ``_mark_blocked(..., skip_escalation=True)`` and leaves the L2 untouched.
 * **#3 — the wait expires (silent producer).**  The existing give-up
   machinery stops the steward, emits ``escalation_resolved{outcome=
@@ -971,12 +971,12 @@ class TestMergeGateBailEntersBoundedWait:
 
 @pytest.mark.asyncio
 class TestMergeGateL2ShortCircuits:
-    """Boundary #2: a born-at-L2 (or level≥2) record open at MERGE entry parks
-    the row ``blocked`` immediately — it is never waited on in-slot.
+    """Boundary #2: a born-at-L2 (or non-info level≥2) record open at MERGE
+    entry parks the row ``blocked`` immediately — it is never waited on in-slot.
 
     ``_wait_for_resolution``'s stop-the-line check (``workflow.py:12206-12217``)
-    raises ``_StewardReescalated`` BEFORE the wait loop, so the handler's
-    ``except`` clause routes straight to ``_mark_blocked(...,
+    raises ``_GatedByOpenL2`` (a ``_HumanHandoff``) BEFORE the wait loop, so
+    the handler's ``except`` clause routes straight to ``_mark_blocked(...,
     skip_escalation=True)``.  Two properties matter equally: the row IS
     written (no strand, spec S1) and the human-facing L2 is NOT consumed
     (repend-PRD boundary B1 stop-the-line — ``_mark_blocked``'s straggler

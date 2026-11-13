@@ -1252,9 +1252,9 @@ class TestUnrepairableResidueIsPreserved:
 
         The middleware declares residue at ``level=2``, and a PENDING level>=2
         escalation carrying a live task id is a stop-the-line event in this
-        repo: ``workflow._is_gating_escalation`` gates on ``level >= 2``,
+        repo: ``workflow._is_gating_escalation`` gates on a non-info ``level >= 2``,
         ``_check_escalations`` looks records up by task id alone, and
-        ``_wait_for_resolution`` raises ``_StewardReescalated`` — which
+        ``_wait_for_resolution`` raises ``_GatedByOpenL2`` — which
         ``run()`` turns into ``_mark_blocked``.
 
         So filing under the leaking task's own id would turn ONE leaked tool
