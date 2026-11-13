@@ -51,6 +51,7 @@ from legibility.detectors import (  # noqa: E402  # debt: task 6760
 from legibility.inventory import (  # noqa: E402
     UNREADABLE_FILE_ERRORS,
     as_unreadable_file_error,
+    encode_cwd,
 )
 
 logger = logging.getLogger('legibility.digest')
@@ -695,35 +696,18 @@ def _derive_date(records: list[dict[str, Any]]) -> str:
     return timestamp.split('T', 1)[0]
 
 
-def _encode_cwd(cwd: str) -> str:
-    """Mirror Claude Code's own ``~/.claude/projects/<enc>`` encoding.
-
-    '/', '.' AND '_' all map to '-', and case is preserved — same rule as
-    orchestrator.session_registry.encode_cwd, the canonical implementation,
-    which carries the authoritative statement of the rule and the record of
-    the 738 real (encoded-dir, decoded-cwd) pairs it was validated against.
-    Reused here as the fallback when the real transcript path isn't
-    available to read the ground-truth encoded dir name off disk.
-
-    Agreement with the canonical is not left to goodwill: it is asserted
-    row-for-row against real on-disk dir names by
-    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``
-    (task 3272, which found this copy and three others all missing '_').
-    """
-    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
-
-
 def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:
     """Prefer the real transcript file's parent dir name (ground truth);
-    fall back to mirror-encoding the derived *cwd* when no *path* is given
-    or *cwd* itself could not be derived."""
+    fall back to ``inventory.encode_cwd`` of the derived *cwd* when no *path*
+    is given or its parent dir name is empty, or to 'unknown' when *cwd*
+    itself could not be derived."""
     if path is not None:
         parent_name = Path(path).parent.name
         if parent_name:
             return parent_name
     if cwd == 'unknown':
         return 'unknown'
-    return _encode_cwd(cwd)
+    return encode_cwd(cwd)
 
 
 SECTION_HEADINGS: dict[str, str] = {
