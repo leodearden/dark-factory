@@ -3755,17 +3755,27 @@ def _prefix_shape_problem(prefix: str) -> str | None:
         return 'must be relative (no leading "/")'
     if '\\' in prefix:
         return 'must use "/" separators, not "\\"'
-    if any(segment in ('', '.', '..') for segment in prefix[:-1].split('/')):
+    problems = (_segment_problem(segment) for segment in prefix[:-1].split('/'))
+    return next((problem for problem in problems if problem), None)
+
+
+def _segment_problem(segment: str) -> str | None:
+    """What makes one path *segment* of a prefix match no lock key, or None."""
+    if segment in ('', '.', '..'):
         return 'must not contain an empty, "." or ".." segment'
+    if segment != segment.strip():
+        return 'must not have a segment with leading or trailing whitespace'
+    if any(char in segment for char in '*?['):
+        return 'is a literal path, not a glob: no "*", "?" or "["'
     return None
 
 
 class UnlimitedHolderLocksConfig(BaseModel):
     """Lock keys any number of tasks may hold at once, chosen by rule rather than key by key.
 
-    Matched against the lock KEY, after ``normalize_lock`` at ``lock_depth``, by
-    ``orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._limit_for``:
-    an exact ``module_overrides`` entry beats it, and it beats ``max_per_module``.
+    Matched against the lock KEY, after ``normalize_lock`` at ``lock_depth``. Where
+    it sits among the other limits is stated once, at
+    ``orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._resolve_limit``.
     The keys stay in every task's lock list; only their holder limit changes.
     Off unless a project sets it. Restart tier, like ``module_overrides``.
     """
@@ -3796,7 +3806,7 @@ class UnlimitedHolderLocksConfig(BaseModel):
             raise ValueError(f'unlimited_holder_locks.prefixes lists {duplicates} more than once')
         return prefixes
 
-    def covers(self, lock_key: str) -> bool:
+    def takes_unlimited_holders(self, lock_key: str) -> bool:
         """Whether *lock_key*, already normalised to ``lock_depth``, takes unlimited holders."""
         if self.root_markdown and '/' not in lock_key and lock_key.endswith('.md'):
             return True

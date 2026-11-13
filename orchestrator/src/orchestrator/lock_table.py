@@ -889,6 +889,8 @@ class ModuleLockTable:
 
         Builds a fresh dict from ``_held`` so callers cannot mutate internal state.
         Preferred over direct ``_held`` access in :meth:`Scheduler.get_state_snapshot`.
+        It shows ONE holder per key: a key several tasks hold names only the
+        last one iterated, so ask :meth:`held_modules` for what one task holds.
         """
         result: dict[str, str] = {}
         for task_id, modules in self._held.items():
@@ -905,13 +907,20 @@ class ModuleLockTable:
         return self._limits[module]
 
     def _resolve_limit(self, key: str) -> int:
-        """*key*'s holder limit: an exact override, then the unlimited-holder rule, then the width."""
+        """*key*'s holder limit, the first that applies, in this order (the one statement of it).
+
+        The key's module config's ``module_overrides[key]``; the top-level
+        ``module_overrides[key]``; ``UNLIMITED_HOLDERS`` when the top-level
+        ``unlimited_holder_locks`` rule takes *key*; the module config's
+        ``max_per_module``; the top-level ``max_per_module``.  An exact entry
+        beating the rule is how a project keeps one file under a prefix exclusive.
+        """
         mc = self._config.for_module(key)
         if mc and mc.module_overrides and key in mc.module_overrides:
             return mc.module_overrides[key]
         if key in self._config.module_overrides:
             return self._config.module_overrides[key]
-        if self._config.unlimited_holder_locks.covers(key):
+        if self._config.unlimited_holder_locks.takes_unlimited_holders(key):
             return UNLIMITED_HOLDERS
         if mc and mc.max_per_module is not None:
             return mc.max_per_module

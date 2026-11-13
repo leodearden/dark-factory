@@ -126,6 +126,26 @@ class TestExactOverrideBeatsTheRule:
         assert not table.try_acquire('C', ['pkg/hub.py'])
 
 
+class TestModuleConfigsAroundTheRule:
+    def test_a_module_override_pins_back_and_a_module_width_yields_to_the_rule(self, tmp_path: Path):
+        """Loaded as production loads it: ``ORCH_PROJECT_ROOT`` is this test's tmp_path."""
+        (tmp_path / 'docs').mkdir()
+        (tmp_path / 'docs' / 'orchestrator.yaml').write_text(
+            'max_per_module: 1\nmodule_overrides:\n  docs/pinned.md: 1\n'
+        )
+        config_file = tmp_path / 'project.yaml'
+        config_file.write_text(
+            'lock_depth: 12\nmax_per_module: 1\n'
+            'unlimited_holder_locks:\n  prefixes: ["docs/"]\n'
+        )
+        config = load_config(config_file)
+        assert config.for_module('docs/x.md') is not None, 'the docs/ module config must load'
+        table = ModuleLockTable(config)
+
+        assert _admits_many(table, 'docs/x.md')
+        assert _is_exclusive(table, 'docs/pinned.md')
+
+
 class TestReservationsOnAnUnlimitedKey:
     def test_a_park_on_a_documentation_key_blocks_no_one(self):
         table = _table(DOCS_AND_ROOT_MARKDOWN)
@@ -153,6 +173,7 @@ class TestReservationsOnAnUnlimitedKey:
 class TestPrefixValidation:
     @pytest.mark.parametrize('prefix', [
         '', 'docs', '/docs/', 'docs\\x/', './docs/', 'docs/../x/', 'docs//x/', '/',
+        'docs/**/', 'docs/*.md/', 'doc?/', 'docs/[ab]/', 'docs /', ' docs/', 'docs/\tx/',
     ])
     def test_a_malformed_prefix_is_refused_by_name(self, prefix):
         with pytest.raises(ValidationError) as caught:
