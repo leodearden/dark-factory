@@ -819,15 +819,23 @@ async def read_links(
     census: LinkCensus,
     projects: Sequence[str],
     created_in: CreatedWindow | None = None,
+    *,
+    presence_projects: Sequence[str] = (),
 ) -> LinkReads:
     """Every live link of *projects*, only those whose child *created_in* admits
-    when it is given."""
+    when it is given.
+
+    A parent missing from its child's project is looked for in *projects* and in
+    *presence_projects*, so a subset run still reads a parent hosted elsewhere as
+    in another project rather than absent.
+    """
+    universe = tuple(dict.fromkeys((*projects, *presence_projects)))
     states: list[LinkState] = []
     unread: list[tuple[str, str]] = []
     for project_id in projects:
         for child_id in await census.linked_ids(project_id, created_in):
             try:
-                state = await read_link_state(store, project_id, child_id, projects)
+                state = await read_link_state(store, project_id, child_id, universe)
             except StoreReadFailed:
                 unread.append((project_id, child_id))
                 continue

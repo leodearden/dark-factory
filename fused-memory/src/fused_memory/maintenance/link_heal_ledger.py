@@ -487,9 +487,12 @@ class CandidateRecord:
 
     ``action_taken`` is the linked heal's action once it applied, even if an undo
     later took it back, else :data:`NO_ACTION_TAKEN`; ``undone_run_id`` names that
-    undo run. ``after_child`` is the child as the applying write's verification
-    read it, the before-state when nothing applied, and ``None`` for an applied
-    heal whose after-state went unrecorded. The verdict fields are
+    undo run. ``action_state`` is the linked heal's state, ``None`` when no heal
+    was staged, so a failed, withheld or skipped heal is told apart from a dry run.
+    ``after_child`` is the child as a write's verification read it whenever one
+    was recorded, a failed heal's included; else the before-state when nothing
+    applied, and ``None`` for an applied heal whose after-state went unrecorded.
+    The verdict fields are
     joined from the adjudication an adjudicator basis names, and are ``None``
     for any other basis.
     """
@@ -508,6 +511,7 @@ class CandidateRecord:
     action_taken: str
     after_child: RecordSnapshot | None
     at: str
+    action_state: ActionState | None = None
     adjudication_id: int | None = None
     verdict: Verdict | None = None
     reason: str | None = None
@@ -669,14 +673,15 @@ class LinkHealLedger:
     def _candidate_record(self, row: sqlite3.Row) -> CandidateRecord:
         before_child = self.read_snapshot(row['child_snapshot_id'])
         parent_snapshot_id = row['parent_snapshot_id']
-        applied = row['action_state'] in APPLIED_STATES
+        action_state = None if row['action_state'] is None else ActionState(row['action_state'])
+        applied = action_state in APPLIED_STATES
         after_child_snapshot_id = row['after_child_snapshot_id']
-        if not applied:
-            after_child: RecordSnapshot | None = before_child
-        elif after_child_snapshot_id is None:
+        if after_child_snapshot_id is not None:
+            after_child: RecordSnapshot | None = self.read_snapshot(after_child_snapshot_id)
+        elif applied:
             after_child = None
         else:
-            after_child = self.read_snapshot(after_child_snapshot_id)
+            after_child = before_child
         return CandidateRecord(
             run_id=row['run_id'],
             project_id=row['project_id'],
@@ -694,6 +699,7 @@ class LinkHealLedger:
             action_taken=row['action_value'] if applied else NO_ACTION_TAKEN,
             after_child=after_child,
             at=row['at'],
+            action_state=action_state,
             adjudication_id=row['adjudication_id'],
             verdict=(
                 None if row['adjudicated_verdict'] is None

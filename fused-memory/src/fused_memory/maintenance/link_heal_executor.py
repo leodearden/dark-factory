@@ -726,10 +726,12 @@ async def run_adjudicator_plan(
     enabled_actions: frozenset[HealAction] | None = None,
     created_in: CreatedWindow | None = None,
     filer: EscapeFiler | None = None,
+    presence_projects: Sequence[str] = (),
 ) -> RunReport:
     """A non-writing run of *source* planning heals from the link adjudicator's verdicts.
 
     Only the links whose child *created_in* admits are read, when it is given.
+    A parent is looked for in *presence_projects* as well as *projects*.
     The adjudicator is asked only about the links the verdict rows decide and
     that this adjudicator (model and prompt version) has not judged at their
     current texts, so a model or brief change asks again. Every read
@@ -740,7 +742,9 @@ async def run_adjudicator_plan(
     filed; so is a failure storm, unless *filer* is given, which files it and
     discloses it as ``escaped``.
     """
-    reads = await read_links(store, census, projects, created_in)
+    reads = await read_links(
+        store, census, projects, created_in, presence_projects=presence_projects,
+    )
     adjudicated = await _adjudicate(_candidates(reads), ledger, adjudicate)
     run_id = ledger.start_run(source, writes=False)
     new_ids = ledger.add_adjudications(run_id, adjudicated.records)

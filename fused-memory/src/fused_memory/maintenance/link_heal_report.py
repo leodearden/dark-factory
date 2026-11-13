@@ -19,7 +19,7 @@ from typing import Any
 
 from fused_memory.maintenance.link_heal import RunCounts
 from fused_memory.maintenance.link_heal_executor import undo_command
-from fused_memory.maintenance.link_heal_ledger import CandidateRecord
+from fused_memory.maintenance.link_heal_ledger import NO_ACTION_TAKEN, CandidateRecord
 from fused_memory.maintenance.link_heal_store import CreatedWindow
 
 SWEEP_REPORT_FORMAT = 'link-heal-sweep-report/1'
@@ -123,12 +123,13 @@ def report_paths(reports_dir: Path, now: datetime, plan_run_id: str) -> tuple[Pa
     return reports_dir / f'{stem}.json', reports_dir / f'{stem}.md'
 
 
-_CROSS_TAB_KEYS = ('project', 'decision', 'verdict', 'action_taken')
+_CROSS_TAB_KEYS = ('project', 'decision', 'verdict', 'action_taken', 'action_state')
 
 
-def _cells(record: CandidateRecord) -> tuple[str, str, str, str]:
+def _cells(record: CandidateRecord) -> tuple[str, str, str, str, str]:
     verdict = NO_VERDICT if record.verdict is None else record.verdict.value
-    return record.project_id, record.decision.value, verdict, record.action_taken
+    state = NO_ACTION_TAKEN if record.action_state is None else record.action_state.value
+    return record.project_id, record.decision.value, verdict, record.action_taken, state
 
 
 def run_headline(view: SweepRunView) -> dict[str, Any]:
@@ -180,13 +181,14 @@ def _writes_mode(view: SweepRunView) -> str:
 def _counts(records: Sequence[CandidateRecord]) -> dict[str, Any]:
     cells = Counter(_cells(record) for record in records)
     by_project: dict[str, Counter[str]] = {}
-    for (project, decision, _verdict, _action), count in cells.items():
+    for (project, decision, _verdict, _action, _state), count in cells.items():
         by_project.setdefault(project, Counter())[decision] += count
     return {
         'records': len(records),
         'by_project': {project: dict(tally) for project, tally in by_project.items()},
         'by_verdict': dict(_tally(cells, 2)),
         'by_action': dict(_tally(cells, 3)),
+        'by_action_state': dict(_tally(cells, 4)),
         'cross_tab': [
             {**dict(zip(_CROSS_TAB_KEYS, cell, strict=True)), 'count': cells[cell]}
             for cell in sorted(cells)
@@ -272,10 +274,11 @@ def _project_tables(cross_tab: Iterable[Mapping[str, Any]]) -> list[str]:
         lines += [
             f'## {project}',
             '',
-            '| decision | verdict | action | count |',
-            '|---|---|---|---|',
+            '| decision | verdict | action | action state | count |',
+            '|---|---|---|---|---|',
             *(
-                f'| {row["decision"]} | {row["verdict"]} | {row["action_taken"]} | {row["count"]} |'
+                f'| {row["decision"]} | {row["verdict"]} | {row["action_taken"]} '
+                f'| {row["action_state"]} | {row["count"]} |'
                 for row in rows_by_project[project]
             ),
             '',

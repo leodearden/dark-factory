@@ -23,6 +23,7 @@ from fused_memory.maintenance.link_heal import (
 from fused_memory.maintenance.link_heal_executor import undo_command
 from fused_memory.maintenance.link_heal_ledger import (
     NO_ACTION_TAKEN,
+    ActionState,
     CandidateRecord,
     Disposition,
     RecordSnapshot,
@@ -96,6 +97,7 @@ def _record(
         disposition=disposition,
         action_id=n if isinstance(decision, HealAction) else None,
         action_taken=decision.value if applied else NO_ACTION_TAKEN,
+        action_state=ActionState.APPLIED if applied else None,
         after_child=after,
         at='2026-11-02T02:16:00+00:00',
         adjudication_id=None if verdict is None else n,
@@ -167,19 +169,25 @@ class TestCounts:
             'detach': 2, 'relabel': 1, NO_ACTION_TAKEN: 3,
         }
 
-    def test_the_cross_tab_is_one_row_per_project_decision_verdict_and_action(self):
+    def test_by_action_state_tells_an_applied_heal_from_no_heal(self):
+        assert _document(_view())['counts']['by_action_state'] == {
+            ActionState.APPLIED.value: 3, NO_ACTION_TAKEN: 3,
+        }
+
+    def test_the_cross_tab_is_one_row_per_project_decision_verdict_action_and_state(self):
         cross_tab = _document(_view())['counts']['cross_tab']
+        applied = ActionState.APPLIED.value
         assert cross_tab == [
             {'project': DF, 'decision': 'detach', 'verdict': 'RELATED',
-             'action_taken': 'detach', 'count': 2},
+             'action_taken': 'detach', 'action_state': applied, 'count': 2},
             {'project': DF, 'decision': 'no_action', 'verdict': 'SAME',
-             'action_taken': NO_ACTION_TAKEN, 'count': 1},
+             'action_taken': NO_ACTION_TAKEN, 'action_state': NO_ACTION_TAKEN, 'count': 1},
             {'project': DF, 'decision': 'relabel', 'verdict': 'EXTENDS',
-             'action_taken': 'relabel', 'count': 1},
+             'action_taken': 'relabel', 'action_state': applied, 'count': 1},
             {'project': REIFY, 'decision': 'flag', 'verdict': 'CORRECTS',
-             'action_taken': NO_ACTION_TAKEN, 'count': 1},
+             'action_taken': NO_ACTION_TAKEN, 'action_state': NO_ACTION_TAKEN, 'count': 1},
             {'project': REIFY, 'decision': 'has_children', 'verdict': 'none',
-             'action_taken': NO_ACTION_TAKEN, 'count': 1},
+             'action_taken': NO_ACTION_TAKEN, 'action_state': NO_ACTION_TAKEN, 'count': 1},
         ]
 
     def test_each_run_discloses_its_own_counts(self):
@@ -258,9 +266,9 @@ class TestMarkdown:
         markdown = _markdown(_view())
         assert f'## {DF}' in markdown
         assert f'## {REIFY}' in markdown
-        assert markdown.count('| decision | verdict | action | count |') == 2
-        assert '| detach | RELATED | detach | 2 |' in markdown
-        assert '| has_children | none | none | 1 |' in markdown
+        assert markdown.count('| decision | verdict | action | action state | count |') == 2
+        assert '| detach | RELATED | detach | applied | 2 |' in markdown
+        assert '| has_children | none | none | none | 1 |' in markdown
 
     def test_the_writes_line_says_applied(self):
         assert '- Writes: applied' in _markdown(_view())

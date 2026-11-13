@@ -3290,6 +3290,11 @@ check.
   next run examines those links again. A run over fewer projects leaves the
   other projects' windows for the next run. A run starting after a project's
   start (`--since`) leaves the gap before it, so the next run covers that gap.
+  A parent missing from its child's project is looked for in every project of
+  `link_heal.projects` as well as the ones examined, and one found there is
+  reported cross-project, never detached. A parent hosted in a project outside
+  `link_heal.projects` reads as absent, so list every project that hosts
+  parents there.
   Examining a link again is harmless: verdicts are reused and pending heals are
   deduped. Only the heals in `link_heal.sweep_actions` (default `detach`,
   `relabel`) are staged; every other heal is recorded as `not_enabled`.

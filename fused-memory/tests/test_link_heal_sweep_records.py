@@ -59,7 +59,12 @@ from fused_memory.maintenance.link_heal_ledger import (
 from fused_memory.maintenance.link_heal_report import WritesWithheld
 from fused_memory.maintenance.link_heal_store import CreatedWindow
 from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
-from fused_memory.server.grouped_read import AMENDMENT_KIND, CONTESTED_METADATA_KEY, SIGHTING_KIND
+from fused_memory.server.grouped_read import (
+    AMENDMENT_KIND,
+    CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
+    SIGHTING_KIND,
+)
 
 LIMITS = RunLimits(
     max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
@@ -581,6 +586,76 @@ STAGED_HEALS = {
 }
 
 
+class TestAWriteThatLandedButFailedVerification:
+    @pytest.mark.asyncio
+    async def test_its_record_shows_the_verification_read_and_the_failed_state(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        _calibrate(ledger, passed=True)
+        _tamper_every_write(harness)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+        )
+
+        record = {r.child_id: r for r in ledger.run_records(report.plan_run_id)}[MISFILED]
+        assert record.action_state is ActionState.FAILED
+        assert record.action_taken == NO_ACTION_TAKEN
+        assert record.after_child is not None
+        assert record.after_child.metadata.get(TAMPER_KEY) is True
+        assert TAMPER_KEY not in record.before_child.metadata
+        assert _report_json(report)['counts']['by_action_state'][ActionState.FAILED.value] == 3
+
+
+TAMPER_KEY = 'x_tampered_after_write'
+
+
+def _tamper_every_write(harness: LinkHealHarness) -> None:
+    """Land each write, then put the record back as it was plus a marker, so the
+    write lands and its verification read differs from both the before- and the
+    intended after-state."""
+    mem0 = harness.mem0
+    for route in ('set_payload', 'delete_payload'):
+        original = getattr(mem0, route)
+
+        async def tampered(memory_id, *args, _original=original, **kwargs):
+            scope = kwargs.get('scope', args[-1] if args else None)
+            key = (scope.project_id, memory_id)
+            before = dict(mem0.points[key])
+            await _original(memory_id, *args, **kwargs)
+            mem0.points[key] = {**before, TAMPER_KEY: True}
+
+        setattr(mem0, route, tampered)
+
+
+class TestAParentHostedInAProjectTheSweepDoesNotExamine:
+    @pytest.mark.asyncio
+    async def test_is_reported_cross_project_and_never_detached(self, harness, ledger, tmp_path):
+        child, parent = _id('cccccccc', 1), _id('dddddddd', 1)
+        harness.seed(REIFY, parent, 'a parent hosted in reify')
+        harness.seed_link(
+            kind=SIGHTING_KIND, child=child, parent=parent, project=DF, parent_text=None,
+            child_text='a cross-project sighting', meta={'created_at': INSIDE},
+        )
+        _calibrate(ledger, passed=True)
+        settings = SweepSettings(
+            projects=(DF,), presence_projects=(REIFY,), writes=True, dry_run=False,
+            actions=SWEEP_ACTIONS, window_hours=24,
+        )
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=settings, filer=RecordingFiler(),
+            adjudicate=FakeAdjudicator(lambda _text: Verdict.RELATED),
+        )
+
+        (record,) = ledger.run_records(report.plan_run_id)
+        assert record.decision is Report.CROSS_PROJECT_REPORTED
+        assert record.action_state is None
+        assert ledger.applied_actions(report.apply_run_id) == []
+        assert harness.mem0.payload(DF, child)[PARENT_ID_KEY] == parent
+
+
 class TestTheWriteTimeCalibrationGate:
     @pytest.mark.asyncio
     async def test_heals_staged_under_a_failed_calibration_are_withheld_after_another_prompt_passes(
@@ -866,6 +941,13 @@ class TestSweepSettings:
         config = LinkHealConfig(projects=[DF])
 
         assert SweepSettings.from_config(config, projects=['reify']).projects == ('reify',)
+
+    def test_a_projects_override_still_looks_for_parents_in_the_configured_projects(self):
+        config = LinkHealConfig(projects=[DF, REIFY])
+
+        settings = SweepSettings.from_config(config, projects=[REIFY])
+
+        assert settings.presence_projects == (REIFY, DF)
 
     def test_a_sweep_over_no_project_is_refused(self):
         with pytest.raises(ValueError, match='projects'):

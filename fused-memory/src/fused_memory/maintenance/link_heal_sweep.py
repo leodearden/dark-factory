@@ -55,16 +55,27 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class SweepSettings:
-    """What one sweep covers, which heals it may stage, and whether it asks to write."""
+    """What one sweep covers, which heals it may stage, and whether it asks to write.
+
+    *presence_projects* always includes *projects*: they are where a parent missing
+    from its child's project is looked for, so a sweep over a subset of the
+    configured projects reports a parent hosted in another one instead of
+    detaching it as absent.
+    """
 
     projects: tuple[str, ...]
     writes: bool
     dry_run: bool
     actions: frozenset[HealAction]
     window_hours: int
+    presence_projects: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'projects', tuple(self.projects))
+        object.__setattr__(
+            self, 'presence_projects',
+            tuple(dict.fromkeys((*self.projects, *self.presence_projects))),
+        )
         object.__setattr__(self, 'actions', frozenset(self.actions))
         if not self.projects:
             raise ValueError(
@@ -87,6 +98,7 @@ class SweepSettings:
             dry_run=dry_run,
             actions=_heal_actions(config.sweep_actions),
             window_hours=config.sweep_window_hours,
+            presence_projects=tuple(config.projects),
         )
 
     def withheld(self, calibration: AdjudicatorCalibration) -> WritesWithheld | None:
@@ -197,6 +209,7 @@ async def run_sweep(
         enabled_actions=settings.actions,
         created_in=window,
         filer=filer if withheld is None else None,
+        presence_projects=settings.presence_projects,
     )
     ledger.record_sweep_window(
         plan.run_id, window, projects=settings.projects, complete=plan.counts.complete,
