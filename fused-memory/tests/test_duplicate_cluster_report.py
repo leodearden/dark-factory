@@ -10,6 +10,7 @@ fixture that could drift from it.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pydantic
@@ -696,3 +697,202 @@ class TestWarmLaneShape:
         assert cluster['lineage']['added_member_ids'] == ['r7', 'r8']
         assert cluster['lineage']['added_by_age']['re_emitted'] == 2
         assert cur['regrowth']['re_emitted_members'] == 2
+
+
+# ---------------------------------------------------------------------------
+# Artifacts and the store-free --plan CLI mode
+# ---------------------------------------------------------------------------
+
+_FAILED_OS = {
+    'category': _OS, 'error_type': 'timeout', 'exit_code': None, 'stderr_tail': 'slow',
+}
+
+
+def _grown_report(config) -> dict:
+    prev = _build(config, [('prev.json', _plan(_family(['a', 'b'])))], stamp=_PREV)
+    return report.build_report(
+        'dark_factory', _CUR,
+        [('cur.json', _plan(
+            [*_family(['a', 'b']), _rec('c', 'venv', 2, _AFTER_PREV)], truncated=1,
+        ))],
+        config=config, previous=prev, failed_categories=[_FAILED_OS],
+    )
+
+
+class TestWriteReport:
+    def test_the_report_and_its_summary_land_under_the_project(
+        self, config, tmp_path: Path,
+    ) -> None:
+        rep = _grown_report(config)
+
+        json_path, summary_path = report.write_report(tmp_path, 'dark_factory', _CUR, rep)
+
+        assert json_path == tmp_path / 'dark_factory' / f'report-{_CUR}.json'
+        assert summary_path == tmp_path / 'dark_factory' / f'summary-{_CUR}.txt'
+        text = json_path.read_text(encoding='utf-8')
+        assert text.endswith('\n')
+        assert json.loads(text) == json.loads(json.dumps(rep))
+        assert text == json.dumps(rep, indent=2, sort_keys=True) + '\n'
+
+    def test_the_summary_states_fitness_coverage_regrowth_and_failures(
+        self, config, tmp_path: Path,
+    ) -> None:
+        _json_path, summary_path = report.write_report(
+            tmp_path, 'dark_factory', _CUR, _grown_report(config),
+        )
+        summary = summary_path.read_text(encoding='utf-8')
+
+        assert 'dark_factory' in summary
+        assert _CUR in summary
+        assert 'regrowth measurement: supported; gate filing: blocked (task 4916)' in summary
+        (pk_line,) = [line for line in summary.splitlines() if line.strip().startswith(_PK)]
+        assert '1 cluster' in pk_line
+        assert 'scan_truncated' in pk_line
+        assert 'grew 1' in summary
+        assert 're-emitted members 1' in summary
+        (top_line,) = [line for line in summary.splitlines() if '+1 added' in line]
+        assert top_line.split()[0] == 'a'
+        (failed_line,) = [line for line in summary.splitlines() if line.strip().startswith(_OS)]
+        assert 'timeout' in failed_line
+
+
+class TestFindPreviousReport:
+    def _write(self, root: Path, project: str, stamp: str, project_id: str | None = None):
+        path = root / project / f'report-{stamp}.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'project_id': project_id or project, 'run_stamp': stamp}))
+        return path
+
+    def test_the_latest_report_strictly_before_the_stamp_is_returned(
+        self, tmp_path: Path,
+    ) -> None:
+        for stamp in ('20261101T000000Z', '20261108T000000Z', '20261115T000000Z'):
+            self._write(tmp_path, 'p', stamp)
+
+        found = report.find_previous_report(tmp_path, 'p', '20261115T000000Z')
+
+        assert found is not None
+        stamp, prior = found
+        assert stamp == '20261108T000000Z'
+        assert prior['run_stamp'] == '20261108T000000Z'
+
+    def test_malformed_names_and_other_projects_are_ignored(self, tmp_path: Path) -> None:
+        self._write(tmp_path, 'p', '20261101T000000Z')
+        self._write(tmp_path, 'p', '2026-11-10T00:00:00Z')
+        self._write(tmp_path, 'p', '20261112T000000Z', project_id='q')
+
+        found = report.find_previous_report(tmp_path, 'p', '20261115T000000Z')
+
+        assert found is not None
+        assert found[0] == '20261101T000000Z'
+
+    def test_no_earlier_report_is_none(self, tmp_path: Path) -> None:
+        self._write(tmp_path, 'p', '20261115T000000Z')
+        assert report.find_previous_report(tmp_path, 'p', '20261115T000000Z') is None
+        assert report.find_previous_report(tmp_path, 'absent', '20261115T000000Z') is None
+
+
+def _dump(path: Path, data: object) -> Path:
+    path.write_text(json.dumps(data), encoding='utf-8')
+    return path
+
+
+@pytest.fixture
+def config_path(tmp_path: Path) -> Path:
+    return _write_yaml(tmp_path, _committed_yaml(), name='config.yaml')
+
+
+class TestPlanModeCli:
+    def _argv(self, config_path: Path, out_root: Path, *plans: Path,
+              stamp: str = '20260811T120000Z', project_id: str | None = 'p') -> list[str]:
+        argv = ['--config', str(config_path), '--out-root', str(out_root), '--run-stamp', stamp]
+        if project_id is not None:
+            argv += ['--project-id', project_id]
+        for plan in plans:
+            argv += ['--plan', str(plan)]
+        return argv
+
+    def test_a_report_is_built_from_saved_plans_and_the_next_one_diffs_against_it(
+        self, config_path: Path, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'reports'
+        first = [
+            _dump(tmp_path / 'pk-1.json', _plan(_family(['a', 'b']))),
+            _dump(tmp_path / 'pn-1.json', _plan([], _PN)),
+        ]
+        second = [
+            _dump(tmp_path / 'pk-2.json', _plan(_family(['a', 'b', 'c']))),
+            _dump(tmp_path / 'pn-2.json', _plan([], _PN)),
+        ]
+
+        assert report.main(self._argv(config_path, out_root, *first)) == report.EXIT_OK
+        assert report.main(self._argv(
+            config_path, out_root, *second, stamp='20260818T120000Z',
+        )) == report.EXIT_OK
+
+        rep = json.loads((out_root / 'p' / 'report-20260818T120000Z.json').read_text())
+        assert rep['regrowth']['previous_run_stamp'] == '20260811T120000Z'
+        assert rep['categories'][_PK]['source'] == str(second[0])
+        assert rep['categories'][_PN]['source'] == str(second[1])
+        assert rep['clusters'][0]['lineage']['status'] == 'grew'
+        assert rep['failed_categories'] == []
+        assert (out_root / 'p' / 'summary-20260818T120000Z.txt').exists()
+
+    def test_a_missing_plan_file_is_bad_input_naming_it(
+        self, config_path: Path, tmp_path: Path, caplog,
+    ) -> None:
+        missing = tmp_path / 'absent.json'
+
+        code = report.main(self._argv(config_path, tmp_path / 'out', missing))
+
+        assert code == report.EXIT_BAD_INPUT == 2
+        assert str(missing) in caplog.text
+
+    def test_a_plan_that_is_not_json_is_bad_input_naming_it(
+        self, config_path: Path, tmp_path: Path, caplog,
+    ) -> None:
+        broken = tmp_path / 'broken.json'
+        broken.write_text('{not json', encoding='utf-8')
+
+        assert report.main(self._argv(config_path, tmp_path / 'out', broken)) == 2
+        assert str(broken) in caplog.text
+
+    def test_two_plans_sweeping_one_category_are_bad_input(
+        self, config_path: Path, tmp_path: Path,
+    ) -> None:
+        plans = [_dump(tmp_path / f'pk-{n}.json', _plan([])) for n in (1, 2)]
+        assert report.main(self._argv(config_path, tmp_path / 'out', *plans)) == 2
+
+    def test_a_malformed_run_stamp_is_bad_input(self, config_path: Path, tmp_path: Path) -> None:
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+        code = report.main(self._argv(
+            config_path, tmp_path / 'out', plan, stamp='2026-08-11T12:00:00Z',
+        ))
+        assert code == 2
+
+    def test_a_config_error_is_bad_input(self, tmp_path: Path, caplog) -> None:
+        bad = _write_yaml(tmp_path, _without(_committed_yaml(), 'projects'), name='bad.yaml')
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+
+        assert report.main(self._argv(bad, tmp_path / 'out', plan)) == 2
+        assert str(bad) in caplog.text
+
+    def test_plans_without_a_project_are_bad_input(
+        self, config_path: Path, tmp_path: Path,
+    ) -> None:
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+        code = report.main(self._argv(config_path, tmp_path / 'out', plan, project_id=None))
+        assert code == 2
+
+    def test_an_unwritable_out_root_aborts_the_run_without_a_traceback(
+        self, config_path: Path, tmp_path: Path, caplog, capsys,
+    ) -> None:
+        not_a_dir = tmp_path / 'regular-file'
+        not_a_dir.write_text('', encoding='utf-8')
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+
+        code = report.main(self._argv(config_path, not_a_dir, plan))
+
+        assert code == report.EXIT_RUN_FAILED == 1
+        assert 'ABORT: cannot write the report' in caplog.text
+        assert 'Traceback' not in caplog.text + capsys.readouterr().err
