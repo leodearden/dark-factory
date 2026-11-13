@@ -23,6 +23,7 @@ from _fm_git_repos import ScriptedGitRunner, _init_git_repo
 from _fm_helpers import make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from _fm_polling import poll_until
+from _import_closure import SRC, modules_loaded_by_importing
 from shared.async_sqlite_base import CheckpointResult
 from shared.git_async import GitResult, run_git
 from shared.task_metadata import DoneProvenance
@@ -46,6 +47,7 @@ from fused_memory.middleware.curator_types import (
     is_combine_eligible_status,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
+from fused_memory.middleware.done_provenance import validate_done_provenance
 from fused_memory.middleware.done_provenance_authz import DETERMINISTIC_PROVENANCE_KINDS
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import (
@@ -60,6 +62,8 @@ from fused_memory.reconciliation.consolidation_gate import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+_DONE_PROVENANCE_LOGGER = 'fused_memory.middleware.done_provenance'
 
 
 @pytest.fixture
@@ -3171,7 +3175,7 @@ async def test_done_provenance_missing_warning_offers_every_caller_selectable_ki
     """The require=False warning names the same kinds as the strict refusal."""
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
-    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+    with caplog.at_level(logging.WARNING, logger=_DONE_PROVENANCE_LOGGER):
         await interceptor.set_task_status('1', 'done', '/project')
 
     [warning] = [
@@ -3821,7 +3825,7 @@ async def test_reopen_freshness_warn_mode_emits_census_line(
         reopened_task = await backend.get_task('1', project_root=project_root)
         reopen_at = reopened_task['metadata']['reopen_at']
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        with caplog.at_level(logging.WARNING, logger=_DONE_PROVENANCE_LOGGER):
             result = await interceptor.set_task_status(
                 '1',
                 'done',
@@ -4021,7 +4025,7 @@ async def test_reopen_freshness_fail_closed_on_unparseable_reopen_at(
     use) so ``before`` can carry a deliberately malformed ``reopen_at``
     string that a real reopen write would never produce -- the atomic
     reopen writer (task 2649) always stamps a valid ISO-8601 string. A
-    real git repo is still required so ``_validate_done_provenance`` can
+    real git repo is still required so ``validate_done_provenance`` can
     resolve + ancestor-check the cited commit before the freshness gate
     even runs.
     """
@@ -4085,7 +4089,7 @@ async def test_reopen_freshness_accepts_fresh_evidence(
 
         fresh_sha = _commit_on_main(tmp_path, 'fresh_evidence.txt', '2099-01-01T00:00:00+00:00')
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        with caplog.at_level(logging.WARNING, logger=_DONE_PROVENANCE_LOGGER):
             result = await interceptor.set_task_status(
                 '1',
                 'done',
@@ -4259,7 +4263,7 @@ async def test_reopen_freshness_invalid_override_rejected_in_warn_mode(
 ):
     """Coverage gap fix (reviewer follow-up on task 2674): the
     override-invalid rejection is mode-independent BY DESIGN (see
-    ``_check_reopen_freshness``'s "Rollout-safety note" and
+    ``check_reopen_freshness``'s "Rollout-safety note" and
     ``reject_stale_done_evidence``'s schema docstring) but was previously
     only exercised under enforce config. Confirms EXPLICIT warn mode (the
     alpha rollout default; the shipped default is 'enforce' as of task 2680
@@ -4303,7 +4307,7 @@ async def test_reopen_freshness_invalid_override_rejected_in_warn_mode(
 
         malformed_override = {'escalation_id': 'esc-2'}  # missing 'reason'
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        with caplog.at_level(logging.WARNING, logger=_DONE_PROVENANCE_LOGGER):
             result = await interceptor.set_task_status(
                 '1',
                 'done',
@@ -4350,7 +4354,7 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
     fail-closed path already covered by
     ``test_reopen_freshness_fail_closed_on_unparseable_reopen_at``.
 
-    By the time ``_check_reopen_freshness`` runs, ``_validate_done_provenance``
+    By the time ``check_reopen_freshness`` runs, ``validate_done_provenance``
     has already resolved + ancestor-checked the cited commit, so a genuine
     "commit does not exist" scenario can never reach the gate -- the
     interceptor's runner scripts a timed-out ``git show`` on an otherwise
@@ -4393,13 +4397,13 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
         # A perfectly valid, resolvable, on-main commit -- NOT actually
         # unresolvable. The scripted `git show` is what makes the gate's own
         # date step fail, isolated from commit resolution/ancestor checking
-        # in _validate_done_provenance (which runs first and would otherwise
+        # in validate_done_provenance (which runs first and would otherwise
         # reject a genuinely bad commit before the gate even sees it).
         evidence_sha = _commit_on_main(
             tmp_path, 'transient_failure_evidence.txt', '2099-01-01T00:00:00+00:00',
         )
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        with caplog.at_level(logging.WARNING, logger=_DONE_PROVENANCE_LOGGER):
             result = await interceptor.set_task_status(
                 '1',
                 'done',
@@ -4833,7 +4837,7 @@ async def test_done_provenance_deterministic_gate_persists_escalation_id(
     DeterministicRunner cites the resolving gate escalation via
     escalation_id on this kind (deterministic_runner.py, `_build_done_provenance(
     'deterministic-gate', ..., escalation_id=_gate_esc_id)`), and the
-    _validate_done_provenance docstring promises the same. The field is
+    validate_done_provenance docstring promises the same. The field is
     optional (unlike 'operational-verified', where it is required), but when
     supplied it must not be silently dropped at the persistence chokepoint —
     Stage-2 audit and any operator reading the stored blob rely on it to
@@ -4939,6 +4943,21 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
 
 
+# ── Layering of middleware/done_provenance.py (task 6236) ──
+
+
+def test_done_provenance_module_imports_without_the_interceptor():
+    """The done-provenance judgement layers below its consumer: importing it
+    in a fresh interpreter never loads task_interceptor."""
+    probe = modules_loaded_by_importing(
+        'fused_memory.middleware.done_provenance',
+        ('fused_memory.middleware.task_interceptor',),
+    )
+
+    assert Path(probe.file).resolve() == SRC / 'fused_memory' / 'middleware' / 'done_provenance.py'
+    assert probe.loaded == ()
+
+
 # ── Tests for the 'operational-verified' done_provenance kind (task 2679) ──
 #
 # Commitless kind for no-code operational tasks (2648/2650 task_kind-thrash
@@ -4951,9 +4970,7 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
 @pytest.mark.asyncio
 async def test_validate_done_provenance_accepts_operational_verified(tmp_path):
     """Direct-call: non-recon caller with escalation_id+note is accepted commitless."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
-    err, resolved = await _validate_done_provenance(
+    err, resolved = await validate_done_provenance(
         '1',
         {'kind': 'operational-verified', 'escalation_id': 'esc-123', 'note': 'restarted fused-memory'},
         str(tmp_path),
@@ -4976,9 +4993,7 @@ async def test_validate_done_provenance_accepts_operational_verified(tmp_path):
 @pytest.mark.asyncio
 async def test_validate_done_provenance_operational_verified_requires_escalation_id(tmp_path):
     """Direct-call: missing escalation_id is a structured rejection."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
-    err, resolved = await _validate_done_provenance(
+    err, resolved = await validate_done_provenance(
         '1',
         {'kind': 'operational-verified', 'note': 'restarted fused-memory'},
         str(tmp_path),
@@ -4997,9 +5012,7 @@ async def test_validate_done_provenance_operational_verified_requires_escalation
 @pytest.mark.asyncio
 async def test_validate_done_provenance_operational_verified_requires_note(tmp_path):
     """Direct-call: missing note is a structured rejection."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
-    err, resolved = await _validate_done_provenance(
+    err, resolved = await validate_done_provenance(
         '1',
         {'kind': 'operational-verified', 'escalation_id': 'esc-123'},
         str(tmp_path),
@@ -5019,9 +5032,7 @@ async def test_validate_done_provenance_operational_verified_requires_note(tmp_p
 async def test_validate_done_provenance_operational_verified_rejects_recon_stage(tmp_path):
     """Direct-call: a recon-stage caller cannot record operational-verified,
     even with both required fields present."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
-    err, resolved = await _validate_done_provenance(
+    err, resolved = await validate_done_provenance(
         '1',
         {'kind': 'operational-verified', 'escalation_id': 'esc-123', 'note': 'restarted fused-memory'},
         str(tmp_path),
@@ -5058,8 +5069,6 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
 
     from shared.task_metadata import DoneProvenance
 
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)  # backs the 'merged'/'found_on_main' commit field
 
     minimal_payloads = {
@@ -5092,7 +5101,7 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
     )
 
     for kind in declared_kinds:
-        err, resolved = await _validate_done_provenance(
+        err, resolved = await validate_done_provenance(
             '1', minimal_payloads[kind], str(tmp_path), require=True,
             # An AUTHORIZED caller (task 5241): the deterministic-* kinds are
             # accepted only from an allowlisted, non-recon-stage identity, so
@@ -5119,7 +5128,7 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
 #
 # Driven end-to-end through `interceptor.set_task_status(...)`, which is
 # where the contract is phrased: the sibling `operational-verified` recon
-# refusal is covered only by direct `_validate_done_provenance` calls, so
+# refusal is covered only by direct `validate_done_provenance` calls, so
 # nothing previously proved the bar actually holds at the MCP-facing seam.
 #
 # The identity is SELF-REPORTED (whatever `agent_id` the caller sends), so
@@ -5505,7 +5514,7 @@ class TestDeterministicProvenanceCallerBar:
 # ── Task 3455: honest git-probe rejection wording ───────────────────────
 #
 # These tests pin the refusal reason a done write gets for each failure
-# branch of the two git probes behind `_validate_done_provenance`. The
+# branch of the two git probes behind `validate_done_provenance`. The
 # authoritative contract lives in the probes' docstrings
 # (`_resolve_commit_sha`, `_verify_commit_on_main`): git-issued verdicts get
 # the assertive wording ("not found in" / "is not on main"), everything else
@@ -5518,11 +5527,11 @@ _TIMED_OUT = GitResult(124, '', 'timed out after 5.0s', timed_out=True)
 
 
 def _probe_warnings(caplog, subcommand):
-    """WARNING records the interceptor logged for an unexpected exception
-    from the git *subcommand* probe."""
+    """WARNING records the done-provenance module logged for an unexpected
+    exception from the git *subcommand* probe."""
     return [
         r for r in caplog.records
-        if r.name == 'fused_memory.middleware.task_interceptor'
+        if r.name == _DONE_PROVENANCE_LOGGER
         and r.levelno == logging.WARNING
         and f'git {subcommand} probe' in r.getMessage()
     ]
@@ -5629,7 +5638,7 @@ async def test_merge_base_residual_failures_report_unconfirmed(
     logged: git's own answer is not a fault of the probe."""
     sha = _init_git_repo(tmp_path)
 
-    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+    with caplog.at_level(logging.WARNING, logger=_DONE_PROVENANCE_LOGGER):
         reason = await _refused_merged_done_reason(
             taskmaster, reconciler, event_buffer, str(tmp_path), sha,
             ScriptedGitRunner({'merge-base': outcome}),
@@ -5740,7 +5749,7 @@ async def test_rev_parse_failure_reports_unresolved(
     exception is logged."""
     sha = _init_git_repo(tmp_path)
 
-    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+    with caplog.at_level(logging.WARNING, logger=_DONE_PROVENANCE_LOGGER):
         reason = await _refused_merged_done_reason(
             taskmaster, reconciler, event_buffer, str(tmp_path), sha,
             ScriptedGitRunner({'rev-parse': outcome}),
@@ -5792,7 +5801,7 @@ async def test_nul_commit_is_refused_as_unresolved_not_raised(
 
 # ── Tests for the server-written `stamped_at` field (task 3576) ──
 #
-# `_validate_done_provenance` is the SINGLE write site: every found_on_main
+# `validate_done_provenance` is the SINGLE write site: every found_on_main
 # producer funnels through it (the fresh-done path, the same-status repair
 # seam, agent-authored set_task_status calls, and the orchestrator's
 # Scheduler.mark_done). The field is scoped to kind='found_on_main' only —
@@ -5811,11 +5820,9 @@ def _fixed_stamp_clock() -> str:
 @pytest.mark.asyncio
 async def test_validate_done_provenance_stamps_found_on_main(tmp_path):
     """Direct-call: a valid found_on_main blob comes back carrying stamped_at."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)
 
-    err, resolved = await _validate_done_provenance(
+    err, resolved = await validate_done_provenance(
         '1',
         {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
         str(tmp_path),
@@ -5872,11 +5879,9 @@ async def test_validate_done_provenance_does_not_stamp_merged(tmp_path):
     A leak here would perturb the exact-equality merged-kind assertions
     elsewhere in this suite, which is precisely why the scoping exists.
     """
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)
 
-    err, resolved = await _validate_done_provenance(
+    err, resolved = await validate_done_provenance(
         '1',
         {'kind': 'merged', 'commit': sha},
         str(tmp_path),
@@ -5911,9 +5916,7 @@ async def test_validate_done_provenance_does_not_stamp_other_kinds(
     tmp_path, raw
 ):
     """Every non-found_on_main kind omits stamped_at."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
-    err, resolved = await _validate_done_provenance(
+    err, resolved = await validate_done_provenance(
         '1',
         raw,
         str(tmp_path),
@@ -5941,13 +5944,11 @@ async def test_validate_done_provenance_discards_caller_supplied_stamp(
     stamped_at, so a hard rejection would break every repair of a stamped
     blob. The warning keeps the override visible instead of silent.
     """
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)
     forged = '1999-01-01T00:00:00+00:00'
 
     with caplog.at_level(logging.WARNING):
-        err, resolved = await _validate_done_provenance(
+        err, resolved = await validate_done_provenance(
             '4242',
             {
                 'kind': 'found_on_main',
@@ -5978,12 +5979,10 @@ async def test_validate_done_provenance_no_stamp_warning_when_absent(
     tmp_path, caplog
 ):
     """The ordinary path (no caller-supplied stamp) stays quiet."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)
 
     with caplog.at_level(logging.WARNING):
-        err, resolved = await _validate_done_provenance(
+        err, resolved = await validate_done_provenance(
             '1',
             {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
             str(tmp_path),
