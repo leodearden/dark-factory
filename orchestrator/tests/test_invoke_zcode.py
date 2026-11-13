@@ -102,6 +102,7 @@ capture = {
     'environ': dotenv_loaded_environ(dotenv_path),
     'dotenv_path': dotenv_path,
     'cwd_realpath': os.path.realpath(cwd_argument),
+    'process_cwd': os.getcwd(),
     'home': home,
     'provider_config': snapshot(os.environ.get('ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', '')),
     'cli_config': snapshot(Path(home, '.zcode', 'cli', 'config.json')),
@@ -211,6 +212,7 @@ class TestInvokeZCode:
         assert _inline_value(argv, '--prompt') == 'do step-1'
         assert Path(_flag_value(argv, '--cwd')).parent == Path(capture['home'])
         assert Path(capture['cwd_realpath']) == worktree.resolve()
+        assert Path(capture['process_cwd']) == worktree.resolve()
         assert _flag_value(argv, '--mode') == 'yolo'
         assert _flag_value(argv, '--output-format') == 'json'
         disallowed = _flag_value(argv, '--disallowed-tools').split()
@@ -291,18 +293,21 @@ class TestInvokeZCode:
             await _invoke(worktree)
         assert not fake_zcode.capture_path.exists()
 
-    async def test_the_run_home_is_writable_inside_the_sandbox(
+    async def test_the_sandbox_is_anchored_on_the_worktree_and_admits_the_run_home(
         self, fake_zcode, worktree, monkeypatch,
     ):
         wrapped: list[dict[str, Any]] = []
 
         def record_wrap(inner_cmd, cwd, writable_modules, writable_extras=None):
-            wrapped.append({'modules': writable_modules, 'extras': list(writable_extras or [])})
+            wrapped.append({
+                'cwd': cwd, 'modules': writable_modules, 'extras': list(writable_extras or []),
+            })
             return inner_cmd
 
         monkeypatch.setattr(sandbox_dispatch, 'wrap_command', record_wrap)
         await _invoke(worktree, sandbox_modules=['orchestrator'], sandbox_extras=['/x'])
         [call] = wrapped
+        assert call['cwd'] == worktree
         assert call['modules'] == ['orchestrator']
         assert '/x' in call['extras']
         assert fake_zcode.capture()['home'] in call['extras']
