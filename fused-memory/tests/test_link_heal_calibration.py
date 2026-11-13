@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -361,6 +361,10 @@ def _failing_alpha(population) -> dict[str, Answer]:
     return {item.child_text: Verdict.EXTENDS for item in _misfiled_in(population, ALPHA)[:2]}
 
 
+#: Late on 3 November in UTC, already 4 November east of it.
+CALIBRATION_NOW = datetime(2026, 11, 4, 1, 30, tzinfo=timezone(timedelta(hours=5)))
+
+
 async def _calibrate(population, adjudicate, ledger, tmp_path, filer=None):
     return await run_calibration(
         population,
@@ -370,6 +374,7 @@ async def _calibrate(population, adjudicate, ledger, tmp_path, filer=None):
         filer=filer if filer is not None else RecordingFiler(),
         reports_dir=tmp_path / 'link-heal-reports',
         population_sha256=POPULATION_SHA,
+        now=CALIBRATION_NOW,
     )
 
 
@@ -459,7 +464,7 @@ class TestRunCalibration:
         report = await _calibrate(population, _answering(population), ledger, tmp_path)
 
         reports_dir = tmp_path / 'link-heal-reports'
-        stem = f'link-heal-calibration-{datetime.now(UTC).date().isoformat()}-{report.run_id[:8]}'
+        stem = f'link-heal-calibration-2026-11-03-{report.run_id[:8]}'
         assert report.json_path == reports_dir / f'{stem}.json'
         assert report.markdown_path == reports_dir / f'{stem}.md'
         row = ledger.latest_calibration(FAKE_ADJUDICATOR_MODEL, FAKE_PROMPT_SHA256)
@@ -469,6 +474,21 @@ class TestRunCalibration:
         for expected in (POOLED, ALPHA, BETA, GAMMA, 'misfile', 'contradiction', '0.700', 'PASSED'):
             assert expected in markdown, expected
         assert 'opus' in markdown
+
+    @pytest.mark.asyncio
+    async def test_a_naive_now_is_refused_before_any_question(self, ledger, tmp_path):
+        population = _population()
+        adjudicate = _answering(population)
+
+        with pytest.raises(ValueError, match='timezone-aware'):
+            await run_calibration(
+                population, adjudicate=adjudicate, ledger=ledger, settings=SETTINGS,
+                filer=RecordingFiler(), reports_dir=tmp_path / 'link-heal-reports',
+                population_sha256=POPULATION_SHA, now=datetime(2026, 11, 3, 12, 0),
+            )
+
+        assert adjudicate.pairs == []
+        assert ledger.recent_runs(10) == []
 
     @pytest.mark.asyncio
     async def test_a_passing_calibration_files_nothing(self, ledger, tmp_path):

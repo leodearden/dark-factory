@@ -489,12 +489,16 @@ async def run_calibration(
     filer: EscapeFiler,
     reports_dir: Path,
     population_sha256: str,
+    now: datetime,
 ) -> CalibrationReport:
     """Score *adjudicate* on *population* and record the score for its model and prompt.
 
     Every question is asked before the run row exists. A pair the adjudicator
-    gave no verdict on is unanswered: counted, never ledgered.
+    gave no verdict on is unanswered: counted, never ledgered. The report files
+    are dated by *now*'s UTC day, which must be timezone-aware.
     """
+    if now.tzinfo is None:
+        raise ValueError(f'a report is dated by a timezone-aware now; got {now.isoformat()}')
     verdicts = await adjudicate([_pair(item) for item in population])
     answered = {
         item.key: _adjudication(item, verdict, adjudicate.prompt_sha256)
@@ -517,7 +521,7 @@ async def run_calibration(
         population_sha256=population_sha256,
     )
     document = {**identity.as_json(), **result.as_json()}
-    json_path, markdown_path = _write_reports(reports_dir, identity, result, document)
+    json_path, markdown_path = _write_reports(reports_dir, now, identity, result, document)
     ledger.finish_run(run_id, counts=_run_counts(len(population), len(answered), result))
     ledger.add_calibration(
         run_id,
@@ -614,11 +618,14 @@ def _calibration_escape(
 
 def _write_reports(
     reports_dir: Path,
+    now: datetime,
     identity: _CalibrationIdentity,
     result: CalibrationResult,
     document: Mapping[str, Any],
 ) -> tuple[Path, Path]:
-    stem = f'link-heal-calibration-{datetime.now(UTC).date().isoformat()}-{identity.run_id[:8]}'
+    stem = (
+        f'link-heal-calibration-{now.astimezone(UTC).date().isoformat()}-{identity.run_id[:8]}'
+    )
     json_path = reports_dir / f'{stem}.json'
     markdown_path = reports_dir / f'{stem}.md'
     atomic_write_text(json_path, json.dumps(document, sort_keys=True, indent=2) + '\n', mkdir=True)

@@ -183,7 +183,8 @@ class LinkHealEnv:
 
     ``home_root_for`` names the server's own project: escapes file into its queue,
     and a run with no project of its own probes it. ``reports_dir_for`` is where
-    sweep and calibration reports go; ``now`` is the clock a sweep's window ends at.
+    sweep and calibration reports go; ``now`` is the clock a sweep's window ends at
+    and both kinds of report are dated by.
     """
 
     config_loader: Callable[[str | None], FusedMemoryConfig] = load_config
@@ -620,6 +621,7 @@ async def _calibrate(args: argparse.Namespace, session: _Session) -> CommandOutc
         filer=FoldedEscapeFiler(session.home_root),
         reports_dir=session.env.reports_dir_for(session.config),
         population_sha256=population_sha256,
+        now=session.env.now(),
     )
     return CommandOutcome(calibration_document(report), EXIT_OK if report.passed else EXIT_FAILED)
 
