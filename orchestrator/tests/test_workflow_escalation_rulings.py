@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from _workflow_helpers import PLAN, AgentStub, FakeBriefing, ReplanningReviewStub
+from _workflow_helpers import PLAN, AgentStub, FakeBriefing
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
@@ -32,6 +32,7 @@ from test_plan_revalidation_skip import (
     _wipe_to,
 )
 from test_reviewer_note_dispositions import TASK_ID, _assignment, _WorkflowRun
+from test_workflow_e2e import ReplanningReviewStub
 from test_workflow_prompt_builder import _PLAN_RENDERING_SITES, _TASK_ID, _render_calls
 
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject

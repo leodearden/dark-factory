@@ -11819,8 +11819,8 @@ class TaskWorkflow:
     async def _replan(self, reviews) -> None:
         """Feed review feedback back to architect for re-planning.
 
-        The architect is shown every ruling, as the reviewers whose findings it
-        answers are, whenever the plan was last confirmed.
+        The architect answers reviewer findings, which are judged against every
+        ruling, so it is shown every ruling however recently the plan was confirmed.
         """
         assert self.worktree is not None and self.artifacts is not None
         self.plan = self.artifacts.read_plan()
