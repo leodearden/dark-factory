@@ -10,7 +10,6 @@ way ``test_workflow_prompt_builder.py`` does.
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -28,14 +27,7 @@ from _workflow_helpers import (
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from test_reviewer_note_dispositions import PASSED, TASK_ID, _assignment, _run_config
-from test_workflow_prompt_builder import (
-    _PLAN_RENDERING_SITES,
-    _TASK_ID,
-    _BuiltTwice,
-    _invoke_building_twice,
-    _make_workflow,
-    _write_two_step_plan,
-)
+from test_workflow_prompt_builder import _PLAN_RENDERING_SITES, _TASK_ID, _render_calls
 
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.escalation_rulings import Ruling
@@ -266,30 +258,27 @@ _SITE_DRIVES['simple_task'] = ('build_simple_task_prompt', lambda wf: None, _sim
 async def _briefed_rulings(
     tmp_path: Path, site: str, *, finalized_at: str | None,
 ) -> tuple[str, list[list[str]]]:
-    wf = _make_workflow(tmp_path)
     queue = EscalationQueue(tmp_path / 'escalation_queue')
     ruling = _resolve_ruling(queue, _TASK_ID)
-    wf.escalation_queue = queue
-    _write_two_step_plan(wf)
-    if finalized_at is not None:
-        assert wf.artifacts is not None
-        plan = wf.artifacts.read_plan()
-        plan['_finalized_at'] = finalized_at
-        wf.artifacts.write_plan(plan)
-        wf.plan = wf.artifacts.read_plan()
-    briefing_method, arrange, drive = _SITE_DRIVES[site]
-    arrange(wf)
-    render = AsyncMock(return_value='PROMPT')
-    setattr(wf.briefing, briefing_method, render)
-    wf._invoke = _invoke_building_twice(wf, lambda _artifacts: None)  # type: ignore[method-assign]
+    briefing_method, site_arrange, drive = _SITE_DRIVES[site]
 
-    with contextlib.suppress(_BuiltTwice):
-        await drive(wf)
+    def arrange(wf: TaskWorkflow) -> None:
+        wf.escalation_queue = queue
+        if finalized_at is not None:
+            assert wf.artifacts is not None
+            plan = wf.artifacts.read_plan()
+            plan['_finalized_at'] = finalized_at
+            wf.artifacts.write_plan(plan)
+            wf.plan = wf.artifacts.read_plan()
+        site_arrange(wf)
 
-    assert render.call_args_list
-    return ruling, [
-        [r.escalation_id for r in call.kwargs['rulings']] for call in render.call_args_list
-    ]
+    calls = await _render_calls(
+        tmp_path, briefing_method=briefing_method, arrange=arrange, drive=drive,
+        between_builds=lambda _artifacts: None,
+    )
+
+    assert calls
+    return ruling, [[r.escalation_id for r in call.kwargs['rulings']] for call in calls]
 
 
 @pytest.mark.asyncio
