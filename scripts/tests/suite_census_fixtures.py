@@ -8,12 +8,18 @@ from __future__ import annotations
 
 import gzip
 import os
-import sqlite3
 import subprocess
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
+
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeSuppression,
+    FlakeVerdict,
+    record_flake_occurrence,
+)
 
 _GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "Suite Census Test",
@@ -79,24 +85,33 @@ def write_gz(path: Path, text: str) -> Path:
     return path
 
 
-def flake_db(path: Path, rows: Sequence[tuple[str, str, str]]) -> Path:
-    """A runs.db carrying a production-shaped flake_occurrence table of (observed_at, test_id, verdict)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            "CREATE TABLE flake_occurrence ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " observed_at TEXT NOT NULL, test_id TEXT NOT NULL,"
-            " project_id TEXT NOT NULL, verdict TEXT NOT NULL,"
-            " call_site TEXT NOT NULL, runner TEXT, merge_sha TEXT,"
-            " task_id TEXT, psi_cpu_some10 REAL, detail TEXT DEFAULT '{}')"
+def flake_db(
+    path: Path,
+    rows: Sequence[tuple[str, str | None, str]],
+    *,
+    call_site: FlakeCallSite = FlakeCallSite.merge_gate,
+) -> Path:
+    """Append (observed_at, test_id, verdict) rows to the runs.db at *path*.
+
+    Rows are written by the ledger's own writer at *call_site*; a None test_id is an
+    observation that named no test.
+    """
+    for observed_at, test_id, verdict in rows:
+        record_flake_occurrence(
+            path,
+            "fixture",
+            FlakeSuppression(
+                verdict=FlakeVerdict(verdict),
+                test_ids=() if test_id is None else (test_id,),
+                observed_at=observed_at,
+                call_site=call_site,
+                runner="local",
+                psi_cpu_some10=None,
+                unconfirmable_reason=None,
+            ),
+            merge_sha=None,
+            task_id=None,
         )
-        conn.executemany(
-            "INSERT INTO flake_occurrence (observed_at, test_id, project_id, verdict, call_site)"
-            " VALUES (?, ?, 'fixture', ?, 'merge_gate')",
-            rows,
-        )
-    conn.close()
     return path
 
 
@@ -138,8 +153,9 @@ def pytest_project(root: Path) -> Path:
       test_live pass 0.7 (mtime 2026-10-03T12:00:00Z);
     - pytest log (orchestrator): FAILED TestX::test_p[1], ERROR test_r, and FAILED
       TestX::test_removed (a method the file does not define);
-    - runs.db flake_occurrence: the ambiguous tests/test_a.py::test_q, '<unknown>',
-      the deleted tests/test_deleted.py::test_x, and the ambiguous
+    - runs.db flake_occurrence: the ambiguous tests/test_a.py::test_q, an observation
+      that named no test (the ledger's sentinel), the deleted
+      tests/test_deleted.py::test_x, and the ambiguous
       tests/test_a.py::TestX::test_flaky, which only orchestrator's file defines.
     """
     git_tree(root, {
@@ -190,7 +206,7 @@ def pytest_project(root: Path) -> Path:
     )
     flake_db(root / "data" / "orchestrator" / "runs.db", [
         ("2026-09-01T00:00:00+00:00", "tests/test_a.py::test_q", "passes_in_isolation"),
-        ("2026-09-02T00:00:00+00:00", "<unknown>", "unconfirmable"),
+        ("2026-09-02T00:00:00+00:00", None, "unconfirmable"),
         ("2026-09-03T00:00:00+00:00", "tests/test_deleted.py::test_x", "fails_in_isolation"),
         ("2026-09-04T00:00:00+00:00", "tests/test_a.py::TestX::test_flaky", "passes_in_isolation"),
     ])
@@ -207,7 +223,7 @@ def nextest_project(root: Path) -> Path:
       pytest-style ``PASS:`` line;
     - log 10 (remote-laptop segment): one PASS;
     - flaky-ledger.jsonl: two test_beta.sh entries and one malformed line;
-    - runs.db flake_occurrence: one '<unknown>' row.
+    - runs.db flake_occurrence: one observation that named no test (the ledger's sentinel).
     """
     git_tree(root, {
         "Cargo.toml": '[workspace]\nmembers = ["crates/*"]\n',
@@ -244,6 +260,6 @@ def nextest_project(root: Path) -> Path:
         '"task":"2","branch":"HEAD","run_id":"run-2"}\n'
     )
     flake_db(root / "data" / "orchestrator" / "runs.db", [
-        ("2026-09-07T00:00:00+00:00", "<unknown>", "unconfirmable"),
+        ("2026-09-07T00:00:00+00:00", None, "unconfirmable"),
     ])
     return root
