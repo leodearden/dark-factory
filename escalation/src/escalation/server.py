@@ -616,9 +616,21 @@ class _HistoryRead:
     """merge_status's one up-front cross-run read: the newest durable row, or that it failed."""
 
     history: _DurableHistory | None
-    failed: bool = False
+    failed: bool
 
-    def require(self) -> _DurableHistory | None:
+    def __post_init__(self) -> None:
+        if self.failed and self.history is not None:
+            raise ValueError('_HistoryRead: a failed read carries no history row')
+
+    @classmethod
+    def found(cls, history: _DurableHistory | None) -> _HistoryRead:
+        return cls(history, failed=False)
+
+    @classmethod
+    def failure(cls) -> _HistoryRead:
+        return cls(None, failed=True)
+
+    def history_or_probe_failure(self) -> _DurableHistory | None:
         """The cross-run tier's own answer: a failed read ends the walk at this tier."""
         if self.failed:
             raise _ProbeFailed(MergeStatusSource.event_store_cross_run)
@@ -5580,7 +5592,7 @@ def create_server(
 
     def _durable_history(key: _PollKey) -> _HistoryRead:
         if event_store is None:
-            return _HistoryRead(None)
+            return _HistoryRead.found(None)
         try:
             row = event_store.latest_merge_finalized(
                 request_id=key.request_id, branch=key.branch, task_id=key.task_id,
@@ -5591,19 +5603,19 @@ def create_server(
                     key.request_id, cross_run=True, fire_safe=False,
                 )
             if row is not None:
-                return _HistoryRead(_DurableHistory(row, MergeReason.prior_run_terminal))
+                return _HistoryRead.found(_DurableHistory(row, MergeReason.prior_run_terminal))
             if key.request_id is not None:
                 members = event_store.merge_finalized_superseded_by(
                     key.request_id, cross_run=True, fire_safe=False,
                 )
                 if members:
-                    return _HistoryRead(
+                    return _HistoryRead.found(
                         _DurableHistory(members[-1], MergeReason.coalesce_train_id),
                     )
-            return _HistoryRead(None)
+            return _HistoryRead.found(None)
         except Exception:
             logger.warning('merge_status: event store (cross run) read failed', exc_info=True)
-            return _HistoryRead(None, failed=True)
+            return _HistoryRead.failure()
 
     async def _walk_durable(key: _PollKey, history_read: _HistoryRead) -> MergeStatusAnswer:
         current = _current_run_answer(key)
@@ -5631,7 +5643,7 @@ def create_server(
                 MergeState.journaled, reason(MergeReason.journaled_not_live),
                 entry.request_id, fields={'enqueued_at': entry.enqueued_at},
             )
-        history = history_read.require()
+        history = history_read.history_or_probe_failure()
         if history is not None:
             return MergeStatusAnswer.epistemic(
                 MergeState.stale_record, reason(history.reason), key.request_id,

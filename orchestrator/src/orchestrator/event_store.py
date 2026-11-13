@@ -1458,7 +1458,8 @@ class EventStore:
         replacement for TerminalOutcomeRetention.record_alias
         (plans/merge-status-durable-non-landed-prd.md D6/D7).  Kept apart from
         latest_merge_finalized so a caller can tell an alias hit from a direct
-        one.  Whole-id match; same projection, run scope and fire-safe policy.
+        one.  Whole-id match; same projection, run scope and read-failure
+        policy as latest_merge_finalized.
         """
         if not request_id:
             return None
