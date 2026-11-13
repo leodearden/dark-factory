@@ -1069,7 +1069,7 @@ class TestDivergenceL0FollowsTheFilingIncarnationAlone:
             harness, 'T1', 120.0, filing_claimant_run_id=_FILER_ID,
         )
         getter = AsyncMock(return_value={'status': 'in-progress', 'metadata': stamp()})
-        harness.scheduler.get_task = getter  # type: ignore[method-assign]
+        harness.scheduler.get_task = getter
 
         assert await harness._reap_orphan_l0_escalations() == 1
         assert len(_pending_l1s(harness, 'T1')) == 1
