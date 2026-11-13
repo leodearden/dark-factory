@@ -259,6 +259,7 @@ from orchestrator.merge_lane.verify_cancellation import (
     VerifyDurationWindow,
     merge_verify_cancelled_data,
 )
+from orchestrator.merge_pool_facts import with_chain_members
 from orchestrator.merge_verify_facts import (
     BaseRelation,
     MergeVerifyDispatchFacts,
@@ -267,6 +268,7 @@ from orchestrator.merge_verify_facts import (
 )
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
+from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
@@ -5170,6 +5172,7 @@ async def build_chain(
         return ChainResult(links=[], tip=head_merge_commit)
 
     links: list[tuple[str, str]] = []
+    link_request_ids: list[str] = []
     # `tip` starts at the base so a zero-link result still names a verifiable tip.
     tip = head_merge_commit
     truncated_at: str | None = None
@@ -5241,6 +5244,7 @@ async def build_chain(
                     truncated_reason = 'merge_error'
                 break
             links.append((req.task_id, res.merge_commit))
+            link_request_ids.append(req.request_id)
             tip = res.merge_commit
     except BaseException:
         # A cancellation mid-build must not strand a pool lane in ASSIGNED
@@ -5285,7 +5289,7 @@ async def build_chain(
     return ChainResult(
         links=links, tip=tip,
         truncated_at=truncated_at, truncated_reason=truncated_reason,
-        lane=lane, lane_warm=warm,
+        lane=lane, lane_warm=warm, link_request_ids=tuple(link_request_ids),
     )
 
 
@@ -8077,6 +8081,7 @@ class SpeculativeMergeWorker:
         runner_quarantine: set[str] | None = None,
         host_holder_reader: Callable[[], Mapping[str, str]] | None = None,
         on_host_readmitted: Callable[[str], None] | None = None,
+        task_priority: TaskPriorityLookup | None = None,
     ):
         self._git_ops = git_ops
         # Task 6565: handed to every RemoteRunner this worker builds.
@@ -8605,6 +8610,7 @@ class SpeculativeMergeWorker:
                 self._merger_task, structure,
             ),
             is_reserved=self._chain_reservations.holds,
+            task_priority=task_priority,
         )
         # Persistent queue.get() future — kept alive across iterations to
         # avoid the lost-item hazard of cancelling an in-flight get().
@@ -15042,7 +15048,10 @@ class SpeculativeMergeWorker:
                         EventType.merge_dequeued,
                         task_id=req.task_id,
                         phase='merge',
-                        data={'branch': req.branch.bare_id, 'queue_depth': self._queue.qsize()},
+                        data={
+                            **self._intake.take_pick_record(req.request_id),
+                            'branch': req.branch.bare_id, 'queue_depth': self._queue.qsize(),
+                        },
                     )
                 t0 = self._clock.monotonic()
                 merge_result_local: MergeResult | None = None
@@ -17449,7 +17458,8 @@ class SpeculativeMergeWorker:
         local whatever host the head holds, and acquires no slot.
         """
         return await self._lane_post_merge_verify(
-            git_ops, req, merge_wt, dispatch_facts=_GATE_HISTORY_LEG_FACTS, **gate_kwargs,
+            git_ops, req, merge_wt,
+            dispatch_facts=with_chain_members(_GATE_HISTORY_LEG_FACTS, req, None), **gate_kwargs,
         )
 
     async def _run_inflight_verify(
@@ -17604,6 +17614,7 @@ class SpeculativeMergeWorker:
             ``None`` (default) leaves the lease to finalize.
         """
         req = item.request
+        dispatch_facts = with_chain_members(dispatch_facts, req, chain)
         # ── task 3185 (PRD γ): THE DEEP-CHAIN REDIRECT ──────────────────────
         # The two facts every path below is written against — WHAT is verified
         # and WHERE — are chosen here, once, so no downstream branch has to

@@ -136,6 +136,7 @@ from orchestrator.starvation_watchdog import (
 )
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.strict_event_reads import task_ids_with_event
+from orchestrator.task_priority import TaskPriority
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 from orchestrator.time_sources import resolve_monotonic_time_source, resolve_wall_time_source
 from orchestrator.work_product import (
@@ -7738,6 +7739,21 @@ class Scheduler:
             )
         except Exception:
             logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
+
+    def task_priority(self, task_id: str) -> TaskPriority:
+        """*task_id*'s live effective tier and pin, read from this scheduler's memory.
+
+        The tier is the one :meth:`get_state_snapshot` exports as
+        ``effective_priorities``; the pin is the override row the last tick
+        loaded. Both are unknown (None) before the first tick, the tier also
+        for a task that tick did not rank, and the pin when no override store
+        is wired. A pure dict read: never touches the override store.
+        """
+        pinned = None
+        if self._override_store is not None and self._overrides_initialized:
+            row = self._prev_overrides_snapshot.get(task_id)
+            pinned = row is not None and row.pinned
+        return TaskPriority(tier=self._last_effective_priorities.get(task_id), pinned=pinned)
 
     def get_state_snapshot(self) -> SchedulerStateSnapshot:
         """Return a frozen copy of the scheduler's current state.

@@ -217,6 +217,7 @@ from orchestrator.stranded_verified_green import (
     merge_request_marker_is_fresh,
     submit_verified_green_merge_request,
 )
+from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -1378,6 +1379,7 @@ class TaskWorkflow:
         prompt_store: PromptArtifactStore | None = None,
         resume_outcome_sink: ResumeOutcomeSink | None = None,
         task_verify: TaskVerifyPort | None = None,
+        task_priority: TaskPriorityLookup | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -1407,6 +1409,9 @@ class TaskWorkflow:
         # TaskVerifyDispatcher); None keeps the module-level
         # run_scoped_verification, resolved at call time.
         self._task_verify = task_verify
+        # Task 9908: the scheduler's tier/pin lookup, recorded on merge_queued;
+        # None leaves those keys null.
+        self._task_priority = task_priority
 
         self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
@@ -2043,6 +2048,7 @@ class TaskWorkflow:
         # coalescing after the train merge starts executing.
         await register_and_enqueue_merge_request(
             self.merge_queue, req, self.event_store, self.merge_inflight_registry,
+            task_priority=self._task_priority,
         )
 
         # W9-θ: a cancel-win now raises WorkflowCancelled('soft') instead of
@@ -12732,6 +12738,7 @@ class TaskWorkflow:
         if not attached:
             _acquired = await register_and_enqueue_merge_request(
                 self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
+                task_priority=self._task_priority,
             )
 
         # task 2753: the request is now on the durable, crash-safe merge journal
@@ -19782,6 +19789,7 @@ def build_workflow(
     run_id: str | None = None,
     resume_outcome_sink: ResumeOutcomeSink | None = None,
     task_verify: TaskVerifyPort | None = None,
+    task_priority: TaskPriorityLookup | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
 
@@ -19818,4 +19826,5 @@ def build_workflow(
         run_id=run_id,
         resume_outcome_sink=resume_outcome_sink,
         task_verify=task_verify,
+        task_priority=task_priority,
     )

@@ -35,6 +35,13 @@ from orchestrator.merge_lane.types import (
     TerminalOutcomeRetention,
     _InFlightEntry,
 )
+from orchestrator.merge_pool_facts import queued_request_fields
+from orchestrator.task_priority import (
+    UNKNOWN_PRIORITY,
+    TaskPriority,
+    TaskPriorityLookup,
+    read_task_priority,
+)
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -62,6 +69,7 @@ def _emit_merge_queued(
     queue_depth: int | None = None,
     position: int | None = None,
     source: str | None = None,
+    priority: TaskPriority = UNKNOWN_PRIORITY,
 ) -> None:
     """Emit a merge_queued event.  No-op when *event_store* is None.
 
@@ -79,11 +87,13 @@ def _emit_merge_queued(
     (stranding-remediation-scheduler-ergonomics-prd.md leaf α §6α) —
     distinguishing reaper submissions from workflow/MCP ones.  Each key is
     omitted when None so the shape remains backward-compatible with existing
-    consumers.
+    consumers.  The keys of
+    ``orchestrator/src/orchestrator/merge_pool_facts.py::queued_request_fields``
+    are always present, null when unknown; *priority* supplies their tier and pin.
     """
     if event_store is None:
         return
-    data: dict = {'branch': req.branch.bare_id}
+    data: dict = {'branch': req.branch.bare_id, **queued_request_fields(req, priority)}
     if reason is not None:
         data['reason'] = reason
     if queue_depth is not None:
@@ -108,6 +118,7 @@ async def enqueue_merge_request(
     retention: TerminalOutcomeRetention | None = None,
     source: str | None = None,
     registry: InFlightMergeRegistry | None = None,
+    task_priority: TaskPriorityLookup | None = None,
 ) -> None:
     """Enqueue a MergeRequest and emit a merge_queued event.
 
@@ -229,7 +240,10 @@ async def enqueue_merge_request(
 
     req.result.add_done_callback(_on_finalized)
     await queue.put(req)
-    _emit_merge_queued(event_store, req, queue_depth=queue.qsize(), source=source)
+    _emit_merge_queued(
+        event_store, req, queue_depth=queue.qsize(), source=source,
+        priority=read_task_priority(task_priority, req.task_id),
+    )
 
 
 async def _enqueue_holding_slot(
@@ -238,6 +252,7 @@ async def _enqueue_holding_slot(
     event_store: EventStore | None,
     registry: InFlightMergeRegistry | None,
     retention: TerminalOutcomeRetention | None,
+    task_priority: TaskPriorityLookup | None = None,
 ) -> None:
     """Enqueue *req* through :func:`enqueue_merge_request`, guarding its slot.
 
@@ -251,6 +266,7 @@ async def _enqueue_holding_slot(
     try:
         await enqueue_merge_request(
             queue, req, event_store, retention=retention, registry=registry,
+            task_priority=task_priority,
         )
     except BaseException:
         if holds_slot and registry is not None:
@@ -264,6 +280,7 @@ async def register_and_enqueue_merge_request(
     registry: InFlightMergeRegistry | None,
     *,
     retention: TerminalOutcomeRetention | None = None,
+    task_priority: TaskPriorityLookup | None = None,
 ) -> bool:
     """Workflow-path enqueue that registers the branch in the in-flight registry.
 
@@ -296,7 +313,7 @@ async def register_and_enqueue_merge_request(
         if registry is not None
         else False
     )
-    await _enqueue_holding_slot(queue, req, event_store, registry, retention)
+    await _enqueue_holding_slot(queue, req, event_store, registry, retention, task_priority)
     return acquired
 
 

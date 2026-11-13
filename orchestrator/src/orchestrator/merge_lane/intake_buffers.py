@@ -27,7 +27,9 @@ from orchestrator.merge_lane.types import (
     MergeRequest,
     SpeculativeItem,
 )
+from orchestrator.merge_pool_facts import PickRecords, first_enqueued_at
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
+from orchestrator.task_priority import TaskPriorityLookup
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -186,8 +188,7 @@ def _aging_key(req: MergeRequest) -> tuple[float, str]:
     clique-minimal item within a footprint clique — the buffered item whose
     footprint-clique peers all have an equal-or-larger aging key.
     """
-    ts = req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
-    return (ts, req.request_id)
+    return (first_enqueued_at(req), req.request_id)
 
 
 def answers_to(req: MergeRequest, request_id: str | None, task_id: str | None) -> bool:
@@ -227,6 +228,7 @@ class MergeIntake:
         retire_item: Callable[[str], None],
         assert_merger_owns: Callable[[str], None],
         is_reserved: Callable[[str], bool],
+        task_priority: TaskPriorityLookup | None = None,
     ) -> None:
         self._queue = queue
         self._is_reserved = is_reserved
@@ -271,6 +273,10 @@ class MergeIntake:
             retire_item=retire_item,
             is_reserved=is_reserved,
         )
+        self._pick_records = PickRecords(
+            lanes=lanes, is_reserved=is_reserved, is_lane_halted=halt.is_lane_halted,
+            task_priority=task_priority,
+        )
 
     # ── reads ──────────────────────────────────────────────────────────────
 
@@ -291,6 +297,10 @@ class MergeIntake:
     def pending_redispatch(self) -> tuple[SpeculativeItem, ...]:
         """The parked redispatch items, in the order they will be dispatched."""
         return tuple(self._redispatch)
+
+    def take_pick_record(self, request_id: str) -> dict[str, object]:
+        """What the buffers held when *request_id* was last picked, once; empty if unrecorded."""
+        return self._pick_records.take(request_id)
 
     @property
     def has_pending_redispatch(self) -> bool:
@@ -621,6 +631,7 @@ class MergeIntake:
                 picked.request_id, ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING,
                 live_obj=picked,
             )
+            self._pick_records.record(picked, lane, self._lane_buffers, self._suffix_tracker.graph)
             return picked
         return None
 

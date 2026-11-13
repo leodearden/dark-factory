@@ -1526,6 +1526,8 @@ class ChainResult:
     lane: Path | None = None
     lane_warm: bool = False
     build_ms: int | None = None
+    link_request_ids: tuple[str, ...] = ()
+    """The ``request_id`` of each link, parallel to ``links``."""
 
     @property
     def depth(self) -> int:

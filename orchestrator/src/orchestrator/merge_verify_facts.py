@@ -46,17 +46,40 @@ class BaseRelation(StrEnum):
 
 
 @dataclasses.dataclass(frozen=True)
+class ChainMembers:
+    """The requests one verify covers, as built: the dispatching one, then its chain links."""
+
+    request_ids: tuple[str, ...]
+    task_ids: tuple[str, ...]
+
+    def event_fields(self) -> dict[str, list[str]]:
+        return {
+            'chain_request_ids': list(self.request_ids),
+            'chain_task_ids': list(self.task_ids),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class MergeVerifyDispatchFacts:
-    """The allocation decision and base a single verify dispatch ran under."""
+    """The allocation decision and base a single verify dispatch ran under,
+    and the requests it covers.
+
+    The two ``chain_*`` keys are written only when *members* is known.
+    """
 
     runner_reason: RunnerReason | None = None
     base_relation: BaseRelation | None = None
+    members: ChainMembers | None = None
 
-    def event_fields(self) -> dict[str, str | None]:
+    def event_fields(self) -> dict[str, object]:
         return {
             'runner_reason': _wire(self.runner_reason),
             'base_relation': _wire(self.base_relation),
+            **_member_fields(self.members),
         }
+
+    def covering(self, members: ChainMembers) -> MergeVerifyDispatchFacts:
+        return dataclasses.replace(self, members=members)
 
     def as_retry(self) -> MergeVerifyDispatchFacts:
         return dataclasses.replace(self, runner_reason=RunnerReason.RETRY_HELD_HOST)
@@ -68,6 +91,10 @@ class MergeVerifyDispatchFacts:
 
 def _wire(member: StrEnum | None) -> str | None:
     return None if member is None else member.value
+
+
+def _member_fields(members: ChainMembers | None) -> dict[str, list[str]]:
+    return {} if members is None else members.event_fields()
 
 
 def classify_base_relation(
