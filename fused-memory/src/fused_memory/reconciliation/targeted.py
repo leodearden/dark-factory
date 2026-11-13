@@ -51,9 +51,6 @@ from fused_memory.utils.task_dependency_ids import task_dependency_ids
 from fused_memory.utils.validation import InputValidationError, require_project_root
 
 if TYPE_CHECKING:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
@@ -63,8 +60,8 @@ EscalationQueueFactory = Callable[[Path], 'EscalationQueue']
 # `escalation` is an optional workspace package. When it is absent the default
 # factory is None and every escalation path degrades to its logged no-op or veto.
 try:
-    from escalation.models import Escalation  # type: ignore[import-untyped,no-redef]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     _INSTALLED_ESCALATION_QUEUE_FACTORY: EscalationQueueFactory | None = EscalationQueue
 except ImportError:  # pragma: no cover — exercised only in minimal envs
     _INSTALLED_ESCALATION_QUEUE_FACTORY = None
