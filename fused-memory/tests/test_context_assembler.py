@@ -1392,6 +1392,21 @@ class TestAFailedContextFetchIsRecorded:
         assert len(result.context_items) == 1
 
     @pytest.mark.asyncio
+    async def test_a_huge_error_body_is_clipped_before_it_reaches_the_prompt(
+        self, mock_memory, mock_taskmaster,
+    ):
+        mock_taskmaster.get_task = AsyncMock(
+            side_effect=RuntimeError('stderr: ' + 'x' * 50_000),
+        )
+        assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+
+        result = await assembler.assemble([self._task_event()], _make_watermark(), 'test-project')
+
+        [failure] = result.context_fetch_failures
+        assert failure.error.startswith('RuntimeError: stderr: ')
+        assert len(failure.error) < 500
+
+    @pytest.mark.asyncio
     async def test_a_raising_memory_search_is_recorded(self, mock_memory):
         mock_memory.search = AsyncMock(side_effect=RuntimeError('search failed'))
         event = _make_event(payload={'content_preview': 'something'})

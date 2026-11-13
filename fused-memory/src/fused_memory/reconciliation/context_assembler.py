@@ -59,6 +59,10 @@ _HINT_JOURNAL_SOURCE = 'reconciliation_hint'
 _TASK_DESC_CHARS = 4_000
 _MEMORY_BODY_CHARS = 2_000
 
+#: Cap on a failed fetch's error text, which Stage 1 reads verbatim: a handler
+#: exception can carry a whole JSON or stderr body.
+_FETCH_ERROR_CHARS = 300
+
 
 def estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 chars per token for mixed English/JSON."""
@@ -166,14 +170,12 @@ class ContextAssembler:
             for event, ctx_result in zip(batch, batch_contexts, strict=True):
                 fetch_failure = None
                 if isinstance(ctx_result, Exception):
-                    logger.warning(
-                        f'Context fetch failed for event {event.id}: '
-                        f'{type(ctx_result).__name__}: {ctx_result}'
-                    )
+                    error = f'{type(ctx_result).__name__}: {ctx_result}'
+                    logger.warning(f'Context fetch failed for event {event.id}: {error}')
                     fetch_failure = ContextFetchFailure(
                         event_id=event.id,
                         event_type=event.type.value,
-                        error=f'{type(ctx_result).__name__}: {ctx_result}',
+                        error=elide_text(error, _FETCH_ERROR_CHARS, field='error').text,
                     )
                     ctx_result = []
 
