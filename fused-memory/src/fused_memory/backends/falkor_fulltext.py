@@ -211,18 +211,18 @@ def build_query(
 class EdgeFulltextQueries:
     """The edge BM25 leg's two RediSearch queries; ``''`` means "no query".
 
-    ``union`` OR-joins every searchable term and ranks the leg.  ``identifiers``
-    intersects the identifier terms and selects the edges the leg promotes.
-    There is never an identifier tier without a union.
+    ``union`` OR-joins every searchable term and ranks the leg.  ``intersection``
+    AND-joins the identifier terms and selects the edges the leg promotes.
+    There is never an intersection without a union.
     """
 
     union: str
-    identifiers: str
+    intersection: str
 
     def __post_init__(self) -> None:
-        if self.identifiers and not self.union:
+        if self.intersection and not self.union:
             raise ValueError(
-                f'identifier tier {self.identifiers!r} without a union query'
+                f'identifier intersection {self.intersection!r} without a union query'
             )
 
 
@@ -239,7 +239,9 @@ def build_edge_queries(
     (``plans/edge-bm25-leg-ranking-9542/README.md``).
     """
     union = build_query(sanitized_text, group_ids, max_query_length)
-    identifiers = [t for t in searchable_terms(sanitized_text) if is_identifier_term(t)]
-    if not union or not identifiers:
-        return EdgeFulltextQueries(union=union, identifiers='')
-    return EdgeFulltextQueries(union=union, identifiers='(' + ' '.join(identifiers) + ')')
+    identifier_terms = [t for t in searchable_terms(sanitized_text) if is_identifier_term(t)]
+    if not union or not identifier_terms:
+        return EdgeFulltextQueries(union=union, intersection='')
+    return EdgeFulltextQueries(
+        union=union, intersection='(' + ' '.join(identifier_terms) + ')'
+    )

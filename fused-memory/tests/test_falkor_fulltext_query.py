@@ -679,7 +679,7 @@ class TestBuildEdgeQueries:
         assert build_edge_queries('note _ alpha', None, 128).union == ' (note | alpha)'
 
     @pytest.mark.parametrize(
-        ('text', 'identifiers'),
+        ('text', 'intersection'),
         [
             ('task 877 context and related decisions', '(877)'),
             ('why are graphiti edges 3ef4c09f and 912e58e8 orphaned', '(3ef4c09f 912e58e8)'),
@@ -688,20 +688,20 @@ class TestBuildEdgeQueries:
         ],
     )
     def test_identifiers_intersect_the_digit_bearing_terms_in_query_order(
-        self, text: str, identifiers: str
+        self, text: str, intersection: str
     ) -> None:
-        assert build_edge_queries(text, ['g'], 128).identifiers == identifiers
+        assert build_edge_queries(text, ['g'], 128).intersection == intersection
 
     def test_no_searchable_term_gives_no_queries(self) -> None:
         assert build_edge_queries('the and of', ['g'], 128) == EdgeFulltextQueries(
-            union='', identifiers=''
+            union='', intersection=''
         )
 
     def test_63_terms_survive_the_length_guard_with_one_group(self) -> None:
         queries = build_edge_queries(' '.join(f'w{i}' for i in range(63)), ['g'], 128)
         assert queries.union != ''
-        assert queries.identifiers != ''
+        assert queries.intersection != ''
 
     def test_the_identifier_tier_dies_with_an_over_length_union(self) -> None:
         queries = build_edge_queries(' '.join(f'w{i}' for i in range(64)), ['g'], 128)
-        assert queries == EdgeFulltextQueries(union='', identifiers='')
+        assert queries == EdgeFulltextQueries(union='', intersection='')

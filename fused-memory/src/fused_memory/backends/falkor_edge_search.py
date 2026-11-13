@@ -101,8 +101,8 @@ def _bfs_reached_nodes(depth: int, filter_queries: list[str]) -> str:
 
 
 async def _promoted_uuids(
-    driver: Any,
-    identifiers: str,
+    driver: GraphDriver,
+    intersection: str,
     filter_queries: list[str],
     limit: int,
     params: dict[str, Any],
@@ -115,7 +115,7 @@ async def _promoted_uuids(
     ``limit + 1`` rows are read so an overflowing tier is told apart from one
     that fits.
     """
-    if identifiers == '':
+    if intersection == '':
         return []
     fulltext_hits = get_relationships_query(
         'edge_name_and_fact', limit=limit, provider=driver.provider
@@ -126,7 +126,7 @@ async def _promoted_uuids(
             [*filter_queries, ACTIVE_EDGE_PREDICATE],
         )
         + ' RETURN e.uuid AS uuid LIMIT $tier_cap',
-        query=identifiers,
+        query=intersection,
         tier_cap=limit + 1,
         routing_='r',
         **params,
@@ -171,7 +171,7 @@ class FalkorEdgeSearch(SearchInterface):
             filter_params['group_ids'] = group_ids
 
         promoted_uuids = await _promoted_uuids(
-            driver, queries.identifiers, filter_queries, limit, filter_params
+            driver, queries.intersection, filter_queries, limit, filter_params
         )
         fulltext_hits = get_relationships_query(
             'edge_name_and_fact', limit=limit, provider=driver.provider
