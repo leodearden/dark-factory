@@ -7365,7 +7365,7 @@ async def _branches_matching(git_ops: GitOps, pattern: str) -> str:
 
 
 async def _checked_out_ref(worktree: Path) -> str:
-    rc, ref, err = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=worktree)
+    rc, ref, err = await _run(['git', 'rev-parse', '--symbolic-full-name', 'HEAD'], cwd=worktree)
     assert rc == 0, err
     return ref.strip()
 

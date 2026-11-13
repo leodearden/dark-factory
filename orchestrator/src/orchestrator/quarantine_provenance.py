@@ -141,26 +141,25 @@ def record_quarantine_provenance(worktree: Path, task_id: str, outcome: Quaranti
     """
     if outcome.dest is None:
         return
+    parking = outcome.dest
     try:
         artifacts = TaskArtifacts.for_task(worktree, task_id)
     except Exception:
-        _log_unrecorded('the task artifacts', worktree, task_id, outcome.dest)
+        logger.warning(_UNRECORDED, 'the task artifacts', worktree, task_id, parking, exc_info=True)
         return
     try:
-        snapshot_into_parking(artifacts, outcome.dest)
+        snapshot_into_parking(artifacts, parking)
     except Exception:
-        _log_unrecorded('the artifact snapshot', worktree, task_id, outcome.dest)
+        logger.warning(_UNRECORDED, 'the artifact snapshot', worktree, task_id, parking, exc_info=True)
     try:
-        stamp_quarantined_from(artifacts, _stamp_for(outcome, outcome.dest, reason))
+        stamp_quarantined_from(artifacts, _stamp_for(outcome, parking, reason))
     except Exception:
-        _log_unrecorded(f'the {QUARANTINED_FROM_KEY} stamp', worktree, task_id, outcome.dest)
+        logger.warning(
+            _UNRECORDED, f'the {QUARANTINED_FROM_KEY} stamp', worktree, task_id, parking, exc_info=True,
+        )
 
 
-def _log_unrecorded(record: str, worktree: Path, task_id: str, parking: Path) -> None:
-    logger.warning(
-        'quarantine provenance: could not record %s for the parking of %s (task %s) at %s',
-        record, worktree, task_id, parking, exc_info=True,
-    )
+_UNRECORDED = 'quarantine provenance: could not record %s for the parking of %s (task %s) at %s'
 
 
 def _stamp_for(outcome: QuarantineOutcome, parking: Path, reason: str) -> dict[str, Any]:
