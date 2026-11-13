@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
+from _graph_access_fake import FakeGraphAccess
 
 from fused_memory.backends.falkor_indices import vector_drop_statement
 from fused_memory.backends.graphiti_client import (
@@ -1410,19 +1411,17 @@ class TestNodeCount:
     @pytest.mark.asyncio
     async def test_returns_count(self, mock_config, make_backend, make_graph_mock):
         """Returns the integer count from result_set[0][0]."""
-        backend = make_backend(mock_config)
         graph = make_graph_mock([[42]])
-        with patch.object(backend, '_graph_for', return_value=graph):
-            result = await backend.node_count('my_graph')
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({'my_graph': graph}))
+        result = await backend.node_count('my_graph')
         assert result == 42
 
     @pytest.mark.asyncio
     async def test_returns_zero_when_empty(self, mock_config, make_backend, make_graph_mock):
         """Returns 0 when result_set is empty."""
-        backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        with patch.object(backend, '_graph_for', return_value=graph):
-            result = await backend.node_count('empty_graph')
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({'empty_graph': graph}))
+        result = await backend.node_count('empty_graph')
         assert result == 0
 
     @pytest.mark.asyncio
@@ -1443,21 +1442,22 @@ class TestNodeCount:
     @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """node_count uses ro_query (read-only path) and never calls graph.query."""
-        backend = make_backend(mock_config)
         graph = make_graph_mock([[7]])
-        with patch.object(backend, '_graph_for', return_value=graph):
-            await backend.node_count('test_graph')
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({'test_graph': graph}))
+        await backend.node_count('test_graph')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_delegates_to_graph_for(self, mock_config, make_backend, make_graph_mock):
-        """node_count delegates graph resolution to _graph_for, not _require_driver._get_graph."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock([[42]])
-        with patch.object(backend, '_graph_for', return_value=graph) as mock_graph_for:
-            result = await backend.node_count('my_graph')
-        mock_graph_for.assert_called_once_with('my_graph')
+    async def test_resolves_its_graph_through_graph_access(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The count comes from the injected provider's graph for exactly the name given."""
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({
+            'my_graph': make_graph_mock([[42]]),
+            'other_graph': make_graph_mock([[9]]),
+        }))
+        result = await backend.node_count('my_graph')
         assert result == 42
 
 

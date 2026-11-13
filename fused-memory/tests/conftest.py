@@ -613,13 +613,18 @@ def make_backend():
     make_backend_over_fake_graphiti.
 
     ``driver=`` replaces the default MagicMock driver; make_graph_driver builds one.
+    ``graph_access=`` injects the provider every raw Cypher call resolves its
+    graph through; ``_graph_access_fake.FakeGraphAccess`` is the test one.
     For a real driver and spec'd sub-clients, use make_wired_backend.
     """
-    def _factory(config, *, registered_graph_ids=(), driver=None) -> GraphitiBackend:
+    def _factory(
+        config, *, registered_graph_ids=(), driver=None, graph_access=None,
+    ) -> GraphitiBackend:
         backend = GraphitiBackend.with_driver(
             config,
             MagicMock() if driver is None else driver,
             registered_graph_ids=registered_graph_ids,
+            graph_access=graph_access,
         )
         backend.client = MagicMock()
         return backend

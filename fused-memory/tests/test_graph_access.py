@@ -14,6 +14,7 @@ from typing import TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _graph_access_fake import HangingRawGraph, wait_forever
 from _import_closure import SRC, modules_loaded_by_importing
 
 from fused_memory.backends import paged_read
@@ -32,23 +33,6 @@ _WRITE_S = 0.08
 
 _PAGE_TEMPLATE = 'MATCH (n:Entity) RETURN n.uuid ORDER BY n.uuid SKIP {skip} LIMIT {limit}'
 _CENSUS = 'MATCH (n:Entity) RETURN count(*)'
-
-
-async def _wait_forever(*_args, **_kwargs) -> None:
-    await asyncio.Event().wait()
-
-
-class HangingRawGraph:
-    """A raw falkordb-shaped graph whose every call waits forever."""
-
-    def query(self, *args):
-        return _wait_forever(*args)
-
-    def ro_query(self, *args):
-        return _wait_forever(*args)
-
-    def execute_command(self, *args):
-        return _wait_forever(*args)
 
 
 async def _guarded(awaitable: Awaitable[_T]) -> _T:
@@ -165,7 +149,7 @@ class TestFalkorGraphAccess:
     @pytest.mark.asyncio
     async def test_a_hanging_list_graphs_overruns_the_read_budget(self, make_graph_driver):
         driver = make_graph_driver({})
-        driver.client.list_graphs = AsyncMock(side_effect=_wait_forever)
+        driver.client.list_graphs = AsyncMock(side_effect=wait_forever)
 
         with pytest.raises(TimeoutError) as raised:
             await _guarded(self._access(driver).list_graphs())
