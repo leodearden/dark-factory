@@ -1,4 +1,4 @@
-"""The serial-recovery re-run keeps the governing addopts it used to blank (task 5079).
+"""Serial re-runs keep the governing config (task 5079, task 6650).
 
 ``verify.py::_serial_pytest_str`` forces a pytest command serial with
 ``-p no:xdist -o addopts=<value>``. ``-o addopts=`` REPLACES the ini addopts
@@ -13,8 +13,11 @@ command from the real module configs, never restated.
 Two halves. The DRIFT GUARD runs against the real repo: the resolver agrees
 with pytest's own config discovery for every module command, scoped and
 unscoped, and the rewrite drops nothing but xdist. The WIRING tests drive
-each serial-recovery call site against a real tmp tree and check it passes
-the directory its command runs in, so none is left on the blanking default.
+each serial re-run call site against a real tmp tree and check it passes the
+directory its command runs in. The recovery site must not fall back to the
+blanking default, and the confirm sites must find the config's xdist and so
+take ``verify.py::_serial_confirm_pytest_str``'s ``-n 0`` form, which keeps
+the config whole.
 """
 
 from __future__ import annotations
@@ -33,6 +36,8 @@ from _serial_recovery_helpers import (
     ROOT_SHAPED_ADDOPTS,
     ROOT_SHAPED_PYPROJECT,
     addopts_values,
+    effective_worker_count,
+    pyproject_with_addopts,
     xdist_offenders,
 )
 from _verify_config_corpus import DF_CONFIG_PATH, REPO_ROOT, load_config_scalar
@@ -198,6 +203,23 @@ class TestSerialRecoveryPreservesTheGoverningAddopts:
         ]
         assert not empty, f'these resolved to the historical blank: {empty}'
 
+    def test_a_scoped_confirm_pins_zero_workers_exactly_where_xdist_is_configured(self):
+        wrong = {}
+        for label, command in _command_shapes():
+            if not label.endswith('(scoped)'):
+                continue
+            confirmed = verify._serial_confirm_pytest_str(command, invocation_dir=REPO_ROOT)
+            assert confirmed is not None
+            tokens = shlex.split(confirmed)
+            inipath = _pytest_own_inipath(command)
+            assert inipath is not None, label
+            if xdist_offenders(_real_addopts(inipath)) or xdist_offenders(shlex.split(command)):
+                if effective_worker_count(tokens) != '0' or 'no:xdist' in tokens:
+                    wrong[label] = confirmed
+            elif confirmed != _recover(command):
+                wrong[label] = confirmed
+        assert not wrong, f'confirm form disagrees with the real config: {wrong}'
+
     def test_the_fleet_raw_chain_stays_the_documented_blank(self):
         """Each ``cd X &&`` clause reads its own config, but one suffix serves them all."""
         fleet = load_config_scalar(DF_CONFIG_PATH, 'test_command')
@@ -279,6 +301,13 @@ def _assert_carries_sub_config(command: str) -> None:
     assert sum(token.startswith('addopts=') for token in tokens) == 1, command
 
 
+def _assert_pins_zero_workers(command: str) -> None:
+    tokens = shlex.split(command)
+    assert effective_worker_count(tokens) == '0', command
+    assert 'no:xdist' not in tokens, command
+    assert addopts_values(tokens) == [], command
+
+
 def _failing_on_the_sub_node() -> VerifyResult:
     return _failing(f'FAILED {_SUB_NODE_ID}\n1 failed, 10 passed in 1.00s\n')
 
@@ -330,17 +359,30 @@ class TestEnvTransientRecoveryWiring:
 
 
 class TestScopedConfirmSitesWiring:
-    """The sweep prefilter, main-tip confirm and flake engine each resolve the scoped command's config."""
+    """The sweep prefilter, main-tip confirm and flake engine each resolve the scoped command's config.
 
-    def test_the_sweep_prefilter(self, tmp_path):
-        worktree = _write_tree(tmp_path, _TREE_LAYOUT)
+    ``sub``'s config runs xdist, so a site that resolved it pins zero workers;
+    one that resolved no config would fall back to ``-p no:xdist``.
+    """
+
+    @staticmethod
+    def _sweep_prefilter_command(worktree: Path) -> str:
         rv = AsyncMock(return_value=_result(True))
         with patch.object(verify, 'run_verification', rv):
             asyncio.run(verify._sweep_failure_reproduces_in_isolation(
                 worktree, _make_config(worktree), _failing_on_the_sub_node(),
             ))
         rv.assert_awaited_once()
-        _assert_carries_sub_config(rv.call_args.args[2].test_command)
+        return rv.call_args.args[2].test_command
+
+    def test_the_sweep_prefilter(self, tmp_path):
+        worktree = _write_tree(tmp_path, _TREE_LAYOUT)
+        _assert_pins_zero_workers(self._sweep_prefilter_command(worktree))
+
+    def test_the_sweep_prefilter_keeps_the_recovery_form_where_no_xdist_is_configured(self, tmp_path):
+        layout = {**_TREE_LAYOUT, 'sub/pyproject.toml': pyproject_with_addopts(('-m', 'not warm_lane_bash'))}
+        worktree = _write_tree(tmp_path, layout)
+        _assert_carries_sub_config(self._sweep_prefilter_command(worktree))
 
     def test_the_main_tip_confirm(self, tmp_path):
         config = _make_config(tmp_path)
@@ -353,7 +395,7 @@ class TestScopedConfirmSitesWiring:
                 config, _make_git_ops(tmp_path), _failing_on_the_sub_node(), main_sha=MAIN_SHA,
             ))
         rv.assert_awaited_once()
-        _assert_carries_sub_config(rv.call_args.args[2].test_command)
+        _assert_pins_zero_workers(rv.call_args.args[2].test_command)
 
     def test_the_merge_flake_engine(self, tmp_path):
         worktree = _write_tree(tmp_path, _TREE_LAYOUT)
@@ -365,7 +407,7 @@ class TestScopedConfirmSitesWiring:
             ))
         rv.assert_awaited_once()
         command = rv.call_args.args[2].test_command
-        _assert_carries_sub_config(command)
+        _assert_pins_zero_workers(command)
         tokens = shlex.split(command)
-        addopts_at = next(i for i, token in enumerate(tokens) if token.startswith('addopts='))
-        assert tokens[addopts_at + 1] == '--timeout', command
+        zero_at = max(i for i, pair in enumerate(zip(tokens, tokens[1:], strict=False)) if pair == ('-n', '0'))
+        assert tokens[zero_at + 2] == '--timeout', command
