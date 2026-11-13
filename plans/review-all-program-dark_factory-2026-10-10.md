@@ -1034,7 +1034,7 @@ Wave 3 owns six invariants, INV-18 to INV-23 in landing order (§Design invarian
 - The wave-3 clerk pass over the eleven returns' `lead_actions` ran on 2026-11-13 (`clerk/clerk-w3-{A,B,C,D}.json`:
   224 actions applied, 19 skipped, 1 kept for the lead, 4 rejected because they would write gate 6698; S16's 24
   same-region edges were found already present). Still open from it, each when the task's branch lands or is
-  dropped (`digests/lead-pending-filings.md`): the amends to 5258, 6254, 8143, 8262, 7008, 3678 and 4875 and the
+  dropped (`plans/review-all-program-dark_factory-2026-10-10.owed-followups.md`, each owned by a "Review-all follow-up" gate task, 9924–9932): the amends to 5258, 6254, 8143, 8262, 7008, 3678 and 4875 and the
   notes to 4809 and 3498 (each task carries unmerged commits); whether to cancel 5912 and 5700 (unmerged real
   work); the key stamp on 6695 (in-progress) after it lands; the S13 cancel of 6843, kept for the lead's call.
   The moves scan (`clerk/moves-scan-w3.json`) repointed four delivered checks (3825, 8143, 9748, 9790; commit
