@@ -18,9 +18,26 @@ clears, and every report carries it.
 The detector is consumed through its stdout contract only, never imported,
 so a report can also be rebuilt from saved plan files (``--plan``) with no
 store access.
+
+Exit status: 0 when every report was written; 1 when a report could not be
+written or a previous report read, or a detector run failed (the report is
+still written, listing it under ``failed_categories``); 2 for bad input or
+config.
+
+Usage
+-----
+  # Scheduled run (what the timer does): every configured project.
+  python fused-memory/scripts/duplicate_cluster_report.py
+
+  # Rebuild one project's report from saved plans, with no store access.
+  python fused-memory/scripts/duplicate_cluster_report.py --project-id dark_factory \\
+      --plan plan-a.json --plan plan-b.json --run-stamp 20260811T120000Z
 """
 from __future__ import annotations
 
+import json
+import logging
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,10 +47,25 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from shared.memory_eval_metrics import stamp_datetime
+from shared.cli_boundary import LoudArgumentParser, run_cli
+from shared.memory_eval_metrics import MetricSchemaError, run_stamp, stamp_datetime, validate_stamp
+from shared.safe_io import atomic_write_text
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'config' / 'duplicate-audit.yaml'
+DEFAULT_OUT_ROOT = REPO_ROOT / 'fused-memory' / 'data' / 'duplicate-cluster-reports'
+
+EXIT_OK = 0
+EXIT_RUN_FAILED = 1
+"""The run did not finish cleanly: a report could not be written, a previous
+report could not be read, or a detector run failed (that project's report is
+still written and lists it). Agrees with shared.cli_boundary.EXIT_STDOUT_FAILED."""
+EXIT_BAD_INPUT = 2
+"""Bad invocation or declaration: a config error, a malformed --run-stamp, an
+unreadable or non-JSON --plan file, two plans for one category, --plan without
+--project-id, or an unconfigured --project-id. Agrees with argparse's own 2."""
+
+logger = logging.getLogger('duplicate_cluster_report')
 
 
 class DuplicateAuditConfigError(ValueError):
@@ -226,11 +258,13 @@ def build_report(
     *,
     config: DuplicateAuditConfig,
     previous: Mapping[str, Any] | None = None,
+    failed_categories: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Assemble one project's report from its per-category detector plans.
 
     With *previous* (that project's prior report) the report is also diffed
-    against it; see ``diff_against_previous``.
+    against it; see ``diff_against_previous``. *failed_categories* names the
+    categories whose detector run produced no plan.
     """
     bare_plans = [plan for _source, plan in plans]
     inventory = {
@@ -253,6 +287,7 @@ def build_report(
         'retained_carveout': _summed_retained_carveout(bare_plans),
         'child_rankings': merge_child_counts(bare_plans),
         'child_counts_known': all('child_counts' in plan for plan in bare_plans),
+        'failed_categories': [dict(f) for f in failed_categories],
     }
     return {**inventory, **diff_against_previous(inventory, previous, config=config)}
 
@@ -604,3 +639,239 @@ def diff_against_previous(
             **_regrowth_totals(clusters, elapsed_days),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Artifacts: <out_root>/<project_id>/{plan,report,summary}-<STAMP>.*
+# ---------------------------------------------------------------------------
+
+_REPORT_PREFIX = 'report-'
+_REPORT_SUFFIX = '.json'
+_TOP_REGROWTH_CLUSTERS = 10
+
+
+def report_path(out_root: Path, project_id: str, stamp: str) -> Path:
+    return Path(out_root) / project_id / f'{_REPORT_PREFIX}{stamp}{_REPORT_SUFFIX}'
+
+
+def summary_path(out_root: Path, project_id: str, stamp: str) -> Path:
+    return Path(out_root) / project_id / f'summary-{stamp}.txt'
+
+
+def _fitness_line(caveat: Mapping[str, Any]) -> str:
+    fitness = caveat['fitness']
+    return (
+        f"regrowth measurement: {fitness['regrowth_measurement']}; "
+        f"gate filing: {fitness['gate_filing']} (task {caveat['gate_filing_owner_task']})"
+    )
+
+
+def _previous_line(regrowth: Mapping[str, Any]) -> str:
+    if regrowth['previous_run_stamp'] is None:
+        return 'previous report: none (baseline)'
+    overdue = ' -- OVERDUE' if regrowth['previous_overdue'] else ''
+    return (f"previous report: {regrowth['previous_run_stamp']} "
+            f"({regrowth['elapsed_days']:.1f} days earlier){overdue}")
+
+
+def _regrowth_line(regrowth: Mapping[str, Any]) -> str:
+    rate = regrowth['rate_per_day']
+    per_day = f'{rate:.3f}/day' if rate is not None else 'no rate'
+    return (
+        f"regrowth: appeared {regrowth['appeared']}, grew {regrowth['grew']}, "
+        f"shrank {regrowth['shrank']}, unchanged {regrowth['unchanged']}, "
+        f"split {regrowth['split']}, dissolved {len(regrowth['dissolved'])}; "
+        f"re-emitted members {regrowth['re_emitted_members']} ({per_day})"
+    )
+
+
+def _category_lines(report: Mapping[str, Any]) -> list[str]:
+    lines = ['categories:']
+    for name, entry in report['categories'].items():
+        count = sum(1 for c in report['clusters'] if c['category'] == name)
+        reasons = entry['incomparable_reasons']
+        verdict = 'incomparable: ' + ', '.join(reasons) if reasons else 'comparable'
+        lines.append(f"  {name}: {count} cluster{'' if count == 1 else 's'}; {verdict}")
+    return lines
+
+
+def _top_regrowth_lines(clusters: Sequence[Mapping[str, Any]]) -> list[str]:
+    grown = sorted(
+        (c for c in clusters if c['lineage']['added_member_ids']),
+        key=lambda c: (-len(c['lineage']['added_member_ids']), c['cluster_key']),
+    )[:_TOP_REGROWTH_CLUSTERS]
+    lines = ['top regrowth clusters (by added members):']
+    for c in grown:
+        lineage = c['lineage']
+        lines.append(
+            f"  {c['cluster_key']} [{c['category']}] {lineage['status']}: size {c['size']}, "
+            f"+{len(lineage['added_member_ids'])} added "
+            f"({lineage['added_by_age'][MemberAge.RE_EMITTED.value]} re-emitted)"
+        )
+    return lines if grown else [*lines, '  none']
+
+
+def _failure_lines(failed: Sequence[Mapping[str, Any]]) -> list[str]:
+    lines = ['failed categories:']
+    lines += [f"  {f['category']}: {f['error_type']} (exit {f['exit_code']})" for f in failed]
+    return lines if failed else [*lines, '  none']
+
+
+def render_summary(report: Mapping[str, Any]) -> str:
+    """The human-readable digest of *report*; the JSON report is the record."""
+    regrowth = report['regrowth']
+    lines = [
+        f"duplicate-cluster report: {report['project_id']} @ {report['run_stamp']}",
+        f"authoritative: false; {_fitness_line(report['recall_caveat'])}",
+        _previous_line(regrowth),
+        _regrowth_line(regrowth),
+        *_category_lines(report),
+        *_top_regrowth_lines(report['clusters']),
+        *_failure_lines(report['failed_categories']),
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def write_report(
+    out_root: Path, project_id: str, stamp: str, report: Mapping[str, Any],
+) -> tuple[Path, Path]:
+    """Write the JSON report and its summary atomically; return both paths."""
+    json_path = report_path(out_root, project_id, stamp)
+    text_path = summary_path(out_root, project_id, stamp)
+    atomic_write_text(json_path, json.dumps(report, indent=2, sort_keys=True) + '\n', mkdir=True)
+    atomic_write_text(text_path, render_summary(report), mkdir=True)
+    return json_path, text_path
+
+
+def _report_stamp(path: Path) -> str | None:
+    stamp = path.name[len(_REPORT_PREFIX):-len(_REPORT_SUFFIX)]
+    try:
+        return validate_stamp(stamp, what='report stamp')
+    except MetricSchemaError:
+        return None
+
+
+def find_previous_report(
+    out_root: Path, project_id: str, before_stamp: str,
+) -> tuple[str, dict[str, Any]] | None:
+    """The project's latest report stamped strictly before *before_stamp*, or None."""
+    directory = Path(out_root) / project_id
+    if not directory.is_dir():
+        return None
+    stamped = (
+        (stamp, path)
+        for path in directory.glob(f'{_REPORT_PREFIX}*{_REPORT_SUFFIX}')
+        if (stamp := _report_stamp(path)) is not None and stamp < before_stamp
+    )
+    for stamp, path in sorted(stamped, reverse=True):
+        prior = json.loads(path.read_text(encoding='utf-8'))
+        if prior.get('project_id') == project_id:
+            return stamp, prior
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The CLI shell
+# ---------------------------------------------------------------------------
+
+class PlanInputError(ValueError):
+    """A --plan file could not be read as a JSON plan object."""
+
+
+class PreviousReportError(RuntimeError):
+    """The project's previous report exists but could not be read."""
+
+
+def _load_plans(paths: Sequence[str]) -> list[LabelledPlan]:
+    plans: list[LabelledPlan] = []
+    for path in paths:
+        try:
+            plan = json.loads(Path(path).read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            raise PlanInputError(f'cannot read plan {path}: {exc}') from exc
+        if not isinstance(plan, dict):
+            raise PlanInputError(f'plan {path} is not a JSON object')
+        plans.append((str(path), plan))
+    return plans
+
+
+def _report_for(
+    project_id: str, stamp: str, plans: Sequence[LabelledPlan], *, config: DuplicateAuditConfig,
+    out_root: Path, failed: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    try:
+        previous = find_previous_report(out_root, project_id, stamp)
+    except (OSError, ValueError) as exc:
+        raise PreviousReportError(f'cannot read the previous report for {project_id}: {exc}') from exc
+    return build_report(
+        project_id, stamp, plans, config=config,
+        previous=previous[1] if previous is not None else None, failed_categories=failed,
+    )
+
+
+def _publish(out_root: Path, project_id: str, stamp: str, report: Mapping[str, Any]) -> int:
+    """Write *report*, then print its summary. A write failure is converted here,
+    so ``run_cli``'s OSError arm only ever means stdout
+    (shared/src/shared/cli_boundary.py::run_cli)."""
+    try:
+        json_path, _summary = write_report(out_root, project_id, stamp, report)
+    except OSError as exc:
+        logger.error('ABORT: cannot write the report for %s under %s: %s', project_id, out_root, exc)
+        return EXIT_RUN_FAILED
+    logger.info('wrote %s', json_path)
+    print(render_summary(report), end='')
+    return EXIT_OK
+
+
+def _run_plan_mode(args: Any, config: DuplicateAuditConfig, stamp: str) -> int:
+    if not args.project_id:
+        logger.error('--plan needs --project-id: a report belongs to one project')
+        return EXIT_BAD_INPUT
+    try:
+        plans = _load_plans(args.plan)
+        built = _report_for(args.project_id, stamp, plans, config=config, out_root=args.out_root)
+    except (PlanInputError, DuplicatePlanCategoryError) as exc:
+        logger.error('%s', exc)
+        return EXIT_BAD_INPUT
+    except PreviousReportError as exc:
+        logger.error('ABORT: %s', exc)
+        return EXIT_RUN_FAILED
+    return _publish(args.out_root, args.project_id, stamp, built)
+
+
+def _build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(
+        description='Build the duplicate-cluster report and diff it against the previous one.',
+    )
+    parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG_PATH,
+                        help='duplicate-audit config (default: %(default)s)')
+    parser.add_argument('--out-root', dest='out_root', type=Path, default=DEFAULT_OUT_ROOT,
+                        help='artifact root; one directory per project (default: %(default)s)')
+    parser.add_argument('--project-id', dest='project_id', default=None,
+                        help='restrict the run to this project (required with --plan)')
+    parser.add_argument('--plan', action='append', default=[],
+                        help='build from this saved detector plan instead of running the '
+                             'detector; repeat once per category')
+    parser.add_argument('--run-stamp', dest='run_stamp', default=None,
+                        help='run stamp, YYYYMMDDTHHMMSSZ (default: now)')
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    args = _build_parser().parse_args(argv)
+    try:
+        config = load_config(args.config)
+        stamp = (validate_stamp(args.run_stamp, what='--run-stamp')
+                 if args.run_stamp is not None else run_stamp())
+    except (DuplicateAuditConfigError, MetricSchemaError) as exc:
+        logger.error('%s', exc)
+        return EXIT_BAD_INPUT
+    if not args.plan:
+        logger.error('no --plan given: the scheduled mode is not wired yet')
+        return EXIT_BAD_INPUT
+    return _run_plan_mode(args, config, stamp)
+
+
+if __name__ == '__main__':
+    sys.exit(run_cli(main))
