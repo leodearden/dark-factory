@@ -255,7 +255,12 @@ class TestAlarmVerifyBaseDivergence:
         self, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
         divergence = _divergence(config)
-        db = build_synthetic_runs_db(tmp_path, [{'task_id': divergence.task_id, 'review_cycles': 1}])
+        db = build_synthetic_runs_db(tmp_path, [{
+            'task_id': divergence.task_id,
+            'review_cycles': 1,
+            'outcome': 'done',
+            'verify_attempts': 1,
+        }])
         events = EventStore(db, run_id='run-test')
 
         alarm_verify_base_divergence(RecordingEscalations(), divergence, event_store=events)
