@@ -1400,7 +1400,7 @@ async def _invoke_zcode(
         operator_home=operator_home, worktree=cwd,
     ) as home:
         cmd, env = _sandbox_spawn(
-            zcode_argv(prompt, cwd, disallowed_tools),
+            zcode_argv(prompt, home, disallowed_tools),
             zcode_spawn_env(base_env, home),
             cwd, sandbox_modules, [*(sandbox_extras or []), str(home.root)],
         )

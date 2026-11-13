@@ -157,9 +157,11 @@ def zcode_spawn_env(base_env: Mapping[str, str], home: ZCodeRunHome) -> dict[str
     }
 
 
-def zcode_argv(prompt: str, cwd: Path, disallowed_tools: Iterable[str] | None) -> list[str]:
+def zcode_argv(
+    prompt: str, home: ZCodeRunHome, disallowed_tools: Iterable[str] | None,
+) -> list[str]:
     return [
-        'zcode', _prompt_argument(prompt), '--cwd', str(cwd), '--mode', 'yolo',
+        'zcode', _prompt_argument(prompt), '--cwd', str(home.workspace), '--mode', 'yolo',
         '--output-format', 'json', '--no-color',
         '--disallowed-tools', ' '.join(_disallowed_tool_names(disallowed_tools)),
     ]
