@@ -56,6 +56,7 @@ from fused_memory.maintenance.link_heal_executor import (
 from fused_memory.maintenance.link_heal_ledger import (
     LEDGER_FILENAME,
     LOCK_FILENAME,
+    ActionState,
     LinkHealLedger,
     RunLock,
     RunRow,
@@ -155,6 +156,14 @@ class Workspace:
         ledger = LinkHealLedger(self.ledger_path)
         try:
             return len(ledger.adjudication_verdicts({run_id}))
+        finally:
+            ledger.close()
+
+    def action_states(self, run_id: str) -> list[ActionState]:
+        """The states of the heals plan run *run_id* staged, oldest first."""
+        ledger = LinkHealLedger(self.ledger_path)
+        try:
+            return [row.state for row in ledger.run_actions(run_id)]
         finally:
             ledger.close()
 
@@ -1386,6 +1395,59 @@ class TestTheSweepThroughApplyAndStatus:
         lines = status_lines(capsys)
         assert report['plan_run_id'][:8] in latest_plan_line(lines, RunSource.SWEEP)
         assert 'sweep  writes no' in run_line(lines, report['plan_run_id'])
+
+
+class TestApplySweepNeedsWrites:
+    @pytest.mark.asyncio
+    async def test_apply_sweep_is_refused_while_writes_are_off(self, harness, workspace, capsys):
+        workspace.write_config(link_heal={'writes': False})
+        seed_sightings_created(harness, range(100, 102))
+        env = sweep_env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        await sweep(env, workspace, capsys, '--dry-run', '--project', DF)
+        assert workspace.pending(RunSource.SWEEP) == 2
+
+        code = await run_cli(env, workspace, 'apply', '--sweep')
+
+        assert code == 2
+        assert 'link_heal.writes' in capsys.readouterr().err
+        assert [run for run in workspace.runs() if run.writes] == []
+        assert harness.mem0.write_count == 0
+        assert workspace.pending(RunSource.SWEEP) == 2
+
+    @pytest.mark.asyncio
+    async def test_apply_sweep_withholds_heals_of_an_uncalibrated_adjudicator(
+        self, harness, workspace, capsys,
+    ):
+        workspace.write_config(link_heal={'writes': True})
+        seed_sightings_created(harness, range(100, 102))
+        env = sweep_env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        _code, planned = await sweep(env, workspace, capsys, '--dry-run', '--project', DF)
+
+        code, applied = await apply(env, workspace, capsys, '--sweep')
+
+        assert code == 0
+        assert harness.mem0.write_count == 0
+        assert workspace.action_states(planned['plan_run_id']) == [
+            ActionState.WITHHELD_UNCALIBRATED, ActionState.WITHHELD_UNCALIBRATED,
+        ]
+        assert workspace.pending(RunSource.SWEEP) == 0
+        assert applied['counts']['withheld_uncalibrated'] == 2
+        assert applied['counts']['applied'] == 0
+
+    @pytest.mark.asyncio
+    async def test_the_writes_leaf_does_not_govern_an_attended_adjudicator_apply(
+        self, harness, workspace, capsys,
+    ):
+        workspace.write_config(link_heal={'writes': False})
+        seed_unrated_sightings(harness, 1)
+        env = env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        await plan_adjudicated(env, workspace, capsys, '--project', DF)
+
+        code, applied = await apply(env, workspace, capsys, '--from-adjudicator')
+
+        assert code == 0
+        assert applied['counts']['applied'] == 1
+        assert harness.mem0.write_count == 1
 
 
 class TestTheNewCommandsHoldTheLock:
