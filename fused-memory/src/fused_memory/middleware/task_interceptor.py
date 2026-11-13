@@ -7,14 +7,13 @@ import json
 import logging
 import os
 import uuid as uuid_mod
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, get_args
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
-from pydantic import ValidationError
 from shared import process_identity
 from shared.declared_scope import (
     DECLARED_SCOPE_METADATA_KEY,
@@ -30,8 +29,10 @@ from shared.followup_items import (
     task_items,
     with_derived_bundle_keys,
 )
+from shared.git_async import run_git
 from shared.mcp_envelope import write_failure_reason
-from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
+from shared.pure_gate_provenance import PureGateTrigger, pure_gate_stamped
+from shared.task_metadata import DoneProvenance
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
@@ -93,10 +94,13 @@ from fused_memory.middleware.curator_zot_duplicate_sweep import (
     sweep_zot_duplicate,
 )
 from fused_memory.middleware.deferral_gate import StatusWriteScope
-from fused_memory.middleware.done_provenance_authz import (
-    DETERMINISTIC_CALLER_ERROR_TYPE,
-    DETERMINISTIC_PROVENANCE_KINDS,
-    resolve_deterministic_provenance_authorization,
+from fused_memory.middleware.done_provenance import (
+    GitProbeRunner,
+    StaleEvidenceMode,
+    check_reopen_freshness,
+    provenance_kind,
+    provenance_stamp_now,
+    validate_done_provenance,
 )
 from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.middleware.live_task_write_guard import (
@@ -108,12 +112,14 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
-
-# NOTE: safe top-level import — operational_routing_guard has NO top-level
-# task_interceptor import (it lazily imports TaskInterceptor inside its
-# function to break the cycle), so this does not create a circular import.
+from fused_memory.middleware.metadata_dict import (
+    extract_metadata_dict,
+    fresh_metadata_copy,
+    raw_metadata_dict,
+)
 from fused_memory.middleware.operational_routing_guard import (
     inject_operational_routing,
+    pure_gate_routing_notice,
 )
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
@@ -195,22 +201,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not resolve any dict at all.
-# Only these are loud from the read-path parsers below; 'unknown_key' /
-# 'invalid_field' / 'invalid_submodel' etc. are expected on legitimate
-# curator-internal metadata (files_to_modify, spawned_from, spawn_context)
-# and belong to the write boundary (W3-β's _emit_schema_warning census),
-# not these read-path helpers — emitting them here would flood the
-# `task_metadata.schema_warning` census that θ2's enforce-flip gate greps
-# for zero lines against schema-clean metadata.
-_METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
-
 # The escalation-gate stamp, named once so the writers stay greppably
 # coupled. WRITERS: ``operational_routing_guard.inject_operational_routing``
 # (the declared execution_class='operational'|'decision' boundary coercion)
-# and ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
-# route_deterministic fallback), which between them set every key below.
+# and ``shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`` (via the
+# curator's route_deterministic fallback), which between them set every key below.
 #
 # NOT a reader-coupling: ``TaskInterceptor._is_gate_metadata`` (task 3446)
 # does NOT consult this constant — its gate predicate is deliberately
@@ -235,28 +230,6 @@ class _CombineRewrite(TypedDict):
     details: str
 
 
-def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
-    """Resolve *metadata* by ``shared.task_metadata_wire.coerce_task_metadata``.
-
-    Returns ``(dict, [])`` for absent metadata (a fresh ``{}``) and for
-    readable metadata, and ``(None, warnings)`` for present-but-unreadable
-    metadata. *warnings* then carries
-    ``shared.task_metadata.parse_metadata``'s diagnosis (``direction='read'``);
-    its ``unparseable_json`` / ``not_an_object`` codes cover every value
-    ``coerce_task_metadata`` rejects, so the list is never empty.
-
-    ``parse_metadata`` runs only on that failure path, for its diagnosis.
-    The returned dict is never ``parse_metadata(...).model_dump()``, so
-    unknown/curator-internal keys round-trip byte-for-value (I1) instead of
-    gaining ``TaskMetadata``'s typed-field defaults.
-    """
-    meta = coerce_task_metadata(metadata)
-    if meta is not None:
-        return meta, []
-    _, warnings = parse_metadata(metadata, direction='read')
-    return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-
-
 def _has_branch_base_sha(metadata: Any) -> bool:
     """True when *metadata* records a non-blank ``branch_base_sha``.
 
@@ -264,20 +237,9 @@ def _has_branch_base_sha(metadata: Any) -> bool:
     (``orchestrator/src/orchestrator/workflow.py``), so the task already owns a branch.
     Absent, non-dict or unparseable metadata answers False without emitting a schema warning.
     """
-    meta, _warnings = _parse_metadata_value(metadata)
+    meta = coerce_task_metadata(metadata)
     sha = (meta or {}).get('branch_base_sha')
     return isinstance(sha, str) and sha.strip() != ''
-
-
-def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
-    """Emit the ``task_metadata.schema_warning`` census line for a whole-metadata discard."""
-    reason = '; '.join(w.message for w in warnings) or 'unrecognised shape'
-    logger.warning(
-        'task_metadata.schema_warning source=%s error=%s (type=%s); metadata discarded',
-        source,
-        reason,
-        type(metadata).__name__,
-    )
 
 
 def _journal_param_clip(value: Any, *, limit: int = 200) -> Any:
@@ -309,9 +271,9 @@ def _resolve_backend_label(taskmaster: Any) -> str:
     return 'unknown'
 
 
-# Terminal statuses the server refuses to exit without a reopen_reason.
-# Re-exported from shared.task_statuses (PRD task-status-authority C1/C2) —
-# the single source of truth, imported above as TERMINAL_STATUSES.
+# Terminal statuses the server refuses to exit without a reopen_reason:
+# shared.task_statuses.TERMINAL (PRD task-status-authority C1/C2), the single
+# source of truth, imported above as TERMINAL_STATUSES.
 #
 # 'merge-deferred' is deliberately NOT in this set — a property of
 # shared.TERMINAL, not this module. It is a non-terminal holding state for
@@ -378,37 +340,8 @@ def _claimant_exception_entry(
     }
 
 
-def _is_ticket_id(value: object) -> bool:
-    """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
-    return isinstance(value, str) and value.startswith('tkt_')
-
-
 class TicketStoreNotConfiguredError(RuntimeError):
     """Raised by a read that needs the ticket store when the interceptor has none."""
-
-
-def _looks_like_task_id(value: object) -> bool:
-    """Return True when *value* parses as a non-negative integer task id.
-
-    Accepts ``int`` directly, plus numeric strings (with surrounding whitespace
-    trimmed). Rejects empty strings, negatives, and non-numeric strings.
-
-    Used by ``resolve_ticket`` to short-circuit when a caller passes a numeric
-    task id that came back from ``submit_task(planning_mode=True)`` — the
-    planning-mode path returns the id synchronously, so the two-step
-    submit/resolve dance does not apply, but agents may still call it blindly.
-    """
-    if isinstance(value, bool):
-        # bool is a subclass of int in Python; reject explicitly.
-        return False
-    if isinstance(value, int):
-        return value >= 0
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return False
-        return stripped.isdigit()
-    return False
 
 
 @dataclasses.dataclass
@@ -684,8 +617,15 @@ class TaskInterceptor:
         path_scope_adjudicator: 'PathScopeAdjudicator | None' = None,
         curator: TaskCurator | None = None,
         proc_root: Path = process_identity.PROC_ROOT,
+        git_runner: GitProbeRunner = run_git,
+        provenance_stamp_clock: Callable[[], str] = provenance_stamp_now,
     ):
         self.taskmaster = taskmaster
+        # Runs the done-provenance git probes (see
+        # middleware/done_provenance.py::GitProbeRunner).
+        self._git_runner = git_runner
+        # Writes done_provenance.stamped_at for a found_on_main close.
+        self._provenance_stamp_clock = provenance_stamp_clock
         # Where the deferral gate reads a held_by_session holder's /proc entries.
         self._proc_root = proc_root
         self.reconciler = targeted_reconciler
@@ -986,7 +926,10 @@ class TaskInterceptor:
         scroll = self._consolidation_scroll
         if scroll is None:
             return None
-        meta = self._extract_metadata_dict(before.get('metadata') if isinstance(before, dict) else None)
+        meta = extract_metadata_dict(
+            before.get('metadata') if isinstance(before, dict) else None,
+            source='TaskInterceptor._consolidation_closure_error',
+        )
         if not meta or meta.get('operational_mode') != 'gate':
             return None
         block = meta.get(GATE_METADATA_KEY)
@@ -1724,7 +1667,7 @@ class TaskInterceptor:
             }
             _journal_agent_id = 'task-interceptor'
             if status == 'done':
-                _journal_params['done_provenance_kind'] = _provenance_kind(done_provenance)
+                _journal_params['done_provenance_kind'] = provenance_kind(done_provenance)
                 _journal_agent_id = agent_id
 
             stored_metadata = before.get('metadata') if isinstance(before, dict) else None
@@ -1764,6 +1707,8 @@ class TaskInterceptor:
                         is_recon_stage=is_recon_stage_write,
                         agent_id=agent_id,
                         config=self._config,
+                        git_runner=self._git_runner,
+                        stamp_clock=self._provenance_stamp_clock,
                     )
                     # This seam had NO journal row at all before 5241: a
                     # repair of an already-`done` task was invisible to the
@@ -1877,7 +1822,7 @@ class TaskInterceptor:
             # non-workflow callers (no provenance / a commitless kind)
             # preserves the original gate behaviour.
             if status == 'done':
-                validation_err, resolved_provenance = await _validate_done_provenance(
+                validation_err, resolved_provenance = await validate_done_provenance(
                     task_id,
                     done_provenance,
                     project_root,
@@ -1885,6 +1830,8 @@ class TaskInterceptor:
                     is_recon_stage=is_recon_stage_write,
                     agent_id=agent_id,
                     config=self._config,
+                    git_runner=self._git_runner,
+                    stamp_clock=self._provenance_stamp_clock,
                 )
                 if validation_err is not None:
                     # Task 5241: the done-provenance VERDICT is journaled with
@@ -1916,15 +1863,16 @@ class TaskInterceptor:
                 # before audit_fields['done_provenance'] is set below, so an
                 # accepted stale_evidence_override (S6) mutates
                 # resolved_provenance in time to be persisted.
-                _reopen_freshness_err = await _check_reopen_freshness(
+                _reopen_freshness_err = await check_reopen_freshness(
                     task_id,
-                    resolved_provenance,
-                    done_provenance,
-                    before,
-                    project_root,
-                    agent_id,
-                    is_recon_stage_write,
-                    self._reject_stale_done_evidence_mode(),
+                    resolved_provenance=resolved_provenance,
+                    raw_done_provenance=done_provenance,
+                    before=before,
+                    project_root=project_root,
+                    agent_id=agent_id,
+                    is_recon_stage=is_recon_stage_write,
+                    mode=self._reject_stale_done_evidence_mode(),
+                    git_runner=self._git_runner,
                 )
                 if _reopen_freshness_err is not None:
                     return _reopen_freshness_err
@@ -2548,17 +2496,11 @@ class TaskInterceptor:
         callers such as :meth:`_extract_meta_files` and
         :meth:`_build_candidate` can read keys without additional guarding.
 
-        The absent/readable/unreadable rule is
-        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
-        :func:`_parse_metadata_value`. Unreadable metadata emits a
-        ``task_metadata.schema_warning`` WARNING before collapsing to ``{}``
-        — I4: this replaces a silent ``{}`` coercion.
+        Resolved by ``fused_memory/middleware/metadata_dict.py::raw_metadata_dict``,
+        so unreadable metadata emits a ``task_metadata.schema_warning`` WARNING
+        before collapsing to ``{}`` — I4: this replaces a silent ``{}`` coercion.
         """
-        metadata = kwargs.get('metadata')
-        parsed, warnings = _parse_metadata_value(metadata)
-        if warnings:
-            _warn_metadata_discard('TaskInterceptor._parse_metadata', metadata, warnings)
-        return parsed if parsed is not None else {}
+        return raw_metadata_dict(kwargs.get('metadata'), source='TaskInterceptor._parse_metadata')
 
     @staticmethod
     def _extract_meta_files_from_meta(meta: dict) -> list[str]:
@@ -3613,8 +3555,10 @@ class TaskInterceptor:
             return None
 
         target_metadata = target.get('metadata')
-        target_meta, _target_warnings = _parse_metadata_value(target_metadata)
-        candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
+        target_meta = coerce_task_metadata(target_metadata)
+        candidate_meta = (
+            extract_metadata_dict(candidate_metadata, source='TaskInterceptor._execute_combine') or {}
+        )
         audit_context, items_after = _combine_fold(
             decision,
             ticket_id=ticket_id,
@@ -3917,47 +3861,10 @@ class TaskInterceptor:
         return lock
 
     @staticmethod
-    def _extract_metadata_dict(metadata) -> dict | None:
-        """Resolve ``metadata`` to ``{}`` (absent: None / ``''``), a dict, or None.
-
-        None means present-but-unreadable, and in that case the
-        ``task_metadata.schema_warning`` census WARNING has already been
-        emitted — I4: this replaces a silent ``None`` coercion. The rule is
-        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
-        :func:`_parse_metadata_value`.
-        """
-        parsed, warnings = _parse_metadata_value(metadata)
-        if warnings:
-            _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
-        return parsed
-
-    @staticmethod
-    def _fresh_metadata_copy(metadata: Any, site: str) -> dict:
-        """Return a mutable dict resolved from *metadata* by :meth:`_extract_metadata_dict`.
-
-        Absent metadata gives a fresh ``{}``, and a readable dict is
-        shallow-copied, so the caller's dict is never mutated. Unreadable
-        metadata is DISCARDED for a fresh ``{}``. On top of the census line
-        :meth:`_extract_metadata_dict` already emitted, a second WARNING
-        prefixed with *site* is logged: two log lines for one failure, so the
-        discard can be grepped by caller.
-        """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            logger.warning(
-                '%s: non-dict metadata discarded (type=%s); using fresh dict. Original value: %r',
-                site,
-                type(metadata).__name__,
-                metadata,
-            )
-            return {}
-        return dict(meta)
-
-    @staticmethod
     def _is_gate_metadata(metadata: Any) -> bool:
         """True when *metadata* declares an escalation gate (task 3446).
 
-        Normalises through :meth:`_extract_metadata_dict` so a JSON-string
+        Normalises through ``metadata_dict.py::extract_metadata_dict`` so a JSON-string
         blob, a dict, and ``None`` are all handled by the one shared shape
         policy — never a hand-rolled ``json.loads``. Unparseable or non-dict
         metadata answers False (ungated): the shape WARNING is already emitted
@@ -3972,7 +3879,7 @@ class TaskInterceptor:
         intent. Reading the same keys loosely here would let a task the guard
         considers ungated be treated as gated (and vice versa).
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        meta = extract_metadata_dict(metadata, source='TaskInterceptor._is_gate_metadata')
         if not meta:
             return False
         return (
@@ -3985,7 +3892,7 @@ class TaskInterceptor:
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
         """Return a metadata dict with ``routing_override_reason`` set to *reason*.
 
-        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
+        Builds on ``metadata_dict.py::fresh_metadata_copy`` to normalise the incoming
         shape (absent or unreadable → fresh dict) before writing the key, so
         the result is always a plain dict ready for JSON serialisation.
 
@@ -3997,31 +3904,8 @@ class TaskInterceptor:
         the ticket blob, so enabling an override would otherwise silently
         change behaviour for such inputs.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'routing-override')
+        meta = fresh_metadata_copy(metadata, site='routing-override')
         meta['routing_override_reason'] = reason
-        return meta
-
-    @staticmethod
-    def _inject_deterministic_pure_gate(metadata: Any) -> dict:
-        """Return a metadata dict stamped as a deterministic PURE-GATE.
-
-        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
-        shape (absent or unreadable → fresh dict) before writing the keys, so
-        the result is always a plain dict ready for JSON serialisation —
-        mirrors :meth:`_inject_routing_override`.
-
-        Unconditionally sets ``task_kind='deterministic'`` and
-        ``always_escalates=True``, and DELETES any ``before_done`` key so the
-        result always satisfies the pure-gate invariant enforced by
-        :func:`deterministic_task_guard.deterministic_task_error` — a
-        deterministic task with no action must always escalate, never be an
-        ill-formed no-op. This holds regardless of what task_kind/before_done
-        the recon LLM originally supplied in metadata.
-        """
-        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
-        meta['task_kind'] = 'deterministic'
-        meta['always_escalates'] = True
-        meta.pop('before_done', None)
         return meta
 
     @staticmethod
@@ -4035,7 +3919,7 @@ class TaskInterceptor:
 
         Task 2206: the PROSE-ADVISORY counterpart to :meth:`_inject_routing_override`
         — normalises the existing ``kwargs['metadata']`` (via
-        :meth:`_fresh_metadata_copy`: absent or unreadable → fresh dict,
+        ``metadata_dict.py::fresh_metadata_copy``: absent or unreadable → fresh dict,
         unreadable input discarded with a WARNING, same as the override path)
         into a plain dict, sets ``possible_scope_mismatch``, and writes the
         result back into ``kwargs['metadata']`` in place.
@@ -4061,9 +3945,7 @@ class TaskInterceptor:
         added — so a second marker key would be silently un-clearable there,
         and would force every consumer to read two keys where one suffices.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(
-            kwargs.get('metadata'), 'scope-mismatch-advisory'
-        )
+        meta = fresh_metadata_copy(kwargs.get('metadata'), site='scope-mismatch-advisory')
         meta['possible_scope_mismatch'] = {
             'matched_paths': list(verdict.matched_paths),
             'suggested_project': verdict.suggested_project,
@@ -4080,7 +3962,7 @@ class TaskInterceptor:
         the task's own branch is legitimately empty because the deliverable
         lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
         :meth:`_attach_possible_scope_mismatch`'s in-place metadata
-        normalisation (via :meth:`_fresh_metadata_copy`: absent or unreadable
+        normalisation (via ``metadata_dict.py::fresh_metadata_copy``: absent or unreadable
         → fresh dict, unreadable input discarded with a WARNING) and, like
         it, runs inside :meth:`_path_guard_or_skip` BEFORE
         ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
@@ -4091,7 +3973,7 @@ class TaskInterceptor:
         ``OutcomeKind.plan_files_cross_repo`` instead of flagging 'files not
         touched'.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(kwargs.get('metadata'), 'cross-repo-marker')
+        meta = fresh_metadata_copy(kwargs.get('metadata'), site='cross-repo-marker')
         meta['cross_repo'] = True
         meta['cross_repo_project'] = owner
         kwargs['metadata'] = meta
@@ -4108,7 +3990,7 @@ class TaskInterceptor:
         *lookup* is the batch's, None without a backend. A lookup that raised falls through to
         CREATE with every item, logged here.
         """
-        meta = self._extract_metadata_dict(metadata)
+        meta = extract_metadata_dict(metadata, source='TaskInterceptor._check_escalation_idempotency')
         if not meta or lookup is None:
             return R4Verdict()
         try:
@@ -4234,22 +4116,29 @@ class TaskInterceptor:
         # tools.py). Idempotent, so for MCP-tool callers — where tools.py has
         # already coerced before delegating — re-running here is a no-op; the
         # twin's real job is the direct caller. Distinct from
-        # _dispatch_ticket_decision's _inject_deterministic_pure_gate call
+        # _dispatch_ticket_decision's pure_gate_stamped call
         # (the curator's untagged-substring route_deterministic fallback),
         # which is a different mechanism, not this declared-tag coercion.
+        # The routing notice is derived here so it is right whichever layer
+        # (tools.py or this twin) converted; the curator's route_deterministic
+        # converts after this response is built, so it never carries one.
         metadata = inject_operational_routing(metadata)
+        routing_notice = pure_gate_routing_notice(metadata)
         attribution = CreationAttribution.from_submission(metadata, agent_id)
         metadata = _with_declared_scope_stamp(metadata, kwargs)
 
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:
-            return await self._submit_task_planning_mode(
+            result = await self._submit_task_planning_mode(
                 project_root=project_root,
                 project_id=project_id,
                 kwargs=kwargs,
                 metadata=metadata,
                 attribution=attribution,
             )
+            if routing_notice and interceptor_write_succeeded(result):
+                return {**result, **routing_notice}
+            return result
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
@@ -4277,7 +4166,7 @@ class TaskInterceptor:
             candidate_json=blob,
         )
         self._enqueue_ticket(project_id, ticket_id)
-        return {'ticket': ticket_id}
+        return {'ticket': ticket_id, **routing_notice}
 
     async def _submit_task_planning_mode(
         self,
@@ -4948,8 +4837,8 @@ class TaskInterceptor:
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
                 # candidate_metadata is this ticket's post-inject_operational_routing
-                # submission metadata — the same object stamped by
-                # _inject_deterministic_pure_gate and serialised into tm.add_task
+                # submission metadata — the same value stamped by
+                # pure_gate_stamped and serialised into tm.add_task
                 # below. _execute_combine reads it to refuse absorbing a gated
                 # candidate into an ungated target (task 3446).
                 combine_result = await self._execute_combine(
@@ -4992,7 +4881,10 @@ class TaskInterceptor:
             # Operational-ask registry match (filing-policy gate): stamp
             # metadata as a deterministic PURE-GATE and fall through to the
             # ordinary create path below.
-            metadata = self._inject_deterministic_pure_gate(metadata)
+            metadata = pure_gate_stamped(
+                fresh_metadata_copy(metadata, site='deterministic-pure-gate'),
+                PureGateTrigger.OPERATIONAL_ASK_REGISTRY,
+            )
 
         # ── Create task ───────────────────────────────────────────────
         status: str = TicketStatus.FAILED
@@ -5004,7 +4896,7 @@ class TaskInterceptor:
         skipped_reason = _dedupe_skipped_reason(decision, curator_unavailable=curator_unavailable)
         if skipped_reason is not None:
             metadata = {
-                **self._fresh_metadata_copy(metadata, 'dedupe-skipped-marker'),
+                **fresh_metadata_copy(metadata, site='dedupe-skipped-marker'),
                 **dedupe_skipped_marker(skipped_reason, at=datetime.now(UTC)),
             }
 
@@ -5730,6 +5622,12 @@ class TaskInterceptor:
            backend floor, to leave room for the ``basis='combine'`` re-stamp that task
            8415 adds in ``_execute_combine``, which writes through the backend directly.
 
+        A call with no mutating argument raises
+        :class:`~fused_memory.backends.task_backend_errors.NoFieldsToUpdateError`
+        out of the backend. Like ``AppendUnsupportedFieldError`` it is NOT caught
+        below: it propagates raw to ``mcp_tool_errors``, which reports
+        ``error_type='NoFieldsToUpdateError'`` (task 4867).
+
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
 
@@ -6418,7 +6316,7 @@ class TaskInterceptor:
         task_status = getattr(cfg, 'task_status', None)
         return bool(getattr(task_status, 'enforce_transitions', False))
 
-    def _reject_stale_done_evidence_mode(self) -> str:
+    def _reject_stale_done_evidence_mode(self) -> StaleEvidenceMode:
         """Return the reopen-freshness gate mode: ``'warn'`` or ``'enforce'``.
 
         ``'warn'`` (the default) when config or its ``reconciliation``
@@ -6588,741 +6486,6 @@ def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> d
     }
 
 
-def _render_done_provenance_kinds() -> str:
-    """Every ``DoneProvenance.kind``, quoted, for a caller-facing remedy (I2).
-
-    Derived from the shared Literal so a new kind reaches every refusal that
-    names the vocabulary without a second edit.
-    """
-    kinds = get_args(DoneProvenance.model_fields['kind'].annotation)
-    return ', '.join(f'"{k}"' for k in kinds[:-1]) + f', or "{kinds[-1]}"'
-
-
-_DONE_PROVENANCE_KINDS_TEXT = _render_done_provenance_kinds()
-_KIND_REQUIRED_REASON = (
-    f'done_provenance.kind is required (must be {_DONE_PROVENANCE_KINDS_TEXT}). '
-    'Use kind="merged" with commit=<merge-sha> after a successful '
-    'merge_request; kind="found_on_main" with commit=<sha> and '
-    'note=<explanation> when the implementation is already on main '
-    'from a sibling task; or kind="operational-verified" with '
-    'escalation_id=<id> and note=<text> for a no-code operational ask '
-    'closed via a resolved escalation. The deterministic-* kinds are '
-    'stamped by DeterministicRunner, not supplied by hand — see the '
-    'per-kind table in docs/task-authoring.md.'
-)
-
-
-# ── Git-probe failure carriers (task 3455) ──────────────────────────────
-#
-# Both git probes used by _validate_done_provenance (_resolve_commit_sha,
-# _verify_commit_on_main) can fail two ways that need OPPOSITE remedies:
-# git ran and affirmatively rejected the input, or the probe never
-# completed (timeout / missing binary / unexpected error). Each returns a
-# NamedTuple whose leading field names that distinction, so the semantics
-# travel with the value instead of living in a call-site variable name.
-# The authoritative branch-by-branch contract is each probe's docstring.
-
-
-class _CommitResolutionFailure(NamedTuple):
-    """`git rev-parse --verify` did not yield a SHA. See _resolve_commit_sha."""
-
-    confirmed_absent: bool
-    reason: str
-
-
-class _AncestorCheckFailure(NamedTuple):
-    """`git merge-base --is-ancestor` did not accept. See _verify_commit_on_main."""
-
-    confirmed_off_main: bool
-    detail: str
-
-
-def _provenance_kind(raw: object) -> str | None:
-    """The ``kind`` a raw ``done_provenance`` payload CLAIMS.
-
-    Pure and total: a non-dict payload, a missing key, a non-``str`` value or
-    a blank one all read as ``None``. It reports the CLAIM, not a validated
-    kind — a refused write's row must still say what the caller asserted, and
-    an unreadable claim must not be able to skip the audit row by raising.
-
-    Shared by every journal site and by the caller bar
-    (:func:`_provenance_caller_refusal`), so an accepted and a refused row
-    report the kind identically and the bar judges the same claim the
-    journal records (SPOT).
-    """
-    if not isinstance(raw, dict):
-        return None
-    kind = raw.get('kind')
-    if not isinstance(kind, str):
-        return None
-    return kind.strip() or None
-
-
-def _provenance_stamp_now() -> str:
-    """Wall-clock for ``done_provenance.stamped_at`` (task 3576).
-
-    Same convention as the module's other timestamp sites (``reopen_at``,
-    ``combined_at``): ``datetime.now(UTC).isoformat()``. Broken out as a
-    named module-level function purely so tests can monkeypatch it and
-    assert an exact string — here the timestamp IS the artifact under test,
-    so a loose "is parseable / within a range" assertion would let a
-    wrong-timezone or wrong-format regression through.
-    """
-    return datetime.now(UTC).isoformat()
-
-
-def _provenance_caller_refusal(
-    task_id: str,
-    claimed_kind: str | None,
-    *,
-    is_recon_stage: bool,
-    agent_id: str | None,
-    config: Any,
-) -> dict | None:
-    """The done_provenance caller bar, judged on the kind a payload CLAIMS.
-
-    Returns the refusal payload, or ``None`` when this caller may record that
-    kind. Runs before the payload's shape is parsed, so an unauthorized caller
-    is refused on identity rather than handed a shape hint first.
-    """
-    if claimed_kind in DETERMINISTIC_PROVENANCE_KINDS:
-        # Factor 1 (PRD D11): config-free, and FIRST. A recon stage may not
-        # self-authorize a runner-stamped close, and an operator who adds
-        # 'recon-stage-' to the allowlist must not thereby reopen incident
-        # 5156.
-        if is_recon_stage:
-            return _done_provenance_error(
-                task_id,
-                f'done_provenance with kind={claimed_kind!r} cannot be recorded by a '
-                'recon-stage caller — a recon stage may not self-authorize a '
-                'close that asserts a DeterministicRunner observation. This '
-                'refusal is config-free: granting the caller prefix does not '
-                'lift it.',
-                error_type=DETERMINISTIC_CALLER_ERROR_TYPE,
-            )
-        # Factor 2: the configured caller allowlist, read live so the leaf
-        # stays green-tier hot-reloadable.
-        decision = resolve_deterministic_provenance_authorization(config, agent_id=agent_id)
-        if not decision.allowed:
-            return _done_provenance_error(
-                task_id,
-                decision.error or '',
-                error_type=decision.error_type,
-            )
-    if claimed_kind == 'operational-verified' and is_recon_stage:
-        return _done_provenance_error(
-            task_id,
-            'done_provenance with kind="operational-verified" cannot be '
-            'recorded by a recon-stage caller — a recon stage may not '
-            'self-authorize an operational close.',
-        )
-    return None
-
-
-def _done_provenance_parse_reason(exc: ValidationError) -> str:
-    """The caller-facing ``reason`` for a payload ``DoneProvenance`` refused.
-
-    Routes on the first error's structured fields only. A missing or unknown
-    kind gets the self-correcting remedy naming every kind; a per-kind
-    requirement (``loc == ()``) is the model's own message, verbatim.
-    """
-    err = exc.errors()[0]
-    loc = err['loc']
-    if loc == ('kind',):
-        if err['type'] == 'missing' or err['input'] is None:
-            return _KIND_REQUIRED_REASON
-        return f'done_provenance.kind must be {_DONE_PROVENANCE_KINDS_TEXT} (got {err["input"]!r})'
-    if loc == ():
-        return err['msg']
-    field = '.'.join(str(part) for part in loc)
-    return f'done_provenance.{field}: {err["msg"]} (got {err["input"]!r})'
-
-
-async def _validate_done_provenance(
-    task_id: str,
-    raw: object,
-    project_root: str,
-    *,
-    require: bool,
-    is_recon_stage: bool = False,
-    agent_id: str | None = None,
-    config: Any = None,
-) -> tuple[dict | None, dict | None]:
-    """Authorize, parse and resolve done_provenance for set_task_status(done).
-
-    The per-kind contract — which fields each kind requires and which it
-    records — lives on ``shared/src/shared/task_metadata.py::DoneProvenance``;
-    the author-facing table is in ``docs/task-authoring.md``. This function
-    owns only what that model cannot know, in this order:
-
-    1. THE CALLER BAR (:func:`_provenance_caller_refusal`), on the CLAIMED
-       kind. The ``deterministic-*`` family (PRD C5 / D11, task 5241) asserts
-       a MACHINE observation whose only live producer is DeterministicRunner:
-       a ``recon-stage-`` caller is refused unconditionally (config-free,
-       incident 5156), and any other caller must match a prefix in
-       ``reconciliation.deterministic_provenance_allowed_agent_prefixes``
-       (deny-on-missing; see ``middleware/done_provenance_authz.py``). Both
-       refusals carry ``error_type='DeterministicProvenanceCallerNotPermitted'``.
-       A recon stage is also refused ``operational-verified``, with no
-       ``error_type``: it may not self-authorize an operational close.
-
-       The identity is SELF-REPORTED. Under stateless HTTP a tool call
-       carries no clientInfo for ``server/tools.py::_resolve_identity`` to
-       fall back to, so a caller that sends no ``agent_id`` arrives as
-       ``None`` and is refused; the orchestrator therefore sends
-       ``agent_id='orchestrator'`` explicitly
-       (``orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status``).
-       The bar DETERS a cooperating caller; it is not a security boundary.
-       The residual is made visible rather than prevented — every done
-       write, accepted or refused, leaves a write-journal row naming the
-       resolved caller and the provenance kind.
-
-    2. PARSE AT THE BOUNDARY through ``DoneProvenance.parse_for_write``, which
-       also enforces the write-time-only requirements. A refusal's reason is
-       built by :func:`_done_provenance_parse_reason`; the record keeps
-       ``recorded_evidence()``.
-
-    3. GIT: a supplied ``commit`` must resolve via ``git rev-parse`` and be an
-       ancestor of main (``git merge-base --is-ancestor <sha> main``), so a
-       steward cannot record a SHA that is only on a feature branch. The full
-       SHA is recorded, plus the original ``commit_input`` when a short hash
-       or ref was resolved.
-
-    4. ``stamped_at`` for ``found_on_main`` is written here, server-side
-       (task 3576); a caller-supplied value is discarded, never parsed.
-
-    Returns ``(error_payload, resolved_provenance)``. When the error payload
-    is non-None the transition must be aborted. When ``require`` is False,
-    missing/empty provenance logs a warning and returns ``(None, None)`` so
-    the transition proceeds; malformed provenance always errors regardless of
-    ``require`` — we never want to record corrupt provenance on the task.
-
-    ``is_recon_stage`` mirrors ``_apply_status_transition``'s
-    ``is_recon_stage_write`` classification (``agent_id.startswith(
-    'recon-stage-')``). It is passed SEPARATELY from ``agent_id`` rather than
-    re-derived here so this function and the transition gate can never
-    disagree about who is a recon stage. ``agent_id`` and ``config`` default
-    to the denying value, so a caller that forgets to thread them refuses
-    rather than silently opening the bar.
-    """
-    if raw is None or raw == {}:
-        if require:
-            return _done_provenance_missing_error(task_id), None
-        logger.warning(
-            'set_task_status(%s, done) called without done_provenance; '
-            'Stage-2 reconciliation will treat this task as provenance-unknown. '
-            'Pass done_provenance={"kind": "merged", "commit": "..."} or '
-            '{"kind": "found_on_main", "commit": "...", "note": "..."} to '
-            'record verified evidence.',
-            task_id,
-        )
-        return None, None
-
-    if not isinstance(raw, dict):
-        return (
-            _done_provenance_error(
-                task_id,
-                'done_provenance must be an object with keys "kind", "commit", and/or "note"',
-            ),
-            None,
-        )
-
-    refusal = _provenance_caller_refusal(
-        task_id,
-        _provenance_kind(raw),
-        is_recon_stage=is_recon_stage,
-        agent_id=agent_id,
-        config=config,
-    )
-    if refusal is not None:
-        return refusal, None
-
-    try:
-        provenance = DoneProvenance.parse_for_write(
-            {key: value for key, value in raw.items() if key != 'stamped_at'}
-        )
-    except ValidationError as exc:
-        return _done_provenance_error(task_id, _done_provenance_parse_reason(exc)), None
-
-    resolved = provenance.recorded_evidence()
-    commit_input = provenance.commit
-    if commit_input is not None:
-        sha_or_err = await _resolve_commit_sha(project_root, commit_input)
-        if isinstance(sha_or_err, _CommitResolutionFailure):
-            # Only a git-issued rejection is a "not found" verdict; see
-            # _resolve_commit_sha for the branch-by-branch contract.
-            verb = 'not found in' if sha_or_err.confirmed_absent else 'could not be resolved in'
-            return _done_provenance_error(
-                task_id,
-                f'commit {commit_input!r} {verb} {project_root}: {sha_or_err.reason}',
-            ), None
-        resolved['commit'] = sha_or_err
-        if sha_or_err != commit_input:
-            resolved['commit_input'] = commit_input
-        # The ancestor backstop applies to every kind that cites a commit,
-        # not only the kinds that require one.
-        ancestor_result = await _verify_commit_on_main(project_root, sha_or_err)
-        if ancestor_result is not None:
-            # rc=1 is the only confirmed off-main verdict; every other
-            # failure is NOT-YET-CONFIRMED and carries the opposite remedy.
-            # See _verify_commit_on_main for the full contract.
-            prefix = (
-                'is not on main'
-                if ancestor_result.confirmed_off_main
-                else 'could not be confirmed on main'
-            )
-            return _done_provenance_error(
-                task_id,
-                f'kind={provenance.kind!r} but commit {sha_or_err} {prefix}: '
-                f'{ancestor_result.detail}.',
-            ), None
-
-    if provenance.kind == 'found_on_main':
-        # THE SINGLE WRITE SITE for done_provenance.stamped_at (task 3576).
-        #
-        # Every found_on_main producer funnels through this function: the
-        # fresh-done path (_apply_status_transition), the same-status repair
-        # seam (_repair_done_provenance_same_status), agent-authored
-        # set_task_status calls, and the orchestrator's
-        # Scheduler.mark_done(kind='found_on_main', ...) which reaches here
-        # via set_task_status. So no producer-side change is needed, and no
-        # future producer can forget to stamp. That matters: this defect
-        # class's history (1087 -> 1091 -> 1180 -> 2372 -> 2500 -> 2648 ->
-        # 2787 -> 2794 -> 3057) is a chain of point fixes each reopened by an
-        # unguarded seam the previous fix missed.
-        #
-        # Scoped to found_on_main deliberately — it is the
-        # attribution-by-inference kind the soak gate watches. `merged`
-        # already carries independent landing evidence (merge-queue journal +
-        # is_ancestor + commit citation), and stamping it would perturb the
-        # exact-equality merged-kind assertions across the existing suites
-        # for no benefit.
-        #
-        # A caller-supplied value is DISCARDED with a warning rather than
-        # rejected. Rejection would break the same-status repair seam:
-        # _repair_done_provenance_same_status re-submits a previously-stored
-        # blob, which post-3576 carries its own stamped_at, so a hard reject
-        # would fail every repair of an already-stamped blob. Refreshing on
-        # repair is also the correct semantics — a repair is a fresh
-        # assertion of the attribution, and a repair that leaves the task
-        # still misattributed SHOULD re-enter the gate window. The warning
-        # keeps the override visible rather than silent.
-        supplied_stamp = raw.get('stamped_at')
-        if supplied_stamp is not None:
-            logger.warning(
-                'done_provenance.stamped_at is server-generated; discarding '
-                'caller-supplied value %r for task %s',
-                supplied_stamp,
-                task_id,
-            )
-        resolved['stamped_at'] = _provenance_stamp_now()
-
-    return None, resolved
-
-
-async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckFailure | None:
-    """Verify ``sha`` is reachable from ``main`` via ``merge-base --is-ancestor``.
-
-    Returns None on success (commit is on main). On failure, returns an
-    :class:`_AncestorCheckFailure`:
-
-    - ``confirmed_off_main=True`` only for rc=1 — git affirmatively
-      determined ``sha`` is NOT reachable from ``main``. This is the only
-      case that actually means "not on main", and the only one whose
-      remedy is to re-derive the landing SHA.
-    - ``confirmed_off_main=False`` for every other failure (a non-1 git
-      error such as an unresolvable ``main`` ref, a timeout, a missing git
-      binary, or any unexpected exception) — the check never completed, so
-      the caller must treat it as NOT-YET-CONFIRMED rather than a
-      not-on-main verdict. The remedy there is the opposite one: fetch /
-      fix the checkout / retry. Task 3455: conflating the two under a
-      single "is not on main" wording is the same defect class as task
-      3119's premature outcome assertions. Any failure branch added later
-      inherits ``False``, i.e. the weaker (honest) claim, by default.
-
-    Used as a backstop for kind="merged" provenance so that a SHA from a
-    feature branch cannot pass as a merge commit.
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'merge-base',
-            '--is-ancestor',
-            sha,
-            'main',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            return _AncestorCheckFailure(False, 'git merge-base timed out')
-    except FileNotFoundError:
-        return _AncestorCheckFailure(False, 'git binary not found')
-    except Exception as e:
-        return _AncestorCheckFailure(False, f'{type(e).__name__}: {e}')
-
-    # Exit codes from `git merge-base --is-ancestor`:
-    #   0 — sha is reachable from main
-    #   1 — sha is NOT reachable from main
-    #   other — git error (e.g. unknown ref `main`)
-    if proc.returncode == 0:
-        return None
-    if proc.returncode == 1:
-        return _AncestorCheckFailure(True, 'commit is not an ancestor of main')
-    msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'merge-base failed'
-    return _AncestorCheckFailure(False, msg)
-
-
-async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitResolutionFailure:
-    """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify``.
-
-    Returns the SHA on success, or a :class:`_CommitResolutionFailure` whose
-    ``confirmed_absent`` flag says whether git actually rendered a verdict
-    (task 3455, mirroring :func:`_verify_commit_on_main`):
-
-    - ``confirmed_absent=True`` for a non-zero rev-parse exit — git ran,
-      evaluated the ref against this checkout, and rejected it. Only then
-      may the caller say the commit was "not found in <project_root>".
-    - ``confirmed_absent=False`` for a timeout, a missing git binary, an
-      unexpected exception, or empty output on rc=0 — rev-parse never
-      rendered a verdict on the ref, so the honest report is "could not be
-      resolved", with the same fetch / fix-the-checkout / retry remedy as
-      an unconfirmed ancestor check. Any failure branch added later
-      inherits ``False``, i.e. the weaker claim, by default.
-
-    Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
-    commit resolves to the commit SHA directly.
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'rev-parse',
-            '--verify',
-            f'{commit}^{{commit}}',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            return _CommitResolutionFailure(False, 'git rev-parse timed out')
-    except FileNotFoundError:
-        return _CommitResolutionFailure(False, 'git binary not found')
-    except Exception as e:
-        return _CommitResolutionFailure(False, f'{type(e).__name__}: {e}')
-
-    if proc.returncode != 0:
-        msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'no such ref'
-        return _CommitResolutionFailure(True, msg)
-    sha = stdout.decode('utf-8', errors='replace').strip()
-    if not sha or len(sha) < 7:
-        return _CommitResolutionFailure(False, 'empty rev-parse output')
-    return sha
-
-
-# ── Reopen-freshness gate (task 2674, PRD task alpha) ───────────────────
-#
-# Closes Face B (re-derivation clobber, task-1175 shape): a legitimate
-# done->pending reopen re-marked done within one dispatch tick citing a
-# PRE-reopen commit. Fires only for commit-bearing done_provenance kinds
-# ('merged'/'found_on_main') on a task whose metadata.reopen_at is set
-# (task 2649 stamps this atomically on every terminal-exit reopen).
-
-
-async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | None:
-    """Resolve a commit's committer date via ``git show -s --format=%cI``.
-
-    Returns the stripped ``%cI`` (strict ISO-8601, offset-aware) string on
-    success, or None on any failure (git binary missing, non-zero exit,
-    timeout, empty output). Modeled directly on :func:`_resolve_commit_sha`'s
-    subprocess/timeout/error-handling shape for consistent semantics.
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'show',
-            '-s',
-            '--format=%cI',
-            sha,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            # Reap the killed child promptly rather than leaving it as a
-            # transient zombie until GC finalizes the Process object.
-            await proc.wait()
-            return None
-    except FileNotFoundError:
-        return None
-    except Exception:
-        # Loud fail-safe (silent-fallthrough gate, sig-b): an unexpected error
-        # in this best-effort committer-date probe must surface in the log
-        # rather than vanish. Behaviour is unchanged (still returns None); the
-        # WARN just makes the swallow observable, matching the "loud over
-        # silent" directive the gate enforces.
-        logger.warning(
-            '_resolve_commit_committed_at: unexpected error resolving committer '
-            'date for %s; returning None',
-            sha,
-            exc_info=True,
-        )
-        return None
-
-    if proc.returncode != 0:
-        return None
-    committed_at = stdout.decode('utf-8', errors='replace').strip()
-    return committed_at or None
-
-
-def _extract_reopen_at(before: Any) -> str | None:
-    """Return ``metadata.reopen_at`` from a Taskmaster ``before`` snapshot.
-
-    Uses :func:`_parse_metadata_value` so a JSON-string metadata blob is
-    handled identically to an already-parsed dict. Returns None when
-    absent, empty, or unresolvable — callers treat that as "never
-    reopened" (the reopen-freshness gate stays inert).
-    """
-    raw = before.get('metadata') if isinstance(before, dict) else None
-    parsed, _warnings = _parse_metadata_value(raw)
-    if not isinstance(parsed, dict):
-        return None
-    reopen_at = parsed.get('reopen_at')
-    return reopen_at if isinstance(reopen_at, str) and reopen_at else None
-
-
-def _parse_aware_utc(value: str) -> datetime | None:
-    """Parse an ISO-8601 datetime string to an aware UTC :class:`datetime`.
-
-    A naive (no ``tzinfo``) input is assumed to already be UTC; an aware
-    input is converted via ``astimezone(UTC)``. Returns None on any parse
-    failure — the reopen-freshness gate's caller treats an unparseable
-    date as fail-closed (stale), never as a silent pass.
-    """
-    try:
-        dt = datetime.fromisoformat(value)
-    except (ValueError, TypeError):
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
-
-
-def _done_evidence_stale_error(
-    task_id: str,
-    evidence_commit: str | None,
-    evidence_committed_at: str | None,
-    reopen_at: str | None,
-    agent_id: str | None,
-) -> dict:
-    """Structured error returned when the reopen-freshness gate rejects (enforce-mode).
-
-    Structured fields only, no prose — MCP callers (scheduler, steward)
-    branch on ``error`` uniformly, matching :func:`_terminal_exit_error` /
-    :func:`_done_gate_error`'s shape.
-    """
-    return {
-        'success': False,
-        'error': 'done_evidence_stale',
-        'task_id': task_id,
-        'evidence_commit': evidence_commit,
-        'evidence_committed_at': evidence_committed_at,
-        'reopen_at': reopen_at,
-        'agent_id': agent_id,
-    }
-
-
-def _done_evidence_stale_override_invalid_error(task_id: str, agent_id: str | None) -> dict:
-    """Structured error for a present-but-invalid ``stale_evidence_override``.
-
-    Mode-independent (returned in both enforce and warn) — an explicit
-    malformed override, or one supplied by a recon-stage caller, is always
-    a loud caller error, never a silent fall-through to the plain
-    :func:`_done_evidence_stale_error` rejection.
-    """
-    return {
-        'success': False,
-        'error': 'done_evidence_stale_override_invalid',
-        'task_id': task_id,
-        'agent_id': agent_id,
-        'hint': (
-            'stale_evidence_override requires a non-recon-stage caller and '
-            'non-empty escalation_id + reason fields'
-        ),
-    }
-
-
-def _valid_stale_evidence_override(override: object, is_recon_stage: bool) -> bool:
-    """True iff ``override`` is a well-formed, non-recon-stage bypass assertion.
-
-    A recon-stage caller may never self-authorize a stale-evidence bypass —
-    the override is a human/orchestrator-sanctioned exception, not a claim
-    a reconciliation stage can make about its own write. Otherwise valid
-    iff ``override`` is a dict carrying non-empty string ``escalation_id``
-    and ``reason`` fields (both are recorded verbatim as Stage-2 audit
-    substrate — see :func:`_check_reopen_freshness`).
-    """
-    if is_recon_stage:
-        return False
-    if not isinstance(override, dict):
-        return False
-    escalation_id = override.get('escalation_id')
-    reason = override.get('reason')
-    return (
-        isinstance(escalation_id, str)
-        and bool(escalation_id)
-        and isinstance(reason, str)
-        and bool(reason)
-    )
-
-
-async def _check_reopen_freshness(
-    task_id: str,
-    resolved_provenance: dict | None,
-    raw_done_provenance: object,
-    before: Any,
-    project_root: str,
-    agent_id: str | None,
-    is_recon_stage: bool,
-    mode: str,
-) -> dict | None:
-    """Reject (enforce) or no-op (warn) a done-write citing PRE-reopen evidence.
-
-    Inert (returns None immediately) unless ALL of:
-      - ``resolved_provenance`` is a dict with ``kind`` in
-        ``DoneProvenance.COMMIT_REQUIRED_KINDS`` (commitless kinds —
-        deterministic-* — self-evidence and are exempt);
-      - it carries a truthy ``commit``;
-      - ``before`` (the pre-write task snapshot) has a non-empty
-        ``metadata.reopen_at`` (a task that was never reopened has nothing
-        to be stale against).
-
-    When the gate fires, the evidence commit's committer date and
-    ``reopen_at`` are both normalised to aware UTC and compared. Evidence
-    dated before the reopen is STALE. Fail-CLOSED (task 2674 S10): an
-    unparseable date on either side (git failure / parse failure) is ALSO
-    treated as stale — a gate that cannot prove freshness must not certify
-    it, so the comparison never silently passes on indeterminate input.
-    This deliberately does not distinguish a transient git failure (binary
-    hiccup, timeout) from a genuinely pre-reopen commit — both fail closed
-    identically; see ``task_status.done_evidence_stale_unresolved_commit``
-    below for the observability seam that at least makes the two cases
-    distinguishable in logs ahead of the task-gamma enforce flip.
-
-    Whenever the evidence commit's committer date cannot be resolved at
-    all (``_resolve_commit_committed_at`` returns None), a
-    ``task_status.done_evidence_stale_unresolved_commit`` WARNING (stable
-    grep anchor) is logged unconditionally — in both modes, and whether or
-    not an override subsequently bypasses the gate — purely as a
-    diagnostic aid; it does not itself change the accept/reject outcome.
-
-    On stale, BEFORE the enforce/warn mode dispatch: a well-formed,
-    non-recon-stage ``raw_done_provenance['stale_evidence_override']``
-    (validated by :func:`_valid_stale_evidence_override`) bypasses the gate
-    unconditionally (both modes). The override is mutated onto
-    ``resolved_provenance`` VERBATIM — the caller persists
-    ``resolved_provenance`` into ``audit_fields['done_provenance']``, so
-    this is Stage-2 audit substrate, not a live cross-service escalation
-    lookup (fused-memory has no orchestrator-escalation client).
-
-    Absent any override: ``mode == 'enforce'`` returns the typed
-    :func:`_done_evidence_stale_error` rejection (the caller must abort the
-    write); otherwise (warn mode) emits one ``task_status.done_evidence_stale_warn``
-    census WARNING (stable grep anchor) and returns None (the write
-    proceeds).
-
-    A present-but-invalid override (malformed shape, or a recon-stage
-    caller) is distinguished from "no override": it returns the typed
-    :func:`_done_evidence_stale_override_invalid_error` rejection,
-    mode-independently (enforce and warn alike) — an explicit malformed
-    override is always a loud caller error, never a silent fall-through to
-    the plain ``done_evidence_stale`` rejection or (worse) an accept. Only
-    the no-override stale path proceeds to the enforce/warn mode dispatch.
-
-    Rollout-safety note: this makes the override-invalid rejection the
-    ONE case where 'warn' mode is not purely observational — every other
-    branch of 'warn' mode (no override, or a *valid* override) never
-    blocks a write. This is intentional (a malformed override is a caller
-    bug, not a staleness verdict the rollout mode should suppress — see
-    task 2674 design decisions), not an oversight; callers relying on
-    warn-mode being unconditionally non-blocking during the alpha rollout
-    must still handle ``done_evidence_stale_override_invalid``.
-    """
-    if not isinstance(resolved_provenance, dict):
-        return None
-    if resolved_provenance.get('kind') not in DoneProvenance.COMMIT_REQUIRED_KINDS:
-        return None
-    evidence_commit = resolved_provenance.get('commit')
-    if not evidence_commit:
-        return None
-    reopen_at = _extract_reopen_at(before)
-    if not reopen_at:
-        return None
-
-    evidence_committed_at = await _resolve_commit_committed_at(project_root, evidence_commit)
-    if evidence_committed_at is None:
-        # Distinguishable from a genuine date-based staleness verdict: this
-        # fires whenever `git show` itself failed (binary missing, timeout,
-        # non-zero exit) rather than because the comparison found the
-        # evidence dated before reopen_at. The disposition is unchanged
-        # (still fail-closed — see the module docstring), but this gives
-        # operators a grep-stable way to tell "couldn't prove freshness
-        # because git errored" apart from "proved stale" ahead of the
-        # task-gamma enforce flip. Logged unconditionally (both modes),
-        # before the override/mode dispatch below.
-        logger.warning(
-            'task_status.done_evidence_stale_unresolved_commit task_id=%s '
-            'evidence_commit=%s reopen_at=%s agent_id=%s',
-            task_id, evidence_commit, reopen_at, agent_id,
-        )
-    evidence_dt = _parse_aware_utc(evidence_committed_at) if evidence_committed_at else None
-    reopen_dt = _parse_aware_utc(reopen_at)
-
-    stale = evidence_dt is None or reopen_dt is None or evidence_dt < reopen_dt
-    if not stale:
-        return None
-
-    override = (
-        raw_done_provenance.get('stale_evidence_override')
-        if isinstance(raw_done_provenance, dict)
-        else None
-    )
-    if override is not None:
-        if _valid_stale_evidence_override(override, is_recon_stage):
-            resolved_provenance['stale_evidence_override'] = {
-                'escalation_id': override['escalation_id'],
-                'reason': override['reason'],
-            }
-            logger.info(
-                'task_status.done_evidence_stale_override_accepted task_id=%s escalation_id=%s',
-                task_id, override['escalation_id'],
-            )
-            return None
-        return _done_evidence_stale_override_invalid_error(task_id, agent_id)
-
-    if mode == 'enforce':
-        return _done_evidence_stale_error(
-            task_id, evidence_commit, evidence_committed_at, reopen_at, agent_id,
-        )
-    logger.warning(
-        'task_status.done_evidence_stale_warn task_id=%s evidence_commit=%s '
-        'evidence_committed_at=%s reopen_at=%s agent_id=%s',
-        task_id, evidence_commit, evidence_committed_at, reopen_at, agent_id,
-    )
-    return None
-
-
 async def _repair_done_provenance_same_status(
     tm: Any,
     task_id: str,
@@ -7333,6 +6496,8 @@ async def _repair_done_provenance_same_status(
     is_recon_stage: bool = False,
     agent_id: str | None = None,
     config: Any = None,
+    git_runner: GitProbeRunner,
+    stamp_clock: Callable[[], str],
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
@@ -7343,7 +6508,7 @@ async def _repair_done_provenance_same_status(
     never be corrected via a fresh done transition. This helper is the
     sanctioned repair (task 2401): validate the supplied ``done_provenance``
     exactly like a fresh done transition
-    (:func:`_validate_done_provenance`, ``require=False`` — a same-status
+    (:func:`validate_done_provenance`, ``require=False`` — a same-status
     repair must never itself demand provenance) and, on success, persist the
     correction through the privileged, non-protocol ``stamp_audit_metadata``
     seam (the sole sanctioned ``done_provenance`` writer, since ``update_task``
@@ -7360,14 +6525,14 @@ async def _repair_done_provenance_same_status(
     instead.
 
     ``is_recon_stage`` forwards the caller's recon-stage classification into
-    :func:`_validate_done_provenance` so a recon-stage caller cannot use this
+    :func:`validate_done_provenance` so a recon-stage caller cannot use this
     sanctioned repair seam to record ``kind="operational-verified"`` either
     (closing the loophole a fresh-transition-only rejection would leave open).
     ``agent_id`` and ``config`` travel the same way and for the same reason:
     the `deterministic-*` caller bar (task 5241) must close BOTH seams, or a
     legacy blob could be re-stamped around it on an already-``done`` task.
     """
-    validation_err, resolved = await _validate_done_provenance(
+    validation_err, resolved = await validate_done_provenance(
         task_id,
         done_provenance,
         project_root,
@@ -7375,6 +6540,8 @@ async def _repair_done_provenance_same_status(
         is_recon_stage=is_recon_stage,
         agent_id=agent_id,
         config=config,
+        git_runner=git_runner,
+        stamp_clock=stamp_clock,
     )
     if validation_err is not None:
         return validation_err
@@ -7457,48 +6624,6 @@ def _journal_error_text(resp: object) -> str | None:
     detail = resp.get('reason') or resp.get('hint')
     error = resp.get('error')
     return (f'{error}: {detail}' if detail else str(error))[:500]
-
-
-def _done_provenance_missing_error(task_id: str) -> dict:
-    return {
-        'success': False,
-        'error': 'done_provenance_required',
-        'task_id': task_id,
-        'hint': (
-            'Cannot mark task done: done_provenance is required when '
-            'reconciliation.require_done_provenance is enabled. Pass '
-            'done_provenance={"kind": "merged", "commit": "<merge-sha>"} when '
-            'the merge_request landed a commit on main, or '
-            'done_provenance={"kind": "found_on_main", "commit": "<sha>", '
-            '"note": "<text>"} when the implementation is already on main '
-            'from a sibling task (commit is ancestor-checked).'
-        ),
-    }
-
-
-def _done_provenance_error(
-    task_id: str,
-    reason: str,
-    *,
-    error_type: str | None = None,
-) -> dict:
-    """The single builder for every ``done_provenance_invalid`` refusal.
-
-    ``error_type`` names a machine-readable refusal CLASS for the caller-bar
-    rejections (task 5241). The key is included only when supplied, so every
-    pre-existing refusal payload stays byte-identical — a consumer keying on
-    its absence is unaffected, and one that keys on its presence learns
-    something no ``reason`` substring match could tell it reliably.
-    """
-    payload = {
-        'success': False,
-        'error': 'done_provenance_invalid',
-        'task_id': task_id,
-        'reason': reason,
-    }
-    if error_type is not None:
-        payload['error_type'] = error_type
-    return payload
 
 
 def _extract_task_dict(raw: Any) -> dict | None:

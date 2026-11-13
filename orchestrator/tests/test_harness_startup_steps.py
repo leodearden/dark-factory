@@ -8,6 +8,7 @@ a failing non-fatal step leaves startup running, emits one
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator.artifacts import AgentSession
+from orchestrator.config import TranscriptArchiveConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
@@ -321,3 +324,53 @@ class TestStrandedSweepAtStartup:
         [call] = handle.stubs['_reconcile_stranded_in_progress'].await_args_list
         assert isinstance(call.kwargs.get('failures'), EntryFailures)
         assert call.kwargs.get('mid_run', False) is False
+
+
+def _seed_dead_owner_sidecar(worktree_base: Path, task_id: str) -> Path:
+    sidecar = worktree_base / task_id / '.task' / 'agent_session.json'
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(json.dumps(AgentSession(
+        session_id=f'sess-{task_id}',
+        role='implementer',
+        started_at='2026-11-01T00:00:00+00:00',
+        owner_pid=2**31 - 1,
+        task_id=task_id,
+    ).to_dict()))
+    return sidecar
+
+
+@pytest.mark.asyncio
+class TestZombieSidecarReaperSiting:
+    """The sidecar reaper reads pre-2d ground truth (plans/session-resume-eligibility-seam-prd.capability-manifest.md §F4)."""
+
+    async def test_reaper_runs_in_2c_before_2d_re_pends_stranded_tasks(
+        self, make_startup_harness,
+    ) -> None:
+        handle = make_startup_harness()
+        h = handle.harness
+        del h._recover_crashed_tasks
+        h.config.transcript_archive = TranscriptArchiveConfig()
+        h.git_ops.worktree_base.mkdir(parents=True)
+        h.git_ops.warm_lane_pool = None
+        h.git_ops.spec_warm_lane_pool = None
+        h.git_ops.pool_in_use = MagicMock(return_value=False)
+        h.git_ops.cleanup_worktree = AsyncMock()
+        stranded = _seed_dead_owner_sidecar(h.git_ops.worktree_base, '7')
+        zombie = _seed_dead_owner_sidecar(h.git_ops.worktree_base, '8')
+        statuses = {'1': 'pending', '7': 'in-progress', '8': 'pending'}
+        handle.scheduler.get_statuses = AsyncMock(
+            side_effect=lambda ids=None: (
+                {k: v for k, v in statuses.items() if ids is None or k in ids}, None,
+            ),
+        )
+        handle.stubs['_reconcile_stranded_in_progress'].side_effect = (
+            lambda *a, **k: statuses.update({'7': 'pending'})
+        )
+
+        await _run(h)
+
+        assert stranded.exists()
+        assert not zombie.exists()
+        assert h.event_store is not None
+        reaped = h.event_store.fetch_events_by_type(EventType.sidecar_reaped)
+        assert [row['task_id'] for row in reaped] == ['8']

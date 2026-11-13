@@ -35,6 +35,7 @@ from orchestrator.session_registry import (
 )
 from shared.project_id import fold_project_token
 from shared.task_deferral import CarriedByDeferral, InvalidRecord, parse_record
+from shared.task_statuses import TERMINAL as TERMINAL_TASK_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 from sitting.inventory import ItemKey, OpenItem, Shortfall, cited_ids, parse_stamp
@@ -49,7 +50,6 @@ LEGACY_COALESCE_KEY = 'x_coalesced_into'
 FOLLOWUP_KEYS: tuple[str, ...] = ('x_origin_escalation', 'origin_escalation')
 HANDOVER_CANDIDATES: tuple[str, ...] = ('data/escalations/l2-handover.md', 'plans/l2-watcher-handover-*.md')
 
-TERMINAL_TASK_STATUSES = frozenset({'done', 'cancelled'})
 UNBLOCK_ROLE = 'unblock'
 
 

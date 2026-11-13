@@ -118,6 +118,13 @@ class EventType(StrEnum):
     # by evidencing the DURABLE write; persisted=False means the in-memory
     # narrowing applied but the metadata write failed (non-critical).
     set_to_plan = 'set_to_plan'
+    # A writer's scope moving past its declared files, one row per boundary
+    # that had something to apply; the row's phase is the workflow phase the
+    # boundary ran in.  Payload: {reason, boundary, role, iteration,
+    # requested, acquired, contested: {path: holder}}.  The reasons and the
+    # boundary kinds live in orchestrator/src/orchestrator/scope_drift.py
+    # (ScopeDriftReason, ScopeBoundary); task 4371 adds its own reason there.
+    scope_drift = 'scope_drift'
     # Declared-vs-landed at done, from
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope.
     # One row per done-time reconcile of a MEASURED merge diff.  data:
@@ -679,6 +686,14 @@ class EventType(StrEnum):
     # "of the resumes we decided to make, how many did not survive to the
     # agent?".
     session_resume_failed = 'session_resume_failed'
+
+    # Boot reap of a zombie agent_session.json (plans/session-resume-eligibility-seam-prd.md
+    # γ/D7), producer harness.py::Harness._reap_zombie_sidecars. One row per
+    # cleared sidecar; data: {sidecar_path, task_id, owner_pid, age_secs, status}.
+    sidecar_reaped = 'sidecar_reaped'
+    # One row per boot scan, zero-reap boots included; data:
+    # agent_session_reaper.py::ReapTally.event_data.
+    sidecar_reap_summary = 'sidecar_reap_summary'
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
@@ -1380,6 +1395,7 @@ class EventStore:
         task_id: str | None = None,
         *,
         cross_run: bool = False,
+        fire_safe: bool = True,
     ) -> dict | None:
         """Return the most-recent merge_finalized row matching the given key.
 
@@ -1398,8 +1414,9 @@ class EventStore:
         events-table timestamp), run_id, is_current_run and
         absorbed_request_ids (None on rows written before that key existed).
 
-        Returns None on miss.  Errors are logged and return None (read path is
-        fire-safe).
+        Returns None on miss.  Fire-safe by default: an error is logged and
+        reads as a miss.  ``fire_safe=False`` re-raises it instead, so a caller
+        can tell a failed read from a miss.
         """
         if request_id is not None:
             key, value = MergeFinalizedKey.request_id, request_id
@@ -1410,18 +1427,23 @@ class EventStore:
         else:
             return None
         rows = self._select_merge_finalized(
-            'latest_merge_finalized', key, value, cross_run=cross_run, latest_only=True,
+            'latest_merge_finalized',
+            key,
+            value,
+            cross_run=cross_run,
+            latest_only=True,
+            fire_safe=fire_safe,
         )
         return rows[0] if rows else None
 
     def merge_finalized_superseded_by(
-        self, superseded_by: str, *, cross_run: bool = False,
+        self, superseded_by: str, *, cross_run: bool = False, fire_safe: bool = True,
     ) -> list[dict]:
         """Return the member rows a coalesce-* train id or a gen-(n+1) request id superseded.
 
         Oldest first, in latest_merge_finalized's projection and run scope
-        (plans/merge-status-durable-non-landed-prd.md D7).  Fire-safe: errors
-        are logged and return [].
+        (plans/merge-status-durable-non-landed-prd.md D7).  Same read-failure
+        policy as latest_merge_finalized; a fire-safe miss is [].
         """
         if not superseded_by:
             return []
@@ -1431,10 +1453,11 @@ class EventStore:
             superseded_by,
             cross_run=cross_run,
             latest_only=False,
+            fire_safe=fire_safe,
         )
 
     def merge_finalized_absorbing(
-        self, request_id: str, *, cross_run: bool = False,
+        self, request_id: str, *, cross_run: bool = False, fire_safe: bool = True,
     ) -> dict | None:
         """Return the newest primary row whose absorbed_request_ids lists *request_id*.
 
@@ -1443,7 +1466,8 @@ class EventStore:
         replacement for TerminalOutcomeRetention.record_alias
         (plans/merge-status-durable-non-landed-prd.md D6/D7).  Kept apart from
         latest_merge_finalized so a caller can tell an alias hit from a direct
-        one.  Whole-id match; same projection, run scope and fire-safe policy.
+        one.  Whole-id match; same projection, run scope and read-failure
+        policy as latest_merge_finalized.
         """
         if not request_id:
             return None
@@ -1453,6 +1477,7 @@ class EventStore:
             request_id,
             cross_run=cross_run,
             latest_only=True,
+            fire_safe=fire_safe,
         )
         return rows[0] if rows else None
 
@@ -1464,10 +1489,12 @@ class EventStore:
         *,
         cross_run: bool,
         latest_only: bool,
+        fire_safe: bool,
     ) -> list[dict]:
         """Every merge_finalized read: runs *key*'s statement in this run's scope and projects it.
 
-        *reader* names the public method in the fire-safe warning.
+        *reader* names the public method in the warning a fire-safe read logs
+        when it swallows an error; a strict read re-raises and logs nothing.
         """
         sql, params = key.select(
             value, run_id=None if cross_run else self.run_id, latest_only=latest_only,
@@ -1480,6 +1507,8 @@ class EventStore:
                 conn.close()
             return [self._merge_finalized_row(*row) for row in rows]
         except Exception:
+            if not fire_safe:
+                raise
             logger.warning('event_store.%s failed', reader, exc_info=True)
             return []
 

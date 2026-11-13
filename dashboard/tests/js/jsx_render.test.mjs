@@ -3,12 +3,15 @@
 // real .jsx renders in a jsdom window (dom_harness.mjs); every expected value
 // comes from calling the helper itself, never from source text.
 //
-// All render tests live in this one file: node --test runs each file in its
-// own process, and each process pays the Babel compile once.
+// node --test runs each file in its own process, and each process pays the
+// Babel compile once, so render tests share as few files as possible: this
+// one, and jsx_render_quality.test.mjs for the quality dashboard's seams. The
+// window/act/fetch plumbing both use is _render_helpers.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { caughtFrom } from './_caught.mjs';
+import { allowAsyncAct, click, openWindow, settle, stubFetch } from './_render_helpers.mjs';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
@@ -28,28 +31,13 @@ import {
   schedulerModule,
   schedulerSnapshot,
   taskCensus,
+  taskRow,
   tasksSnapshotEntry,
   wireDatum,
 } from './wire_fixtures.mjs';
 
 const PROJECT = 'p';
 const TAB_PROPS = { projectFilter: [], search: '' };
-
-// React reports a broken render (a missing key, an update outside act(), a bad
-// prop) on console.error and renders on, so every test also asserts that
-// nothing reached it, through the unmount.
-function openWindow(t) {
-  const harness = buildDashboardWindow();
-  t.after(() => {
-    harness.close();
-    assert.deepEqual(harness.consoleErrors, [], 'the window wrote to console.error');
-  });
-  return harness;
-}
-
-function click(window, element) {
-  window.React.act(() => element.dispatchEvent(new window.MouseEvent('click', { bubbles: true })));
-}
 
 function spansDescribedBy(root, descriptor) {
   return [...root.querySelectorAll('span')].filter(
@@ -63,7 +51,7 @@ function spansDescribedBy(root, descriptor) {
 // ── Decision 1: the stranded badge (task_row_cells.js::strandBadgeState) ──
 
 function inProgressTask(stranded) {
-  return { id: '42', project: PROJECT, title: 'TT', status: 'in-progress', agent: 'impl', stranded, deps: [] };
+  return taskRow({ project: PROJECT, agent: 'impl', stranded });
 }
 
 // One running orchestrator for one project holding one task, as the
@@ -978,6 +966,97 @@ test('tab_escalations.jsx::EscalationSidebar renders no check-owner section with
   assert.equal(nullDialog.innerHTML, absentDialog.innerHTML);
 });
 
+// ── The sidebar's linked-task description (data.js::ON_DEMAND_KEYS.taskProse) ──
+// Task rows carry no prose, so the drawer reads the linked task's description
+// through the on-demand read the Task Detail pane uses, addressed by the uid
+// active_tasks.task_uid builds: `<project>/T-<id>`.
+
+const PROSE_TASK = '7700';
+const PROSE_URL_PREFIX = '/api/v2/dashboard/task/';
+
+function linkedTaskRow(task) {
+  return escalationRow({ id: `esc-${PROSE_TASK}-1`, taskId: PROSE_TASK, summary: 'needs a ruling', project: PROJECT, task });
+}
+
+// Answers the taskProse url for `uid` with `response`, a fetch Response or a
+// promise of one. Returns every url asked for.
+function stubProseFetch(window, uid, response) {
+  return stubFetch(window, { [window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse.url(uid)]: response });
+}
+
+function proseResponse(window, uid, prose) {
+  const { key } = window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse;
+  return { ok: true, status: 200, json: async () => ({ [key(uid)]: prose }) };
+}
+
+const PROSE_UNAVAILABLE = 'The description of this task could not be fetched.';
+
+test("tab_escalations.jsx::EscalationSidebar renders the linked task's description from the taskProse on-demand read", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  const asked = stubProseFetch(window, uid, proseResponse(window, uid, { description: 'why it exists', details: '' }));
+  const row = linkedTaskRow(undefined);
+  assert.equal('description' in row.task.value, false, 'the card itself must carry no description');
+
+  const dialog = openSidebar(harness, row);
+  await settle(window);
+
+  assert.ok(dialog.textContent.includes('why it exists'), dialog.textContent);
+  assert.deepEqual(
+    asked.filter(url => url.startsWith(PROSE_URL_PREFIX)),
+    [window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse.url(uid)],
+  );
+});
+
+test('tab_escalations.jsx::EscalationSidebar requests no taskProse for a card that is a hole', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  const asked = stubProseFetch(window, uid, proseResponse(window, uid, { description: 'why it exists', details: '' }));
+  const row = linkedTaskRow(wireDatum(null, { state: 'unknown', reason: 'the task could not be read' }));
+
+  const dialog = openSidebar(harness, row);
+  await settle(window);
+
+  assert.ok(dialog.textContent.includes('the task could not be read'), dialog.textContent);
+  assert.deepEqual(asked.filter(url => url.startsWith(PROSE_URL_PREFIX)), []);
+});
+
+test("tab_escalations.jsx::EscalationSidebar shows loading… until the linked task's taskProse read answers", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  let answer;
+  stubProseFetch(window, uid, new Promise(resolve => { answer = resolve; }));
+
+  const dialog = openSidebar(harness, linkedTaskRow(undefined));
+  await settle(window);
+  assert.ok(dialog.textContent.includes('loading…'), dialog.textContent);
+
+  answer(proseResponse(window, uid, { description: 'why it exists', details: '' }));
+  await settle(window);
+  assert.ok(dialog.textContent.includes('why it exists'), dialog.textContent);
+  assert.equal(dialog.textContent.includes('loading…'), false, dialog.textContent);
+});
+
+test("tab_escalations.jsx::EscalationSidebar says the linked task's description could not be fetched when its taskProse read fails", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  stubProseFetch(window, uid, { ok: false, status: 503, json: async () => ({}) });
+
+  const dialog = openSidebar(harness, linkedTaskRow(undefined));
+  await settle(window);
+
+  assert.ok(dialog.textContent.includes(PROSE_UNAVAILABLE), dialog.textContent);
+  assert.equal(dialog.textContent.includes('loading…'), false, dialog.textContent);
+});
+
 // ── Decision 8: the Tasks tab's preferences go through persisted_state.js ──
 // A key exists only while its value differs from its default, and a write the
 // browser refuses is reported on console.warn rather than swallowed.
@@ -1504,3 +1583,51 @@ test("tab_memory_evals.jsx::MemoryEvalsSection renders a tripwire's per-item ver
     assertLinksOnly(trs[i], row);
   });
 });
+
+// ── Decision 12: the filed cell (task_row_cells.js::filedCellState) ──
+
+// TaskDetail's 'filed' kv row: its key span and the value span beside it.
+function filedRowOf(detail) {
+  const key = [...detail.querySelectorAll('.kv > span.k')].find(span => span.textContent === 'filed');
+  return { key, value: key?.nextElementSibling };
+}
+
+const FILED_CASES = [
+  {
+    name: 'a recorded filing time',
+    task: () => ({ ...inProgressTask(false), created_at: '2026-11-12T09:10:17.253Z', created_at_source: 'first_event' }),
+    recorded: true,
+  },
+  {
+    name: 'no recorded filing time',
+    task: () => ({ ...inProgressTask(false), created_at: null, created_at_source: null }),
+    recorded: false,
+  },
+];
+
+for (const { name, task: buildTask, recorded } of FILED_CASES) {
+  test(`tab_tasks.jsx::TaskDetail renders the filed row filedCellState describes, for ${name}`, t => {
+    const harness = openWindow(t);
+    const task = buildTask();
+    seedOneTask(harness.window, task);
+    const detail = taskDetailOf(harness, task);
+    assert.ok(detail, 'the detail pane never opened on the task');
+
+    const expected = harness.window.DF_TASK_ROW_CELLS.filedCellState(task);
+    const { key, value } = filedRowOf(detail);
+    assert.ok(key, "TaskDetail renders no 'filed' kv key");
+    assert.equal(value?.textContent, expected.text);
+    assert.equal(value?.title, expected.title);
+    const statusKey = key.previousElementSibling?.previousElementSibling;
+    assert.ok(statusKey?.matches('span.k'), "the 'filed' row does not follow a kv row");
+    assert.equal(statusKey.textContent, 'status', "the 'filed' row is not directly after the status row");
+
+    if (recorded) {
+      assert.notEqual(expected.text, harness.window.DF_DATUM.EM_DASH, 'fixture: the filing time is recorded');
+      assert.ok(
+        !detail.querySelector('.sub').textContent.includes(expected.text),
+        "the filing time is rendered on the .sub line beside fmtAge's unlabelled reading",
+      );
+    }
+  });
+}

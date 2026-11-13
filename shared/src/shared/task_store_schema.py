@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     claimant_run_id TEXT,
     heartbeat_at    TEXT,
     candidate_key   TEXT,
+    created_at      TEXT,
+    created_at_source TEXT,
     PRIMARY KEY (tag, id)
 );
 

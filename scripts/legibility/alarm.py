@@ -1,4 +1,4 @@
-"""The legibility subsystem's one alarm: journal a finding, then post it as an escalate_info."""
+"""The legibility subsystem's guarded MCP poster, and the one alarm posted through it."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
     sys.path.insert(0, _SHARED_SRC)
@@ -103,10 +103,28 @@ def refuse_real_post_under_test(url: str, tool_name: str) -> None:
     )
 
 
+def post_tool_call(
+    base_url: str,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    *,
+    timeout: float,
+    client_name: str = "legibility",
+) -> dict:
+    """Call MCP tool *tool_name* on the server at *base_url* and return its reply.
+
+    Refused under pytest unless the caller declared the endpoint its own
+    (:func:`refuse_real_post_under_test`).
+    """
+    refuse_real_post_under_test(base_url, tool_name)
+    with SyncMcpSession(base_url, client_name=client_name, timeout=timeout) as session:
+        return session.call_tool(tool_name, arguments)
+
+
 def _post_escalation(base_url: str, arguments: Mapping[str, str]) -> object:
-    refuse_real_post_under_test(base_url, _TOOL_NAME)
-    with SyncMcpSession(base_url, client_name="legibility-alarm", timeout=_POST_TIMEOUT_SECS) as session:
-        return session.call_tool(_TOOL_NAME, arguments)
+    return post_tool_call(
+        base_url, _TOOL_NAME, arguments, timeout=_POST_TIMEOUT_SECS, client_name="legibility-alarm",
+    )
 
 
 def raise_alarm(

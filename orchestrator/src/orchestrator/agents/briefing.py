@@ -34,6 +34,7 @@ from orchestrator.escalation_rulings import (
 )
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
+from orchestrator.scope_drift import ScopeDriftReport
 
 logger = logging.getLogger(__name__)
 
@@ -181,14 +182,15 @@ _TEXT_DRIFT_NOTICES = {
         '## The Task Text Has Changed\n\n'
         'The description or details under # Task have been amended since this '
         'plan was authored. Re-read them and change the plan to cover the '
-        'amended scope; call confirm_plan() only if it already does.'
+        'amended scope, then call confirm_plan(); if it already covers it, '
+        'confirm it unchanged.'
     ),
     TaskTextDrift.UNSTAMPED: (
         '## The Task Text May Have Changed\n\n'
         'This plan carries no record of the task text it was authored against, '
         'so the description or details under # Task may have been amended '
-        'since. Re-read them and change the plan if its scope has moved; call '
-        'confirm_plan() only if it already covers it.'
+        'since. Re-read them and change the plan if its scope has moved, then '
+        'call confirm_plan(); if it already covers it, confirm it unchanged.'
     ),
 }
 
@@ -486,6 +488,37 @@ def _format_verify_attempt(ctx: VerifyAttemptContext) -> str:
     return '# Verify Attempt\n\n' + '\n'.join(lines) + '\n\n'
 
 
+def _format_scope_drift(report: ScopeDriftReport | None) -> str:
+    """The briefing block reporting what the last writer boundary did with scope requests.
+
+    Empty for None or a report with nothing acquired or contested. The single
+    home of this briefing line; task 4371 reuses it.
+    """
+    if report is None or not (report.acquired or report.contested):
+        return ''
+    lines = [
+        '## Scope Requests',
+        '',
+        'The orchestrator applied the files reported with `report_missing_plan_file`:',
+        '',
+    ]
+    lines.extend(
+        f'- `{path}`: granted. It is now in plan.json `files`, and this task holds its lock.'
+        for path in report.acquired
+    )
+    lines.extend(
+        f'- `{path}`: contested, held by task {holder}.' for path, holder in report.contested
+    )
+    if report.contested:
+        lines.extend([
+            '',
+            'Do not edit a contested file. Revert any edit already made to it, or call '
+            "`escalate_blocker(category='scope_violation')` naming the file, the "
+            'holder and the design reason it must change.',
+        ])
+    return '\n'.join(lines) + '\n'
+
+
 @dataclass
 class CompletionJudgeVerdict:
     """Structured verdict returned by the completion judge agent.
@@ -743,6 +776,10 @@ and either confirm it, update it, or recreate it from scratch.
    human ratification marker. A revalidation that drops a done step without
    that record, or newly marks a step done at another done step's commit, is
    refused.
+6. Once the plan is valid, after (a), (b) or (c) alike, call `confirm_plan()`
+   as your FINAL action. Editing the step set (b) or calling `create_plan` (c)
+   clears the plan's confirmation, so a revalidation that stops without it
+   leaves an unconfirmed plan.
 """
 
     async def build_plan_completion_prompt(
@@ -1014,6 +1051,8 @@ The implementation was reviewed and blocking issues were found.
 4. Keep every existing step in place, in order: do not remove or reorder
    steps, and do not call `create_plan` — it replaces the plan wholesale and
    would discard completed steps.
+5. Call `confirm_plan()` as your FINAL action. Adding steps clears the plan's
+   confirmation, so a replan that stops without it leaves an unconfirmed plan.
 """
 
     async def build_simple_task_prompt(
@@ -1026,10 +1065,12 @@ The implementation was reviewed and blocking issues were found.
     ) -> str:
         """Build prompt for the SIMPLE_TASK agent (Lever C).
 
-        The agent will explore briefly, register a single-step plan via the
-        plan-tools MCP server, edit the listed files, commit, then call
-        ``mark_step_done`` and stop. The orchestrator then advances to VERIFY
-        without invoking the implementer.
+        The workflow and its exits live in
+        ``orchestrator/src/orchestrator/agents/roles.py::SIMPLE_TASK_WORKFLOW``,
+        which ``SIMPLE_TASK.system_prompt`` carries, so this briefing adds only
+        the task preamble and the listed files. Once the agent marks its step
+        done, the orchestrator advances to VERIFY without invoking the
+        implementer.
 
         *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the
         PLAN_AND_EXECUTE audience, since this one agent both plans and implements.
@@ -1043,47 +1084,14 @@ The implementation was reviewed and blocking issues were found.
         else:
             files_section = '_No files listed in task metadata — explore briefly to identify the target file(s)._'
 
-        # The stop-criterion prose below ("no new abstraction, no cross-module design,
-        # substantial architectural thought") mirrors _COMPLEXITY_RUBRIC in roles.py.
-        # Update both in lockstep if the rubric changes.
         return f"""\
 {preamble}
 
 {render_rulings_section(rulings, RulingAudience.PLAN_AND_EXECUTE)}# Action
 
-This task was routed to the SIMPLE_TASK path because its author declared
-complexity:simple. A simple task may be high-priority and may span several
-files/modules — the declaration means the *change* is mechanically simple,
-not that the task is trivial. Your job is to do the change end-to-end in a
-single session:
-
-1. **Read the listed files** below. Confirm the change is mechanically
-   simple — no new abstraction, no cross-module design required.
-2. **Register a plan via plan-tools MCP** — call
-   `mcp__plan-tools__create_plan(task_id, title, analysis, files)`.
-   - For doc/comment-only or behaviour-preserving refactors: add a single
-     `impl` step via `add_plan_step`.
-   - If a new test belongs here: add `test` then `impl`.
-3. **Implement** — edit the file(s), run any tests touching the module,
-   commit (excluding `.task/`), then call
-   `mcp__plan-tools__mark_step_done(step_id, commit_sha)`.
-4. **Stop after marking done.** Do not loop further.
-
-If the change turns out to need cross-module design, a new abstraction, or
-substantial architectural thought, STOP without calling `create_plan` — do
-NOT stop merely because the change spans several files/modules. The
-orchestrator will route to the full architect path on the next dispatch.
-
-If the task spec itself is broken or unworkable, call
-`mcp__plan-tools__report_unactionable_task(reason, evidence)` and stop.
-
-If instead the work is already complete and green on THIS BRANCH and only
-the merge to main is missing — a clean fast-forward (main is an ancestor of
-the branch tip and the tip is not already contained in main), verify already
-PASSED on this exact tip, and review already returned PASS or
-suggestions-only on this exact tree — call
-`mcp__plan-tools__report_ready_to_merge(commit, evidence)` instead of
-`report_unactionable_task` and stop.
+Make this change end-to-end in this one session, following the workflow in
+your role instructions; it also says when to stop and which exit to report
+instead.
 
 {files_section}
 """
@@ -1097,6 +1105,7 @@ suggestions-only on this exact tree — call
         wip_notice: list[dict] | None = None,
         *,
         rulings: Sequence[Ruling] = (),
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the implementer agent.
 
@@ -1135,6 +1144,9 @@ Your worktree was rebased onto the latest main branch.
 
 Review any overlap with your plan steps before continuing — file contents may have changed.
 """
+
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'\n{scope_drift_block}' if scope_drift_block else ''
 
         wip_section = ''
         if wip_notice:
@@ -1185,7 +1197,7 @@ Before writing any new code, walk the pending steps in plan order:
 **Analysis:** {plan.get('analysis', 'N/A')}
 
 {rebase_section}
-{wip_section}
+{wip_section}{scope_drift_section}
 # Session Startup Protocol
 
 1. Read `.task/plan.json` to see the full plan with current status.
@@ -1219,6 +1231,7 @@ Before writing any new code, walk the pending steps in plan order:
         task_id: str | None = None,
         *,
         rulings: Sequence[Ruling] = (),
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for an amendment pass — implementer applies in-scope
         review suggestions without re-planning.
@@ -1243,6 +1256,10 @@ Before writing any new code, walk the pending steps in plan order:
         and the Action section below mandates reading it.
 
         *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the EXECUTE audience.
+
+        Rule 3 tells the agent not to file a scope request in this pass; one
+        filed anyway is still applied at the pass boundary
+        (``workflow.py::TaskWorkflow._amend``), so none is orphaned.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1269,13 +1286,15 @@ Before writing any new code, walk the pending steps in plan order:
                 block.append(f'**Suggested fix:** {fix}')
             suggestion_blocks.append('\n'.join(block))
         suggestions_body = '\n\n'.join(suggestion_blocks)
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
 
 {identity}
 
-# Amendment Pass
+{scope_drift_section}# Amendment Pass
 
 The implementation for this task is complete and verification has passed.
 A code reviewer surfaced the suggestions below, all scoped to modules this
@@ -1304,6 +1323,9 @@ This task holds locks for the following modules:
 3. If a suggestion requires EDITING an existing file not covered above,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
+   This pass never widens the task's scope, so do NOT call
+   `report_missing_plan_file` here, whatever your role's standing scope
+   guidance says.
 4. Prefix amendment commit messages with `amend:` so they're distinguishable
    from the main plan commits.
 
@@ -1327,6 +1349,7 @@ This task holds locks for the following modules:
         task_id: str | None = None,
         *, attempt_context: VerifyAttemptContext | None = None,
         rulings: Sequence[Ruling] = (),
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the debugger agent.
 
@@ -1342,6 +1365,8 @@ This task holds locks for the following modules:
 
         identity = self._agent_identity(scope.task_id, 'debugger')
         verify_attempt = _format_verify_attempt(attempt_context) if attempt_context else ''
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
@@ -1353,7 +1378,7 @@ This task holds locks for the following modules:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-{verify_attempt}# Failures
+{verify_attempt}{scope_drift_section}# Failures
 
 ```
 {failures}
@@ -1568,10 +1593,14 @@ Your disposition is read from the `submit_merge_disposition` tool call, not from
         escalation_summary: str,
         resolution: str,
         worktree: Path | None = None,
+        *,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
         context = await self._get_memory_context(BriefingScope.from_task(task), 'implementer')
         prior_proposal_section = self._format_prior_proposal(task)
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
@@ -1587,12 +1616,43 @@ This task was paused because an agent escalated a blocking issue.
 {resolution}
 
 {prior_proposal_section}
-## Action
+{scope_drift_section}## Action
 Resume the task applying the resolution(s) that answer this round's
 escalation(s), each attributed to its escalation id. The prior agent's work
 is preserved in the worktree. Read `.task/plan.json` and
 `.task/iterations.jsonl` to understand current progress, then continue from
 where the previous agent left off.
+"""
+
+    async def build_scope_drift_followup_prompt(
+        self, plan: dict, scope_drift: ScopeDriftReport, task_id: str | None = None,
+    ) -> str:
+        """Prompt for the one session that briefs a contested scope request no writer saw.
+
+        ``workflow.py::TaskWorkflow._brief_contested_scope_drift`` runs it when
+        the session that filed the request was the last writer session due.
+        That can be the judge's early exit with steps still pending, so the
+        prompt claims nothing about the plan's progress.
+        """
+        scope = _plan_scope(plan, task_id)
+        context = await self._get_memory_context(scope, 'implementer')
+        identity = self._agent_identity(scope.task_id, 'implementer')
+        return f"""\
+{context}
+
+{identity}
+
+# Scope Request Follow-up
+
+A file reported with `report_missing_plan_file` is locked by another task,
+and no other writer session is due to hear about it. This session exists only
+to settle it.
+
+{_format_scope_drift(scope_drift)}
+## Action
+For each contested file: revert your edits to it and commit, keeping the
+task's tests passing, or escalate as the section above says. Make no other
+change. Do not edit `.task/plan.json`.
 """
 
     async def build_steward_initial_prompt(

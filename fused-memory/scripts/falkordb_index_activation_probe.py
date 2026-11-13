@@ -37,10 +37,11 @@ from mcp.client.streamable_http import streamablehttp_client
 from shared.cli_boundary import LoudArgumentParser, run_cli
 
 from fused_memory.backends.falkor_indices import (
+    INDEX_CATALOG_QUERY,
     IndexSpec,
     expected_index_set,
+    index_records_from_rows,
     normalize_index_records,
-    resolve_header_positions,
     unsettled_index_statuses,
 )
 from fused_memory.backends.graphiti_client import GraphitiBackend
@@ -73,7 +74,6 @@ READ_TIMEOUT_MS = 60000
 CASE_FOLD_SPLIT_SINCE = '2026-10-02T11:42:23+00:00'
 CASE_FOLD_SPLIT_SINCE_COMMIT = '13a9caaca2'
 
-INDEXES = 'CALL db.indexes()'
 FULLTEXT = (
     "CALL db.idx.fulltext.queryRelationships('RELATES_TO', $q) YIELD relationship AS rel "
     'RETURN rel.uuid, rel.fact, rel.invalid_at, rel.expired_at'
@@ -92,14 +92,6 @@ CASE_FOLD_SPLIT = (
 
 EXIT_BAD_INPUT = 2
 EXIT_RUN_FAILED = 1
-
-INDEX_COLUMNS = {
-    'label': 'label',
-    'field': 'properties',
-    'type': 'types',
-    'entity_type': 'entitytype',
-    'status': 'status',
-}
 
 _JOINER = r'(?:\s*(?:,|&|/|\band\b|\bor\b))+\s*'
 _TASK_REFERENCE_RE = re.compile(
@@ -355,12 +347,6 @@ def briefing_verdict(hits_by_id: Mapping[str, bool], floor: int = PROBE_FLOOR) -
     )
 
 
-def index_records(header, rows) -> list[dict]:
-    """``CALL db.indexes()`` rows as the records ``GraphitiBackend.list_indices`` returns."""
-    positions = resolve_header_positions(header, INDEX_COLUMNS)
-    return [{key: row[position] for key, position in positions.items()} for row in rows]
-
-
 def graph_index_status(
     group_id: str,
     records: Sequence[Mapping] | None,
@@ -517,8 +503,8 @@ def _single_row(rows: QueryRows) -> list:
 
 
 def _read_index_records(reader: GraphReader, group_id: str) -> list[dict]:
-    rows = reader.ro_query(group_id, INDEXES)
-    return index_records(rows.header, rows.rows)
+    rows = reader.ro_query(group_id, INDEX_CATALOG_QUERY)
+    return index_records_from_rows(rows.header, rows.rows)
 
 
 def _fulltext_edges(reader: GraphReader, task_id: str) -> tuple[FulltextEdge, ...]:

@@ -31,6 +31,9 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
 REPO_ROOT = Path(__file__).parents[2]
 # APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
 # subproject directories resolve as namespace packages shadowing their own
@@ -44,6 +47,8 @@ from df_pytest_isolation import (  # noqa: E402
     PYTEST_SESSION_TOKEN_ENV,
     assert_synthetic_units,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"
 # The ORIGINAL synthetic literal, and the precedent task 3799's allowlist prefix

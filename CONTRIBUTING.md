@@ -296,7 +296,15 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     zero-argument `.wait()` barrier on any receiver, reached either through a
     bare `asyncio.wait_for(...)` or carrying a raw numeric literal bound
     (`timeout=`, `max_wall_s=`, or `asyncio.wait_for`'s positional timeout).
-    Remedy: `wait_responsive(...)` with a descriptive `label=`, and a bound
+    The same deadline written two more ways is flagged too: an
+    `asyncio.timeout(...)`/`asyncio.timeout_at(...)` block wrapping a poll or
+    a load-bearing await, and an async poll loop whose comparison reads a
+    wall clock directly (`loop.time() < deadline`,
+    `deadline - time.monotonic() > 0` and the like); a clock read held in a
+    variable and compared later is not seen yet.
+    Remedy: `wait_responsive(...)` with a descriptive `label=` — or, for a
+    poll, `poll_responsive(predicate, ...)` from
+    `orchestrator/tests/_poll_responsive.py` — and a bound
     derived from `MERGE_RESULT_TIMEOUT` rather than a written number — a
     deadline expiry on such a wait fails a test whose awaited event did
     happen. Both legs are pure **shape**: no receiver name, no class list
@@ -304,10 +312,10 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     join in `stop_merge_worker` (`orchestrator/tests/_merge_worker_drive.py`)
     is exempt structurally (a bare `ast.Name` target).
     `wait_responsive` and `MERGE_RESULT_TIMEOUT` live in
-    `orchestrator/tests/_orch_helpers.py` and are importable only under
-    `orchestrator/tests`, so in any other package the
+    `orchestrator/tests/_orch_helpers.py`, and like `poll_responsive` are
+    importable only under `orchestrator/tests`, so in any other package the
     per-site `# noqa: wall-clock-deadline — <reason>` is the remedy. See the
-    script's Rule C docstring. Pre-existing debt, across four packages, is
+    script's Rule C docstring. Pre-existing debt, across five packages, is
     grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline — the
     last surviving baseline, and **shrink-only** and opt-out, so a new
     offending file fails the gate by default. It is an **exact budget** rather than a bare list: a listed file is

@@ -392,6 +392,39 @@ The remaining header-block differences belong to other entries. The
 K1–K6 index line is Delta 7. Header entries that describe dark-factory-native
 additions travel with those additions.
 
+### Delta 9 — `test_warm_lane_degenerate_ref.sh`: Block M, the merge arm from `shared.merge_subject`
+
+Added by **task 6716**. This is a dark-factory-native block with no reify
+counterpart, and it pins scripts README Delta 19. Its fixture is a
+`git init -b trunk` repo whose subjects are written by
+`shared.merge_subject.format_merge_subject`, for a `feat/` prefix landing into
+`trunk`. `shared/src` is found from `WARM_LANE_SCRIPTS_DIR` three levels up,
+and `python3 -I` renders each subject. The block has eleven asserts:
+
+- **M1:** `feat/6101` is parked on a no-ff merge carrying its own landing
+  subject. It reads `landed <sha>` and exits 4.
+- **M2:** `feat/6102` is parked on `Revert "<its landing subject>"`. It reads
+  `degenerate <sha>` and exits 0.
+- **M3:** the script and its lib are copied to a temp directory with no
+  `shared/src` three levels up. It exits 2, and stderr names
+  `shared.merge_subject`.
+- **M4:** the lib is sourced alone and `task_citation_message_cites` is called
+  in reify's three-argument form on `chore: tidy` with the body line
+  `6101 files touched`. It returns 2 rather than citing, and stderr names
+  `<merge_head_re> and <merge_into_re>`. The control assert makes the
+  five-argument call on the same message, which returns 1.
+- **M5:** `task_citation_peer_ids` in reify's two-argument form returns 2 and
+  prints no id.
+
+The floor moved **84 → 90** for M1–M3, then **90 → 95** for M4–M5. Both counts
+were re-measured, not raised to absorb a red: `Results: 95 passed, 0 failed`.
+The block is NON-VACUOUS by construction. Against the script before Delta 19
+the same file reports `Results: 88 passed, 2 failed`, the two M3 asserts.
+Against the lib before it refused an empty pair, it reports
+`Results: 91 passed, 4 failed`: M4's control passes, and the other four M4/M5
+asserts fail. The block needs `python3`, which `REQUIRED_HOST_TOOLS` already
+lists, so it is not a deduction.
+
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 
 α's relocation of `provision-warm-lane-fs.sh` changed its `REPO_ROOT` to a

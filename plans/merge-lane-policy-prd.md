@@ -13,6 +13,9 @@ measurement is the report).
 **Code anchors** verified against main `72239dfd5d` (2026-11-05). Cited by symbol; re-locate at
 implementation time.
 
+> **Amended 2026-11-10** (Leo): ε no longer waits for tasks 7721 and 7824; both now land after it. See §8,
+> the dated note under ε.
+
 ## 1. Goal
 
 Stop the merge lane from spending two verifies on every landing. Today (post-coalesce window
@@ -218,8 +221,9 @@ tiers). Novel substrate introduced here, each owned by a leaf: `on_base_invalida
 `merge_deep.depth_table` (ζ), the suspect-list state (ζ), the gate-rebased `RealMergeItem` path (γ), the new
 event fields (α), `scripts/merge_screen.yaml` if absent (η). Nothing assumes κ/λ (D11).
 
-Prerequisite tasks: 7720 and 7721 (chain links are popped by the look-ahead during a tip verify;
-chain-build lane leak) and 7824 (build the chain off the verifier loop) before ε/ζ; 7918 → 7919 → 7921 before
+Prerequisite tasks: 7720 (chain links are popped by the look-ahead during a tip verify) before ε/ζ. Tasks 7721
+(chain-build lane leak) and 7824 (build the chain off the verifier loop) were prerequisites of ε until
+2026-11-10 and now land after it (§8, note under ε). 7918 → 7919 → 7921 before
 8411's widening (θ) is testable. 7829 (deploy once the chain fixes land) is superseded by ι's deploy.
 
 ## 5. Cross-PRD relationships and seam owners (G4)
@@ -227,7 +231,7 @@ chain-build lane leak) and 7824 (build the chain off the verifier loop) before �
 | Other PRD | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
 | `plans/two-layer-merge-queue-prd.md` §5.3 | amends | the re-merge carve-out bullet (task 3206) and its five in-code cross-references | this PRD (leaf β carries the prose amendment in the same change) | queued |
-| `plans/deep-merge-ahead-prd.md` (3183–3192, 7720–7829) | consumes / supersedes | `select_chain_depth`, `next_halving_state`, `_deep_chain_placement` guard 1, `chain_cap` semantics, η2 3191 | this PRD owns the policy; deep-merge PRD owns link reservation (7720/7721/7824) which ε/ζ depend on; 3191 cancelled; 3190 unchanged | queued |
+| `plans/deep-merge-ahead-prd.md` (3183–3192, 7720–7829) | consumes / supersedes | `select_chain_depth`, `next_halving_state`, `_deep_chain_placement` guard 1, `chain_cap` semantics, η2 3191 | this PRD owns the policy; deep-merge PRD owns link reservation (7720), which ε/ζ depend on, and the lane-leak and off-loop-build fixes (7721, 7824), which follow ε since 2026-11-10; 3191 cancelled; 3190 unchanged | queued |
 | `plans/merge-lane-quality-prd.md` κ 5040 / λ 5041 | will refactor | `verify_dispatch.py`, `speculation.py` extraction | quality PRD owns the extraction and moves this PRD's as-built code unchanged (D11) | wired (no new edges) |
 | `plans/merge-pre-verify-screen-prd.md` 7918–7924 | consumes / produces | `scripts/merge_screen.yaml` (η creates if absent, 7919 consumes); 7921 hold + 8411 widening (θ amends 8411) | screen PRD owns `run_node_ids`, `screen.py`, 7921; this PRD owns the hook leg and the type-error widening | queued |
 | `plans/merge-lane-throughput-prd.md` | discharges | gate 5098, measurement 5056, `scripts/merge_lane_throughput.py` reads α's fields | this PRD | queued |
@@ -318,7 +322,27 @@ is not used (this is not a quality-instrument remediation).
   `verify_runner.py`; ~400 LOC). Unlocks ε. Signal: boundary rows 5, 6; on df, laptop `finished` share < 15%
   within 3 days (from 33%) and `inflight_total` reaches 3 in heartbeats. Prereqs: γ.
 - **ε — Chain the head when alone** (intermediate; `worker.py`; ~400 LOC). Unlocks ζ. Signal: boundary row 9;
-  on df, `chain_items > 1` on a `speculative=False` row. Prereqs: δ, 7720, 7721, 7824.
+  on df, `chain_items > 1` on a `speculative=False` row. Prereqs: δ, 7720.
+
+  *Amended 2026-11-10 (Leo).* ε's prerequisites were δ, 7720, 7721 and 7824. Tasks 7721 and 7824 now land
+  after ε: 7721 depends on ε by a real edge, 7824 depends on 7721, and reify's resume capstone 8791 depends on
+  both. Grounds, checked against main `29e22e3406`:
+  - dark-factory runs no spec warm-lane pool (`git.merge_spec_warm_lane_pool` is false by default and unset in
+    its yaml), so `git_ops.py::GitOps.acquire_spec_lane` always takes the cold path there. The leaked lane and
+    the wasted warm seed that 7721 fixes cannot occur on dark-factory.
+  - dark-factory's chain build took 2.3 to 7.7 s on the five chain verifies of 2026-11-09..10, against a 300 s
+    `merge_deep.chain_build_timeout_secs`. ε chains the head only when the frontier holds nothing else, so the
+    verifier-loop stall that 7824 removes holds up no other entry.
+  - no code at ε's sites (`_deep_chain_placement` guard 1, the reset arm in `_run_inflight_verify`,
+    `_adopt_head_on_tip_authority`) reads what 7721 or 7824 introduces.
+  - of the nine orchestrator units on the host, only dark-factory and reify set `merge_deep.chain_cap` above 0,
+    and only reify runs the warm pool. reify's scheduler is paused until 8791.
+
+  Residual on dark-factory until 7721 lands: a chain build cancelled or timed out during cold acquisition can
+  leave a partly created `_merge-*` worktree. Residual on reify: a merge submitted by hand while its scheduler
+  is paused can chain a head with the inline build and the warm pool; set reify's `chain_cap: 0` if that
+  matters before 7721 and 7824 land.
+
 - **ζ — Suspect-list bisect, depth table, chain_cap as kill switch; cancel 3191** (intermediate;
   `worker.py`, `config.py`, yaml comment, docs; ~700 LOC). Unlocks ι. Signal: boundary rows 7, 8;
   `chain_depth_reason` on live rows. Prereqs: ε.
@@ -357,8 +381,10 @@ definition for phantom heads (the §5.3 "separate task"); the pre-verify screen'
 
 1. **Where p̂'s 30-verdict window persists across restarts.** Suggested: in-memory, seeded from the last 30
    `merge_verify` rows at start (the probe's `_recent_verify_outcomes` shape). Decide in ζ.
-2. **Whether the gate-rebased item (γ) prefers the head's previous host.** Suggested: no; `prefer_remote`
-   as for any dispatch. Decide in γ.
+2. **Whether the gate-rebased item (γ) prefers the head's previous host.** DECIDED in γ (task 8525): no
+   head-host preference. The rebased head is dispatched like any item, through `HostAllocator.acquire`
+   with the configured `verify_host_policy`. See
+   `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._dispatch_rebased_head`.
 3. **The hook's screen-leg file set.** DECIDED in η (task 8531): exactly the D8 globs, not narrowed. A
    "package" is a uv workspace member with a `src` dir, so `scripts/` is not one. See
    `scripts/hook_module_checks.py::screen_triggered`.

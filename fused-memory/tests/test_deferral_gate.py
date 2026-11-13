@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 from shared import task_deferral
 from shared.project_layout import tasks_db
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import DeferralWriteAuthorityError
@@ -35,6 +36,8 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.targeted import TargetedReconciler
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.write_journal import WriteJournal
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _EVENT_PEEK_LIMIT = 1000
 

@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 from shared.project_layout import tasks_db
 from shared.task_statuses import ACTIVE
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.metadata_lookup import InvalidMetadataLookupError
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -30,6 +31,8 @@ from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import RESULT_BYTE_BUDGET, create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _SLIM_ROW_KEYS = {'task_id', 'title', 'status', 'priority', 'updated_at'}
 _TOOL = 'find_tasks_by_metadata'

@@ -164,6 +164,22 @@ class _TasksRead:
     project_root: str
     statuses: frozenset[str] | None
     mode: _OnePage | _CompleteRead
+    fields: tuple[str, ...] | None
+
+    def __post_init__(self) -> None:
+        """Refuse a projection :func:`_shape_task` would misread.
+
+        An omitted key reads as absent, so a projection without ``title`` or
+        ``status`` would serve rows titled ``''`` with no status rather than
+        fail. ``None`` asks for whole rows and needs no check.
+        """
+        if self.fields is None:
+            return
+        missing = [key for key in SHAPED_ROW_FIELDS if key not in self.fields]
+        if missing:
+            raise ValueError(
+                f'a projected task read must ask for every key _shape_task reads; missing {missing}',
+            )
 
     def wire_arguments(self) -> dict:
         """Build the MCP ``get_tasks`` arguments for this read.
@@ -173,10 +189,14 @@ class _TasksRead:
         ``None``'s "whole tree", so a truthiness guard would silently widen it.
         It crosses the wire ``sorted()`` — a frozenset has no iteration order,
         and deterministic bytes beat nondeterministic ones for logs and mocks.
+        ``fields`` is already an ordered tuple, so it crosses in the caller's
+        order, guarded on ``is not None`` the same way.
         """
         arguments: dict = {'project_root': self.project_root}
         if self.statuses is not None:
             arguments['statuses'] = sorted(self.statuses)
+        if self.fields is not None:
+            arguments['fields'] = list(self.fields)
         if isinstance(self.mode, _OnePage):
             arguments['page_size'] = self.mode.page_size
             arguments['offset'] = self.mode.offset
@@ -209,6 +229,17 @@ seam that speaks it.
 """
 
 
+SHAPED_ROW_FIELDS: tuple[str, ...] = (
+    'id', 'title', 'status', 'priority', 'dependencies', 'updatedAt',
+    'claimant_run_id', 'heartbeat_at', 'created_at', 'created_at_source',
+)
+"""The top-level wire keys :func:`_shape_task` reads besides ``metadata``.
+
+A projected row read asks for all of them (:class:`_TasksRead` refuses one
+that does not) plus the ``metadata.<key>`` entries its own readers need;
+naming ``metadata`` itself would bring back every metadata key."""
+
+
 def _shape_task(task: dict) -> dict | None:
     """Trim an MCP get_tasks row to the dashboard's persistent shape.
 
@@ -217,10 +248,9 @@ def _shape_task(task: dict) -> dict | None:
     ``updatedAt`` is preserved as ``updated_at`` — it is the recency key for
     ordering done tasks and the ``completed`` display timestamp.
 
-    ``description`` stays because ``redux_api.shape_escalations`` embeds this
-    whole dict as each escalation row's ``task`` and the Escalations drawer
-    renders it; ``details`` is dropped because only the Task Detail pane
-    renders it, and that pane reads it through :func:`fetch_task_prose`.
+    Rows carry no prose: ``description`` and ``details`` are dropped, and the
+    Task Detail pane and the Escalations drawer read them through
+    :func:`fetch_task_prose`.
 
     ``claimant_run_id`` and ``heartbeat_at`` are carried through for the
     STRANDED projection (task 3543 / PRD ι): they are the two columns
@@ -229,6 +259,13 @@ def _shape_task(task: dict) -> dict | None:
     ``.get`` so a pre-migration row (or an older fused-memory that does not
     emit them) surfaces ``None`` rather than raising — the shaped dict always
     carries the keys, so consumers never have to guard for their absence.
+
+    ``created_at`` and ``created_at_source`` are carried through as the
+    task's FILING TIME and the proxy it was learned from (PRD α; vocabulary
+    ``shared/src/shared/task_created_at.py::CreatedAtSource``).  Both are
+    read with ``.get``: a store without the v6 columns omits them and an
+    un-backfilled row serves ``None``, so the shaped dict always carries the
+    keys.
 
     Mutation warning: ``task_snapshot``'s unit cache holds these dicts by
     reference and hands the same objects to every reader within its TTL, so
@@ -258,7 +295,6 @@ def _shape_task(task: dict) -> dict | None:
     return {
         'id': tid,
         'title': task.get('title') or '',
-        'description': task.get('description') or '',
         'status': task.get('status'),
         'priority': task.get('priority'),
         'dependencies': deps,
@@ -266,6 +302,8 @@ def _shape_task(task: dict) -> dict | None:
         'updated_at': task.get('updatedAt'),
         'claimant_run_id': task.get('claimant_run_id'),
         'heartbeat_at': task.get('heartbeat_at'),
+        'created_at': task.get('created_at'),
+        'created_at_source': task.get('created_at_source'),
     }
 
 
@@ -491,6 +529,7 @@ async def fetch_task_page(
     page_size: int,
     offset: int,
     statuses: list[str] | None = None,
+    fields: Sequence[str] | None = None,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch ONE explicit page of *project_root*'s task list via MCP.
@@ -511,18 +550,13 @@ async def fetch_task_page(
     **Ascending id is the only ordering key.**  *page_size*/*offset* are a
     POST-FETCH in-memory slice in ``server/tools.py::get_tasks``, over a list
     already ordered by ascending ``id``.  They cut wire bytes but not backend
-    work.  Two substrate gaps bound what any caller can do here and are
-    recorded as fused-memory-side follow-up rather than faked client-side:
-    ``get_tasks`` offers NO field/column projection (the backend is a
-    hardcoded ``SELECT *`` feeding a fixed 14-key row, so the heavy
-    ``description``/``details``/``testStrategy``/``metadata`` fields cannot be
-    dropped), and NO ``ORDER BY updated_at`` (so "the N most recently updated"
-    is not expressible server-side).  That second gap is why reaching the
-    high-id end takes a COMPUTED *offset* rather than a ``LIMIT``.
+    work.  ``get_tasks`` offers NO ``ORDER BY updated_at``, so "the N most
+    recently updated" is not expressible server-side, which is why reaching
+    the high-id end takes a COMPUTED *offset* rather than a ``LIMIT``.
 
-    *statuses* narrowing, the offline marker, the absence of any cache and the
-    per-request *timeout* budget behave IDENTICALLY here and are documented
-    once on :func:`fetch_tasks`.  Both reads go through the single
+    *statuses* narrowing, the *fields* projection, the offline marker, the
+    absence of any cache and the per-request *timeout* budget behave
+    IDENTICALLY here and are documented once on :func:`fetch_tasks`.  Both reads go through the single
     :func:`_fanout_read` core, so there is deliberately no second copy of that
     policy — or of its description — to drift.
     """
@@ -530,6 +564,7 @@ async def fetch_task_page(
         str(project_root),
         None if statuses is None else frozenset(statuses),
         _OnePage(page_size, offset),
+        None if fields is None else tuple(fields),
     )
     return await _fanout_read(
         client, config, read, timeout=timeout, label='fetch_task_page',
@@ -542,6 +577,7 @@ async def fetch_tasks(
     project_root: str | bytes | os.PathLike[str],
     *,
     statuses: list[str] | None = None,
+    fields: Sequence[str] | None = None,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch the COMPLETE dashboard-shaped task set for *project_root* via MCP.
@@ -585,6 +621,16 @@ async def fetch_tasks(
     two calls differing only in order are ONE read, and the wire bytes stay
     deterministic.
 
+    **Projection.**  *fields* is forwarded as ``get_tasks``' ``fields``
+    argument, in the caller's order, and only when given: ``None`` (the
+    default) asks for whole rows and sends no key.  The contract is
+    ``fused-memory/src/fused_memory/backends/task_projection.py::parse_task_projection``:
+    top-level keys in ``_row_to_task``'s spelling (``updatedAt``), and
+    ``metadata.<key>`` one level deep, with ``id`` always returned.  A
+    projected row's ``metadata`` holds only the requested keys present on the
+    task. A projection must name every :data:`SHAPED_ROW_FIELDS` key, or the
+    read raises ``ValueError`` before anything is sent.
+
     **Per-request budget.** *timeout* is threaded into
     :func:`dashboard.data.memory.mcp_tool_call`, whose docstring is the
     authority: it is a PER-HTTP-REQUEST budget bounding connect/read/write and
@@ -605,6 +651,7 @@ async def fetch_tasks(
         str(project_root),
         None if statuses is None else frozenset(statuses),
         _CompleteRead(),
+        None if fields is None else tuple(fields),
     )
     return await _fanout_read(
         client, config, read, timeout=timeout, label='fetch_tasks',
@@ -729,7 +776,7 @@ async def fetch_statuses(
 
 @dataclass(frozen=True, slots=True)
 class TaskProse:
-    """One task's description and details, as the Task Detail pane renders them."""
+    """One task's description and details, read on demand because task rows omit both."""
 
     description: str
     details: str
@@ -806,7 +853,7 @@ async def _read_task(
 
 
 def _prose_of(result: dict) -> TaskProse:
-    """Missing prose normalises to ``''``, as :func:`_shape_task` does for ``description``."""
+    """Missing prose normalises to ``''``."""
     return TaskProse(result.get('description') or '', result.get('details') or '')
 
 
@@ -826,16 +873,17 @@ async def fetch_task_prose(
     *,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> TaskProseRead:
-    """Read ONE task's description/details for the Tasks tab's Task Detail pane.
+    """Read ONE task's description/details on demand.
 
-    The task rows (``TASKS_SNAPSHOT[p].rows``) omit both fields; the pane
-    fetches them here for the selected task only. Each outcome is its own type
+    The task rows (``TASKS_SNAPSHOT[p].rows``) omit both fields; the Task
+    Detail pane fetches them here for the selected task, and the Escalations
+    drawer for the linked one. Each outcome is its own type
     because the route answers each with a different status:
     :class:`TaskProse`, :class:`TaskNotFound` or :class:`TaskReadOffline`,
     classified by :func:`_read_task`.
 
     *timeout* is per HTTP request; the caller bounds the whole read.
-    Uncached, deliberately: a primary-key lookup fetched only on selection.
+    Uncached, deliberately: a primary-key lookup fetched only when a task is opened.
     """
     return await _read_task(
         client, config, project_root, task_id,

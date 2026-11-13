@@ -15,7 +15,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from escalation.categories import EscalationCategory
-from escalation.models import Escalation
+from escalation.file_or_refresh import RefreshableAlarm, file_or_refresh
 
 from orchestrator.event_store import EventStore, EventType
 
@@ -178,8 +178,11 @@ def _report(
     if escalation_queue is None:
         return
     try:
-        _file_or_refresh_l1(
-            escalation_queue, outcome, fatal=fatal,
+        file_or_refresh(
+            escalation_queue,
+            _step_alarm(outcome.step),
+            summary=_l1_summary(outcome)[:_SUMMARY_LIMIT],
+            detail=_l1_detail(outcome, fatal=fatal),
             filing_claimant_run_id=filing_claimant_run_id,
         )
     except Exception:
@@ -198,37 +201,15 @@ def _event_data(outcome: StepOutcome) -> dict:
     }
 
 
-def _file_or_refresh_l1(
-    queue: EscalationQueue,
-    outcome: StepOutcome,
-    *,
-    fatal: bool,
-    filing_claimant_run_id: str | None,
-) -> None:
-    sentinel = sentinel_task_id(outcome.step)
-    summary = _l1_summary(outcome)[:_SUMMARY_LIMIT]
-    detail = _l1_detail(outcome, fatal=fatal)
-    existing = queue.get_by_task(sentinel, status='pending', level=1)
-    if existing:
-        esc = existing[0]
-        esc.summary = summary
-        esc.detail = detail
-        esc.timestamp = datetime.now(UTC).isoformat()
-        esc.dedupe_count += 1
-    else:
-        esc = Escalation(
-            id=queue.make_id(sentinel),
-            task_id=sentinel,
-            agent_role=_L1_AGENT_ROLE,
-            severity='blocking',
-            level=1,
-            category=EscalationCategory.INFRA_ISSUE,
-            summary=summary,
-            detail=detail,
-            suggested_action='investigate_startup_step',
-            filing_claimant_run_id=filing_claimant_run_id,
-        )
-    queue.submit(esc)
+def _step_alarm(step: str) -> RefreshableAlarm:
+    return RefreshableAlarm(
+        task_id=sentinel_task_id(step),
+        level=1,
+        agent_role=_L1_AGENT_ROLE,
+        severity='blocking',
+        category=EscalationCategory.INFRA_ISSUE,
+        suggested_action='investigate_startup_step',
+    )
 
 
 def _l1_summary(outcome: StepOutcome) -> str:

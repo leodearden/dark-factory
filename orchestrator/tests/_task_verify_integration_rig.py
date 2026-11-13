@@ -811,6 +811,7 @@ class Scene:
         """Start the harness's own merge worker, with the escalation queue run() would give it."""
         self.harness._escalation_queue = EscalationQueue(self.tmp_path / 'escalations')
         await self.harness._start_merge_worker()
+        await self.harness._launch_merge_worker_loop()
         self._worker_started = True
 
     async def stop_worker(self) -> None:

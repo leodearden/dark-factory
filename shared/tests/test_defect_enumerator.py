@@ -25,6 +25,9 @@ from shared.defect_enumerator import (
     main,
 )
 from shared.defects import MalformedDefectRef, NodeId, mint_explore_ref
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REF_A = mint_explore_ref('run1', 1)
 REF_B = mint_explore_ref('run1', 2)

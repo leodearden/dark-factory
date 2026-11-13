@@ -21,6 +21,9 @@ import pytest
 import yaml
 from legibility import config as mod
 from pydantic import ValidationError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 MINIMAL_YAML = textwrap.dedent("""\
     project_id: dark_factory
@@ -262,21 +265,117 @@ class TestCompletionThresholdPct:
         with pytest.raises(ValidationError):
             mod.load_config(_write(tmp_path, text))
 
-    def test_retired_trigger_keys_still_load(self, tmp_path):
-        """extra='allow' keeps a not-yet-migrated project's legibility.yaml
-        loadable; the census trigger names the retired keys instead."""
+
+class TestStrictCensusThresholds:
+    """PRD boundary row 12 (plans/review-all-s21-legibility-pipeline-prd.md):
+    a malformed census threshold fails load_config naming its field and the
+    offending value, so no reader can fall back to a default."""
+
+    @pytest.mark.parametrize(
+        ('census_yaml', 'expected_fragments'),
+        [
+            ('{floor_days: -1}', ['floor_days', 'input_value=-1']),
+            ('{floor_days: true}', ['floor_days', 'input_value=True']),
+            ("{floor_days: '5'}", ['floor_days', "input_value='5'"]),
+            ('{floor_days: 2.5}', ['floor_days', 'input_value=2.5']),
+            ("{novelty_spike: {count: '9'}}", ['count', "input_value='9'"]),
+            ('{novelty_spike: {window_hours: true}}', ['window_hours', 'input_value=True']),
+            ('{completion_threshold_pct: true}', ['completion_threshold_pct', 'input_value=True']),
+            ('{saturation: {dup_rate: 1.5}}', ['dup_rate', 'input_value=1.5']),
+            ('{saturation: {dup_rate: true}}', ['dup_rate', 'input_value=True']),
+            ("{saturation: {dup_rate: '0.9'}}", ['dup_rate', "input_value='0.9'"]),
+            ('{saturation: {consecutive_batches: 0}}', ['consecutive_batches', 'input_value=0']),
+            ("{saturation: {consecutive_batches: '2'}}", ['consecutive_batches', "input_value='2'"]),
+            (
+                '{adjudication: {attach_min_similarity: true}}',
+                ['attach_min_similarity', 'input_value=True'],
+            ),
+            (
+                "{adjudication: {cluster_min_similarity: '0.8'}}",
+                ['cluster_min_similarity', "input_value='0.8'"],
+            ),
+        ],
+    )
+    def test_malformed_value_names_field_and_value(self, tmp_path, census_yaml, expected_fragments):
+        text = MINIMAL_YAML + f'census: {census_yaml}\n'
+        with pytest.raises(ValidationError) as excinfo:
+            mod.load_config(_write(tmp_path, text))
+        message = str(excinfo.value)
+        for fragment in expected_fragments:
+            assert fragment in message
+
+    def test_an_unquoted_int_dup_rate_loads_as_a_float(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {saturation: {dup_rate: 1}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.saturation.dup_rate == 1.0
+        assert isinstance(cfg.census.saturation.dup_rate, float)
+
+    def test_census_block_is_frozen(self):
+        census = mod.Census()
+        with pytest.raises(ValidationError):
+            census.floor_days = 0
+        assert census.floor_days == 5
+
+    def test_novelty_spike_block_is_frozen(self):
+        novelty = mod.NoveltySpike()
+        with pytest.raises(ValidationError):
+            novelty.count = 0
+        assert novelty.count == 4
+
+    def test_saturation_block_is_frozen(self):
+        saturation = mod.Saturation()
+        with pytest.raises(ValidationError):
+            saturation.dup_rate = 0.1
+        assert saturation.dup_rate == 0.9
+
+
+RETIRED_KEYS = ('max_interval_days', 'tasks_landed_threshold', 'tasks_landed_min_days')
+
+
+def _warnings(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.levelname == 'WARNING']
+
+
+class TestRetiredCensusKeys:
+    """PRD boundary row 13: a retired census key (task 6408) is accepted and
+    ignored with ONE warning at load_config, whatever its value."""
+
+    def test_all_three_retired_keys_load_with_one_warning_naming_them(self, tmp_path, caplog):
         text = MINIMAL_YAML + textwrap.dedent("""\
             census:
               max_interval_days: 10
               tasks_landed_threshold: 120
               tasks_landed_min_days: 7
             """)
-        cfg = mod.load_config(_write(tmp_path, text))
+        path = _write(tmp_path, text)
+        with caplog.at_level('WARNING'):
+            cfg = mod.load_config(path)
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1
+        for key in RETIRED_KEYS:
+            assert key in warnings[0]
+        assert 'retired' in warnings[0]
+        assert 'ignored' in warnings[0]
+        assert str(path) in warnings[0]
         assert cfg.census.completion_threshold_pct == 70
-        assert not any(
-            name in type(cfg.census).model_fields
-            for name in ('max_interval_days', 'tasks_landed_threshold', 'tasks_landed_min_days')
-        )
+        extra = cfg.census.model_extra or {}
+        assert not any(key in extra for key in RETIRED_KEYS)
+
+    @pytest.mark.parametrize('junk', ['true', "'ten'", 'null', '[10]'])
+    def test_a_junk_retired_value_still_loads_with_one_warning(self, tmp_path, caplog, junk):
+        text = MINIMAL_YAML + f'census: {{max_interval_days: {junk}}}\n'
+        with caplog.at_level('WARNING'):
+            cfg = mod.load_config(_write(tmp_path, text))
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1
+        assert 'max_interval_days' in warnings[0]
+        assert 'max_interval_days' not in (cfg.census.model_extra or {})
+
+    def test_a_census_block_without_retired_keys_warns_nothing(self, tmp_path, caplog):
+        text = MINIMAL_YAML + 'census: {floor_days: 3}\n'
+        with caplog.at_level('WARNING'):
+            mod.load_config(_write(tmp_path, text))
+        assert _warnings(caplog) == []
 
 
 class TestNoveltySpikeBaseline:
@@ -631,8 +730,10 @@ class TestShippedDarkFactoryConfig:
         assert cfg.sampling.top_fraction == 0.12
         assert cfg.sampling.per_stratum_min == 2
 
-    def test_shipped_config_census_and_models_nonempty(self):
-        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+    def test_shipped_config_census_and_models_nonempty(self, caplog):
+        with caplog.at_level('WARNING'):
+            cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert _warnings(caplog) == [], 'the shipped config carries a retired key'
         assert cfg.census.completion_threshold_pct == 70
         assert cfg.census.floor_days > 0
         assert cfg.models.trickle

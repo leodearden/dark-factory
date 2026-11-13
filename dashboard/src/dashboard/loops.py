@@ -4,6 +4,7 @@ The dashboard writes its own history: ``_burndown_loop`` writes one value
 or gap row per project from the task snapshot unit, ``_metrics_loop``
 snapshots orchestrator/queue metrics, and ``_quality_loop`` writes one
 value or gap sample per git-checkout project plus its new landing rows,
+then refreshes that project's stored marker derivation,
 each on a fixed interval aligned to the wall clock so samples from separate
 processes land on the same tick boundaries. Each owns a writable WAL-mode
 SQLite store and checkpoints it periodically so the WAL cannot grow without
@@ -49,8 +50,9 @@ from dashboard.data.metrics import (
     collect_metrics_snapshot,
     downsample_metrics,
 )
+from dashboard.data.quality_marker_sampler import refresh_markers
 from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS, collect_quality
-from dashboard.data.quality_store import QUALITY_SCHEMA
+from dashboard.data.quality_store import QUALITY_SCHEMA, ensure_marker_tables
 from dashboard.project_dbs import _project_scoped_dbs_labeled
 
 logger = logging.getLogger(__name__)
@@ -125,6 +127,20 @@ class _QualityStore(AsyncSqliteBase):
     def connection(self) -> aiosqlite.Connection:
         """Public accessor for the open connection; raises RuntimeError if not opened."""
         return self._require_conn()
+
+    async def open(self) -> None:
+        """Open, then reshape a markers table older than the marker producer.
+
+        Runs before ``_quality_loop`` can write a marker, and closes the connection on failure
+        so a half-open store is never left behind.
+        """
+        await super().open()
+        try:
+            await ensure_marker_tables(self.connection)
+            await self.connection.commit()
+        except BaseException:
+            await self.close()
+            raise
 
 
 async def _sleep_to_aligned_tick(interval: int) -> None:
@@ -265,16 +281,26 @@ async def _metrics_loop(
             logger.warning('Metrics snapshot error', exc_info=True)
 
 
-async def _quality_loop(store: _QualityStore, config: DashboardConfig) -> None:
-    """Each tick, write one quality sample per git-checkout project root.
+async def _refresh_quality_markers(store: _QualityStore, config: DashboardConfig) -> None:
+    """The marker tick, guarded on its own so that neither tick's failure stops the other."""
+    try:
+        await refresh_markers(store.connection, config.all_project_roots)
+    except Exception:
+        logger.warning('Quality marker refresh failed', exc_info=True)
 
-    Delegates to ``collect_quality``. ``store`` and ``config`` are the
-    lifespan's own handles, never re-read from ``app.state`` (task 3771).
+
+async def _quality_loop(store: _QualityStore, config: DashboardConfig) -> None:
+    """Each tick, write one quality sample per git-checkout project root, then refresh its markers.
+
+    Delegates to ``collect_quality`` and then ``refresh_markers``. ``store``
+    and ``config`` are the lifespan's own handles, never re-read from
+    ``app.state`` (task 3771).
     """
     try:
         await collect_quality(store.connection, config.all_project_roots)
     except Exception:
         logger.warning('Initial quality snapshot failed', exc_info=True)
+    await _refresh_quality_markers(store, config)
     last_checkpoint = 0.0
     while True:
         await _sleep_to_aligned_tick(QUALITY_SAMPLE_INTERVAL_SECONDS)
@@ -289,3 +315,4 @@ async def _quality_loop(store: _QualityStore, config: DashboardConfig) -> None:
                 last_checkpoint = now
         except Exception:
             logger.warning('Quality snapshot error', exc_info=True)
+        await _refresh_quality_markers(store, config)

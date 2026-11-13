@@ -11,6 +11,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -117,6 +118,13 @@ _MEMORY_CLOSE_STEP_TIMEOUT = 20.0
 # Worst case (Fix A): drain(5)+close(5)+sqlite_watchdog(5)+event_queue(5)
 # +harness_cancel(25)+memory_close(20)+journal_close(5) = 70s; +5s headroom = 75.
 _FORCE_EXIT_BUDGET = 75.0
+
+# A repeat stop signal this soon after the first is the same stop delivered
+# twice; the measurement behind the value is in the module docstring of
+# fused-memory/tests/test_server_shutdown.py. Must stay below the drain, or a
+# deliberate second signal could not force exit during it. Enforced by
+# TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
+_OPERATOR_STOP_REPEAT_WINDOW_SECS = 3.0
 
 # Mirrors TimeoutStopSec=90 in the committed systemd unit template
 # (scripts/fused-memory.service.template). Invariant (survey finding D1):
@@ -638,8 +646,8 @@ async def run_server():
         ScopeViolationEscalator,
     )
     from fused_memory.models.scope import (
-        build_known_projects_map,
-        known_project_roots_from_env,
+        configured_known_projects_map,
+        configured_primary_root,
     )
 
     curator_escalator = CuratorEscalator(
@@ -652,17 +660,12 @@ async def run_server():
     # configured falls back to the built-in single-project dark_factory
     # registry (ProjectPrefixRegistry.default(), task 2208) — the guard
     # always runs, just against a smaller registry.
-    _primary_root = (
-        config.taskmaster.project_root if config.taskmaster else ''
-    ) or ''
-    if _primary_root:
-        _primary_root = str(Path(_primary_root).expanduser().resolve())
-    _extra_roots = known_project_roots_from_env()
-    # Single source of truth for the project registry — derived once and used to
-    # build the path-scope guard (ProjectPrefixRegistry), then passed through to
-    # ReconciliationHarness and TicketJanitor so all three consumers share the
-    # same snapshot (task 1164).
-    _known_projects_map = build_known_projects_map(_primary_root, _extra_roots)
+    _primary_root = configured_primary_root(config.taskmaster)
+    # The registry's derivation rule lives in
+    # models/scope.py::configured_known_projects_map (GraphitiBackend calls it
+    # too).  This SNAPSHOT is shared with ProjectPrefixRegistry, MemoryService,
+    # ReconciliationHarness and TicketJanitor (task 1164).
+    _known_projects_map = configured_known_projects_map(config.taskmaster)
     # Task 3088: the same snapshot, injected into MemoryService so update_memory's
     # storm escalator can resolve a project_root. Deliberately HERE — before the
     # `if config.reconciliation ... enabled:` block below — because the alarm is
@@ -722,7 +725,8 @@ async def run_server():
     # Stage-2 LLM adjudicator for path-scope guard (task 1822): wired only in
     # multi-project mode when config.path_scope_adjudicator.enabled is True.
     # In single-project/back-compat mode the adjudicator is None and the guard
-    # behaves exactly as before (heuristic-only, not weakened).
+    # behaves exactly as before (heuristic-only, not weakened).  It borrows the
+    # curator's gate and ledger store; _graceful_shutdown keeps owning the store's close.
     path_scope_adjudicator = None
     if _multi_project_mode and config.path_scope_adjudicator.enabled:
         from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
@@ -730,6 +734,7 @@ async def run_server():
         path_scope_adjudicator = PathScopeAdjudicator(
             config.path_scope_adjudicator,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             cwd=Path(_primary_root) if _primary_root else None,
             scope_violation_escalator=scope_violation_escalator,
         )
@@ -1958,18 +1963,16 @@ def _build_ticket_janitor(
 ) -> TicketJanitor | None:
     """The ticket janitor, wired to drain parked tickets through *task_interceptor*; None when disabled."""
     from fused_memory.middleware.ticket_janitor import TicketJanitor
+    from fused_memory.models.scope import configured_primary_root
 
     janitor_cfg = getattr(config.curator, 'janitor', None)
     if janitor_cfg is None or not janitor_cfg.enabled:
         return None
-    primary_root = (config.taskmaster.project_root if config.taskmaster else '') or ''
-    if primary_root:
-        primary_root = str(Path(primary_root).expanduser().resolve())
     return TicketJanitor(
         ticket_store,
         cooldown_secs=janitor_cfg.cooldown_seconds,
         batch_limit=janitor_cfg.batch_limit,
-        primary_project_root=primary_root,
+        primary_project_root=configured_primary_root(config.taskmaster),
         liveness_probe=task_interceptor.is_worker_alive if task_interceptor is not None else None,
         signal_ticket_resolved=(
             task_interceptor._signal_ticket_event if task_interceptor is not None else None
@@ -2116,54 +2119,77 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 def _install_tool_dispatch_guards(
     mcp: Any, *, known_projects: dict[str, str] | None = None
 ) -> None:
-    """Install both ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+    """Install the three ``ToolManager.call_tool`` wrappers, in the ONE order that works.
 
-    Two independent concerns share this chokepoint, and the order they are
-    installed in is not cosmetic — it decides which one ends up OUTSIDE, and
-    therefore what the caller sees when both fire:
+    Three independent concerns share this chokepoint, and the order they are
+    installed in is not cosmetic — each call wraps whatever ``call_tool`` it
+    finds, so the order decides which one ends up OUTSIDE, and therefore what
+    the caller sees when more than one fires:
 
-    1. :func:`_install_safe_tool_wrapper` — defence-in-depth. Catches
-       BaseException escapes (SystemExit, BaseExceptionGroup, ...) that would
-       otherwise poison StreamableHTTPSessionManager's shared task group and
-       cascade into uvicorn's main loop. Re-raises CancelledError, which
+    1. :func:`_install_safe_tool_wrapper` — defence-in-depth, INNERMOST.
+       Catches BaseException escapes (SystemExit, BaseExceptionGroup, ...) that
+       would otherwise poison StreamableHTTPSessionManager's shared task group
+       and cascade into uvicorn's main loop. Re-raises CancelledError, which
        asyncio cancellation semantics require.
-    2. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
+    2. :func:`~fused_memory.server.unknown_argument_guard.install_unknown_argument_guard`
+       — refuses a call naming an argument the tool does not declare, which
+       the bundled FastMCP would otherwise drop silently (task 4867).
+    3. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
        write-boundary markup guard (task 4458, PRD
-       ``plans/toolcall-markup-containment-prd.md``). Rejects a call whose
-       argument absorbed MCP tool-call envelope markup and hands the caller a
-       ``repaired_call`` to resubmit verbatim.
+       ``plans/toolcall-markup-containment-prd.md``), OUTERMOST. Rejects a call
+       whose argument absorbed MCP tool-call envelope markup and hands the
+       caller a ``repaired_call`` to resubmit verbatim.
 
-    DO NOT tidy these two calls into the other order. The guard REJECTS by
-    raising :class:`fastmcp.exceptions.ToolError` — measured as the only shape
-    that survives every output schema, since a returned dict is destroyed by
-    the output validation of any tool annotated ``-> str``. Installed second it
-    is the OUTER wrapper, so that ToolError reaches the lowlevel server intact.
-    Installed FIRST it ends up inside ``_safe_call_tool``, which catches
-    BaseException and flattens the rejection into its own
-    ``{'error': str, 'error_type': 'ToolError'}`` shape: ``repaired_call``
-    stops being a key the caller can read and survives only as text inside an
-    opaque string, so the agent cannot resubmit the repair.
+    DO NOT tidy these calls into another order. Both guards REJECT by raising
+    :class:`fastmcp.exceptions.ToolError` — measured as the only shape that
+    survives every output schema, since a returned dict is destroyed by the
+    output validation of any tool annotated ``-> str``. A guard installed
+    BEFORE ``_install_safe_tool_wrapper`` ends up inside ``_safe_call_tool``,
+    which catches BaseException and flattens the rejection into its own
+    ``{'error': str, 'error_type': 'ToolError'}`` shape: the structured payload
+    survives only as text inside an opaque string.
 
     Nor can that be fixed by teaching ``_safe_call_tool`` to re-raise ToolError:
     the bundled ``Tool.run`` wraps EVERY tool-body exception into ToolError, so
     such an exemption would gut the containment ``tests/test_tool_safe_wrapper.py``
     pins. Order is the whole mechanism.
 
+    The unknown-argument guard sits INSIDE the markup guard because the markup
+    remedy, ``metadata={'allow_mcp_markup': True}``, is legal on every tool:
+    on a tool that declares no ``metadata`` the markup guard strips it before
+    forwarding, so the unknown-argument guard must see the post-strip call.
+
     *known_projects* is run_server's ``project_id -> project_root`` registry,
-    which the guard's storm-escalation sink uses to place a burst in the right
-    queue.
+    which the markup guard's storm-escalation sink uses to place a burst in the
+    right queue.
 
     REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
     C2), declared HERE at the interception point rather than inferred per tool
-    (INV-1). This is also the primary server only: the recon-report server
-    hosts no write tools and keeps the bare defence-in-depth wrapper.
+    (INV-1). The recon-report server hosts no write tools and gets no markup
+    guard; it gets the other two through :func:`_install_recon_report_guards`.
     """
+    from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
+
     _install_safe_tool_wrapper(mcp)
+    install_unknown_argument_guard(mcp)
     install_markup_guard(
         mcp,
         policy=RepairPolicy.REJECT_WITH_REPAIR,
         known_projects=known_projects,
     )
+
+
+def _install_recon_report_guards(mcp: Any) -> None:
+    """The recon-report server's wrappers: the safe wrapper inside, the unknown-argument guard outside.
+
+    Recon LLM agents call its cite_* and report tools over MCP, so a misnamed
+    argument there is dropped exactly as on the primary server. Order: see
+    :func:`_install_tool_dispatch_guards`.
+    """
+    from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
+
+    _install_safe_tool_wrapper(mcp)
+    install_unknown_argument_guard(mcp)
 
 
 def _build_uvicorn_config(
@@ -2276,7 +2302,7 @@ def _build_recon_report_components(
         state.known_projects = known_projects
 
     mcp = create_recon_report_server(state)
-    _install_safe_tool_wrapper(mcp)
+    _install_recon_report_guards(mcp)
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.recon_report_port
@@ -2299,45 +2325,45 @@ def _build_recon_report_components(
     return state, mcp, uv_config
 
 
-def _make_operator_stop_callback(*servers: Any) -> Callable[[], None]:
-    """Return a callback implementing graceful-then-forced shutdown escalation.
+def _make_operator_stop_callback(
+    *servers: Any,
+    clock: Callable[[], float] = time.monotonic,
+    repeat_window_secs: float = _OPERATOR_STOP_REPEAT_WINDOW_SECS,
+) -> Callable[[], None]:
+    """Return the ``on_operator_stop`` callback that stops every server together.
 
-    Used as the ``on_operator_stop`` argument to :func:`_install_operator_stop_handler`
-    so that a SIGTERM/SIGINT signal stops **both** the primary uvicorn.Server
-    and the recon_report uvicorn.Server simultaneously.
-
-    Without this, ``asyncio.gather(server.serve(), recon_server.serve())`` never
-    resolves on operator shutdown because only the primary server's ``should_exit``
-    flag was flipped — the recon_report server kept running, blocking the gather,
-    and ``run_server()`` hung until SIGKILL.
-
-    Stateful second-signal escalation (survey finding D1, second gap): the 1st
-    invocation sets only ``should_exit = True`` (graceful). The 2nd and every
-    subsequent invocation additionally sets ``force_exit = True``. This mirrors
-    uvicorn's own default signal handler contract (1st SIGINT/SIGTERM graceful,
-    2nd forces immediate exit) — a contract otherwise lost here because
-    ``install_signal_handlers`` is neutered, leaving an operator with no way to
-    force-exit a wedged shutdown without this escalation.
-
-    Args:
-        *servers: Zero or more server objects exposing writable ``should_exit``
-            and ``force_exit`` attributes (typically :class:`uvicorn.Server`
-            instances, but any object with the attributes works — including
-            test fakes).
-
-    Returns:
-        A zero-argument callable that flips ``should_exit`` (and, from the 2nd
-        call onward, ``force_exit``) to ``True`` on each server.
+    The first signal drains: it sets ``should_exit`` on each server. A repeat
+    arriving within ``repeat_window_secs`` of the FIRST signal is the same stop
+    delivered twice and is ignored. A later signal also sets ``force_exit``,
+    keeping uvicorn's deliberate-second-Ctrl-C escape hatch, which is otherwise
+    lost because ``install_signal_handlers`` is neutered. Contract pinned by
+    fused-memory/tests/test_operator_signal_handler.py::TestOperatorStopCallbackForceExit.
     """
-    call_count = 0
+    first_signal_at: float | None = None
 
     def _stop() -> None:
-        nonlocal call_count
-        call_count += 1
+        nonlocal first_signal_at
+        now = clock()
+        if first_signal_at is None:
+            first_signal_at = now
+            for s in servers:
+                s.should_exit = True
+            return
+        since_first = now - first_signal_at
+        if since_first < repeat_window_secs:
+            logger.info(
+                'Repeat stop signal %.3f s after the first ignored as a duplicate delivery',
+                since_first,
+            )
+            return
+        logger.warning(
+            'Second stop signal %.3f s after the first: forcing exit without '
+            'draining in-flight requests',
+            since_first,
+        )
         for s in servers:
             s.should_exit = True
-            if call_count >= 2:
-                s.force_exit = True
+            s.force_exit = True
 
     return _stop
 

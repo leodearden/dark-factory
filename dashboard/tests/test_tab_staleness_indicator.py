@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 _TESTID = 'endpoint-stale-banner'
 

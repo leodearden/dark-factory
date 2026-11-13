@@ -16,13 +16,14 @@ from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
-from _git_fixtures import seed_repo
+from _git_fixtures import _git, seed_repo
 from _orch_helpers import (
     NonIsolatedGitRepoError,
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
+from shared.merge_subject import format_merge_subject
 
 from orchestrator import git_ops as git_ops_module
 from orchestrator.artifacts import TaskArtifacts
@@ -35,6 +36,7 @@ from orchestrator.git_ops import (
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     CommitEffectProbe,
     GitOps,
+    GitQueryFailed,
     MergeParkContentionError,
     MergeParkError,
     MergeParkLockContentionError,
@@ -45,7 +47,6 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _assert_no_conflict_markers,
     _git_stderr_is_unresolved_ref,
-    _merge_subject,
     _run,
 )
 from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
@@ -4307,7 +4308,7 @@ class TestMergeMarkerIndex:
     async def test_index_and_direct_scan_agree(self, git_ops: GitOps):
         """Indexed lookup == direct scan, for both a hit and a miss."""
         repo = git_ops.project_root
-        marker = _merge_subject('task/agree', git_ops.config.main_branch)
+        marker = format_merge_subject('task/agree', git_ops.config.main_branch)
         sha = await _seed_on_main(repo, {'agree.txt': 'x\n'}, marker)
 
         assert await git_ops.find_merge_marker('task/agree') == sha
@@ -4320,7 +4321,7 @@ class TestMergeMarkerIndex:
         """A hand-written ``Merge task/x: ...`` subject is not a marker.
 
         dark-factory's main carries 46 such commits against 2,972 canonical
-        ones.  They do not match ``_merge_subject``'s ``into <main>`` shape and
+        ones.  They do not match ``format_merge_subject``'s ``into <main>`` shape and
         are invisible to the grep, so the index must not surface them either.
         """
         repo = git_ops.project_root
@@ -4343,7 +4344,7 @@ class TestMergeMarkerIndex:
         # Builds an index at a main sha that has no such marker.
         assert await git_ops.find_merge_marker('task/later') is None
 
-        marker = _merge_subject('task/later', git_ops.config.main_branch)
+        marker = format_merge_subject('task/later', git_ops.config.main_branch)
         sha = await _seed_on_main(repo, {'later.txt': 'x\n'}, marker)
 
         assert await git_ops.find_merge_marker('task/later') == sha
@@ -4375,7 +4376,7 @@ class TestMergeMarkerIndex:
     ):
         """A failed index build degrades to the direct scan, not to a wrong answer."""
         repo = git_ops.project_root
-        marker = _merge_subject('task/fallback', git_ops.config.main_branch)
+        marker = format_merge_subject('task/fallback', git_ops.config.main_branch)
         sha = await _seed_on_main(repo, {'fb.txt': 'x\n'}, marker)
 
         async def _no_index(self: GitOps) -> dict[str, str] | None:
@@ -4399,7 +4400,7 @@ class TestMergeMarkerIndex:
             'orchestrator.git_ops._MERGE_MARKER_INDEX_RECHECK_SECS', 0.0,
         )
         repo = git_ops.project_root
-        marker = _merge_subject('task/flaky', git_ops.config.main_branch)
+        marker = format_merge_subject('task/flaky', git_ops.config.main_branch)
         sha = await _seed_on_main(repo, {'flaky.txt': 'x\n'}, marker)
 
         real = GitOps._build_merge_marker_index
@@ -4419,17 +4420,6 @@ class TestMergeMarkerIndex:
         # Second call: build succeeds and is cached — no failure was pinned.
         assert await git_ops.find_merge_marker('task/flaky') == sha
         assert git_ops._merge_marker_index is not None
-
-    async def test_pattern_is_derived_from_merge_subject(self, git_ops: GitOps):
-        """The index's regex tracks _merge_subject rather than a hard-coded format."""
-        from orchestrator.git_ops import _merge_marker_pattern
-
-        pattern = _merge_marker_pattern(git_ops.config.main_branch)
-        subject = _merge_subject('task/derived', git_ops.config.main_branch)
-        match = pattern.search(subject)
-
-        assert match is not None
-        assert match.group(1) == 'task/derived'
 
 
 async def _quote_marker_in_body(repo: Path, marker: str) -> None:
@@ -4487,7 +4477,7 @@ async def _wrapped_first_paragraph(repo: Path, task_id: str, marker: str) -> str
 @pytest.mark.asyncio
 class TestMergeMarkerIsExactSubject:
     """A marker is a commit whose git subject (``%s``) equals
-    ``_merge_subject(branch, main_branch)``; the body and the parent count are
+    ``format_merge_subject(branch, main_branch)``; the body and the parent count are
     never consulted (task 5765).
     """
 
@@ -4515,7 +4505,7 @@ class TestMergeMarkerIsExactSubject:
         repo = git_ops.project_root
         task_id = '5765'
         branch = f'task/{task_id}'
-        marker = _merge_subject(branch, git_ops.config.main_branch)
+        marker = format_merge_subject(branch, git_ops.config.main_branch)
 
         expected = await build(repo, task_id, marker)
 
@@ -6707,9 +6697,9 @@ class TestFindTaskCitationCommit:
 @pytest.mark.asyncio
 class TestMergeSubjectContract:
     """End-to-end contract: the merge subject written to main by merge_to_main
-    equals _merge_subject output, and find_merge_marker locates that commit.
+    equals format_merge_subject output, and find_merge_marker locates that commit.
 
-    If either the writer or reader drifts from _merge_subject (e.g. an inline
+    If either the writer or reader drifts from format_merge_subject (e.g. an inline
     f-string replaces the helper call with a different format), at least one of
     the two roundtrip assertions will fail.
     """
@@ -6717,7 +6707,7 @@ class TestMergeSubjectContract:
     async def test_merge_subject_roundtrip(
         self, git_ops: GitOps
     ) -> None:
-        """Assert the on-main subject equals _merge_subject output and that
+        """Assert the on-main subject equals format_merge_subject output and that
         find_merge_marker returns the same SHA.
         """
         tid = 'contract-1'
@@ -6744,34 +6734,11 @@ class TestMergeSubjectContract:
             ['git', 'log', '--format=%s', '-n', '1', result.merge_commit],
             cwd=git_ops.project_root,
         )
-        assert subject == _merge_subject(full_branch, git_ops.config.main_branch)
+        assert subject == format_merge_subject(full_branch, git_ops.config.main_branch)
 
         # find_merge_marker must locate the same commit
         marker_sha = await git_ops.find_merge_marker(full_branch)
         assert marker_sha == result.merge_commit
-
-
-class TestMergeSubject:
-    """Unit tests for the _merge_subject helper.
-
-    Locks the canonical format: 'Merge {branch} into {main_branch}'.
-    This helper is the single source of truth consumed by merge_to_main,
-    advance_main (retry path), and find_merge_marker.
-    """
-
-    @pytest.mark.parametrize(
-        'branch, main_branch, expected',
-        [
-            ('task/1', 'main', 'Merge task/1 into main'),
-            ('task/123', 'main', 'Merge task/123 into main'),
-            ('task/v1.0', 'develop', 'Merge task/v1.0 into develop'),
-        ],
-    )
-    def test_canonical_format(
-        self, branch: str, main_branch: str, expected: str
-    ) -> None:
-        """_merge_subject returns 'Merge {branch} into {main_branch}'."""
-        assert _merge_subject(branch, main_branch) == expected
 
 
 @pytest.mark.asyncio
@@ -7780,7 +7747,7 @@ class TestFindInflightMergeWorktree:
     """Tests for GitOps.find_inflight_merge_worktree(branch).
 
     Uses real _merge-* worktrees created by merge_to_main, verified via HEAD
-    subject matching against _merge_subject.
+    subject matching against format_merge_subject.
     """
 
     async def _make_branch_with_commit(
@@ -9067,55 +9034,81 @@ class TestParseDiffLineRanges:
 
 @pytest.mark.asyncio
 class TestGetChangedLineRanges:
-    """Unit tests for GitOps.get_changed_line_ranges."""
+    """PRD merge-pre-verify-screen §7 S1.3 ref: real git, not a mocked ``_run``."""
 
-    async def test_invokes_correct_git_command(self, git_config, git_repo):
-        """Verify that git diff is called with main...ref --unified=0 --no-color."""
-        ops = GitOps(git_config, git_repo)
-        ref = 'task/123'
+    @staticmethod
+    def _commit_on(repo: Path, branch: str, name: str, text: str = 'changed\n') -> None:
+        _git(repo, 'checkout', '-q', '-b', branch, 'main')
+        (repo / name).write_text(text)
+        _git(repo, 'add', name)
+        _git(repo, 'commit', '-q', '-m', f'add {name}')
+        _git(repo, 'checkout', '-q', 'main')
 
-        captured_cmds: list[list[str]] = []
-
-        async def mock_run(cmd, cwd=None):
-            captured_cmds.append(cmd)
-            return (0, CANNED_DIFF_TWO_FILES, '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            await ops.get_changed_line_ranges(ref)
-
-        assert len(captured_cmds) == 1
-        cmd = captured_cmds[0]
-        assert 'git' in cmd
-        assert 'diff' in cmd
-        assert f'{git_config.main_branch}...{ref}' in cmd
-        assert '--unified=0' in cmd
-        assert '--no-color' in cmd
-
-    async def test_returns_parsed_ranges(self, git_config, git_repo):
-        """Verify the returned dict matches parse_diff_line_ranges output."""
-        from orchestrator.git_ops import parse_diff_line_ranges
-        ops = GitOps(git_config, git_repo)
-        ref = 'task/456'
-
-        async def mock_run(cmd, cwd=None):
-            return (0, CANNED_DIFF_TWO_FILES, '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await ops.get_changed_line_ranges(ref)
-
-        expected = parse_diff_line_ranges(CANNED_DIFF_TWO_FILES)
-        assert result == expected
-
-    async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
+    async def test_returns_exact_old_side_ranges_whatever_the_colour_config(
+        self, git_config, git_repo,
+    ):
+        lines = [f'line {n}\n' for n in range(1, 11)]
+        (git_repo / 'lines.txt').write_text(''.join(lines))
+        _git(git_repo, 'add', 'lines.txt')
+        _git(git_repo, 'commit', '-q', '-m', 'add lines.txt')
+        lines[4] = 'line 5 changed\n'
+        self._commit_on(git_repo, 'task/31', 'lines.txt', ''.join(lines))
+        _git(git_repo, 'config', 'color.ui', 'always')
         ops = GitOps(git_config, git_repo)
 
-        async def mock_run(cmd, cwd=None):
-            return (0, '', '')
+        result = await ops.get_changed_line_ranges('31')
 
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await ops.get_changed_line_ranges('task/789')
+        assert result == {'lines.txt': [(5, 5)]}
 
-        assert result == {}
+    async def test_branch_with_no_commits_returns_empty_dict(self, git_config, git_repo):
+        _git(git_repo, 'branch', 'task/789', 'main')
+        ops = GitOps(git_config, git_repo)
+
+        assert await ops.get_changed_line_ranges('789') == {}
+
+    async def test_bare_id_diffs_the_task_branch_not_a_same_named_ref(self, git_config, git_repo):
+        self._commit_on(git_repo, 'task/5563', 'task_file.txt')
+        self._commit_on(git_repo, '5563', 'unrelated_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('5563')
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_bare_id_never_resolves_as_an_abbreviated_commit_sha(
+        self, git_config, git_repo,
+    ):
+        self._commit_on(git_repo, 'scratch', 'unrelated_file.txt')
+        abbrev = subprocess.run(
+            ['git', 'rev-parse', '--short=7', 'scratch'],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _git(git_repo, 'branch', '-q', '-D', 'scratch')
+        self._commit_on(git_repo, f'task/{abbrev}', 'task_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges(abbrev)
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_prefixed_ref_still_works(self, git_config, git_repo):
+        self._commit_on(git_repo, 'task/77', 'task_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('task/77')
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_missing_ref_raises_naming_ref_rc_and_stderr(self, git_config, git_repo):
+        ops = GitOps(git_config, git_repo)
+
+        with pytest.raises(GitQueryFailed) as excinfo:
+            await ops.get_changed_line_ranges('9999')
+
+        message = str(excinfo.value)
+        assert 'main...task/9999' in message
+        assert 'exited 128' in message
+        assert 'task/9999' in message.partition('exited 128')[2]
 
 
 # ---------------------------------------------------------------------------

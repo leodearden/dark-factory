@@ -39,6 +39,7 @@ from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     MetadataNotAnObjectError,
     MetadataTooDeepError,
+    NoFieldsToUpdateError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
@@ -1670,6 +1671,60 @@ async def test_stamp_audit_metadata_persists_and_preserves_sibling_keys(backend,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'fields',
+    [
+        pytest.param({}, id='empty'),
+        pytest.param({'pending_since': '2000-01-01T00:00:00.000Z'}, id='only-pending_since'),
+        pytest.param(
+            {'pending_since': 'x', 'pending_since_backfilled': True},
+            id='only-machine-authored-keys',
+        ),
+    ],
+)
+async def test_stamp_audit_metadata_with_nothing_to_write_raises_and_writes_nothing(
+    backend, project_root, fields,
+):
+    """Task 4867: a stamp whose SANITISED fields are empty is the same false
+    success as a fieldless update_task (it rewrote the unchanged blob, bumped
+    ``updated_at`` and reported 'Stamped audit metadata'), so it raises the
+    same class, naming this operation."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'files': ['src/a.py']}),
+    )
+    before = await backend.get_task('1', project_root=project_root)
+    await asyncio.sleep(0.01)
+
+    with pytest.raises(NoFieldsToUpdateError) as exc:
+        await backend.stamp_audit_metadata('1', project_root, fields)
+
+    assert exc.value.operation == 'stamp_audit_metadata'
+    assert exc.value.task_id == '1'
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'stamp_audit_metadata' in str(exc.value)
+    assert await backend.get_task('1', project_root=project_root) == before
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_machine_authored_keys_do_not_block_a_real_field(
+    backend, project_root,
+):
+    """Only the sanitised remainder counts: a writable key beside a stripped
+    one still stamps, and the stripped one is not persisted."""
+    await backend.add_task(project_root=project_root, title='x')
+
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': 'merged', 'commit': 'abc'}, 'pending_since': 'forged'},
+    )
+
+    metadata = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert metadata['done_provenance'] == {'kind': 'merged', 'commit': 'abc'}
+    assert metadata.get('pending_since') != 'forged'
+
+
+@pytest.mark.asyncio
 async def test_stamp_audit_metadata_second_stamp_merges_without_dropping_earlier(backend, project_root):
     """A second stamp (e.g. reopen_* fields) merges in without erasing the
     done_provenance a prior stamp wrote."""
@@ -3077,7 +3132,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after migration; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
     )
@@ -3095,7 +3150,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 5."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 6."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -3122,13 +3177,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 5
+    assert user_version == 6
     assert 'parent_id' not in tasks_cols
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_6(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -3154,7 +3209,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 5, f'Fresh DB should have user_version=5; got {user_version}'
+    assert user_version == 6, f'Fresh DB should have user_version=6; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
     )
@@ -3252,7 +3307,7 @@ async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
     )
-    assert user_version == 5, f'Expected user_version=5 after v1->v5 migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after v1->v6 migration; got {user_version}'
 
 
 def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
@@ -3521,7 +3576,7 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     # residual audit over the same rows is trivially clean too, so the chain
     # runs on past v4 (index built) to the v4->v5 pending_since back-fill
     # rather than stopping at v3.
-    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after migration; got {user_version}'
 
     # Exactly one audit record, at INFO (not WARNING), naming duplicate_groups=0.
     audit_records = [r for r in caplog.records if 'duplicate_groups=' in r.message]
@@ -3885,7 +3940,7 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
     assert after[11] is None
 
     # (e) the chain lands at the new top.
-    assert user_version == 5, f'Expected user_version=5; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6; got {user_version}'
 
     # (f) exactly one line, reporting the COUNT -- the migration reporting N is
     # part of the user-observable signal (PRD boundary row 3).
@@ -3937,7 +3992,7 @@ async def test_v4_to_v5_backfill_is_a_no_op_on_reopen(tmp_path, caplog):
     after_second, user_version = _read_backfill_state(db_path)
     assert after_second == after_first, 'a second open must touch no row'
     assert [r.getMessage() for r in caplog.records if 'v4->v5' in r.getMessage()] == []
-    assert user_version == 5
+    assert user_version == 6
 
 
 @pytest.mark.asyncio
@@ -4069,8 +4124,8 @@ async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     assert 'tag' in index_sql and 'candidate_key' in index_sql, index_sql
     # (d) the version advances past 4 on a clean build -- the v3->v4 step
     # stamps 4 and the chain then runs the v4->v5 back-fill to the top.
-    assert user_version == 5, (
-        f'Expected user_version=5 after clean v3->v4 migration + chain; got {user_version}'
+    assert user_version == 6, (
+        f'Expected user_version=6 after clean v3->v4 migration + chain; got {user_version}'
     )
 
 
@@ -4317,8 +4372,8 @@ async def test_v3_to_v4_self_heal_cancels_non_canonical_and_builds_index(
     assert 'ux_tasks_candidate_key' in indexes, (
         f'Expected the index to be built once the residual is self-healed; got {indexes}'
     )
-    assert user_version == 5, (
-        f'Expected user_version=5 after a fully self-healed residual; got {user_version}'
+    assert user_version == 6, (
+        f'Expected user_version=6 after a fully self-healed residual; got {user_version}'
     )
 
     # (e) nothing ambiguous here — the escalation callback must NOT fire.
@@ -7708,6 +7763,149 @@ async def test_update_task_invalid_metadata_mode_always_raises(
             metadata_mode='bogus',
         )
     assert exc2.value.code == 'TASKMASTER_TOOL_ERROR'
+
+
+# ── fieldless update_task is refused (task 4867) ──
+
+
+async def _updated_at(backend, project_root, task_id='1') -> str:
+    task = await backend.get_task(task_id, project_root=project_root)
+    return task['updatedAt']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'ignored_arguments',
+    [
+        pytest.param({}, id='nothing-at-all'),
+        pytest.param({'append': True}, id='append-only'),
+        pytest.param({'append': False}, id='append-false-only'),
+        pytest.param({'metadata_mode': 'merge'}, id='metadata_mode-only'),
+        pytest.param({'tag': 'master'}, id='tag-only'),
+        pytest.param(
+            {'append': True, 'metadata_mode': 'additive', 'tag': 'master'},
+            id='every-non-mutating-parameter',
+        ),
+    ],
+)
+async def test_update_task_with_no_mutating_field_raises_and_writes_nothing(
+    backend, project_root, ignored_arguments,
+):
+    """A call whose only arguments are non-mutating must fail loudly.
+
+    Two L2 escalations (esc-3147-7, esc-3671-7) came from a caller's
+    misnamed ``metadata`` argument being dropped: the call wrote nothing and
+    still returned ``updated: True`` after bumping ``updated_at``.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    before = await backend.get_task('1', project_root=project_root)
+    await asyncio.sleep(0.01)
+
+    with pytest.raises(NoFieldsToUpdateError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, **ignored_arguments,
+        )
+
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert exc.value.operation == 'update_task'
+    assert exc.value.task_id == '1'
+    assert set(exc.value.accepted_fields) == {
+        'prompt', 'metadata', 'title', 'description', 'details', 'priority',
+        'dependencies',
+    }
+    for name in exc.value.accepted_fields:
+        assert name in str(exc.value), (
+            f'the message must name every field the caller could have '
+            f'supplied; {name!r} missing from {str(exc.value)!r}'
+        )
+    after = await backend.get_task('1', project_root=project_root)
+    assert after == before, 'a refused fieldless call must not touch the row'
+
+
+@pytest.mark.asyncio
+async def test_update_task_fieldless_refusal_precedes_the_existence_lookup(
+    backend, project_root,
+):
+    """The refusal is a floor, judged before the row is read."""
+    with pytest.raises(NoFieldsToUpdateError):
+        await backend.update_task('9999', project_root=project_root)
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_floor_outranks_the_fieldless_refusal(
+    backend, project_root,
+):
+    """``status`` is not a mutating field here, but it names the real mistake."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    with pytest.raises(StatusWriteAuthorityError):
+        await backend.update_task('1', project_root=project_root, status='done')
+
+
+@pytest.mark.asyncio
+async def test_update_task_bad_metadata_mode_outranks_the_fieldless_refusal(
+    backend, project_root,
+):
+    """A supplied-but-wrong argument is reported before an absent one."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, metadata_mode='bogus',
+        )
+
+    assert not isinstance(exc.value, NoFieldsToUpdateError)
+    assert 'bogus' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_update_task_empty_dependencies_list_is_a_real_write(
+    backend, project_root,
+):
+    """``dependencies=[]`` clears the list; it is not a fieldless call."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_task(project_root=project_root, title='b')
+    await backend.update_task('2', project_root=project_root, dependencies=['1'])
+    assert (await backend.get_task('2', project_root=project_root))['dependencies']
+
+    await backend.update_task('2', project_root=project_root, dependencies=[])
+
+    assert (await backend.get_task('2', project_root=project_root))['dependencies'] == []
+
+
+@pytest.mark.asyncio
+async def test_update_task_empty_metadata_object_is_a_real_write(
+    backend, project_root,
+):
+    """``metadata='{}'`` is a write (the orchestrator harness can produce it)."""
+    await backend.add_task(project_root=project_root, title='t')
+    before = await _updated_at(backend, project_root)
+    await asyncio.sleep(0.01)
+
+    result = await backend.update_task('1', project_root=project_root, metadata='{}')
+
+    assert result['updated'] is True
+    assert await _updated_at(backend, project_root) != before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field',
+    [
+        {'prompt': 'p'}, {'metadata': '{"k": "v"}'}, {'title': 'new'},
+        {'description': 'd'}, {'details': 'x'}, {'priority': 'high'},
+        {'dependencies': []},
+    ],
+    ids=lambda field: next(iter(field)),
+)
+async def test_update_task_each_mutating_field_alone_is_accepted(
+    backend, project_root, field,
+):
+    await backend.add_task(project_root=project_root, title='t')
+
+    result = await backend.update_task('1', project_root=project_root, **field)
+
+    assert result['updated'] is True
 
 
 # ── write-boundary validation (task 2162, update_task post-merge I3) ──

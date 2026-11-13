@@ -253,7 +253,7 @@ class TestMergeBranchIntoWorktree:
         assert (wt / 'disjoint.txt').read_text() == 'edit-101\n'
 
     async def test_merge_subject_is_canonical(self, git_repo: Path):
-        """Subject comes from _merge_subject — find_merge_marker depends on it."""
+        """Subject comes from shared.merge_subject.format_merge_subject — find_merge_marker depends on it."""
         git_ops = _make_git_ops(git_repo)
         await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
         main_sha = await _rev_parse(git_repo)

@@ -1508,6 +1508,9 @@ _CLEAR_INVALID_BODIES = [
     pytest.param({'task_id': ''}, id='empty-task_id'),
     pytest.param({'task_id': 'T1', 'fields': 'not-a-list'}, id='fields-not-list'),
     pytest.param({'task_id': 'T1', 'fields': ['bad_field']}, id='invalid-field'),
+    pytest.param(
+        {'task_id': 'T1', 'project_root': '/proj', 'fields': []}, id='fields-empty',
+    ),
 ]
 
 
@@ -1629,7 +1632,7 @@ def test_reorder_pin_queue_proxies_verbatim_on_success(client):
     assert resp.json() == mcp_result
     _client, _url, tool_arg, args = mock_mcp.call_args.args
     assert tool_arg == 'reorder_pin_queue'
-    assert args['task_ids'] == ['T1', 'T2']
+    assert args == {'ordered_task_ids': ['T1', 'T2'], 'project_root': '/proj'}
     assert args['project_root'] == '/proj'
 
 
@@ -1974,9 +1977,55 @@ def test_clear_override_translates_ttl_until_to_mcp_ttl(client):
     _client, _url, tool_arg, args = mock_mcp.call_args.args
     assert tool_arg == 'clear_task_priority_override'
     # Dashboard must translate 'ttl_until' → 'ttl' before forwarding to MCP
-    assert args.get('fields') == ['ttl'], (
-        f"Expected MCP fields=['ttl'], got {args.get('fields')!r}"
-    )
+    assert args == {'task_id': 'T1', 'project_root': '/p', 'field': 'ttl'}
+
+
+def test_clear_override_clears_each_named_field_by_its_own_call(client):
+    """The tool declares one ``field`` per call; a 'fields' key would be refused."""
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['pinned', 'boost_tier']},
+        )
+
+    assert resp.status_code == 200
+    sent = [call.args[3] for call in mock_mcp.call_args_list]
+    assert sent == [
+        {'task_id': 'T1', 'project_root': '/p', 'field': 'pinned'},
+        {'task_id': 'T1', 'project_root': '/p', 'field': 'boost_tier'},
+    ]
+
+
+def test_clear_override_without_fields_clears_the_whole_row(client):
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value={'status': 'ok'})) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p'},
+        )
+
+    assert resp.status_code == 200
+    assert [call.args[3] for call in mock_mcp.call_args_list] == [
+        {'task_id': 'T1', 'project_root': '/p'},
+    ]
+
+
+def test_clear_override_stops_at_the_first_field_that_is_not_found(client):
+    from unittest.mock import AsyncMock, patch
+
+    not_found = {'error': 'not_found', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=not_found)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['pinned', 'ttl_until']},
+        )
+
+    assert resp.status_code == 404
+    assert mock_mcp.call_count == 1
 
 
 # ---------------------------------------------------------------------------

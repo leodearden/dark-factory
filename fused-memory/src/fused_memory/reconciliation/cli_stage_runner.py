@@ -268,6 +268,24 @@ DISALLOW_ESCALATION_READS = [
     'mcp__escalation__resolve_escalation_shas',
 ]
 
+# SILENT standalone orchestrator RUNTIME reads (disallowed in every stage —
+# task 6553, plans/escalation-store-ambiguity-prd.md §11 OQ3): with no harness
+# attached they answer an empty-but-live result instead of an error.
+#
+# The recon escalation server is built with no orchestrator harness
+# (reconciliation/harness.py::ReconciliationHarness._start_escalation_server),
+# so escalation/server.py::create_server's get_task_runtime_state answers with
+# the snapshot model's default envelope: offline=False, tasks=[]. That is the
+# categorical empty DISALLOW_ESCALATION_READS exists to stop, made worse by a
+# positive "online, nothing running" claim. It is a separate bucket because it
+# reads orchestrator runtime state, not escalation records. Reading runtime
+# state alone does not qualify a tool: the merge-queue reads stay reviewed-safe
+# because standalone they fail loudly. S3 δ moving get_task_runtime_state off
+# create_server supersedes this bucket; OQ3's resolution names what δ retires.
+DISALLOW_ESCALATION_RUNTIME_READS = [
+    'mcp__escalation__get_task_runtime_state',
+]
+
 # Escalation FILING tools (disallowed in Stage 1 and Stage 3 — task 3250).
 #
 # The write path is sanctioned in Stage 2 only: the FIX D Stale Flag Escalation
@@ -302,19 +320,22 @@ STAGE1_DISALLOWED = (
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
 # Stage 2 keeps its memory + task write access except the consolidation op and
-# the proposal tool; built-ins, the escalation reads, the fused-memory
-# control-plane mutators and the defect-record writers are blocked too.
+# the proposal tool; built-ins, the escalation reads, the orchestrator runtime
+# snapshot read, operator merge-lane control, the fused-memory control-plane
+# mutators and the defect-record writers are blocked too.
 STAGE2_DISALLOWED = (
     DISALLOW_CONSOLIDATION_OP
     + DISALLOW_CONSOLIDATION_PROPOSALS
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_BUILTIN
 )
@@ -327,6 +348,7 @@ STAGE3_DISALLOWED = (
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN

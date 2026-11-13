@@ -218,10 +218,11 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
 
     # ``timeout`` is accepted-and-ignored: the unit threads
     # task_snapshot.PER_CALL_TIMEOUT into both reads, so a stub missing the
-    # keyword raises TypeError instead of shaping rows.
+    # keyword raises TypeError instead of shaping rows. ``fields`` is ignored
+    # too: *fetch* answers rows that are already shaped.
     async def _narrowed(
         client, config, project_root, *,
-        statuses=None, timeout=None,
+        statuses=None, fields=None, timeout=None,
     ):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
@@ -579,6 +580,8 @@ async def test_collect_tasks_with_counts_handles_missing_worktree_metadata(tmp_p
         # Claim projection (task 3543): carried on every row. A 'pending' task
         # is never stranded — the shared predicate gates on 'in-progress'.
         'claimant_run_id': None, 'heartbeat_at': None, 'stranded': False,
+        # Filing-time pair, carried on every row; this fixture's shaped task has none.
+        'created_at': None, 'created_at_source': None,
     }]
 
 

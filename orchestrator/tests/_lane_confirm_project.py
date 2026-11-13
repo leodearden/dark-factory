@@ -57,6 +57,10 @@ LANE_TESTS = {
         '    assert 1 == 2\n'
     ),
     'test_uses_worker_id': "def test_uses_worker_id(worker_id):\n    assert worker_id.startswith('gw')\n",
+    'test_flaky_uses_worker_id': (
+        'def test_flaky_uses_worker_id(worker_id):\n'
+        "    assert not _first_run('flaky_worker_id')\n"
+    ),
     'test_param': (
         "@pytest.mark.parametrize('word', ['x y'])\n"
         'def test_param(word):\n'

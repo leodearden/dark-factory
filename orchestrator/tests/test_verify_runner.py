@@ -23,7 +23,7 @@ from _gate_fixtures import (
 )
 from _orch_helpers import pydantic_spec, wait_responsive
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
@@ -330,6 +330,48 @@ class TestMergeVerifySpec:
         legacy.pop("verify_cold_preprovision_command", None)
         restored = MergeVerifySpec.from_dict(legacy)
         assert restored.verify_cold_preprovision_command == ''
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs ride the spec ---
+
+    def test_scope_cargo_and_config_only_globs_round_trip(self):
+        spec = dataclasses.replace(
+            self._make_spec(),
+            scope_cargo=False,
+            merge_config_only_full_gate_globs=(
+                'dark-factory-orchestrator.yaml', 'crates/*/Cargo.toml',
+            ),
+        )
+        restored = MergeVerifySpec.from_dict(spec.to_dict())
+        assert restored == spec
+        assert isinstance(restored.merge_config_only_full_gate_globs, tuple)
+        assert spec_from_json(spec_to_json(spec)) == spec
+
+    def test_scope_cargo_and_config_only_globs_default_to_not_carried(self):
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+        )
+        assert spec.scope_cargo is None
+        assert spec.merge_config_only_full_gate_globs is None
+
+    def test_from_dict_back_compat_missing_scope_cargo_and_globs(self):
+        """BACK-COMPAT: a pre-7465 dispatcher's dict lacks both keys and decodes
+        to None, which leaves the consuming host's own values in force."""
+        legacy = self._make_spec().to_dict()
+        legacy.pop("scope_cargo", None)
+        legacy.pop("merge_config_only_full_gate_globs", None)
+        restored = MergeVerifySpec.from_dict(legacy)
+        assert restored.scope_cargo is None
+        assert restored.merge_config_only_full_gate_globs is None
+
+    def test_empty_globs_round_trip_as_carried(self):
+        """() is a carried value that replaces the host's globs, never None."""
+        spec = dataclasses.replace(self._make_spec(), merge_config_only_full_gate_globs=())
+        assert MergeVerifySpec.from_dict(spec.to_dict()).merge_config_only_full_gate_globs == ()
+        assert spec_from_json(spec_to_json(spec)).merge_config_only_full_gate_globs == ()
 
 
 # ---------------------------------------------------------------------------
@@ -2115,17 +2157,24 @@ class TestRetryScopeEventFields:
 class TestBuildMergeVerifySpec:
     """build_merge_verify_spec projects config + module_configs into a MergeVerifySpec."""
 
-    def _make_module_config(self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None):
+    def _make_module_config(
+        self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None, scope_cargo=None,
+    ):
         mc = MagicMock()
         mc.prefix = prefix
         mc.test_command = test_cmd
         mc.lint_command = lint_cmd
         mc.type_check_command = type_check_cmd
+        # Task 7465: collapsed_module_overrides reads these; a bare MagicMock
+        # attr is non-None and truthy, so it would flag every mock module.
+        mc.scope_cargo = scope_cargo
+        mc.verify_env = None
         return mc
 
     def _make_config(
         self, *, verify_env=None, cold_timeout=None,
         test_cmd=None, lint_cmd=None, type_check_cmd=None,
+        scope_cargo=True, config_only_globs=(),
     ):
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.verify_env = verify_env or {}
@@ -2146,6 +2195,9 @@ class TestBuildMergeVerifySpec:
         config.type_check_command = type_check_cmd
         # Task 6127: projected onto the spec, so it needs a real (JSON-native) value.
         config.verify_cold_preprovision_command = ''
+        # Task 7465: both projected onto the spec, so they need real values.
+        config.scope_cargo = scope_cargo
+        config.git = GitConfig(merge_config_only_full_gate_globs=list(config_only_globs))
         return config
 
     def test_verify_commands_project_module_fields(self):
@@ -2332,6 +2384,52 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         spec = build_merge_verify_spec(OrchestratorConfig(), [], None)
         assert spec.verify_cold_preprovision_command == ''
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs ride the spec ---
+
+    @pytest.mark.parametrize('scope_cargo', [True, False])
+    def test_scope_cargo_projected_from_config(self, scope_cargo):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(scope_cargo=scope_cargo), [], None)
+        assert spec.scope_cargo is scope_cargo
+
+    def test_config_only_globs_projected_from_config_git(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = self._make_config(config_only_globs=('dark-factory-orchestrator.yaml',))
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.merge_config_only_full_gate_globs == ('dark-factory-orchestrator.yaml',)
+
+        config.git.merge_config_only_full_gate_globs.append('later.yaml')
+
+        assert spec.merge_config_only_full_gate_globs == ('dark-factory-orchestrator.yaml',)
+
+    def _collapsing_modules(self, override):
+        return [
+            ModuleConfig(prefix='crates/a', test_command='cargo test --workspace', scope_cargo=override),
+            ModuleConfig(prefix='crates/b', test_command='cargo test --workspace'),
+        ]
+
+    @pytest.mark.parametrize('override', [False, True])
+    def test_collapsed_per_module_scope_cargo_ships_scope_cargo_false(self, override):
+        """A per-module scope_cargo cannot ride the spec, so the spec ships False,
+        which on the remote can only widen cargo scope.
+
+        The spec is also built for LOCAL merges, so a collapse must never raise.
+        """
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True), self._collapsing_modules(override), None,
+        )
+        assert spec.scope_cargo is False
+
+    def test_per_module_verify_env_alone_leaves_scope_cargo_carried(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True),
+            [ModuleConfig(prefix='m', verify_env={'X': '1'})],
+            None,
+        )
+        assert spec.scope_cargo is True
 
 
 # ---------------------------------------------------------------------------
@@ -3056,6 +3154,73 @@ class TestRunMergeVerifyOnWorktree:
         )
 
         assert effective_config.verify_cold_preprovision_command == 'HOST_PROVISION'
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs reach the remote leg
+
+    _CONFIG_ONLY_GLOB = 'dark-factory-orchestrator.yaml'
+
+    @pytest.mark.parametrize(('host_scope_cargo', 'spec_scope_cargo'), [(True, False), (False, True)])
+    async def test_spec_scope_cargo_overrides_host_scope_cargo(
+        self, host_scope_cargo, spec_scope_cargo,
+    ):
+        caller_config = self._host_config(scope_cargo=host_scope_cargo)
+        spec = dataclasses.replace(self._preprovision_spec(''), scope_cargo=spec_scope_cargo)
+
+        effective_config = await self._effective_config(caller_config, spec)
+
+        assert effective_config.scope_cargo is spec_scope_cargo
+        assert caller_config.scope_cargo is host_scope_cargo
+
+    @pytest.mark.parametrize(('host_globs', 'spec_globs'), [
+        pytest.param([], (_CONFIG_ONLY_GLOB,), id='carried_glob_fills_an_empty_host'),
+        pytest.param(['host.yaml'], (), id='carried_empty_wipes_the_host'),
+    ])
+    async def test_spec_config_only_globs_override_host_globs(self, host_globs, spec_globs):
+        caller_config = self._host_config(
+            git=GitConfig(main_branch='trunk', merge_config_only_full_gate_globs=host_globs),
+        )
+        caller_git = caller_config.git
+        spec = dataclasses.replace(
+            self._preprovision_spec(''), merge_config_only_full_gate_globs=spec_globs,
+        )
+
+        effective_config = await self._effective_config(caller_config, spec)
+
+        assert effective_config.git.merge_config_only_full_gate_globs == list(spec_globs)
+        assert effective_config.git.main_branch == 'trunk'
+        assert caller_config.git is caller_git
+        assert caller_config.git.merge_config_only_full_gate_globs == host_globs
+
+    async def test_legacy_spec_keeps_host_scope_cargo_and_globs(self):
+        config = self._host_config(
+            scope_cargo=True, git=GitConfig(merge_config_only_full_gate_globs=['host.yaml']),
+        )
+        legacy = dataclasses.replace(
+            self._preprovision_spec(''),
+            scope_cargo=False,
+            merge_config_only_full_gate_globs=('spec.yaml',),
+        ).to_dict()
+        legacy.pop('scope_cargo')
+        legacy.pop('merge_config_only_full_gate_globs')
+
+        effective_config = await self._effective_config(config, MergeVerifySpec.from_dict(legacy))
+
+        assert effective_config.scope_cargo is True
+        assert effective_config.git.merge_config_only_full_gate_globs == ['host.yaml']
+
+    async def test_collapsed_per_module_scope_cargo_reaches_the_remote_as_false(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        dispatcher = OrchestratorConfig(scope_cargo=True)
+        module = ModuleConfig(
+            prefix='crates/a', test_command='cargo test --workspace', scope_cargo=False,
+        )
+        spec = spec_from_json(spec_to_json(
+            build_merge_verify_spec(dispatcher, [module], ('crates/a/src/lib.rs',)),
+        ))
+
+        effective_config = await self._effective_config(self._host_config(scope_cargo=True), spec)
+
+        assert effective_config.scope_cargo is False
 
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
@@ -5997,6 +6162,7 @@ class TestDriftDetectorCheckEnvFaithful:
         assert result.verdict == DriftVerdict.AGREE
         assert result.is_faithful is True
         assert result.drift_dimensions == ()
+        assert result.unavailable_reason is None
 
     async def test_matching_probes_emit_exactly_one_parity_event(self):
         from orchestrator.event_store import EventType
@@ -6124,6 +6290,7 @@ class TestDriftDetectorCheckEnvDivergence:
         assert result.verdict == DriftVerdict.DIVERGE
         assert result.is_faithful is False
         assert result.drift_dimensions == ('extra_probes',)
+        assert result.unavailable_reason is None
 
     async def test_divergence_event_emitted_exactly_once(self):
         from orchestrator.event_store import EventType
@@ -6501,6 +6668,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         result = await detector.check_env([], local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
         assert result.drift_dimensions == ()
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6525,6 +6693,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6544,6 +6713,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
 
     async def test_remote_without_env_probe_run_is_inconclusive(self):
         """A non-RemoteRunner stand-in: duck-typed, so VerifyRunner stays unwidened.
@@ -6566,6 +6736,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6580,6 +6751,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason == 'laptop unreachable'
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6591,6 +6763,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason == 'local seam down'
 
     async def test_inconclusive_does_not_quarantine(self):
         from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
@@ -6600,6 +6773,100 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert pool.is_quarantined('laptop') is False
+
+
+class TestEnvDriftCheckResultUnavailableReasonInvariant:
+    """A reason rides only on a faithful INCONCLUSIVE: check_env_safely trusts it to mean that."""
+
+    def test_reason_on_a_faithful_inconclusive_is_accepted(self):
+        from orchestrator.verify_runner import DriftVerdict, EnvDriftCheckResult
+        result = EnvDriftCheckResult(
+            verdict=DriftVerdict.INCONCLUSIVE, is_faithful=True, unavailable_reason='ssh down',
+        )
+        assert result.unavailable_reason == 'ssh down'
+
+    @pytest.mark.parametrize(
+        ('verdict_name', 'is_faithful'),
+        [('AGREE', True), ('DIVERGE', False), ('INCONCLUSIVE', False)],
+    )
+    def test_reason_on_any_other_result_is_rejected(self, verdict_name, is_faithful):
+        from orchestrator.verify_runner import DriftVerdict, EnvDriftCheckResult
+        verdict = DriftVerdict[verdict_name]
+        with pytest.raises(ValueError) as excinfo:
+            EnvDriftCheckResult(
+                verdict=verdict, is_faithful=is_faithful, unavailable_reason='ssh down',
+            )
+        assert f'verdict={verdict}' in str(excinfo.value)
+        assert f'is_faithful={is_faithful}' in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvSafelyInconclusiveReason:
+    """check_env_safely(): the land-hook path is where an INCONCLUSIVE's reason is seen.
+
+    check_env_safely is the only production caller of check_env and discards
+    its result, so a reason that lived only on the result would never reach
+    the journal, and a dispatcher-side ssh fault would leave the env check
+    silently INCONCLUSIVE forever.  A sleeping laptop is the common case, so
+    the record is INFO, never a WARNING per check.
+    """
+
+    async def test_runner_unavailable_reason_is_logged_at_info_not_warning(self, caplog):
+        import logging
+
+        from orchestrator.config import EnvProbeConfig
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        reason = (
+            "ssh laptop.local exited 255 probing 'true': unix_listener: cannot "
+            'bind to path /home/leo/.df-env-probe-0123abcd.XyZ: Permission denied'
+        )
+        pool, _, _ = _make_env_drift_pool(remote_raises=RunnerUnavailable(reason))
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(
+            pool, event_store=event_store, escalation_queue=queue,
+            task_id='task-7481-probe',
+        )
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_runner'):
+            await detector.check_env_safely(
+                [EnvProbeConfig(key='uv', argv=['uv', '--version'])]
+            )
+
+        verify_runner_records = [
+            r for r in caplog.records if r.name == 'orchestrator.verify_runner'
+        ]
+        reason_records = [
+            r for r in verify_runner_records
+            if r.levelno == logging.INFO
+            and 'unix_listener: cannot bind to path' in r.getMessage()
+            and 'task-7481-probe' in r.getMessage()
+        ]
+        assert len(reason_records) == 1, (
+            'expected exactly one INFO record naming the task and the '
+            f'RunnerUnavailable reason; saw: '
+            f'{[(r.levelname, r.getMessage()) for r in verify_runner_records]!r}'
+        )
+        assert [r for r in verify_runner_records if r.levelno >= logging.WARNING] == []
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_not_taken_guard_logs_nothing(self, caplog):
+        """The shipped default (verify_env_probes: []) stays silent."""
+        import logging
+
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_env_drift_pool()
+        detector = DriftDetector(
+            pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue(),
+            task_id='task-7481-probe',
+        )
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_runner'):
+            await detector.check_env_safely([])
+
+        assert [
+            r for r in caplog.records
+            if r.name == 'orchestrator.verify_runner' and r.levelno >= logging.INFO
+        ] == []
 
 
 # ---------------------------------------------------------------------------
@@ -6763,6 +7030,46 @@ class TestDriftDetectorCheckEnvUnreachableRemote:
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
         assert queue.submitted == []
+
+    async def test_unbindable_control_path_reason_survives_on_the_result(self):
+        """A dispatcher-side ssh fault must be told apart from a sleeping laptop.
+
+        Both exit 255 and both are INCONCLUSIVE, so the verdict alone cannot
+        say whether the probe master's ControlPath could not be bound on THIS
+        host (fixable here, and the check never runs until it is) or the remote
+        is simply asleep (the common, self-healing case).  ssh's own stderr is
+        what distinguishes them, so it has to reach the result.
+        """
+        from orchestrator.verify_runner import DriftVerdict
+        control_path_fault = (
+            _SSH_UNREACHABLE_RC,
+            '',
+            'unix_listener: cannot bind to path '
+            '/home/leo/.df-env-probe-0123abcd.XyZ: Permission denied',
+        )
+        detector, pool, event_store, queue = self._detector(
+            _make_ssh_seam(default=control_path_fault)
+        )
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        unbindable = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+
+        assert unbindable.verdict == DriftVerdict.INCONCLUSIVE
+        assert unbindable.is_faithful is True
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+        assert pool.is_quarantined('laptop') is False
+        assert unbindable.unavailable_reason is not None
+        assert 'unix_listener: cannot bind to path' in unbindable.unavailable_reason
+        assert 'laptop.local' in unbindable.unavailable_reason
+
+        asleep_detector, _, _, _ = self._detector(_make_ssh_seam())
+        asleep = await asleep_detector.check_env(
+            _ENV_PROBE_SPECS, local_run=_make_probe_run(_MATCHING_PROBE_OUTPUT)
+        )
+        assert asleep.verdict == DriftVerdict.INCONCLUSIVE
+        assert asleep.unavailable_reason is not None
+        assert 'No route to host' in asleep.unavailable_reason
+        assert asleep.unavailable_reason != unbindable.unavailable_reason
 
     async def test_remote_binary_absent_is_still_real_divergence(self):
         """The guard must not over-broaden to 'any non-zero rc is transport'.
@@ -8462,7 +8769,7 @@ class TestRemoteRunnerStderrArchival:
 class TestRemoteRunnerStreamArchival:
     """RemoteRunner archives test/lint/type output streams on failure (task 1921).
 
-    Mirrors _archive_merge_verify_logs via a synthetic runs projection.
+    Mirrors archive_verify_logs via a synthetic runs projection.
     Filename pattern: attempt-1.remote-<name>.{label}-<utc_ts>.log
                       attempt-1.remote-<name>.summary-<utc_ts>.json
     """
@@ -8753,8 +9060,8 @@ class TestRemoteRunnerStreamArchival:
     async def test_stream_archival_exception_is_swallowed_result_unchanged(self, tmp_path, monkeypatch):
         """Non-OSError in _archive_failure_streams → swallowed; VerifyResult returned unchanged.
 
-        Monkeypatches orchestrator.verify_runner._archive_merge_verify_logs to raise
-        RuntimeError('boom') — a non-OSError that _archive_merge_verify_logs's internal
+        Monkeypatches orchestrator.verify_runner.archive_verify_logs to raise
+        RuntimeError('boom') — a non-OSError that archive_verify_logs's internal
         OSError handler does not catch.  Verifies that run_merge_verify:
           (1) does NOT raise;
           (2) returns the VerifyResult unchanged.
@@ -8767,7 +9074,7 @@ class TestRemoteRunnerStreamArchival:
         def boom(*args, **kwargs):
             raise RuntimeError('boom')
 
-        monkeypatch.setattr(_vrmod, '_archive_merge_verify_logs', boom)
+        monkeypatch.setattr(_vrmod, 'archive_verify_logs', boom)
 
         fail_result = VerifyResult(
             passed=False, test_output='FAILED', lint_output='', type_output='',

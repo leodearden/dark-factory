@@ -1,5 +1,6 @@
 """Tests for the live-FalkorDB scaffolding in _fm_falkor_live.py."""
 
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,76 +14,14 @@ import pytest
 class TestFalkorHelpers:
     """Unit tests for FALKOR_HOST/FALKOR_PORT, _falkor_available(), falkor_skipif()."""
 
-    def test_falkor_host_from_env_default(self, monkeypatch):
-        """_falkor_host_from_env() falls back to the local-FalkorDB default.
+    def test_falkor_constants_are_the_scratch_endpoint_the_environment_names(self):
+        """The constants come from the one scratch resolver, never a local copy of it."""
+        from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT
 
-        The ``delenv`` is what makes the assertion deterministic under an
-        operator environment that sets FALKOR_HOST.
-        """
-        from _fm_falkor_live import _falkor_host_from_env
+        from fused_memory.config.falkordb_endpoints import scratch_falkordb_from_env
 
-        monkeypatch.delenv('FALKOR_HOST', raising=False)
-
-        assert _falkor_host_from_env() == 'localhost'
-
-    def test_falkor_host_from_env_override(self, monkeypatch):
-        """FALKOR_HOST is honoured — the normal shape when FalkorDB is not on loopback."""
-        from _fm_falkor_live import _falkor_host_from_env
-
-        monkeypatch.setenv('FALKOR_HOST', 'falkordb.internal')
-
-        assert _falkor_host_from_env() == 'falkordb.internal'
-
-    def test_falkor_port_from_env_default(self, monkeypatch):
-        """_falkor_port_from_env() falls back to 6379 *as an int*."""
-        from _fm_falkor_live import _falkor_port_from_env
-
-        monkeypatch.delenv('FALKOR_PORT', raising=False)
-
-        assert _falkor_port_from_env() == 6379
-        assert isinstance(_falkor_port_from_env(), int)
-
-    def test_falkor_port_from_env_coerces_to_int(self, monkeypatch):
-        """An overridden FALKOR_PORT is coerced from str to int.
-
-        The coercion is load-bearing: a str port silently breaks
-        ``FalkorDB(port=...)``. This is the assertion that fails if ``int()``
-        is ever dropped — ``'7000' == 7000`` is False.
-        """
-        from _fm_falkor_live import _falkor_port_from_env
-
-        monkeypatch.setenv('FALKOR_PORT', '7000')
-
-        assert _falkor_port_from_env() == 7000
-        assert isinstance(_falkor_port_from_env(), int)
-
-    def test_falkor_port_from_env_treats_empty_as_unset(self, monkeypatch):
-        """An empty FALKOR_PORT takes the default instead of exploding.
-
-        ``FALKOR_PORT: ${FALKOR_PORT}`` in a compose/CI template with the
-        variable unset produces exactly this shape. A ValueError here would
-        fail collection of every module that imports _fm_falkor_live, even in
-        a run that never touches FalkorDB.
-        """
-        from _fm_falkor_live import _falkor_port_from_env
-
-        monkeypatch.setenv('FALKOR_PORT', '')
-
-        assert _falkor_port_from_env() == 6379
-
-    def test_falkor_port_from_env_rejects_non_integer(self, monkeypatch):
-        """A malformed FALKOR_PORT fails loudly, naming the variable and value.
-
-        Not silently defaulted: a typo'd port must not be papered over into a
-        probe against 6379. The RuntimeError replaces a bare ``int()``
-        ValueError whose traceback pointed into a shared helper.
-        """
-        from _fm_falkor_live import _falkor_port_from_env
-
-        monkeypatch.setenv('FALKOR_PORT', 'notaport')
-
-        with pytest.raises(RuntimeError, match=r"FALKOR_PORT.*'notaport'"):
-            _falkor_port_from_env()
+        scratch = scratch_falkordb_from_env(os.environ)
+        assert (scratch.host, scratch.port) == (FALKOR_HOST, FALKOR_PORT)
 
     def test_falkor_constants_have_the_types_consumers_require(self):
         """The module constants carry the types ``FalkorDB(...)`` requires.
@@ -92,13 +31,13 @@ class TestFalkorHelpers:
         holds under any environment and pins no literal default, which would
         couple this lane to the operator's environment.
 
-        It does NOT pin that the constants are *derived* from the environment.
-        That cannot be asserted in-process without an ``importlib.reload`` of a
+        Neither test varies the environment the constants are derived from.
+        That cannot be done in-process without an ``importlib.reload`` of a
         module the whole session already holds references into (it would hand
         earlier-imported tests stale dataclass identities), and a subprocess
-        import costs a measured ~8.6s here. The derivation functions themselves
-        are covered directly by the tests above; what is untested is only the
-        two assignment lines that call them.
+        import costs a measured ~8.6s here. The derivation itself is covered by
+        tests/test_falkordb_endpoints.py, and its agreement with these
+        constants by the test above.
         """
         from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT
 

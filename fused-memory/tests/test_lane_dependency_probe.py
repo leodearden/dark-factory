@@ -5,20 +5,17 @@ FalkorDB is covered by its unreachable case only; a write-refusing FalkorDB woul
 
 from __future__ import annotations
 
-import errno
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
@@ -27,9 +24,18 @@ from _fm_helpers import (
     load_script_module,
 )
 from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
+from _fm_sockets import has_pending_connection, refused_port, silent_listener
 from shared.lane_probe import OUTAGE_EXIT_STATUS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.config.falkordb_endpoints import (
+    PRODUCTION_FALKORDB,
+    FalkorEndpoint,
+    scratch_falkordb_from_env,
+)
 from fused_memory.config.schema import FusedMemoryConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FM_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = FM_ROOT / 'scripts' / 'lane_dependency_probe.py'
@@ -38,13 +44,6 @@ PROBE_LEASE_PREFIX = 'lane-dependency-probe.'
 CONFIG_PATH = FM_ROOT / 'config' / 'config.yaml'
 SUBPROCESS_TIMEOUT_SECS = 120
 EMPTY_COLLECTIONS = json.dumps({'result': {'collections': []}, 'status': 'ok', 'time': 0.0}).encode()
-
-
-@contextmanager
-def refused_port() -> Iterator[int]:
-    with closing(socket.socket()) as reservation:
-        reservation.bind(('127.0.0.1', 0))
-        yield reservation.getsockname()[1]
 
 
 def lease_files(directory: Path) -> list[str]:
@@ -143,16 +142,6 @@ def write_refusing_qdrant(watched_lease_dir: Path | None = None) -> Iterator[Run
         thread.join()
 
 
-def test_a_refused_port_turns_connects_away_and_cannot_be_bound_while_held() -> None:
-    with refused_port() as port:
-        with pytest.raises(ConnectionRefusedError):
-            socket.create_connection(('127.0.0.1', port), timeout=5)
-        with pytest.raises(OSError) as bind:
-            ThreadingHTTPServer(('127.0.0.1', port), WriteRefusingQdrant)
-
-    assert bind.value.errno == errno.EADDRINUSE
-
-
 def test_unreachable_qdrant_is_an_outage_naming_qdrant(lease_dir: Path) -> None:
     with refused_port() as port:
         result = run_probe(lease_dir=lease_dir, env={'QDRANT_URL': f'http://127.0.0.1:{port}'})
@@ -173,13 +162,35 @@ def test_a_qdrant_that_refuses_writes_is_an_outage_at_the_step_that_was_refused(
 
 
 def test_unreachable_falkordb_is_an_outage_naming_falkordb(lease_dir: Path) -> None:
-    with refused_port() as port:
-        result = run_probe('falkordb', lease_dir=lease_dir, env={'FALKORDB_URI': f'redis://127.0.0.1:{port}'})
+    """The probe is steered by FALKOR_*, the tests' knob, never by the config's FALKORDB_URI."""
+    with refused_port() as port, silent_listener() as config_server:
+        result = run_probe(
+            'falkordb',
+            lease_dir=lease_dir,
+            env={
+                'FALKOR_HOST': '127.0.0.1',
+                'FALKOR_PORT': str(port),
+                'FALKORDB_URI': f'redis://127.0.0.1:{config_server.getsockname()[1]}',
+            },
+        )
+        config_server_was_dialled = has_pending_connection(config_server)
 
     assert result.returncode == OUTAGE_EXIT_STATUS, result.stderr
     assert result.stdout.startswith('falkordb: ')
     assert len(result.stdout.splitlines()) == 1
     assert 'Traceback' not in result.stdout + result.stderr
+    assert not config_server_was_dialled
+
+
+def test_a_falkordb_probe_aimed_at_production_is_a_broken_probe_not_an_outage(lease_dir: Path) -> None:
+    probe = load_script_module(SCRIPT, 'lane_dependency_probe_under_test')
+
+    result = run_probe('falkordb', lease_dir=lease_dir, env={'FALKOR_PORT': str(PRODUCTION_FALKORDB.port)})
+
+    assert result.returncode == probe.BROKEN_CONFIG_EXIT_STATUS
+    assert result.stdout == ''
+    assert 'production' in result.stderr
+    assert 'Traceback' not in result.stderr
 
 
 def test_the_same_outage_prints_the_same_line(lease_dir: Path) -> None:
@@ -198,18 +209,18 @@ def test_a_bad_dependency_name_is_a_broken_probe_not_an_outage(lease_dir: Path) 
     assert result.stdout == ''
 
 
-def test_the_configuration_defaults_name_the_endpoints_the_integration_tests_use(
+def test_the_probe_checks_the_endpoints_the_integration_tests_use(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    probe = load_script_module(SCRIPT, 'lane_dependency_probe_under_test')
     monkeypatch.delenv('QDRANT_URL', raising=False)
-    monkeypatch.delenv('FALKORDB_URI', raising=False)
     cfg = FusedMemoryConfig()
 
     assert cfg.mem0.qdrant_url == QDRANT_URL
-    if 'FALKOR_HOST' in os.environ or 'FALKOR_PORT' in os.environ:
-        pytest.skip('FALKOR_HOST/FALKOR_PORT override the integration tests default')
-    falkor = urlparse(cfg.graphiti.falkordb.uri)
-    assert (falkor.hostname, falkor.port) == (FALKOR_HOST, FALKOR_PORT)
+    checked = probe.probe_config(cfg, scratch_falkordb_from_env()).graphiti.falkordb
+    assert checked.uri == FalkorEndpoint(FALKOR_HOST, FALKOR_PORT).uri
+    assert checked.password is None
+    assert checked.expected_graph_timeout_ms == cfg.graphiti.falkordb.expected_graph_timeout_ms
 
 
 def test_the_script_imports_the_fused_memory_tree_pytest_imports(tmp_path: Path) -> None:

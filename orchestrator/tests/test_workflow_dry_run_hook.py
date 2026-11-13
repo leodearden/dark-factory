@@ -29,6 +29,7 @@ from shared.task_submit import SubmitFailed, SubmitOutcome
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.dry_run_unblock import investigation_task_name
+from orchestrator.lock_table import UncontestedAcquisition
 from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.workflow import TaskWorkflow
@@ -66,6 +67,9 @@ class _Scheduler:
         self, task_id, current, needed, /, *, persist_files=None
     ):
         return BlastRadiusResult(applied=False)
+
+    async def acquire_uncontested(self, task_id, modules, /, *, reason):
+        return UncontestedAcquisition(acquired=tuple(modules), contested=())
 
     async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 30.0) -> dict:
         return {}

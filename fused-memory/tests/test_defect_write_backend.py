@@ -45,6 +45,7 @@ from shared.defects import (
     mint_human_ref,
 )
 from shared.project_layout import tasks_db
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.defect_records import (
     DefectRefNotLive,
@@ -59,6 +60,8 @@ from fused_memory.backends.defect_ref_lookup import (
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.config.schema import TaskmasterConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _REF = mint_human_ref(datetime(2026, 10, 18, 12, 34, 56, tzinfo=UTC), 'Some summary')
 _OTHER_REF = mint_explore_ref('run-1', 4)

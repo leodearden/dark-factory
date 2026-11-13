@@ -82,7 +82,7 @@ LOOPBACK: Final = HostAddress(ip="127.0.0.1", family=socket.AF_INET, scope_id=0,
 # fused-memory/docker/docker-compose.yml; pinned there by
 # tests/scripts/test_check_network_exposure.py.
 COMPOSE_PUBLISHED_PORTS: Final[Mapping[int, str]] = types.MappingProxyType(
-    {6379: "falkordb", 6333: "qdrant", 6334: "qdrant", 8002: "fused-mcp"}
+    {6379: "falkordb", 6380: "falkordb-scratch", 6333: "qdrant", 6334: "qdrant", 8002: "fused-mcp", 8420: "embedder"}
 )
 RECON_REPORT_PORT: Final = 8003
 

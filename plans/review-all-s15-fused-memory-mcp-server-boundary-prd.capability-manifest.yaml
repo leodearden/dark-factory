@@ -1,0 +1,630 @@
+prd: plans/review-all-s15-fused-memory-mcp-server-boundary-prd.md
+schema_version: 1
+signal_leaves: ["ω"]
+tasks:
+  - label: "κ"
+    task_id: null
+    title: "Dashboard panel read model served by fused-memory get_status(panels=...)"
+    note: "Produces C4. Contributes to S22's fk-1c1d247caaa7 (S22's consumer leaf closes it). Depends on 9280 and S19 α (the journal and event-buffer modules move to recon_state)."
+    capabilities:
+      - name: "panels-reply-models"
+        binding: "producer (κ) — shared/src/shared/dashboard_panels.py::PanelsReply, the wire models S22 parses"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class PanelsReply"
+          paths: ["shared/src/shared/dashboard_panels.py"]
+          expect: present
+      - name: "panel-reader"
+        binding: "producer (κ) — fused-memory server/dashboard_panels.py::DashboardPanelReader composes the owning stores' reads"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class DashboardPanelReader"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "burst-effective-state-owner"
+        binding: "producer (κ) — EventBuffer.burst_state_rows computes effective_state with the instance's burst_cooldown_seconds, so no dashboard module restates the cooldown"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def burst_state_rows"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "phantom-verdict-substrate"
+        binding: "substrate — shared/src/shared/phantom_verdict.py::is_phantom_verdict_row classifies LatestVerdict.is_phantom (passes today)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_phantom_verdict_row"
+          paths: ["shared/src/shared/phantom_verdict.py"]
+          expect: present
+  - label: "α0"
+    task_id: null
+    title: "fused-memory project-root normalization takes an injected checkout resolver and runs off the event loop; tests stop patching server.tools"
+    note: "Contributes to fk-a9f21093207e. Depends on κ. Offloads the 23 inline resolver calls (INV-8) and deletes their 23 allowlist rows as fixed; narrows task 5071. Codemod over 24 test files (32 patch sites, measured at 7848173a7d); hand-carry if lock-starved > 24 h."
+    capabilities:
+      - name: "checkout-resolver-seam"
+        binding: "producer (α0) — create_mcp_server(..., checkout_resolver=...) feeds project-root normalization"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "checkout_resolver: Callable"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "no-inline-checkout-resolution"
+        binding: "anti-inversion (INV-8) — no MCP handler calls _normalize_project_root(project_root) on the loop thread; every call is asyncio.to_thread"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_normalize_project_root\\(project_root\\)"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+      - name: "no-private-resolver-patch"
+        binding: "anti-inversion — no test patches fused_memory.server.tools.resolve_main_checkout"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fused_memory\\.server\\.tools\\.resolve_main_checkout"
+          paths: ["fused-memory/tests/"]
+          expect: absent
+      - name: "resolve-main-checkout-substrate"
+        binding: "substrate — models/scope.py::resolve_main_checkout is the production default (passes today)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def resolve_main_checkout"
+          paths: ["fused-memory/src/fused_memory/models/scope.py"]
+          expect: present
+  - label: "α"
+    task_id: null
+    title: "fused-memory ToolContext: interceptor bound once, one not-configured error code, journaled reads"
+    note: "Produces C1. Closes fk-22ab8d1f3a42 (tools half; λ the interceptor half) and fk-1509bcd45e2a. Absorbs 4044. Depends on α0. Moves the identity helpers verbatim; S12 δ edits them at their new home afterwards (S12's edge), refusing a differing agent_id or _causation_id on writes and on get_entity, get_entity_by_uuid and get_episodes, never on search's agent_id filter."
+    capabilities:
+      - name: "tool-context"
+        binding: "producer (α) — server/tool_context.py::ToolContext"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ToolContext"
+          paths: ["fused-memory/src/fused_memory/server/tool_context.py"]
+          expect: present
+      - name: "journaled-read-decorator"
+        binding: "producer (α) — ToolContext.journaled_read replaces the hand-copied journal blocks"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def journaled_read"
+          paths: ["fused-memory/src/fused_memory/server/tool_context.py"]
+          expect: present
+      - name: "not-configured-code"
+        binding: "producer (α) — McpErrorType.NOT_CONFIGURED added to S14's vocabulary"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "NOT_CONFIGURED"
+          paths: ["shared/src/shared/mcp_envelope.py"]
+          expect: present
+      - name: "no-interceptor-rebinding"
+        binding: "anti-inversion — tools.py no longer rebinds task_interceptor to a fallback TaskInterceptor mid-function"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "task_interceptor = TaskInterceptor\\("
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: absent
+      - name: "triage-counter-substrate"
+        binding: "substrate — server/write_triage.py::TriageFailOpenCounter becomes a ToolContext member (passes today)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TriageFailOpenCounter"
+          paths: ["fused-memory/src/fused_memory/server/write_triage.py"]
+          expect: present
+  - label: "β0"
+    task_id: null
+    title: "fused-memory's tool-call guard stack is installed once, by create_mcp_server"
+    note: "Contributes to fk-a9f21093207e. Depends on α, ζ and task 4643. Moves main.py's guard installation (safe wrapper, 4867's unknown-argument guard, markup guard; and the recon-report pair) into boundary_guards, called by create_mcp_server (OQ-2 ruled as recommended, 2026-11-12)."
+    capabilities:
+      - name: "stack-installed-by-create-mcp-server"
+        binding: "producer (β0) — server/tools.py::create_mcp_server calls boundary_guards.install_boundary_guards"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "install_boundary_guards\\("
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "no-second-installer"
+        binding: "anti-inversion — server/main.py::_install_tool_dispatch_guards, the second wrapping path of ToolManager.call_tool, is gone"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _install_tool_dispatch_guards"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+  - label: "β"
+    task_id: null
+    title: "fused-memory tools declare their project scope; one dispatch scope gate parses it"
+    note: "Produces C2. Closes fk-a9f21093207e. Depends on β0 and 6815. R14 option 1; every declared scope validates (OQ-10) and the six graph mutators gain the known-project gate (OQ-3), both ruled 2026-11-12."
+    capabilities:
+      - name: "scope-gate"
+        binding: "producer (β) — server/tool_scope.py::ScopeGate, the innermost member of install_boundary_guards"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ScopeGate"
+          paths: ["fused-memory/src/fused_memory/server/tool_scope.py"]
+          expect: present
+      - name: "undeclared-is-registration-error"
+        binding: "producer (β) — server/tool_scope.py::ToolScopeUndeclared raised at server build"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ToolScopeUndeclared"
+          paths: ["fused-memory/src/fused_memory/server/tool_scope.py"]
+          expect: present
+      - name: "scope-validates"
+        binding: "producer (β) — ToolScope.validate, set on every declared scope including raw (OQ-10 ruled 2026-11-12)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "validate: bool"
+          paths: ["fused-memory/src/fused_memory/server/tool_scope.py"]
+          expect: present
+      - name: "scope-gate-offloads-resolver"
+        binding: "producer (β) — ScopeGate.parse runs the checkout resolver through asyncio.to_thread (INV-8)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "to_thread\\(self\\._checkout_resolver"
+          paths: ["fused-memory/src/fused_memory/server/tool_scope.py"]
+          expect: present
+      - name: "no-per-body-canonicalize"
+        binding: "anti-inversion — no tool body calls _canonicalize_project_id_arg"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_canonicalize_project_id_arg\\("
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+      - name: "no-root-narrowing"
+        binding: "anti-inversion — the 21 isinstance(_normalized, dict) narrowings are gone"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "isinstance\\(_normalized, dict\\)"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+      - name: "canonicalize-substrate"
+        binding: "substrate — utils/validation.py::canonicalize_project_id is the one canonicalizer the gate calls (passes today)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def canonicalize_project_id"
+          paths: ["fused-memory/src/fused_memory/utils/validation.py"]
+          expect: present
+  - label: "ε1"
+    task_id: null
+    title: "Move fused-memory's ops, scheduler and defects tool families out of create_mcp_server"
+    note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on β and S12 δ (OQ-11 ruled (b): the moves carry S12 δ's call-site edits and every per-tool identity call verbatim, search's exclusion included). Creates the tools/list snapshot. S16 β2 waits on ε1 for reload_config (S16's edge); never ε1 → S16 β2, which would park it behind 8528 and 5040."
+    capabilities:
+      - name: "ops-family-module"
+        binding: "producer (ε1) — server/tool_families/ops.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/ops.py"]
+          expect: present
+      - name: "scheduler-family-module"
+        binding: "producer (ε1) — server/tool_families/scheduler.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/scheduler.py"]
+          expect: present
+      - name: "defects-family-module"
+        binding: "producer (ε1) — server/tool_families/defects.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/defects.py"]
+          expect: present
+      - name: "tool-surface-snapshot"
+        binding: "producer (ε1) — the tools/list snapshot every later move compares against (boundary row 17)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/data/mcp_tool_surface.json"]
+          expect: present
+  - label: "ε2"
+    task_id: null
+    title: "Move fused-memory's task-read and task-write tool families"
+    note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on ε1."
+    capabilities:
+      - name: "task-read-family-module"
+        binding: "producer (ε2) — server/tool_families/task_read.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/task_read.py"]
+          expect: present
+      - name: "task-write-family-module"
+        binding: "producer (ε2) — server/tool_families/task_write.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/task_write.py"]
+          expect: present
+  - label: "ε3"
+    task_id: null
+    title: "Move fused-memory's memory-read and graph-admin tool families"
+    note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on ε2. Moves search, get_entity, get_entity_by_uuid and get_episodes with their identity calls as S12 δ left them: the three reads keep the refusal, search keeps its exclusion."
+    capabilities:
+      - name: "memory-read-family-module"
+        binding: "producer (ε3) — server/tool_families/memory_read.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/memory_read.py"]
+          expect: present
+      - name: "graph-admin-family-module"
+        binding: "producer (ε3) — server/tool_families/graph_admin.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/graph_admin.py"]
+          expect: present
+      - name: "task-status-facts-leaf"
+        binding: "producer (ε3) — server/task_status_facts.py, the batched task-status read graph_admin and memory_write share"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/task_status_facts.py"]
+          expect: present
+  - label: "ε4"
+    task_id: null
+    title: "Move fused-memory's memory-write tool family"
+    note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on ε3 and S1 θ1a (which makes _report_unverified_claims async before it moves)."
+    capabilities:
+      - name: "memory-write-family-module"
+        binding: "producer (ε4) — server/tool_families/memory_write.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/memory_write.py"]
+          expect: present
+  - label: "ε5"
+    task_id: null
+    title: "Move fused-memory's memory-curation family; create_mcp_server becomes a composition of family registrars"
+    note: "Produces C6. Closes fk-45cf67bff540, fk-9214f842ca92. Depends on ε4 and S19 δ (which subsumes task 5983)."
+    capabilities:
+      - name: "family-registrars"
+        binding: "producer (ε5) — server/tools.py::FAMILY_REGISTRARS is the one list create_mcp_server runs"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FAMILY_REGISTRARS"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "curation-moved"
+        binding: "anti-inversion — consolidate_memories no longer lives in server/tools.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def consolidate_memories"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: absent
+      - name: "memory-curation-family-module"
+        binding: "producer (ε5) — server/tool_families/memory_curation.py::register"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/tool_families/memory_curation.py"]
+          expect: present
+  - label: "δ"
+    task_id: null
+    title: "fused-memory write-gate protocol, one write-time control-key registry, and submit_task as an ordered gate list"
+    note: "Produces C5's protocol half. Closes fk-1cadfcc36cfa; carries fk-358e8dfe8d02 (absorbs task 4469). Depends on ε5 and S12 δ (OQ-11 ruled (b): δ reads the causation header through S12 δ's resolver, which refuses a differing _causation_id). Priority inversion δ low before γ high recorded."
+    capabilities:
+      - name: "control-key-registry"
+        binding: "producer (δ) — server/write_controls.py::WRITE_TIME_CONTROL_KEYS and split_write_controls (the causation id is S12 δ's resolved header value when present)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "WRITE_TIME_CONTROL_KEYS"
+          paths: ["fused-memory/src/fused_memory/server/write_controls.py"]
+          expect: present
+      - name: "write-gate-protocol"
+        binding: "producer (δ) — server/write_gates.py::WriteGate and run_gates"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class WriteGate"
+          paths: ["fused-memory/src/fused_memory/server/write_gates.py"]
+          expect: present
+      - name: "submit-task-gate-list"
+        binding: "producer (δ) — SUBMIT_TASK_GATES in the task-write family"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SUBMIT_TASK_GATES"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "no-per-tool-markup-strip"
+        binding: "anti-inversion — no tool body calls strip_markup_override; split_write_controls strips every control key at one point"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "strip_markup_override\\("
+          paths: ["fused-memory/src/fused_memory/server/tools.py", "fused-memory/src/fused_memory/server/tool_families/"]
+          expect: absent
+  - label: "γ"
+    task_id: null
+    title: "fused-memory add_memory as an ordered gate list; sibling write entry points declare their gate sets"
+    note: "Closes fk-330a60eef271 (high; gate 6698 depends on γ). Depends on δ."
+    capabilities:
+      - name: "add-memory-gate-list"
+        binding: "producer (γ) — ADD_MEMORY_GATES in the memory-write family, today's order pinned"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ADD_MEMORY_GATES"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "declared-entry-gate-sets"
+        binding: "producer (γ) — WRITE_ENTRY_GATES maps each sibling entry point to its declared gates and skips"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "WRITE_ENTRY_GATES"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+  - label: "ι"
+    task_id: null
+    title: "fused-memory tool descriptions carry the agent-facing contract only"
+    note: "Closes fk-009fbbf855e7; absorbs tasks 5511 and 6235 and the tools.py docstring halves of 5717 and 6295. Depends on γ."
+    capabilities:
+      - name: "no-reviewer-prose-in-descriptions"
+        binding: "anti-inversion — get_statuses' reviewer note is gone from the served description"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Deliberately no line numbers"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+      - name: "description-rubric-test"
+        binding: "producer (ι) — fused-memory/tests/test_tool_descriptions.py applies the rubric to every served description"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/test_tool_descriptions.py"]
+          expect: present
+  - label: "λ"
+    task_id: null
+    title: "fused-memory's TaskInterceptor raises the declared not-configured error"
+    note: "Completes fk-22ab8d1f3a42 with α. Depends on α and 9282 (last wave-2 editor of task_interceptor.py). complexity='simple'."
+    capabilities:
+      - name: "typed-not-configured-raise"
+        binding: "producer (λ) — backends/task_backend_errors.py::TaskmasterNotConfigured declares McpErrorType.NOT_CONFIGURED"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TaskmasterNotConfigured"
+          paths: ["fused-memory/src/fused_memory/backends/"]
+          expect: present
+      - name: "no-runtime-error-spelling"
+        binding: "anti-inversion — _ensure_taskmaster no longer raises a bare RuntimeError"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "RuntimeError\\('Taskmaster is not configured"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: absent
+  - label: "ζ"
+    task_id: null
+    title: "fused-memory's shutdown runs declared phases of concurrent closes; the force-exit budget is computed from them and the drain is sized from measured tool-call durations"
+    note: "Produces C3. Closes fk-d085b903f01c. Depends on κ and task 9493 (one stop signal; filed 2026-11-12 outside this plan; done, merged 1d0ae21e44, so the edge is satisfied). OQ-1 ruled option D: TimeoutStopSec stays 90; budget = sum of each phase's largest timeout (55 s at the draft table); drain sized from 9493's recorded tool-call durations, under 33 s."
+    capabilities:
+      - name: "declared-shutdown-phases"
+        binding: "producer (ζ) — config/shutdown_plan.py::SHUTDOWN_PHASES and the derived FORCE_EXIT_BUDGET_SECS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SHUTDOWN_PHASES"
+          paths: ["fused-memory/src/fused_memory/config/shutdown_plan.py"]
+          expect: present
+      - name: "phase-order-pinned-by-test"
+        binding: "producer (ζ) — tests/test_server_shutdown.py asserts every step's after-set sits in an earlier phase (boundary row 11b)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SHUTDOWN_PHASES"
+          paths: ["fused-memory/tests/test_server_shutdown.py"]
+          expect: present
+      - name: "loop-cancels-one-step"
+        binding: "producer (ζ) — the seven background-loop cancels are one declared step under one timeout"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "background_loops\\.cancel_all"
+          paths: ["fused-memory/src/fused_memory/config/shutdown_plan.py"]
+          expect: present
+      - name: "drain-in-budget-check"
+        binding: "producer (ζ) — ServerConfig's validator asserts graceful_shutdown_timeout + PRE_ARM_BOUND_SECS + FORCE_EXIT_BUDGET_SECS < SYSTEMD_TIMEOUT_STOP_SECS, reading them from config/shutdown_plan.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "PRE_ARM_BOUND_SECS"
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
+          expect: present
+      - name: "no-schema-mirror-literals"
+        binding: "anti-inversion — config/schema.py imports the budget instead of restating it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_MIRROR_FORCE_EXIT_BUDGET"
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
+          expect: absent
+      - name: "no-main-py-budget-copies"
+        binding: "anti-inversion — server/main.py no longer defines _FORCE_EXIT_BUDGET or _SYSTEMD_TIMEOUT_STOP_SECS; main.py and the tests read config/shutdown_plan.py's FORCE_EXIT_BUDGET_SECS and SYSTEMD_TIMEOUT_STOP_SECS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_(FORCE_EXIT_BUDGET|SYSTEMD_TIMEOUT_STOP_SECS) = "
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+      - name: "no-hand-counted-step-sum"
+        binding: "anti-inversion — the test no longer multiplies a literal 5"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "5 \\* main_mod\\._CLEANUP_STEP_TIMEOUT"
+          paths: ["fused-memory/tests/test_server_shutdown.py"]
+          expect: absent
+      - name: "parity-script-reads-template"
+        binding: "anti-inversion — scripts/check_fused_memory_unit_parity.py::REQUIRED_SERVICE_DIRECTIVES no longer restates TimeoutStopSec (the fourth copy)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\"TimeoutStopSec=[0-9]"
+          paths: ["scripts/check_fused_memory_unit_parity.py"]
+          expect: absent
+      - name: "bounded-closes-precedent-substrate"
+        binding: "substrate — services/memory_service.py::MemoryService.close_budget_secs, the in-tree (label, closer, timeout) precedent (passes today)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def close_budget_secs"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: present
+      - name: "live-restart-returns-inflight-answer"
+        binding: "with task 9493 and ζ deployed, a live systemctl --user restart fused-memory during a slow submit_task returns that call's answer, not a reset; every phase is logged and the stop ends inside TimeoutStopSec (90 s)"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer runs the live restart against the deployed unit and reads the journal; a live service property, not a tree property"
+  - label: "θ1"
+    task_id: null
+    title: "fused-memory process lifecycle is a ProcessLifecycle object, not module globals"
+    note: "Closes fk-b3d95cdaa0d3. Depends on ζ, β0 and 8804."
+    capabilities:
+      - name: "process-lifecycle-object"
+        binding: "producer (θ1) — server/process_lifecycle.py::ProcessLifecycle"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ProcessLifecycle"
+          paths: ["fused-memory/src/fused_memory/server/process_lifecycle.py"]
+          expect: present
+      - name: "no-test-global-rebinding"
+        binding: "anti-inversion — no test reads or writes the operator-stop module global"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_operator_stop_received"
+          paths: ["fused-memory/tests/"]
+          expect: absent
+      - name: "no-watchdog-global-patching"
+        binding: "anti-inversion — no test reaches the watchdog stop-event module global"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_watchdog_stop_event"
+          paths: ["fused-memory/tests/"]
+          expect: absent
+  - label: "θ2"
+    task_id: null
+    title: "fused-memory's HTTP/ASGI boundary leaves server/main.py"
+    note: "Contributes to fk-b3d95cdaa0d3. Depends on θ1."
+    capabilities:
+      - name: "http-boundary-module"
+        binding: "producer (θ2) — server/http_boundary.py holds the ASGI shield, the JSON error handler, uvicorn config and the listener claim"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/server/http_boundary.py"]
+          expect: present
+      - name: "shield-moved"
+        binding: "anti-inversion — _ASGIExceptionShield no longer lives in main.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class _ASGIExceptionShield"
+          paths: ["fused-memory/src/fused_memory/server/main.py"]
+          expect: absent
+  - label: "η"
+    task_id: null
+    title: "fused-memory collaborators via constructors; one TaskInterceptor builder in server/composition.py"
+    note: "Closes fk-db357b64fcae with S26 γ 9158, S10 μ2 9280 and S12 κ1 (OQ-9 ruled (a)). Depends on θ2, S12 κ1 (C6: the InterceptorCollaborators.reconciler provider) and 5462. set_event_buffer stays (S26 C3)."
+    capabilities:
+      - name: "one-interceptor-builder"
+        binding: "producer (η) — server/composition.py::build_task_interceptor, called once per configuration"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def build_task_interceptor"
+          paths: ["fused-memory/src/fused_memory/server/composition.py"]
+          expect: present
+      - name: "builder-supplies-reconciler-provider"
+        binding: "producer (η) — η's builder passes S12 C6's InterceptorCollaborators(reconciler=...) provider; the interceptor resolves it with itself as the write gate; S12 κ1 deletes both targeted. back-wires (OQ-9 ruled (a))"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reconciler="
+          paths: ["fused-memory/src/fused_memory/server/composition.py"]
+          expect: present
+      - name: "no-locals-probes"
+        binding: "anti-inversion — no server module tests variable existence with locals()"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "in locals\\(\\)"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+      - name: "no-journal-setter-wiring"
+        binding: "anti-inversion — ReconciliationJournal takes write_journal at construction; no server module calls its setter"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "recon_journal\\.set_write_journal\\("
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+  - label: "σ"
+    task_id: null
+    title: "fused-memory add_memory and add_system_record replies carry a typed per-store error map"
+    note: "Produces C7 (extends S26 C2's AddMemoryResponse). Closes fk-05a87fd1777d (OQ-5 ruled option B; also stamped onto 9147). Depends on 9252 (S26's last memory_service.py task; its closure holds 9147) and 9147."
+    capabilities:
+      - name: "store-errors-field"
+        binding: "producer (σ) — models/memory.py::AddMemoryResponse.store_errors: dict[SourceStore, str], disjoint from the three store lists"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "store_errors"
+          paths: ["fused-memory/src/fused_memory/models/memory.py"]
+          expect: present
+      - name: "store-errors-producers"
+        binding: "producer (σ) — MemoryService.add_memory and add_system_record fill store_errors for a failed leg"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "store_errors"
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          expect: present
+  - label: "ω"
+    task_id: null
+    title: "fused-memory MCP server boundary integration gate"
+    note: "Integration gate and signal leaf; no key of its own. Depends on ι, γ, η, θ2, λ, κ, σ."
+    capabilities:
+      - name: "boundary-test-module"
+        binding: "producer (ω) — fused-memory/tests/test_mcp_server_boundary.py runs boundary rows 1, 4, 5, 12, 14, 17 and 22 through call_tool"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/test_mcp_server_boundary.py"]
+          expect: present
+      - name: "live-boundary-behaviour"
+        binding: "after the final deploy: hyphen project_id on a write tool, get_status(panels=...) and tools/list behave as the rows state"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms the three live calls against the deployed fused-memory unit; not a tree property"

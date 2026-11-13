@@ -13,6 +13,9 @@ from config_reload_script_fakes import (
     FakeEscalationMcp,
     reload_report,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 COMMITTED_AS = "abc1234"
 CONFIG_PATH = "/x/dark-factory-orchestrator.yaml"

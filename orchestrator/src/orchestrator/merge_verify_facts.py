@@ -21,7 +21,8 @@ class RunnerReason(StrEnum):
     #: Local by rule: no remote configured, or a local-only caller
     #: (shadow, history leg, leaseless gate).
     LOCAL_ONLY_RULE = 'local_only_rule'
-    #: A gate re-verify on the head's held host.
+    #: A gate re-verify on the head's held host.  Historical: produced
+    #: before task 8525 made that re-verify a dispatch of the rebased head.
     GATE_ON_HEAD_HOST = 'gate_on_head_host'
     #: An in-place retry on the host attempt 0 held.
     RETRY_HELD_HOST = 'retry_held_host'

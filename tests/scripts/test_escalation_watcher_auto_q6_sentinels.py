@@ -21,8 +21,11 @@ import pathlib
 
 import pytest
 import verify_command_invariants as vci
-from orchestrator.harness import Harness
 from orchestrator.recovery_emission import RECOVERY_VETO_STREAK_SENTINEL_PREFIX
+from orchestrator.stale_l0_strand_identity import STALE_L0_STRAND_SENTINEL
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SKILL = REPO_ROOT / 'skills' / 'escalation-watcher-auto' / 'SKILL.md'
@@ -30,7 +33,7 @@ SKILL = REPO_ROOT / 'skills' / 'escalation-watcher-auto' / 'SKILL.md'
 _SLUG = 'q6-detector-sentinels'
 _CODE_SENTINELS = (
     RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
-    Harness._STALE_L0_STRAND_SENTINEL,
+    STALE_L0_STRAND_SENTINEL,
 )
 
 
@@ -86,7 +89,7 @@ def test_q6_rule_span_names_exactly_the_detector_sentinel_constants() -> None:
         f'the {_SLUG} table names {sorted(documented)!r} but the detectors file '
         f'under {sorted(_CODE_SENTINELS)!r} '
         '(recovery_emission.py::RECOVERY_VETO_STREAK_SENTINEL_PREFIX, '
-        'harness.py::Harness._STALE_L0_STRAND_SENTINEL). A renamed constant must '
+        'stale_l0_strand_identity.py::STALE_L0_STRAND_SENTINEL). A renamed constant must '
         'be mirrored in the table, and a table row needs a constant behind it.'
     )
 

@@ -58,6 +58,9 @@ from audit_delivered_checks import (
 )
 from shared.delivered_check_polarity import CheckOutcome
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # classify_descriptor — the pure core, and the whole point of the script.

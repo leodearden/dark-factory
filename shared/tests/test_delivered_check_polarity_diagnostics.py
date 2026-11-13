@@ -15,6 +15,9 @@ import pytest
 from polarity_fixture_repo import init_git_repo
 
 from shared.delivered_check_polarity import lint_delivered_checks
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # TestSelfReferentialRefinement (task 3500 — step-7 RED / step-8 GREEN)

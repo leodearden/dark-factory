@@ -26,12 +26,15 @@ from _fm_helpers import (
     make_rebuild_detail,
 )
 from falkordb.asyncio import FalkorDB
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.graphiti_client import (
     GraphitiBackend,
     NodeNotFoundError,
     _MultiTenantFalkorDriver,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.redirect_node_edges

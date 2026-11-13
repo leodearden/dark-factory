@@ -71,6 +71,10 @@ from silent_fallthrough_scan import (
     reconcile_against_allowlist,
 )
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 
 def _src(text: str) -> str:
     """Dedent one triple-quoted chunk of a synthetic module source."""

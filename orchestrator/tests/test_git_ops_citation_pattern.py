@@ -18,12 +18,19 @@ from _git_fixtures import seed_repo
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps
+from orchestrator.git_ops import (
+    DEFAULT_COMMIT_CITATION_PATTERN,
+    CitationPatternInvalid,
+    GitOps,
+    render_citation_pattern,
+)
 
 
 def _cites(subject: str, tid: str) -> bool:
     """Apply the template to one SUBJECT the way ``find_task_citation_commit`` does."""
-    pattern = re.compile(DEFAULT_COMMIT_CITATION_PATTERN.format(tid=re.escape(tid)))
+    pattern = re.compile(render_citation_pattern(
+        DEFAULT_COMMIT_CITATION_PATTERN, tid, branch_prefix='task/', main_branch='main',
+    ))
     return pattern.search(subject) is not None
 
 
@@ -160,3 +167,24 @@ class TestGitDialect:
         _commit(git_repo, 'chore: notes', body='(task 4369 step-1)')
 
         assert await git_ops.find_task_citation_commit('4369') is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tid', ['', '4369 x'], ids=['empty', 'whitespace'])
+class TestTaskIdNoBranchCanName:
+    """The merge arm cannot render such an id: the checked face says so, the fail-safe face reads no citation."""
+
+    async def test_checked_lookup_raises_citation_pattern_invalid(
+        self, git_ops: GitOps, git_repo: Path, tid: str,
+    ) -> None:
+        _commit(git_repo, 'impl(4369): x')
+
+        with pytest.raises(CitationPatternInvalid):
+            await git_ops.find_task_citation_commit_checked(tid)
+
+    async def test_fail_safe_lookup_reads_no_citation(
+        self, git_ops: GitOps, git_repo: Path, tid: str,
+    ) -> None:
+        _commit(git_repo, 'impl(4369): x')
+
+        assert await git_ops.find_task_citation_commit(tid) is None

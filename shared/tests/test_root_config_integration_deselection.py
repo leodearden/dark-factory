@@ -40,6 +40,10 @@ from pathlib import Path
 
 import pytest
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ROOT_PYPROJECT = REPO_ROOT / 'pyproject.toml'
 TARGET_MODULE = REPO_ROOT / 'shared' / 'tests' / 'test_cli_invoke_integration.py'

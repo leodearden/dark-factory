@@ -64,13 +64,17 @@ def map_terminal_state(raw: str) -> MergeState:
 
 _HINTS: Mapping[MergeReason, str] = types.MappingProxyType({
     MergeReason.never_submitted: (
-        'No live, journal or event-store record exists and git shows no landing '
-        'on main: this merge was never submitted. Submit it with merge_request.'
+        'No live, journal or event-store record exists for this key. Only a '
+        'task_id- or branch-keyed poll checks git for a landing on main; a '
+        'request_id-keyed answer says nothing about one, and is expected for the '
+        'own request_id of an attached submit. A resubmit is licensed only by a '
+        'task_id- or branch-keyed answer, with get_merge_queue() showing no entry '
+        'for the branch.'
     ),
     MergeReason.prior_run_terminal: (
         "Only a previous orchestrator run's record exists (see last_outcome); it "
-        "is history, not this run's outcome. Resubmit with merge_request if the "
-        'work is still not on main.'
+        "is history, not this run's outcome. Do not resubmit on this answer: "
+        "resubmitting after a prior run's record is a human's decision."
     ),
     MergeReason.journaled_not_live: (
         'The durable merge journal holds this request, but the live worker '

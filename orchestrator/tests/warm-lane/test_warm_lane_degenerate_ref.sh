@@ -25,6 +25,7 @@
 #   step-11 — fleet-audit status-oracle (advisory filter)
 #   esc-7244-16 — K1-K6: the conventional-commit citation form, the usual
 #            landed tip in both repos
+#   M — merge-subject arm rendered from shared.merge_subject (task 6716)
 #
 # Driven by orchestrator/tests/test_warm_lane_bash_suite.py (PORTED_TESTS).
 
@@ -665,5 +666,101 @@ assert "O2: 9206 (oracle prints empty) row status is 'unknown'" \
 assert "O2: summary flagged=2 (both unknown treated as non-terminal)" \
     bash -c 'printf "%s\n" "$1" | grep -qxF "audit: degenerate=2 live=0 landed=0 absent=0 total=2 flagged=2"' \
     _ "$OUT"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M — merge-subject arm rendered from shared.merge_subject (task 6716)
+#
+# Every subject here is written by shared.merge_subject.format_merge_subject,
+# for a feat/ prefix landing into trunk, so a merge arm that still spells
+# "task/" or "main" cannot classify it.
+#
+# M1 — feat/<id> parked on a no-ff merge carrying its own landing subject
+#      -> `landed <sha>`, exit 4
+# M2 — feat/<id2> parked on `Revert "<landing subject of feat/<id2>>"`
+#      -> `degenerate <sha>`, exit 0
+# M3 — the script and its lib copied where no shared/src sits three levels up
+#      -> exit 2 (wiring), stderr names shared.merge_subject
+# M4 — the lib called in reify's three-argument form, with no merge head/into,
+#      on a body line that merely starts with the id -> refuses, rc 2, rather
+#      than citing; the five-argument call on the same message answers rc 1
+# M5 — task_citation_peer_ids in reify's two-argument form -> rc 2, no ids
+# ─────────────────────────────────────────────────────────────────────────────
+M_SHARED_SRC="$(cd "$WARM_LANE_SCRIPTS_DIR/../../.." && pwd)/shared/src"
+
+# m_subject <branch> <main_branch> — the landing subject, from shared.
+m_subject() {
+    python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from shared.merge_subject import format_merge_subject; print(format_merge_subject(sys.argv[2], sys.argv[3]))' \
+        "$M_SHARED_SRC" "$1" "$2"
+}
+
+M_TMP="$(mktemp -d /tmp/test-warm-lane-degen-ref-merge-subject-XXXXXX)"
+_TMPDIRS+=("$M_TMP")
+M_REPO="$M_TMP/repo"
+git init -q -b trunk "$M_REPO"
+git -C "$M_REPO" config user.email "test@test.local"
+git -C "$M_REPO" config user.name "Test"
+git -C "$M_REPO" commit -q --allow-empty -m "initial"
+
+git -C "$M_REPO" checkout -q -b _m-side trunk
+git -C "$M_REPO" commit -q --allow-empty -m "work for the merge-subject block"
+git -C "$M_REPO" checkout -q trunk
+git -C "$M_REPO" merge -q --no-ff -m "$(m_subject feat/6101 trunk)" _m-side
+git -C "$M_REPO" branch -q -D _m-side
+M_LANDED_TIP="$(git -C "$M_REPO" rev-parse HEAD)"
+git -C "$M_REPO" branch -q feat/6101 "$M_LANDED_TIP"
+
+git -C "$M_REPO" commit -q --allow-empty -m "Revert \"$(m_subject feat/6102 trunk)\""
+M_REVERT_TIP="$(git -C "$M_REPO" rev-parse HEAD)"
+git -C "$M_REPO" branch -q feat/6102 "$M_REVERT_TIP"
+
+run_helper --task 6101 --main-ref trunk --branch-prefix feat/ --repo "$M_REPO"
+assert "M1: feat/6101 on its own landing subject into trunk exits 4 (landed)" \
+    test "$RC" -eq 4
+assert "M1: stdout is 'landed <tip sha>'" \
+    bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$M_LANDED_TIP"
+
+run_helper --task 6102 --main-ref trunk --branch-prefix feat/ --repo "$M_REPO"
+assert "M2: feat/6102 on a Revert of its landing subject exits 0 (degenerate)" \
+    test "$RC" -eq 0
+assert "M2: stdout is 'degenerate <tip sha>'" \
+    bash -c '[ "$1" = "degenerate $2" ]' _ "$OUT" "$M_REVERT_TIP"
+
+M3_DIR="$M_TMP/relocated"
+mkdir -p "$M3_DIR"
+cp "$SCRIPT" "$WARM_LANE_SCRIPTS_DIR/lib_task_citation.sh" "$M3_DIR/"
+M3_RC=0
+M3_ERR="$(bash "$M3_DIR/warm-lane-degenerate-ref-check.sh" \
+    --task 6101 --main-ref trunk --branch-prefix feat/ --repo "$M_REPO" 2>&1 >/dev/null)" || M3_RC=$?
+assert "M3: no shared/src three levels above the relocated script exits 2 (wiring)" \
+    test "$M3_RC" -eq 2
+assert "M3: stderr names shared.merge_subject" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "shared.merge_subject"' _ "$M3_ERR"
+
+M_LIB="$WARM_LANE_SCRIPTS_DIR/lib_task_citation.sh"
+M_BODY_MSG=$'chore: tidy\n\n6101 files touched'
+M_HEAD_INTO="$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from shared.merge_subject import rendered_prefix; print("\n".join(rendered_prefix(sys.argv[2])))' \
+    "$M_SHARED_SRC" feat/)"
+M_HEAD_RE="${M_HEAD_INTO%%$'\n'*}"
+M_INTO_RE="${M_HEAD_INTO#*$'\n'}"
+
+M4_RC=0
+M4_ERR="$(bash -c 'source "$1"; task_citation_message_cites "$2" 6101 "feat\\/"' \
+    _ "$M_LIB" "$M_BODY_MSG" 2>&1 >/dev/null)" || M4_RC=$?
+assert "M4: a three-argument call refuses with rc 2 rather than citing" \
+    test "$M4_RC" -eq 2
+assert "M4: stderr names the missing merge head/into" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "<merge_head_re> and <merge_into_re>"' _ "$M4_ERR"
+assert "M4: control — the five-argument call on the same message does not cite (rc 1)" \
+    bash -c 'source "$1"; task_citation_message_cites "$2" 6101 "feat\\/" "$3" "$4"; [ "$?" -eq 1 ]' \
+    _ "$M_LIB" "$M_BODY_MSG" "$M_HEAD_RE" "$M_INTO_RE"
+
+M5_RC=0
+M5_OUT="$(bash -c 'source "$1"; task_citation_peer_ids "$2" "feat\\/"' \
+    _ "$M_LIB" "$M_BODY_MSG" 2>/dev/null)" || M5_RC=$?
+assert "M5: a two-argument task_citation_peer_ids refuses with rc 2" \
+    test "$M5_RC" -eq 2
+assert "M5: and names no peer id" \
+    test -z "$M5_OUT"
 
 test_summary

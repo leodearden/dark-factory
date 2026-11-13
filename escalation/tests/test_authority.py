@@ -41,6 +41,8 @@ from escalation.authority import (
     POLICY_TABLE,
     PROMOTE_ALLOWED,
     PROMOTE_SENTINEL_BOUND_ROLES,
+    REVERSIBILITY_WAIVED_ACTIONS,
+    REVERSIBLE_POLICY_ACTIONS,
     ROLE_LEVEL_ALLOWLIST,
     ClassSwitch,
     IllegalClassTransition,
@@ -174,6 +176,14 @@ class TestCrossLayerIdentityLockstep:
         from orchestrator.deterministic_runner import MILESTONE_CHECK_STALLED_CATEGORY
 
         assert MILESTONE_CHECK_STALLED_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES
+
+    def test_runner_review_due_category_is_registered_and_denied(self) -> None:
+        """The trigger chain's human gate stays denied (PRD C4), and the
+        literal the runner files is the registered category, not a copy."""
+        from orchestrator.deterministic_runner import REVIEW_DUE_CATEGORY
+
+        assert REVIEW_DUE_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert REVIEW_DUE_CATEGORY in set(EscalationCategory)
 
 
 class TestPromoteSentinelBoundRoles:
@@ -635,6 +645,20 @@ class TestL2AutoCloseClass:
             f'Expected denylist to block curator_adjudication_missing, got: {result!r}'
         )
 
+    def test_review_due_denied_even_for_non_deterministic_role(self) -> None:
+        """'review_due' is the human gate of a trigger chain (PRD
+        completion-driven-triggers C4): Leo decides whether to run the review,
+        so the category alone blocks an auto-close under any role."""
+        resolution = 'Subject task status=done per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='review_due', agent_role='some-other-role',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block review_due, got: {result!r}'
+        )
+
     def test_orchestrator_deterministic_role_denied_even_for_infra_issue(self) -> None:
         resolution = 'live probe: curator paused=false — transient infra self-cleared.'
         result = l2_auto_close_class(
@@ -657,6 +681,7 @@ class TestL2AutoCloseClass:
         assert 'milestone_gate' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_check_failed' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'curator_adjudication_missing' in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert 'review_due' in L2_AUTO_CLOSE_DENY_CATEGORIES
 
     def test_deny_roles_are_frozenset_containing_expected_members(self) -> None:
         assert isinstance(L2_AUTO_CLOSE_DENY_ROLES, frozenset)
@@ -719,10 +744,19 @@ class TestPolicyRowInvariants:
         assert 'str_evidence' in str(excinfo.value)
         assert 'raw-string' in str(excinfo.value)
 
-    def test_reversible_is_false_iff_done_flip_is_allowed(self) -> None:
+    def test_reversible_iff_every_act_is_a_reversible_action(self) -> None:
         assert _row().reversible is True
-        flipping = _row(actions=frozenset({PolicyAction.DONE_FLIP, PolicyAction.CLOSE_ONLY}))
-        assert flipping.reversible is False
+        filing = _row(actions=frozenset({PolicyAction.FILE_TASK, PolicyAction.CLOSE_ONLY}))
+        assert filing.reversible is True
+        for irreversible in (PolicyAction.DONE_FLIP, PolicyAction.RECOVER_MAIN, PolicyAction.B3_APPLY):
+            row = _row(actions=frozenset({irreversible, PolicyAction.CLOSE_ONLY}))
+            assert row.reversible is False, irreversible
+
+    def test_no_act_is_both_reversible_and_waived(self) -> None:
+        """A waiver makes an act stampable, not reversible; an act in both sets
+        would make every row allowing it read reversible."""
+        overlap = REVERSIBLE_POLICY_ACTIONS & REVERSIBILITY_WAIVED_ACTIONS
+        assert not overlap, sorted(map(str, overlap))
 
     def test_audit_full_until_is_20_for_file_writing_or_recover_main(self) -> None:
         assert _row().audit_full_until == 0
@@ -790,6 +824,9 @@ class TestPolicyTableRows:
 
     _FOUND_ON_MAIN = 'found_on_main at 1a2b3c4d; git merge-base --is-ancestor 1a2b3c4d main rc=0'
     _FOUND_ON_MAIN_NO_SHA = 'found_on_main; git merge-base --is-ancestor main rc=0'
+    _CLAIM_TRUE = 'get_task 4321 status=done; git merge-base --is-ancestor 1a2b3c4d main rc=0'
+    _CLAIM_TRUE_NO_ANCESTRY = 'get_task 4321 status=done; 1a2b3c4d'
+    _CLAIM_TRUE_NO_SHA = 'get_task 4321 status=done; git merge-base --is-ancestor main rc=0'
 
     def test_table_is_a_tuple_of_rows_with_unique_slugs(self) -> None:
         assert isinstance(POLICY_TABLE, tuple)
@@ -804,9 +841,9 @@ class TestPolicyTableRows:
         }
         assert not not_shadow, f'every class must start shadow (decision 7): {not_shadow!r}'
 
-    def test_no_row_allows_park_or_restart(self) -> None:
+    def test_no_row_allows_park_restart_or_abandon(self) -> None:
         for row in POLICY_TABLE:
-            assert not ({'park', 'restart'} & row.actions), row.policy_class
+            assert {'park', 'restart', 'abandon'}.isdisjoint(row.actions), row.policy_class
 
     def test_unknown_slug_has_no_row(self) -> None:
         assert policy_row('nope') is None
@@ -824,6 +861,17 @@ class TestPolicyTableRows:
         assert row.reversible is False
         assert row.evidence_present(self._FOUND_ON_MAIN)
         assert not row.evidence_present(self._FOUND_ON_MAIN_NO_SHA)
+
+    def test_completion_claim_true_closes_the_gate_record(self) -> None:
+        """Sitting item 522 (Leo, 2026-11-09): the TRUE arm closes; nothing is abandoned."""
+        row = policy_row('completion_claim_true')
+        assert row is not None
+        assert row.match.matches('unverified_completion_claim', 'some-agent')
+        assert not row.match.matches('task_failure', 'some-agent')
+        assert row.actions == frozenset({PolicyAction.CLOSE_ONLY})
+        assert row.evidence_present(self._CLAIM_TRUE)
+        assert not row.evidence_present(self._CLAIM_TRUE_NO_ANCESTRY)
+        assert not row.evidence_present(self._CLAIM_TRUE_NO_SHA)
 
     def test_found_on_main_matches_any_category(self) -> None:
         row = policy_row('found_on_main')

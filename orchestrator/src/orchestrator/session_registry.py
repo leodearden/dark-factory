@@ -59,6 +59,7 @@ if (
 ) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
     sys.path.append(_CHECKOUT_SHARED_SRC)
 
+from shared.proc_liveness import pid_alive
 from shared.process_identity import Liveness, ProcessIdentity
 from shared.project_id import fold_project_token
 from shared.session_liveness import capture_for_record, judge
@@ -2890,54 +2891,11 @@ no fresh write (heartbeat) before the reaper reclaims it. A launcher not
 judged DEAD retains the record regardless of age."""
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if the process identified by *pid* is alive.
-
-    Copied (not imported) from harness.py:295-317 to keep this module
-    stdlib-only and self-contained (invocable as a standalone script from
-    bash with no orchestrator package import). That copy's contract is
-    preserved verbatim EXCEPT in the OverflowError branch, where this one
-    deliberately diverges (task 4755): harness.py::_pid_alive and the
-    fused_memory orchestrator_detector copy it mirrors still raise there, and
-    widening them is filed as follow-up work rather than done here, because
-    neither sits on the fleet-redeploy lease's read path.
-
-    - Returns False for pid <= 0 (invalid).
-    - Uses os.kill(pid, 0): success -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable); other OSError, or
-      an OverflowError from a pid too large for the platform's C pid_t ->
-      treated as dead.
-
-    The OverflowError case is ordinary untrusted input, not a hypothetical:
-    service_restart.lease_is_live imports this predicate to evaluate a pid
-    parsed out of JSON another process wrote, so a value no pid_t can hold
-    arrives the same way a negative one does. "Cannot name a live process" is
-    exactly the judgment the OSError branch already makes for every other
-    value the syscall refuses.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except (OSError, OverflowError):
-        return False
-
-
-def pid_alive(pid: int) -> bool:
-    """Whether *pid* names a live process; ``_pid_alive``'s contract."""
-    return _pid_alive(pid)
-
-
 def _swept_as_dead(
     identity: ProcessIdentity | None, pid: int, *, sweep: str, subject: str
 ) -> bool:
     """Whether a liveness sweep may treat *pid* as dead: ``judge``'s DEAD, with an OTHER_HOST skip logged."""
-    verdict = judge(identity, pid, pid_alive=_pid_alive)
+    verdict = judge(identity, pid, pid_alive=pid_alive)
     if verdict is Liveness.OTHER_HOST and identity is not None:
         logger.info('%s: skipped %s, reason=other_host host=%s', sweep, subject, identity.host)
     return verdict is Liveness.DEAD
@@ -4178,7 +4136,7 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     ``$$``=2487079 (transient wrapper) vs ``$PPID``==``$CLAUDE_PID``=2345789,
     with ``ps -o comm=`` confirming the latter is the long-lived ``claude``
     process. Both watcher SKILLs nonetheless prescribed ``--pid $$`` for a
-    year, so ``_pid_alive`` was ~always False for a watcher lease and the
+    year, so ``pid_alive`` was ~always False for a watcher lease and the
     (dead pid AND aged heartbeat) staleness AND-guard collapsed to a pure
     heartbeat check.
 
@@ -4198,7 +4156,7 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     session leader is ordinarily the interactive shell, which lives for the
     terminal's whole lifetime -- so it stays alive after the ``claude``
     process it stood in for has crashed.
-    ``_pid_alive`` would then answer True forever, and because BOTH staleness
+    ``pid_alive`` would then answer True forever, and because BOTH staleness
     rules (claim_lease's ``is_stale`` and reap_stale_leases' ``stale_pid``)
     require a DEAD pid AND an aged heartbeat, a crashed holder's lease would
     become PERMANENTLY unreapable -- recoverable only by a human
@@ -4206,7 +4164,7 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     ``--pid $$`` defect this function exists to fix, and the exact opposite of
     the heartbeat-only degradation documented here and in LEASE_HEARTBEAT_TTL.
 
-    0 makes that documented degradation literally true: ``_pid_alive`` returns
+    0 makes that documented degradation literally true: ``pid_alive`` returns
     False for every pid <= 0, so an unresolvable session pid collapses the
     AND-guard to its heartbeat half -- precisely the pre-3994 behaviour, which
     LEASE_HEARTBEAT_TTL's 7200s is still sized to survive -- instead of to a
@@ -4315,7 +4273,7 @@ mis-diagnoses itself with.
 
 WITHDRAWN BASIS (2796): "watcher leases are effectively HEARTBEAT-ONLY, not
 pid-guarded" -- true only because both watcher SKILLs claimed with
-``--pid $$``, the ephemeral Bash-tool wrapper pid, so ``_pid_alive`` was
+``--pid $$``, the ephemeral Bash-tool wrapper pid, so ``pid_alive`` was
 ~always False and the staleness AND-guard collapsed to a pure heartbeat-TTL
 check. Task 3994's ``resolve_session_pid`` restores a real, long-lived
 session pid, so that premise no longer holds.
@@ -4325,7 +4283,7 @@ never reaped regardless of heartbeat age (a shared ``claude agents`` host pid
 excepted, see _lease_is_stale), so this TTL now bounds only ONE
 thing -- crash recovery for a genuinely-dead holder. It nonetheless stays at
 2h rather than dropping back toward the old 5min, for two reasons:
-(a) resolve_session_pid still degrades -- to pid 0, which `_pid_alive`
+(a) resolve_session_pid still degrades -- to pid 0, which `pid_alive`
 reports dead by construction -- whenever CLAUDE_PID is unresolvable on some
 launch path or names a shared ``claude agents`` host, and that degradation is
 logged but not fatal. On that path the
@@ -4464,7 +4422,7 @@ class LeaseHolder:
         Its ONLY two roles are (i) the ownership comparison in
         ``_check_lease_ownership`` and (ii) naming the holder in a
         human-readable contention/refusal message.
-    pid: the holder process's pid; liveness is checked via _pid_alive. Any int, bool
+    pid: the holder process's pid; liveness is checked via pid_alive. Any int, bool
         excluded (0 is resolve_session_pid's degraded provably-dead value).
     start_ts: ISO-8601 timestamp of when this holder claimed the lease.
     record_slug: the holder's session-registry record key, resolved at claim
@@ -4544,7 +4502,7 @@ class LeaseClaim:
     holder: the lease's holder after this call -- the caller's own *holder*
         argument when acquired, otherwise the pre-existing holder found on
         disk (or None if that body was missing/unreadable).
-    holder_alive: whether `holder`'s pid is currently alive (_pid_alive).
+    holder_alive: whether `holder`'s pid is currently alive (pid_alive).
     heartbeat_age_secs: seconds since the lease file's mtime; 0.0 for a
         freshly-acquired lease.
     message: fully-formatted, user-observable line -- callers print this
@@ -4693,7 +4651,7 @@ def _read_lease_holder_state(
         holder = LeaseHolder.from_json(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None, False, age_secs
-    return holder, _pid_alive(holder.pid), age_secs
+    return holder, pid_alive(holder.pid), age_secs
 
 
 def _lease_is_stale(holder: LeaseHolder | None, *, holder_alive: bool, age_secs: float) -> bool:
@@ -4719,7 +4677,7 @@ def claim_lease(
     Uses ``os.open(O_CREAT|O_EXCL|O_WRONLY)`` -- the identical atomic
     exclusive-create idiom as ``ArtifactStore.lock_plan`` (artifacts.py) --
     so the first caller to create the ``.lease`` file wins outright. When the
-    lease is already held, the existing holder's liveness (_pid_alive) and
+    lease is already held, the existing holder's liveness (pid_alive) and
     heartbeat age (file mtime) are checked: if _lease_is_stale, the stale
     lease is reaped and the claim retried once; otherwise the existing holder is
     reported under *policy* (STAND_DOWN/WARN_AND_PROCEED) and the on-disk
@@ -4961,7 +4919,7 @@ class LeaseStatus:
         holder) or 'absent' (no such lease). The discriminator: the holder_*
         identity fields are populated only for 'held'.
     holder_slug / holder_pid: the holder's identity from the body, or None.
-    holder_pid_alive: whether that pid is currently running (_pid_alive) --
+    holder_pid_alive: whether that pid is currently running (pid_alive) --
         the LIVENESS axis, independent of freshness.
     heartbeat_ts: ISO-8601 timestamp of the last heartbeat, derived from the
         lease file's mtime (None when absent) -- the FRESHNESS axis.
@@ -5116,7 +5074,7 @@ def reap_stale_leases(
             holder = LeaseHolder.from_json(lease_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             holder = None
-        holder_alive = holder is not None and _pid_alive(holder.pid)
+        holder_alive = holder is not None and pid_alive(holder.pid)
         if not _lease_is_stale(holder, holder_alive=holder_alive, age_secs=age_secs):
             reason = None
         elif holder is None:

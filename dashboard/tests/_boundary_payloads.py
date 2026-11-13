@@ -13,14 +13,16 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import httpx
-from _canned_mcp import CannedMCP, _raw_row
+from _canned_mcp import CannedMCP, _raw_row, is_metadata_projection
 from _dt_helpers import fixed_clock, installed_clock
 from _prd_lanes_tree import (
     CARRIER,
@@ -33,6 +35,16 @@ from _prd_lanes_tree import (
     tree_tasks,
 )
 from _prd_tree import prd_tree_tasks
+from _quality_rows import (
+    NO_COST,
+    NO_OUTCOMES,
+    epochs_from,
+    history,
+    train,
+    write_landing_events,
+    write_marker_state_db,
+    write_quality_db,
+)
 from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
 from _served_reads import forget_escalation_corpus, forget_served_reads
 from escalation.archive import archive_dir_for_date
@@ -41,6 +53,10 @@ from escalation.queue import EscalationQueue
 from fastapi.testclient import TestClient
 from shared.capability_manifest import sidecar_path
 from shared.locking import files_to_modules
+from shared.project_id import project_id_for_root
+from shared.quality_series.git_lines import ModuleLines
+from shared.quality_series.landings import GitCrossCheck, LinesBase
+from shared.quality_series.rows import Cost, LandingRow, Outcomes
 from shared.task_statuses import TaskStatus
 
 import dashboard.data.task_snapshot as snapshot_mod
@@ -48,6 +64,9 @@ from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
+from dashboard.data.quality_markers import Marker, MarkerKind, MarkerSource, SourceType
+from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS
+from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
@@ -62,6 +81,7 @@ ESCALATION_ANALYTICS = '/api/v2/dashboard/escalation-analytics'
 MEMORY_GRAPHS = '/api/v2/dashboard/memory-graphs'
 SCHEDULER = '/api/v2/dashboard/scheduler'
 PRDS = '/api/v2/dashboard/prds'
+QUALITY = '/api/v2/dashboard/quality'
 
 # in_flight 43 (running 25), backlog 1310, terminal 4106: total 5459.
 DARK_FACTORY_COUNTS: Mapping[TaskStatus, int] = {
@@ -762,8 +782,8 @@ def _furnish_lanes(
     return furnish
 
 
-def _projected_read(call: dict) -> bool:
-    return call['tool'] == 'get_tasks' and call['args'].get('fields') is not None
+def _lineage_read(call: dict) -> bool:
+    return call['tool'] == 'get_tasks' and is_metadata_projection(call['args'])
 
 
 CONTENDED_IDS = (950, 951, 952)
@@ -831,7 +851,7 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         ) -> None:
             substrate = lanes_substrate(tree)
             if lineage_fails:
-                substrate.fail_when = _projected_read
+                substrate.fail_when = _lineage_read
             if contended:
                 _contend(substrate)
             substrates = {LANES_ROOT: substrate, QUEUELESS_ROOT: _substrate(REIFY_COUNTS)}
@@ -855,6 +875,201 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             schedulers={LANES_ROOT: _CARRIER_HOLDS_LOCKED_MODULE},
         )
         serve('prd_lanes_queueless', queue=False)
+    return bodies
+
+
+QUALITY_AT = datetime(2026, 11, 10, 12, 0, 0, tzinfo=UTC)
+"""The instant the quality scenarios are read at; their stored landings end a day before it."""
+QUALITY_WINDOW = 100
+QUALITY_STORED = 150
+"""Landings a full quality scenario stores: past the window and past a baseline's 100."""
+QUALITY_SMALL_N = 40
+QUALITY_OFF_LINE = QUALITY_STORED - 3
+QUALITY_LATE_CLAIM = QUALITY_STORED - 2
+"""The ordinals of the fresh scenario's landing off main's first parent and of its late claim,
+which re-claims the sha landed :data:`QUALITY_RECLAIMED_BACK` units before it."""
+QUALITY_RECLAIMED_BACK = 3
+QUALITY_GIT_CHECK = GitCrossCheck(off_first_parent=1, merges_without_landing=1, late_claims=1)
+"""The fresh scenario's git cross-check: its two landings off the line, and a merge commit
+runs.db records no landing for."""
+QUALITY_SOURCE_EPOCH = datetime(2026, 10, 21, tzinfo=UTC)
+"""review_completed's first row in the before-epoch scenario, after every landing it stores."""
+QUALITY_PENDING_TRAIN = ('7001', '7002', '7003')
+"""A train runs.db records after the main-ahead scenario's last tick, which quality.db lacks."""
+QUALITY_TICK = timedelta(seconds=QUALITY_SAMPLE_INTERVAL_SECONDS)
+QUALITY_MODULE = 'dashboard'
+QUALITY_MODULE_ORDINALS = tuple(range(0, QUALITY_STORED, 3))
+"""The module the drill-down scenario is read for, and the stored landings touching it."""
+QUALITY_SHIFT = 300
+"""The landing at which the alarm scenarios' rejection rate jumps from 3 in 10 to every landing:
+past the 200 a frozen baseline needs before the marker nearest it."""
+QUALITY_SHIFTED = 15
+"""Landings the alarm scenarios store from the shift on: enough for the up-CUSUM to cross h, too
+few to give the explaining marker's own segment a baseline of its own."""
+_NO_DISAGREEMENT = GitCrossCheck(0, 0, 0)
+
+
+def _quality_outcome(ordinal: int) -> Outcomes:
+    """Every landing reviewed; every fifth rejected and every fourth blocked in review."""
+    rejections = int(ordinal % 5 == 0)
+    return replace(NO_OUTCOMES, rejected=rejections > 0, rejection_events=rejections,
+                   reviewed=True, review_blocking=ordinal % 4 == 0)
+
+
+def _quality_cost(ordinal: int) -> Cost:
+    usd = 2.0 + (ordinal % 7) / 2
+    return replace(NO_COST, all_role_usd=usd, by_role=(('implementer', usd),),
+                   implementer_invocations=1 + ordinal % 3, turns=40 + ordinal % 11)
+
+
+def _quality_history(
+    n: int, *, cost: Callable[[int], Cost] = lambda ordinal: NO_COST,
+    outcome: Callable[[int], Outcomes] = _quality_outcome,
+    modules: Callable[[int], tuple[ModuleLines, ...]] = lambda ordinal: (),
+) -> list[LandingRow]:
+    """*n* landings two hours apart, the newest a day before :data:`QUALITY_AT`."""
+    return history(n, start=QUALITY_AT - timedelta(days=1, hours=2 * (n - 1)),
+                   outcome=outcome, cost=cost, modules=modules)
+
+
+def _shifted_outcome(ordinal: int) -> Outcomes:
+    """The first three of every ten landings rejected until :data:`QUALITY_SHIFT`, every one from it."""
+    rejected = ordinal >= QUALITY_SHIFT or ordinal % 10 < 3
+    return replace(NO_OUTCOMES, rejected=rejected, rejection_events=int(rejected))
+
+
+_MODULE_TOUCHED = frozenset(QUALITY_MODULE_ORDINALS)
+
+
+def _module_lines(ordinal: int) -> tuple[ModuleLines, ...]:
+    module = QUALITY_MODULE if ordinal in _MODULE_TOUCHED else 'orchestrator'
+    return (ModuleLines(module, 40),)
+
+
+def _off_the_line(rows: list[LandingRow]) -> list[LandingRow]:
+    """*rows* with :data:`QUALITY_OFF_LINE` off main's first parent and :data:`QUALITY_LATE_CLAIM`
+    a late claim on an earlier landing's sha, as α records each."""
+    served = list(rows)
+    off = served[QUALITY_OFF_LINE]
+    served[QUALITY_OFF_LINE] = replace(off, landing=replace(off.landing, git_first_parent=False))
+    late = served[QUALITY_LATE_CLAIM]
+    sha = served[QUALITY_LATE_CLAIM - QUALITY_RECLAIMED_BACK].landing.merge_sha
+    served[QUALITY_LATE_CLAIM] = replace(late, landing=replace(
+        late.landing, merge_sha=sha, unit_id=f'{sha}:{late.landing.task_id}', late_claim=True,
+        lines_base=LinesBase.UNMEASURABLE, base_sha=None,
+    ))
+    return served
+
+
+def _quality_root(workdir: Path) -> Path:
+    """Configure the app over one root named dark_factory under *workdir*."""
+    root = workdir / 'dark_factory'
+    root.mkdir(parents=True)
+    app.state.config = DashboardConfig(project_root=root)
+    return root
+
+
+def _store_quality(
+    client: TestClient, root: Path, rows: list[LandingRow], *, sampled_at: datetime,
+    git_check: GitCrossCheck = _NO_DISAGREEMENT,
+) -> None:
+    """Store *rows* in the app's quality.db with one value sample at *sampled_at* whose cursor is
+    the newest row, as a sampler tick that measured them would."""
+    sample = QualitySample.value(
+        project_id_for_root(root), sampled_at, cursor_sha=rows[-1].landing.merge_sha,
+        landings_sampled=len(rows), landings_deferred=0, git_check=git_check,
+    )
+    assert client.portal is not None, 'quality.db is written inside a live TestClient'
+    client.portal.call(write_quality_db, app.state.config.quality_db, rows, [sample])
+
+
+def _render_quality(client: TestClient, at: datetime, **module: str) -> dict[str, Any]:
+    """GET /quality?project=dark_factory&window=100 on the real route, its clock at *at*; a
+    ``module=`` keyword drills down to that module."""
+    with installed_clock(app, fixed_clock(at)):
+        return _get(client, QUALITY, project='dark_factory', window=str(QUALITY_WINDOW), **module)
+
+
+def _store_routing_marker(client: TestClient, at: datetime, *, refreshed_at: datetime) -> None:
+    """Store one derived reviewer effort change at *at* as dark_factory's marker derivation."""
+    marker = Marker(
+        marker_id=f'routing:reviewer_comprehensive:{at.isoformat()}', at=at, kind=MarkerKind.EFFORT,
+        scope='dark_factory', series=None, until=None,
+        label='reviewer_comprehensive effort high → xhigh',
+        source=MarkerSource(SourceType.ROUTING, role='reviewer_comprehensive'),
+    )
+    assert client.portal is not None, 'quality.db is written inside a live TestClient'
+    client.portal.call(partial(write_marker_state_db, app.state.config.quality_db, 'dark_factory',
+                               (marker,), refreshed_at=refreshed_at))
+
+
+def _alarm_scenario(
+    client: TestClient, workdir: Path, *, marker_before: int, sampled_at: datetime,
+) -> dict[str, Any]:
+    """Sketch row 9: the rejection rate shifts at :data:`QUALITY_SHIFT`, and the one derived
+    marker is dated at the landing *marker_before* landings before it."""
+    root = _quality_root(workdir)
+    rows = _quality_history(QUALITY_SHIFT + QUALITY_SHIFTED, outcome=_shifted_outcome)
+    write_landing_events(root, rows)
+    _store_quality(client, root, rows, sampled_at=sampled_at)
+    _store_routing_marker(client, rows[QUALITY_SHIFT - marker_before].landing.landed_at,
+                          refreshed_at=sampled_at)
+    return _render_quality(client, QUALITY_AT)
+
+
+def _quality_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Quality sketch rows 3, 4, 5, 9, 10 and 12 and the module drill-down: one project's
+    per-landing series as /quality serves it.
+
+    Each scenario stores rows in quality.db and records the same landings in runs.db, so the
+    read side's freshness is runs.db's verdict on the store, never a fixture's say-so.
+    """
+    bodies: dict[str, Any] = {}
+    sampled = QUALITY_AT - timedelta(minutes=5)
+
+    root = _quality_root(workdir / 'quality_fresh')
+    fresh = _off_the_line(_quality_history(QUALITY_STORED, cost=_quality_cost))
+    write_landing_events(root, fresh)
+    _store_quality(client, root, fresh, sampled_at=sampled, git_check=QUALITY_GIT_CHECK)
+    bodies['quality_fresh'] = _render_quality(client, QUALITY_AT)
+    bodies['quality_fresh_again'] = _render_quality(client, QUALITY_AT + timedelta(minutes=1))
+
+    root = _quality_root(workdir / 'quality_before_epoch')
+    start = QUALITY_SOURCE_EPOCH - timedelta(days=40)
+    before = history(QUALITY_STORED, start=start, outcome=_quality_outcome,
+                     epochs=replace(epochs_from(start), review_completed=QUALITY_SOURCE_EPOCH))
+    write_landing_events(root, before)
+    _store_quality(client, root, before, sampled_at=sampled)
+    bodies['quality_before_epoch'] = _render_quality(client, QUALITY_AT)
+
+    root = _quality_root(workdir / 'quality_small_n')
+    small = _quality_history(QUALITY_SMALL_N)
+    write_landing_events(root, small)
+    _store_quality(client, root, small, sampled_at=sampled)
+    bodies['quality_small_n'] = _render_quality(client, QUALITY_AT)
+
+    root = _quality_root(workdir / 'quality_main_ahead')
+    stored = _quality_history(QUALITY_STORED)
+    pending = train(QUALITY_PENDING_TRAIN, 'sha-pending-train', QUALITY_STORED,
+                    sampled + timedelta(minutes=2), epochs=stored[-1].rule_vintage)
+    write_landing_events(root, [*stored, *pending])
+    _store_quality(client, root, stored, sampled_at=sampled)
+    bodies['quality_main_ahead'] = _render_quality(client, QUALITY_AT)
+    next_tick = sampled + QUALITY_TICK
+    _store_quality(client, root, [*stored, *pending], sampled_at=next_tick)
+    bodies['quality_main_ahead_cleared'] = _render_quality(client, next_tick + timedelta(minutes=1))
+
+    bodies['quality_alarm_explained'] = _alarm_scenario(
+        client, workdir / 'quality_alarm_explained', marker_before=10, sampled_at=sampled)
+    bodies['quality_alarm_unexplained'] = _alarm_scenario(
+        client, workdir / 'quality_alarm_unexplained', marker_before=100, sampled_at=sampled)
+
+    root = _quality_root(workdir / 'quality_module')
+    touched = _quality_history(QUALITY_STORED, cost=_quality_cost, modules=_module_lines)
+    write_landing_events(root, touched)
+    _store_quality(client, root, touched, sampled_at=sampled)
+    bodies['quality_module'] = _render_quality(client, QUALITY_AT, module=QUALITY_MODULE)
+
     return bodies
 
 
@@ -884,4 +1099,5 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_check_owner_family(client, workdir),
             **prd_view_family(client, workdir),
             **prd_lanes_family(client, workdir),
+            **_quality_family(client, workdir),
         }

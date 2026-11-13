@@ -60,7 +60,10 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from shared.storm_counter import StormCounter
 
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import (
+    is_orchestrator_completion_record,
+    normalize_supersedes,
+)
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.models.enums import MEM0_PRIMARY
 from fused_memory.models.memory import AddMemoryResponse, Mem0WriteState
@@ -119,6 +122,24 @@ CANONICAL_ID_KEY = 'canonical_id'
 #: rare by construction, and additive like the other two.
 FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 
+#: Key on the add_memory ack naming the :class:`FailOpenStage` at which THIS
+#: write failed open. Present only when it did, absent like ``canonical_id``.
+TRIAGE_FAIL_OPEN_KEY = 'triage_fail_open'
+
+
+class FailOpenStage(StrEnum):
+    """Where triage gave up on a write and stored it untriaged (INV-11)."""
+
+    RETRIEVE = 'retrieve'
+    JUDGE = 'judge'
+    ATTACH_GUARD = 'attach_guard'
+    #: The attach's child write raised; the tool stored the write standalone.
+    ATTACH_WRITE = 'attach_write'
+    #: The attach's child write returned no memory_ids.
+    ATTACH_NOT_DURABLE = 'attach_not_durable'
+    #: A verdict the tool has no attach kind wired for.
+    UNWIRED_VERDICT = 'unwired_verdict'
+
 #: The metadata keys an ATTACH outcome OVERWRITES when it reroutes a write
 #: into a child record. This is the definition the force-store predicate
 #: below is derived from, so the two cannot drift: every key the attach
@@ -149,8 +170,11 @@ ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
 })
 
 #: The write was stored as a new standalone memory. Also the fail-open
-#: outcome and the deliberate-stub outcome — from the caller's side those are
-#: indistinguishable from a genuine "nothing matched", which is the point.
+#: outcome and the deliberate-stub outcome: C1 keeps ``routed`` at ``stored``
+#: so the write stays unblocked. A fail-open is still told apart from a
+#: genuine "nothing matched": its decision names the stage in
+#: ``BandDecision.fail_open_stage`` and its ack carries
+#: :data:`TRIAGE_FAIL_OPEN_KEY`.
 OUTCOME_STORED = 'stored'
 
 #: The write restates an existing memory and was attached to it as a sighting.
@@ -420,6 +444,8 @@ class BandDecision:
     winner_id: str | None = None
     #: Why the attach guard refused this write's attach; empty when it did not.
     attach_refusals: frozenset[AttachRefusal] = frozenset()
+    #: Non-``None`` means the write is stored WITHOUT triage, having failed open here.
+    fail_open_stage: FailOpenStage | None = None
 
     @property
     def attach_source_id(self) -> str | None:
@@ -543,6 +569,25 @@ def declares_supersession(metadata: Any) -> bool:
     if not isinstance(metadata, dict):
         return False
     return bool(normalize_supersedes(metadata.get('supersedes')))
+
+
+def is_orchestrator_completion_write(metadata: Any) -> bool:
+    """True when *metadata* is an orchestrator task-completion record's.
+
+    The LEGACY fallback for the completion record's declared
+    ``kind='task_completion'``, which :func:`declares_attach_keys` already
+    force-stores. It covers orchestrators not yet redeployed and any other
+    writer that emits the completion source without the kind.
+
+    It matches the one source constant ``memory_metadata`` owns, by equality
+    and never by parsing, and deliberately not by ``task_id``: an agent
+    memory's ``task_id`` is provenance, not its subject (task 6956).
+
+    Retire it once no writer emits the completion source without the kind:
+    each write it decides logs one ``legacy completion record`` INFO line, so
+    the condition is that those lines stop.
+    """
+    return isinstance(metadata, dict) and is_orchestrator_completion_record(metadata)
 
 
 def canonical_id_of(result: MemoryResult) -> str:
@@ -913,6 +958,7 @@ async def triage_write(
     allow_near_duplicate: bool = False,
     caller_owns_attach_keys: bool = False,
     caller_declares_supersession: bool = False,
+    caller_is_completion_record: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
 
@@ -920,9 +966,10 @@ async def triage_write(
     stage is wrapped after the force-store checks: any
     exception whatsoever yields :data:`OUTCOME_STORED` plus exactly one
     counted fail-open and a logged warning with ``exc_info``. Nothing escapes,
-    because C1 is absolute — from the caller's side a fail-open is
-    indistinguishable from "nothing matched", which is what keeps the write
-    unblocked.
+    because C1 is absolute: a fail-open keeps ``routed`` at ``stored`` and
+    the write unblocked. The decision still names where triage gave up, in
+    ``fail_open_stage``, which ``add_memory`` surfaces on the ack as
+    :data:`TRIAGE_FAIL_OPEN_KEY`.
 
     This is where the module deliberately DIVERGES from the retired guard's
     call site, which re-raises ``TypeError``/``AttributeError``/``NameError``
@@ -933,12 +980,13 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate*, *caller_owns_attach_keys* and
-    *caller_declares_supersession* are passed IN rather than recomputed:
-    ``add_memory`` already derives them from the metadata it holds, and a
-    second derivation here is a second place for them to disagree about who is
-    exempt. :func:`declares_attach_keys` and :func:`declares_supersession` are
-    the one spellings of the last two predicates.
+    *allow_near_duplicate*, *caller_owns_attach_keys*,
+    *caller_declares_supersession* and *caller_is_completion_record* are
+    passed IN rather than recomputed: ``add_memory`` already derives them from
+    the metadata it holds, and a second derivation here is a second place for
+    them to disagree about who is exempt. :func:`declares_attach_keys`,
+    :func:`declares_supersession` and :func:`is_orchestrator_completion_write`
+    are the one spellings of the last three predicates.
 
     There is deliberately no recon-stage arm. It was retired by task 3134
     (leaf iota) once Stage-1 consolidation moved onto ``consolidate_memories``,
@@ -979,6 +1027,15 @@ async def triage_write(
         # candidate can change the answer, so no round-trip is spent asking.
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
+    if caller_is_completion_record:
+        # A legacy completion record with no kind; see is_orchestrator_completion_write.
+        logger.info(
+            'write_triage legacy completion record force-stored: project=%s; '
+            'its writer declared no kind',
+            project_id,
+        )
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
     if caller_declares_supersession:
         # A correction is never filed under the record it retires; see
         # declares_supersession.
@@ -1013,19 +1070,19 @@ async def triage_write(
         # the candidate slate is empty-or-unusable, never merely thinner.
         if getattr(results, 'degraded', False):
             failed = getattr(results, 'failed_stores', None)
-            _record_fail_open(
+            return _fail_open_decision(
                 counter, project_id,
                 RuntimeError(f'search degraded: failed_stores={failed!r}'),
-                stage='retrieve',
+                FailOpenStage.RETRIEVE, t_high=t_high, t_low=t_low,
             )
-            return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
         decision = replace(
             decide_band(results, t_high=t_high, t_low=t_low),
             truncation_facts=_retrieval_cap_facts(results, k, t_low),
         )
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='retrieve')
-        return BandDecision(OUTCOME_STORED, None, None, None, None)
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.RETRIEVE, t_high=None, t_low=None,
+        )
 
     judged = decision.outcome == OUTCOME_JUDGE
     if judged:
@@ -1040,8 +1097,10 @@ async def triage_write(
             content=content, project_id=project_id, judged=judged,
         )
     except Exception as exc:  # C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='attach_guard')
-        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.ATTACH_GUARD,
+            t_high=decision.t_high, t_low=decision.t_low,
+        )
 
 
 async def _judge_band(
@@ -1075,8 +1134,10 @@ async def _judge_band(
         _log_retarget(decision, judged, project_id)
         return judged
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='judge')
-        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.JUDGE,
+            t_high=decision.t_high, t_low=decision.t_low,
+        )
 
 
 async def _guard_attach(
@@ -1264,12 +1325,26 @@ def _log_retarget(band: BandDecision, judged: BandDecision, project_id: str) -> 
 _WIRING_BUG_CLASSES = (TypeError, AttributeError, NameError)
 
 
+def _fail_open_decision(
+    counter: TriageFailOpenCounter,
+    project_id: str,
+    exc: BaseException,
+    stage: FailOpenStage,
+    *,
+    t_high: float | None,
+    t_low: float | None,
+) -> BandDecision:
+    """Record one fail-open at *stage* and return the untriaged ``stored`` that names it."""
+    _record_fail_open(counter, project_id, exc, stage=stage)
+    return BandDecision(OUTCOME_STORED, None, None, t_high, t_low, fail_open_stage=stage)
+
+
 def _record_fail_open(
     counter: TriageFailOpenCounter,
     project_id: str | None,
     exc: BaseException,
     *,
-    stage: str,
+    stage: FailOpenStage,
 ) -> dict[str, Any] | None:
     """Log and count one fail-open; return a storm summary iff a burst fired.
 

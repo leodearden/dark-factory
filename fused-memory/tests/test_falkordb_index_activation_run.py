@@ -28,9 +28,12 @@ from shared.memory_eval_metrics import (
     parse_metric_series,
     serialize_metric_series,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.eval import retrieval_probe
 from fused_memory.reconciliation.index_health import summarize_index_health
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 RUN_ROOT = REPO_ROOT / 'plans' / 'falkordb-index-activation-run'

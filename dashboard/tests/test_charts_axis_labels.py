@@ -54,7 +54,7 @@ import shutil
 import subprocess
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     extract_function_body,
     find_function_params,
     jsx_open_tags,
@@ -103,7 +103,7 @@ def _extract_signature(src: str, fn_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Extractors.  Each fails LOUDLY on a miss — a silent '' would make a rename
 # turn this whole file into a permanent false GREEN.  Neither needs a guard of
-# its own any more: both are projections over shared `_dashboard_helpers`
+# its own any more: both are projections over shared `_jsx_source_helpers`
 # helpers that RAISE rather than return '' (task 3549, task 4881).
 # `_component_body` takes the BODY via `extract_function_body`;
 # `_extract_signature` above takes the PARAMETER LIST via the same
@@ -184,9 +184,9 @@ def _tick_generator(body: str) -> str:
 # Caller-audit extractors — the props (formatY) and flags (countAxis) that each
 # LineChart and StackedAreaChart CALL SITE passes, read out of the tab sources.
 # Each call site is read from its own opening tag, spanned by
-# `_dashboard_helpers.py::jsx_open_tag_end`, so a quoted `}` or `/>` cannot end
+# `_jsx_source_helpers.py::jsx_open_tag_end`, so a quoted `}` or `/>` cannot end
 # it and a child element's attributes are never the chart's. A prop's
-# expression is read out of that tag by `_dashboard_helpers.py::jsx_prop_expr`.
+# expression is read out of that tag by `_jsx_source_helpers.py::jsx_prop_expr`.
 #
 # `_line_chart_format_y` returns None for a site that passes no formatter. That
 # None is load-bearing for the esc-per-done ratio guard, which requires the site

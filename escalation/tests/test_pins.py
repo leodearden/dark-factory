@@ -41,6 +41,7 @@ from escalation.pins import (
     PinReport,
     classify_pins,
     is_queue_handoff,
+    needs_human,
     pinned_only_by_human_parked,
 )
 
@@ -134,6 +135,7 @@ class TestPinsModuleExports:
 
         assert {
             'PinClass', 'PinRecord', 'PinReport', 'classify_pins', 'is_queue_handoff',
+            'needs_human',
         } <= set(pins_mod.__all__)
 
 
@@ -1150,3 +1152,63 @@ class TestIsQueueHandoff:
         before = record.to_dict()
         is_queue_handoff(record)
         assert record.to_dict() == before
+
+
+# ---------------------------------------------------------------------------
+# needs_human — can only a human dispose of this ONE record? (task 6145)
+# ---------------------------------------------------------------------------
+
+#: (record, expected needs_human) over the severity x level table.
+_NEEDS_HUMAN_TABLE: list[tuple[Escalation, bool]] = [
+    # Info never needs a human, at any level, whatever its spelling.
+    (_esc(id='esc-42-1', severity='info', level=0), False),
+    (_esc(id='esc-42-2', severity='info', level=2), False),
+    (_esc(id='esc-42-3', severity=' INFO ', level=2), False),
+    # A blocking record needs a human only once it reaches L2.
+    (_esc(id='esc-42-4', severity='blocking', level=0), False),
+    (_esc(id='esc-42-5', severity='blocking', level=1), False),
+    (_esc(id='esc-42-6', severity='blocking', level=2), True),
+    (_esc(id='esc-42-7', severity='blocking', level=3), True),
+    # A born-at-L2 severity needs a human at any level.
+    (_esc(id='esc-42-8', severity='critical', level=0), True),
+    (_esc(id='esc-42-9', severity='critical', level=1), True),
+    (_esc(id='esc-42-10', severity='critical', level=2), True),
+    (_esc(id='esc-42-11', severity='urgent', level=0), True),
+    # An unknown severity is a handoff, so it needs a human at L2 only.
+    (_esc(id='esc-42-12', severity='weird', level=2), True),
+    (_esc(id='esc-42-13', severity='weird', level=1), False),
+    (_esc(id='esc-42-14', severity='', level=2), True),
+    # The born-at-L2 membership is raw, unlike the chain's normalised
+    # severity, so a re-spelt critical below L2 needs no human.  Normalising
+    # it would change what gates merge entry.
+    (_esc(id='esc-42-15', severity='CRITICAL', level=0), False),
+    (_esc(id='esc-42-16', severity=' critical ', level=1), False),
+]
+
+_NON_BORN_AT_L2_TABLE_SEVERITIES = sorted(
+    {record.severity for record, _ in _NEEDS_HUMAN_TABLE} - BORN_AT_L2_SEVERITIES,
+)
+
+
+class TestNeedsHuman:
+    """``needs_human`` answers "can only a human dispose of this ONE record?"
+    with a raw ``BORN_AT_L2_SEVERITIES`` membership check, or, at L2 and
+    above, the shared chain's handoff answer."""
+
+    @pytest.mark.parametrize(('record', 'expected'), _NEEDS_HUMAN_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_answer_over_the_severity_level_table(self, record: Escalation, expected: bool) -> None:
+        assert needs_human(record) is expected
+
+    @pytest.mark.parametrize('record', [record for record, _ in _NEEDS_HUMAN_TABLE], ids=lambda v: v.id)
+    def test_is_pure(self, record: Escalation) -> None:
+        before = record.to_dict()
+        needs_human(record)
+        assert record.to_dict() == before
+
+    @pytest.mark.parametrize('level', [2, 3])
+    @pytest.mark.parametrize('severity', _NON_BORN_AT_L2_TABLE_SEVERITIES)
+    def test_a_human_level_record_needs_a_human_iff_it_is_a_queue_handoff(
+        self, severity: str, level: int,
+    ) -> None:
+        record = _esc(severity=severity, level=level)
+        assert needs_human(record) is is_queue_handoff(record)

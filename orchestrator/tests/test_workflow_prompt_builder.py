@@ -71,7 +71,10 @@ def _make_workflow(tmp_path: Path, *, event_store: _RecordingEventStore | None =
 
     briefing = MagicMock()
 
-    async def render_implementer(plan, *, rebase_notice=None, task_id=None, wip_notice=None, rulings=()):
+    async def render_implementer(
+        plan, *, rebase_notice=None, task_id=None, wip_notice=None, scope_drift=None,
+        rulings=(),
+    ):
         return f"analysis={plan['analysis']} wip={[c['sha'] for c in wip_notice or []]}"
 
     briefing.build_implementer_prompt = AsyncMock(side_effect=render_implementer)

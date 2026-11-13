@@ -1,4 +1,7 @@
-"""The WIRE shape of the task-4039 append rejection, end to end (task 4039).
+"""The WIRE shape of update_task's raw backend refusals, end to end (tasks 4039, 4867).
+
+The module is named for the task-4039 append rejection; the task-4867
+no-mutating-field refusal travels the same path and is pinned at the bottom.
 
 Two agent-facing surfaces promise callers one specific reply for
 ``update_task(description=..., append=True)``:
@@ -37,7 +40,10 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
-from fused_memory.backends.task_backend_errors import AppendUnsupportedFieldError
+from fused_memory.backends.task_backend_errors import (
+    AppendUnsupportedFieldError,
+    NoFieldsToUpdateError,
+)
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
@@ -144,3 +150,30 @@ async def test_wire_reply_is_the_shape_agents_are_told_to_expect(stack):
     assert task['description'] == _ORIGINAL_DESCRIPTION, (
         'a rejection reply must mean nothing was written'
     )
+
+
+@pytest.mark.asyncio
+async def test_fieldless_update_propagates_raw_and_renders_as_error_type(stack):
+    """Task 4867: the no-mutating-field refusal takes the SAME two hops.
+
+    A fieldless ``update_task`` raises ``NoFieldsToUpdateError`` out of the
+    interceptor (no ``to_error_dict`` conversion) and
+    ``mcp_tool_errors`` renders it as ``error_type='NoFieldsToUpdateError'``,
+    the false-success reply (``updated: True``) it replaces never appearing.
+    """
+    interceptor, backend, project_root = stack
+    before = await backend.get_task('1', project_root=project_root)
+
+    with pytest.raises(NoFieldsToUpdateError):
+        await interceptor.update_task('1', project_root, append=True)
+
+    @mcp_tool_errors('update_task')
+    async def update_task_tool(**kwargs):
+        return await interceptor.update_task(**kwargs)
+
+    result = await update_task_tool(task_id='1', project_root=project_root)
+
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
+    assert result['error'].startswith('TASKMASTER_TOOL_ERROR: '), result
+    assert 'updated' not in result, result
+    assert await backend.get_task('1', project_root=project_root) == before

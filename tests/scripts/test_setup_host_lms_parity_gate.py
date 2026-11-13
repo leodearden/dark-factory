@@ -25,6 +25,9 @@ from setup_host_parsing import (
     SETUP_HOST_PATH,
     shell_statements,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CHECKER = "check_lms_unit_parity.py"
 LOG_TAG = "[lms_unit_parity]"

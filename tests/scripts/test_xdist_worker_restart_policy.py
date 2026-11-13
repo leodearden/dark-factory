@@ -63,6 +63,9 @@ from collections.abc import Mapping
 
 import pytest
 from pytest_config_discovery import discovered_pytest_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The configs that keep the flag under timeout_method = "signal". The module
 # docstring states why.

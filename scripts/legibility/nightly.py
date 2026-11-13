@@ -51,6 +51,7 @@ from legibility import (  # noqa: E402
     digest,
     invariants,
     inventory,
+    layout,
     plan_deviation_census,
     sampling,
     session_ledger,
@@ -113,30 +114,44 @@ def resolve_config(
     :func:`legibility.config.load_config` -- never a directory-name guess.
     A candidate whose config fails to load (malformed YAML, schema error) is
     skipped rather than aborting the whole search. Raises
-    ``FileNotFoundError`` if no candidate matches.
+    ``FileNotFoundError`` if no candidate matches, naming every skipped
+    candidate with its load error, since *project_id*'s own config may be
+    among them.
     """
     roots = (
         [Path(r) for r in search_roots] if search_roots is not None
         else _default_search_roots()
     )
+    unloadable: list[str] = []
     for root in roots:
         if not root.is_dir():
             continue
         for candidate_root in sorted(root.iterdir()):
             if not candidate_root.is_dir():
                 continue
-            config_path = candidate_root / 'docs' / 'legibility' / 'legibility.yaml'
+            config_path = layout.config_path(candidate_root)
             if not config_path.is_file():
                 continue
             try:
                 cfg = load_config(config_path)
-            except Exception:
+            except Exception as exc:
+                unloadable.append(f'{config_path}: {type(exc).__name__}: {exc}')
                 continue
             if cfg.project_id == project_id:
                 return config_path, cfg
     raise FileNotFoundError(
         f'no legibility.yaml found for project_id={project_id!r} under '
         f'search roots {[str(r) for r in roots]!r}'
+        + _unloadable_candidates_note(unloadable)
+    )
+
+
+def _unloadable_candidates_note(unloadable: Sequence[str]) -> str:
+    if not unloadable:
+        return ''
+    return (
+        f'; {len(unloadable)} candidate legibility.yaml failed to load and may '
+        'be it:\n' + '\n'.join(unloadable)
     )
 
 
@@ -174,28 +189,6 @@ def select_scored_records(
     return [sampling.score_session(session) for session in sessions]
 
 
-DEFAULT_MAX_DIGEST_BYTES = sampling.DEFAULT_DIGEST_MAX_BYTES
-"""Per-digest soft byte cap (PRD §7.2) — an ALIAS, not a second definition.
-
-Both the COST basis (:func:`select_digest_sessions`) and the RENDER basis
-(:func:`build_digests`) read this one name, so what the sampler charged is
-provably the digest that later gets produced. It binds to
-:data:`sampling.DEFAULT_DIGEST_MAX_BYTES` rather than re-declaring ``15360``
-because ``DEFAULT_MAX_DIGEST_BYTES`` and ``DEFAULT_DIGEST_MAX_BYTES`` are one
-word-order swap apart — trivially confusable at a call site, and if they were
-independent literals a drift between them would be invisible to every test
-(reviewer_comprehensive, task 3268 amendment pass). The alias is kept because
-this is the established public name for the nightly cap.
-
-The remaining independent literal is :func:`legibility.digest.build_digest`'s
-own ``max_bytes=15360`` default. ``digest.py`` is outside task 3268's locked
-scope, so collapsing all three into a single ``digest.DEFAULT_MAX_BYTES``
-(the reviewer's preferred shape, and where the §7.2 cap naturally belongs) is
-left to a follow-up; ``TestDigestByteCostFn.test_module_constant_matches_the_
-renderers_own_default`` pins the two against each other in the meantime so
-drift fails a test instead of silently mis-charging the budget."""
-
-
 def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
     *, rendered: dict[tuple, str] | None = None,
@@ -220,7 +213,7 @@ def select_digest_sessions(
 
     The byte budget (``cfg.budgets.max_daily_digest_bytes``) is charged
     against each candidate's ACTUAL rendered digest size, at exactly the
-    :data:`DEFAULT_MAX_DIGEST_BYTES` cap :func:`build_digests` will render
+    :data:`legibility.digest.DEFAULT_MAX_BYTES` cap :func:`build_digests` will render
     with -- the same constant on both sides, so ``bytes_used`` describes the
     digests this night actually produces. Charging the RAW transcript size
     instead over-charged the budget by 20x-500x (a 0.5-6.5MB session renders
@@ -263,7 +256,7 @@ def select_digest_sessions(
     return sampling.stratified_sample(
         scored, cfg,
         cost_fn=sampling.digest_byte_cost_fn(
-            max_bytes=DEFAULT_MAX_DIGEST_BYTES, build=build, rendered=rendered,
+            max_bytes=digest.DEFAULT_MAX_BYTES, build=build, rendered=rendered,
         ),
     )
 
@@ -276,7 +269,7 @@ def select_digest_sessions(
 def build_digests(
     selected: Sequence[sampling.ScoredRecord],
     *,
-    max_bytes: int = DEFAULT_MAX_DIGEST_BYTES,
+    max_bytes: int = digest.DEFAULT_MAX_BYTES,
     build=digest.build_digest,
     rendered: dict[tuple, str] | None = None,
 ) -> tuple[list[str], list[tuple[str, str]]]:
@@ -289,7 +282,7 @@ def build_digests(
     while COSTING these same records against the byte budget. A record whose
     digest is already in it is emitted from the cache rather than rendered a
     second time -- the cost basis and the render basis are the same constant
-    by construction (:data:`DEFAULT_MAX_DIGEST_BYTES`), so the cached text is
+    by construction (:data:`legibility.digest.DEFAULT_MAX_BYTES`), so the cached text is
     byte-identical to what a re-render would produce, and
     :func:`sampling.render_cache_key` makes a mismatched cap or builder a
     structural MISS rather than a wrong digest. Skipping the re-render matters
@@ -469,7 +462,8 @@ def evaluate_census_step(
     run, returning a :class:`CensusEvaluation`.
 
     *decide* (default ``census_trigger.decide_for_project``) makes the
-    FIRE/NO-FIRE call. On NO-FIRE, *launcher* is never called. On FIRE: if
+    FIRE/NO-FIRE call on *cfg* itself, the config this run loaded, so the
+    thresholds are never re-read from another file (task 3269). On NO-FIRE, *launcher* is never called. On FIRE: if
     *entrypoint_exists* (default: does ``scripts/legibility/census.py`` --
     task η -- exist) is False, this logs a LOUD "FIRE-WITHOUT-LAUNCH"
     warning and returns without calling *launcher* -- η is NOT a dependency
@@ -505,7 +499,7 @@ def evaluate_census_step(
         launcher = _default_census_launcher
 
     try:
-        decision = decide(cfg.project_root, now=now, completion_runner=completion_runner)
+        decision = decide(cfg, now=now, completion_runner=completion_runner)
     except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
         # The exception text is BOUNDED before it reaches either sink, and both
         # sinks are single-line: the WARNING becomes one nightly journal line,
@@ -514,7 +508,7 @@ def evaluate_census_step(
         # YAML / pydantic error -- so it is truncated (and its newlines escaped) by
         # census_trigger's own log-hygiene helper rather than a second copy of
         # that logic here. Formatted once, so the two sinks cannot drift.
-        detail = f'{type(exc).__name__}: {census_trigger._bounded_repr(str(exc))}'
+        detail = f'{type(exc).__name__}: {census_trigger.bounded_repr(str(exc))}'
         logger.warning(
             'census trigger evaluation failed (%s) -- NO-FIRE; the nightly '
             'run is unaffected', detail,
@@ -578,8 +572,6 @@ def evaluate_census_step(
 # run_nightly — full pipeline assembly: inventory -> sample -> digest ->
 # code -> merge -> docs-only commit -> census (PRD §5.5).
 # ---------------------------------------------------------------------------
-
-_CODEBOOK_RELPATH = Path('docs') / 'legibility' / 'confusion-codebook.yaml'
 
 DEFAULT_PROJECTS_ROOT = Path.home() / '.claude' / 'projects'
 
@@ -1051,6 +1043,7 @@ def _report_sample_outcome(
 
 def _record_trickle_progress(
     cfg: LegibilityConfig,
+    resolved_config_path: Path,
     sample: sampling.SampleResult,
     target_date: date,
     end: _NightEnd,
@@ -1101,7 +1094,7 @@ def _record_trickle_progress(
             end.census is not None
             and trickle_state.completion_error_streak_reached(night)
             and _escalate_completion_error_streak(
-                cfg, night.state, target_date,
+                cfg, resolved_config_path, night.state, target_date,
                 census_line=end.census.line, raise_alarm=raise_alarm,
             ).landed
         )
@@ -1241,6 +1234,7 @@ def _escalate_barren_streak(
 
 def _escalate_completion_error_streak(
     cfg: LegibilityConfig,
+    config_path: Path,
     night: trickle_state.TrickleState,
     target_date: date,
     *,
@@ -1249,7 +1243,8 @@ def _escalate_completion_error_streak(
 ) -> Alarm:
     """Raise the COMPLETION_ERROR_STREAK alarm for *night*, on each night
     :func:`trickle_state.completion_error_streak_reached` owes it. WARNING
-    level, exit code 0, like the barren one."""
+    level, exit code 0, like the barren one. The reproduce command names
+    *config_path*, the config this pass decided on."""
     streak = night.completion_error_streak
     summary = (
         f'legibility census trigger: completion check failed on {streak} '
@@ -1260,7 +1255,8 @@ def _escalate_completion_error_streak(
         f'completion_error_streak={streak}. Last decision: {census_line}. '
         f'Until scripts/check_run_completion.py answers again (exit 0 or 75), '
         f'the census now fires on the novelty spike alone. Reproduce with: '
-        f'census_trigger.py evaluate --project-root {cfg.project_root}'
+        f'census_trigger.py evaluate --project-root {cfg.project_root} '
+        f'--config {config_path}'
     )
     return raise_alarm(AlarmKind.COMPLETION_ERROR_STREAK, summary, detail)
 
@@ -1453,7 +1449,7 @@ def _run_configured_nightly(
         end = _crashed(exc, raise_alarm)
     try:
         retry_due = _record_trickle_progress(
-            cfg, sample, target_date, end,
+            cfg, resolved_config_path, sample, target_date, end,
             recorder=seams.recorder, retry_recorder=seams.retry_recorder,
             raise_alarm=raise_alarm, now=now, pass_kind=pass_kind,
             max_barren_runs=max_barren_runs,
@@ -1567,7 +1563,7 @@ def _digest_stage(
 def _load_codebook(cfg: LegibilityConfig) -> dict:
     """*cfg*'s codebook, or an empty v2 document for a project onboarded
     without one."""
-    codebook_path = Path(cfg.project_root) / _CODEBOOK_RELPATH
+    codebook_path = layout.codebook_path(cfg.project_root)
     try:
         return codebook.load(codebook_path)
     except FileNotFoundError:
@@ -1686,14 +1682,14 @@ def _commit_stage(
     loud and never leaves its dump in the checkout
     (scripts/legibility/unlanded.py)."""
     if merge.mutated:
-        codebook.dump(merge.codebook, Path(cfg.project_root) / _CODEBOOK_RELPATH)
-        if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
+        codebook.dump(merge.codebook, layout.codebook_path(cfg.project_root))
+        if _git_status_changed(cfg.project_root, layout.CODEBOOK_RELPATH):
             message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
             refusal = _commit_refusal(committer, cfg.project_root, message)
             if refusal is None:
                 return True
             rollback = unlanded.roll_back(
-                cfg.project_root, [_CODEBOOK_RELPATH],
+                cfg.project_root, [layout.CODEBOOK_RELPATH],
                 project_id=cfg.project_id, label=f'trickle-{target_date.isoformat()}',
             )
             summary = 'legibility trickle codebook commit failed'
@@ -1715,7 +1711,7 @@ def _commit_refusal(
     """``None`` once *committer* lands the codebook dump, else why it did not:
     git's diagnostic, or the traceback of the committer's raise."""
     try:
-        result = committer(repo, [_CODEBOOK_RELPATH], message)
+        result = committer(repo, [layout.CODEBOOK_RELPATH], message)
     except Exception as exc:
         return ''.join(traceback.format_exception(exc))
     return None if result.ok else result.stderr
@@ -1751,7 +1747,7 @@ def _census_stage(
             cfg.project_id, target_date.isoformat(),
         )
         return None
-    state_path = census_trigger.census_state_path(cfg.project_root)
+    state_path = layout.census_state_path(cfg.project_root)
     anchor = _census_anchor(state_path)  # read BEFORE the synchronous launch
     evaluation = evaluate_census_step(
         cfg, now=now,

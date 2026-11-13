@@ -61,7 +61,9 @@ from dashboard.data.census import (
 from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum, validate_datum
 from dashboard.data.deferral_summary import read_liveness, session_holders
 from dashboard.data.mcp_fanout import TTLCache
+from dashboard.data.prd_attribution import LINEAGE_METADATA_KEYS
 from dashboard.data.tasks import (
+    SHAPED_ROW_FIELDS,
     fetch_statuses,
     fetch_task_page,
     fetch_tasks,
@@ -123,10 +125,10 @@ demonstrably failed; a per-call budget below the honest service time turns
 that claim into a lie on every cold render.
 
 WHY THE SERVER COST SCALES WITH TREE SIZE even though the row read is
-status-narrowed: there is no field projection at any layer and the backend
-query is ``SELECT *`` feeding a fixed 14-key row — see ``fetch_tasks``'
-docstring, and task 4390, the open follow-up to add projection. Until that
-lands, narrowing the STATUSES does not narrow the WORK.
+status-narrowed: the row read projects to :data:`ROW_READ_FIELDS`, which cuts
+the wire bytes and both JSON decodes, but the backend still reads whole rows
+and projects after ``_row_to_task``. Narrowing the STATUSES or the FIELDS does
+not narrow the backend WORK.
 
 WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
 ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
@@ -168,6 +170,20 @@ _RETENTION_BOUND_SECONDS = 24 * 60 * 60
 ROW_READ_STATUSES: frozenset[TaskStatus] = ACTIVE
 """The statuses the unit's rows half asks for, applied server-side as
 ``WHERE status IN (...)``."""
+
+ROW_READ_FIELDS: tuple[str, ...] = (
+    *SHAPED_ROW_FIELDS,
+    *(f'metadata.{key}' for key in (
+        'files', 'train', 'external_deps', 'deferral', 'infra_hold',
+        'task_kind', 'always_escalates', 'milestone', 'milestone_deps_satisfied_at',
+        'pending_since', 'pending_since_backfilled', 'source',
+        *LINEAGE_METADATA_KEYS,
+    )),
+)
+"""The wire fields every dashboard row read asks ``get_tasks`` for:
+:data:`~dashboard.data.tasks.SHAPED_ROW_FIELDS`, plus the metadata keys the
+readers of those rows touch. ``tests/test_row_read_projection.py`` fails when a reader reads a key
+this omits."""
 
 
 class SnapshotFailure(enum.StrEnum):
@@ -539,6 +555,7 @@ async def _read_unit(
             fetch_tasks(
                 client, config, project_root,
                 statuses=sorted(ROW_READ_STATUSES),
+                fields=ROW_READ_FIELDS,
                 timeout=PER_CALL_TIMEOUT,
             ),
             label='active rows',
@@ -850,6 +867,7 @@ async def acquire_terminal_window(
             # A COMPUTED offset, not a LIMIT: the slice is over ascending ids,
             # so reaching the high-id end is arithmetic rather than an option.
             offset=max(0, terminal_total - window),
+            fields=ROW_READ_FIELDS,
             timeout=PER_CALL_TIMEOUT,
         ),
         label='terminal window',

@@ -1,0 +1,1046 @@
+# S20 capability-manifest sidecar (draft, author pass + fold + ruling fold + fold-verify of 2026-11-12; aligned
+# 2026-11-13). Every
+# task_id is null until decompose. Checks re-run at main 1b106418da and 0f21f5e457 (2026-11-12).
+# ω (acceptance record for fk-49b55c1270ae, ruled by Leo 2026-11-12) carries no capability and has no block.
+prd: plans/review-all-s20-cli-invocation-and-usage-gate-prd.md
+schema_version: 1
+signal_leaves:
+- η
+- ο2
+- ο3
+tasks:
+- label: α
+  task_id: null
+  title: 'Shared sidecar surface for the commit_planning stamper and manifest audits: SIDECAR_SUFFIX, sidecar_for,
+    tracked_sidecar_paths'
+  note: Delivers C3, the seam held task 6764 (S25 ι) waits on; closes no S20 key.
+  capabilities:
+  - name: sidecar-path-rule-substrate
+    binding: '`grep:shared/src/shared/capability_manifest.py::sidecar_path` substrate: the pure PRD-key rule sidecar_for
+      composes (task 6582)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def sidecar_path\(
+      paths:
+      - shared/src/shared/capability_manifest.py
+      expect: present
+  - name: sidecar-for-defined
+    binding: built here — C3 sidecar_for, containment-checked
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def sidecar_for\(
+      paths:
+      - shared/src/shared/capability_manifest.py
+      expect: present
+  - name: tracked-sidecar-paths-defined
+    binding: built here — C3 tracked_sidecar_paths over git ls-files
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def tracked_sidecar_paths\(
+      paths:
+      - shared/src/shared/capability_manifest.py
+      expect: present
+  - name: discovery-failure-is-an-exception
+    binding: built here — C3 ManifestDiscoveryUnavailable
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ManifestDiscoveryUnavailable
+      paths:
+      - shared/src/shared/capability_manifest.py
+      expect: present
+  - name: suffix-public
+    binding: built here — SIDECAR_SUFFIX replaces the private _SIDECAR_SUFFIX
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^SIDECAR_SUFFIX
+      paths:
+      - shared/src/shared/capability_manifest.py
+      expect: present
+  - name: b1-table-agrees-with-stamper-and-audit
+    binding: built here — B1 pins the eight prd_path rows against the values the stamper and drift audit produce
+      at main
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: B1 expected values are pinned from main; a reviewer confirms the table covers the eight shapes C3
+        lists
+- label: β
+  task_id: null
+  title: 'Result leaf: AgentResult and CliSubtype in shared/cli_result.py; failure projection in shared/agent_failure.py;
+    the import cycle goes'
+  note: 'Contributes fk-1778eb482209, fk-aacd5e9381f6, fk-3ae32b390a81 (closers: ο2, ε, ο3). Depends on S19 ι (S19/C7,
+    the public CLI runner in shared.cli_invoke; lead ruling S20/OQ-7 = S19/Q-C2 (a)).'
+  capabilities:
+  - name: classify-invocation-substrate
+    binding: '`grep:shared/src/shared/invocation_outcome.py::classify_invocation` substrate: C1 signature kept'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def classify_invocation\(
+      paths:
+      - shared/src/shared/invocation_outcome.py
+      expect: present
+  - name: cli-result-module
+    binding: built here — shared/cli_result.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/cli_result.py
+      expect: present
+  - name: clisubtype-defined
+    binding: built here — C4 CliSubtype beside AgentResult
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class CliSubtype\(StrEnum\)
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: agent-failure-module
+    binding: built here — shared/agent_failure.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/agent_failure.py
+      expect: present
+  - name: outcome-no-longer-imports-cli-invoke
+    binding: built here (deletion) — invocation_outcome imports cli_result only
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^from shared\.cli_invoke import
+      paths:
+      - shared/src/shared/invocation_outcome.py
+      expect: absent
+  - name: cli-invoke-local-outcome-imports-gone
+    binding: built here (deletion) — the function-local invocation_outcome imports
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^ +from shared\.invocation_outcome import
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: absent
+  - name: reviewer-failure-budget-copy-gone
+    binding: built here (deletion) — reviewer_failure uses CliSubtype
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'BUDGET_CAP_SUBTYPE = '
+      paths:
+      - orchestrator/src/orchestrator/reviewer_failure.py
+      expect: absent
+  - name: subtype-spelling-guard
+    binding: built here — the AST spelling guard with its shrinking allow-list
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/tests/test_cli_subtype_spelling.py
+      expect: present
+- label: γ
+  task_id: null
+  title: 'Transcript leaf shared/transcript.py: public locator, content_blocks, fixtures instead of patches'
+  note: 'Contributes fk-e59c30a25d27, fk-fede65204150, fk-3ae32b390a81 (closers: ο2, θ, ο3).'
+  capabilities:
+  - name: transcript-module
+    binding: built here — shared/transcript.py (C5)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/transcript.py
+      expect: present
+  - name: content-blocks-public
+    binding: built here — the one nesting rule
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def content_blocks\(
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: archive-private-reach-gone
+    binding: built here (deletion) — transcript_archive imports transcript_path at module level
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: import _resolve_transcript_path
+      paths:
+      - shared/src/shared/transcript_archive.py
+      expect: absent
+  - name: hoist-paragraph-gone
+    binding: built here (deletion) — no test patches count_transcript_turns, so the paragraph has no reason
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: Do NOT hoist a functools\.partial
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: transcript-patch-sites-gone
+    binding: built here (deletion) — tests write real transcripts
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shared\.cli_invoke\.count_transcript_turns
+      paths:
+      - shared/tests/
+      expect: absent
+- label: δ
+  task_id: null
+  title: Argv leaf shared/claude_argv.py and the invocation cost floor
+  note: Closes fk-2f4b8655fb3c; contributes fk-3ae32b390a81. Raises the ten sub-floor test budgets (eight files).
+  capabilities:
+  - name: argv-module
+    binding: built here — shared/claude_argv.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/claude_argv.py
+      expect: present
+  - name: cost-floor-home
+    binding: built here — C6 INVOCATION_COST_FLOOR_USD
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^INVOCATION_COST_FLOOR_USD
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: cost-floor-enforced
+    binding: built here — C6 InvocationBudgetBelowFloor raised by build_claude_argv
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class InvocationBudgetBelowFloor
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: usage-gate-stops-importing-cli-invoke
+    binding: built here (deletion) — usage_gate imports cli_result and claude_argv only
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^from shared\.cli_invoke import
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: absent
+  - name: sub-floor-test-budgets-gone
+    binding: built here (deletion) — the ten test call sites passing max_budget_usd=0.01 pass the floor constant
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max_budget_usd=0\.01
+      paths:
+      - orchestrator/tests/test_invoke_agent_credentials.py
+      - orchestrator/tests/test_invoke_agent_python_env.py
+      - orchestrator/tests/test_invoke_bash_cwd_reset.py
+      - orchestrator/tests/test_mcp_lifecycle.py
+      - orchestrator/tests/test_sandbox_git_config.py
+      - orchestrator/tests/test_landlock.py
+      - shared/tests/test_landlock.py
+      - shared/tests/test_cli_invoke_agent_env.py
+      - shared/tests/test_wildcard_deny_live_inventory.py
+      expect: absent
+- label: ε
+  task_id: null
+  title: 'UsageGate partition: vocabulary, probe verdict, scope overlay; one resets_at writer; one cap-event writer
+    and its resumed dual'
+  note: Closes fk-377f5a42e8be, fk-f7f1747302dc, fk-ae6cd7600d0e, fk-aacd5e9381f6; contributes fk-8805d20c0c4c,
+    fk-005378a1b462, fk-db060c262575. Absorbs tasks 6930 and 6729.
+  capabilities:
+  - name: account-state-module
+    binding: built here — shared/account_state.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/account_state.py
+      expect: present
+  - name: account-probe-module
+    binding: built here — shared/account_probe.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/account_probe.py
+      expect: present
+  - name: probe-verdict-type
+    binding: built here — ProbeVerdict returned by the probe
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ProbeVerdict
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: scope-caps-module
+    binding: built here — shared/scope_caps.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/scope_caps.py
+      expect: present
+  - name: probe-no-longer-transitions
+    binding: built here (deletion) — the gate applies the verdict
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _probe_verdict
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: absent
+  - name: invented-reset-gone
+    binding: built here (deletion) — unknown resets_at sleeps on the plain backoff
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defaulting to 1h
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: one-cap-event-writer
+    binding: built here — _record_cap_event
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _record_cap_event
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: present
+  - name: cli-invoke-imports-usage-gate-at-module-level
+    binding: built here (deletion) — no indented import of shared.usage_gate in cli_invoke
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^ +from shared\.usage_gate import
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: absent
+  - name: usage-gate-local-outcome-import-gone
+    binding: built here (deletion) — the function-local CAP_HIT_PREFIXES import in UsageGate.detect_cap_hit is hoisted
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^ +from shared\.invocation_outcome import
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: absent
+  - name: pool-backends-in-vocabulary
+    binding: built here — ACCOUNT_POOL_BACKENDS moves into the account vocabulary so the slot can read it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^ACCOUNT_POOL_BACKENDS
+      paths:
+      - shared/src/shared/account_state.py
+      expect: present
+- label: ζ
+  task_id: null
+  title: 'invocations rows per attempt: invocation_id, attempt, returned; count readers filter returned'
+  note: Contributes fk-b8cba955b358 (closer ο2). Row shape per lead ruling S20/OQ-4.
+  capabilities:
+  - name: attempt-columns
+    binding: built here — additive invocation_id/attempt/returned columns
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: invocation_id
+      paths:
+      - shared/src/shared/cost_store.py
+      expect: present
+  - name: count-readers-filter-returned
+    binding: built here — every row-as-invocation reader filters returned = 1
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reviewer confirms each reader in the re-measured list is classified sum-only or row-as-invocation
+        and the latter filter returned = 1
+- label: η
+  task_id: null
+  title: Slot observe returns a Decision; the cap-retry state machine; one classification and one cost row per attempt
+    for callers that pass a cost store
+  note: Closes fk-dcc5dce60bb6, fk-2a5d97aeb64d, fk-005378a1b462; contributes fk-8805d20c0c4c, fk-b8cba955b358,
+    fk-db060c262575. Signal leaf. Absorbs 7334, 6605 and 6994 (lead ruling S20/OQ-8).
+  capabilities:
+  - name: stale-lease-failsafe-substrate
+    binding: '`grep:shared/src/shared/usage_gate.py::UsageGate.lease_is_current` substrate: observe keeps the stale-lease
+      fail-safe'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def lease_is_current
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: present
+  - name: observe-defined
+    binding: built here — C2 InvokeSlot.observe
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def observe\(
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: present
+  - name: account-verdict-defined
+    binding: built here — C2 AccountVerdict
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class AccountVerdict
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: decision-table-defined
+    binding: built here — C7 decide
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def decide\(
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: present
+  - name: clock-seam
+    binding: built here — C7 RetryClock, used by the Wait-row tests
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class RetryClock
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: present
+  - name: heuristic-net-gone
+    binding: built here (deletion) — D3
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'Heuristic cap: zero-cost instant exit'
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: private-config-reach-gone
+    binding: built here (deletion) — D12, the gate derives scope
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: getattr\(usage_gate, '_config'
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: loop-stops-calling-detect-cap-hit
+    binding: built here (deletion) — the second classification leaves the production path
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: slot\.detect_cap_hit\(
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: absent
+  - name: loop-lifetime-attempt-record-gone
+    binding: built here (deletion) — one AttemptRecord written per attempt
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class _DispatchedAttempt
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: every-attempt-accounted
+    binding: 'built here — B9: three attempts write three rows sharing invocation_id'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: B9 runs against a real CostStore in CI; a reviewer confirms the after-deploy runs.db read of a steward
+        invocation named in the signal
+  - name: hand-written-gate-fakes-accept-new-slot-call
+    binding: built here (deletion) — D12, the four hand-written gate fakes driven through the real loop stop declaring
+      today's invoke_slot(scope=None, ...) signature, so the loop's model=/backend= call does not raise in them
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: invoke_slot\(self, scope=None|def _cm\(scope=None
+      paths:
+      - shared/tests/test_cli_invoke_sandbox_wrap.py
+      - orchestrator/tests/test_dry_run_unblock.py
+      - orchestrator/tests/test_steward.py
+      - orchestrator/tests/test_invoke.py
+      expect: absent
+- label: θ
+  task_id: null
+  title: Runner leaf shared/claude_runner.py; cli_invoke is the state machine; loop suites onto invoke_fn and clock
+  note: Closes fk-fede65204150; contributes fk-3ae32b390a81, fk-2a5d97aeb64d. Carries S19/C7 public runner names
+    unchanged (lead ruling S20/OQ-7). Absorbs task 6996.
+  capabilities:
+  - name: runner-module
+    binding: built here — shared/claude_runner.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/claude_runner.py
+      expect: present
+  - name: runner-left-cli-invoke
+    binding: built here (deletion) — the runner lives in claude_runner
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def (_run_subprocess|run_cli_subprocess)\(
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: absent
+  - name: loop-sleep-patches-gone
+    binding: built here (deletion) — loop suites pass clock= instead of patching asyncio.sleep through cli_invoke
+      (the 13 shared test files patching it at 97be1d71fa)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shared\.cli_invoke\.asyncio\.sleep
+      paths:
+      - shared/tests/test_cap_retry.py
+      - shared/tests/test_cap_retry_prompt_builder.py
+      - shared/tests/test_cap_retry_resume_opt_out.py
+      - shared/tests/test_cap_scan_successful_output.py
+      - shared/tests/test_cli_input_rejected.py
+      - shared/tests/test_cli_invoke.py
+      - shared/tests/test_cli_invoke_session_cost.py
+      - shared/tests/test_failover_integration.py
+      - shared/tests/test_invocation_outcome_boundary.py
+      - shared/tests/test_model_not_found.py
+      - shared/tests/test_resume_rejection.py
+      - shared/tests/test_server_error.py
+      - shared/tests/test_usage_gate_scope_boundary.py
+      expect: absent
+  - name: loop-patch-sites-gone
+    binding: built here (deletion) — loop suites pass invoke_fn (the 6 shared test files patching it at 97be1d71fa)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shared\.cli_invoke\.invoke_claude_agent
+      paths:
+      - shared/tests/test_cap_retry.py
+      - shared/tests/test_cap_retry_prompt_builder.py
+      - shared/tests/test_cli_invoke.py
+      - shared/tests/test_cli_invoke_agent_env.py
+      - shared/tests/test_failover_integration.py
+      - shared/tests/test_resume_rejection.py
+      expect: absent
+  - name: runner-patch-targets-renamed
+    binding: built here (deletion) — a patch of a moved runner name through cli_invoke would silently no-op
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: shared\.cli_invoke\.terminate_process_group
+      paths:
+      - orchestrator/tests/test_liveness_boundary_gate.py
+      - shared/tests/test_cli_invoke.py
+      - shared/tests/test_cli_invoke_transcript_offloop.py
+      expect: absent
+  - name: cli-invoke-size-measured
+    binding: built here — heuristic-14 measurement recorded at landing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: wc -l shared/src/shared/cli_invoke.py ≤ 1,000, recorded in the task record
+- label: ι
+  task_id: null
+  title: UsageGate public test seam; AccountState setters and the probe-dir alias go
+  note: Closes fk-db060c262575; contributes fk-25c96d016239.
+  capabilities:
+  - name: setters-gone
+    binding: built here (deletion) — the four AccountState phase setters
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '@capped\.setter'
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: probe-dir-alias-gone
+    binding: built here (deletion) — the _probe_config_dir alias
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'self\._probe_config_dir = '
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: drive-to-seam
+    binding: built here — shared/testing.py::drive_to
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def drive_to\(
+      paths:
+      - shared/src/shared/testing.py
+      expect: present
+  - name: account-snapshot-seam
+    binding: built here — UsageGate.account_snapshot
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def account_snapshot\(
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: present
+- label: κ1
+  task_id: null
+  title: Move the probe and exhaustive UsageGate suites onto the public seam; private-reach ratchet
+  note: Contributes fk-25c96d016239. Lead ruling S20/OQ-5.
+  capabilities:
+  - name: exhaustive-suite-off-private-state
+    binding: built here (deletion) — gate._accounts reads in the exhaustive suite
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: gate\._accounts
+      paths:
+      - shared/tests/test_usage_gate_exhaustive.py
+      expect: absent
+  - name: private-reach-ratchet
+    binding: built here — the ratchet test
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/tests/test_usage_gate_private_reach_ratchet.py
+      expect: present
+- label: κ2
+  task_id: null
+  title: Move the remaining large UsageGate suites onto the public seam and lower the private-reach ratchet
+  note: Contributes fk-25c96d016239. The slot verdict methods are deleted later, in ο3.
+  capabilities:
+  - name: orchestrator-gate-suite-off-private-state
+    binding: built here (deletion) — gate._accounts reads
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: gate\._accounts
+      paths:
+      - orchestrator/tests/test_usage_gate.py
+      expect: absent
+  - name: kappa2-suites-observe-not-detect
+    binding: built here (deletion) — the four suites drive observe instead of configuring detect_cap_hit
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: detect_cap_hit
+      paths:
+      - shared/tests/test_usage_gate.py
+      - shared/tests/test_concurrency.py
+      - orchestrator/tests/test_usage_gate.py
+      - shared/tests/test_usage_gate_scope_attribution.py
+      expect: absent
+- label: ξ1
+  task_id: null
+  title: Repoint shared test importers onto shared.cli_result, shared.transcript, shared.claude_argv, shared.claude_runner
+    and shared.account_state; shared tests stop calling the old slot verdict methods
+  note: Contributes fk-3ae32b390a81. Files enumerated at 97be1d71fa, re-checked at 1b106418da (count rule in the PRD).
+  capabilities:
+  - name: shared-tests-stop-calling-slot-verdict-methods
+    binding: built here (deletion) — the 12 shared test files calling a slot's report/confirm/settle directly at
+      1b106418da move onto observe or drive_to, so ο3 can delete those methods
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: slot\.(report|confirm|settle)\(
+      paths:
+      - shared/tests/test_auth_reprobe_opt_out.py
+      - shared/tests/test_cap_retry.py
+      - shared/tests/test_cap_retry_attempt_verdict.py
+      - shared/tests/test_cli_input_rejected.py
+      - shared/tests/test_cli_invoke.py
+      - shared/tests/test_invocation_outcome_boundary.py
+      - shared/tests/test_make_gate_mock_scope.py
+      - shared/tests/test_park_free_invocation.py
+      - shared/tests/test_usage_gate_account_names.py
+      - shared/tests/test_usage_gate_park_visibility.py
+      - shared/tests/test_usage_gate_probe_hold.py
+      - shared/tests/test_usage_gate_scope_attribution.py
+      expect: absent
+  - name: shared-tests-import-agent-result-from-home
+    binding: built here (deletion) — the 18 shared test files importing AgentResult through cli_invoke at 97be1d71fa
+      import it from its home (single-line form; the layering guard covers parenthesised imports)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.cli_invoke import .*\bAgentResult\b
+      paths:
+      - shared/tests/_capacity_skip.py
+      - shared/tests/_cross_account_evidence.py
+      - shared/tests/_usage_gate_test_helpers.py
+      - shared/tests/test_auth_failed.py
+      - shared/tests/test_cap_retry_attempt_verdict.py
+      - shared/tests/test_cap_retry_resume_opt_out.py
+      - shared/tests/test_cap_scan_successful_output.py
+      - shared/tests/test_capacity_skip.py
+      - shared/tests/test_cli_invoke_session_cost.py
+      - shared/tests/test_cross_account_evidence.py
+      - shared/tests/test_invocation_outcome.py
+      - shared/tests/test_park_free_invocation.py
+      - shared/tests/test_probe_loop.py
+      - shared/tests/test_resume_rejection.py
+      - shared/tests/test_usage_gate.py
+      - shared/tests/test_usage_gate_exhaustive.py
+      - shared/tests/test_usage_gate_scope_boundary.py
+      - shared/tests/test_usage_gate_test_helpers.py
+      expect: absent
+- label: ξ2
+  task_id: null
+  title: Repoint fused-memory and scripts importers in files no wave-2 task holds; scripts adopt CliSubtype
+  note: Contributes fk-1778eb482209, fk-3ae32b390a81.
+  capabilities:
+  - name: judge-imports-from-homes
+    binding: built here — judge.py imports the failure projection from shared.agent_failure (it keeps importing
+      invoke_with_cap_retry from cli_invoke)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.agent_failure import
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/judge.py
+      expect: present
+  - name: review-admission-turn-cap-copy-gone
+    binding: built here (deletion) — counts by CliSubtype members
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'TURN_CAP_SUBTYPE = '
+      paths:
+      - scripts/review_model_admission.py
+      expect: absent
+- label: ξ3
+  task_id: null
+  title: Repoint orchestrator importers in files no wave-2 task holds (the tests and the zcode backend) onto shared.cli_result,
+    shared.transcript, shared.claude_argv, shared.claude_runner and shared.account_state
+  note: Contributes fk-3ae32b390a81. Files enumerated at 97be1d71fa, re-checked at 1b106418da (test_reviewer_note_dispositions.py
+    left the set; _info_l0_router_fixtures.py, test_zcode_backend.py and agents/zcode_backend.py joined).
+  capabilities:
+  - name: zcode-backend-spells-subtypes-as-members
+    binding: built here (deletion) — agents/zcode_backend.py (task 5399) mints CliSubtype members, leaving the spelling
+      guard's allow-list
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''error_empty_output''|subtype=''success''|subtype: str = ''error'''
+      paths:
+      - orchestrator/src/orchestrator/agents/zcode_backend.py
+      expect: absent
+  - name: orchestrator-free-importers-import-agent-result-from-home
+    binding: built here (deletion) — no ξ3 file imports AgentResult through cli_invoke (single-line form; the layering
+      guard covers the rest)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.cli_invoke import .*\bAgentResult\b
+      paths:
+      - orchestrator/src/orchestrator/agents/zcode_backend.py
+      - orchestrator/tests/_info_l0_router_fixtures.py
+      - orchestrator/tests/_eval_refusal.py
+      - orchestrator/tests/test_eval_architect.py
+      - orchestrator/tests/test_eval_compare_unmeasured.py
+      - orchestrator/tests/test_eval_diff_threading.py
+      - orchestrator/tests/test_eval_elo_unmeasured.py
+      - orchestrator/tests/test_eval_measurement.py
+      - orchestrator/tests/test_eval_refusal_is_unmeasured.py
+      - orchestrator/tests/test_eval_spawn_identity.py
+      - orchestrator/tests/test_merger_disposition_verdict.py
+      - orchestrator/tests/test_review_checkpoint_cap.py
+      - orchestrator/tests/test_review_checkpoint_degraded_outcomes.py
+      - orchestrator/tests/test_review_checkpoint_phase1_spawn.py
+      - orchestrator/tests/test_review_checkpoint_pre_test.py
+      - orchestrator/tests/test_review_checkpoint_working_tree.py
+      - orchestrator/tests/test_reviewer_failure.py
+      - orchestrator/tests/test_reviewer_trial_main.py
+      - orchestrator/tests/test_reviewer_trial_mining.py
+      - orchestrator/tests/test_reviewer_trial_scorer.py
+      - orchestrator/tests/test_routing.py
+      - orchestrator/tests/test_steward_prompt_builder.py
+      - orchestrator/tests/test_zero_work_failure.py
+      expect: absent
+- label: ξ4
+  task_id: null
+  title: Repoint the orchestrator test importers that wave-2 tasks also hold, rebase-only under file locks
+  note: Contributes fk-3ae32b390a81. Every file is a test file, so no edge onto 9236 or any wave-2 holder (lead
+    ruling of 2026-11-12).
+  capabilities:
+  - name: orchestrator-held-tests-import-agent-result-from-home
+    binding: built here (deletion) — no ξ4 file imports AgentResult through cli_invoke (single-line form)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.cli_invoke import .*\bAgentResult\b
+      paths:
+      - orchestrator/tests/test_architect_all_committed_plan.py
+      - orchestrator/tests/test_eval_boundary_suite.py
+      - orchestrator/tests/test_eval_mcp_isolation.py
+      - orchestrator/tests/test_harness_watcher_supervisor.py
+      - orchestrator/tests/test_judge_completion_verdict.py
+      - orchestrator/tests/test_out_of_band_routing.py
+      - orchestrator/tests/test_plan_revalidation_skip.py
+      - orchestrator/tests/test_project_layout_adoption.py
+      - orchestrator/tests/test_retry_cap.py
+      - orchestrator/tests/test_reviewer_trial_runner.py
+      - orchestrator/tests/test_reviewer_verdict_routing.py
+      - orchestrator/tests/test_shadow_invocation_sandbox.py
+      - orchestrator/tests/test_simple_task_workflow.py
+      - orchestrator/tests/test_watcher_rotation_cap_retry.py
+      - orchestrator/tests/test_workflow_architect_l0_promotion.py
+      - orchestrator/tests/test_workflow_architect_transient_retry.py
+      - orchestrator/tests/test_workflow_false_premise.py
+      - orchestrator/tests/test_workflow_plan_repair_replan.py
+      - orchestrator/tests/test_workflow_ready_to_merge.py
+      expect: absent
+- label: λ
+  task_id: null
+  title: Thread the scratch root as a parameter; the sweep interception point goes
+  note: Closes fk-734bc1fc18bf (weakened, re-verified). Absorbs task 8234.
+  capabilities:
+  - name: default-scratch-root
+    binding: built here — config_dir.default_scratch_root
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def default_scratch_root\(
+      paths:
+      - shared/src/shared/config_dir.py
+      expect: present
+  - name: sweep-parameter-gone
+    binding: built here (deletion) — the required sweep callable
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'sweep: Callable'
+      paths:
+      - shared/src/shared/config_dir.py
+      expect: absent
+  - name: interception-tests-gone
+    binding: built here (deletion) — the two interception-point tests
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_the_module_level_sweep_name_is_still_the_interception_point
+      paths:
+      - shared/tests/
+      expect: absent
+- label: μ
+  task_id: null
+  title: Delivered-check kinds as a discriminated union; consumers dispatch on the model
+  note: Closes fk-240df0521f83 (weakened, re-verified). Absorbs task 7376. Depends on S10 η 9240 (S10 C3) and θ
+    9242 (INV-16), and on S16 ζ1 (agents/briefing.py).
+  capabilities:
+  - name: delivered-check-module-upstream
+    binding: producer:task-9240 (S10 η moves the validator into shared/delivered_check.py; upstream of μ)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency edge μ → 9240, wired at decompose
+  - name: kind-models
+    binding: built here — GrepCheck/ScriptCheck/PathCheck/ManualCheck
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class GrepCheck\(
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: meta-parser-public
+    binding: built here — parse_delivered_check_meta, called by the four construction sites
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def parse_delivered_check_meta\(
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: ladder-gone
+    binding: built here (deletion) — _check_kind_conditional_fields
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _check_kind_conditional_fields
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: briefing-kind-table-gone
+    binding: built here (deletion) — the briefing renders model fields
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _DELIVERED_CHECK_FIELDS_BY_KIND
+      paths:
+      - orchestrator/src/
+      expect: absent
+- label: ν
+  task_id: null
+  title: Type the invocation backend with the shared Backend enum (S16's role-and-backend vocabulary, S16/C1)
+  note: HELD on S16/C1 (shared/backends.py Backend, S16 γ0; x_seam_wait), unless γ0 already has a task id at decompose.
+    Closes no key. Follows S16 π on shared/account_state.py through ο3 → ο2 → S16 π.
+  capabilities:
+  - name: backend-typed
+    binding: 'producer: S16 C1, one Backend StrEnum with its one decoder parse_backend in shared/backends.py (S16''s
+      shared role-and-backend vocabulary leaf γ0, not yet filed; S16 is folded and fold-verified, and C1 carries ZCODE
+      and MIMO, tasks 5399 and 7993, both outside the account pool); ν held on it; built here once released'
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: 'backend: Backend'
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: present
+- label: ο1
+  task_id: null
+  title: Fused-memory files that wave-2 tasks hold adopt the new shared homes
+  note: Contributes fk-3ae32b390a81. Waits on λ and 9188 (the non-test files' wave-2 holders) and on S16 ε2a and
+    ε2b (cli_stage_runner.py, task_curator.py); test files take no edge (lead ruling of 2026-11-12).
+  capabilities:
+  - name: deferral-acceptance-test-stops-calling-slot-report
+    binding: built here (deletion) — fused-memory/tests/test_curation_deferral_acceptance.py, which no leaf owned at
+      the fold, drives the gate through observe or drive_to so ο3 can delete InvokeSlot.report
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: slot\.report\(
+      paths:
+      - fused-memory/tests/test_curation_deferral_acceptance.py
+      expect: absent
+  - name: stage-runner-imports-from-homes
+    binding: built here — cli_stage_runner imports AgentResult and is_zero_output_timeout from shared.cli_result
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.cli_result import
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
+      expect: present
+- label: ο2
+  task_id: null
+  title: The orchestrator adopts CliSubtype, the transcript leaf and the retry loop as the one writer of invocation
+    cost rows
+  note: Closes fk-1778eb482209, fk-e59c30a25d27, fk-b8cba955b358. Signal leaf (task-workflow cost rows). Lead ruling
+    S20/OQ-6. Waits on S16 π (routing.py, S16's last leaf on it). The factory-level refusal of production stores in
+    eval cells is the S1 plan's λ1/λ2 (eval hermeticity), not this leaf's.
+  capabilities:
+  - name: eval-cells-write-no-cost-rows
+    binding: built here — B19, evals stay hermetic after the writer moves into the loop (cross-stream rule, Leo
+      2026-11-12); the one-writer test drives a workflow built by evals/runner.py::_cell_workflow
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _cell_workflow
+      paths:
+      - orchestrator/tests/test_invocation_rows_one_writer.py
+      expect: present
+  - name: budget-alias-gone-from-orchestrator
+    binding: built here (deletion) — consumers use CliSubtype members
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: BUDGET_EXHAUSTED_SUBTYPE
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: steward-minted-literal-gone
+    binding: built here (deletion) — steward._EMPTY_OUTPUT_SUBTYPES uses CliSubtype members
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: frozenset\(\{'error_empty_output'
+      paths:
+      - orchestrator/src/orchestrator/steward.py
+      expect: absent
+  - name: workflow-nesting-copy-gone
+    binding: built here (deletion) — zero-output evidence reads transcript_evidence
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: msg = rec\.get\('message'\)
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: callers-stop-writing-their-own-row
+    binding: built here (deletion) — the task workflow and the deep reviewer pass cost_store into the loop (lead
+      ruling S20/OQ-6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: cost_store\.save_invocation\(
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      - orchestrator/src/orchestrator/review_checkpoint.py
+      expect: absent
+- label: ο3
+  task_id: null
+  title: Transitional re-exports, the old slot verdict methods and the __new__ gate builder go
+  note: Closes fk-3ae32b390a81, fk-25c96d016239, fk-8805d20c0c4c; contributes fk-1778eb482209 (the spelling allow-list's
+    last entries). Signal leaf (end state).
+  capabilities:
+  - name: second-classify-gone
+    binding: built here (deletion) — UsageGate.detect_cap_hit and InvokeSlot.detect_cap_hit
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def detect_cap_hit
+      paths:
+      - shared/src/shared/
+      expect: absent
+  - name: slot-report-gone
+    binding: built here (deletion) — InvokeSlot.report
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def report\(self, outcome
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: absent
+  - name: new-built-gate-gone
+    binding: built here (deletion) — _orch_helpers builds through the constructor
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: UsageGate\.__new__
+      paths:
+      - orchestrator/tests/_orch_helpers.py
+      expect: absent
+  - name: class-level-park-defaults-gone
+    binding: built here (deletion) — no __new__-built gate remains
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    _park_waiters: int = 0'
+      paths:
+      - shared/src/shared/usage_gate.py
+      expect: absent
+- label: π
+  task_id: null
+  title: The cap classifier also recognises the CLI's structured usage-limit field, not only banner text
+  note: No S20 key (side finding of the task-8253 investigation, 2026-11-12; heuristic 12). Priority low; after η.
+    The reset time and cap scope still come from the banner text.
+  capabilities:
+  - name: classifier-reads-usage-limit-field
+    binding: built here — classify_invocation's cap arm recognises api_error usage_limit_reached
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: usage_limit_reached
+      paths:
+      - shared/src/shared/invocation_outcome.py
+      expect: present
+  - name: result-carries-api-error
+    binding: built here — AgentResult.api_error set from the CLI result JSON
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    api_error: str'
+      paths:
+      - shared/src/shared/
+      expect: present

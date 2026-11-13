@@ -145,7 +145,10 @@ relay within an hour reach a sitting within minutes through a criteria-triggered
    `shadow` and flip `live` per class at n ≥ 10 and ≥ 95% agreement, by Leo at the η gate; task
    3346 is a dependency of η for the new classes only. The skeleton's reversibility condition is
    waived for the 1b/3 done-flip (`REVERSIBLE_ACTIONS` gains `done_flip` so the codec accepts the
-   stamp; the comparable rate is the trailing `close_only`).
+   stamp; the comparable rate is the trailing `close_only`). Amended 2026-11-09 (Leo, sitting
+   item 522, esc-8475-2): item 11 does not move. Class 1a's TRUE arm (`completion_claim_true`)
+   closes the gate record `close_only`, cancelling the router-spawned task stays
+   interactive-only, and reversibility is not waived for `abandon`.
 8. **Audit** (Leo, Q6): population = executor closes (DecisionRecords whose `closing_evidence`
    names a `policy_class`); draw = random, ten per week, seeded per render; rendered in the return
    brief §6 with an answer slot; `audit N=ok|wrong:note` is a sitting answer; `wrong` sets the
@@ -199,9 +202,9 @@ relay within an hour reach a sitting within minutes through a criteria-triggered
 class PolicyRow:
     policy_class: str                  # slug, also the shadow-vocabulary slug
     match: PolicyMatch                 # category | agent_role regex | root_cause regex | ruling_citation
-    actions: frozenset[str]            # subset of {'close_only','resume','abandon','done_flip','update_task','recover_main','b3_apply', ...}
+    actions: frozenset[str]            # subset of {'close_only','resume','done_flip','update_task','recover_main','b3_apply', ...}
     evidence: tuple[re.Pattern, ...]   # ALL must match `resolution` (presence-only, as 2630)
-    reversible: bool                   # False only for done_flip (waived, Leo 2026-11-04)
+    reversible: bool                   # False when any act is outside the reversible set: done_flip (waived), recover_main, b3_apply, replay_dead_letters, reprobe_quarantine (amended 2026-11-09)
     file_writing: bool                 # worktree-only rule + 100% audit until n>=20
     audit_full_until: int              # 20 for file_writing and recover_main; 0 otherwise
 

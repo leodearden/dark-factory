@@ -282,7 +282,6 @@ class TestFetchTask:
         assert row == {
             'id': 19,
             'title': 'merge attempts as one datum',
-            'description': 'd',
             'status': 'done',
             'priority': 'high',
             'dependencies': [3, 4],
@@ -290,6 +289,8 @@ class TestFetchTask:
             'updated_at': '2026-09-30T12:00:00+00:00',
             'claimant_run_id': 'run-7',
             'heartbeat_at': '2026-09-30T11:59:00+00:00',
+            'created_at': None,
+            'created_at_source': None,
         }
 
     async def test_one_get_task_call_names_the_id_and_root(self, tmp_path):

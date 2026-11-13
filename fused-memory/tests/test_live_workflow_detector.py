@@ -17,6 +17,7 @@ import pytest
 from _fm_helpers import as_async_run_git as _as_async_run_git
 from shared.scheduler_state import SchedulerStateSnapshot
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, carries_claimant
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
@@ -32,6 +33,8 @@ from fused_memory.services.live_workflow_detector import (
     is_unclaimed_awaiting_dependency,
     is_workflow_live_for_task,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers

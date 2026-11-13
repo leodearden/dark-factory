@@ -7,6 +7,9 @@ import re
 import pytest
 import verify_command_invariants as vci
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 HOOK_PATH = REPO_ROOT / "hooks" / "project-checks"

@@ -42,6 +42,9 @@ from review_all_program_fixture import (
     running_fake_store,
 )
 from review_all_program_seeded_run import StoreCopy
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = 'gen_brief.py'
 S1_PRD = 'plans/review-all-fixture-s1-prd.md'

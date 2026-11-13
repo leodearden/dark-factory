@@ -359,6 +359,17 @@ proposing a rename.
 `get_escalation`, `get_task_escalation_history`, `escalate_info`,
 `escalate_blocker`.
 
+> **Amendment (2026-11-11, task 6552).** `get_task_escalations` also takes
+> `project_root: str | None = None`. The table below governs it, and its
+> refusals feed the same §6.4 streak. It is the archive-inclusive, filterable
+> read over the same `queue.get_by_task` primitive that
+> `get_task_escalation_history` wraps, and it carries the same
+> evidence-of-absence contract. `server_instructions.py` presents it as an
+> equal "every escalation ever filed" read, and the escalation-watcher-auto
+> skill calls it. Left unguarded, it kept §2.2 flavors 1 and 4 open on exactly
+> the read whose `[]` callers are told to trust. Omitting the argument is
+> unchanged. The sentence above is left as the γ2-time record.
+
 | Condition | Result |
 |---|---|
 | arg omitted | proceed, unchanged (fleet-agent path) |
@@ -480,6 +491,33 @@ No waivers required.
    snapshot is safe here. α covers this case verbally only, via the
    `ESCALATION_BOUNDARY_NOTE` "serves the RECONCILIATION store only" sentence;
    nothing mechanical does.
+
+   **RESOLVED (task 6553): option (a), deny.** γ3 (task 3167) put the
+   `THIS ENDPOINT SERVES` block on every tool the server registers,
+   `get_task_runtime_state` included. That attributes the result to the
+   reconciliation store but does not make the read safe: `offline: False` plus
+   `tasks: []` is still a positive "online, nothing running" claim.
+   `mcp__escalation__get_task_runtime_state` is now denied to all three stages by
+   `fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::DISALLOW_ESCALATION_RUNTIME_READS`.
+   That bucket is separate from `DISALLOW_ESCALATION_READS` because the tool reads
+   orchestrator runtime state, not escalation records. The `ESCALATION_BOUNDARY_NOTE`
+   core explains the absence. Option (b), an unwired standalone envelope, was not
+   taken: it would change the shared `shared/src/shared/task_runtime_state.py` wire
+   model, whose only consumer, the dashboard, never polls the recon server
+   (`dashboard/src/dashboard/config.py::_discover_escalation_urls`). A non-stage
+   caller of 8103 still receives the empty-but-live envelope, attributable through
+   the description block and the server instructions' "(empty when no orchestrator
+   is attached)". The merge/halt pair needs nothing further. Pinned by
+   `fused-memory/tests/reconciliation/test_recon_stage_escalation_read_boundary.py::test_recon_stage_cannot_obtain_the_task_runtime_snapshot`.
+
+   S3 δ (`plans/review-all-s3-escalation-server-and-queue-boundary-prd.md`) moves
+   `get_task_runtime_state` off `create_server`, so the reconciliation server stops
+   serving it and this denial is superseded. δ retires
+   `DISALLOW_ESCALATION_RUNTIME_READS` (its folds into `STAGE1/2/3_DISALLOWED` and
+   its entry in `test_every_escalation_server_tool_is_classified`'s bucket map),
+   the `ESCALATION_BOUNDARY_NOTE` runtime-snapshot sentences, and the pinning test
+   above. It does not touch `_REVIEWED_STAGE_SAFE` for this tool, which that set
+   no longer holds: ten of δ's eleven moved names leave it, not eleven.
 4. **Does `--disallowed-tools` reject a denied MCP tool on call, or omit it from
    the listing?** **RESOLVED during α (task 3163): OMISSION.** A denied tool is
    simply absent from the agent's visible tool set; there is no rejection event

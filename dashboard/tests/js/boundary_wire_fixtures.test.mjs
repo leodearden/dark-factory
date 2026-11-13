@@ -15,10 +15,18 @@ import {
   escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
+  qualityBody,
+  qualityComparison,
+  qualityMarker,
+  qualityMarkers,
+  qualityMetric,
+  qualityModuleRow,
+  qualityPayload,
   schedulerLockRow,
   schedulerModule,
   schedulerSnapshot,
   taskCensus,
+  taskRow,
   tasksSnapshotEntry,
   wireDatum,
 } from './wire_fixtures.mjs';
@@ -62,6 +70,13 @@ test('a TASKS_SNAPSHOT entry is built with exactly the keys /tasks serves for on
   for (const part of ['counts', 'views', 'sub_views']) {
     assertSameKeys(built.census.value[part], served.census.value[part], `census.value.${part}`);
   }
+});
+
+test('a TASKS_SNAPSHOT row is built only with keys /tasks serves on one', () => {
+  const served = payload('census_fresh').TASKS_SNAPSHOT['dark-factory'].rows.value;
+  assert.ok(served.length > 0, 'the census_fresh body serves no task rows to check the builder against');
+
+  assertBuiltKeysServed(taskRow(), served[0], 'TASKS_SNAPSHOT[project].rows.value[0]');
 });
 
 test('a burndown block is built only with keys /burndown serves, in the aggregate and per project', () => {
@@ -137,4 +152,72 @@ test("an /escalations payload's counts and views agree with the served ones for 
     assert.deepEqual(builtPart.summary, servedPart.summary, `${where}.summary`);
     assert.deepEqual(viewValues(builtPart.views), viewValues(servedPart.views), `${where}.views`);
   }
+});
+
+test('a QUALITY series, a measured and a no-producer metric included, is built only with keys /quality serves', () => {
+  const served = payload('quality_fresh').QUALITY;
+  const measured = qualityMetric({
+    kind: 'rate',
+    points: [0, 1, 0],
+    headlineForm: 'rate',
+    ewma: { line: [0.2, 0.25, 0.22], ucl: [0.4, 0.4, 0.4] },
+  });
+  const unproduced = qualityMetric({ kind: 'count', points: [null, null, null], measuredSince: null });
+  const built = qualityPayload({
+    axis: [{}, { git_first_parent: false }, { late_claim: true }],
+    metrics: { rejected: measured, reverts: unproduced },
+  });
+  const servedMetrics = served.value.metrics;
+
+  assertSameKeys(wireDatum(null), served, 'the QUALITY Datum');
+  assertBuiltKeysServed(built, served.value, 'QUALITY.value');
+  assertSameKeys(built, served.value, 'QUALITY.value');
+  assertSameKeys(built.axis[0], served.value.axis[0], 'QUALITY.value.axis[0]');
+  for (const [id, metric] of Object.entries(built.metrics)) {
+    assertSameKeys(metric, servedMetrics[id], `QUALITY.value.metrics.${id}`);
+    assertSameKeys(metric.rule, servedMetrics[id].rule, `QUALITY.value.metrics.${id}.rule`);
+    assertSameKeys(metric.headline, servedMetrics[id].headline, `QUALITY.value.metrics.${id}.headline`);
+  }
+  assertSameKeys(measured.headline.value, servedMetrics.rejected.headline.value, 'a measured headline value');
+  assert.equal(servedMetrics.reverts.rule.measured_since, null, 'this check expects reverts to have no producer');
+  assert.equal(unproduced.headline.state, servedMetrics.reverts.headline.state);
+});
+
+test('a whole /quality body, its cost model and a before/after comparison are built with exactly the keys /quality serves', () => {
+  const served = payload('quality_alarm_explained');
+  const [servedComparison] = served.QUALITY.value.before_after;
+  const comparison = qualityComparison({ markerId: 'routing:reviewer_comprehensive:1', metric: 'rejected', state: 'not_yet' });
+  const body = qualityBody({
+    quality: qualityPayload({ axis: [{}], metrics: {}, costModel: { reference_cost_100: 1.5 }, beforeAfter: [comparison] }),
+  });
+
+  assertSameKeys(body, served, 'the /quality body');
+  assertSameKeys(body.WINDOW, served.WINDOW, 'the /quality WINDOW echo');
+  assertSameKeys(body.QUALITY_SNAPSHOTS, served.QUALITY_SNAPSHOTS, 'the QUALITY_SNAPSHOTS Datum');
+  assert.equal(body.QUALITY_SNAPSHOTS.state, served.QUALITY_SNAPSHOTS.state);
+  assertSameKeys(body.QUALITY.value.cost_model, served.QUALITY.value.cost_model, 'QUALITY.value.cost_model');
+  assert.ok(servedComparison, 'this check expects quality_alarm_explained to serve a before/after comparison');
+  assertSameKeys(comparison, servedComparison, 'QUALITY.value.before_after[0]');
+  assert.equal(comparison.state, servedComparison.state);
+});
+
+// No boundary scenario serves a module row yet (each one's modules is []), so
+// qualityModuleRow is held to quality_series.py::ModuleRow.to_wire's field
+// list only; this pins that the builder's keys stay that one list.
+test('a module row is built with the seven keys ModuleRow.to_wire serves', () => {
+  assert.deepEqual(Object.keys(qualityModuleRow({ module: 'dashboard' })).sort(), [
+    'allocated_lines', 'allocated_usd', 'landings', 'module', 'ranked', 'tasks', 'usd_per_100_lines',
+  ]);
+});
+
+test('a QUALITY_MARKERS stream and its derived marker are built with exactly the keys /quality serves', () => {
+  const served = payload('quality_alarm_explained').QUALITY_MARKERS;
+  const [servedMarker] = served.value.markers.filter(marker => marker.source.type === 'routing');
+  const built = qualityMarkers([qualityMarker({ id: 'routing:reviewer_comprehensive:1', ordinal: 3 })]);
+
+  assertSameKeys(wireDatum(null), served, 'the QUALITY_MARKERS Datum');
+  assertSameKeys(built, served.value, 'QUALITY_MARKERS.value');
+  assertSameKeys(built.prompt_coverage, served.value.prompt_coverage, 'QUALITY_MARKERS.value.prompt_coverage');
+  assertSameKeys(built.markers[0], servedMarker, 'QUALITY_MARKERS.value.markers[0]');
+  assertSameKeys(built.markers[0].source, servedMarker.source, 'QUALITY_MARKERS.value.markers[0].source');
 });

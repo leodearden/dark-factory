@@ -40,7 +40,7 @@ from orchestrator.offline_lane_runs import (
 from orchestrator.verify import (
     FailureKind,
     PytestFailure,
-    _serial_pytest_str,
+    _serial_confirm_pytest_str,
     _with_junitxml_str,
     _with_pytest_timeout_str,
     node_ids_of,
@@ -195,7 +195,7 @@ def serial_confirm_command(
 ) -> str:
     """The narrowed confirm of *ids*: serial, with a per-test timeout, writing junit to *junit_path*."""
     narrowed = _narrowed(cmd, ids)
-    serial = _serial_pytest_str(narrowed, invocation_dir=invocation_dir) or narrowed
+    serial = _serial_confirm_pytest_str(narrowed, invocation_dir=invocation_dir) or narrowed
     timed = _with_pytest_timeout_str(serial, CONFIRM_TEST_TIMEOUT_SECS) or serial
     return _with_junitxml_str(timed, str(junit_path)) or timed
 
@@ -339,7 +339,7 @@ async def _confirm_generic(
         command = serial_confirm_command(cmd, ids, invocation_dir=run_cwd, junit_path=junit_path)
     else:
         junit_path = None
-        command = _serial_pytest_str(cmd.command, invocation_dir=run_cwd) or cmd.command
+        command = _serial_confirm_pytest_str(cmd.command, invocation_dir=run_cwd) or cmd.command
     launched = await runner(
         [*nice_prefix('background'), 'sh', '-c', command],
         cwd=run_cwd,

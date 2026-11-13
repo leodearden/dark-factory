@@ -330,12 +330,12 @@ class ClaimResult(Generic[R]):
 class ResolveOutcome(TypedDict):
     """What ONE :meth:`EscalationQueue.resolve` call actually DID (task 4495).
 
-    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: the
-    ``Escalation`` is ``resolve()``'s primary return value and every existing
-    call site reads it directly, so widening the return into a tuple would churn
-    all of them — the member cascade, ``dismiss_all_pending``, the steward, the
-    five workflow auto-dismiss backstops — for a fact only ``server.resolve_issue``
-    wants.
+    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: only
+    ``server.resolve_issue`` and ``dismiss_all_pending`` want this fact, while the
+    ``Escalation`` is ``resolve()``'s primary return value and every other call
+    site reads it directly — the member cascade, the steward, the five workflow
+    auto-dismiss backstops — so widening the return into a tuple would churn all
+    of them.
 
     WHY IT EXISTS: ``resolve()``'s already-terminal branch is a no-op, so a caller
     whose text did NOT apply gets back a perfectly healthy-looking ``Escalation``
@@ -717,11 +717,38 @@ def read_escalation_for_scan(
         return None, 'unparsable'
 
 
+def _warn_cross_tier_duplicates(root_paths: list[Path], archive_paths: list[Path]) -> None:
+    """WARN once per escalation id that has a copy in BOTH the queue root and the archive.
+
+    That signals a crash-mid-resolve or a backup-restore needing reconciliation.
+    Each path's tier is known from which list it came in, so ids are matched
+    by filename alone, with no JSON parsing and no per-path ``.parent``.  An id
+    present in several dated archive subdirs but not the root is NOT warned
+    about: ``queue.py::EscalationQueue._locate_path`` selects the newest copy.
+    """
+    root_names = {path.name for path in root_paths}
+    archive_copies: dict[str, list[Path]] = {}
+    for path in archive_paths:
+        if path.name in root_names:
+            archive_copies.setdefault(path.name, []).append(path)
+    for root_copy in root_paths:
+        copies = archive_copies.get(root_copy.name)
+        if copies:
+            esc_paths = [root_copy, *copies]
+            logger.warning(
+                f'Escalation {root_copy.stem!r} exists in both queue_dir and archive: '
+                f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
+            )
+
+
 class EscalationQueue:
     """Filesystem queue for escalations.
 
     Each escalation is a JSON file named {id}.json in the queue directory.
     Writes are atomic (tmp file + rename). Reads tolerate partial writes.
+    The read paths (``get`` / ``get_by_task`` / ``get_pending``) may run on
+    worker threads while writes run on the loop thread, which is why
+    iteration over the archive-listing memo is snapshot-based.
     """
 
     def __init__(self, queue_dir: Path):
@@ -909,7 +936,7 @@ class EscalationQueue:
         listing = self._get_archive_listing()
         candidates = [
             archive_root / subdir / f'{escalation_id}.json'
-            for subdir, stems in listing.items()
+            for subdir, stems in list(listing.items())
             if escalation_id in stems
             and (archive_root / subdir / f'{escalation_id}.json').exists()
         ]
@@ -1095,8 +1122,7 @@ class EscalationQueue:
         anyway.
 
         Recovery is further gated to a ``'vanished'`` path whose parent is
-        the queue ROOT (the same root/archive tier test the pre-scan above
-        already makes).  An archive-tier path going ``'vanished'`` is
+        the queue ROOT.  An archive-tier path going ``'vanished'`` is
         overwhelmingly ``archive.prune_archive`` rmtree-ing its whole dated
         subdir wholesale — a genuine deletion recovery cannot help with, not
         the root -> archive move this recovery targets — and re-locating it
@@ -1105,42 +1131,15 @@ class EscalationQueue:
         that is genuinely gone.  This deliberately leaves a second,
         archive-to-archive relocation (e.g. a re-date) unrecovered.
         """
-        # Build the candidate path list.
-        paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
-        if status != 'pending':
-            paths.extend(self._iter_archive_paths('esc-*.json'))
-
-        # Pre-scan: detect ids that span both queue_dir root and archive subtree.
-        # Uses filename stems only (no JSON parsing) to avoid extra I/O.
-        #
-        # Tier-membership: classify each path by comparing its parent directory
-        # to self.queue_dir.  Files written by queue_dir.glob('esc-*.json') are
-        # non-recursive, so their parent IS self.queue_dir (root tier).  Files
-        # from _iter_archive_paths come from archive_root.rglob(...) and land
-        # inside a dated subdir (e.g. archive/2025-06-15/); their parent is that
-        # date dir, NOT self.queue_dir (archive tier).
-        #
-        # A single id can legitimately appear multiple times within the archive
-        # tier (the same stem in two different dated subdirs after a requeue or
-        # backup-restore).  That situation is handled by get()'s newest-by-date
-        # selection (queue.py:102-117) and is NOT a cross-tier inconsistency.
-        # We warn only when an id has members in BOTH tiers — that signals a
-        # crash-mid-resolve or backup-restore scenario requiring reconciliation.
-        id_to_paths: dict[str, list[Path]] = {}
-        for path in paths:
-            id_to_paths.setdefault(path.stem, []).append(path)
-        for esc_id, esc_paths in id_to_paths.items():
-            has_root = any(p.parent == self.queue_dir for p in esc_paths)
-            has_archive = any(p.parent != self.queue_dir for p in esc_paths)
-            if has_root and has_archive:
-                logger.warning(
-                    f'Escalation {esc_id!r} exists in both queue_dir and archive: '
-                    f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
-                )
+        root_paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
+        archive_paths: list[Path] = (
+            list(self._iter_archive_paths('esc-*.json')) if status != 'pending' else []
+        )
+        _warn_cross_tier_duplicates(root_paths, archive_paths)
 
         seen: set[str] = set()
         results = []
-        for path in paths:
+        for path in root_paths + archive_paths:
             # The glob above snapshotted the listing; nothing holds a lock over
             # these reads, so a concurrent resolve()/sweep can relocate any of
             # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
@@ -1155,8 +1154,7 @@ class EscalationQueue:
                 # vanish -- re-locate it fresh and retry the read once before
                 # giving up on it.
                 #
-                # Gated to the ROOT tier (path.parent == self.queue_dir), the
-                # same root/archive test the pre-scan above already uses.
+                # Gated to the ROOT tier (path.parent == self.queue_dir).
                 # An ARCHIVE-tier path going 'vanished' is overwhelmingly
                 # archive.prune_archive rmtree-ing its whole dated subdir --
                 # a genuine deletion this recovery cannot help with, not the
@@ -3014,16 +3012,17 @@ class EscalationQueue:
         notes survive for the orphan reaper
         (plans/info-l0-disposition-router-prd.md boundary #16).
 
-        Returns the number of escalations where resolve() returned non-None.
-        This is an UPPER BOUND on the records this call dismissed, not an exact
-        count.  Other processes, among them fused-memory's middlewares and
-        reconciliation, write this queue directory concurrently, so a record
-        one of them resolves between get_pending() and resolve() is still
-        counted: resolve() on an already-terminal record is a no-op that
-        returns the stored record.  Nor does the count distinguish the three
-        per-record outcomes — age-annotated, strand-stamped, or
-        ``pending_secs=unknown`` for a record whose timestamp would not parse;
-        a caller that needs that detail reads the resolved records themselves.
+        Returns the exact number of records THIS call dismissed: a record is
+        counted only when resolve()'s ``ResolveOutcome`` reports it applied.
+        Other processes, among them fused-memory's middlewares and
+        reconciliation, routinely write this queue directory, so a record one
+        of them resolves between get_pending() and resolve() is an
+        already-terminal no-op here and is not counted.  The stale-strand tally
+        in the INFO line is counted the same way.  The count does not
+        distinguish the three per-record outcomes — age-annotated,
+        strand-stamped, or ``pending_secs=unknown`` for a record whose
+        timestamp would not parse; a caller that needs that detail reads the
+        resolved records themselves.
         """
         pending = self.get_pending()
         now = now or datetime.now(UTC)
@@ -3054,14 +3053,16 @@ class EscalationQueue:
                 else:
                     is_strand = False
                     per_record = f'{resolution} [pending_secs=unknown severity={esc.severity}]'
-                resolved = self.resolve(
+                outcome = blank_resolve_outcome()
+                self.resolve(
                     esc.id,
                     per_record,
                     dismiss=True,
                     resolved_by='auto-dismissed',
                     resolution_class='stale-strand' if is_strand else None,
+                    outcome=outcome,
                 )
-                if resolved is not None:
+                if outcome['applied']:
                     count += 1
                     strands += int(is_strand)
             except Exception as e:

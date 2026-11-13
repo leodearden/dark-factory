@@ -110,114 +110,6 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 # the working-regime poll is 60s, so a poll-relative yardstick would mask a 5s
 # read that already indicates a badly saturated executor.
 _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
-# Per-caller cap-wait policy (post-1365 audit, task 1401)
-# ─────────────────────────────────────────────────────────────────────────────
-# _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
-# pass an explicit cap_wait_sanity_secs= override.  Each call site below has
-# been audited; the policy for each is documented here so future readers know
-# why an override is or is not present.
-#
-# Caller                                  Policy / WHY
-# ───────────────────────────────────────────────────────────────────────────
-# orchestrator/workflow.py                14-day default OK.  Per-task AFK
-#   (implementer/debugger invocation)     implementer/debugger; 14-day patient
-#                                         wait is the documented AFK A1 intent.
-#
-# orchestrator/steward.py                 14-day default OK.  Pre-triage; the
-#   (pre-triage invocation)               AllAccountsCappedException handler
-#                                         logs and falls back to inline triage.
-#
-# orchestrator/review_checkpoint.py       14-day default OK.  Deep reviewer;
-#   (deep reviewer invocation)            AllAccountsCappedException handler
-#                                         returns an empty report, no queue
-#                                         stall.
-#
-# orchestrator/harness.py                 14-day default OK for both sites.
-#   (module tagging + watcher rotation)   Module tagging: the handler logs and
-#                                         returns.  Watcher rotation: also
-#                                         max_cap_retries=16, and a cap hit
-#                                         retries FRESH (resume_on_cap_hit=
-#                                         False); AllAccountsCappedException
-#                                         takes the supervisor's unclean path.
-#                                         Neither blocks a queue.
-#
-# orchestrator/evals/architect_eval.py    14-day default OK (esc-4002-1, task
-#   (invoke_architect invocation)         7320).  A cap lands MID-cell after
-# orchestrator/evals/measurement.py       real spend, which --resume carries
-#   (measured_call invocation)            across the account switch: waiting
-#                                         is ~free, while tainting re-spends
-#                                         it.  AllAccountsCappedException is
-#                                         recorded as an Unmeasured with cause
-#                                         cap_exhausted, never raised.
-#
-# fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s
-#   (LLM triage calls)                    + park_on_frozen_pool=False.  DEFERS,
-#                                         never creates, when the pool cannot
-#                                         serve: AllAccountsCappedException
-#                                         (after ~120 s of cap-retry patience)
-#                                         or PoolFrozen (frozen at call start,
-#                                         no wait) parks the ticket
-#                                         awaiting_curation; the ticket janitor
-#                                         retries it until it is curated; every
-#                                         create the curator did not judge is
-#                                         marked metadata.dedupe_skipped
-#                                         (fused_memory/middleware/
-#                                         curation_deferral.py).
-#
-# fused_memory/reconciliation             _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
-#   (agent_loop, judge, cli_stage_runner) Shared by all three stage runners.
-#   (reconciliation stage runners)        Short-lived stage runners; expected
-#                                         to complete promptly within the
-#                                         reconciliation cycle.  14-day default
-#                                         would stall the queue indefinitely
-#                                         under sustained cap.  1800 s lets a
-#                                         brief cap window resolve in-band.
-#
-# orchestrator/dry_run_unblock.py         _DRY_RUN_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
-#   (block-time investigation invocation) Fire-and-forget background
-#                                         investigation spawned from
-#                                         _mark_blocked; 14-day default would
-#                                         leave it pending for weeks under a
-#                                         cap storm. AllAccountsCappedException
-#                                         is caught and converted to a
-#                                         retryable 'infra_failure' proposal
-#                                         entry instead of raising.  A cap hit
-#                                         retries FRESH (resume_on_cap_hit=
-#                                         False).
-#
-# scripts/legibility/session_runner.py    NO patience at all: park_on_frozen_
-#   (nightly legibility trickle + census, pool=False + max_cap_retries=
-#    every LLM call they make)            gate.account_count.  The contract is
-#                                         IMMEDIATE defer/taint (task 4736):
-#                                         a nightly oneshot must not block on
-#                                         a cap wait across the NEXT night's
-#                                         timer, and its digests are
-#                                         re-derivable, so patience buys
-#                                         nothing and costs a missed run.  One
-#                                         pass over the pool, then
-#                                         AllAccountsCappedException or
-#                                         PoolFrozen, which the runner types
-#                                         per task 5947 (all-capped defers at
-#                                         exit 0; all-auth-failed fails loud).
-#                                         cap_wait_sanity_secs left at the
-#                                         default: the two bounds above always
-#                                         fire first.  Was an audited
-#                                         NON-caller (own text-mode spawn, no
-#                                         account pool) until task 6042.
-#
-# SCOPE OF EVERY BOUND IN THIS TABLE (tasks 3630, 6042, 4002).  One deadline,
-# call start + cap_wait_sanity_secs, bounds BOTH places a call waits on caps:
-# the cap-retry branch (_check_cap_wait, after an invocation returned a cap)
-# and the gate's own park when no account is admissible (the time left on the
-# deadline, forwarded as before_invoke's max_wait_secs).  A park that outlives
-# it raises AllAccountsCappedException chained from the gate's PoolFrozen and
-# carrying it as pool_frozen, so an all-AUTH_FAILED freeze is not read as a cap.
-# park_on_frozen_pool=False (the curator, the legibility runner) still refuses
-# to park at all and gets PoolFrozen unconverted.  The bound lives in the
-# wrapper and the gate because a wait in before_invoke is definitionally a cap
-# wait — a caller-side asyncio.wait_for cannot tell a frozen pool from a slow
-# agent and would misattribute the latter.
-# ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
 
@@ -245,8 +137,8 @@ CAP_HIT_RESUME_PROMPT = (
     'Continue where you left off and complete your task.'
 )
 # Prompt sent to a session that the orchestrator is resuming after a crash.
-# Kept separate from CAP_HIT_RESUME_PROMPT because the cause differs
-# (orchestrator restart, not a usage-cap interrupt) and the agent message
+# Kept separate from its siblings because the cause differs (orchestrator
+# restart, not a usage-cap interrupt or a watchdog kill) and the agent message
 # should stay a short crash-recovery continuation prompt rather than mentioning usage limits.
 CRASH_RECOVERY_RESUME_PROMPT = (
     'You were interrupted by an orchestrator restart. '
@@ -254,6 +146,20 @@ CRASH_RECOVERY_RESUME_PROMPT = (
     'git/worktree state, then continue where you left off. '
     'Any escalation you filed before the restart may have been auto-dismissed '
     'as stale — re-raise it if it is still relevant.'
+)
+# Prompt sent to a session the orchestrator resumes after its own watchdog
+# killed it mid-progress (the workflow's is_timed_out_with_progress path).
+# Kept separate from CRASH_RECOVERY_RESUME_PROMPT because no restart happened.
+PROGRESS_TIMEOUT_RESUME_PROMPT = (
+    'Your previous run was stopped at an orchestrator time limit while you '
+    'were still making progress: it reached the wall-clock cap for a single '
+    'invocation, or went too long without a new turn (a long-running '
+    'foreground command can cause this). '
+    'This was not an orchestrator restart, so no escalation you filed was '
+    'auto-dismissed; do not re-raise one. '
+    'Your branch may have been rebased onto main since you stopped, with any '
+    'uncommitted work first saved as a WIP commit, so check git status and '
+    'git log, then continue where you left off.'
 )
 
 # The NON_CAP_CLI_ERROR_MARKERS table and its _is_non_cap_cli_error scanner
@@ -271,6 +177,7 @@ __all__ = [
     'BUDGET_EXHAUSTED_SUBTYPE',
     'CAP_HIT_RESUME_PROMPT',
     'CRASH_RECOVERY_RESUME_PROMPT',
+    'PROGRESS_TIMEOUT_RESUME_PROMPT',
     'AgentFailureClass',
     'AgentFailureKind',
     'AgentResult',
@@ -2533,6 +2440,7 @@ async def invoke_with_cap_retry(
     max_cap_retries: int | None = None,
     rebuild_prompt: PromptBuilder | None = None,
     resume_delivers_prompt: bool = False,
+    resume_prompt: str | None = None,
     resume_on_cap_hit: bool = True,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
@@ -2578,7 +2486,10 @@ async def invoke_with_cap_retry(
     time left on it, the gate's park on a pool with no admissible account.
     Once it is spent ``AllAccountsCappedException`` is raised so the caller
     can escalate.  Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).
-    Pass ``None`` to wait indefinitely.
+    Pass ``None`` to wait indefinitely.  A caller that must not wait that
+    long passes its own bound, and names and justifies it beside the call.
+    A caller-side ``asyncio.wait_for`` is no substitute, because it cannot
+    tell a frozen pool from a slow agent.
 
     *max_cap_retries* is an optional count-based sibling of
     *cap_wait_sanity_secs*: when the number of consecutive cap hits reaches
@@ -2635,6 +2546,13 @@ async def invoke_with_cap_retry(
     task context, so the short crash-recovery continuation prompt is sufficient
     and the real prompt is kept only as ``original_prompt`` for fresh-fallback.
 
+    *resume_prompt* is the continuation a caller-initiated resume's first
+    dispatch sends in place of ``prompt``; ``None`` (the default) means
+    ``CRASH_RECOVERY_RESUME_PROMPT``.  It is consulted only when
+    ``resume_session_id`` is preset, ``prompt`` is still kept as
+    ``original_prompt`` for fresh-fallback, and it is mutually exclusive with
+    *resume_delivers_prompt* (passing both raises ``ValueError``).
+
     *resume_on_cap_hit*, when ``True`` (the default), applies the two-part
     resume rule above.  ``False`` makes every cap-hit re-dispatch fresh, for
     a stateless caller whose retry would preserve nothing worth keeping.  It
@@ -2673,13 +2591,22 @@ async def invoke_with_cap_retry(
     # Caller-initiated resume contract: when the caller pre-sets resume_session_id
     # (e.g. orchestrator crash recovery), they pass the real task prompt as `prompt`
     # so that `original_prompt` captures it for fresh-fallback restoration.  We
-    # immediately overwrite `invoke_kwargs['prompt']` with CRASH_RECOVERY_RESUME_PROMPT
-    # so the first subprocess invocation uses the short continuation string.  The
+    # immediately overwrite `invoke_kwargs['prompt']` with the continuation named by
+    # `resume_prompt` (CRASH_RECOVERY_RESUME_PROMPT when None) so the first
+    # subprocess invocation uses the short continuation string.  The
     # resume-rejection branch (below) then correctly restores `original_prompt`
     # (the real task prompt) for any subsequent fresh invocation.
     # `resume_delivers_prompt` opts a live-continuation caller (the steward) out of
-    # this swap: its resumed session must receive the real prompt, not the short
-    # crash-recovery continuation prompt.
+    # this swap: its resumed session must receive the real prompt, not a short
+    # continuation prompt.
+    if resume_delivers_prompt and resume_prompt is not None:
+        raise ValueError(
+            f'{label}: resume_delivers_prompt and resume_prompt are mutually '
+            "exclusive: resume_delivers_prompt sends the caller's prompt, "
+            'resume_prompt names a continuation in its place'
+        )
+    if resume_prompt is not None:
+        require_non_blank_prompt(resume_prompt, context=f'{label} resume_prompt')
     if invoke_kwargs.get('resume_session_id'):
         # ONE exception type for "blank prompt" (task 3143 amendment): this
         # branch used to raise its own hand-rolled TypeError, so the SAME
@@ -2701,7 +2628,9 @@ async def invoke_with_cap_retry(
             ),
         )
         if not resume_delivers_prompt:
-            invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
+            invoke_kwargs['prompt'] = (
+                CRASH_RECOVERY_RESUME_PROMPT if resume_prompt is None else resume_prompt
+            )
     else:
         # Non-resume invocation: the prompt IS the whole request, so a blank one
         # is always a caller bug.  Raised here — before any invoke_slot is

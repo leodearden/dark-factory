@@ -28,6 +28,7 @@ from _fm_helpers import LoopFreedomProbe
 from _swallowed_failure_log import swallowed_causes
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import ticket_janitor
 from fused_memory.middleware.curation_deferral import (
@@ -41,6 +42,8 @@ from fused_memory.middleware.ticket_janitor import (
     curation_backlog_anchor,
 )
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest_asyncio.fixture

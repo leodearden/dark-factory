@@ -22,7 +22,10 @@ import sys
 import time
 import types
 
+import _watchdog_crash_loop as crash_loop
 import pytest
+from fake_uv import argv_flag, recorded_argvs, write_fake_uv
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Importable by name only because tests/scripts/conftest.py puts this
 # directory on sys.path, which pytest's --import-mode=importlib deliberately
@@ -58,6 +61,8 @@ from df_pytest_isolation import (  # noqa: E402
     wait_proof_grace_secs,
 )
 
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 
 def _load_watchdog() -> types.ModuleType:
     """Load scripts/orchestrator-watchdog.py as a module (hyphenated name)."""
@@ -67,6 +72,33 @@ def _load_watchdog() -> types.ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _isolate_crash_loop_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Point the crash-loop detector and the per-unit revive clocks at tmp_path.
+
+    REPO_DIR is the live checkout, so without this every main() test would
+    write the live restart-rate state and stamp live revive clocks, and a test
+    that left main() on its real status reader could page through real uv.
+    test_boundary7_liveness_during_window_does_not_stamp_clock patches
+    time.time to 2e9: a revive clock it stamped in the live tree would be
+    future-dated and suppress real revives for years. The satellite reads
+    these per call, and the watchdog reads its clock dir at module exec, which
+    _load_watchdog re-runs per test, so both follow this setenv.
+    """
+    root = tmp_path / "crash-loop"
+    monkeypatch.setenv("ORCH_RESTART_RATE_STATE", str(root / "watchdog-restart-rate.json"))
+    monkeypatch.setenv("ORCH_CRASH_LOOP_QUEUE_DIR", str(root / "escalations"))
+    monkeypatch.setenv("ORCH_LIVENESS_RESTART_CLOCK_DIR", str(root / "liveness-restart"))
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(root / "no-such-uv"))
+
+
+def _healthy_restart_status(_unit: str) -> crash_loop.UnitRestartStatus:
+    """main()'s NRestarts/Result reader for tests about something else: no systemd, healthy."""
+    return crash_loop.UnitRestartStatus(n_restarts=0, result="success")
 
 
 def _neutralize_fleet_clock_gates(
@@ -757,7 +789,7 @@ def test_main_restarts_only_failed_probe(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"Expected only df unit restarted, got: {restarted}"
@@ -788,7 +820,7 @@ def test_main_logs_each_action(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(log_messages) >= 1, "Expected at least one log() call for the restarted unit"
     # At least one message must mention the unit being restarted
@@ -827,7 +859,7 @@ def test_main_isolates_per_unit_failure(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "log", fake_log)
 
     # Must not raise
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert "orchestrator-reify.service" in restarted, (
         "reify unit must still be processed even if df probe raised"
@@ -859,7 +891,7 @@ def test_main_skips_probe_in_grace_window(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert probed == [], (
         f"probe_port must not be called inside the grace window; was called for ports: {probed}"
@@ -895,7 +927,7 @@ def test_main_probes_after_grace_window(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(probed) == len(wdog.WATCHED), (
         f"All watched ports must be probed when outside grace window; probed: {probed}"
@@ -934,7 +966,7 @@ def test_main_grace_window_skipped_when_elapsed_is_none(
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(probed) == len(wdog.WATCHED), (
         f"When elapsed is None, all watched ports must be probed; probed: {probed}"
@@ -1045,7 +1077,7 @@ def test_main_skips_disabled_unit_entirely(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     # df is disabled → skipped (port 8102 never probed)
     assert 8102 not in probed, (
@@ -1182,7 +1214,7 @@ def test_main_revives_dead_enabled_unit_whose_port_still_listens(
     wdog = _load_watchdog()
     restarted = _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: dead_state)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [u for _p, u in wdog.WATCHED], (
         f"every enabled unit reporting ActiveState={dead_state!r} while its port "
@@ -1211,7 +1243,7 @@ def test_main_does_not_revive_a_unit_in_a_transitional_active_state(
         wdog, monkeypatch, active_state=lambda _u: transitional_state
     )
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], (
         f"ActiveState={transitional_state!r} while the port listens must not "
@@ -1242,7 +1274,7 @@ def test_main_does_not_query_active_state_when_the_port_is_down(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], f"the down-port unit must still be revived; got {restarted}"
     assert queried == [], (
@@ -1261,7 +1293,7 @@ def test_main_log_line_names_the_active_state_signal(monkeypatch: pytest.MonkeyP
     _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: "failed")
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     restart_lines = [m for m in logged if "restarting" in m]
     assert restart_lines, f"expected at least one 'restarting' log line: {logged}"
@@ -1287,11 +1319,534 @@ def test_main_port_down_log_line_is_unchanged(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: None)
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert (
         f"{_DF_UNIT} escalation port {_DF_PORT} not listening; restarting" in logged
     ), logged
+
+
+# ---------------------------------------------------------------------------
+# main() crash-loop detector (task 8270)
+#
+# main() samples every WATCHED unit's NRestarts/Result before any liveness
+# gate, so the startup grace window that blinded the watchdog to the
+# 2026-10-26 loop cannot hide a crash loop, and a disabled unit is still
+# sampled. The detector itself is tested in
+# tests/scripts/test_watchdog_crash_loop.py; these pin its wiring into main().
+# ---------------------------------------------------------------------------
+
+_SHOW_RESTARTS_ARGV_TAIL = "--property=NRestarts,Result"
+
+
+def _restart_rate_state() -> dict:
+    return json.loads(pathlib.Path(os.environ["ORCH_RESTART_RATE_STATE"]).read_text())
+
+
+def _fake_show(stdout: str = "", returncode: int = 0, raises: BaseException | None = None):
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+    return fake_run, calls
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["Result=start-limit-hit\nNRestarts=7\n", "NRestarts=7\nResult=start-limit-hit\n"],
+)
+def test_unit_restart_status_parses_by_key_in_either_order(
+    monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    """systemd prints Result before NRestarts whatever the --property order."""
+    wdog = _load_watchdog()
+    fake_run, calls = _fake_show(stdout)
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+
+    status = wdog._unit_restart_status(_DF_UNIT)
+
+    assert status == wdog.UnitRestartStatus(n_restarts=7, result="start-limit-hit")
+    assert calls == [["systemctl", "--user", "show", _DF_UNIT, _SHOW_RESTARTS_ARGV_TAIL]]
+
+
+@pytest.mark.parametrize(
+    ("fake", "expected"),
+    [
+        (_fake_show("Result=success\nNRestarts=3\n", returncode=1)[0], (None, None)),
+        (_fake_show(raises=FileNotFoundError("systemctl"))[0], (None, None)),
+        (
+            _fake_show(raises=subprocess.TimeoutExpired(["systemctl"], 5))[0],
+            (None, None),
+        ),
+        (_fake_show("Result=success\nNRestarts=lots\n")[0], (None, "success")),
+        (_fake_show("Result=\nNRestarts=4\n")[0], (4, None)),
+    ],
+    ids=["nonzero-rc", "no-systemctl", "timeout", "bad-nrestarts", "empty-result"],
+)
+def test_unit_restart_status_fails_soft(
+    monkeypatch: pytest.MonkeyPatch, fake, expected: tuple[int | None, str | None]
+) -> None:
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog.subprocess, "run", fake)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    status = wdog._unit_restart_status(_DF_UNIT)
+
+    assert (status.n_restarts, status.result) == expected
+
+
+def _recording_restart_status_reader():
+    """A healthy main() reader that records each unit it is asked about; return (reads, reader)."""
+    reads: list[str] = []
+
+    def reader(unit: str) -> crash_loop.UnitRestartStatus:
+        reads.append(unit)
+        return _healthy_restart_status(unit)
+
+    return reads, reader
+
+
+def test_main_samples_every_unit_inside_the_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wdog = _load_watchdog()
+    reads, reader = _recording_restart_status_reader()
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: pytest.fail("inside grace"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main(read_status=reader)
+
+    units = [u for _p, u in wdog.WATCHED]
+    assert reads == units
+    state = _restart_rate_state()
+    assert {u: len(state[u]["samples"]) for u in units} == dict.fromkeys(units, 1)
+
+
+def test_main_samples_a_disabled_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    wdog = _load_watchdog()
+    reads, reader = _recording_restart_status_reader()
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: pytest.fail("disabled"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main(read_status=reader)
+
+    assert reads == [u for _p, u in wdog.WATCHED]
+
+
+def test_main_pages_a_restart_burst_once_per_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    uv, record = write_fake_uv(tmp_path)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+    state_path = pathlib.Path(os.environ["ORCH_RESTART_RATE_STATE"])
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({_DF_UNIT: {"samples": [[int(time.time()) - 600, 0]]}})
+    )
+    _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: "active")
+    burst = wdog.UnitRestartStatus(n_restarts=5, result="success")
+    healthy = wdog.UnitRestartStatus(n_restarts=0, result="success")
+    def read_status(unit: str) -> crash_loop.UnitRestartStatus:
+        return burst if unit == _DF_UNIT else healthy
+
+    wdog.main(read_status=read_status)
+
+    calls = recorded_argvs(record)
+    assert len(calls) == 1
+    assert argv_flag(calls[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
+    assert argv_flag(calls[0], "--severity") == "critical"
+
+    wdog.main(read_status=read_status)
+
+    assert len(recorded_argvs(record)) == 1
+
+
+# ---------------------------------------------------------------------------
+# start-limit-hit is honoured (task 8270)
+#
+# A unit systemd gave up on (Result=start-limit-hit) is left down for a human
+# with its crash-loop page open: main() runs neither reset-failed nor restart
+# on it, whichever dead signal fired. Every other Result still revives.
+# ---------------------------------------------------------------------------
+
+_MUTATING_SYSTEMCTL_VERBS = frozenset({"reset-failed", "restart", "start", "stop"})
+
+
+def _wire_start_limit(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    *,
+    result: str,
+    port_up: bool,
+    active_state: str = "active",
+    now: float | None = None,
+) -> tuple[list[list[str]], list[str], str]:
+    """Drive main() for the df unit alone through a recording subprocess.run.
+
+    Returns (every argv run, every log line, the uv path the page runs).
+    restart_unit is left REAL, so a revive shows up as systemctl argv. *now*
+    defaults to the start of a SKIP_LOG_INTERVAL_SECS emit slot.
+    """
+    tick = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 if now is None else now
+    monkeypatch.setattr(wdog.time, "time", lambda: tick)
+    uv = str(tmp_path / "fake-uv")
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", uv)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        stdout = ""
+        if _SHOW_RESTARTS_ARGV_TAIL in argv:
+            stdout = f"Result={result}\nNRestarts=10\n"
+        elif "ActiveState" in argv:
+            stdout = f"{active_state}\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "WATCHED", [(_DF_PORT, _DF_UNIT)])
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: port_up)
+    monkeypatch.setattr(wdog, "log", logged.append)
+    return calls, logged, uv
+
+
+def _systemctl_mutations(calls: list[list[str]]) -> list[list[str]]:
+    return [
+        argv
+        for argv in calls
+        if argv[:1] == ["systemctl"] and _MUTATING_SYSTEMCTL_VERBS & set(argv)
+    ]
+
+
+def _pages(calls: list[list[str]], uv: str) -> list[list[str]]:
+    return [argv for argv in calls if argv[:1] == [uv]]
+
+
+def test_main_leaves_a_start_limit_hit_unit_down_and_pages_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    calls, logged, uv = _wire_start_limit(
+        wdog, monkeypatch, tmp_path, result="start-limit-hit", port_up=False
+    )
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    pages = _pages(calls, uv)
+    assert len(pages) == 1
+    assert argv_flag(pages[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
+    assert any(_DF_UNIT in m and "leaving it down" in m for m in logged), logged
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    assert len(_pages(calls, uv)) == 1
+
+
+def test_the_start_limit_hit_hold_line_is_journalled_only_in_the_skip_log_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A unit can sit in start-limit-hit for days; one line per 60s tick would flood the journal."""
+    wdog = _load_watchdog()
+    calls, logged, _uv = _wire_start_limit(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        result="start-limit-hit",
+        port_up=False,
+        now=wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    assert not any("leaving it down" in m for m in logged), logged
+
+
+def test_main_does_not_revive_a_start_limit_hit_unit_whose_socket_still_listens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_start_limit(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        result="start-limit-hit",
+        port_up=True,
+        active_state="failed",
+    )
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda _u: pytest.fail("start-limit-hit must hold the revive")
+    )
+
+    wdog.main()
+
+
+def test_main_still_revives_a_unit_that_failed_with_any_other_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_start_limit(wdog, monkeypatch, tmp_path, result="exit-code", port_up=False)
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "restart_unit", restarted.append)
+
+    wdog.main()
+
+    assert restarted == [_DF_UNIT]
+
+
+# ---------------------------------------------------------------------------
+# per-unit liveness revive min-interval (task 8270)
+#
+# A liveness revive is capped to one per ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS
+# per unit, on a per-unit clock that is its own family: no deploy clock gates
+# it and it stamps none. Both dead signals share the one cap. The autouse
+# _isolate_crash_loop_state fixture puts the clock dir under tmp_path.
+# ---------------------------------------------------------------------------
+
+_CAP_T = 1_900_000_000.0
+_REIFY_PORT, _REIFY_UNIT = 8100, "orchestrator-reify.service"
+
+
+def _wire_revive_cap(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    *,
+    down_ports: set[int],
+    active_state: str = "active",
+    watched: list[tuple[int, str]] | None = None,
+) -> tuple[list[str], list[str], dict[str, float]]:
+    """Drive main() on a settable clock; return (restarted, logged, clock).
+
+    *down_ports* and clock["now"] may be changed between ticks.
+    """
+    restarted: list[str] = []
+    logged: list[str] = []
+    clock = {"now": _CAP_T}
+    monkeypatch.setattr(wdog, "WATCHED", watched or [(_DF_PORT, _DF_UNIT)])
+    monkeypatch.setattr(wdog.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "no-lease.json"))
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: port not in down_ports)
+    monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: active_state)
+    monkeypatch.setattr(wdog, "restart_unit", restarted.append)
+    monkeypatch.setattr(wdog, "log", logged.append)
+    return restarted, logged, clock
+
+
+def _revive_clock_file(unit: str) -> pathlib.Path:
+    return pathlib.Path(os.environ["ORCH_LIVENESS_RESTART_CLOCK_DIR"]) / f"{unit}.json"
+
+
+def test_liveness_revive_is_capped_to_one_per_interval_per_unit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    fleet_clock = tmp_path / "fleet-clock.json"
+    fleet_body = json.dumps({"ts": _CAP_T - 3600, "iso": "sentinel"})
+    fleet_clock.write_text(fleet_body)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(fleet_clock))
+    restarted, logged, clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+    clock["now"] = _CAP_T + 600
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT]
+    capped = [m for m in logged if _DF_UNIT in m and "capped" in m]
+    assert capped, logged
+    assert "900s" in capped[-1]
+    assert "300s remain" in capped[-1]
+
+    clock["now"] = _CAP_T + 901
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT, _DF_UNIT]
+    assert fleet_clock.read_text() == fleet_body
+
+
+def test_liveness_revive_cap_is_per_unit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    down: set[int] = {_DF_PORT}
+    restarted, _logged, clock = _wire_revive_cap(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        down_ports=down,
+        watched=[(_DF_PORT, _DF_UNIT), (_REIFY_PORT, _REIFY_UNIT)],
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+    down.add(_REIFY_PORT)
+    clock["now"] = _CAP_T + 60
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT, _REIFY_UNIT]
+
+
+def test_liveness_revive_cap_is_shared_by_both_dead_signals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    down: set[int] = set()
+    restarted, _logged, clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports=down, active_state="failed"
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+    assert restarted == [_DF_UNIT]
+    assert _revive_clock_file(_DF_UNIT).exists()
+
+    clock["now"] = _CAP_T + 60
+    wdog.main(read_status=_healthy_restart_status)
+    down.add(_DF_PORT)
+    clock["now"] = _CAP_T + 120
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT]
+
+
+def test_liveness_revive_cap_is_armed_even_when_the_restart_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _restarted, logged, clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
+    )
+    attempts: list[str] = []
+
+    def raising_restart(unit: str) -> None:
+        attempts.append(unit)
+        raise OSError("systemctl exploded")
+
+    monkeypatch.setattr(wdog, "restart_unit", raising_restart)
+
+    wdog.main(read_status=_healthy_restart_status)
+    clock["now"] = _CAP_T + 60
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert attempts == [_DF_UNIT]
+    assert any("watchdog error" in m and "systemctl exploded" in m for m in logged), logged
+
+
+def test_an_unarmable_revive_cap_is_logged_loudly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("ORCH_LIVENESS_RESTART_CLOCK_DIR", str(blocker / "liveness-restart"))
+    wdog = _load_watchdog()
+    restarted, logged, _clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT]
+    assert any(_DF_UNIT in m and "could NOT be armed" in m for m in logged), logged
+
+
+def test_liveness_revive_clock_is_a_per_unit_stamp_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_revive_cap(wdog, monkeypatch, tmp_path, down_ports={_DF_PORT})
+
+    wdog.main(read_status=_healthy_restart_status)
+
+    body = json.loads(_revive_clock_file(_DF_UNIT).read_text())
+    assert body["ts"] == int(_CAP_T)
+    assert isinstance(body["iso"], str)
+    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [(None, 900), ("60", 60), ("15m", 900), ("0", 0)]
+)
+def test_liveness_revive_min_interval_knob(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: int
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS", raising=False)
+    else:
+        monkeypatch.setenv("ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS", raw)
+    interval = _load_watchdog().ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS
+    assert interval == expected
+
+
+def test_a_zero_revive_min_interval_disables_the_cap_without_reading_a_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    monkeypatch.setenv("ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS", "0")
+    wdog = _load_watchdog()
+    restarted, _logged, clock = _wire_revive_cap(
+        wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
+    )
+    monkeypatch.setattr(
+        wdog, "read_clock_epoch", lambda *_a: pytest.fail("a disabled cap reads no clock")
+    )
+
+    wdog.main(read_status=_healthy_restart_status)
+    clock["now"] = _CAP_T + 1
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert restarted == [_DF_UNIT, _DF_UNIT]
+
+
+def test_liveness_revive_clock_dir_is_its_own_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No other watchdog state file sits where a unit's revive clock is written (I5).
+
+    Compared at their defaults: the session redirects the deploy clocks to tmp
+    paths, which would make the comparison vacuous.
+    """
+    for var in (
+        "ORCH_LIVENESS_RESTART_CLOCK_DIR",
+        "ORCH_RESTART_RATE_STATE",
+        "ORCH_FLEET_DEPLOY_CLOCK",
+        "ORCH_FLEET_LEASE",
+        "FM_DEPLOY_CLOCK",
+        "FM_LIVENESS_RESTART_CLOCK",
+        "FM_LIVENESS_STREAK",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    wdog = _load_watchdog()
+
+    clock_dir = wdog.ORCH_LIVENESS_RESTART_CLOCK_DIR
+    assert clock_dir == os.path.join(wdog.REPO_DIR, "data", "orchestrator", "liveness-restart")
+    revive_clocks = {
+        wdog._orch_liveness_restart_clock_path(unit) for _port, unit in wdog.WATCHED
+    }
+    assert len(revive_clocks) == len(wdog.WATCHED)
+    assert revive_clocks.isdisjoint(
+        {
+            wdog.FLEET_DEPLOY_CLOCK_PATH,
+            wdog.FLEET_LEASE_PATH,
+            wdog.FM_DEPLOY_CLOCK_PATH,
+            wdog.FM_LIVENESS_RESTART_CLOCK_PATH,
+            wdog.FM_LIVENESS_STREAK_PATH,
+            crash_loop.restart_rate_state_path(wdog.REPO_DIR),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3266,7 +3821,7 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
 
     main() still restarts a port-down unit via restart_unit even when
     _within_fleet_deploy_min_interval() would report True (inside the 8h
-    fleet-deploy window) — liveness is uncapped, non-clock-gated, and
+    fleet-deploy window) — liveness is not deploy-clock-gated and
     non-stamping; brokenness is not a scheduled deploy.
     """
     wdog = _load_watchdog()
@@ -3283,7 +3838,7 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"main() must still restart a port-down unit even when the fleet-deploy "
@@ -3330,7 +3885,7 @@ def test_main_liveness_unaffected_by_fleet_redeploy_lease_for_other_units(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"a live lease that names no unit yet must suppress liveness for NO "
@@ -4117,6 +4672,68 @@ def test_report_extended_columns_stay_read_only(
     assert clock_file.read_text() == clock_payload, (
         "report() must never write the shared fleet-deploy clock file"
     )
+
+
+# ---------------------------------------------------------------------------
+# RESTARTS column (task 8270)
+#
+# NRestarts/Result per running unit, one whitespace-free token immediately
+# left of VERDICT, so the whitespace-positional readers above keep their
+# indices (tokens[-4:] is still VERDICT/DEPLOY-AGE/MERGE-IDLE/WOULD-DEFER).
+# ---------------------------------------------------------------------------
+
+
+def test_report_restarts_column_sits_left_of_verdict_and_stays_read_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wdog = _load_watchdog()
+    commit_epoch = 1_800_000_000
+    looping = synthetic_unit("restarts-looping")
+    stuck = synthetic_unit("restarts-stuck")
+    unreadable = synthetic_unit("restarts-unreadable")
+    restart_answers = {
+        looping: "Result=success\nNRestarts=3\n",
+        stuck: "Result=start-limit-hit\nNRestarts=10\n",
+    }
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(
+                f"{u} loaded active running desc\n" for u in (looping, stuck, unreadable)
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"] and _SHOW_RESTARTS_ARGV_TAIL in cmd:
+            unit = cmd[3]
+            if unit not in restart_answers:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such unit")
+            return subprocess.CompletedProcess(cmd, 0, stdout=restart_answers[unit], stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{commit_epoch + 100}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = wdog.report()
+
+    assert exit_code == 0, "staleness alone decides the exit code"
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.startswith("UNIT"))
+    assert "RESTARTS" in header
+    assert header.index("RESTARTS") < header.index("VERDICT")
+    rows = {line.split()[0]: line.split() for line in lines if line.split()[:1]}
+    expected = {looping: "3/success", stuck: "10/start-limit-hit", unreadable: "?/?"}
+    for unit, restarts in expected.items():
+        tokens = rows[unit]
+        assert tokens[-4] == "fresh", tokens
+        assert tokens[-5] == restarts, tokens
+    systemctl_verbs = {c[2] for c in recorded_calls if c[:1] == ["systemctl"]}
+    assert systemctl_verbs <= {"list-units", "show"}, systemctl_verbs
 
 
 # ---------------------------------------------------------------------------
@@ -5348,7 +5965,7 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
     """Scenario 7 (I5) -- liveness during the 8h window, non-stamping: with
     a REAL on-disk fleet-deploy clock dated ~1h ago (inside the window,
     sentinel {ts, iso}), main() still immediately revives a port-down unit
-    (liveness is uncapped and not clock-gated) AND the clock file is left
+    (liveness is not deploy-clock-gated) AND the clock file is left
     byte-identical afterward -- a single wedged-unit revive must never
     advance the fleet-wide deploy clock. Extends
     test_main_liveness_unaffected_by_fleet_deploy_gate above (which
@@ -5376,7 +5993,7 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"main() must immediately revive a port-down unit even inside the "
@@ -11457,7 +12074,7 @@ def test_staleness_pass_still_delegates_exactly_once_when_nothing_changes(
 # code=killed status=9/KILL.
 #
 # The suppression is scoped to the lease's current_unit and NOTHING else. I5 —
-# liveness stays uncapped, non-clock-gated and non-stamping, because brokenness
+# liveness stays not deploy-clock-gated and non-stamping, because brokenness
 # is not a scheduled deploy — must survive for every other unit. A blanket
 # liveness disable during a sweep is explicitly forbidden.
 #
@@ -11509,7 +12126,7 @@ def test_main_skips_the_liveness_restart_of_the_unit_the_sweep_is_restarting(
     logged: list[str] = []
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], (
         f"a unit the in-flight sweep is restarting must not also be restarted "
@@ -11544,7 +12161,7 @@ def test_main_still_restarts_a_different_unit_while_a_sweep_holds_the_lease(
     )
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], (
         f"liveness must stay intact for every unit the sweep is not touching; "
@@ -11570,7 +12187,7 @@ def test_main_restarts_the_unit_when_the_lease_is_not_live(
     _write_lease(wdog, monkeypatch, tmp_path, body)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], (
         f"a {why} lease must not suppress a liveness restart; got {restarted}"
@@ -11586,7 +12203,7 @@ def test_main_liveness_is_byte_identical_when_no_lease_file_exists(
     monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], f"no lease means no suppression; got {restarted}"
 
@@ -11611,7 +12228,7 @@ def test_main_does_not_read_the_lease_when_every_probe_is_up(
     monkeypatch.setattr(wdog, "_live_fleet_lease", _counting_read)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], "sanity: no probe failed, so nothing may restart"
     assert reads == [], (

@@ -57,7 +57,7 @@ see drift between. This file now imports ``min_budget``,
 ``FAMILY_PUBLISHER_PATHS``, ``FAMILY_READER_PATH`` and ``published_pairs`` from
 ``module_budget_family`` — a non-test sibling, on the ``setup_host_sections`` /
 ``systemd_unit_invariants`` precedent already established in this directory —
-reads ``BudgetCensus`` and ``ORCHESTRATOR_BUDGET_CENSUS`` from the non-test
+reads ``RULED_BUDGET_CENSUS`` and ``ORCHESTRATOR_BUDGET_CENSUS`` from the non-test
 ``verify_budget_census_records`` (task 6172), and takes its setup from the
 ``root_config`` / ``discover_module_configs`` / ``executed_for_touched``
 fixtures in ``tests/scripts/conftest.py``. Every guard in the family still
@@ -114,6 +114,7 @@ from collections.abc import Callable
 import pytest
 import verify_budget_census_records as census_records
 import yaml
+from git_listing import listed_files
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
     FAMILY_READER_PATH,
@@ -122,8 +123,16 @@ from module_budget_family import (
     published_pairs,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_plan import FileKind, classify_file
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    is_whole_tree_guard_module,
+    min_leg_budget_for_family,
+)
 
 from orchestrator import verify
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -391,15 +400,6 @@ RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
 CENSUS_FLOOR_REFUSAL_CEILING = 7200
 
 
-# Keyed by prefix, like every other justification dict here, so the
-# parametrized branch below stays total rather than special-casing one name.
-# Each record is IMPORTED from tests/scripts/verify_budget_census_records.py,
-# its single home, which test_fallback_verify_config.py reads too.
-RULED_BUDGET_CENSUS: dict[str, census_records.BudgetCensus] = {
-    'orchestrator': census_records.ORCHESTRATOR_BUDGET_CENSUS,
-}
-
-
 # RULED_COLD_BUDGET_DECLARATIONS: keyed by prefix so the justification lives at
 # the definition site, exactly like RULED_INTERIM_BUDGET_EXCEPTIONS above and
 # MODULE_BUDGET_EXCLUSIONS below. A module listed here DECLARES its own
@@ -605,7 +605,7 @@ def test_module_carries_its_own_measured_verify_budget(
         # something. root_warm is operator-tunable and currently sits ON this
         # module's ruled figure; the floor that actually holds the budget up
         # is the measurement assertion below, not this one.
-        census = RULED_BUDGET_CENSUS[prefix]
+        census = census_records.RULED_BUDGET_CENSUS[prefix]
 
         # (4) THE WINDOW IS REGIME-SCOPED. Asserted BEFORE the derivation it
         # feeds, because a straddling window makes every figure below describe
@@ -1770,19 +1770,40 @@ def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
 
 
 def test_the_ruled_census_is_the_shared_record_the_fleet_table_reads() -> None:
-    """The excepted branch reads the ONE census record, not a local copy of it.
+    """The ruled table's entry IS the record the fleet table reads, not a re-literalised copy.
 
-    Task 6172. ``RULED_BUDGET_CENSUS`` and
+    Task 6172. ``verify_budget_census_records.py::RULED_BUDGET_CENSUS`` and
     ``test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS`` both consume
-    task 3353's orchestrator census. Asserted by IDENTITY rather than equality:
-    a re-introduced local copy carrying equal values today is exactly the drift
+    task 3353's orchestrator census through ``ORCHESTRATOR_BUDGET_CENSUS``.
+    Asserted by IDENTITY rather than equality: a second ``BudgetCensus(...)``
+    literal inside the table, carrying equal values today, is exactly the drift
     a single home exists to prevent, and equality would pass it.
     """
-    assert RULED_BUDGET_CENSUS['orchestrator'] is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
-        "RULED_BUDGET_CENSUS['orchestrator'] is not the record at "
+    ruled = census_records.RULED_BUDGET_CENSUS['orchestrator']
+    assert ruled is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
+        "tests/scripts/verify_budget_census_records.py::RULED_BUDGET_CENSUS"
+        "['orchestrator'] is not the record at "
         'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS '
         '(task 6172). That record is the single home the fleet table also reads; '
-        'import it, never copy it'
+        'reference it, never copy it'
+    )
+
+
+def test_the_ruled_census_table_and_the_ruled_exceptions_name_the_same_modules() -> None:
+    """The census report and this gate pick the D17 modules from one key set.
+
+    Task 7929.
+    """
+    census_keys = set(census_records.RULED_BUDGET_CENSUS)
+    exception_keys = set(RULED_INTERIM_BUDGET_EXCEPTIONS)
+    assert census_keys == exception_keys, (
+        'tests/scripts/verify_budget_census_records.py::RULED_BUDGET_CENSUS and '
+        'tests/scripts/test_module_verify_budgets.py::RULED_INTERIM_BUDGET_EXCEPTIONS '
+        f'name different modules: {sorted(census_keys ^ exception_keys)} (task 7929). '
+        'scripts/verify_budget_census.py decides which modules get the D17 census '
+        'floor from RULED_BUDGET_CENSUS, while this gate branches on '
+        'RULED_INTERIM_BUDGET_EXCEPTIONS, so the census report would state one '
+        'floor while the gate enforces another'
     )
 
 
@@ -1864,3 +1885,72 @@ class TestCensusBudgetFloor:
         import module_budget_family as family  # noqa: PLC0415
 
         assert family.HELPER_NAME == 'min_budget'
+
+
+FAMILY_RUNNING_LEGS_FLOOR = frozenset(
+    {'orchestrator', 'fused-memory', 'shared', 'scripts', 'tests/scripts'},
+)
+
+
+def _source_or_none(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _leg_tree_holds_a_member(prefix: str) -> bool:
+    return any(
+        classify_file(path.as_posix(), None) is FileKind.COLLECTABLE_TEST
+        and is_whole_tree_guard_module(_source_or_none(path))
+        for path in listed_files(REPO_ROOT, f'{prefix}/*.py')
+    )
+
+
+def test_every_leg_running_the_family_outlasts_its_ceiling(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """A whole-tree guard member's per-test ceiling must be able to fire before verify kills its leg.
+
+    A leg whose tracked tree holds a collectable member must budget at least
+    ``min_leg_budget_for_family(W)``, whichever run collects the member (task-role family
+    or merge-gate suite), W being its recorded worst green run: a hang starting as late
+    as W must still reach WHOLE_TREE_SCAN_TEST_TIMEOUT, or it surfaces as a retried,
+    unattributed infra_timeout (task 8402). It lives here because this file alone holds
+    every leg's budget and W.
+    Scope: registered module legs only; the repo-root fallback chain and
+    merge_gate_history_test_command are not checked (task 9396).
+    """
+    published = published_pairs()
+    family_running: set[str] = set()
+    failures: list[str] = []
+    for prefix, module_config in sorted(discover_module_configs().items()):
+        if not _leg_tree_holds_a_member(prefix):
+            continue
+        family_running.add(prefix)
+        budget = module_config.verify_command_timeout_secs
+        worst = MEASURED_MODULE_SUITE_WORST_SECS.get(prefix)
+        if worst is None and prefix in published:
+            worst = published[prefix].worst
+        floor = None if worst is None else min_leg_budget_for_family(worst)
+        if budget is None or floor is None or budget < floor:
+            failures.append(
+                f'{prefix}: verify_command_timeout_secs={budget}, W={worst}, '
+                f'WHOLE_TREE_SCAN_TEST_TIMEOUT={WHOLE_TREE_SCAN_TEST_TIMEOUT}, '
+                f'min_leg_budget_for_family(W)={floor}'
+            )
+
+    missing = FAMILY_RUNNING_LEGS_FLOOR - family_running
+    assert not missing, (
+        f'no whole-tree guard member found under {sorted(missing)}: the family scan '
+        f'has regressed, and the budget check below would pass vacuously. '
+        f'Family-running legs found: {sorted(family_running)}'
+    )
+    assert not failures, (
+        'every leg running a whole-tree guard family member must budget at least '
+        'min_leg_budget_for_family(W), so the per-test ceiling fires before verify '
+        'kills the leg. Raise the leg budget to the derived floor; never lower the '
+        'ceiling, whose floor is '
+        'orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.\n'
+        + '\n'.join(failures)
+    )

@@ -18,7 +18,7 @@ from _git_fixtures import seed_repo
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps
+from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps, render_citation_pattern
 from orchestrator.merge_lane.gates import (
     ALREADY_LANDED_CITATION_PATTERN,
     resolve_already_landed_branch,
@@ -27,7 +27,8 @@ from orchestrator.merge_lane.gates import (
 
 def _matches(template: str, subject: str, tid: str) -> bool:
     """Apply *template* to one SUBJECT the way ``find_task_citation_commit`` does."""
-    return re.compile(template.format(tid=re.escape(tid))).search(subject) is not None
+    rendered = render_citation_pattern(template, tid, branch_prefix='task/', main_branch='main')
+    return re.compile(rendered).search(subject) is not None
 
 
 def _attributes(subject: str, tid: str) -> bool:

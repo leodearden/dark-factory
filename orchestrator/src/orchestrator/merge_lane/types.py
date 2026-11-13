@@ -29,7 +29,7 @@ from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
-from orchestrator.merge_lane.reverify_gate_decision import GateClearance
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
@@ -1342,6 +1342,9 @@ class RealMergeItem:
     # rebuild that re-anchors base_sha (gate rebase, CAS retry) passes None, so
     # the anchor never outlives the base it describes.
     remerge_base: RemergeBase | None = None
+    # The commit a gate-rebased head supersedes, set only by
+    # rebased_head.py::rebased_head_item (plans/merge-lane-policy-prd.md D3).
+    gate_rebase_of: str | None = None
 
 
 @dataclass
@@ -1630,11 +1633,11 @@ _NON_TERMINAL_OUTCOMES: frozenset[OutcomeKind] = frozenset({
 ``plan_files_narrowed``: a mid-submission waypoint — enqueue / ``merge_queued``
 follows in the same flow.
 
-FROZEN CONTRACT: ``scripts/merge_lane_throughput.py::_NON_TERMINAL_OUTCOMES``
-mirrors this exact set as literal strings and does not import this module, so
-nothing fails on its side if this set changes. Changing this set REQUIRES
-updating that mirror in the same change — the pinning test is
-``orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
+FROZEN CONTRACT: ``scripts/merge_lane_throughput.py::NON_TERMINAL_OUTCOMES``
+mirrors this exact set as literal strings, since scripts/ cannot import this
+module. ``orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``
+pins this set and fails if that mirror drifts from it, so change both in the
+same commit.
 """
 
 
@@ -1830,15 +1833,18 @@ class LandingCandidate:
 
 @dataclass(frozen=True)
 class PendingGate:
-    """A head's gate re-verify of its rebased tree, running while the head
-    stays parked at the front of ``_inflight`` (task 6155).
+    """A head's gate on its rebased tree, running while the head stays
+    parked at the front of ``_inflight`` (task 6155).
 
-    ``candidate`` is what the CAS was landing when it rebased; ``rebased_sha``
-    onto ``rebased_onto`` is what the gate is re-verifying.  ``started_at``
-    is when the gate was parked, on the worker clock's wall ``now()`` scale.
+    The gate decides, and runs at most a history leg; a full re-verify comes
+    back as a ``ReverifyDispatch``, and the head is then dispatched as its
+    rebased commit (task 8525).  ``candidate`` is what the CAS was landing
+    when it rebased; ``rebased_sha`` onto ``rebased_onto`` is what the gate
+    judges.  ``started_at`` is when the gate was parked, on the worker
+    clock's wall ``now()`` scale.
     """
 
-    task: asyncio.Task[MergeOutcome | GateClearance]
+    task: asyncio.Task[MergeOutcome | GateClearance | ReverifyDispatch]
     candidate: LandingCandidate
     rebased_sha: str
     rebased_onto: str
@@ -1853,7 +1859,8 @@ class LeaseActivity(StrEnum):
     live ssh dispatch while its verify task still runs on THIS host, either
     before the dispatch claims its request (the main-mirror push, which can
     hang on an ssh connect) or after it returned (task 2822's cross-check, a
-    task-6155 gate re-verify); the runner does not tell the two apart.
+    task-6155 parked gate, which runs nothing remote since task 8525); the
+    runner does not tell the two apart.
     FINISHED holds the lease until finalize with nothing left to run.
     """
 
@@ -2003,9 +2010,10 @@ class InflightEntry:
                      through :class:`InflightEntrySlot` (task 5447).  ``None``
                      until resolved, and always ``None`` for passthroughs.
     gate           : the :class:`PendingGate` this head is parked on while its
-                     rebased tree re-verifies, or ``None`` (task 6155).  While
+                     rebased tree is judged, or ``None`` (task 6155).  While
                      it is set the entry keeps its lease and permit, and the
-                     next ``_finalize_inflight`` call resumes the CAS from it.
+                     next ``_finalize_inflight`` call resumes the CAS from it,
+                     or dispatches the rebased head (task 8525).
     verify_base_divergence: the :class:`VerifyBaseDivergence` recorded when
                      this entry's verify was dispatched off the frozen tip, or
                      ``None`` (task 5302).

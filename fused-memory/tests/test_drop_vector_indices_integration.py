@@ -37,8 +37,9 @@ barriers, load-bearing rather than defensive.
 The window itself is UNCHANGED, and ``TestDropRebuildWindow`` below still pins
 it; what task 4777 changed is that production no longer walks into it.
 ``fused_memory/backends/graphiti_client.py::GraphitiBackend.drop_vector_indices``
-now reads the catalog through ``GraphitiBackend._await_index_catalog_settled``,
-the production-side barrier, so even a back-to-back second call settles before
+now reads the catalog through
+``fused_memory/backends/falkor_indices.py::await_index_catalog_settled``, the
+production-side barrier, so even a back-to-back second call settles before
 it reads — ``test_a_back_to_back_second_run_settles_without_a_test_side_barrier``
 is the live proof.
 
@@ -266,8 +267,9 @@ class TestDropVectorIndicesLive:
             #   redis.exceptions.ResponseError: Unable to drop index on
             #   :Entity(name_embedding): no such index.
             # As of task 4777, drop_vector_indices() opens with
-            # _await_index_catalog_settled() rather than a bare list_indices(),
-            # so pass 2 settles the catalog for itself before reading it and
+            # falkor_indices.await_index_catalog_settled() rather than a bare
+            # list_indices(), so pass 2 settles the catalog for itself before
+            # reading it and
             # cannot see the stale Entity{name_embedding: ['VECTOR']} row.
             # test_a_back_to_back_second_run_settles_without_a_test_side_barrier
             # below is the test that exercises THAT path, with no test-side

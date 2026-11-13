@@ -70,6 +70,7 @@ from _orch_helpers import (  # noqa: F401
     pydantic_spec,
     wait_responsive,
 )
+from _poll_responsive import poll_responsive
 from _verify_result_doubles import (
     FAIL_OPEN_LOGGERS,
     fail_open_records,
@@ -1524,12 +1525,11 @@ class TestLateArrivalAttaches:
 
             # Poll until B's merge_to_main call appears in the spy (indicates the
             # Merger has dequeued B and merged it — either speculatively or not).
-            deadline = asyncio.get_running_loop().time() + 10.0
-            while (
-                not any(c['branch'] == 'task/late1-b' for c in _merge_calls)
-                and asyncio.get_running_loop().time() < deadline
-            ):
-                await asyncio.sleep(0.05)
+            await poll_responsive(
+                lambda: any(c['branch'] == 'task/late1-b' for c in _merge_calls),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='late1-b: merge_to_main called',
+            )
 
             # ── Assertions while A is still in-flight ─────────────────────────
             b_spy = [c for c in _merge_calls if c['branch'] == 'task/late1-b']

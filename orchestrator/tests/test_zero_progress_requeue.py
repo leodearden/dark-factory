@@ -14,6 +14,7 @@ unresolved incident and auto-resolving when the loop breaks.
 from __future__ import annotations
 
 import pytest
+from _null_task_escalation import submit_null_task_escalation
 from _packaged_defaults import load_packaged_defaults
 
 from orchestrator.workflow import WorkflowOutcome
@@ -962,6 +963,17 @@ class TestInheritZeroProgressAlarms:
         assert _inherit(queue.get_pending(), filed_at=memo) == frozenset()
         assert memo == {}
 
+    def test_a_null_task_id_record_beside_a_real_alarm_is_skipped(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        submit_null_task_escalation(queue)
+        _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset({'3068'})
+        assert memo == {'3068': 0}
+
     def test_a_live_memo_entry_keeps_its_value(self, tmp_path):
         from escalation.queue import EscalationQueue
 
@@ -1416,3 +1428,16 @@ class TestHarnessZeroProgressAlarmSurvivesRestart:
         await restarted._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
 
         assert _alerts(restarted) == []
+
+    async def test_a_null_task_id_record_does_not_stop_the_inheritance(
+        self, wired_harness,
+    ):
+        queue = wired_harness._escalation_queue
+        null_record = submit_null_task_escalation(queue)
+        _file_alarm(queue, '3068')
+        wired_harness._inherit_pending_streak_alarms()
+
+        await wired_harness._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(wired_harness) == []
+        assert _status(queue, null_record.id) == 'pending'

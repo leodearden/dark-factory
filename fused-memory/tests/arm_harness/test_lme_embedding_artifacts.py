@@ -19,6 +19,7 @@ from functools import cache
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.arm_spec import METERED_STACK, EmbeddingArmSpec, load_arm_spec
 from fused_memory.arm_harness.embedding_preregistration import (
@@ -43,6 +44,8 @@ from fused_memory.arm_harness.slate import (
     embedding_control_spec,
     load_embedding_slate,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[3]
 EMBEDDING_RELATIVE = 'plans/local-memory-models-eval-embedding'

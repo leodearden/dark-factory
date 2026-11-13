@@ -11,6 +11,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _clip_assertions import assert_elided
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_git_repos import init_ab_commit_repo, init_merge_history_repo
 from _fm_helpers import (
@@ -48,6 +49,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_CONSOLIDATION_PROPOSALS,
     DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
     DISALLOW_ESCALATION_READS,
+    DISALLOW_ESCALATION_RUNTIME_READS,
     DISALLOW_ESCALATION_WRITES,
     DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
     DISALLOW_MEMORY_WRITES,
@@ -218,12 +220,12 @@ class TestMockTypesConstant:
 #     to — never an arbitrary per-task query, so it answers no existence
 #     question either.
 #   - merge_* (except merge_relane, denied by DISALLOW_ESCALATION_MERGE_LANE_CONTROL) / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
-#     reload_config / get_task_runtime_state — orchestrator control-plane and
-#     merge-lane surface, unrelated to the escalation-record question.
+#     reload_config — orchestrator control-plane and merge-lane surface,
+#     unrelated to the escalation-record question.
 #
 # This is the reviewed-safe half of the classification asserted by
-# test_every_escalation_server_tool_is_classified; the denied half is
-# DISALLOW_ESCALATION_READS plus DISALLOW_ESCALATION_WRITES. Adding a name here is a decision that the tool
+# test_every_escalation_server_tool_is_classified; the denied half is every
+# DISALLOW_ESCALATION_* bucket in that test's map. Adding a name here is a decision that the tool
 # cannot mislead a stage about the reconciliation queue — not a formality.
 _REVIEWED_STAGE_SAFE = {
     # amend_escalation (task 4886) acts on a record the caller already holds
@@ -246,7 +248,6 @@ _REVIEWED_STAGE_SAFE = {
     'mcp__escalation__declare_pin',
     'mcp__escalation__get_merge_halt_status',
     'mcp__escalation__get_merge_queue',
-    'mcp__escalation__get_task_runtime_state',
     'mcp__escalation__halt_merge_queue',
     'mcp__escalation__halt_scheduler',
     'mcp__escalation__merge_cancel',
@@ -534,6 +535,7 @@ class TestDisallowedToolLists:
             registered,
             {
                 'DISALLOW_ESCALATION_READS': DISALLOW_ESCALATION_READS,
+                'DISALLOW_ESCALATION_RUNTIME_READS': DISALLOW_ESCALATION_RUNTIME_READS,
                 'DISALLOW_ESCALATION_WRITES': DISALLOW_ESCALATION_WRITES,
                 'DISALLOW_ESCALATION_MERGE_LANE_CONTROL': DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
                 '_REVIEWED_STAGE_SAFE': _REVIEWED_STAGE_SAFE,
@@ -543,7 +545,11 @@ class TestDisallowedToolLists:
                 '(cli_stage_runner.py) if a stage must not call it — the default for '
                 'anything that READS per-task escalation state, since a stage is wired '
                 'to the reconciliation queue and would read a categorical [] as proof '
-                'of absence — or to DISALLOW_ESCALATION_WRITES if it FILES an '
+                'of absence — or to DISALLOW_ESCALATION_RUNTIME_READS if, with no '
+                'orchestrator harness attached, it answers a silent empty-but-live '
+                'result instead of an error (a runtime read that fails loudly '
+                'standalone, like get_merge_queue, is reviewed-safe) — or to '
+                'DISALLOW_ESCALATION_WRITES if it FILES an '
                 'escalation (denied in Stage 1/3, kept by Stage 2 for FIX D), or to '
                 '_REVIEWED_STAGE_SAFE here once you have confirmed it is harmless '
                 'against that store.'
@@ -5011,16 +5017,13 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ):
             text = _format_flagged(items)
 
-        # The LLM must see SOMETHING about the item — not just a footer
-        assert '… [item truncated]' in text, (
-            f'Expected truncation marker in text; got first 200 chars: {text[:200]!r}'
-        )
+        assert text.startswith('- ')
+        assert_elided(text[len('- '):], json.dumps(items[0]))
         # No "... and N more" footer when there are no additional items to report
         assert '... and ' not in text, (
             f'Unexpected "... and N more" footer for single-item list; text: {text[:200]!r}'
         )
-        # Text must not exceed the budget by more than the marker length
-        assert len(text) <= _FLAGGED_ITEMS_CHAR_BUDGET + len('… [item truncated]') + 10, (
+        assert len(text) <= _FLAGGED_ITEMS_CHAR_BUDGET, (
             f'Text too long: {len(text)} chars; expected ≤ {_FLAGGED_ITEMS_CHAR_BUDGET}'
         )
         # A truncation warning must still be emitted
@@ -5046,9 +5049,8 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ):
             text = _format_flagged(items)
 
-        assert '… [item truncated]' in text, (
-            'Expected truncation marker for oversized first item'
-        )
+        first_line = text.splitlines()[0]
+        assert_elided(first_line[len('- '):], json.dumps(items[0]))
         # The second item was not rendered; the footer should note it
         assert '... and 1 more (truncated: char budget)' in text, (
             f'Expected "... and 1 more" footer; got last 200 chars: {text[-200:]!r}'
@@ -5121,6 +5123,11 @@ class TestFormatFlaggedFirstItemEdgeCase:
         assert rec.total == rec.rendered + rec.dropped, (
             f'total={rec.total} must equal rendered={rec.rendered} + dropped={rec.dropped}'
         )
+
+    def test_budget_too_small_for_the_marker_raises(self):
+        """A budget that cannot hold the counted marker is refused, not rendered as a footer-only body."""
+        with pytest.raises(ValueError, match='elision marker'):
+            _format_flagged([{'description': 'y' * 100}], budget_chars=10)
 
 
 # ---------------------------------------------------------------------------

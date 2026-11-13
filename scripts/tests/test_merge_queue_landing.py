@@ -37,6 +37,9 @@ from merge_queue_fakes import (
     assert_target_checkout_clean,
     deploy_tmpdir_env,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CONFIG = "dark-factory-orchestrator.yaml"
 SEED = "project_root: /nowhere\nknob: 0\n"

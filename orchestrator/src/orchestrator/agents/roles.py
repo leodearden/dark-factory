@@ -407,6 +407,12 @@ _PLAN_DEVIATION_TOOLS = [
     'mcp__plan-tools__' + _RECORD_STEP_DEVIATION,
 ]
 
+# Only the writers whose sessions end at a scope-request boundary
+# (workflow.py::TaskWorkflow._apply_scope_requests) hold this.
+_SCOPE_REQUEST_TOOLS = [
+    'mcp__plan-tools__report_missing_plan_file',
+]
+
 # The writer-facing metadata vocabulary spliced onto the tail of
 # _MEMORY_INSTRUCTIONS (task 3202, PRD docs/prds/memory-metadata-vocabulary.md
 # leaf iota).  Before it, the word `metadata` did not appear anywhere in the
@@ -725,22 +731,29 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
 # (confirmed, detail) NamedTuple, and the caller emits one of two distinct
 # prefixes per probe depending on it, rather than reporting every failure
 # mode (timeout, missing binary, unexpected error) under the single
-# assertive "not found" / "is not on main" wording. So the prefix is now
-# the verdict at BOTH steps and this note can describe it as such.
+# assertive "not found" / "is not on main" wording; task 5274 moved an
+# unreadable checkout (rc=128) onto the honest side too. So the prefix is
+# now the verdict at BOTH steps and this note can describe it as such.
 SERVER_BACKSTOP_NOTE = """\
 The server runs the same checks as a backstop, in this order:
 
-1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first, so an
-   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs.
-   Failure is reported under one of two distinct prefixes:
-     - `commit <x> not found in <project_root>: <detail>` -> rev-parse ran and
-       rejected the ref against this checkout. This is the server's rc=128
-       analogue: usually a stale/unfetched <project_root> or a mistyped SHA,
-       so `git -C <project_root> fetch --all` and re-run before re-deriving.
-     - `commit <x> could not be resolved in <project_root>: <detail>` ->
-       rev-parse never rendered a verdict on the ref (5s timeout, missing git
-       binary, unexpected error). NOT-YET-CONFIRMED, not a bad SHA: fix the
-       checkout and retry.
+1. `git rev-parse --verify --quiet <commit>^{commit}` resolves the SHA first,
+   so an unresolvable or mistyped SHA is rejected HERE, before merge-base ever
+   runs. `--quiet` is what separates the two outcomes below: without it, a
+   rejected ref and an unreadable checkout both exit 128, so reproduce this
+   step with the flag. Failure is reported under one of two distinct prefixes:
+     - `commit <x> not found in <project_root>: <detail>` -> rc=1, the ONLY
+       "not found" verdict: rev-parse ran inside a readable repository and
+       rejected the ref (unknown, not a commit, or an ambiguous short
+       prefix). This is the server's analogue of the ancestry check's rc=128
+       "Not a valid object name": usually a stale/unfetched <project_root> or
+       a mistyped SHA, so `git -C <project_root> fetch --all` and re-run
+       before re-deriving.
+     - `commit <x> could not be resolved in <project_root>: <detail>` -> any
+       other outcome; rev-parse never rendered a verdict on the ref (rc=128
+       for a <project_root> that is not a readable git repository or does
+       not exist, 5s timeout, missing git binary, unexpected error).
+       NOT-YET-CONFIRMED, not a bad SHA: fix the checkout and retry.
 2. `git merge-base --is-ancestor <sha> main` runs only if step 1 resolved. rc=0
    accepts. Failure is likewise reported under one of two distinct prefixes,
    so the prefix itself is the verdict at both steps -- no need to interpret
@@ -758,8 +771,11 @@ The server runs the same checks as a backstop, in this order:
 # The Scope Boundary section shared (in substance) by IMPLEMENTER, DEBUGGER,
 # and SIMPLE_TASK (task 4370): the sandbox enforces WORKTREE containment, not
 # per-file plan scope, so every file inside the worktree is writable and
-# staying within the plan's assigned files is the agent's own responsibility,
-# self-reported via `escalate_blocker(category='scope_violation')`.
+# staying within the plan's assigned files is the agent's own responsibility.
+# IMPLEMENTER/DEBUGGER report a merely incomplete file list with
+# report_missing_plan_file, which workflow.py::TaskWorkflow._apply_scope_requests
+# locks and declares at the session boundary; a design-level scope question
+# is still `escalate_blocker(category='scope_violation')`.
 #
 # Split into a shared factual paragraph (_SCOPE_BOUNDARY_FACTS) plus a
 # role-specific recourse paragraph (task 4370 review, suggestion 3), so the
@@ -802,13 +818,24 @@ not the sandbox's.
 """
 
 
-# IMPLEMENTER/DEBUGGER's recourse: escalate and keep working in this same
-# session. Concatenated onto _SCOPE_BOUNDARY_FACTS below -- never used alone.
+# IMPLEMENTER/DEBUGGER's recourse: report an incomplete file list and keep
+# working, or escalate a design-level scope question. Concatenated onto
+# _SCOPE_BOUNDARY_FACTS below -- never used alone.
 _SCOPE_BOUNDARY_RECOURSE = """
-If you genuinely need to modify files outside your assigned scope, that is
-the ONLY mechanism to request it: call `escalate_blocker` with
-`category='scope_violation'` BEFORE making the edit, rather than widening
-scope on your own.
+When you need to EDIT an existing file the plan's `files` list omits, decide
+which of two cases it is BEFORE making the edit:
+
+1. The list was merely incomplete: the edit belongs to this task. Call
+   `report_missing_plan_file(path, reason)`, then make the edit and carry on —
+   there is no need to stop. When your session ends the orchestrator takes
+   that file's lock and adds it to the plan's `files`. Your next briefing says
+   whether it was granted or is held by another task. If it is held, revert
+   your edits to it, or escalate as in case 2 naming the holding task.
+2. The file is out of scope for a DESIGN reason — it belongs to another
+   owner's module or another PRD. Call `escalate_blocker` with
+   `category='scope_violation'` and the design reason, before editing it.
+
+CREATING a new file needs no report.
 """
 
 
@@ -1007,7 +1034,7 @@ The workflow for each step is:
 - Run tests frequently to verify your work.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
@@ -1050,7 +1077,7 @@ git add -- .
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -2100,19 +2127,10 @@ or expired tickets as a follow-up escalation):
 )
 
 
-# NOTE: the stop-criterion prose below ("no cross-module design, no new abstraction,
-# no substantial architectural thought") mirrors the _COMPLEXITY_RUBRIC constant above
-# (the chokepoint published to all task-creating roles).  Update both in lockstep.
-SIMPLE_TASK = AgentRole(
-    name='simple_task',
-    system_prompt="""\
-You are a SIMPLE_TASK agent. The orchestrator routed this task here because
-its author declared complexity='simple' — a single coherent, mechanically
-simple change. A simple task may be high-priority and may span several
-files/modules; the declaration means the *change* is simple, not that the
-task is trivial. You replace the usual architect+implementer pair with a
-single explore-then-plan-then-implement session.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + """
+# SIMPLE_TASK's workflow and rejection exits; their one home (the briefing points here).
+# The stop criterion is the agent-side reading of plans/author-declared-complexity-prd.md
+# decision 7, as _COMPLEXITY_RUBRIC is the author-side one.
+SIMPLE_TASK_WORKFLOW = """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is
@@ -2120,8 +2138,9 @@ single explore-then-plan-then-implement session.
    substantial architectural thought required. STOP (using a rejection
    artifact below) only if that criterion is not met.
 2. **Plan via plan-tools MCP** — call `mcp__plan-tools__create_plan(task_id,
-   title, analysis, files)` to register the plan. Do NOT write
-   `.task/plan.json` directly.
+   title, analysis, files)` to register the plan, then
+   `mcp__plan-tools__add_plan_step(step_id, step_type, description)` once per
+   step. Do NOT write `.task/plan.json` directly.
    - For doc/comment-only tasks: add a single `impl` step (the architect
      rule that "every behavior gets a test first" does NOT apply when the
      deliverable is documentation prose).
@@ -2167,7 +2186,19 @@ abstraction, or substantial architectural thought, do NOT call `create_plan`
 the criterion is whether the *change* requires design or architectural work.
 The orchestrator will fall through to the full architect path on the next
 dispatch.
+"""
 
+
+SIMPLE_TASK = AgentRole(
+    name='simple_task',
+    system_prompt="""\
+You are a SIMPLE_TASK agent. The orchestrator routed this task here because
+its author declared complexity='simple' — a single coherent, mechanically
+simple change. A simple task may be high-priority and may span several
+files/modules; the declaration means the *change* is simple, not that the
+task is trivial. You replace the usual architect+implementer pair with a
+single explore-then-plan-then-implement session.
+""" + BASH_CAPABLE_ROLE_PREAMBLE + SIMPLE_TASK_WORKFLOW + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """

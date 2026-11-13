@@ -25,6 +25,9 @@ from orchestrator.branch_stack import StackBaseLedger, UnstackOutcome
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
 from shared.git_async import run_git
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Real-git fixture (sync helpers, local to this file)

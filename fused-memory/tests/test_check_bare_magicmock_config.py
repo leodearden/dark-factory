@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import inspect
 import re
 import shutil
 import subprocess
@@ -20,6 +21,9 @@ from typing import NamedTuple
 import pytest
 from _fm_helpers import load_script_module
 from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -685,16 +689,26 @@ class TestHooksIntegration:
 # Assign/AnnAssign-only) is unchanged; every test above this banner pins it.
 # ===========================================================================
 
+def _fingerprinted_class(name: str) -> type:
+    """The class named *name* among those the gate-identity wire fingerprint hashes.
+
+    Imported here, not at module top, so an import-time break in orchestrator
+    fails only the tests that read it rather than collection of this whole suite.
+    """
+    from orchestrator.remote_gate import wire_classes
+
+    matches = [cls for cls in wire_classes() if cls.__qualname__ == name]
+    assert len(matches) == 1, (
+        f'orchestrator/src/orchestrator/remote_gate.py::wire_classes must hold exactly '
+        f'one class named {name!r}; got {matches}'
+    )
+    return matches[0]
+
+
 @pytest.fixture
 def verify_result_field_names() -> frozenset[str]:
-    """VerifyResult's real field names, read at runtime from orchestrator.verify.
-
-    Imported here, not at module top, so an import-time break in orchestrator.verify
-    fails only the drift tests that read it rather than collection of this whole suite.
-    """
-    from orchestrator.verify import VerifyResult
-
-    return frozenset(f.name for f in dataclasses.fields(VerifyResult))
+    """VerifyResult's real field names, read from the class the wire fingerprint hashes."""
+    return frozenset(f.name for f in dataclasses.fields(_fingerprinted_class('VerifyResult')))
 
 
 class TestDataclassShapeRegistry:
@@ -719,16 +733,18 @@ class TestDataclassShapeRegistry:
     def test_registry_names_no_stale_verify_result_field(self, verify_result_field_names):
         """Every registered field is one VerifyResult really has, read at runtime.
 
-        The script must stay stdlib-only, so it carries a literal copy.  This test owns
-        the STALE direction; the MISSING direction is owned by
+        The script must stay stdlib-only, so the registry derives its fields from
+        ``shape.home`` with ``dataclass_field_names``; a stale name means that reader
+        disagrees with ``dataclasses.fields``.  This test owns the STALE direction; the
+        MISSING direction is owned by
         test_every_real_field_counts_toward_the_overlap_floor, so one drift fails once.
         """
         shape = _checker._DATACLASS_SHAPES[0]
         stale = sorted(shape.fields - verify_result_field_names)
         assert stale == [], (
-            'remove these names from `_DATACLASS_SHAPES[0].fields` in '
-            'fused-memory/scripts/check_bare_magicmock_config.py; '
-            f'orchestrator/src/orchestrator/verify.py::VerifyResult has no such field: {stale}'
+            'the registry reader disagrees with dataclasses.fields: '
+            f'orchestrator/src/orchestrator/verify.py::VerifyResult has no such field: {stale}; '
+            'fix fused-memory/scripts/check_bare_magicmock_config.py::dataclass_field_names'
         )
         assert isinstance(shape.fields, frozenset), (
             f'fields must be a frozenset for cheap set algebra; got {type(shape.fields)}'
@@ -746,8 +762,9 @@ class TestDataclassShapeRegistry:
 
         The behavioural consequence of the registry: a field VerifyResult has but the
         registry lacks would not count toward ``min_field_matches``, so a double built
-        from it would slip through.  The field list is read at runtime, so a future
-        field landing unregistered turns this red too.
+        from it would slip through.  The registry derives its fields from
+        ``shape.home`` with ``dataclass_field_names``, so a missing name means that
+        reader disagrees with ``dataclasses.fields``.
         """
         unflagged = []
         for name in sorted(verify_result_field_names):
@@ -758,9 +775,9 @@ class TestDataclassShapeRegistry:
             if len(violations) != 1 or 'bare-dataclass-double' not in violations[0].message:
                 unflagged.append(name)
         assert unflagged == [], (
-            'these VerifyResult fields do not count toward Rule B\'s overlap floor; add '
-            'them to `_DATACLASS_SHAPES[0].fields` in '
-            f'fused-memory/scripts/check_bare_magicmock_config.py: {unflagged}'
+            'these VerifyResult fields do not count toward Rule B\'s overlap floor, so '
+            f'the registry reader disagrees with dataclasses.fields: {unflagged}; fix '
+            'fused-memory/scripts/check_bare_magicmock_config.py::dataclass_field_names'
         )
 
     def test_verify_result_min_field_matches_is_two(self):
@@ -784,18 +801,29 @@ class TestDataclassShapeRegistry:
                 f'stray anchors={sorted(shape.anchors - shape.fields)}'
             )
 
-    def test_every_shape_names_its_module_and_factory_remedy(self):
+    def test_every_shape_names_its_home_and_factory_remedy(self):
         """Each shape carries the provenance the violation message is built from."""
         for shape in _checker._DATACLASS_SHAPES:
-            assert shape.module, f'{shape.name}: module must be set (message provenance)'
+            assert shape.home, f'{shape.name}: home must be set (message provenance)'
             assert shape.factory, f'{shape.name}: factory must name the canonical remedy'
             assert shape.factory_home, (
                 f'{shape.name}: factory_home must name the file defining {shape.factory}'
             )
         verify_result = _checker._DATACLASS_SHAPES[0]
-        assert verify_result.module == 'orchestrator.verify'
         assert verify_result.factory == 'fake_verify_result'
         assert verify_result.factory_home == 'orchestrator/tests/_verify_result_doubles.py'
+
+    def test_message_cites_the_file_defining_the_fingerprinted_verify_result(self):
+        """Rule B reads the VerifyResult the wire fingerprint hashes, and cites its file."""
+        source_file = inspect.getsourcefile(_fingerprinted_class('VerifyResult'))
+        assert source_file is not None, 'VerifyResult has no Python source file'
+        defining = Path(source_file).resolve().relative_to(_REPO_ROOT.resolve()).as_posix()
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        assert f'{defining}::VerifyResult' in message, (
+            f'Rule B must read the VerifyResult defined in {defining}, the class '
+            'orchestrator/src/orchestrator/remote_gate.py::wire_classes fingerprints; '
+            f'got {message!r}'
+        )
 
     def test_the_registered_factory_is_defined_at_its_registered_home(self):
         """The printed remedy names a helper that really exists where it says.
@@ -1230,7 +1258,7 @@ class TestRuleBIsUnconditional:
 
 
 # Each repo-wide scan sweeps all seven packages' tests/; 61.52s x 8 = 492.16, rounded up to a
-# whole minute. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+# whole minute. Family rationale: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540
 
 # Both scan classes run on one loadgroup worker, so `repo_test_scan` is built once per run.
@@ -1251,10 +1279,12 @@ def _timeout_seconds(marker: pytest.Mark | None) -> float | None:
 
 
 def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
-    """The scan classes' items resolve the repo-scan ceiling; this module's unit tests do not.
+    """The scan classes' items resolve the repo-scan ceiling; this module's unit tests resolve the family's.
 
     Reads get_closest_marker on the collected items, which is what pytest-timeout
-    reads. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+    reads. The unit tests carry the family ceiling through module-level membership
+    in the task-role whole-tree guard family. Family rationale:
+    shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
     """
     scan_classes = (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity)
     scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
@@ -1273,10 +1303,10 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
         'on a scan test REPLACES it.'
     )
     own = _timeout_seconds(request.node.get_closest_marker('timeout'))
-    assert own is None or own <= ini_default, (
-        f"this module's unit tests resolve a {own}s timeout mark, above the {ini_default}s ini "
-        'default. A mark overrides verify\'s CLI --timeout too, so a hang in any of them would '
-        'surface that much later; bind the repo-scan ceiling on the scan classes only.'
+    assert own == WHOLE_TREE_SCAN_TEST_TIMEOUT, (
+        f"this module's unit tests resolve a {own}s timeout mark, not the "
+        f'{WHOLE_TREE_SCAN_TEST_TIMEOUT}s whole-tree guard family ceiling its module-level '
+        'pytestmark binds; bind the repo-scan ceiling on the scan classes only.'
     )
 
 
@@ -1300,11 +1330,11 @@ class _ScannedTestFile(NamedTuple):
 
 
 def _rule_c_count(tree: ast.Module, lines: list[str], entry: str) -> int:
-    """Count *tree*'s Rule C violations with the checker's own predicate, before any debt budget."""
+    """Count *tree*'s Rule C violations at every node, before any debt budget, as
+    ``check_bare_magicmock_config.py::_wall_clock_deadline_violations`` dispatches on node type."""
     return sum(
         len(_checker._wall_clock_deadline_violations(node, lines, entry))
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
     )
 
 
@@ -1395,7 +1425,7 @@ class TestAllScannedTestDirsClean:
             'Remedy depends on the rule:\n'
             '  bare-magicmock        → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
             '  bare-dataclass-double → fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
-            '  wall-clock-deadline   → wait_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
+            '  wall-clock-deadline   → wait_responsive(...) or poll_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
             '                          or, for a debt-baseline slack report, lower the named budget\n'
             f'Scanned: {present}\n'
             'Violations:\n'
@@ -1958,57 +1988,135 @@ class TestExemptionSeparatorVariants:
         )
 
 
-# The Rule C census, re-measured by task 5269 after it widened detection: 650
-# violations across 47 files in four packages (task 4246 shipped 618 across 20,
-# every one under orchestrator/tests/).  Counted as VIOLATIONS, not sites — one call
-# can produce two.  test_merge_speculation.py measures ZERO (task 3980 migrated it)
-# and is deliberately ABSENT.
+# The Rule C census, re-measured ONCE per widening of its detection, each time a
+# sanctioned rise where every added violation was newly SEEN, not new debt:
+#   * task 5269: 650 violations across 47 files in four packages (task 4246 shipped
+#     618 across 20, every one under orchestrator/tests/);
+#   * task 7800: 311 across 91 files in five packages after Rule C learned
+#     asyncio.timeout blocks and clock-deadline polls — every added violation newly
+#     SEEN, not new debt (220 across 39 before it), sites rebased in from main
+#     admitted at their measured counts per esc-7800-5 and esc-7800-7.
+# Counted as VIOLATIONS, not sites — one call can produce two.
+# test_merge_speculation.py measures ZERO (tasks 3980 and 7800 migrated it) and is
+# deliberately ABSENT.
 _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_concurrent_verify.py',
     'orchestrator/tests/test_merge_queue_request_liveness.py',
     'orchestrator/tests/test_offline_lane.py',
     'orchestrator/tests/test_live_merge_worker.py',
+    'orchestrator/tests/test_merge_queue.py',
+    'orchestrator/tests/test_verify_admission_integration_gate.py',
     'orchestrator/tests/test_background_service.py',
+    'orchestrator/tests/test_harness_lifecycle_registry.py',
     'orchestrator/tests/test_merge_queue_deep_dispatch.py',
-    'orchestrator/tests/test_merge_queue_deep_landing.py',
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
-    'orchestrator/tests/test_harness.py',
+    'orchestrator/tests/_task_verify_integration_rig.py',
+    'orchestrator/tests/test_git_ops.py',
     'orchestrator/tests/test_invoke.py',
-    'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_bounce.py',
+    'orchestrator/tests/test_merge_queue_deep_landing.py',
     'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_supervisor.py',
+    'orchestrator/tests/test_workflow_cancellation.py',
+    'orchestrator/tests/test_harness.py',
+    'orchestrator/tests/test_merge_queue_coalesce.py',
+    'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_rebased_landing_dead_base.py',
     'orchestrator/tests/test_merge_skew_tripwire.py',
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
     'orchestrator/tests/test_offline_lane_infra_integration.py',
     'orchestrator/tests/test_offline_lane_integration.py',
-    'orchestrator/tests/test_workflow_cancellation.py',
+    'orchestrator/tests/test_verify_cancel_unwind.py',
+    'orchestrator/tests/test_verify_ruff_config_boundary.py',
+    'orchestrator/tests/test_before_done_script.py',
+    'orchestrator/tests/test_cancel_scope_bounded_cleanup.py',
+    'orchestrator/tests/test_cascade_unblock.py',
+    'orchestrator/tests/test_coalesce_integration_gate.py',
+    'orchestrator/tests/test_done_phase_wedge.py',
+    'orchestrator/tests/test_harness_force_release_wedged_slot.py',
+    'orchestrator/tests/test_harness_offline_lane.py',
+    'orchestrator/tests/test_harness_resume_scheduler.py',
+    'orchestrator/tests/test_lane_lock_leak_guard.py',
+    'orchestrator/tests/test_merge_lane_parked_custody.py',
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+    'orchestrator/tests/test_merge_queue_orphan_reaper.py',
+    'orchestrator/tests/test_merge_queue_restart_hook.py',
+    'orchestrator/tests/test_offline_lane_records.py',
+    'orchestrator/tests/test_remote_gate.py',
+    'orchestrator/tests/test_task_verify_host_race.py',
     'orchestrator/tests/test_verify.py',
+    'orchestrator/tests/test_verify_admission_cancel_release.py',
+    'orchestrator/tests/test_verify_admission_executor_bypass.py',
+    'orchestrator/tests/test_verify_admission_gate.py',
+    'orchestrator/tests/test_verify_admission_order_integration.py',
+    'orchestrator/tests/test_verify_admission_watch.py',
+    'orchestrator/tests/test_verify_hosts.py',
+    'orchestrator/tests/test_verify_plan_latch.py',
+    'orchestrator/tests/test_verify_run_cmd_reap.py',
+    'orchestrator/tests/test_workflow_halt_owner.py',
     'dashboard/tests/test_db.py',
     'dashboard/tests/test_mcp_fanout.py',
     'dashboard/tests/test_durability.py',
     'dashboard/tests/test_metrics_curator.py',
     'dashboard/tests/_dashboard_helpers.py',
     'dashboard/tests/test_api_curator.py',
+    'dashboard/tests/test_memory_exchange_isolation.py',
     'dashboard/tests/test_merge_queue_data.py',
-    'fused-memory/tests/test_drain_signal_handler.py',
+    'dashboard/tests/test_quality_sampler.py',
+    'dashboard/tests/test_quality_marker_sampler.py',
+    'dashboard/tests/test_escalation_corpus.py',
     'fused-memory/tests/test_harness.py',
+    'fused-memory/tests/test_drain_signal_handler.py',
     'fused-memory/tests/test_memory_service.py',
     'fused-memory/tests/test_operator_signal_handler.py',
     'fused-memory/tests/test_periodic_rebuild_summaries.py',
     'fused-memory/tests/test_task_interceptor.py',
+    'fused-memory/tests/_fm_polling.py',
     'fused-memory/tests/server/test_grouped_read.py',
     'fused-memory/tests/test_dependency_direction_check.py',
     'fused-memory/tests/test_e2e_durable_queue.py',
     'fused-memory/tests/test_journaling_integration.py',
     'fused-memory/tests/test_recon_claim_verification_wiring.py',
+    'fused-memory/tests/test_mem0_collection_provisioning.py',
+    'fused-memory/tests/test_event_loop_lag.py',
+    'fused-memory/tests/test_event_queue.py',
+    'fused-memory/tests/test_main_curator_usage_gate.py',
+    'shared/tests/test_cli_invoke.py',
     'shared/tests/test_uuid_prefix_guard.py',
     'shared/tests/test_async_sqlite_base.py',
-    'shared/tests/test_cli_invoke.py',
+    'shared/tests/test_auth_failed.py',
+    'shared/tests/test_auth_reprobe_opt_out.py',
+    'shared/tests/test_cli_invoke_transcript_offloop.py',
+    'shared/tests/test_failover_integration.py',
+    'shared/tests/test_git_async.py',
+    'shared/tests/test_usage_gate_park_visibility.py',
+    'escalation/tests/test_prefix_resolver_client.py',
 })
 
 # Exactly ONE Rule C violation (bare wait_for; the bound is derived, not written),
 # so N copies produce N violations, copy i on line i, and the arithmetic in the
 # budget tests is exact.
 _RULE_C_ONE_HIT = 'asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)\n'
+
+# One Rule C violation per non-Call leg: an asyncio.timeout block wrapping a poll,
+# and a poll giving up against a clock-deadline read.
+_RULE_C_POLL_LEGS = (
+    'import asyncio\n'
+    '\n'
+    '\n'
+    'async def await_ready(verifier, timeout):\n'
+    '    async with asyncio.timeout(timeout):\n'
+    '        while not verifier.ready:\n'
+    '            await asyncio.sleep(0.01)\n'
+    '\n'
+    '\n'
+    'async def await_done(state, deadline):\n'
+    '    loop = asyncio.get_running_loop()\n'
+    '    while loop.time() < deadline:\n'
+    '        if state.done:\n'
+    '            return\n'
+    '        await asyncio.sleep(0.01)\n'
+)
 
 
 def _live_rule_c_debt_entry() -> tuple[str, int]:
@@ -2037,8 +2145,10 @@ class TestWallClockDeadlineDebtBaseline:
     """The shrink-only per-file debt baseline that lets Rule C ship default-ON.
 
     Pre-existing violations — 618 across 20 files when task 4246 shipped the rule,
-    650 across 47 files in four packages once task 5269 widened its detection —
-    mean a hot default-on rule would turn those packages' lint_commands red
+    650 across 47 files in four packages once task 5269 widened its detection, and
+    311 across 91 files in five packages once task 7800 taught it asyncio.timeout
+    blocks and clock-deadline polls (220 across 39 before; every added one newly
+    SEEN, not new debt) — mean a hot default-on rule would turn those packages' lint_commands red
     immediately and stall the merge lane repo-wide — the identical situation Rule B
     faced at 95 sites/11 files, solved the identical way and since retired, its debt
     fully migrated (task 4354).
@@ -2232,6 +2342,23 @@ class TestWallClockDeadlineDebtBaseline:
         for foreign in ('fake_verify_result', 'spec=VerifyResult', 'bare-dataclass-double'):
             assert foreign not in message, (
                 f'Rule C overrun message must not offer {foreign!r}: {message!r}'
+            )
+
+    def test_overrun_message_cites_both_responsive_helpers_at_their_homes(self):
+        """An overrun may be a new poll as well as a new wait, so it names both remedies.
+
+        A debt file's budget now counts clock-deadline polls and timeout blocks, whose
+        remedy is poll_responsive, not wait_responsive.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        [overrun] = _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)
+        for citation in (
+            'orchestrator/tests/_orch_helpers.py::wait_responsive',
+            'orchestrator/tests/_poll_responsive.py::poll_responsive',
+            'poll_responsive(predicate, ...)',
+        ):
+            assert citation in overrun.message, (
+                f'the Rule C overrun message must cite {citation!r}; got {overrun.message!r}'
             )
 
     def test_both_budget_builders_are_required_and_keyword_only(self):
@@ -2563,6 +2690,20 @@ class TestScanRepoTestDirs:
 
         assert by_relpath['pkg_a/tests/_helper.py'].rule_c_count == 1
         assert by_relpath['pkg_a/tests/test_bad.py'].rule_c_count == 0
+
+    def test_rule_c_count_includes_the_timeout_block_and_clock_poll_legs(self, tmp_path: Path):
+        relpath = 'pkg_a/tests/_poll_helper.py'
+        path = tmp_path / relpath
+        path.parent.mkdir(parents=True)
+        path.write_text(_RULE_C_POLL_LEGS, encoding='utf-8')
+
+        [record] = _scan_repo_test_dirs(tmp_path, ('pkg_a/tests',))
+
+        reported = [
+            v for v in find_violations(_RULE_C_POLL_LEGS, relpath) if 'wall-clock-deadline' in v.message
+        ]
+        assert record.rule_c_count == 2
+        assert record.rule_c_count == len(reported)
 
     def test_a_syntax_error_is_recorded_with_no_gate_violation(self, fake_repo: Path):
         by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}

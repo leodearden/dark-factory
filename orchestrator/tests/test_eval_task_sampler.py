@@ -570,7 +570,10 @@ class TestGitGlue:
     ) -> None:
         repo, task_id, merge_sha, pre, post = merge_repo
         cands = asyncio.run(
-            discover_completed_tasks(repo, since=None, project='dark_factory')
+            discover_completed_tasks(
+                repo, since=None, project='dark_factory',
+                branch_prefix='task/', main_branch='main',
+            )
         )
         assert len(cands) == 1
         c = cands[0]

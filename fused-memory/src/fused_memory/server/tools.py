@@ -25,8 +25,11 @@ from shared.delivered_check_polarity import (
     lint_delivered_checks,
     polarity_error,
 )
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_submit import is_ticket_id, looks_like_task_id
 from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
 from fused_memory.backends.defect_records import (
@@ -99,10 +102,7 @@ from fused_memory.middleware.routing_intent_guard import (
 )
 from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
 from fused_memory.middleware.task_interceptor import (
-    TERMINAL_STATUSES,
     TicketStoreNotConfiguredError,
-    _is_ticket_id,
-    _looks_like_task_id,
     interceptor_write_succeeded,
 )
 from fused_memory.middleware.trigger_chain_guard import trigger_chain_open_error
@@ -210,11 +210,14 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
+    TRIAGE_FAIL_OPEN_KEY,
+    FailOpenStage,
     TriageFailOpenCounter,
     attach_write_durable,
     declares_attach_keys,
     declares_supersession,
     emit_triage_fail_open_storm_escalation,
+    is_orchestrator_completion_write,
     resolve_write_triage_enabled,
     triage_write,
 )
@@ -1702,13 +1705,12 @@ def create_mcp_server(
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
     # Derived from the authoritative sets so this validator stays in lockstep
     # automatically when a new status is added to either partition. Both names
-    # are re-exported from shared.task_statuses (PRD task-status-authority
-    # C1/C2, finding 6.4) — the single source of truth:
+    # come from shared.task_statuses (PRD task-status-authority C1/C2,
+    # finding 6.4) — the single source of truth:
     #   ACTIVE_TASK_STATUSES  — shared.ACTIVE: non-terminal in-flight statuses
     #                           (re-exported by fused_memory.reconciliation.task_filter)
     #   TERMINAL_STATUSES     — shared.TERMINAL: terminal statuses requiring
-    #                           reopen_reason to exit (re-exported by
-    #                           fused_memory.middleware.task_interceptor)
+    #                           reopen_reason to exit (imported directly)
     # Do NOT hardcode this as a literal; use the union so a future status added
     # to shared.task_statuses.TaskStatus is automatically accepted here without
     # a separate edit to this file.
@@ -3918,9 +3920,11 @@ def create_mcp_server(
         # the attach below OVERWRITES, so a caller that set either force-stores
         # exactly like allow_near_duplicate. See write_triage.declares_attach_keys
         # for why ANY `kind` counts (not just the child kinds) and what that
-        # costs in coverage.
+        # costs in coverage. An orchestrator completion record force-stores even
+        # without its kind; see write_triage.is_orchestrator_completion_write.
         caller_owns_attach_keys = declares_attach_keys(metadata)
         caller_declares_supersession = declares_supersession(metadata)
+        caller_is_completion_record = is_orchestrator_completion_write(metadata)
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3959,6 +3963,7 @@ def create_mcp_server(
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
                 caller_declares_supersession=caller_declares_supersession,
+                caller_is_completion_record=caller_is_completion_record,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
@@ -4146,6 +4151,7 @@ def create_mcp_server(
             if triage_decision is not None and attach_kind is not None
             else None
         )
+        fail_open_stage = triage_decision.fail_open_stage if triage_decision is not None else None
         if (
             triage_decision is not None
             and attach_kind is None
@@ -4180,6 +4186,7 @@ def create_mcp_server(
                 triage_decision.outcome, OUTCOME_STORED,
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.UNWIRED_VERDICT
         write_meta = cleaned_meta
         if attached_to is not None:
             # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
@@ -4263,6 +4270,7 @@ def create_mcp_server(
                 attached_to,
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.ATTACH_WRITE
             attached_to = None
             result = await memory_service.add_memory(
                 content=content,
@@ -4315,6 +4323,7 @@ def create_mcp_server(
                 attached_to, OUTCOME_STORED, getattr(result, 'message', None),
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.ATTACH_NOT_DURABLE
             attached_to = None
         # Marks each record this write supersedes, now that the new id exists.
         # Not a triage event; see services/supersession_mark.py.
@@ -4348,6 +4357,9 @@ def create_mcp_server(
             ack = {**ack, ROUTED_KEY: outcome}
             if attached_to is not None:
                 ack[CANONICAL_ID_KEY] = attached_to
+            # See write_triage.TRIAGE_FAIL_OPEN_KEY.
+            if fail_open_stage is not None:
+                ack[TRIAGE_FAIL_OPEN_KEY] = fail_open_stage.value
             ack.update(truncation_fields(*triage_decision.truncation_facts))
             # Drained AFTER any fallback record above, so one drain covers both
             # triage_write's internal fail-opens and this body's own.
@@ -8653,10 +8665,10 @@ def create_mcp_server(
         task tools. Returning a clear error here prevents confusing downstream
         failures inside the taskmaster backend.
 
-        Delegates to :func:`~fused_memory.middleware.task_interceptor._is_ticket_id`
-        so there is a single source of truth for the ticket-id prefix.
+        Delegates to ``shared/src/shared/task_submit.py::is_ticket_id`` so
+        there is a single source of truth for the ticket-id prefix.
         """
-        if _is_ticket_id(value):
+        if is_ticket_id(value):
             return {
                 'error': (
                     f'Ticket-shaped id {value!r} not allowed here; '
@@ -8696,9 +8708,13 @@ def create_mcp_server(
             fields: Optional row projection.  None returns full rows, unchanged.  Each
                 entry is a top-level row key or ``metadata.<key>`` (key matching
                 ``[A-Za-z_][A-Za-z0-9_]*``); ``id`` is always returned, and a requested
-                metadata key absent on a task is omitted.  An invalid entry is a
-                ValidationError carrying ``field`` and ``allowed``.  Composes with
-                ``statuses`` and ``page_size``.
+                metadata key absent on a task, or a requested row key the store's schema
+                lacks, is omitted.  An invalid entry is a ValidationError carrying
+                ``field`` and ``allowed``.  Composes with ``statuses`` and ``page_size``.
+                The row keys are ``backends/task_projection.py::TASK_ROW_KEYS``; among
+                them ``created_at`` is the filing time and ``created_at_source`` its
+                provenance, a ``shared/src/shared/task_created_at.py::CreatedAtSource``
+                value.
         """
         # Input validation — early-exit before touching the interceptor.
         # Shared with get_statuses so both tools reject identical inputs
@@ -9380,6 +9396,15 @@ def create_mcp_server(
         "planning_mode": True}`` synchronously — no ticket, no
         ``resolve_ticket`` follow-up needed.
 
+        ``metadata.execution_class`` 'operational' or 'decision' converts the
+        submission into a deterministic pure gate that escalates to a HUMAN at
+        dispatch; the response then carries ``routing_notice`` and the task
+        carries ``metadata.pure_gate_from``, unless the metadata already
+        declares that shape (``task_kind='deterministic'`` +
+        ``always_escalates=True``), in which case nothing is rewritten and
+        neither appears. A docs, comment or rename edit is agent work:
+        ``task_kind='normal'`` + ``metadata.complexity='simple'``.
+
         Any string argument carrying a raw MCP envelope fragment — not just
         ``title``/``description``/``details``/``prompt`` — is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
@@ -9673,6 +9698,11 @@ def create_mcp_server(
         # the interceptor-side twin re-running on this coerced metadata is a
         # no-op. This deliberately reverses the declaration-only scoping of
         # tasks 2085/2563 (owner-greenlit 2026-07-19).
+        #
+        # pure_gate_from is machine-written, so a caller's copy (metadata
+        # cloned from get_task, say) is dropped here at the outer boundary,
+        # never in the twin, which must keep the stamp written just below.
+        metadata.pop(PURE_GATE_FROM_KEY, None)
         metadata = inject_operational_routing(metadata)
 
         # Premise-lint guard xi (task 2231/W5-xi) — see premise_lint_guard.py.
@@ -9813,14 +9843,14 @@ def create_mcp_server(
                 under the MCP 120 s hard limit) so external callers that omit this
                 parameter cannot hang indefinitely on an orphaned ticket.
         """
-        if not _is_ticket_id(ticket):
+        if not is_ticket_id(ticket):
             # Idempotent passthrough: if the caller passed a numeric task id,
             # short-circuit instead of erroring.  This catches agents that
             # blindly use the two-step submit/resolve dance after a
             # ``planning_mode=True`` submit_task that already returned a
             # synchronous ``task_id``.  No store lookup is performed — the
             # contract is that any numeric id is treated as already-resolved.
-            if _looks_like_task_id(ticket):
+            if looks_like_task_id(ticket):
                 return {
                     'status': 'created',
                     'task_id': str(ticket).strip(),
@@ -10319,7 +10349,7 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
         for tid in ids:
-            if _is_ticket_id(tid):
+            if is_ticket_id(tid):
                 return {
                     'error': (
                         f'commit_planning: task_ids must contain numeric task ids, '
@@ -10507,6 +10537,13 @@ def create_mcp_server(
         ``prompt`` is legacy: it routes through the LLM-driven Taskmaster
         path which can drift on re-rewrite. It will be removed once the
         sqlite cutover is complete.
+
+        A call that supplies none of ``prompt``, ``metadata``, ``title``,
+        ``description``, ``details``, ``priority`` or ``dependencies`` is
+        REFUSED with ``error_type='NoFieldsToUpdateError'`` and writes nothing
+        (task 4867): it used to bump ``updated_at`` and report success, hiding
+        an argument that was misnamed and dropped. ``append``, ``metadata_mode``
+        and ``tag`` alone do not make a write.
 
         Any string argument carrying raw MCP envelope markup — not just
         ``title``/``description``/``details``/``prompt`` — is REJECTED outright

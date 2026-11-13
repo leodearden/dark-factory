@@ -1,12 +1,16 @@
-"""quality.db's single home: its schema, the LandingRow codec over ``landings``, and value-or-gap samples.
+"""quality.db's single home: its schema, the LandingRow codec over ``landings``, value-or-gap
+samples, and each project's stored marker derivation.
 
-Design: plans/quality-dashboard-prd.md decision 14 and §Contract "Per-landing row".
+Design: plans/quality-dashboard-prd.md decision 14, §Contract "Per-landing row" and §Contract
+"Markers".
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -31,16 +35,51 @@ from shared.quality_series.rows import (
     SourceEpochs,
 )
 
+from dashboard.data.quality_markers import (
+    AxisLanding,
+    DerivedState,
+    Marker,
+    MarkerKind,
+    MarkerSource,
+    PromptCoverage,
+    RoutingFold,
+    RoutingStep,
+    RuleSpan,
+    SourceLayer,
+    StoredMarkerState,
+)
+
 __all__ = [
     'QUALITY_SCHEMA',
+    'NewestSamples',
     'QualitySample',
     'SampleState',
+    'ensure_marker_tables',
     'insert_sample',
+    'landing_axis',
+    'newest_samples',
     'read_landing_rows',
+    'read_marker_state',
+    'read_routing_fold',
     'read_samples',
+    'record_marker_failure',
     'stored_cursor',
     'upsert_landing_rows',
+    'write_marker_state',
 ]
+
+_MARKERS_DERIVED_DDL = """\
+CREATE TABLE IF NOT EXISTS markers_derived (
+    project_id  TEXT    NOT NULL,
+    marker_id   TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,
+    at          TEXT    NOT NULL,
+    label       TEXT    NOT NULL,
+    source      TEXT    NOT NULL,
+    ref         TEXT,
+    PRIMARY KEY (project_id, marker_id)
+);
+"""
 
 QUALITY_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS landings (
@@ -96,13 +135,48 @@ CREATE TABLE IF NOT EXISTS late_events (
     PRIMARY KEY (project_id, merge_sha, task_id, kind, event_sha)
 );
 
-CREATE TABLE IF NOT EXISTS markers_derived (
-    project_id  TEXT    NOT NULL,
-    role        TEXT    NOT NULL,
-    kind        TEXT    NOT NULL,
-    at          TEXT    NOT NULL,
-    ordinal     INTEGER,
-    PRIMARY KEY (project_id, role, kind, at)
+CREATE TABLE IF NOT EXISTS routing_steps (
+    project_id      TEXT    NOT NULL,
+    role            TEXT    NOT NULL,
+    first_event_id  INTEGER NOT NULL,
+    first_at        TEXT    NOT NULL,
+    last_event_id   INTEGER NOT NULL,
+    last_at         TEXT    NOT NULL,
+    decisions       INTEGER NOT NULL,
+    source_layer    TEXT    NOT NULL,
+    model           TEXT    NOT NULL,
+    effort          TEXT    NOT NULL,
+    budget_usd      REAL    NOT NULL,
+    max_turns       INTEGER NOT NULL,
+    prompt_digest   TEXT,
+    PRIMARY KEY (project_id, first_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS routing_rules (
+    project_id      TEXT    NOT NULL,
+    rule_id         TEXT    NOT NULL,
+    first_event_id  INTEGER NOT NULL,
+    first_at        TEXT    NOT NULL,
+    last_at         TEXT    NOT NULL,
+    decisions       INTEGER NOT NULL,
+    PRIMARY KEY (project_id, rule_id)
+);
+
+CREATE TABLE IF NOT EXISTS marker_state (
+    project_id          TEXT    PRIMARY KEY,
+    routing_cursor      INTEGER,
+    first_decision_at   TEXT,
+    newest_decision_at  TEXT,
+    digest_since        TEXT,
+    fold_complete       INTEGER,
+    skipped_routing     INTEGER,
+    skipped_derived     INTEGER,
+    roles_py_landings   INTEGER,
+    roles_py_since      TEXT,
+    roles_py_reason     TEXT,
+    refreshed_at        TEXT,
+    attempted_at        TEXT    NOT NULL,
+    failure             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sample_state (
@@ -119,7 +193,7 @@ CREATE TABLE IF NOT EXISTS sample_state (
     late_claims             INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sample_state_project_ts ON sample_state(project_id, ts);
-"""
+""" + _MARKERS_DERIVED_DDL
 
 
 def _utc_text(at: datetime) -> str:
@@ -284,11 +358,15 @@ async def upsert_landing_rows(
     await conn.executemany(_UPSERT_SQL, [_encode_row(row, stamp) for row in rows])
 
 
+def _decode_rows(records: Iterable[Iterable[Any]]) -> list[LandingRow]:
+    return [_decode_row(dict(zip(_ROW_COLUMNS, record, strict=True))) for record in records]
+
+
 async def read_landing_rows(conn: aiosqlite.Connection, project_id: str) -> list[LandingRow]:
-    """The project's stored rows in ordinal order."""
+    """The project's stored rows in ordinal order, decoded off the event loop."""
     async with conn.execute(_READ_ROWS_SQL, (project_id,)) as cursor:
         records = await cursor.fetchall()
-    return [_decode_row(dict(zip(_ROW_COLUMNS, record, strict=True))) for record in records]
+    return await asyncio.to_thread(_decode_rows, records)
 
 
 async def stored_cursor(
@@ -414,20 +492,303 @@ async def insert_sample(conn: aiosqlite.Connection, sample: QualitySample) -> No
     )
 
 
+def _decode_sample(record: Iterable[Any]) -> QualitySample:
+    """A stored sample, re-checked by QualitySample's invariant."""
+    (pid, ts, state, reason, cursor_sha, sampled, deferred,
+     off_first_parent, merges_without_landing, late_claims) = record
+    return QualitySample(
+        project_id=pid, ts=parse_utc(ts), state=SampleState(state), reason=reason,
+        cursor_sha=cursor_sha, landings_sampled=sampled, landings_deferred=deferred,
+        git_check=_decode_git_check(off_first_parent, merges_without_landing, late_claims),
+    )
+
+
+_SELECT_SAMPLES = f'SELECT {", ".join(_SAMPLE_COLUMNS)} FROM sample_state WHERE project_id = ?'
+
+
 async def read_samples(conn: aiosqlite.Connection, project_id: str) -> list[QualitySample]:
     """The project's samples in time order, each re-checked by QualitySample's invariant."""
+    async with conn.execute(f'{_SELECT_SAMPLES} ORDER BY ts, id', (project_id,)) as cursor:
+        records = await cursor.fetchall()
+    return [_decode_sample(record) for record in records]
+
+
+@dataclass(frozen=True)
+class NewestSamples:
+    """The project's newest sample of any state, and its newest value; None when it has none."""
+
+    latest: QualitySample | None
+    latest_value: QualitySample | None
+
+
+_NEWEST_FIRST = 'ORDER BY ts DESC, id DESC'
+_NEWEST_SAMPLES_SQL = (
+    f'SELECT {", ".join(_SAMPLE_COLUMNS)} FROM sample_state WHERE id IN ('
+    f'(SELECT id FROM sample_state WHERE project_id = :project {_NEWEST_FIRST} LIMIT 1), '
+    f'(SELECT id FROM sample_state WHERE project_id = :project AND state = :value '
+    f'{_NEWEST_FIRST} LIMIT 1)) {_NEWEST_FIRST}'
+)
+
+
+async def newest_samples(conn: aiosqlite.Connection, project_id: str) -> NewestSamples:
+    """The newest sample and the newest value sample, in read_samples' order, without the rest.
+
+    One statement reads both, so a tick committed between two reads cannot pair a superseded
+    gap with a newer value.
+    """
+    params = {'project': project_id, 'value': SampleState.VALUE.value}
+    async with conn.execute(_NEWEST_SAMPLES_SQL, params) as cursor:
+        newest_first = [_decode_sample(record) for record in await cursor.fetchall()]
+    return NewestSamples(
+        latest=next(iter(newest_first), None),
+        latest_value=next(
+            (sample for sample in newest_first if sample.state is SampleState.VALUE), None,
+        ),
+    )
+
+
+async def landing_axis(conn: aiosqlite.Connection, project_id: str) -> list[AxisLanding]:
+    """The project's stored landings as (ordinal, landed_at), in read_landing_rows' order."""
     async with conn.execute(
-        f'SELECT {", ".join(_SAMPLE_COLUMNS)} FROM sample_state'
-        ' WHERE project_id = ? ORDER BY ts, id',
+        'SELECT ordinal, landed_at FROM landings WHERE project_id = ? ORDER BY ordinal, task_id',
         (project_id,),
     ) as cursor:
-        records = await cursor.fetchall()
-    return [
-        QualitySample(
-            project_id=pid, ts=parse_utc(ts), state=SampleState(state), reason=reason,
-            cursor_sha=cursor_sha, landings_sampled=sampled, landings_deferred=deferred,
-            git_check=_decode_git_check(off_first_parent, merges_without_landing, late_claims),
-        )
-        for (pid, ts, state, reason, cursor_sha, sampled, deferred,
-             off_first_parent, merges_without_landing, late_claims) in records
-    ]
+        return [AxisLanding(ordinal, parse_utc(landed_at)) for ordinal, landed_at in await cursor.fetchall()]
+
+
+async def ensure_marker_tables(conn: aiosqlite.Connection) -> None:
+    """Reshape a markers_derived from before the marker producer, which nothing ever wrote.
+
+    Its rows are derived only and re-derived on the next marker tick, so the old table is
+    dropped rather than migrated. The caller commits.
+    """
+    async with conn.execute(
+        "SELECT 1 FROM pragma_table_info('markers_derived') WHERE name = 'marker_id'"
+    ) as cursor:
+        current = await cursor.fetchone() is not None
+    if not current:
+        await conn.execute('DROP TABLE IF EXISTS markers_derived')
+        await conn.execute(_MARKERS_DERIVED_DDL)
+
+
+@dataclass(frozen=True)
+class _ProjectTable:
+    """A frozen dataclass stored one row per value, one column per field, under a project_id."""
+
+    name: str
+    cls: Callable[..., Any]
+    codecs: tuple[tuple[str, _Codec], ...]
+    order_by: str
+
+    def __post_init__(self) -> None:
+        _require_every_field_coded(self.cls, (name for name, _ in self.codecs))
+
+    @property
+    def _columns(self) -> tuple[str, ...]:
+        return tuple(name for name, _ in self.codecs)
+
+    def insert_sql(self) -> str:
+        columns = ('project_id', *self._columns)
+        return (f'INSERT INTO {self.name} ({", ".join(columns)}) '
+                f'VALUES ({", ".join("?" for _ in columns)})')
+
+    def select_sql(self) -> str:
+        return (f'SELECT {", ".join(self._columns)} FROM {self.name} '
+                f'WHERE project_id = ? ORDER BY {self.order_by}')
+
+    def encode(self, project_id: str, value: object) -> tuple[object, ...]:
+        return (project_id, *(codec.encode(getattr(value, name)) for name, codec in self.codecs))
+
+    def decode(self, record: Iterable[Any]) -> Any:
+        return self.cls(**{
+            name: codec.decode(stored)
+            for (name, codec), stored in zip(self.codecs, record, strict=True)
+        })
+
+
+_STEPS = _ProjectTable('routing_steps', RoutingStep, (
+    ('role', _PLAIN), ('first_event_id', _PLAIN), ('first_at', _UTC),
+    ('last_event_id', _PLAIN), ('last_at', _UTC), ('decisions', _PLAIN),
+    ('source_layer', _enum(SourceLayer)), ('model', _PLAIN), ('effort', _PLAIN), ('budget_usd', _PLAIN),
+    ('max_turns', _PLAIN), ('prompt_digest', _PLAIN),
+), order_by='first_event_id')
+
+_RULES = _ProjectTable('routing_rules', RuleSpan, (
+    ('rule_id', _PLAIN), ('first_event_id', _PLAIN), ('first_at', _UTC), ('last_at', _UTC),
+    ('decisions', _PLAIN),
+), order_by='first_event_id, rule_id')
+
+_MARKER_COLUMNS = ('marker_id', 'kind', 'at', 'label', 'source', 'ref')
+
+
+def _storable_marker(project_id: str, marker: Marker) -> bool:
+    """A marker markers_derived holds whole: the project's own, unplaced, with no series or range."""
+    return (marker.scope == project_id and marker.series is None and marker.until is None
+            and not marker.tasks and marker.ordinal is None and marker.until_ordinal is None)
+
+
+def _encode_marker(project_id: str, marker: Marker) -> tuple[object, ...]:
+    _invariant(_storable_marker(project_id, marker),
+               "a stored derived marker is its project's own, unplaced, with no series, "
+               'until or tasks', project_id=project_id, marker_id=marker.marker_id,
+               marker=marker)
+    return (project_id, marker.marker_id, marker.kind.value, _utc_text(marker.at), marker.label,
+            json.dumps(marker.source.to_wire(), sort_keys=True), marker.ref)
+
+
+def _decode_marker(project_id: str, record: Iterable[Any]) -> Marker:
+    marker_id, kind, at, label, source, ref = record
+    return Marker(
+        marker_id=marker_id, at=parse_utc(at), kind=MarkerKind(kind), scope=project_id,
+        series=None, until=None, label=label, source=MarkerSource.from_wire(json.loads(source)),
+        ref=ref,
+    )
+
+
+_INSERT_MARKER_SQL = (
+    f'INSERT INTO markers_derived (project_id, {", ".join(_MARKER_COLUMNS)}) '
+    f'VALUES ({", ".join("?" for _ in ("project_id", *_MARKER_COLUMNS))})'
+)
+_SELECT_MARKERS_SQL = (
+    f'SELECT {", ".join(_MARKER_COLUMNS)} FROM markers_derived '
+    'WHERE project_id = ? ORDER BY at, marker_id'
+)
+
+_STATE_COLUMNS = (
+    'routing_cursor', 'first_decision_at', 'newest_decision_at', 'digest_since', 'fold_complete',
+    'skipped_routing', 'skipped_derived', 'roles_py_landings', 'roles_py_since',
+    'roles_py_reason', 'refreshed_at', 'attempted_at', 'failure',
+)
+_UPSERT_STATE_SQL = (
+    f'INSERT INTO marker_state (project_id, {", ".join(_STATE_COLUMNS)}) '
+    f'VALUES ({", ".join("?" for _ in ("project_id", *_STATE_COLUMNS))}) '
+    'ON CONFLICT(project_id) DO UPDATE SET '
+    + ', '.join(f'{column} = excluded.{column}' for column in _STATE_COLUMNS)
+)
+_SELECT_STATE_SQL = f'SELECT {", ".join(_STATE_COLUMNS)} FROM marker_state WHERE project_id = ?'
+
+
+def _encode_state(state: DerivedState) -> tuple[object, ...]:
+    fold, coverage = state.fold, state.prompt_coverage
+    _invariant(coverage.digest_since == fold.digest_since,
+               "the prompt coverage's digest_since is its fold's, stored once",
+               project_id=fold.project_id, coverage_digest_since=coverage.digest_since,
+               fold_digest_since=fold.digest_since)
+    return (
+        fold.project_id, fold.cursor, _UTC.encode(fold.first_at), _UTC.encode(fold.newest_at),
+        _UTC.encode(fold.digest_since), _BOOL.encode(fold.complete), fold.skipped, state.skipped,
+        coverage.roles_py_landings, _UTC.encode(coverage.counted_since), coverage.reason,
+        _utc_text(state.refreshed_at), _utc_text(state.refreshed_at), None,
+    )
+
+
+_DERIVED_TABLES = ('routing_steps', 'routing_rules', 'markers_derived')
+
+
+async def write_marker_state(conn: aiosqlite.Connection, state: DerivedState) -> None:
+    """Replace the stored derivation of *state*'s project with *state*; the caller commits.
+
+    Clears any recorded failure, since this derivation is the newest attempt.
+    """
+    project_id = state.fold.project_id
+    state_row = _encode_state(state)
+    markers = [_encode_marker(project_id, marker) for marker in state.markers]
+    for table in _DERIVED_TABLES:
+        await conn.execute(f'DELETE FROM {table} WHERE project_id = ?', (project_id,))
+    await conn.executemany(_STEPS.insert_sql(), [_STEPS.encode(project_id, step) for step in state.fold.steps])
+    await conn.executemany(_RULES.insert_sql(), [_RULES.encode(project_id, span) for span in state.fold.rules])
+    await conn.executemany(_INSERT_MARKER_SQL, markers)
+    await conn.execute(_UPSERT_STATE_SQL, state_row)
+
+
+async def record_marker_failure(
+    conn: aiosqlite.Connection, project_id: str, *, attempted_at: datetime, failure: str,
+) -> None:
+    """Record a failed marker refresh, keeping the newest good derivation; the caller commits."""
+    await conn.execute(
+        'INSERT INTO marker_state (project_id, attempted_at, failure) VALUES (?, ?, ?) '
+        'ON CONFLICT(project_id) DO UPDATE SET '
+        'attempted_at = excluded.attempted_at, failure = excluded.failure',
+        (project_id, _utc_text(attempted_at), failure),
+    )
+
+
+@asynccontextmanager
+async def _one_snapshot(conn: aiosqlite.Connection) -> AsyncIterator[None]:
+    """Every read inside sees one database state: a commit on another connection cannot tear it,
+    but a commit on this one while the snapshot is open ends the savepoint, so never snapshot-read
+    on a connection another coroutine may commit on."""
+    await conn.execute('SAVEPOINT read_marker_state')
+    try:
+        yield
+    finally:
+        await conn.execute('RELEASE read_marker_state')
+
+
+async def _fetch(conn: aiosqlite.Connection, sql: str, project_id: str) -> list[Any]:
+    async with conn.execute(sql, (project_id,)) as cursor:
+        return list(await cursor.fetchall())
+
+
+async def _fetch_state(conn: aiosqlite.Connection, project_id: str) -> dict[str, Any] | None:
+    found = await _fetch(conn, _SELECT_STATE_SQL, project_id)
+    return dict(zip(_STATE_COLUMNS, found[0], strict=True)) if found else None
+
+
+async def _fetch_fold_rows(
+    conn: aiosqlite.Connection, project_id: str,
+) -> tuple[list[Any], list[Any]]:
+    return (await _fetch(conn, _STEPS.select_sql(), project_id),
+            await _fetch(conn, _RULES.select_sql(), project_id))
+
+
+def _decode_fold(
+    project_id: str, state: Mapping[str, Any], steps: Iterable[Any], rules: Iterable[Any],
+) -> RoutingFold:
+    return RoutingFold(
+        project_id=project_id, cursor=state['routing_cursor'],
+        steps=tuple(_STEPS.decode(record) for record in steps),
+        rules=tuple(_RULES.decode(record) for record in rules),
+        first_at=_UTC.decode(state['first_decision_at']),
+        newest_at=_UTC.decode(state['newest_decision_at']),
+        digest_since=_UTC.decode(state['digest_since']),
+        skipped=state['skipped_routing'], complete=_BOOL.decode(state['fold_complete']),
+    )
+
+
+async def read_routing_fold(conn: aiosqlite.Connection, project_id: str) -> RoutingFold | None:
+    """The routing fold of the project's newest good derivation, without its markers; None if it
+    has never had one."""
+    async with _one_snapshot(conn):
+        state = await _fetch_state(conn, project_id)
+        if state is None or state['refreshed_at'] is None:
+            return None
+        steps, rules = await _fetch_fold_rows(conn, project_id)
+    return _decode_fold(project_id, state, steps, rules)
+
+
+async def read_marker_state(
+    conn: aiosqlite.Connection, project_id: str,
+) -> StoredMarkerState | None:
+    """The project's newest good derivation and newest attempt; None if it has never had one."""
+    async with _one_snapshot(conn):
+        state = await _fetch_state(conn, project_id)
+        if state is None:
+            return None
+        attempted_at, failure = parse_utc(state['attempted_at']), state['failure']
+        if state['refreshed_at'] is None:
+            return StoredMarkerState(derived=None, attempted_at=attempted_at, failure=failure)
+        steps, rules = await _fetch_fold_rows(conn, project_id)
+        markers = await _fetch(conn, _SELECT_MARKERS_SQL, project_id)
+    fold = _decode_fold(project_id, state, steps, rules)
+    derived = DerivedState(
+        fold=fold,
+        markers=tuple(_decode_marker(project_id, record) for record in markers),
+        skipped=state['skipped_derived'],
+        prompt_coverage=PromptCoverage(
+            digest_since=fold.digest_since, roles_py_landings=state['roles_py_landings'],
+            counted_since=_UTC.decode(state['roles_py_since']), reason=state['roles_py_reason'],
+        ),
+        refreshed_at=parse_utc(state['refreshed_at']),
+    )
+    return StoredMarkerState(derived=derived, attempted_at=attempted_at, failure=failure)

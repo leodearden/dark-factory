@@ -33,6 +33,9 @@ from shared.project_layout import (
     scheduler_state_json,
     tasks_db,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ORCHESTRATOR_STORES = (
     (runs_db, 'runs.db'),

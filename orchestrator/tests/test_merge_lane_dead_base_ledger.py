@@ -95,5 +95,6 @@ class TestKillerWire:
     def test_site_vocabulary_is_closed(self) -> None:
         assert {site.value for site in DeadBaseSite} == {
             'head_failed', 'cascade_remerge', 'adoption_void', 'runner_unavailable',
-            'gate_rebased', 'dispatch_void', 'stale_discard',
+            'gate_rebased', 'gate_reanchor', 'gate_unlanded', 'dispatch_void',
+            'stale_discard', 'chain_released',
         }

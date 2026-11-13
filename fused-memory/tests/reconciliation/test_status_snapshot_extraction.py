@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.reconciliation.status_snapshot_extraction import (
     _ENUM_PREP_WORDS,
@@ -48,6 +49,8 @@ from reconciliation.plural_enum_shapes import (
     PRECISION_GUARD_SHAPES,
     SUBJECT_POSITIVE_SHAPES,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def test_extraction_module_imports_nothing_from_the_sweep():

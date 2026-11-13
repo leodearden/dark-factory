@@ -127,8 +127,13 @@ def _sentinel(task_id: str) -> str:
     return f'{ZERO_PROGRESS_SENTINEL_PREFIX}{task_id}'
 
 
-def _alarm_subject(esc_task_id: str) -> str | None:
-    """Return the real task id behind a :func:`_sentinel` id, else ``None``."""
+def _alarm_subject(esc_task_id: str | None) -> str | None:
+    """Return the real task id behind a :func:`_sentinel` id, else ``None``.
+
+    Also ``None`` for a record with no task_id.
+    """
+    if esc_task_id is None:
+        return None
     subject = esc_task_id.removeprefix(ZERO_PROGRESS_SENTINEL_PREFIX)
     if subject == esc_task_id or not subject:
         return None

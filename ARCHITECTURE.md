@@ -636,8 +636,16 @@ and are not restated here.
     below, a dead-filer L0 does not suppress that re-file.
   - **Both blocked-arm predicates** carry the `MERGE_REMEDIABLE_ESC_CATEGORIES`
     relaxation, so a record set made up entirely of `stranded_blocked`
-    records does not veto the merge it asks for. They differ on exactly one
-    input: a dead-filer L0 holds the done-flip but not the recovery.
+    records does not veto the merge it asks for. The recovery predicate
+    applies it only while no record needs a human
+    (`escalation/src/escalation/pins.py::needs_human`): a re-dispatch would
+    meet the workflow gate that stops on that record, and the off-main
+    verified-green submit goes straight to the merge queue and would merge
+    past it, which repend-PRD D4 stop-the-line forbids (task 6145). They differ
+    on exactly three inputs: a dead-filer L0 holds the done-flip but not the
+    recovery; a lone `preexisting_main_break` record holds the recovery but
+    not the on-main done-flip; and a human-held `stranded_blocked` record
+    holds the recovery but not the done-flip.
   - **Owned-record question.** `Harness._reconcile_one_stranded`'s re-file
     dedup asks `records_would_duplicate_a_handoff`, which counts a dead-filer
     L0 even though it does not pin: the orphan-L0 reaper will promote it, so a
@@ -675,7 +683,7 @@ and are not restated here.
   blocked-arm upgrade clauses would move again on the next sweep —
   `orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery`
   is False, because it is pinned only by merge-remediable `stranded_blocked`
-  records or only by dead-filer L0s — would not be at rest in `blocked`, so it
+  records that no human holds, or only by dead-filer L0s — would not be at rest in `blocked`, so it
   is held at `LEAVE` instead. The write is observe-before-enforce, gated by
   `convert_to_blocked_enforce`
   (`orchestrator/src/orchestrator/config.py::OrchestratorConfig`). With it

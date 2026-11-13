@@ -27,8 +27,8 @@ from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
 
 TASK = '5534'
-READS = ('get_pending_escalations', 'get_escalation', 'get_task_escalation_history')
-WRITES = ('escalate_info', 'escalate_blocker')
+READS = stores.GUARDED_READS
+WRITES = stores.GUARDED_WRITES
 GUARDED = READS + WRITES
 _FILING = {
     'task_id': TASK,
@@ -43,6 +43,7 @@ def arguments(name: str, escalation_id: str) -> dict[str, Any]:
         'get_pending_escalations': {'task_id': TASK},
         'get_escalation': {'escalation_id': escalation_id},
         'get_task_escalation_history': {'task_id': TASK},
+        'get_task_escalations': {'task_id': TASK},
         'escalate_info': _FILING,
         'escalate_blocker': _FILING,
     }

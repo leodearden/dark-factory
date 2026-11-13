@@ -7,8 +7,12 @@ call), with the server's lookup, paging and byte-budget semantics and task
 7178's ``include_rows`` widening. It prints its endpoint URL as the first
 stdout line, then serves until SIGTERM or SIGINT.
 
+An argument the tool does not declare is refused with fused-memory's
+``unknown_argument`` refusal (task 4867), before the required-argument check,
+as the real server's dispatch guard does.
+
 Flags, one per axis: ``--no-include-rows`` (the pre-widening server),
-``--reject-unknown-args`` (undeclared arguments refused, not dropped),
+``--drop-unknown-args`` (the pre-4867 server, which drops undeclared arguments),
 ``--byte-budget N``, ``--limit-cap N`` (the clamp on ``limit``; 0 is a server
 that reports ``has_more`` with no rows), ``--drop-row-key KEY``,
 ``--find-error TEXT`` (every lookup answers that tool error), ``--sse``
@@ -31,6 +35,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[5] / 'shared' / 'src'))
 
+from shared.mcp_unknown_arguments import unknown_argument_refusal
 from shared.task_statuses import TaskStatus
 
 _TASK_STATUSES = frozenset(s.value for s in TaskStatus)
@@ -40,10 +45,10 @@ DEFAULT_LIMIT = 50
 DEFAULT_BYTE_BUDGET = 48_000
 _KEY_PATTERN = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_-]*')
 _ROW_FIELDS = ('task_id', 'title', 'status', 'priority', 'updated_at')
-_FIND_PARAMS = frozenset({
+_FIND_PARAMS = (
     'project_root', 'key', 'value', 'statuses', 'limit', 'offset', 'tag', 'include_value',
-})
-_GET_TASK_PARAMS = frozenset({'id', 'project_root', 'tag'})
+)
+_GET_TASK_PARAMS = ('id', 'project_root', 'tag')
 _REQUIRED_PARAMS: Mapping[str, frozenset[str]] = {
     'find_tasks_by_metadata': frozenset({'project_root', 'key'}),
     'get_task': frozenset({'id', 'project_root'}),
@@ -55,7 +60,7 @@ class Behaviour:
     store: Path
     journal: Path | None
     include_rows: bool
-    reject_unknown_args: bool
+    drop_unknown_args: bool
     byte_budget: int
     limit_cap: int
     drop_row_key: str | None
@@ -221,19 +226,20 @@ _TOOLS: Mapping[str, _Tool] = {
 }
 
 
-def _declared_params(tool: str, behaviour: Behaviour) -> frozenset[str]:
+def _declared_params(tool: str, behaviour: Behaviour) -> tuple[str, ...]:
     if tool == 'get_task':
         return _GET_TASK_PARAMS
-    return _FIND_PARAMS | ({'include_rows'} if behaviour.include_rows else set())
+    return _FIND_PARAMS + (('include_rows',) if behaviour.include_rows else ())
 
 
 def _accepted_arguments(tool: str, arguments: Mapping[str, Any], behaviour: Behaviour) -> dict:
-    """Arguments as FastMCP's argument model sees them: undeclared ones dropped (extra='ignore')."""
+    """Arguments as the server's tool sees them, or the refusal it answers instead."""
     declared = _declared_params(tool, behaviour)
-    problems = [f'{name}\n  Extra inputs are not permitted [type=extra_forbidden]'
-                for name in sorted(set(arguments) - declared) if behaviour.reject_unknown_args]
-    problems += [f'{name}\n  Field required [type=missing]'
-                 for name in sorted(_REQUIRED_PARAMS[tool] - set(arguments))]
+    refusal = unknown_argument_refusal(tool, declared, arguments)
+    if refusal is not None and not behaviour.drop_unknown_args:
+        raise ToolValidationError(json.dumps(refusal))
+    problems = [f'{name}\n  Field required [type=missing]'
+                for name in sorted(_REQUIRED_PARAMS[tool] - set(arguments))]
     if problems:
         raise ToolValidationError(
             f'Error executing tool {tool}: {len(problems)} validation error(s) for '
@@ -343,7 +349,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument('--store', type=Path, required=True)
     parser.add_argument('--journal', type=Path)
     parser.add_argument('--no-include-rows', action='store_true')
-    parser.add_argument('--reject-unknown-args', action='store_true')
+    parser.add_argument('--drop-unknown-args', action='store_true')
     parser.add_argument('--byte-budget', type=int, default=DEFAULT_BYTE_BUDGET)
     parser.add_argument('--limit-cap', type=int, default=LIMIT_CAP)
     parser.add_argument('--drop-row-key')
@@ -356,7 +362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     behaviour = Behaviour(
         store=args.store.resolve(), journal=args.journal, include_rows=not args.no_include_rows,
-        reject_unknown_args=args.reject_unknown_args, byte_budget=args.byte_budget,
+        drop_unknown_args=args.drop_unknown_args, byte_budget=args.byte_budget,
         limit_cap=args.limit_cap, drop_row_key=args.drop_row_key, find_error=args.find_error,
         sse=args.sse,
     )

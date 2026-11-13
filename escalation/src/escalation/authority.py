@@ -39,9 +39,8 @@ done the check. The denylist (``L2_AUTO_CLOSE_DENY_CATEGORIES`` /
 ``L2_AUTO_CLOSE_DENY_ROLES``) is applied BEFORE the allowlist, guaranteeing
 the born-at-L2 human gates (the design_concern / milestone_gate /
 milestone_check_failed / milestone_check_stalled / curator_adjudication_missing
-categories, and the ``orchestrator-deterministic`` sentinel role) are never
-auto-closable even
-when a class predicate would otherwise match. That guarantee belongs to the
+/ review_due categories, and the ``orchestrator-deterministic`` sentinel role)
+are never auto-closable even when a class predicate would otherwise match. That guarantee belongs to the
 MCP ``resolve_issue`` path. Direct-queue paths also auto-close L2s, gated by
 MEMBERSHIP rather than by class, so the category denylist does not bind them:
 
@@ -162,10 +161,11 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # resolution text said the curator work was "deliberately NOT executed"). Like
 # 'milestone_check_failed' it is ALSO covered today by L2_AUTO_CLOSE_DENY_ROLES
 # (it files under agent_role='orchestrator-deterministic'), and is listed here
-# for that same defense-in-depth reason.
+# for that same defense-in-depth reason. 'review_due' is the runner-filed human
+# gate of a trigger chain, held for the same reason.
 #
 # Every member is spelled through the registry, so a misspelling fails at
-# import instead of silently ending the denial. The four RUNNER-FILED members
+# import instead of silently ending the denial. The five RUNNER-FILED members
 # are additionally held in lockstep with their named constants in
 # ``orchestrator.deterministic_runner`` by the function-local orchestrator
 # imports in ``tests/test_authority.py``, per the layer-direction rule in this
@@ -178,6 +178,8 @@ L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({
     # The stall escalation of a re-arming predicate (PRD completion-driven-triggers C1).
     EscalationCategory.MILESTONE_CHECK_STALLED,
     EscalationCategory.CURATOR_ADJUDICATION_MISSING,
+    # The human gate of a trigger chain (PRD completion-driven-triggers C4).
+    EscalationCategory.REVIEW_DUE,
 })
 
 # Agent roles that are NEVER auto-closable regardless of category/evidence —
@@ -226,16 +228,15 @@ class ClassSwitch(StrEnum):
 class PolicyAction(StrEnum):
     """Every act a policy row may authorise.
 
-    ``close_only``, ``resume`` and ``abandon`` are ``resolve_issue`` actions;
-    the rest are task-side or infra acts the executor performs before it
-    resolves. ``park`` and ``restart`` are absent on purpose: no class is ever
-    granted them. ``update_task_amendment`` is the shadow codec's existing
+    ``close_only`` and ``resume`` are ``resolve_issue`` actions; the rest are
+    task-side or infra acts the executor performs before it resolves.
+    ``park``, ``restart`` and ``abandon`` are absent on purpose: no class is
+    ever granted them. ``update_task_amendment`` is the shadow codec's existing
     spelling of "amend the task record", reused rather than re-coined.
     """
 
     CLOSE_ONLY = 'close_only'
     RESUME = 'resume'
-    ABANDON = 'abandon'
     DONE_FLIP = 'done_flip'
     UPDATE_TASK_AMENDMENT = 'update_task_amendment'
     ADD_DEPENDENCY = 'add_dependency'
@@ -244,6 +245,21 @@ class PolicyAction(StrEnum):
     B3_APPLY = 'b3_apply'
     REPLAY_DEAD_LETTERS = 'replay_dead_letters'
     REPROBE_QUARANTINE = 'reprobe_quarantine'
+
+
+# The acts the ratified skeleton counts as reversible
+# (docs/escalation-standing-policy.md '## Reversible actions').
+REVERSIBLE_POLICY_ACTIONS: frozenset[PolicyAction] = frozenset({
+    PolicyAction.CLOSE_ONLY,
+    PolicyAction.RESUME,
+    PolicyAction.ADD_DEPENDENCY,
+    PolicyAction.UPDATE_TASK_AMENDMENT,
+    PolicyAction.FILE_TASK,
+})
+
+# Not reversible, but stampable under a named waiver (Leo, 2026-11-04;
+# plans/decision-stream-prd.md §3 decision 7).
+REVERSIBILITY_WAIVED_ACTIONS: frozenset[PolicyAction] = frozenset({PolicyAction.DONE_FLIP})
 
 
 _RESOLVE_ACTIONS: frozenset[str] = frozenset(action for action, _, _ in ACTION_EFFECTS)
@@ -317,8 +333,8 @@ class PolicyRow:
 
     @property
     def reversible(self) -> bool:
-        """False only for a done flip (waived, Leo 2026-11-04; PRD §3 decision 7)."""
-        return PolicyAction.DONE_FLIP not in self.actions
+        """True iff every act the row allows is reversible; a waived act does not make a row reversible."""
+        return self.actions <= REVERSIBLE_POLICY_ACTIONS
 
     @property
     def audit_full_until(self) -> int:
@@ -410,14 +426,14 @@ _MOVED_ROWS: tuple[PolicyRow, ...] = (
         _actions(_A.UPDATE_TASK_AMENDMENT, _A.CLOSE_ONLY),
         (_any_of(_TASK_CITE), _any_of(r'status\s*[=:]\s*pending'), _any_of(r'\bappend')),
     ),
-    # Item 11, class 1a's TRUE arm.
+    # Class 1a's TRUE arm closes the gate record, as humans always did (Leo,
+    # 2026-11-09, sitting item 522). Item 11, cancelling the router-spawned
+    # task, has no row and stays interactive-only: docs/escalation-standing-policy.md
+    # '## First-tranche candidate classes' says why.
     PolicyRow(
         'completion_claim_true', _categories(_C.UNVERIFIED_COMPLETION_CLAIM),
-        _actions(_A.ABANDON),
-        (
-            _any_of(r'status\s*[=:]\s*done'), _any_of(*_ANCESTOR),
-            _any_of(r'no dependents'), _any_of(r'rev-list\s+--count'),
-        ),
+        _actions(_A.CLOSE_ONLY),
+        (_any_of(r'status\s*[=:]\s*done'), _any_of(_SHA), _any_of(*_ANCESTOR)),
     ),
     # The three task-2630 carve-out classes; L2_AUTO_CLOSE_ALLOWLIST below
     # orders them for the auto-watcher.

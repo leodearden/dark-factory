@@ -31,14 +31,14 @@ from _mcp_transport_harness import (
     RecordingMcpServer,
 )
 from _mcp_url_scan import SweepFindings, sweep_source
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.workflow import TaskWorkflow
 
 # The repo-wide sweep guard below ast.parses every swept *.py, so this module
 # is a member of the whole-tree-scanner family whose ceiling
 # test_whole_tree_scan_timeout_guard.py enforces (see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py).
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 

@@ -45,6 +45,7 @@ assertions here fail in that case.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import re
@@ -56,6 +57,7 @@ import pytest
 import pytest_asyncio
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from _graphiti_fake import FakeGraphitiClient
+from _queued_write_fixtures import queued
 from _unreached_provider import skip_if_provider_unreached
 
 from fused_memory.backends.graphiti_client import (
@@ -66,6 +68,7 @@ from fused_memory.backends.graphiti_client import (
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
+from fused_memory.services.queued_writes import QueuedEpisodeWrite
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -106,10 +109,12 @@ async def svc_fake_registry(svc_and_fake, tmp_path):
     await reg.close()
 
 
-def _enqueued_payload(svc) -> dict[str, Any]:
-    """The payload ``add_episode`` handed to the durable queue."""
+def _enqueued_value(svc) -> QueuedEpisodeWrite:
+    """The value ``add_episode`` handed to the durable queue."""
     svc.durable_queue.enqueue.assert_called_once()
-    return svc.durable_queue.enqueue.call_args[1]['payload']
+    value = svc.durable_queue.enqueue.call_args.args[0]
+    assert isinstance(value, QueuedEpisodeWrite)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +143,10 @@ class TestAddEpisodeWriteReachesTheGraph:
         content = 'Task 165 depends on Task 166'
 
         await svc.add_episode(content=content, project_id='p')
-        payload = _enqueued_payload(svc)
+        value = _enqueued_value(svc)
 
         # Must not raise — this is the 304-attempt/0-success production failure.
-        await svc._execute_graphiti_write('add_episode', payload)
+        await svc._execute_graphiti_write(value)
 
         assert len(fake.episodes) == 1, (
             'Exactly one episode node should have been created in the graph; '
@@ -162,7 +167,7 @@ class TestAddEpisodeWriteReachesTheGraph:
         svc, fake = svc_and_fake
 
         await svc.add_episode(content='some episode', project_id='p')
-        await svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
+        await svc._execute_graphiti_write(_enqueued_value(svc))
 
         assert len(fake.calls) == 1
         assert fake.calls[0]['uuid'] is None, (
@@ -192,7 +197,7 @@ class TestPlanningRegistrationKeysOnTheRealUuid:
             project_id='p',
             temporal_context='planning',
         )
-        await svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
+        await svc._execute_graphiti_write(_enqueued_value(svc))
 
         assert len(fake.episodes) == 1
         minted_uuid = next(iter(fake.episodes))
@@ -255,11 +260,12 @@ class TestLegacyPayloadDrainedAfterTheFix:
         svc, fake = svc_and_fake
         payload = _pre_fix_payload()
         expected_content = payload['content']
+        value = queued('add_episode', payload)
 
         with caplog.at_level(logging.WARNING):
             # Must not raise: the stale uuid names no node, so forwarding it
             # would be NodeNotFoundError all over again.
-            await svc._execute_graphiti_write('add_episode', payload)
+            await svc._execute_graphiti_write(value)
 
         assert len(fake.episodes) == 1, (
             "The legacy row's episode must still be written, not silently "
@@ -280,13 +286,10 @@ class TestLegacyPayloadDrainedAfterTheFix:
             'The backend must be reached with uuid=None even when the payload '
             f'carries a legacy one; got {fake.calls[0]["uuid"]!r}'
         )
-        # The stated reason execution POPS rather than GETS: `_dual_write_callback`
-        # receives this same dict, so a key left in place would leak onward to a
-        # consumer that has no reason to expect a dead uuid. Pinned here because
-        # `get` would satisfy every other assertion in this test.
-        assert 'uuid' not in payload, (
-            "The legacy key must be POPPED from the payload, not merely ignored, "
-            f'so it cannot leak onward; still holds {payload.get("uuid")!r}'
+        assert not hasattr(value, 'uuid')
+        assert 'uuid' not in json.loads(value.to_json()), (
+            'The legacy key must not survive decoding, so it cannot leak onward '
+            'to a consumer that has no reason to expect a dead uuid'
         )
 
     @pytest.mark.asyncio
@@ -297,7 +300,7 @@ class TestLegacyPayloadDrainedAfterTheFix:
         svc, fake = svc_and_fake
 
         with caplog.at_level(logging.WARNING):
-            await svc._execute_graphiti_write('add_episode', _pre_fix_payload())
+            await svc._execute_graphiti_write(queued('add_episode', _pre_fix_payload()))
 
         warnings = [
             r.getMessage()
@@ -330,9 +333,7 @@ class TestLegacyPayloadDrainedAfterTheFix:
         svc, fake = svc_and_fake
 
         with caplog.at_level(logging.WARNING):
-            await svc._execute_graphiti_write(
-                'add_episode', _pre_fix_payload(uuid=None)
-            )
+            await svc._execute_graphiti_write(queued('add_episode', _pre_fix_payload(uuid=None)))
 
         # 'Ignoring legacy', not the bare word 'legacy': the payload's group_id
         # is literally 'legacy-group', so any unrelated warning naming the group
@@ -365,9 +366,7 @@ class TestLegacyPayloadDrainedAfterTheFix:
         """
         svc, fake, reg = svc_fake_registry
 
-        await svc._execute_graphiti_write(
-            'add_episode', _pre_fix_payload(temporal_context='planning')
-        )
+        await svc._execute_graphiti_write(queued('add_episode', _pre_fix_payload(temporal_context='planning')))
 
         assert len(fake.episodes) == 1
         (minted_uuid,) = fake.episodes
@@ -440,7 +439,7 @@ class TestDegenerateResultNeverRegistersSilently:
         with caplog.at_level(logging.WARNING):
             # Must not raise — preserves the existing no-crash contract
             # (test_execute_graphiti_write_none_result_no_crash).
-            await svc._execute_graphiti_write('add_episode', _planning_payload())
+            await svc._execute_graphiti_write(queued('add_episode', _planning_payload()))
 
         register_spy.assert_not_called()
 
@@ -473,9 +472,7 @@ class TestDegenerateResultNeverRegistersSilently:
         reg.register = register_spy  # type: ignore[method-assign]
 
         with caplog.at_level(logging.WARNING):
-            await svc._execute_graphiti_write(
-                'add_episode', _planning_payload(temporal_context=None)
-            )
+            await svc._execute_graphiti_write(queued('add_episode', _planning_payload(temporal_context=None)))
 
         register_spy.assert_not_called()
         offenders = [
@@ -525,8 +522,8 @@ class TestEpisodeIdIsACorrelationId:
                 project_id='p',
                 temporal_context='planning',
             )
-            payload = _enqueued_payload(svc)
-            await svc._execute_graphiti_write('add_episode', dict(payload))
+            value = _enqueued_value(svc)
+            await svc._execute_graphiti_write(value)
 
         # (a) A caller or log reader can tell at a glance it is not a node uuid.
         assert response.episode_id.startswith('corr_'), (
@@ -535,17 +532,16 @@ class TestEpisodeIdIsACorrelationId:
         )
 
         # (b) It travels on a key that can never reach graphiti_core.
-        assert payload['correlation_id'] == response.episode_id
-        assert 'uuid' not in payload, (
-            "The enqueue payload must carry no 'uuid' key at all; got "
-            f'{payload.get("uuid")!r}'
+        assert value.correlation_id == response.episode_id
+        assert 'uuid' not in json.loads(value.to_json()), (
+            "The enqueued value must carry no 'uuid' key on the wire"
         )
 
         # (c) Episode NAMES in the graph are unaffected by the demotion — the
         # name stays derived from the raw uuid4, not from 'corr_...'.
-        assert _EPISODE_NAME_RE.match(payload['name']), (
+        assert _EPISODE_NAME_RE.match(value.name), (
             "Episode name must stay 'episode_<8 hex>' off the RAW uuid4, so the "
-            f'prefix does not leak into the graph; got {payload["name"]!r}'
+            f'prefix does not leak into the graph; got {value.name!r}'
         )
 
         # (d) The two identities are provably distinct, and the registry holds
@@ -573,9 +569,7 @@ class TestEpisodeIdIsACorrelationId:
 
         with caplog.at_level(logging.INFO):
             response = await svc.add_episode(content='an episode', project_id='p')
-            await svc._execute_graphiti_write(
-                'add_episode', dict(_enqueued_payload(svc))
-            )
+            await svc._execute_graphiti_write(_enqueued_value(svc))
 
         minted_uuid = next(iter(fake.episodes))
         tying = [
@@ -605,9 +599,7 @@ class TestEpisodeIdIsACorrelationId:
         svc, fake = svc_and_fake
 
         with caplog.at_level(logging.INFO):
-            await svc._execute_graphiti_write(
-                'add_memory_graphiti', _pre_fix_payload(uuid=None)
-            )
+            await svc._execute_graphiti_write(queued('add_memory_graphiti', _pre_fix_payload(uuid=None)))
 
         assert len(fake.episodes) == 1, 'the write itself must still happen'
         stray = [
@@ -644,7 +636,7 @@ async def _execute_planning_round_trip(
     await svc.add_episode(
         content=content, project_id='p', temporal_context=temporal_context
     )
-    await svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
+    await svc._execute_graphiti_write(_enqueued_value(svc))
 
     assert len(fake.episodes) == 1
     return next(iter(fake.episodes)), edge
@@ -925,7 +917,7 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
         # The real production route: enqueue, then execute the queued payload.
         await svc.add_episode(content=_LIVE_CONTENT, project_id=graph_name)
         result = await skip_if_provider_unreached(
-            svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
+            svc._execute_graphiti_write(_enqueued_value(svc))
         )
 
         real_uuid = result.episode.uuid

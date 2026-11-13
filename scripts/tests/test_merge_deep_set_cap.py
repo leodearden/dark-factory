@@ -44,6 +44,9 @@ from config_reload_script_fakes import (
     venvless_checkout_copy,
 )
 from merge_queue_fakes import FakeMergeQueue, assert_target_checkout_clean, deploy_tmpdir_env
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / "merge-deep-set-cap.sh"
 KNOB = "merge_deep.chain_cap"

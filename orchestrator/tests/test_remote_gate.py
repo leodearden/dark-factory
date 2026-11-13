@@ -22,7 +22,8 @@ import shlex
 import signal
 import subprocess
 import time
-from collections.abc import Awaitable, Callable
+import typing
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -81,12 +82,13 @@ FAKE_FINGERPRINT = 'a' * 64
 def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     """A changed vector means a wire shape changed: re-pin it deliberately.
 
-    ``fused-memory/scripts/check_bare_magicmock_config.py`` keeps a second,
-    exhaustive copy of ``VerifyResult``'s field list for its mock-shape rule;
-    a field change must update it too (folding the two is a follow-up).
+    The Rule B mock-shape registry
+    (``fused-memory/scripts/check_bare_magicmock_config.py::_DATACLASS_SHAPES``)
+    derives ``VerifyResult``'s fields from the same class definition, so a field
+    change re-pins only this vector.
     """
     assert wire_fingerprint(wire_classes()) == (
-        '3076fb1cad4f7b75b1c1671568bcb88b1eba726d7c1ffcec5522a10ca5002605'
+        'b1e6ef47df4f6703fccf60fb9bef8c546270ede27f9daa25688147c06011e410'
     )
 
 
@@ -130,6 +132,77 @@ def test_class_order_does_not_matter():
 def test_local_gate_identity_pairs_the_sha_with_this_process_fingerprint():
     identity = local_gate_identity('1' * 40)
     assert identity == GateIdentity('1' * 40, wire_fingerprint(wire_classes()))
+
+
+def _component_types(tp: object) -> list[object]:
+    """*tp*'s origin and arguments, with a Callable's parameter list flattened."""
+    origin = typing.get_origin(tp)
+    args = [a for arg in typing.get_args(tp) for a in (arg if isinstance(arg, list) else [arg])]
+    return args if origin is None else [origin, *args]
+
+
+def _nested_dataclasses(cls: type) -> dict[str, frozenset[type]]:
+    hints = typing.get_type_hints(cls)
+    nested: dict[str, frozenset[type]] = {}
+    for f in dataclasses.fields(cls):
+        found: set[type] = set()
+        stack: list[object] = [hints[f.name]]
+        while stack:
+            tp = stack.pop()
+            if isinstance(tp, type) and dataclasses.is_dataclass(tp):
+                found.add(tp)
+            else:
+                stack.extend(_component_types(tp))
+        if found:
+            nested[f.name] = frozenset(found)
+    return nested
+
+
+def test_nested_dataclass_walk_sees_through_optional_tuple_and_mapping():
+    inner = _one_class('Inner', ('x', int))
+    outer = _one_class(
+        'Outer',
+        ('maybe', inner | None),
+        ('many', tuple[inner, ...]),
+        ('by_id', Mapping[str, inner]),
+        ('plain', str),
+    )
+    assert _nested_dataclasses(outer) == {'maybe': {inner}, 'many': {inner}, 'by_id': {inner}}
+
+
+_T = typing.TypeVar('_T')
+
+
+@dataclass
+class _Box(typing.Generic[_T]):
+    x: _T
+
+
+def test_nested_dataclass_walk_sees_a_generic_dataclass_and_a_callable_parameter():
+    inner = _one_class('Inner', ('x', int))
+    outer = _one_class(
+        'Outer',
+        ('parameterised', _Box[int]),
+        ('hook', Callable[[inner], None]),
+    )
+    assert _nested_dataclasses(outer) == {'parameterised': {_Box}, 'hook': {inner}}
+
+
+def test_every_dataclass_nested_in_a_wire_class_is_a_wire_class():
+    """A nested shape outside wire_classes() could change without moving the fingerprint."""
+    wire = set(wire_classes())
+    unlisted = sorted(
+        f'{cls.__qualname__}.{name} -> {nested.__module__}.{nested.__qualname__}'
+        for cls in wire
+        for name, found in _nested_dataclasses(cls).items()
+        for nested in found - wire
+    )
+    assert unlisted == [], (
+        'a dataclass nested in a wire class\'s fields is wire shape the fingerprint '
+        'does not hash: add it to '
+        'orchestrator/src/orchestrator/remote_gate.py::wire_classes and re-pin '
+        'test_wire_fingerprint_is_pinned_for_todays_wire_classes'
+    )
 
 
 # ---------------------------------------------------------------------------

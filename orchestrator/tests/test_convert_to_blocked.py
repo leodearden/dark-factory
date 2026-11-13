@@ -1241,7 +1241,7 @@ async def _land_via_merge(
     """Commit *paths_content* on *branch*, then no-ff merge it into *main*.
 
     The merge subject defaults to the canonical ``Merge <branch> into <main>``
-    that ``git_ops._merge_subject`` derives and ``find_merge_marker`` greps
+    that ``shared.merge_subject.format_merge_subject`` derives (git_ops' writer) and ``find_merge_marker`` greps
     for — writer and reader share one derivation in production, and this
     helper reproduces that exact string so the probe under test is exercised
     against the real format rather than a paraphrase.  Returns the merge SHA.

@@ -16,9 +16,21 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from typing import Generic, TypeVar
+from unittest.mock import AsyncMock
 
 import pytest
-from _workflow_helpers import PLAN, AgentStub, FakeBriefing
+from _curator_fake import FakeCurator
+from _info_l0_router_fixtures import PASSED, TASK_ID, run_config
+from _info_l0_router_fixtures import assignment as _assignment
+from _workflow_helpers import (
+    PLAN,
+    AgentStub,
+    FakeBriefing,
+    _build_workflow_with_escalation,
+    _init_repo,
+    _make_git_ops,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
@@ -31,14 +43,13 @@ from test_plan_revalidation_skip import (
     _scripted_architect,
     _wipe_to,
 )
-from test_reviewer_note_dispositions import TASK_ID, _assignment, _WorkflowRun
 from test_workflow_e2e import ReplanningReviewStub
 from test_workflow_prompt_builder import _PLAN_RENDERING_SITES, _TASK_ID, _render_calls
 
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.escalation_rulings import Ruling
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -84,6 +95,7 @@ class _RulingRecordingBriefing(FakeBriefing):
         rebase_notice: dict | None = None, task_id: str | None = None,
         wip_notice: list[dict] | None = None,
         *, rulings: Sequence[Ruling] = (),
+        scope_drift=None,
     ) -> str:
         self._record('build_implementer_prompt', rulings)
         return await super().build_implementer_prompt(plan, context)
@@ -139,6 +151,39 @@ class _FlakyReviewerStub(AgentStub):
 def _declared_simple(assignment: TaskAssignment) -> TaskAssignment:
     metadata = {**assignment.task['metadata'], 'complexity': 'simple'}
     return replace(assignment, task={**assignment.task, 'metadata': metadata})
+
+
+_Recorder = TypeVar('_Recorder', bound=FakeBriefing)
+
+
+class _WorkflowRun(Generic[_Recorder]):
+    """A real ``TaskWorkflow.run()`` of *assignment* in a fresh repo: *stub* answers every agent, *recorder* every briefing."""
+
+    def __init__(
+        self, tmp_path: Path, monkeypatch, stub: AgentStub, recorder: _Recorder,
+        assignment: TaskAssignment, *, briefing: ReviewBriefing, router_enabled: bool,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_repo(repo)
+        config = run_config(repo, briefing=briefing, router_enabled=router_enabled)
+        self.workflow, _scheduler, self.queue = _build_workflow_with_escalation(
+            config, _make_git_ops(config.project_root), assignment, stub, tmp_path,
+        )
+        self.briefing = recorder
+        self.workflow.briefing = recorder
+        self._monkeypatch = monkeypatch
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', AsyncMock(return_value=PASSED),
+        )
+        self.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        self.workflow.event_store = self.event_store
+        self.curator = FakeCurator()
+        self.workflow.scheduler.dispatch_tool = self.curator
+
+    async def run(self) -> WorkflowOutcome:
+        return (await self.workflow.run()).outcome
 
 
 class _FullRun(_WorkflowRun[_RulingRecordingBriefing]):

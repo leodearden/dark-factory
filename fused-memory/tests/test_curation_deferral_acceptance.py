@@ -39,6 +39,7 @@ from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit
 from shared.project_layout import escalation_queue_dir
 from shared.usage_gate import UsageGate
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
 from fused_memory.middleware.candidate_key import normalize_title
@@ -57,6 +58,8 @@ from fused_memory.middleware.ticket_janitor import TicketJanitor, curation_backl
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _build_ticket_janitor
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ROOT = '/project'
 PROJECT_ID = 'project'

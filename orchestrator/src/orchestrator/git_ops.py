@@ -67,7 +67,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict, TypeGuard
 
+from shared.branch_names import canonical_queued_branch_name
 from shared.git_async import run_git
+from shared.merge_subject import (
+    MergeSubject,
+    format_merge_subject,
+    merge_subject_pattern,
+    parse_merge_subject,
+)
 from shared.proc_group import (
     reap_process_groups,
     scan_process_groups_under_path,
@@ -394,8 +401,11 @@ class TrainStackResult:
 #     after a colon: ``impl(50): xyz`` / ``fix(50): xyz`` / ``test(50: ...)``.
 #   - Subjects that mention the task branch directly: ``... task/50 ...``
 #     anywhere in the subject line.
-#   - The canonical no-ff merge subject ``Merge task/50 into <main>`` produced
-#     by ``merge_to_main``.
+#   - The ``{merge_subject}`` slot: the landing subject ``merge_to_main``
+#     writes, rendered by ``render_citation_pattern`` from
+#     ``shared/src/shared/merge_subject.py::merge_subject_pattern`` with the
+#     configured ``branch_prefix``/``main_branch`` and anchored to the whole
+#     subject line.
 #   - Prefix-independent, unanchored paren citations anywhere in the
 #     subject (task 2870): ``(50)`` and ``(#50)`` (via ``\(#?{tid}\)``) and
 #     ``(task 50)`` (via ``\(task {tid}\)``). These are NOT tied to the
@@ -413,7 +423,7 @@ class TrainStackResult:
 #     ``({tid})`` arm is deliberately NOT widened: ``(30 s)`` / ``(3 files)``
 #     is the task-4705 false-positive class.
 #
-# The ``{tid}`` placeholder is interpolated via ``str.format`` with the
+# ``render_citation_pattern`` fills the ``{tid}`` placeholder with the
 # escaped task id; a ``\b`` (word boundary) at each side of the
 # conventional-commit / ``task/{tid}`` alternatives blocks substring overlap
 # so ``task/3399`` doesn't match a row that cites ``task/339``. The paren
@@ -427,8 +437,8 @@ class TrainStackResult:
 # and bare ``({tid})`` alternatives assume a parenthesized number in a
 # subject on main is ALWAYS a task citation in THIS repo — never a GitHub
 # PR number, squash-merge suffix, or trailing issue number. This holds
-# because dark-factory's merge worker writes the canonical
-# ``Merge task/{tid} into <main>`` subject (see ``merge_to_main``), not a
+# because dark-factory's merge worker writes the landing subject of
+# ``shared.merge_subject`` (see ``merge_to_main``), not a
 # GitHub-style ``(#PR)`` squash suffix, and the repo does not take PR
 # merges. The assumption matters because relaxing the FIX-2 bidirectional
 # lineage guard (task 2870) left the FIX-1' effect-present check as the SOLE
@@ -447,8 +457,8 @@ class TrainStackResult:
 # Subject-only (task 2675 FIX 2): this pattern is written with ``^``
 # anchors as if applied to a single SUBJECT line, but git's ``--grep``
 # applies ``^``/``$`` per LINE across the whole commit message — a BODY
-# line that happens to start with a conventional-commit token, or with
-# ``Merge task/{tid} into ``, or that carries a bare paren citation like
+# line that happens to start with a conventional-commit token, or that is
+# a landing subject, or that carries a bare paren citation like
 # ``(#50)``, would otherwise false-cite.
 # ``find_task_citation_commit`` uses ``--grep`` only as a coarse
 # full-message PRE-filter (a sound superset) and then re-applies this
@@ -461,24 +471,39 @@ class TrainStackResult:
 DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'(\(\b{tid}\b([):]|[ ,/][^)]*\))|.*\btask/{tid}\b)'
-    r'|^Merge task/{tid} into '
+    r'|{merge_subject}'
     r'|\(#?{tid}\)'
     r'|\(task {tid}([ ,/][^)]*)?\)'
 )
 
 
-def task_citation_pattern(tid: str, pattern_template: str | None = None) -> str | None:
-    """*tid*'s citation regex, valid as both git ERE and Python ``re``; None when *pattern_template* is ``''`` (opted out).
+def render_citation_pattern(template: str, tid: str, *, branch_prefix: str, main_branch: str) -> str:
+    """Fill a citation template's ``{tid}`` and ``{merge_subject}`` slots; the merge slot is the anchored whole-line landing subject for the configured naming."""
+    return template.format(
+        tid=re.escape(tid),
+        merge_subject=merge_subject_pattern(
+            branch_prefix=branch_prefix, task_id=tid, main_branch=main_branch,
+        ),
+    )
+
+
+def task_citation_pattern(
+    tid: str, pattern_template: str | None = None, *, branch_prefix: str, main_branch: str,
+) -> str | None:
+    """*tid*'s citation regex for the configured naming, valid as both git ERE and Python ``re``; None when *pattern_template* is ``''`` (opted out).
 
     Raises :class:`CitationPatternInvalid` when the template does not render
     for *tid* (a literal brace such as an ERE ``{2}`` quantifier is a format
-    field) or renders to something Python ``re`` cannot compile.
+    field, and a *tid* no branch can name has no merge subject) or renders to
+    something Python ``re`` cannot compile.
     """
     template = pattern_template if pattern_template is not None else DEFAULT_COMMIT_CITATION_PATTERN
     if template == '':
         return None
     try:
-        pattern = template.format(tid=re.escape(tid))
+        pattern = render_citation_pattern(
+            template, tid, branch_prefix=branch_prefix, main_branch=main_branch,
+        )
         re.compile(pattern)
     except (KeyError, IndexError, ValueError, AttributeError, TypeError, re.error) as exc:
         raise CitationPatternInvalid(template) from exc
@@ -994,12 +1019,12 @@ def classify_worktree_entry(name: str) -> WorktreeClass:
         * everything else                => ``'task'`` — the task-id-shaped
           namespace the sweep/reaper may act on.
 
-    WARNING — adoptable warm/spec lanes (``_lane-`` / ``_spec-``) are
-    ``_``-prefixed, so this classifier labels them ``'infra'``.  They are
-    NOT infra: they carry recoverable task work and have their own
-    adopt/release/quarantine handling.  Every caller MUST therefore check
-    ``pool.is_lane()`` (warm AND spec pools) FIRST and only consult this
-    classifier for non-lane entries.
+    WARNING — only ``_lane-`` warm lanes carry recoverable task work, yet
+    they are labelled ``'infra'``: a caller that adopts warm lanes MUST check
+    ``warm_lane_pool.is_lane()`` first.  ``_spec-`` lanes carry none, so
+    ``'infra'`` is right for them (owner: the merge worker's spec pool,
+    PROTECTED_PREFIXES ``'_spec-'``); a caller may still skip them earlier
+    through ``spec_warm_lane_pool.is_lane()``.
 
     Fail-safe direction: a mis-shaped task name is left alone / leaked
     (recoverable by an operator), never destroyed.
@@ -1515,28 +1540,6 @@ _EFFECT_PROBE_TRANSIENT_FAILURES = frozenset({
 _MERGE_MARKER_INDEX_RECHECK_SECS = 2.0
 
 
-@functools.lru_cache(maxsize=8)
-def _merge_marker_pattern(main_branch: str) -> re.Pattern[str]:
-    """Compile the regex that recovers a branch name from a merge marker.
-
-    DERIVED FROM ``git_ops.py::_merge_subject`` rather than hand-written, so the
-    marker index and the merge-commit writer can never drift apart — the same
-    single-source-of-truth property that ``find_merge_marker``'s original
-    ``--grep`` spelling had by construction.  A sentinel is substituted for the
-    branch, then split back out, so only ``_merge_subject`` decides the literal
-    format.
-
-    The capture is ``\\S+`` because a git branch name can never contain
-    whitespace.  The pattern is ANCHORED: a commit is a marker only when its
-    SUBJECT is exactly the merge subject, so a body quote, a ``Revert "..."``
-    subject or a suffixed subject is not a marker (task 5765).
-    """
-    sentinel = '\x00BRANCH\x00'
-    template = _merge_subject(sentinel, main_branch)
-    prefix, _, suffix = template.partition(sentinel)
-    return re.compile(r'\A' + re.escape(prefix) + r'(\S+)' + re.escape(suffix) + r'\Z')
-
-
 #: The ``git log`` output shape :func:`_merge_markers_by_branch` parses.
 _MERGE_MARKER_LOG_FORMAT: tuple[str, ...] = ('-z', '--format=%H%x1f%s')
 
@@ -1546,14 +1549,18 @@ def _merge_markers_by_branch(log_output: str, main_branch: str) -> dict[str, str
     :data:`_MERGE_MARKER_LOG_FORMAT`.  ``git log`` walks newest-first, so
     ``setdefault`` keeps the most recent marker of a branch merged more than
     once (measured: ``task/958``, ``task/924`` and ``task/791`` each twice).
+
+    A marker's SUBJECT is exactly a landing into *main_branch*, read by
+    ``shared/src/shared/merge_subject.py::parse_merge_subject``, so a body
+    quote, a ``Revert "..."`` subject or a suffixed subject is not a marker
+    (task 5765).
     """
-    pattern = _merge_marker_pattern(main_branch)
     markers: dict[str, str] = {}
     for record in log_output.split('\0'):
         sha, _, subject = record.partition('\x1f')
-        match = pattern.match(subject)
-        if match:
-            markers.setdefault(match.group(1), sha.strip())
+        match parse_merge_subject(subject):
+            case MergeSubject(branch=branch, main_branch=target) if target == main_branch:
+                markers.setdefault(branch, sha.strip())
     return markers
 
 
@@ -1721,10 +1728,12 @@ class GitQueryFailed(RuntimeError):
 
 
 class CitationPatternInvalid(ValueError):
-    """A citation pattern does not render to a valid Python ``re``: a caller's error, not git's."""
+    """A citation lookup's pattern does not render for its task id, or is not a valid Python ``re``: a caller's error, not git's."""
 
     def __init__(self, pattern: str) -> None:
-        super().__init__(f'citation pattern does not render to a valid Python re: {pattern!r}')
+        super().__init__(
+            f'citation pattern does not render for the task id or is not a valid Python re; raising: {pattern!r}'
+        )
         self.pattern = pattern
 
 
@@ -2810,18 +2819,6 @@ def _git_stderr_is_unresolved_ref(stderr: str) -> bool:
             'not a valid object name',
         )
     )
-
-
-def _merge_subject(branch: str, main_branch: str) -> str:
-    """Return the canonical subject line for a no-ff merge of *branch* into *main_branch*.
-
-    Single source of truth for the merge commit subject format consumed by
-    ``find_merge_marker``, ``merge_to_main``, and the retry path in
-    ``advance_main``.  Changing this function is the one place where the
-    format needs to be updated — all three consumers will automatically
-    use the new format.
-    """
-    return f'Merge {branch} into {main_branch}'
 
 
 def _merge_worktree_remove_argv(path: Path) -> list[str]:
@@ -9698,10 +9695,21 @@ class GitOps:
         so both tasks diffed against the same main share BASE coordinates that
         are directly comparable for stackability.
 
+        *ref* may be a bare task id or an already-prefixed branch name; it is
+        canonicalised through
+        ``shared/src/shared/branch_names.py::canonical_queued_branch_name`` so a
+        bare id can never be resolved by git as an abbreviated commit SHA.
+
         Returns an empty dict when the diff is empty (no changes vs main).
+
+        Raises:
+            GitQueryFailed: the diff could not be computed (for example a
+                missing ref), naming the command (and so the ref), the exit code and
+                stderr.
         """
-        _, diff, _ = await _run(
-            ['git', 'diff', f'{self.config.main_branch}...{ref}',
+        branch = canonical_queued_branch_name(ref, self.config.branch_prefix)
+        diff = await _git_query(
+            ['git', 'diff', f'{self.config.main_branch}...{branch}',
              '--unified=0', '--no-color'],
             cwd=self.project_root,
         )
@@ -9860,8 +9868,7 @@ class GitOps:
     async def find_merge_marker(
         self, branch: str, *, gate_on_existing_ref: bool = True,
     ) -> str | None:
-        """Search main's history for a merge commit whose subject matches
-        ``Merge {branch} into {main_branch}``.
+        """Search main's history for a merge commit whose subject is *branch*'s landing.
 
         This is the companion check to ``is_ancestor`` for the case where the
         branch ref has already been deleted (e.g., ``cleanup_worktree`` ran
@@ -9883,13 +9890,14 @@ class GitOps:
         off the branch, not the task id).
 
         **Marker rule**: a marker is a commit on main whose git subject
-        (``%s``) EQUALS ``_merge_subject(branch, self.config.main_branch)``.
-        The body is never read, so prose quoting a marker is not a landing
-        (task 5765).  The parent count is not checked, because a real landing
-        can be single-parent.  ``merge_to_main`` and ``advance_main``'s retry
-        path write that same ``_merge_subject``, so writer and reader cannot
-        drift apart, and substring safety (``task/1`` vs ``task/10``) follows
-        from equality.
+        (``%s``) EQUALS
+        ``shared/src/shared/merge_subject.py::format_merge_subject(branch,
+        self.config.main_branch)``.  The body is never read, so prose quoting
+        a marker is not a landing (task 5765).  The parent count is not
+        checked, because a real landing can be single-parent.
+        ``merge_to_main`` and ``advance_main``'s retry path write that same
+        subject, so writer and reader cannot drift apart, and substring safety
+        (``task/1`` vs ``task/10``) follows from equality.
 
         **Lookup is indexed, not re-scanned.** The search half delegates to
         :meth:`_lookup_merge_marker`, which builds one branch→sha map per main
@@ -10014,8 +10022,8 @@ class GitOps:
         """Search main's history for a commit whose SUBJECT cites *tid*.
 
         The fail-safe face of :meth:`find_task_citation_commit_checked`: a git
-        failure or an override that does not render to a valid Python ``re``
-        reads as no citation.
+        failure, an uncompilable override or a *tid* no branch can name reads
+        as no citation.
 
         Used by the reconciler to gate the ``is_ancestor==True`` fast-path:
         ``is_ancestor`` returns True trivially for zero-commit branches
@@ -10026,8 +10034,8 @@ class GitOps:
         Matching is constrained to each candidate commit's SUBJECT line
         only (task 2675 FIX 2): git's ``--grep`` applies ``^``/``$`` per
         LINE across the whole commit message, so a BODY line that merely
-        happens to start with a conventional-commit token, or with
-        ``Merge task/{tid} into ``, would otherwise false-cite.  ``--grep``
+        happens to start with a conventional-commit token, or that is a
+        landing subject, would otherwise false-cite.  ``--grep``
         is used only as a coarse, uncapped full-message PRE-filter (a
         sound superset — any subject match is necessarily a message
         match); each candidate's subject is then re-tested against the
@@ -10050,9 +10058,10 @@ class GitOps:
         message-matches), but no such cap is applied here.
 
         Args:
-            tid: Bare task id (no ``task/`` prefix); the prefix is added
-                by the default pattern where appropriate.
-            pattern_template: Optional override for the citation pattern.
+            tid: Bare task id (no branch prefix); the configured prefix is
+                added by the ``{merge_subject}`` slot.
+            pattern_template: Optional override for the citation pattern,
+                rendered by :func:`render_citation_pattern`.
                 Defaults to ``DEFAULT_COMMIT_CITATION_PATTERN``.  Empty
                 string disables the check by returning None immediately
                 (caller opt-out for projects without citation
@@ -10075,8 +10084,8 @@ class GitOps:
         except CitationPatternInvalid as exc:
             logger.warning(
                 'find_task_citation_commit: pattern_template does not '
-                'render to a valid Python re pattern (tid=%s); treating as '
-                'no-citation (fail-safe): %r',
+                'render for tid=%r or is not a valid Python re pattern; '
+                'treating as no-citation (fail-safe): %r',
                 tid, exc.pattern,
             )
             return None
@@ -10087,12 +10096,16 @@ class GitOps:
         """:meth:`find_task_citation_commit`, but a failed lookup raises :class:`GitQueryFailed`.
 
         Raises :class:`GitQueryFailed` on a git failure and
-        :class:`CitationPatternInvalid` on an override that does not render to
-        a valid Python ``re``; a disabled pattern (``''``) still answers None. For a caller
+        :class:`CitationPatternInvalid` on an override that is not a valid
+        Python ``re`` or a *tid* no branch can name (empty, or holding
+        whitespace); a disabled pattern (``''``) still answers None. For a caller
         that writes on a miss and so must not read "could not look" as "no
         citation".
         """
-        pattern_str = task_citation_pattern(tid, pattern_template)
+        pattern_str = task_citation_pattern(
+            tid, pattern_template,
+            branch_prefix=self.config.branch_prefix, main_branch=self.config.main_branch,
+        )
         if pattern_str is None:
             return None
         compiled = re.compile(pattern_str)
@@ -12694,7 +12707,8 @@ class GitOps:
         Shared by :meth:`merge_to_main` and :meth:`merge_branch_into_worktree`
         so the two merge primitives derive the merge-SOURCE candidate and the
         canonical prefixed name identically.  *full_branch* is what
-        :func:`_merge_subject` renders into the commit message, so a drift
+        ``shared/src/shared/merge_subject.py::format_merge_subject`` renders
+        into the commit message, so a drift
         between the two callers would break ``find_merge_marker``
         already_merged idempotency for one of them only.
 
@@ -12715,7 +12729,8 @@ class GitOps:
         """Run the shared ``git merge --no-ff`` invocation in *worktree*.
 
         The single definition of HOW this repo merges a queued branch: the
-        argv, the ``-m`` subject (:func:`_merge_subject` over *full_branch*,
+        argv, the ``-m`` subject
+        (``shared/src/shared/merge_subject.py::format_merge_subject`` over *full_branch*,
         load-bearing for ``find_merge_marker`` idempotency), and the textual
         conflict detection.  Both :meth:`merge_to_main` and
         :meth:`merge_branch_into_worktree` call it so the chain builder can
@@ -12736,7 +12751,7 @@ class GitOps:
         """
         rc, out, err = await _run(
             ['git', 'merge', '--no-ff', merge_source,
-             '-m', _merge_subject(full_branch, self.config.main_branch)],
+             '-m', format_merge_subject(full_branch, self.config.main_branch)],
             cwd=worktree,
         )
         return rc, out, err, ('CONFLICT' in out or 'CONFLICT' in err)
@@ -12810,8 +12825,8 @@ class GitOps:
             # Merge with no-ff.
             # merge_source is the named branch ref when present, or the worktree
             # HEAD SHA as an absent-ref fallback.  full_branch is always the
-            # canonical prefixed name for _merge_subject so the commit message
-            # stays 'Merge task/<id> into main' for find_merge_marker.
+            # canonical prefixed name for format_merge_subject so the commit
+            # message stays the landing subject find_merge_marker reads.
             rc, out, err, conflicts = await self._run_no_ff_merge(
                 merge_wt, merge_source, full_branch,
             )
@@ -12853,7 +12868,7 @@ class GitOps:
         """Merge a task branch into a CALLER-SUPPLIED worktree (task 3184, PRD β).
 
         The chain-builder twin of :meth:`merge_to_main`.  Same merge semantics
-        — same ``git merge --no-ff``, same :func:`_merge_subject` (so
+        — same ``git merge --no-ff``, same merge subject (so
         ``find_merge_marker`` idempotency is preserved), same
         :meth:`resolve_queued_branch_ref` source resolution, same
         :class:`MergeResult` return type — but the worktree comes from the
@@ -13795,7 +13810,7 @@ class GitOps:
         an mmap'd path falls at-or-under the ``_merge-verify`` subtree and
         reaps them (SIGTERM → bounded wait → SIGKILL) BEFORE the worker loop
         starts, hence before that first reset can run.  The Harness invokes it
-        once from :meth:`Harness._start_merge_worker`, immediately before
+        once from :meth:`Harness._launch_merge_worker_loop`, immediately before
         creating the merge-worker task.
 
         Scope + fail-open: confined to the LOCAL in-process lane
@@ -14275,7 +14290,8 @@ class GitOps:
         children of ``worktree_base`` whose name starts with ``_merge-``).
         For each candidate, reads its HEAD commit subject with
         ``git log -1 --format=%s`` and compares it by **literal equality** to
-        ``_merge_subject(f'{branch_prefix}{branch}', main_branch)``.
+        ``shared/src/shared/merge_subject.py::format_merge_subject``
+        over ``f'{branch_prefix}{branch}'`` and ``main_branch``.
 
         Returns the first matching :class:`~pathlib.Path`, or ``None`` if no
         match is found.
@@ -14295,10 +14311,7 @@ class GitOps:
             await self.resolve_queued_branch_ref(branch)
             or f'{self.config.branch_prefix}{branch}'
         )
-        target_subject = _merge_subject(
-            full_branch,
-            self.config.main_branch,
-        )
+        target_subject = format_merge_subject(full_branch, self.config.main_branch)
 
         async for wt_path, _ in self._iter_merge_worktrees():
             # Read HEAD commit subject of this candidate
@@ -14883,7 +14896,7 @@ class GitOps:
             )
             merge_rc, merge_out, merge_err = await _run(
                 ['git', 'merge', '--no-ff', _remerge_target,
-                 '-m', _merge_subject(full_branch, self.config.main_branch)],
+                 '-m', format_merge_subject(full_branch, self.config.main_branch)],
                 cwd=merge_worktree,
             )
             if merge_rc != 0:

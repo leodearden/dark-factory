@@ -8,91 +8,31 @@ dispositions its verdict carries.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from pathlib import Path
-from typing import Generic, TypeVar
-from unittest.mock import AsyncMock
 
 import pytest
-from _curator_fake import FakeCurator
-from _workflow_helpers import (
-    AgentStub,
-    FakeBriefing,
-    _build_workflow_with_escalation,
-    _init_repo,
-    _make_git_ops,
-    agent_side_artifacts,
+from _info_l0_router_fixtures import (
+    TASK_ID,
+    DispositioningReviewer,
+    LostVerdictReviewer,
+    RouterRun,
+    disposition_entry,
 )
 from _workflow_helpers import (
     _derive_meta_root_like_production as _derive_meta_root_like_production,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from shared.cli_invoke import AgentResult
 
-from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
-from orchestrator.config import (
-    GitConfig,
-    OrchestratorConfig,
-    ReviewConfig,
-    SandboxConfig,
-    TimeoutsConfig,
-    UnblockAutoConfig,
-)
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.escalation_router import REVIEWER_LEG_ID, read_hold
-from orchestrator.escalation_rulings import Ruling
-from orchestrator.event_store import EventStore, EventType
-from orchestrator.mcp.verdict_tools import _envelope
-from orchestrator.scheduler import TaskAssignment
-from orchestrator.verify import VerifyResult
 from orchestrator.workflow import WorkflowOutcome
 
-TASK_ID = '42'
 STARVATION = 'orchestrator-starvation-watchdog'
 UNKNOWN_ID = 'esc-42-999'
 CORRUPTION = {
     'agent_role': 'orchestrator', 'category': 'infra_issue',
     'suggested_action': 'investigate_log_corruption',
 }
-PASSED = VerifyResult(
-    passed=True, test_output='', lint_output='', type_output='', summary='All checks passed',
-)
-
-
-def _run_config(
-    project_root: Path, *, briefing: ReviewBriefing, router_enabled: bool,
-) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=project_root,
-        max_concurrent_tasks=1,
-        max_execute_iterations=5,
-        max_verify_attempts=3,
-        max_review_cycles=2,
-        judge_after_each_iteration=False,
-        max_amendment_rounds=1,
-        reviewer_stagger_secs=0.0,
-        steward_completion_timeout=0.25,
-        timeouts=TimeoutsConfig(steward=0.25),
-        unblock_auto=UnblockAutoConfig(enabled=False),
-        info_l0_router_enabled=router_enabled,
-        review=ReviewConfig(reviewer_briefing=briefing),
-        git=GitConfig(
-            main_branch='main', branch_prefix='task/', remote='origin',
-            worktree_dir='.worktrees',
-        ),
-        sandbox=SandboxConfig(enabled=False),
-    )
-
-
-def _assignment() -> TaskAssignment:
-    return TaskAssignment(
-        task_id=TASK_ID,
-        task={
-            'id': TASK_ID, 'title': 'X', 'description': 'Y', 'status': 'pending',
-            'metadata': {'files': ['lib']}, 'dependencies': [],
-        },
-        modules=['lib'],
-    )
 
 
 def _file_note(
@@ -110,150 +50,12 @@ def _file_note(
     return note
 
 
-def _disposition(esc_id: str, disposition: str) -> dict:
-    return {'escalation_id': esc_id, 'disposition': disposition, 'rationale': f'{disposition} rationale'}
-
-
-class _DispositioningStub(AgentStub):
-    """A reviewer whose PASS verdict carries *note_dispositions*."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.note_dispositions: list[dict] = []
-
-    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
-        result = super()._reviewer(role, output_schema)
-        assert result.structured_output is not None
-        result.structured_output['note_dispositions'] = self.note_dispositions
-        return result
-
-
-class _LostVerdictStub(_DispositioningStub):
-    """A reviewer whose verdict file is present but off-contract, so the workflow discards it."""
-
-    async def invoke_agent(self, prompt: str, system_prompt: str, cwd: Path, **kwargs) -> AgentResult:
-        role = self._detect_role(system_prompt)
-        if not role.startswith('reviewer'):
-            return await super().invoke_agent(prompt, system_prompt, cwd, **kwargs)
-        self.calls.append(role)
-        artifacts = agent_side_artifacts(cwd)
-        artifacts.write_verdict(role, _envelope(role, 'sid', {
-            'reviewer': role, 'verdict': 'MAYBE', 'issues': [], 'summary': 's',
-            'note_dispositions': self.note_dispositions,
-        }))
-        return AgentResult(success=True, output='')
-
-
-class _NoteRecordingBriefing(FakeBriefing):
-    """Canned prompts that also record which notes each reviewer briefing listed."""
-
-    def __init__(self) -> None:
-        self.briefed: list[tuple[ReviewBriefing, list[str]]] = []
-
-    async def build_reviewer_prompt(
-        self, reviewer_type: str, diff: str, context: str | None = None,
-        *, amendment_suggestions: list[dict] | None = None,
-        task: dict | None = None,
-        open_info_notes: Sequence[Escalation] | None = None,
-        rulings: Sequence[Ruling] = (),
-    ) -> str:
-        self._record(ReviewBriefing.DIFF_ONLY, open_info_notes)
-        return await super().build_reviewer_prompt(reviewer_type, diff, context)
-
-    async def build_context_complete_reviewer_prompt(
-        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
-        *, amendment_suggestions: list[dict] | None = None,
-        open_info_notes: Sequence[Escalation] | None = None,
-        rulings: Sequence[Ruling] = (),
-    ) -> str:
-        self._record(ReviewBriefing.CONTEXT_COMPLETE, open_info_notes)
-        return await super().build_context_complete_reviewer_prompt(reviewer_type, subject, context)
-
-    def _record(self, generation: ReviewBriefing, notes: Sequence[Escalation] | None) -> None:
-        self.briefed.append((generation, [note.id for note in notes or ()]))
-
-
-_Recorder = TypeVar('_Recorder', bound=FakeBriefing)
-
-
-class _WorkflowRun(Generic[_Recorder]):
-    """A real ``TaskWorkflow.run()`` of *assignment* in a fresh repo: *stub* answers every agent, *recorder* every briefing."""
-
-    def __init__(
-        self, tmp_path: Path, monkeypatch, stub: AgentStub, recorder: _Recorder,
-        assignment: TaskAssignment, *, briefing: ReviewBriefing, router_enabled: bool,
-    ) -> None:
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        _init_repo(repo)
-        config = _run_config(repo, briefing=briefing, router_enabled=router_enabled)
-        self.workflow, _scheduler, self.queue = _build_workflow_with_escalation(
-            config, _make_git_ops(config.project_root), assignment, stub, tmp_path,
-        )
-        self.briefing = recorder
-        self.workflow.briefing = recorder
-        self._monkeypatch = monkeypatch
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification', AsyncMock(return_value=PASSED),
-        )
-        self.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
-        self.workflow.event_store = self.event_store
-        self.curator = FakeCurator()
-        self.workflow.scheduler.dispatch_tool = self.curator
-
-    async def run(self) -> WorkflowOutcome:
-        return (await self.workflow.run()).outcome
-
-
-class _FullRun(_WorkflowRun[_NoteRecordingBriefing]):
-    def __init__(
-        self, tmp_path: Path, monkeypatch, stub: _DispositioningStub, *,
-        briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY, router_enabled: bool = True,
-    ) -> None:
-        super().__init__(
-            tmp_path, monkeypatch, stub, _NoteRecordingBriefing(), _assignment(),
-            briefing=briefing, router_enabled=router_enabled,
-        )
-
-    def fail_the_first_note_read_after_verification(self) -> None:
-        """The reviewer's note read is the first pending-record read once verification passes."""
-        armed = False
-        read = self.queue.get_by_task
-
-        def get_by_task(*args, **kwargs):
-            nonlocal armed
-            if armed and kwargs.get('status') == 'pending':
-                armed = False
-                raise OSError('disk unreadable')
-            return read(*args, **kwargs)
-
-        async def verify(*_args, **_kwargs) -> VerifyResult:
-            nonlocal armed
-            armed = True
-            return PASSED
-
-        self._monkeypatch.setattr(self.queue, 'get_by_task', get_by_task)
-        self._monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify)
-
-    def current(self, note: Escalation) -> Escalation:
-        current = self.queue.get(note.id)
-        assert current is not None
-        return current
-
-    def rows(self, esc_id: str) -> list[dict]:
-        return [
-            row['data'] for row in self.event_store.fetch_events_by_type(EventType.info_l0_dispositioned)
-            if row['data']['escalation_id'] == esc_id
-        ]
-
-
 @pytest.mark.asyncio
 class TestReviewerIsBriefedWithItsNotes:
     async def test_the_diff_only_reviewer_sees_exactly_the_eligible_notes(
         self, tmp_path, monkeypatch,
     ):
-        run = _FullRun(tmp_path, monkeypatch, _DispositioningStub())
+        run = RouterRun(tmp_path, monkeypatch, DispositioningReviewer())
         eligible = _file_note(run.queue)
         _file_note(run.queue, severity='blocking')
         _file_note(run.queue, agent_role=STARVATION)
@@ -267,8 +69,8 @@ class TestReviewerIsBriefedWithItsNotes:
     async def test_the_context_complete_reviewer_sees_the_same_notes(
         self, tmp_path, monkeypatch,
     ):
-        run = _FullRun(
-            tmp_path, monkeypatch, _DispositioningStub(),
+        run = RouterRun(
+            tmp_path, monkeypatch, DispositioningReviewer(),
             briefing=ReviewBriefing.CONTEXT_COMPLETE,
         )
         eligible = _file_note(run.queue)
@@ -279,7 +81,7 @@ class TestReviewerIsBriefedWithItsNotes:
         assert run.briefing.briefed == [(ReviewBriefing.CONTEXT_COMPLETE, [eligible.id])]
 
     async def test_a_disabled_router_briefs_no_notes(self, tmp_path, monkeypatch):
-        run = _FullRun(tmp_path, monkeypatch, _DispositioningStub(), router_enabled=False)
+        run = RouterRun(tmp_path, monkeypatch, DispositioningReviewer(), router_enabled=False)
         _file_note(run.queue)
 
         assert await run.run() == WorkflowOutcome.DONE
@@ -289,7 +91,7 @@ class TestReviewerIsBriefedWithItsNotes:
     async def test_a_queue_fault_costs_the_notes_not_the_review(
         self, tmp_path, monkeypatch, caplog,
     ):
-        run = _FullRun(tmp_path, monkeypatch, _DispositioningStub())
+        run = RouterRun(tmp_path, monkeypatch, DispositioningReviewer())
         _file_note(run.queue)
         run.fail_the_first_note_read_after_verification()
 
@@ -318,10 +120,10 @@ class TestReviewLoopAppliesDispositions:
     async def test_a_closing_disposition_closes_the_note_before_the_exit(
         self, tmp_path, monkeypatch, disposition, resolution_class,
     ):
-        stub = _DispositioningStub()
-        run = _FullRun(tmp_path, monkeypatch, stub)
+        stub = DispositioningReviewer()
+        run = RouterRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue)
-        stub.note_dispositions = [_disposition(note.id, disposition)]
+        stub.note_dispositions = [disposition_entry(note.id, disposition)]
 
         assert await run.run() == WorkflowOutcome.DONE
 
@@ -336,10 +138,10 @@ class TestReviewLoopAppliesDispositions:
     async def test_work_leaves_the_note_for_the_exit_router_to_convert(
         self, tmp_path, monkeypatch,
     ):
-        stub = _DispositioningStub()
-        run = _FullRun(tmp_path, monkeypatch, stub)
+        stub = DispositioningReviewer()
+        run = RouterRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue)
-        stub.note_dispositions = [_disposition(note.id, 'work')]
+        stub.note_dispositions = [disposition_entry(note.id, 'work')]
 
         assert await run.run() == WorkflowOutcome.DONE
 
@@ -358,10 +160,10 @@ class TestReviewLoopAppliesDispositions:
     async def test_work_overrides_the_authors_no_action_declaration_at_the_exit(
         self, tmp_path, monkeypatch,
     ):
-        stub = _DispositioningStub()
-        run = _FullRun(tmp_path, monkeypatch, stub)
+        stub = DispositioningReviewer()
+        run = RouterRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue, suggested_action='no action needed for this task')
-        stub.note_dispositions = [_disposition(note.id, 'work')]
+        stub.note_dispositions = [disposition_entry(note.id, 'work')]
 
         assert await run.run() == WorkflowOutcome.DONE
 
@@ -373,11 +175,11 @@ class TestReviewLoopAppliesDispositions:
     async def test_a_disposition_of_a_note_the_reviewer_was_not_shown_is_rejected(
         self, tmp_path, monkeypatch,
     ):
-        stub = _DispositioningStub()
-        run = _FullRun(tmp_path, monkeypatch, stub)
+        stub = DispositioningReviewer()
+        run = RouterRun(tmp_path, monkeypatch, stub)
         foreign = _file_note(run.queue, task_id='99')
         stub.note_dispositions = [
-            _disposition(UNKNOWN_ID, 'addressed'), _disposition(foreign.id, 'no_action'),
+            disposition_entry(UNKNOWN_ID, 'addressed'), disposition_entry(foreign.id, 'no_action'),
         ]
 
         assert await run.run() == WorkflowOutcome.DONE
@@ -393,10 +195,10 @@ class TestReviewLoopAppliesDispositions:
     async def test_a_lost_verdict_carries_no_dispositions_and_the_exit_router_routes_the_note(
         self, tmp_path, monkeypatch,
     ):
-        stub = _LostVerdictStub()
-        run = _FullRun(tmp_path, monkeypatch, stub)
+        stub = LostVerdictReviewer()
+        run = RouterRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue)
-        stub.note_dispositions = [_disposition(note.id, 'addressed')]
+        stub.note_dispositions = [disposition_entry(note.id, 'addressed')]
 
         assert await run.run() == WorkflowOutcome.BLOCKED
 
@@ -416,10 +218,10 @@ class TestReviewLoopAppliesDispositions:
         assert hold is not None and hold.ticket == 'tkt_1'
 
     async def test_a_harness_notice_is_left_to_the_exit_router(self, tmp_path, monkeypatch):
-        stub = _DispositioningStub()
-        run = _FullRun(tmp_path, monkeypatch, stub)
+        stub = DispositioningReviewer()
+        run = RouterRun(tmp_path, monkeypatch, stub)
         notice = _file_note(run.queue, **CORRUPTION)
-        stub.note_dispositions = [_disposition(notice.id, 'no_action')]
+        stub.note_dispositions = [disposition_entry(notice.id, 'no_action')]
 
         assert await run.run() == WorkflowOutcome.DONE
 

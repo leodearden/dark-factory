@@ -81,11 +81,15 @@ from orchestrator.remote_gate import (
     reap_script_text,
     shim_suspected,
 )
-from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
+from orchestrator.task_verify_spec import (
+    TaskVerifySpec,
+    collapsed_module_overrides,
+    task_spec_to_json,
+)
 from orchestrator.verify import (
     VerifyResult,
-    _archive_merge_verify_logs,
     _target_subprocess_env,
+    archive_verify_logs,
 )
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
@@ -358,6 +362,15 @@ class MergeVerifySpec:
                           TaskVerifySpec's rule: non-empty replaces the host's
                           value, '' keeps the host's own. '' is also what a
                           pre-6127 dispatcher's spec decodes to.
+    scope_cargo         : the cargo-scoping switch that gates
+                          verify.py::_apply_cargo_scope, including the
+                          zero-module __cargo_scoped__ route (task 7465). None
+                          (a pre-7465 spec) keeps the host's own value; a
+                          carried value replaces it.
+    merge_config_only_full_gate_globs : task 2838's manifest-drift backstop,
+                          read by verify.py::_merge_config_only_diff_forces_full_gate
+                          (task 7465). None (a pre-7465 spec) keeps the host's
+                          own globs; a carried value, () included, replaces them.
 
     Note
     ----
@@ -386,6 +399,10 @@ class MergeVerifySpec:
     global_verify_command: VerifyCommand | None = None
     # Task 6127 — the dispatcher's pre-provision command; '' keeps the host's.
     verify_cold_preprovision_command: str = ''
+    # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
+    scope_cargo: bool | None = None
+    # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
+    merge_config_only_full_gate_globs: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -403,6 +420,12 @@ class MergeVerifySpec:
                 else None
             ),
             "verify_cold_preprovision_command": self.verify_cold_preprovision_command,
+            "scope_cargo": self.scope_cargo,
+            "merge_config_only_full_gate_globs": (
+                list(self.merge_config_only_full_gate_globs)
+                if self.merge_config_only_full_gate_globs is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -411,6 +434,7 @@ class MergeVerifySpec:
         # Back-compat: a legacy spec dict (pre-task-2883) lacks this key, so
         # default to None — same d.get idiom as merge_verify_workspace/breadth.
         _gvc = d.get("global_verify_command")
+        _globs = d.get("merge_config_only_full_gate_globs")
         return cls(
             verify_commands=tuple(VerifyCommand.from_dict(vc) for vc in d["verify_commands"]),
             unscoped_typecheck=UnscopedTypecheckSpec.from_dict(d["unscoped_typecheck"]),
@@ -426,6 +450,8 @@ class MergeVerifySpec:
                 VerifyCommand.from_dict(_gvc) if _gvc is not None else None
             ),
             verify_cold_preprovision_command=d.get("verify_cold_preprovision_command", ""),
+            scope_cargo=d.get("scope_cargo"),
+            merge_config_only_full_gate_globs=tuple(_globs) if _globs is not None else None,
         )
 
 
@@ -532,7 +558,20 @@ def build_merge_verify_spec(
         merge_verify_breadth=config.merge_verify_breadth,
         global_verify_command=global_verify_command_for(config, verify_commands),
         verify_cold_preprovision_command=config.verify_cold_preprovision_command,
+        scope_cargo=_carried_scope_cargo(config, module_configs),
+        merge_config_only_full_gate_globs=tuple(config.git.merge_config_only_full_gate_globs),
     )
+
+
+def _carried_scope_cargo(config: OrchestratorConfig, module_configs: list[ModuleConfig]) -> bool:
+    """The scope_cargo the spec ships: False when a per-module override cannot ride it.
+
+    module_config_from_command drops a per-module scope_cargo, and on the remote
+    a spec-level False can only widen cargo scope (verify.py::_apply_cargo_scope);
+    η (task 9135) makes per-module carriage lossless.
+    """
+    collapsed = collapsed_module_overrides(module_configs)
+    return config.scope_cargo and not any(c.field == 'scope_cargo' for c in collapsed)
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +600,9 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     cascade (module→top-level→warm) exactly as a real local merge run does, instead of
     returning 0.0 and triggering an immediate asyncio.wait_for(..., timeout=0.0)
     TimeoutError.  Positive cold timeouts map verbatim.
+
+    A per-module scope_cargo is not carried; build_merge_verify_spec collapses it
+    into the spec-level value (see _carried_scope_cargo).
     """
     return module_config_from_command(
         vc,
@@ -629,16 +671,15 @@ async def run_merge_verify_on_worktree(
 
     # Fix (a), task 2822 — the merge-deciding profile rides the spec, so the
     # host's own --config can no longer narrow it; task 6127 — nor skip the
-    # dispatcher's cold-venv pre-provision.
+    # dispatcher's cold-venv pre-provision; task 7465 — nor decide cargo scope
+    # or the config-only full-gate backstop.
     config = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides={
-            'merge_verify_workspace': spec.merge_verify_workspace,
-            'merge_verify_breadth': spec.merge_verify_breadth,
-        },
+        field_overrides=_spec_field_overrides(spec),
+        git_field_overrides=_spec_git_field_overrides(spec),
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
 
@@ -652,6 +693,24 @@ async def run_merge_verify_on_worktree(
         task_id=task_id,
     )
     return await runner.run_merge_verify(merge_sha, spec)
+
+
+def _spec_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
+    """The top-level OrchestratorConfig fields the spec decides; a None scope_cargo is not carried."""
+    overrides: dict[str, Any] = {
+        'merge_verify_workspace': spec.merge_verify_workspace,
+        'merge_verify_breadth': spec.merge_verify_breadth,
+    }
+    if spec.scope_cargo is not None:
+        overrides['scope_cargo'] = spec.scope_cargo
+    return overrides
+
+
+def _spec_git_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
+    """The GitConfig leaves the spec decides, as fresh lists (strict validation rejects a tuple)."""
+    if spec.merge_config_only_full_gate_globs is None:
+        return {}
+    return {'merge_config_only_full_gate_globs': list(spec.merge_config_only_full_gate_globs)}
 
 
 # ---------------------------------------------------------------------------
@@ -2083,9 +2142,9 @@ class RemoteRunner:
     ) -> list[Path]:
         """Archive *result*'s captured test/lint/type output streams under *archive*.
 
-        Mirrors verify._archive_merge_verify_logs by projecting the three VerifyResult
+        Mirrors verify.archive_verify_logs by projecting the three VerifyResult
         output fields into synthetic per-stream run dicts, one per NON-EMPTY stream.
-        Delegates to _archive_merge_verify_logs so filenames, the microsecond UTC timestamp,
+        Delegates to archive_verify_logs so filenames, the microsecond UTC timestamp,
         and the summary.json shape are byte-identical to local merge-verify archives.
 
         Filename convention (task 1921):
@@ -2107,7 +2166,7 @@ class RemoteRunner:
 
         Best-effort: any exception is swallowed with a WARNING (returning ``[]``) so
         the caller's VerifyResult is always returned unchanged (PRD §A Invariant 5).
-        _archive_merge_verify_logs already swallows OSError internally; this outer
+        archive_verify_logs already swallows OSError internally; this outer
         guard additionally swallows non-OSError failures as a backstop (task 1921 step-4).
         """
         try:
@@ -2136,7 +2195,7 @@ class RemoteRunner:
             # result.timed_out=True when a timeout occurred.  Distinguishability in the
             # emitted summary.json depends on the remote host honouring this contract;
             # this method threads the fields through verbatim but cannot enforce them.
-            return _archive_merge_verify_logs(
+            return archive_verify_logs(
                 runs,
                 archive.root,
                 archive.task_id,
@@ -3337,6 +3396,14 @@ class EnvDriftCheckResult:
     remote_probes:    The remote host's extra_probes mapping ({} when unprobed).
     escalated:        True when a NEW env-divergence escalation was submitted
                       (False when deduped against an already-open L1).
+    unavailable_reason: str() of the RunnerUnavailable that made the check
+                      INCONCLUSIVE — for a remote, ssh's own stderr via
+                      ``RemoteRunner._probe_ssh`` — so a dispatcher-side fault
+                      such as an unbindable ControlPath can be told from an
+                      unreachable host.  None on every other result, including
+                      the INCONCLUSIVE guards for a check that was not taken.
+                      Construction rejects a reason on anything but a faithful
+                      INCONCLUSIVE, because check_env_safely logs it as one.
     """
     verdict: DriftVerdict
     is_faithful: bool
@@ -3344,6 +3411,18 @@ class EnvDriftCheckResult:
     local_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     remote_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     escalated: bool = False
+    unavailable_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.unavailable_reason is None:
+            return
+        if self.verdict is not DriftVerdict.INCONCLUSIVE or not self.is_faithful:
+            raise ValueError(
+                'EnvDriftCheckResult: unavailable_reason is set only on a faithful '
+                f'INCONCLUSIVE; got verdict={self.verdict}, '
+                f'is_faithful={self.is_faithful}, '
+                f'unavailable_reason={self.unavailable_reason!r}'
+            )
 
 
 class DriftDetector:
@@ -3605,7 +3684,10 @@ class DriftDetector:
         ------------
         AGREE → emit ``verify_env_parity_ok`` (None-safe).
         DIVERGE → emit ``verify_env_divergence`` + one deduped L1 escalation.
-        INCONCLUSIVE → nothing at all: no event, no escalation, no probe.
+        INCONCLUSIVE → no event, no escalation.  When a runner raised
+        RunnerUnavailable its message is kept on ``unavailable_reason``, which
+        :meth:`check_env_safely` logs once at INFO; every other INCONCLUSIVE
+        carries None.
         INCONCLUSIVE covers every reason the check could not be TAKEN — no
         probes declared, no local runner, no eligible remote (including one
         the verdict path just quarantined), a remote that is not a
@@ -3707,7 +3789,7 @@ class DriftDetector:
                 extra_probe_specs=probe_specs,
                 include_toolchain=include_toolchain,
             )
-        except RunnerUnavailable:
+        except RunnerUnavailable as exc:
             # Invariant 5: transport failure is not divergence.  A closed or
             # flaky laptop must never raise a false env-skew alarm — the same
             # reasoning check() applies to a failed verify dispatch.
@@ -3717,7 +3799,11 @@ class DriftDetector:
             # spawn failure) into RunnerUnavailable precisely so an unreachable
             # host lands here instead of comparing '<unavailable rc=255>'
             # against real local versions and alarming on every declared tool.
-            return inconclusive
+            return EnvDriftCheckResult(
+                verdict=DriftVerdict.INCONCLUSIVE,
+                is_faithful=True,
+                unavailable_reason=str(exc),
+            )
 
         parity = compare_env_fingerprints(local_fp, remote_fp, dimensions=dimensions)
 
@@ -3840,18 +3926,27 @@ class DriftDetector:
         here — an ssh probe hanging up, a malformed argv, a bug in
         ``check_env``, its ValueError for a bad selection — is logged at
         WARNING with the traceback and swallowed rather than allowed to skip
-        ``check``.
+        ``check``.  An INCONCLUSIVE caused by RunnerUnavailable is logged once
+        at INFO with its ``unavailable_reason``.
         """
-        import logging
-
         try:
-            await self.check_env([(probe.key, list(probe.argv)) for probe in probes])
+            result = await self.check_env(
+                [(probe.key, list(probe.argv)) for probe in probes]
+            )
         except Exception:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 'Env drift check failed for task %s; ignoring (detective control)',
                 self._task_id,
                 exc_info=True,
             )
+        else:
+            if result.unavailable_reason is not None:
+                logger.info(
+                    'Env drift check inconclusive for task %s '
+                    '(runner unavailable, not an alarm): %s',
+                    self._task_id,
+                    result.unavailable_reason,
+                )
 
 
 def render_parity_report(report: VerdictParityReport) -> str:

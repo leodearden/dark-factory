@@ -7,7 +7,9 @@ every lock and park event from these methods' return values.
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from typing import NamedTuple
 
@@ -29,6 +31,10 @@ from orchestrator.time_sources import resolve_wall_time_source
 
 logger = logging.getLogger(__name__)
 
+#: The holder limit of a key no count of holders can fill: every limit test is
+#: ``len(<set of task ids>) >= limit``, and no Python collection is that long.
+UNLIMITED_HOLDERS = sys.maxsize
+
 
 class _ParkKey(NamedTuple):
     """THE park order (task 7799): the smaller key outranks; see ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`` §7, Amendment (task 7799)."""
@@ -40,6 +46,20 @@ class _ParkKey(NamedTuple):
     @classmethod
     def of(cls, owner: str, rank: int) -> _ParkKey:
         return cls(rank, *id_tie_break(owner))
+
+
+
+@dataclass(frozen=True)
+class UncontestedAcquisition:
+    """What a partial widen took, and each key another task holds or parks."""
+
+    acquired: tuple[str, ...]
+    contested: tuple[Blocker, ...]
+
+    def __post_init__(self) -> None:
+        both = sorted(set(self.acquired) & {blocker.module for blocker in self.contested})
+        if both:
+            raise ValueError(f'lock keys {both} cannot be both acquired and contested')
 
 
 class ModuleLockTable:
@@ -869,6 +889,8 @@ class ModuleLockTable:
 
         Builds a fresh dict from ``_held`` so callers cannot mutate internal state.
         Preferred over direct ``_held`` access in :meth:`Scheduler.get_state_snapshot`.
+        It shows ONE holder per key: a key several tasks hold names only the
+        last one iterated, so ask :meth:`held_modules` for what one task holds.
         """
         result: dict[str, str] = {}
         for task_id, modules in self._held.items():
@@ -876,21 +898,33 @@ class ModuleLockTable:
                 result[m] = task_id
         return result
 
-    # --- Limit lookup (unchanged) ---
+    # --- Limit lookup ---
 
     def _limit_for(self, module: str) -> int:
         module = normalize_lock(module, self._config.lock_depth)
         if module not in self._limits:
-            mc = self._config.for_module(module)
-            if mc and mc.module_overrides and module in mc.module_overrides:
-                self._limits[module] = mc.module_overrides[module]
-            elif module in self._config.module_overrides:
-                self._limits[module] = self._config.module_overrides[module]
-            elif mc and mc.max_per_module is not None:
-                self._limits[module] = mc.max_per_module
-            else:
-                self._limits[module] = self._config.max_per_module
+            self._limits[module] = self._resolve_limit(module)
         return self._limits[module]
+
+    def _resolve_limit(self, key: str) -> int:
+        """*key*'s holder limit, the first that applies, in this order (the one statement of it).
+
+        The key's module config's ``module_overrides[key]``; the top-level
+        ``module_overrides[key]``; ``UNLIMITED_HOLDERS`` when the top-level
+        ``unlimited_holder_locks`` rule takes *key*; the module config's
+        ``max_per_module``; the top-level ``max_per_module``.  An exact entry
+        beating the rule is how a project keeps one file under a prefix exclusive.
+        """
+        mc = self._config.for_module(key)
+        if mc and mc.module_overrides and key in mc.module_overrides:
+            return mc.module_overrides[key]
+        if key in self._config.module_overrides:
+            return self._config.module_overrides[key]
+        if self._config.unlimited_holder_locks.takes_unlimited_holders(key):
+            return UNLIMITED_HOLDERS
+        if mc and mc.max_per_module is not None:
+            return mc.max_per_module
+        return self._config.max_per_module
 
     # --- Public API ---
 
@@ -1001,3 +1035,35 @@ class ModuleLockTable:
         self._held.setdefault(task_id, set()).update(new_modules)
         logger.info(f'Task {task_id} expanded locks: {new_modules}')
         return True
+
+    def held_modules(self, task_id: str) -> frozenset[str]:
+        """The modules *task_id* holds now, as an immutable snapshot. A READ."""
+        return frozenset(self._held.get(task_id, ()))
+
+    def acquire_uncontested(
+        self, task_id: str, modules: Iterable[str]
+    ) -> UncontestedAcquisition:
+        """Take every free key of *modules*, name the rest, release nothing.
+
+        Keys the task already holds are skipped. The contested keys are
+        exactly :meth:`blockers`, which names what the acquire gate honours
+        (INV-5), so the free remainder must then be acquirable; a refusal is
+        an invariant breach and raises rather than returning a silent partial.
+        Never releases a lock and never touches task status.
+        """
+        depth = self._config.lock_depth
+        held = self.held_modules(task_id)
+        requested = [
+            key
+            for key in dict.fromkeys(normalize_lock(m, depth) for m in modules)
+            if key and key not in held
+        ]
+        contested = tuple(self.blockers(task_id, requested))
+        contested_keys = {blocker.module for blocker in contested}
+        free = [key for key in requested if key not in contested_keys]
+        if free and not self.try_acquire_additional(task_id, free):
+            raise RuntimeError(
+                f'Task {task_id}: try_acquire_additional refused {free}, which '
+                'blockers() reported free; INV-5 requires the two to agree'
+            )
+        return UncontestedAcquisition(acquired=tuple(free), contested=contested)

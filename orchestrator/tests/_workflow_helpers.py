@@ -39,6 +39,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.escalation_rulings import Ruling
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
+from orchestrator.lock_table import UncontestedAcquisition
 from orchestrator.mcp.verdict_tools import (
     _envelope as _verdict_envelope,
 )
@@ -48,6 +49,7 @@ from orchestrator.mcp.verdict_tools import (
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.pin_reservation import Blocker, BlockerKind
 from orchestrator.scheduler import (
     BlastRadiusResult,
     TaskAssignment,
@@ -89,6 +91,14 @@ class FakeScheduler:
         # BlastRadiusResult every call reports (default: applied).
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
         self.blast_radius_result = BlastRadiusResult(applied=True)
+        # Live-slot widen (task 3090): each key in contested_modules comes back
+        # contested by the mapped holder; every other key not yet in
+        # uncontested_held is acquired, and a held key is skipped, as
+        # lock_table.py::ModuleLockTable.acquire_uncontested does. Calls are
+        # recorded as (task_id, modules, reason); status is never written.
+        self.contested_modules: dict[str, str] = {}
+        self.uncontested_held: set[str] = set()
+        self.acquire_uncontested_calls: list[tuple[str, list[str], str]] = []
         # Scope-grant direct metadata.files persist seam (task 2505, step-18):
         # every update_task(task_id, metadata) call is recorded here so the
         # same-module scope-grant persist path (which writes metadata.files
@@ -167,6 +177,24 @@ class FakeScheduler:
         if not result.applied and result.repend_error is None:
             await self.set_task_status(task_id, 'pending')
         return result
+
+    async def acquire_uncontested(
+        self, task_id: str, modules: list[str], /, *, reason: str,
+    ) -> UncontestedAcquisition:
+        self.acquire_uncontested_calls.append((task_id, list(modules), reason))
+        acquired = tuple(
+            m for m in modules
+            if m not in self.contested_modules and m not in self.uncontested_held
+        )
+        self.uncontested_held.update(acquired)
+        return UncontestedAcquisition(
+            acquired=acquired,
+            contested=tuple(
+                Blocker(m, self.contested_modules[m], BlockerKind.HELD)
+                for m in modules
+                if m in self.contested_modules
+            ),
+        )
 
     async def get_status(self, task_id: str) -> str | None:
         history = self.statuses.get(task_id)
@@ -485,13 +513,14 @@ class FakeBriefing:
         rebase_notice: dict | None = None, task_id: str | None = None,
         wip_notice: list[dict] | None = None,
         *, rulings: Sequence[Ruling] = (),
+        scope_drift=None,
     ) -> str:
         return 'Implement the plan'
 
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
-        *, attempt_context=None,
+        *, attempt_context=None, scope_drift=None,
         rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Fix: {failures[:100]}'
@@ -538,13 +567,20 @@ class FakeBriefing:
         escalation_summary: str,
         resolution: str,
         worktree=None,
+        *, scope_drift=None,
     ) -> str:
         return f'Resume: {resolution[:100]}'
+
+    async def build_scope_drift_followup_prompt(
+        self, plan: dict, scope_drift, task_id: str | None = None,
+    ) -> str:
+        return 'Settle the contested scope request'
 
     async def build_amender_prompt(
         self, plan: dict, suggestions: list, locked_modules: list,
         context: str | None = None, task_id: str | None = None,
         *, rulings: Sequence[Ruling] = (),
+        scope_drift=None,
     ) -> str:
         return 'Amend the plan'
 

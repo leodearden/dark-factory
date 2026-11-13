@@ -22,6 +22,7 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
+from _prompt_action_items import action_items
 from _roles_helpers import tool_is_granted
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -117,6 +118,13 @@ class TestReplanPrompt:
         with memory_transport(mcp):
             prompt = await briefing.build_replan_prompt(_TASK, 'FEEDBACK')
         _assert_recalled_under_architect_identity(prompt, mcp)
+
+    @pytest.mark.asyncio
+    async def test_ends_by_confirming_the_plan(self, briefing: BriefingAssembler):
+        items = action_items(await briefing.build_replan_prompt(_TASK, 'FEEDBACK', context=''))
+        confirming = [i for i, item in enumerate(items) if 'confirm_plan()' in item]
+        assert confirming == [len(items) - 1], items
+        assert 'FINAL' in items[-1]
 
 
 async def _repair_prompt(briefing: BriefingAssembler) -> str:

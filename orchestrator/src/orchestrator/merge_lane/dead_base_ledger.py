@@ -24,10 +24,16 @@ class DeadBaseSite(StrEnum):
     RUNNER_UNAVAILABLE = 'runner_unavailable'
     #: A head that landed rebased, superseding its pre-rebase commit.
     GATE_REBASED = 'gate_rebased'
+    #: A successor torn down so it re-anchors on its head's gate-rebased commit.
+    GATE_REANCHOR = 'gate_reanchor'
+    #: A gate-rebased commit whose head left the lane without landing it.
+    GATE_UNLANDED = 'gate_unlanded'
     #: A dead-base straggler discarded and re-merged at dispatch.
     DISPATCH_VOID = 'dispatch_void'
     #: A stale merge discarded at dispatch (Mechanism 2).
     STALE_DISCARD = 'stale_discard'
+    #: A deep chain tip whose reserved links did not all land (task 7720).
+    CHAIN_RELEASED = 'chain_released'
 
 
 class VoidPoint(StrEnum):

@@ -1,0 +1,725 @@
+prd: plans/review-all-s17-scheduler-seams-and-tick-state-prd.md
+schema_version: 1
+signal_leaves: ["ω", "ζ", "δ2", "ν"]
+tasks:
+  - label: "α0"
+    task_id: null
+    title: "One shared reader for a task's dependency ids, train id and deterministic kind; fused-memory's own copy is deleted"
+    note: "complexity=simple, low. Contributes to fk-a2bc16e5812c (α and ξ1 repoint the scheduler-side readers). Lands C11: dependency_ids is the union of the scheduler's and fused-memory's tolerances and returns a fresh list; fused-memory's utils/task_dependency_ids.py and its test are deleted and the four importers change only their import line (lead S17/OQ-4, as changed: no re-export). No dependency: import-line edits are rebase-only under S19/Q-C6."
+    capabilities:
+      - name: "task-fields-module-exists"
+        binding: "capability→producer (α0; C11) — shared/src/shared/task_fields.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/task_fields.py"]
+          expect: present
+      - name: "dependency-ids-reader"
+        binding: "capability→producer (α0; C11) — dependency_ids(task)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def dependency_ids"
+          paths: ["shared/src/shared/task_fields.py"]
+          expect: present
+      - name: "fused-memory-copy-deleted"
+        binding: "anti-inversion (α0; C11) — fused-memory/src/fused_memory/utils/task_dependency_ids.py is deleted, no re-export (lead S17/OQ-4; INV-9)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/utils/task_dependency_ids.py"]
+          expect: absent
+      - name: "fused-memory-importers-use-the-shared-reader"
+        binding: "capability→consumer (α0; C11) — the four fused-memory importers import shared.task_fields.dependency_ids under their local name"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from shared\\.task_fields import dependency_ids"
+          paths: ["fused-memory/src/fused_memory/middleware/recon_write_policy.py", "fused-memory/src/fused_memory/middleware/task_curator.py", "fused-memory/src/fused_memory/reconciliation/targeted.py", "fused-memory/src/fused_memory/services/live_workflow_detector.py"]
+          expect: present
+  - label: "β"
+    task_id: null
+    title: "Scheduler test builder over public calls, an in-memory task store, a per-task snapshot section, and the private-reach guard"
+    note: "high. Contributes to fk-a571802ee4ea. Lands C1 (task section bounded to live dispatch state, lead S17/OQ-7) and C2; D2-D4. Depends on 9234 (tail of the wave-2 scheduler.py chain: brings S8 β0 9217 make_scheduler and β 9218 C3) and 6718 (S14 θ shared override store). Subsumes the PSI-reader and hold-history items of task 6143. Records the 68,002-byte scheduler_state.json baseline (2026-11-13) row 3b is stated against."
+    capabilities:
+      - name: "scenario-builder-exists"
+        binding: "capability→producer (β; C2) — orchestrator/tests/_scheduler_scenario.py::SchedulerScenario"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class SchedulerScenario"
+          paths: ["orchestrator/tests/_scheduler_scenario.py"]
+          expect: present
+      - name: "in-memory-task-store-at-the-session-boundary"
+        binding: "capability→producer (β; C2, D3) — InMemoryTaskStore implements McpSessionLike.call_tool"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class InMemoryTaskStore"
+          paths: ["orchestrator/tests/_in_memory_task_store.py"]
+          expect: present
+      - name: "snapshot-carries-task-lifecycle"
+        binding: "capability→producer (β; C1) — SchedulerStateSnapshot.tasks of TaskLifecycle, bounded to tasks with live dispatch state (lead S17/OQ-7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TaskLifecycle"
+          paths: ["shared/src/shared/scheduler_state.py"]
+          expect: present
+      - name: "psi-reader-constructor-seam"
+        binding: "capability→producer (β; task 6143 item) — Scheduler(psi_reader: Callable[...] | None = None)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "psi_reader: Callable"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+      - name: "private-reach-guard-exists"
+        binding: "rejection-mechanism (β; D2) — the shrink-only per-file guard over orchestrator/tests, defining PRIVATE_REACH_PATTERN"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_scheduler_private_reach.py"]
+          expect: present
+      - name: "snapshot-seam-substrate"
+        binding: "substrate — Scheduler.get_state_snapshot exists at a85cb1ad78 (S14 η 6717); not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def get_state_snapshot"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+  - label: "ι1"
+    task_id: null
+    title: "Move test_scheduler.py's lifecycle, constructor and streak reaches onto the scenario builder"
+    note: "high, tests only. Contributes to fk-a571802ee4ea. 318 lines under PRIVATE_REACH_PATTERN (measured at 97be1d71fa). Depends on β."
+    capabilities:
+      - name: "test-scheduler-off-dispatched-set"
+        binding: "anti-inversion (ι1) — no test_scheduler.py reach of the dispatched container"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'scheduler\._dispatched'
+          paths: ["orchestrator/tests/test_scheduler.py"]
+          expect: absent
+      - name: "test-scheduler-off-private-callbacks"
+        binding: "anti-inversion (ι1) — the public callbacks property replaces the private read"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'scheduler\._callbacks'
+          paths: ["orchestrator/tests/test_scheduler.py"]
+          expect: absent
+  - label: "ι2"
+    task_id: null
+    title: "Move the other lifecycle-heavy scheduler test files onto the scenario builder"
+    note: "high, tests only, 16 files (mechanical), including test_scheduler_deterministic.py's real_scheduler._x reaches. Contributes to fk-a571802ee4ea. 314 lines under PRIVATE_REACH_PATTERN (measured at 97be1d71fa, unchanged at a85cb1ad78). Depends on β only (lead test-file rule: no edge onto ι1, which shares only the baseline json)."
+    capabilities:
+      - name: "retry-cap-tests-off-privates"
+        binding: "anti-inversion (ι2) — test_retry_cap.py reaches no private Scheduler name"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'scheduler\._'
+          paths: ["orchestrator/tests/test_retry_cap.py"]
+          expect: absent
+      - name: "dispatch-admission-tests-off-privates"
+        binding: "anti-inversion (ι2) — test_scheduler_dispatch_admission.py reaches no private Scheduler name"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'scheduler\._'
+          paths: ["orchestrator/tests/test_scheduler_dispatch_admission.py"]
+          expect: absent
+      - name: "deterministic-tests-off-privates"
+        binding: "anti-inversion (ι2) — test_scheduler_deterministic.py's real_scheduler._x reaches move to the builder"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'real_scheduler\._'
+          paths: ["orchestrator/tests/test_scheduler_deterministic.py"]
+          expect: absent
+  - label: "ι3"
+    task_id: null
+    title: "Move the remaining lifecycle, alias and dependency reaches outside the scheduler's own test files onto the scenario builder"
+    note: "high, tests only, 32 files (mechanical). Contributes to fk-a571802ee4ea. Every orchestrator/tests file whose code reaches a name γ, δ1, δ2, ε, η or θ deletes and that neither the deleting leaf nor ι2 declares, plus test_harness_deterministic_dispatch.py: 30 files, 70 code lines (measured at a85cb1ad78, upper bound incl. mocks; test_agent_session_reaper.py is new), plus 2. Depends on β only (lead test-file rule); γ depends on it (D1)."
+    capabilities:
+      - name: "outside-files-off-lifecycle-containers"
+        binding: "anti-inversion (ι3) — the four heaviest outside files reach no lifecycle container or streak alias through a scheduler receiver"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: '(sched[A-Za-z_]*|Scheduler)\._(dispatched|requeue_until|module_cache|skip_count|external_unresolved_counts)([^A-Za-z0-9_]|$)'
+          paths: ["orchestrator/tests/_orch_helpers.py", "orchestrator/tests/test_cross_project_dispatch_integration.py", "orchestrator/tests/test_repend_state_machine.py", "orchestrator/tests/test_warm_lane_structural_exhaustion.py"]
+          expect: absent
+      - name: "deterministic-dispatch-off-deps-satisfied"
+        binding: "anti-inversion (ι3) — test_harness_deterministic_dispatch.py no longer calls scheduler._deps_satisfied"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'scheduler\._deps_satisfied'
+          paths: ["orchestrator/tests/test_harness_deterministic_dispatch.py"]
+          expect: absent
+  - label: "α"
+    task_id: null
+    title: "Every scheduler-side reader of dependency ids, train ids and the deterministic kind uses the shared readers"
+    note: "low (priority inheritance from ζ). Closes fk-a2bc16e5812c. Depends on β (scheduler.py chain), α0, ξ1 and 9236 (tail of harness.py; implies 9235 briefing.py and 9283 dependency_verdict.py)."
+    capabilities:
+      - name: "scheduler-dep-id-copies-gone"
+        binding: "anti-inversion (α) — no inline dependency-id normalisation in scheduler.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'isinstance\(_?d, dict\)'
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "inline-deterministic-kind-tests-gone"
+        binding: "anti-inversion (α) — no inline task_kind == 'deterministic' comparison in scheduler.py or harness.py; Scheduler.is_deterministic delegates to shared.task_fields.is_deterministic (the method stays: the harness calls it and 27 test files mock it, corrected at the ruling fold)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "get\\('task_kind'\\) == 'deterministic'"
+          paths: ["orchestrator/src/orchestrator/scheduler.py", "orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "scheduler-imports-the-readers"
+        binding: "capability→consumer (α; C11) — scheduler.py imports shared.task_fields"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from shared.task_fields import"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+  - label: "ζ"
+    task_id: null
+    title: "The scheduler stops re-pending stranded blocked tasks; the recovery table's rows decide them"
+    note: "high. Closes fk-cc01eb7b143f. Ruled by Leo (S17-1 option D, S17-4 A plus a third row; R-2 = A): task 4082, re-scoped, adds the blocked rows (three code leave rows, the owned-record hold, the clean re-pend row with a recovery_applied event carrying its outcome, the loop cap with its over-cap level-1 and the once-per-window leave that keeps the cap from looping) and ζ deletes the scheduler's step. Depends on α (chain), 9219 (S8 δ C2), 9223 (S8 ε2a), 9229 (config.py tail), 9232 (workflow.py tail), 9236 (harness.py tail) and 4082. S16 ζ2 depends on ζ (S16's draft); ζ adds no edge onto S16. Task 6145 is done (2b044c36ca); its follow-up 9529 is cancelled into ζ and 4082. Re-points task 5247's hard-constraint test at the reconciler's blocked partition."
+    capabilities:
+      - name: "stranded-phase-deleted"
+        binding: "anti-inversion (ζ) — the scheduler's second recovery decider is gone (S17-1, ruled)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _phase_redispatch_stranded_blocked"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "redispatch-kill-switch-deleted"
+        binding: "anti-inversion (ζ) — OrchestratorConfig.stranded_blocked_redispatch_enabled (set in no project yaml) is deleted with the phase (S17-1, ruled)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "blocked_redispatch"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: absent
+      - name: "clean-strand-re-pended-by-a-code-row"
+        binding: "behavioural — boundary rows 14, 14b-14e, 14g and 15: no scheduler write; the StrandedReconciler re-pends a clean strand with recovery_applied naming blocked_clean_repend; the three parks and an owned open record are left under named reasons; the third block within the window files one level-1 and no re-pend, and any later block in the window is left under REPEND_CAP_ESCALATED, so the cap cannot loop (task 4082's rows)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; a reviewer confirms test_stranded_blocked_one_decider.py asserts rows 14, 14b-14e, 14g and 15 across scheduler ticks and a StrandedReconciler pass"
+      - name: "flip-log-helper-deleted"
+        binding: "anti-inversion (ζ) — task 6145's flip-log helper goes with the phase it served"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _describe_records_flipped_past"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "recovery-classifier-substrate"
+        binding: "substrate — TaskGroundTruth.recovery_for exists at a85cb1ad78; S8 δ reshapes its rules; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def recovery_for"
+          paths: ["orchestrator/src/orchestrator/task_ground_truth.py"]
+          expect: present
+  - label: "ζ2"
+    task_id: null
+    title: "Correct every document that says the scheduler re-pends stranded blocked tasks, and name deferred as the park"
+    note: "complexity=simple, low, prose and comments only; no key (companion of ζ). Carries task 4082's former item 4 (ruled): the blocked partition stated once in ARCHITECTURE.md, one sentence in docs/task-authoring.md §9 'Deferring a task', the set_task_status/update_task descriptions pointing at it. Depends on ζ, 9200 (S3 ζ, escalation/server.py), 9210 (S3 μ, ARCHITECTURE.md/OPERATIONS.md), 9248 (S10 κ1, task_transitions.py), 9285 (S10 ο, targeted.py), 9280 (S10 μ2, server/tools.py); S15 ε2/ι if filed first."
+    capabilities:
+      - name: "architecture-doc-corrected"
+        binding: "anti-inversion (ζ2) — ARCHITECTURE.md no longer names the deleted phase, including the tick-order line that names it without the _phase_ prefix"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "redispatch_stranded_blocked"
+          paths: ["ARCHITECTURE.md"]
+          expect: absent
+      - name: "transition-actor-note-corrected"
+        binding: "anti-inversion (ζ2) — the blocked→pending actor note in shared.task_transitions names no deleted writer"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_phase_redispatch_stranded_blocked"
+          paths: ["shared/src/shared/task_transitions.py"]
+          expect: absent
+  - label: "γ"
+    task_id: null
+    title: "Dependency readiness is one predicate over a required DepGates value"
+    note: "high. Closes fk-4b35b1adea0d. Lands C3; D5; the delayed-milestone clock waits for delivered checks (S17-3, ruled as recommended; affects trigger gate 6698). Depends on ζ (chain) and ι1, ι2, ι3 (D1: the migrations precede the first leaf that deletes a name tests reach outside its own files). Also rewrites DeliveredChecksConfig.enabled's description in config.py."
+    capabilities:
+      - name: "dep-gates-value"
+        binding: "capability→producer (γ; C3) — DepGates with no defaulted field"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class DepGates"
+          paths: ["orchestrator/src/orchestrator/dependency_verdict.py"]
+          expect: present
+      - name: "boolean-wrapper-gone"
+        binding: "anti-inversion (γ) — Scheduler._deps_satisfied deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _deps_satisfied"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "optional-cache-parameters-gone"
+        binding: "anti-inversion (γ) — deps_verdict no longer takes an optional external cache"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "external_status_cache: dict"
+          paths: ["orchestrator/src/orchestrator/dependency_verdict.py"]
+          expect: absent
+      - name: "verdict-equivalence"
+        binding: "behavioural — boundary row 5: golden table generated before γ matches deps_verdict(task, gates)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_dep_gates.py over the golden table built from today's deps_verdict"
+  - label: "δ1"
+    task_id: null
+    title: "Every delivered-check evaluation goes through delivered_checks.run"
+    note: "medium. Closes fk-8af92edd6f38. Lands C4 (incl. ErroredReason with author_fixable); D6 (b); owns the G4 seam 'delivered_checks.run as the one evaluator'. Depends on γ (chain), 9263 (S5 ε, delivered_checks.py tail), 9201 (S6 μ, landing_evidence.py tail); δ1 ↔ S20 μ (whichever stream files second). The decompose return lists verify_delivered_checks_on_main and DeliveredChecksVerdict.main_sha under moves."
+    capabilities:
+      - name: "one-evaluator-function"
+        binding: "capability→producer (δ1; C4) — delivered_checks.run"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: '^async def run\('
+          paths: ["orchestrator/src/orchestrator/delivered_checks.py"]
+          expect: present
+      - name: "mirror-comment-gone"
+        binding: "anti-inversion (δ1) — the stale 'mirror scheduler.py' pin goes with the second collapse"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "mirror scheduler.py"
+          paths: ["orchestrator/src/orchestrator/delivered_checks.py"]
+          expect: absent
+      - name: "second-aggregator-gone"
+        binding: "anti-inversion (δ1) — verify_delivered_checks_on_main deleted; gate_mark_done_on_delivered_checks calls run"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def verify_delivered_checks_on_main"
+          paths: ["orchestrator/src/orchestrator/delivered_checks.py"]
+          expect: absent
+      - name: "scheduler-calls-no-single-check-runner"
+        binding: "anti-inversion (δ1) — the scheduler's own wait_for and collapse are gone"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "run_delivered_check"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "landing-differential-through-run"
+        binding: "anti-inversion (δ1) — landing_evidence's differential calls run, bounded by the timeout"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "run_delivered_check"
+          paths: ["orchestrator/src/orchestrator/merge_lane/landing_evidence.py"]
+          expect: absent
+  - label: "δ2"
+    task_id: null
+    title: "A delivered check that cannot be evaluated is reported and escalated, never held silently"
+    note: "high. Closes fk-6c103745c784; contributes to fk-09bf639213ca. Lands C5 under S17-2 option B (Leo) and the lead's reading under one-decision-partition-per-area (INV-23): an author-fixable cause files born-at-L2 at the first window end and blocks the dependent; a transient cause is counted by the gate in grace windows, cleared by the gate when the check runs again, and filed as the same born-at-L2 on the third consecutive window; no watcher playbook section. Windows 1-2 file no queue record (S17-OQ-9 ruled A by the lead 2026-11-13). Files through S1 C5 SchedulerEscalations.file_and_block; errored_grace_sweeps is green-tier. Depends on δ1 (chain), 6724 (S14 ο, error streak on KeyedStreaks), 9231 (event_store.py tail, implied), 4700, S1 ζ2 (wave-3 leaf; task id wired at decompose). Delivers task 6035 item 4 (DeliveredCheckGate resolves GATE_REF)."
+    capabilities:
+      - name: "gate-collaborator-module"
+        binding: "capability→producer (δ2; C5) — orchestrator/src/orchestrator/delivered_check_gate.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class DeliveredCheckGate"
+          paths: ["orchestrator/src/orchestrator/delivered_check_gate.py"]
+          expect: present
+      - name: "errored-event-type"
+        binding: "capability→producer (δ2; C5) — EventType.delivered_check_errored"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "delivered_check_errored"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "errored-grace-config-field"
+        binding: "capability→producer (δ2; C5) — DeliveredChecksConfig.errored_grace_sweeps beside grace_cycles replaces the module constant (S17-2, ruled)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "errored_grace_sweeps"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "log-only-threshold-gone"
+        binding: "anti-inversion (δ2) — the WARNING-only threshold leaves scheduler.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_DELIVERED_CHECK_ERROR_LOG_THRESHOLD"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "persistent-errored-escalates"
+        binding: "behavioural (INV-11, INV-7) — boundary rows 8b, 10, 10b, 10c, 10d, 11: one event per window; born-at-L2 per (dependent, dep) at the first window end for an author-fixable reason or at the third consecutive transient window; windows 1-2 file no queue record at any level (S17-OQ-9 = A, lead 2026-11-13); no watcher step"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; a reviewer confirms test_delivered_check_errored.py rows 8b, 10, 10b, 10c, 10d and 11 assert the events, the filing per reason and window, the reset when the check runs again and the dependent's status, with no level-1 filing in rows 10b and 10c (S17-OQ-9 = A)"
+      - name: "keyed-streaks-substrate"
+        binding: "substrate — shared/src/shared/streak.py::KeyedStreaks exists at a85cb1ad78; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class KeyedStreaks"
+          paths: ["shared/src/shared/streak.py"]
+          expect: present
+  - label: "λ"
+    task_id: null
+    title: "Escalate to a human when a tick's delivered-check phase takes more than 30 seconds"
+    note: "low (ruled by Leo 2026-11-13 under S17-2). No finding key. Lands C13; D15: Scheduler._emit_tick_telemetry hands phases['delivered_check_gate'] to DeliveredCheckGate.observe_phase_time; above delivered_checks.phase_alarm_secs (default 30, green tier) one born-at-L2 infra_issue per project at severity critical (lead 2026-11-13, confirmed: critical is the floor of BORN_AT_L2_SEVERITIES, the lowest severity that reaches Leo's queue at main) under the sentinel __delivered_check_phase_slow__ (a Sentinel member in S1's registry, escalation/models.py), naming the phase time and the checks run, remedy a wall-clock budget for the phase. Offloading is not built. Depends on δ2 (scheduler.py chain); ε depends on it."
+    capabilities:
+      - name: "phase-alarm-threshold-setting"
+        binding: "capability→producer (λ; C13) — DeliveredChecksConfig.phase_alarm_secs (default 30.0, green tier)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "phase_alarm_secs"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "gate-observes-the-phase-time"
+        binding: "capability→producer (λ; C13) — DeliveredCheckGate.observe_phase_time, fed the scheduler_tick event's own phase value"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def observe_phase_time"
+          paths: ["orchestrator/src/orchestrator/delivered_check_gate.py"]
+          expect: present
+      - name: "phase-alarm-sentinel-registered"
+        binding: "capability→producer (λ; C13) — the project sentinel __delivered_check_phase_slow__ is a Sentinel member of S1's sentinel-id registry in escalation/models.py (lead 2026-11-13: S17's scheduler filers state their sentinel)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "__delivered_check_phase_slow__"
+          paths: ["escalation/src/escalation/models.py"]
+          expect: present
+      - name: "slow-phase-reaches-a-human-once"
+        binding: "behavioural (INV-4, INV-9) — boundary row 11b: one born-at-L2 at severity critical per project while open; nothing at or under the threshold; the gate's value equals the scheduler_tick event's"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; a reviewer confirms test_delivered_check_phase_alarm.py asserts row 11b"
+      - name: "tick-telemetry-substrate"
+        binding: "substrate — Scheduler._emit_tick_telemetry writes the per-phase phases map at a85cb1ad78; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _emit_tick_telemetry"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+  - label: "ε"
+    task_id: null
+    title: "The tick's phases are a validated table of method references over a context with required fields"
+    note: "medium. Closes fk-3e1e7c5129b5. Lands C6; D7 (read/write sets derived from each phase's body by AST, helpers receiving ctx included; status_map produced by backfill_dep_status). Depends on λ (chain); keeps λ's observe_phase_time call in the phase table's telemetry."
+    capabilities:
+      - name: "phase-table-type"
+        binding: "capability→producer (ε; C6) — TickPhase in tick_phases.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TickPhase"
+          paths: ["orchestrator/src/orchestrator/tick_phases.py"]
+          expect: present
+      - name: "string-phase-order-gone"
+        binding: "anti-inversion (ε) — the label tuple driving getattr dispatch is replaced by method references"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_TICK_PHASE_ORDER"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "phase-order-validated"
+        binding: "rejection-mechanism (ε; D7) — boundary rows 12, 12b and 13"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_tick_phase_order.py (stamp_milestone moved before external_dep_policy raises PhaseOrderError; declared sets cover the AST-derived sets; an early read raises TickFieldUnset)"
+  - label: "η"
+    task_id: null
+    title: "One frozen record per task in a dispatch ledger; the streak aliases go"
+    note: "medium. Closes fk-b2cd27267851; contributes to fk-09bf639213ca. Lands C7; D8. Depends on ε (chain) and 6821 (age-anchor extraction). Leaves the age-anchor maps to task 6821, backfill grants to θ, the ERRORED streak to δ2."
+    capabilities:
+      - name: "task-record-type"
+        binding: "capability→producer (η; C7) — dispatch_ledger.py::TaskRecord"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TaskRecord"
+          paths: ["orchestrator/src/orchestrator/dispatch_ledger.py"]
+          expect: present
+      - name: "requeue-deadline-dict-gone"
+        binding: "anti-inversion (η) — the requeue deadline lives in TaskRecord, not a scheduler dict"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "self._requeue_until"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "streak-aliases-gone"
+        binding: "anti-inversion (η) — the test-only alias attributes are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_external_unresolved_counts"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+  - label: "θ"
+    task_id: null
+    title: "Backfill admission and the warm-base hard-down watchdog become collaborators the scheduler constructs"
+    note: "medium. Closes fk-09bf639213ca (ModuleLockTable part fixed:0112c8fde0). Lands C8; D9. Depends on η (chain) and S1 ζ2 (both collaborators file through C5 SchedulerEscalations; wave-3 task id wired at decompose). S16 ζ3 depends on S17 κ1 (S16's draft); θ adds no edge onto S16. Carries the heuristic-14 record of scheduler.py in its task record."
+    capabilities:
+      - name: "backfill-admission-module"
+        binding: "capability→producer (θ; C8) — backfill_admission.py::BackfillAdmission"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class BackfillAdmission"
+          paths: ["orchestrator/src/orchestrator/backfill_admission.py"]
+          expect: present
+      - name: "warm-base-watchdog-module"
+        binding: "capability→producer (θ; C8) — warm_base_watchdog.py::WarmBaseHardDownWatchdog"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class WarmBaseHardDownWatchdog"
+          paths: ["orchestrator/src/orchestrator/warm_base_watchdog.py"]
+          expect: present
+      - name: "inline-admission-gone"
+        binding: "anti-inversion (θ) — Scheduler._backfill_admission deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _backfill_admission"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+  - label: "κ1"
+    task_id: null
+    title: "The scheduler's shadow protocol goes: TaskWorkflow and its peers type the scheduler they use"
+    note: "medium. Contributes to fk-4b3eb71db017; R16 rules the remedy (shadow protocol and hand fakes replaced). Depends on θ (chain), 9232 (S8 κ1, workflow.py tail), 9253 and 9279 (S9 μ1, μ2). SchedulerFacade has 17 methods (measured at a85cb1ad78). Declares test_port_conformance.py, dry_run_unblock.py and test_scheduler_acquire_uncontested.py (task 3090's conformance assert)."
+    capabilities:
+      - name: "shadow-protocol-deleted"
+        binding: "anti-inversion (κ1) — scheduler.py::SchedulerFacade deleted (R16)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class SchedulerFacade"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "workflow-types-the-scheduler"
+        binding: "anti-inversion (κ1) — workflow.py no longer names the facade (R16)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SchedulerFacade"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: absent
+  - label: "κ2"
+    task_id: null
+    title: "Workflow tests use the real scheduler over the in-memory task store; the hand-written FakeScheduler and TaskStoreDouble go"
+    note: "medium, tests only, 45 files (mechanical; the 42 FakeScheduler files enumerated in the PRD, measured at a85cb1ad78, plus _task_store_doubles.py and its 2 users). Closes fk-4b3eb71db017. Depends on κ1. No edge onto 8778 (it would rest only on test files, lead test-file rule); the lead amends 8778's item 4 onto InMemoryTaskStore."
+    capabilities:
+      - name: "hand-fake-deleted"
+        binding: "anti-inversion (κ2) — orchestrator/tests/_workflow_helpers.py::FakeScheduler deleted, and no test file re-declares it (R16)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class FakeScheduler"
+          paths: ["orchestrator/tests/"]
+          expect: absent
+      - name: "task-store-double-deleted"
+        binding: "anti-inversion (κ2) — orchestrator/tests/_task_store_doubles.py::TaskStoreDouble deleted; its users run on InMemoryTaskStore (R16)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TaskStoreDouble"
+          paths: ["orchestrator/tests/"]
+          expect: absent
+  - label: "ω"
+    task_id: null
+    title: "No test reaches a private Scheduler name: the long tail moves and the baseline is deleted (integration gate)"
+    note: "high, tests only (mechanical; 32 files with residual reaches enumerated in the PRD, measured at a85cb1ad78, plus the guard and the baseline). Closes fk-a571802ee4ea. Stream integration gate and signal leaf. Its zero check greps PRIVATE_REACH_PATTERN, the same pattern the D2 guard counts. Depends on κ2 (integration gate)."
+    capabilities:
+      - name: "zero-private-scheduler-reaches"
+        binding: "anti-inversion (ω; D2) — no line of any tracked file under orchestrator/tests matches PRIVATE_REACH_PATTERN (1,479 lines at a85cb1ad78), the guard's own source included and no file exempt"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: '(^|[^A-Za-z0-9_])((real|fresh)_)?(scheduler|sched)\._[a-z]|(^|[^A-Za-z0-9_])Scheduler\._[A-Za-z]'
+          paths: ["orchestrator/tests/"]
+          expect: absent
+      - name: "boundary-suite-green"
+        binding: "integration gate — boundary rows 1-22 (with 10b-10d, 11b, 14b-14g) green in one orchestrator suite run; the guard asserts zero"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "integration gate; a reviewer confirms the merge-gate run of orchestrator/tests includes every boundary-row test named in the PRD and test_scheduler_private_reach.py asserts zero"
+  - label: "ξ1"
+    task_id: null
+    title: "The deterministic runner parses a task once into RunnerState and dispatches to gate and predicate steps"
+    note: "medium, behaviour-neutral. Contributes to fk-ebce5e23048a (and repoints the runner's fk-a2bc16e5812c copy). Lands C10 (state, gate and predicate steps); D11. Depends on α0, S1 γ (S1's decompose cancels 8355 and 3887 into γ; γ's status_write.py::file_and_block is the lower-module filer; wave-3 task id wired at decompose), 9191 (S10 β2, deterministic_runner.py tail), 9254 and 9285 (S10, live_workflow_detector.py), and 7827, 3638 (live tasks changing the moved branches). Golden capture regenerated on the rebased base. Subsumes task 8356 with ξ2."
+    capabilities:
+      - name: "runner-state-type"
+        binding: "capability→producer (ξ1; C10) — deterministic_state.py::RunnerState"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RunnerState"
+          paths: ["orchestrator/src/orchestrator/deterministic_state.py"]
+          expect: present
+      - name: "gate-step-module"
+        binding: "capability→producer (ξ1; D11) — the gate step lives below the runner"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/deterministic_gate_step.py"]
+          expect: present
+      - name: "raw-gate-stamp-read-gone"
+        binding: "anti-inversion (ξ1) — neither run() nor any step module reads gate_escalated_at from the raw dict (one read inside run at a85cb1ad78)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "metadata\\.get\\('gate_escalated_at'\\)"
+          paths: ["orchestrator/src/orchestrator/deterministic_runner.py", "orchestrator/src/orchestrator/deterministic_state.py", "orchestrator/src/orchestrator/deterministic_gate_step.py", "orchestrator/src/orchestrator/deterministic_predicate_step.py", "orchestrator/src/orchestrator/deterministic_deploy_step.py"]
+          expect: absent
+      - name: "parse-metadata-substrate"
+        binding: "substrate — shared.task_metadata.parse_metadata exists at a85cb1ad78; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def parse_metadata"
+          paths: ["shared/src/shared/task_metadata.py"]
+          expect: present
+  - label: "ξ2"
+    task_id: null
+    title: "A deterministic deploy resumes after a crash from its recorded deploy phase"
+    note: "medium. Closes fk-5a5d08e775de and fk-ebce5e23048a. Lands C10 (deploy step; module-level deploy_state.from_legacy_stamps); D10. Depends on ξ1 and 5312 (live task changing the deploy path)."
+    capabilities:
+      - name: "deploy-step-module"
+        binding: "capability→producer (ξ2; D11) — the deploy step lives below the runner"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/deterministic_deploy_step.py"]
+          expect: present
+      - name: "legacy-stamp-mapping"
+        binding: "capability→producer (ξ2; D10) — deploy_state.from_legacy_stamps (module level) is the one stamp-to-phase mapping"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def from_legacy_stamps"
+          paths: ["orchestrator/src/orchestrator/deploy_state.py"]
+          expect: present
+      - name: "stamp-presence-resume-gone"
+        binding: "anti-inversion (ξ2) — neither the runner nor any step module resumes by reading before_done_ran_at from the raw dict"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "metadata\\.get\\('before_done_ran_at'\\)"
+          paths: ["orchestrator/src/orchestrator/deterministic_runner.py", "orchestrator/src/orchestrator/deterministic_state.py", "orchestrator/src/orchestrator/deterministic_gate_step.py", "orchestrator/src/orchestrator/deterministic_predicate_step.py", "orchestrator/src/orchestrator/deterministic_deploy_step.py"]
+          expect: absent
+      - name: "resume-equivalence"
+        binding: "behavioural — boundary row 19: golden table of phase x stamp rows generated before ξ2"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_deterministic_deploy_resume.py over the golden table; disagreeing rows listed in the task record"
+  - label: "μ"
+    task_id: null
+    title: "Plan-tools and verdict-tools receive their markup channels as one bundle"
+    note: "low. Closes fk-6e7e9bb942d6. Lands C9; D12. Depends on 9170 (S9 α, plan_tools.py; done) and S1 κ2 (markup_sink.py; wave-3 leaf, task id wired at decompose). Subsumes task 7627."
+    capabilities:
+      - name: "markup-channels-type"
+        binding: "capability→producer (μ; C9) — markup_sink.py::MarkupChannels"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class MarkupChannels"
+          paths: ["orchestrator/src/orchestrator/mcp/markup_sink.py"]
+          expect: present
+      - name: "global-root-resolver-gone"
+        binding: "anti-inversion (μ) — plan_tools._markup_project_root deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _markup_project_root"
+          paths: ["orchestrator/src/orchestrator/mcp/plan_tools.py"]
+          expect: absent
+      - name: "global-channel-opener-gone"
+        binding: "anti-inversion (μ) — plan_tools._escalation_channel deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _escalation_channel"
+          paths: ["orchestrator/src/orchestrator/mcp/plan_tools.py"]
+          expect: absent
+      - name: "escalation-sink-substrate"
+        binding: "substrate — markup_sink.make_escalation_sink exists at a85cb1ad78; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def make_escalation_sink"
+          paths: ["orchestrator/src/orchestrator/mcp/markup_sink.py"]
+          expect: present
+  - label: "ν"
+    task_id: null
+    title: "Record Leo's principle as the design invariant one-decision-partition-per-area (four-site lockstep edit)"
+    note: "medium (ruled by Leo 2026-11-13). No finding key. The four-site lockstep edit (CONTRIBUTING.md §6): design-invariants.md (section, header dating paragraph, Fixtures date list), design-invariants-fixtures.md (INV-N-PRD, INV-N-CODE, both violating, and a dated addendum walk), gates.md (family-inventory row, inv-trigger-shapes span); CONTRIBUTING.md and code_quality.md untouched. Rule text from digests/discussion/S17.md 'The principle, recorded'; checkable form: every row of a recovery or policy table names who decides it (code, an LLM or a human). House pattern: task 4082's RECOVERY_RULES.decided_by and validate_recovery_rules. INV-23 fixtures: INV-23-CODE has a row with no decided_by, and the addendum walk shows the checkable question failing on it and passing on the house pattern. Depends on task 4082; the lead chains it among the wave-3 invariant leaves at decompose (S2/OQ-10); INV-23, minted last of the six wave-3 invariant tasks (lead 2026-11-13). Checks anchor on the slug."
+    capabilities:
+      - name: "invariant-in-the-normative-list"
+        binding: "capability→producer (ν) — docs/legibility/design-invariants.md carries the one-decision-partition-per-area section"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "one-decision-partition-per-area"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+      - name: "invariant-fixtures-prove-the-negative"
+        binding: "capability→producer (ν) — design-invariants-fixtures.md carries the invariant's violating PRD and code fixtures and the addendum walk"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "one-decision-partition-per-area"
+          paths: ["docs/legibility/design-invariants-fixtures.md"]
+          expect: present
+      - name: "invariant-in-the-g7-gate"
+        binding: "capability→consumer (ν) — skills/prd/references/gates.md lists the slug in the family inventory and the inv-trigger-shapes span, so /prd G7 walks it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "one-decision-partition-per-area"
+          paths: ["skills/prd/references/gates.md"]
+          expect: present
+      - name: "family-consistency"
+        binding: "behavioural — boundary row 23: scripts/tests/test_design_invariants_consistency.py passes with the slug in every pinned site"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms uv run --project shared pytest scripts/tests/test_design_invariants_consistency.py passes on the merge commit"
+      - name: "consistency-guard-substrate"
+        binding: "substrate — scripts/tests/test_design_invariants_consistency.py::PINNED_SITES exists at a85cb1ad78; not a producer check"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^PINNED_SITES = "
+          paths: ["scripts/tests/test_design_invariants_consistency.py"]
+          expect: present

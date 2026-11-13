@@ -21,17 +21,25 @@ from shared.testing_timeout_markers import (
     judge_inversion_band,
     scan_timeout_marker_sites,
 )
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    WHOLE_TREE_SCAN_TIMEOUT_NAME,
+)
 
 # One xdist worker pays for the cached sweep once, under -n auto --dist loadgroup.
-pytestmark = pytest.mark.xdist_group('timeout_marker_inversion_guard')
+pytestmark = [
+    pytest.mark.xdist_group('timeout_marker_inversion_guard'),
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+]
 
 _TESTS_DIR = Path(__file__).resolve().parent
 _ORCH_YAML = _TESTS_DIR.parent / 'orchestrator.yaml'
 
-#: No named timeout constant is shared across this package's modules, so a
+#: The one named timeout constant this package's modules share: the
+#: whole-tree guard family's ceiling, resolved from its home.  Any other
 #: marker spelled as a NAME reads as "no opinion".  The guard is a floor, with
 #: the same stated limit as orchestrator's.
-_SANCTIONED: Mapping[str, float] = {}
+_SANCTIONED: Mapping[str, float] = {WHOLE_TREE_SCAN_TIMEOUT_NAME: WHOLE_TREE_SCAN_TEST_TIMEOUT}
 
 #: Set below the 487 files and 60 sites measured on 2026-10-07.
 _FLOORS = SweepFloors(test_files=300, marker_sites=40)

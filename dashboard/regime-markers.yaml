@@ -1,15 +1,27 @@
-# Regime markers for the escalation-analytics dashboard (Seam 2,
-# plans/escalation-lifecycle-dashboard-prd.md).
+# Curated quality and regime markers (plans/quality-dashboard-prd.md decision 12;
+# first introduced for plans/escalation-lifecycle-dashboard-prd.md Seam 2).
 #
-# Hand-curated: add an entry whenever a behaviour-reshaping change lands so
-# the analytics charts can render a vertical annotation marking the
-# before/after boundary. Each entry is a mapping with:
-#   date:  YYYY-MM-DD (the change's landing date)
-#   label: short human-readable description
-#   tasks: list of task ids that implemented the change
+# Hand-curated: add an entry whenever a behaviour-reshaping change lands, or an
+# incident corrupts a stretch of a quality series, so the charts can mark the
+# before/after boundary or set the range aside. Each entry is a mapping with:
+#   date:    YYYY-MM-DD (the start of that UTC day) or an ISO instant with an
+#            offset; naive times are rejected
+#   label:   short human-readable description
+#   tasks:   list of task ids that implemented the change (optional)
+#   project: the project id the entry applies to, in any spelling
+#            (optional; absent = every project)
+#   kind:    one of model, effort, budget, turns, prompt, reviewer_policy,
+#            routing_rule, cli, deploy, artefact, regime, instrument
+#            (optional; absent = regime)
+#   until:   the inclusive end of an artefact range: a YYYY-MM-DD date means the
+#            end of that UTC day (allowed on artefact entries only)
+#   series:  the quality metric ids the entry is a regime event for (optional;
+#            absent = every series)
 #
-# Loaded by dashboard.data.escalation_analytics.load_regime_markers(), which
-# fails soft (never raises) on a missing or malformed file.
+# Read by dashboard.data.quality_markers.load_curated_markers(), the one reader,
+# which fails soft (never raises): a missing file is no markers, and every
+# rejected entry is logged and counted. The escalation-analytics tab shows the
+# regime entries only.
 
 - date: 2026-07-15
   label: "Starvation threshold raised to 72h"
@@ -20,3 +32,10 @@
 - date: 2026-07-15
   label: "Verify-scope flip"
   tasks: [2593]
+- date: 2026-10-16
+  until: 2026-10-16
+  kind: artefact
+  project: dark_factory
+  series: [flakes_confirmed, flakes_real_red]
+  label: "Disk-full incident: 1,098 flake_occurrence rows on 2026-10-16, unconfirmable (leg_without_verdict:disk_full)"
+  tasks: []

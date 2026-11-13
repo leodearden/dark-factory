@@ -35,12 +35,15 @@ from typing import Any, NamedTuple
 import pytest
 from _ast_guard import parse_python_module
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.ticket_store import CurationBacklog
 from fused_memory.services.write_journal import JournalGrowthSample, Mem0RetryBacklog
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: Applied PER CLASS rather than as a module-level ``pytestmark``, so the
 #: pairwise anchor-collision regression at the foot of this file keeps running

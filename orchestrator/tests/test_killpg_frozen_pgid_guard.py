@@ -66,7 +66,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This guard sweeps the WIDEST root in the family -- REPO_ROOT.glob('*/src/*')
 # and glob('*/tests') expanded, then rglob('*.py') under each, plus scripts/
@@ -75,7 +75,7 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # structurally identical to the three members that crashed.
 # WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
 # ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

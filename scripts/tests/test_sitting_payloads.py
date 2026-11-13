@@ -8,10 +8,13 @@ from pathlib import Path
 import pytest
 from escalation.shadow_ruling import SHADOW_RULING_MARKER
 from orchestrator.session_registry import decision_path_for_id
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import payloads as mod
 from sitting.inventory import OpenItem, decision_key, escalation_key, queue_tag
 
 from orchestrator import session_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ESCALATION_SERVER = REPO_ROOT / 'escalation' / 'src' / 'escalation' / 'server.py'

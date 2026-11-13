@@ -45,7 +45,7 @@ Both cases run the same command and the same checklists. Only the reason differs
    ```bash
    PYTHONPATH=<factory checkout>/scripts uv run --directory <factory checkout>/shared python <factory checkout>/scripts/legibility/census_trigger.py evaluate --project-root <target-root>
    ```
-   It prints FIRE or NO-FIRE and one reason line each for completion (the share of the previous run's filed tasks landed, against 0.70, or a named N/A), the novelty spike and the floor. It runs one read-only `scripts/check_run_completion.py` check and makes no `get_statuses` call.
+   `--config <path>` names a non-default `legibility.yaml`. As with the census, a config whose `project_root` is not `<target-root>` is refused with exit 1. It prints a `config:` line naming the `legibility.yaml` it loaded and the validated thresholds, then FIRE or NO-FIRE and one reason line each for completion (the share of the previous run's filed tasks landed, against 0.70, or a named N/A), the novelty spike and the floor. It runs one read-only `scripts/check_run_completion.py` check and makes no `get_statuses` call.
 3. **Headroom.** The run probes this itself (`preflight_headroom`, one trickle-model call, which defers the whole run when the account pool is capped), and probes again before verification. Mining uses `census_miner` (Sonnet), verification `census_verify` (Sonnet) and synthesis `census_synthesis` (Fable). Avoid starting an uncapped census while other heavy work holds the pool.
 
 ## Running
@@ -118,9 +118,9 @@ To have the trigger treat an earlier hand-run legibility survey as the first cen
 }
 ```
 
-`last_census_at` may be a date or an ISO datetime (`datetime.fromisoformat`). Add `"last_census_run_id": "<run id>"` only when the survey filed its tasks under `x_finding_run=<run id>`; without it, completion is N/A and the census fires on a novelty spike alone.
+`last_census_at` may be a date or an ISO datetime, which is read as its UTC date. Add `"last_census_run_id": "<run id>"` only when the survey filed its tasks under `x_finding_run=<run id>`; without it, completion is N/A and the census fires on a novelty spike alone.
 
-Every threshold in `legibility.yaml`'s `census:` block must be an **unquoted integer**: `completion_threshold_pct` in 1..100, the others non-negative. `CensusConfig.from_mapping` falls back per field and names each rejected value in one warning. A retired key (`max_interval_days`, `tasks_landed_threshold`, `tasks_landed_min_days`) is ignored, with one warning naming it.
+Every threshold in `legibility.yaml`'s `census:` block must be an **unquoted integer**: `completion_threshold_pct` in 1..100, the others non-negative (the `saturation` and `adjudication` similarities are unquoted numbers in 0..1). A malformed `census:` value fails `config.load_config` naming the field and value: the trickle records a failed night, its error naming the field and value, and `census_trigger.py evaluate` exits 1. A retired key (`max_interval_days`, `tasks_landed_threshold`, `tasks_landed_min_days`) is ignored, with one warning naming it and the file it is in.
 
 Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/agent-legibility-survey-2026-07-13.md`. Use this only when an equivalent survey really exists.
 

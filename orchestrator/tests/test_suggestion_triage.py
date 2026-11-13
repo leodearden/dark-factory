@@ -112,7 +112,8 @@ def _make_escalation(**overrides):
 # ---------------------------------------------------------------------------
 
 class TestEscalateSuggestions:
-    def test_creates_escalation_with_correct_fields(self):
+    @pytest.mark.asyncio
+    async def test_creates_escalation_with_correct_fields(self):
         queue = MagicMock()
         queue.make_id.return_value = 'esc-42-0'
         wf = _make_workflow(escalation_queue=queue)
@@ -125,7 +126,7 @@ class TestEscalateSuggestions:
         ]
         reviews = _fake_reviews(suggestions)
 
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
 
         queue.submit.assert_called_once()
         esc = queue.submit.call_args[0][0]
@@ -138,16 +139,18 @@ class TestEscalateSuggestions:
         json_start = detail.index('#', 6) + 1
         assert json.loads(detail[json_start:]) == suggestions
 
-    def test_noop_without_queue(self):
+    @pytest.mark.asyncio
+    async def test_noop_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
         reviews = _fake_reviews([{'description': 'something'}])
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
 
-    def test_noop_without_suggestions(self):
+    @pytest.mark.asyncio
+    async def test_noop_without_suggestions(self):
         queue = MagicMock()
         wf = _make_workflow(escalation_queue=queue)
         reviews = _fake_reviews([])
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
         queue.submit.assert_not_called()
 
 
@@ -171,7 +174,8 @@ class TestEscalateSuggestionsCharacterization:
              'description': 'Add coverage for X', 'suggested_fix': 'Write test'},
         ]
 
-    def test_detail_uses_shared_hash_helper(self):
+    @pytest.mark.asyncio
+    async def test_detail_uses_shared_hash_helper(self):
         """detail must start with '#hash:<shared_hash>#' — not a re-inlined hash."""
         from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
 
@@ -183,14 +187,15 @@ class TestEscalateSuggestionsCharacterization:
 
         suggestions = self._suggestions()
         reviews = _fake_reviews(suggestions)
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
 
         queue.submit.assert_called_once()
         esc = queue.submit.call_args[0][0]
         expected_hash = review_suggestion_payload_hash(suggestions)
         assert esc.detail.startswith(f'#hash:{expected_hash}#')
 
-    def test_skips_when_prior_matching_hash(self):
+    @pytest.mark.asyncio
+    async def test_skips_when_prior_matching_hash(self):
         """submit must NOT be called when a prior escalation with the same hash exists."""
         from orchestrator.review_suggestions.dedup import (
             hash_marker,
@@ -210,11 +215,12 @@ class TestEscalateSuggestionsCharacterization:
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
 
-        wf._escalate_suggestions(_fake_reviews(suggestions))
+        await wf._escalate_suggestions(_fake_reviews(suggestions))
 
         queue.submit.assert_not_called()
 
-    def test_does_not_skip_when_prior_has_different_hash(self):
+    @pytest.mark.asyncio
+    async def test_does_not_skip_when_prior_has_different_hash(self):
         """submit IS called when the prior escalation has a different hash."""
         from orchestrator.review_suggestions.dedup import hash_marker
 
@@ -231,7 +237,7 @@ class TestEscalateSuggestionsCharacterization:
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
 
-        wf._escalate_suggestions(_fake_reviews(suggestions))
+        await wf._escalate_suggestions(_fake_reviews(suggestions))
 
         queue.submit.assert_called_once()
 
@@ -1143,7 +1149,8 @@ class TestAwaitStewardCompletion:
 # ---------------------------------------------------------------------------
 
 class TestReviewLoopRouting:
-    def test_escalates_instead_of_memory_write_when_queue_available(self):
+    @pytest.mark.asyncio
+    async def test_escalates_instead_of_memory_write_when_queue_available(self):
         queue = MagicMock()
         queue.make_id.return_value = 'esc-42-0'
         wf = _make_workflow(escalation_queue=queue)
@@ -1153,15 +1160,16 @@ class TestReviewLoopRouting:
         reviews = _fake_reviews(suggestions)
 
         with patch.object(wf, '_write_suggestions_to_memory') as mock_write:
-            wf._escalate_suggestions(reviews)
+            await wf._escalate_suggestions(reviews)
             mock_write.assert_not_called()
             queue.submit.assert_called_once()
 
-    def test_falls_back_to_memory_write_without_queue(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_memory_write_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
         suggestions = [{'description': 'something'}]
         reviews = _fake_reviews(suggestions)
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
 
 
 # ---------------------------------------------------------------------------

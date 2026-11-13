@@ -749,7 +749,18 @@ it, and the gate slug where one corresponds:
   work is curating memories in place (its text says it is curator-sitting work, edits no
   repository file, and names the memories to amend) is handled under self-execute line 14, with
   every check that line requires, and reported afterwards (Leo, 2026-11-10, scoping_intake
-  esc-866-1; precedent esc-787-1). Any other milestone gate is still asked.
+  esc-866-1; precedent esc-787-1). Any other milestone gate is still asked. **Second exception:**
+  `review_due`, or a `milestone_gate` whose task carries `metadata.trigger_chain.role='human_gate'`
+  (an interim gate, filed as milestone_gate by a runner that predates review_due), is handled under
+  "`review_due` (born-at-L2, human gate)", which spawns the attended run with no prior ask (D10,
+  Leo 2026-10-05). A withheld gate
+  does not qualify: a `milestone_gate` whose detail carries "This human gate files milestone_gate
+  rather than review_due because …"
+  (`orchestrator/src/orchestrator/review_due.py::ReviewDueWithheld.detail_line`: an invalid chain,
+  or a config without project_id or project_root) is asked like any other milestone gate. The
+  spawn itself is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost with Leo
+  before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
+  `--launched-from` go-gate lands, task 9446).
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
@@ -2077,6 +2088,64 @@ fallback, the field meanings and why not `get_escalation` are in the "Investigat
 Once the check passes on main, resolve with `action='resume'` to re-pend the dependent. Other
 dependents of the same owner may hold their own records for the same check: one fix on the owner
 serves them all, so close each against the ruling.
+
+### `review_due` (born-at-L2, human gate)
+
+Filed by `orchestrator-deterministic` when a completion-driven chain's completion gate passes
+(`plans/completion-driven-triggers-prd.md` C4/C5). Read the typed `review_due` payload (`skill`,
+`project_root`, `launched_from`, `verdict`), never the summary text; an interim `milestone_gate`
+has no payload, so its fields come from the interim bullet below. Never stamp it or auto-close
+it: it lands in `deterministic_runner_filing`, a human-forever gate. Whenever it is left pending
+(spawned, AFK, or "not now"), append `<esc-id>` to the exclude-file. The brief line's live share
+comes from `cd "$DARK_FACTORY_ROOT" && .venv/bin/python scripts/check_run_completion.py --pending
+--project-root <project_root>`.
+
+- **Attended: spawn directly, no prior ask.** `/spawn` (multi-turn case of "Sub-agent or `/spawn`")
+  with `prompt="/<skill> <project_root> --launched-from <launched_from>"`, built from the payload
+  (the stored `skill` is bare; you add the slash), `terminal_title="<skill>:<project_id>
+  <launched_from>"` (a project-level spawn, no task id), `cwd=<project_root>`. The leading
+  `/<skill>` token and `--launched-from <launched_from>` are both load-bearing: the first invokes
+  the skill, the second is how its supersede step (`skills/_shared/filing-the-trigger-chain.md`
+  §5 step 2) knows this escalation launched it. `/review-all` reads the positional
+  `<project_root>` as its project, `/hotspot-survey` as free-text scope naming the whole repo, and
+  `/review` defines no positional; `cwd` carries the project for those two.
+- **AFK: digest line plus a DecisionRecord via `write-decision`.** Never spawn, and never a
+  sub-agent that runs the skill (Leo's ruling, `plans/completion-driven-triggers-prd.md` §7). On
+  Leo's return, handle it under the attended branch (spawn, no prior ask) unless he has already
+  said "not now".
+- **Never resolve it when you spawn.** The spawned run resolves it once, in its supersede step
+  (C5 step 5), with `resume` and `ran as <run_id>`; resolving it here too would double-resolve it.
+  Leave it pending until the spawn reports back, and never re-spawn for it after. A run that
+  handed off still owns it (`/review-all` hands off after phases 0–5 and resolves it in Phase 6,
+  when the program files its chain): record the successor session as its owner in the handover's
+  In flight section. Only a run whose report's `## Method` block carries "no trigger chain: the
+  run filed no tasks" under `extra` (snippet §0) leaves it to you: resolve it once, `resume` with
+  `ran as <run_id>` from that report. A run that stopped at its own scope/cost go-gate, or ended
+  `abandoned`, `blocked` or `in-progress` without that line, never ran: take it to Leo under
+  Decline, never `resume`.
+- **Decline (C5 step 6).** "Not now": leave it pending, a standing brief item that re-files
+  nothing. "End the cadence": `resolve_issue(action='abandon')` on the human gate.
+- **Interim gate.** A `milestone_gate` whose task carries `metadata.trigger_chain.role='human_gate'`
+  (filed by a runner that predates review_due) and whose detail lacks the withheld line is handled
+  like `review_due`: attended spawn, AFK digest, never resolve on spawn, decline. Its spawn fields come from three
+  places, never the summary: `skill` from the task's `metadata.trigger_chain.skill`, read with
+  `mcp__fused-memory__get_task` (it must be exactly `review`, `hotspot-survey` or `review-all`,
+  per `shared/src/shared/task_metadata.py::TriggerChainSkill`; add the slash; any other value is
+  asked like a withheld gate); `project_root` is this watcher's own
+  `<project_root>`, since an escalation record has no project_root field
+  (`escalation/src/escalation/models.py::Escalation`); `launched_from` is the record's own
+  escalation id. A withheld gate, whose detail carries "This human gate files milestone_gate
+  rather than review_due because …" (an invalid chain or an unusable config), is never spawned: it
+  is asked like any other milestone gate, per "Always ask".
+
+### `milestone_check_stalled` (trigger chain, completion gate)
+
+Filed on a chain's completion gate when its predicate re-armed to its cap (the PRD's C1). Three
+resolutions: `resume` keeps waiting (streak restarted); `abandon` on this record fires the human
+gate now; or end the chain: cancel the human gate first (`set_task_status("cancelled")`: it is
+pending and has no escalation), then `abandon` this record. The order is load-bearing: a cancelled
+completion gate satisfies the human gate's dependency and fires it. Which one is Leo's to pick: it
+is a milestone gate, so it is asked.
 
 ### `design_concern` (info or blocking)
 

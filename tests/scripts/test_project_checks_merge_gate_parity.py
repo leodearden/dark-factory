@@ -32,6 +32,9 @@ from hook_checks_fixture import (
     ModuleSpec,
     make_hook_repo,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 BAD_TYPE = 'x: int = "not an int"\n'
 TIMED_LINE = re.compile(r'merge-gate checks\b.* in [0-9]+s')

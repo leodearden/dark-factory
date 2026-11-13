@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.corpus import (
     CorpusIntegrityError,
@@ -14,6 +15,8 @@ from fused_memory.arm_harness.corpus import (
 )
 from fused_memory.arm_harness.replay_types import ReplayItem
 from fused_memory.arm_harness.transcript_queries import iter_transcript_queries
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FUSED_MEMORY_ROOT = Path(__file__).parents[2]
 LME_DIR = FUSED_MEMORY_ROOT / 'scripts' / 'local_memory_models_eval'

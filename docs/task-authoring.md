@@ -168,7 +168,10 @@ for every kind:
 - **Evidence is type-checked, not filtered.** A wrongly-typed field such as
   `pid: "abc"` or `fire_delay_secs: "soon"` refuses the whole write with
   `done_provenance_invalid`; it is not silently dropped. A well-typed field
-  the kind does not record (for example `pid` on `merged`) is discarded.
+  the kind does not record (for example `pid` on `merged`, or an
+  `escalation_id` on a kind whose row above does not name it) is
+  discarded, so cite a resolving escalation in `note` when the kind does
+  not record one.
 - **The `deterministic-gate` `escalation_id` requirement is write-time
   only.** New `done` writes must carry it, while stored blobs written before
   task 5241, which lack it, still read without a schema warning.
@@ -856,7 +859,7 @@ architect path regardless of `complexity`.
 
 `metadata.execution_class` answers **who executes the task at dispatch**, not
 what kind of edit it is. `'operational'` (and `'decision'`) are converted **at
-submit** by `TaskInterceptor._inject_deterministic_pure_gate` into
+submit** by `shared/src/shared/pure_gate_provenance.py::pure_gate_stamped` into
 `task_kind='deterministic'` + `always_escalates=True` — a pure gate whose only
 dispatch action is a born-at-L2 escalation **to a human**. Human attention is
 the bottleneck; use these values only for work that genuinely requires an
@@ -867,8 +870,18 @@ operator (a ruling, an action no agent can take).
 docs edits). This mistake — declaring a mechanical docs leaf `'operational'`
 because it "isn't code" — has been made by multiple independent sessions
 (ruled by Leo 2026-08-24; tasks 4626/4671/4675/4680 were retyped out of it).
-The conversion is currently **silent** in the `submit_task` response; a
-submit-time notice + metadata provenance stamp is filed as its own task.
+The conversion is not silent. On both the ticket and the `planning_mode`
+path the `submit_task` response carries `routing_notice` (`pure_gate_from`,
+`detail`, `hint`), and the stored task carries `metadata.pure_gate_from`
+naming the trigger: `execution_class=operational`, `execution_class=decision`,
+or `operational_ask_registry` (vocabulary:
+`shared/src/shared/pure_gate_provenance.py::PureGateTrigger`). The last is the
+curator's route for an untagged ask matching the operational-ask registry. The
+curator decides that after `submit_task` has returned, so that path gets the
+stamp and `resolve_ticket`'s `route_deterministic` reason, but no response
+notice. Only a submission whose routing the conversion actually rewrites is
+marked: one that already declares the pure-gate shape, such as recon's
+consolidation gate, gets neither `routing_notice` nor `pure_gate_from`.
 
 ---
 
@@ -892,7 +905,7 @@ dependency gate as every other task (§3).
   script: "<repo-relative path>",  # must exist & be executable
   args: [],                         # list[str], default []
   env: {},                          # dict[str,str], default {}; reaches the script on every path, see below
-  cwd: "<project_root>",            # default: project_root
+  cwd: "<project_root>",            # str|None; default project_root
   timeout_secs: 120,                # int, required; runner kills + escalates on timeout
   target_unit: None,                # str|None; None → cross-unit (no self-kill)
   kind: "deploy",                   # "deploy" | "predicate"; default "deploy" — see §6 for "predicate"
@@ -1529,8 +1542,9 @@ source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
+execution_class, pure_gate_from, merge_lane, pending_since,
+pending_since_backfilled, claimant_exception, audit_trail_rotation,
+plan_text_fp, plan_authored_at,
 main_health_signature, superseded_by, cancel_dispositions, trigger_chain,
 predicate_recheck, predicate_verdict
 ```
@@ -1574,6 +1588,20 @@ Three of the entries belong to the completion-driven trigger chain
   predicate's trailing JSON-object payload, parsed; or
   `{"elided": true, "chars": N}` over the 400-char cap; or `null` when a
   declared `75` carried no JSON object (§6).
+
+`pure_gate_from` is machine-written at conversion, never author-supplied: the
+`submit_task` tool drops a caller-supplied value (metadata cloned from
+`get_task`, say), and `shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`
+stamps it with a
+`shared/src/shared/pure_gate_provenance.py::PureGateTrigger` value (§4). It
+is written only when the conversion rewrote the submission's routing: a
+submission that already declared the pure-gate shape
+(`task_kind='deterministic'` with `always_escalates=True` and no
+`before_done`) is never stamped, whatever its `execution_class` (the rule is
+`shared/src/shared/pure_gate_provenance.py::is_pure_gate_shape`). It is history,
+not current state: `update_task`'s shallow metadata merge keeps it after a
+retype, so a watcher or retype workflow pairs it with the current
+`task_kind`/`always_escalates` before treating a task as a mis-filed conversion.
 
 `deferral` is, like `milestone`, a registered submodel
 (`shared/src/shared/task_deferral.py::DeferralRecord`) and deliberately not
@@ -2525,6 +2553,9 @@ were prose.
   on any scalar collision, and never removes a key. So append to `details`
   in one call, and rotate `description` and `metadata` in a separate call
   with `append` omitted and `metadata_mode='replace'`.
+- A call that supplies none of `prompt`, `metadata`, `title`, `description`,
+  `details`, `priority` or `dependencies` is refused with
+  `NoFieldsToUpdateError` (task 4867), and nothing is written.
 - No column has a length cap of its own. The only size guidance is the
   whole-task threshold above, and no write is refused for exceeding it.
 - Re-read the task from the store afterwards and confirm the status, the

@@ -3,8 +3,10 @@
 ``plans/dashboard-one-datum-one-path-prd.md`` sketches each datum's server row
 and the client decision that renders it; the suite also owns rows 20-21 of
 ``plans/dashboard-prd-lanes-prd.md``, the PRD lanes page rendered from the
-served /prds and /tasks bodies (``prd lanes #N:`` tests). Component tests prove each half
-alone; this suite proves the pair agrees. ``_boundary_payloads`` drives the
+served /prds and /tasks bodies (``prd lanes #N:`` tests). The ``test_quality_sketch_N_``
+tests hold the server half of ``plans/quality-dashboard-prd.md`` rows 3, 4, 5, 9, 10 and 12;
+``js/boundary_quality.test.mjs`` holds their client half (``quality #N:`` tests), the served
+bodies read the way the Quality tab reads them. Component tests prove each half alone; this suite proves the pair agrees. ``_boundary_payloads`` drives the
 real routes over fixture substrates, and ``js/boundary_*.test.mjs`` apply
 those exact bodies through data.js's real refreshOne. This file is the node
 half's one owner: ``test_graph_layout_js.py`` does not run it.
@@ -32,6 +34,17 @@ from _boundary_payloads import (
     MEMORY_OPS,
     MERGE_ATTEMPTS,
     OFFLINE_SCHEDULER,
+    QUALITY_GIT_CHECK,
+    QUALITY_LATE_CLAIM,
+    QUALITY_MODULE_ORDINALS,
+    QUALITY_OFF_LINE,
+    QUALITY_PENDING_TRAIN,
+    QUALITY_RECLAIMED_BACK,
+    QUALITY_SMALL_N,
+    QUALITY_SOURCE_EPOCH,
+    QUALITY_STORED,
+    QUALITY_TICK,
+    QUALITY_WINDOW,
     RAGGED,
     RAGGED_CAP,
     RAGGED_DAYS,
@@ -59,13 +72,15 @@ _JS_DIR = Path(__file__).parent / 'js'
 
 _SKETCH_ROWS = frozenset(range(1, 14))
 _PRD_LANES_ROWS = frozenset({20, 21})
+_QUALITY_ROWS = frozenset({3, 4, 5, 9, 10, 12})
 
-# A top-level TAP result for a passing test named 'sketch #N: ...' or
-# 'prd lanes #N: ...'; TAP escapes the '#' because a bare one opens a
-# directive. A `not ok` line never matches, so a failing row counts as
-# uncovered.
+# A top-level TAP result for a passing test named 'sketch #N: ...',
+# 'prd lanes #N: ...' or 'quality #N: ...'; TAP escapes the '#' because a bare
+# one opens a directive. A `not ok` line never matches, so a failing row counts
+# as uncovered.
 _PASSING_ROW_RE = re.compile(r'^ok \d+ - sketch \\#(\d+):', re.MULTILINE)
 _PASSING_PRD_LANES_ROW_RE = re.compile(r'^ok \d+ - prd lanes \\#(\d+):', re.MULTILINE)
+_PASSING_QUALITY_ROW_RE = re.compile(r'^ok \d+ - quality \\#(\d+):', re.MULTILINE)
 
 
 @pytest.fixture(scope='module')
@@ -101,6 +116,7 @@ def test_the_boundary_suite_covers_every_sketch_row(served_bodies, tmp_path):
     for label, rows, pattern in (
         ('sketch', _SKETCH_ROWS, _PASSING_ROW_RE),
         ('prd lanes', _PRD_LANES_ROWS, _PASSING_PRD_LANES_ROW_RE),
+        ('quality', _QUALITY_ROWS, _PASSING_QUALITY_ROW_RE),
     ):
         covered = {int(row) for row in pattern.findall(result.stdout)}
         missing = sorted(rows - covered)
@@ -402,3 +418,132 @@ def test_prd_lanes_20_a_queueless_view_is_a_lower_bound_that_still_draws_rows(se
     rows = view['value']['prds']
     assert any(row['signal']['reason'] for row in rows), 'no row serves a signal reason to keep on hover'
     assert any(row['followup_open'] for row in rows), 'no row serves an open follow-up to split on hover'
+
+
+def _quality(body: dict[str, Any]) -> dict[str, Any]:
+    """The QUALITY Datum's value, once its envelope has been checked."""
+    datum = body['QUALITY']
+    assert set(datum) == {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}, datum
+    assert datum['value'] is not None, datum['reason']
+    return datum['value']
+
+
+def _ordinals(series: dict[str, Any]) -> list[int]:
+    return [point['ordinal'] for point in series['axis']]
+
+
+def test_quality_sketch_3_git_disagreement_is_served_not_dropped(served_bodies):
+    body = served_bodies['quality_fresh']
+    series = _quality(body)
+    by_ordinal = {point['ordinal']: point for point in series['axis']}
+
+    assert body['QUALITY']['state'] == 'fresh', body['QUALITY']['reason']
+    assert body['WINDOW'] == {'requested': '100', 'served': '100', 'landings': QUALITY_WINDOW}
+    assert _ordinals(series) == list(range(QUALITY_STORED - QUALITY_WINDOW, QUALITY_STORED)), (
+        'the axis is the stored landings, newest last: none dropped, none invented'
+    )
+    off_line, late = by_ordinal[QUALITY_OFF_LINE], by_ordinal[QUALITY_LATE_CLAIM]
+    assert (off_line['git_first_parent'], off_line['late_claim']) == (False, False)
+    assert (late['git_first_parent'], late['late_claim']) == (True, True)
+    assert late['merge_sha'] == by_ordinal[QUALITY_LATE_CLAIM - QUALITY_RECLAIMED_BACK]['merge_sha']
+    assert series['git_check'] == {
+        'off_first_parent': QUALITY_GIT_CHECK.off_first_parent,
+        'merges_without_landing': QUALITY_GIT_CHECK.merges_without_landing,
+        'late_claims': QUALITY_GIT_CHECK.late_claims,
+        'disagreement': QUALITY_GIT_CHECK.disagreement,
+    }
+    for metric_id, metric in series['metrics'].items():
+        assert len(metric['points']) == QUALITY_WINDOW, metric_id
+
+
+def test_quality_sketch_4_a_source_that_has_not_started_is_unknown_not_zero(served_bodies):
+    body = served_bodies['quality_before_epoch']
+    metrics = _quality(body)['metrics']
+    blocking = metrics['reviewer_blocking']
+
+    assert blocking['points'] == [None] * QUALITY_WINDOW, 'every landing was reviewed: only the epoch nulls them'
+    assert all(center is None for center in blocking['rolling']['center'])
+    assert blocking['rule']['measured_since'] == QUALITY_SOURCE_EPOCH.isoformat()
+    headline = blocking['headline']
+    assert (headline['state'], headline['value']) == ('unknown', None), headline
+    assert QUALITY_SOURCE_EPOCH.date().isoformat() in headline['reason']
+    assert metrics['rejected']['headline']['state'] == 'fresh', (
+        'a source that did start is measured in the same body'
+    )
+
+
+def test_quality_sketch_5_small_n_is_k_of_n_with_no_chart_statistics(served_bodies):
+    body = served_bodies['quality_small_n']
+    series = _quality(body)
+    headline = series['metrics']['rejected']['headline']
+
+    assert len(series['axis']) == QUALITY_SMALL_N
+    assert headline['state'] == 'fresh', headline
+    value = headline['value']
+    assert (value['form'], value['n']) == ('k_of_n', QUALITY_SMALL_N)
+    assert value['k'] == sum(1 for ordinal in range(QUALITY_SMALL_N) if ordinal % 5 == 0)
+    assert value['lo'] < value['value'] < value['hi'], 'k of n carries its Wilson band'
+    for metric_id, metric in series['metrics'].items():
+        assert metric['ewma'] is None, metric_id
+        assert metric['alarms'] == [], metric_id
+        assert metric['baseline']['p0'] is None, metric_id
+    assert series['before_after'] == []
+
+
+def test_quality_sketch_10_the_same_window_served_twice_is_byte_equal(served_bodies):
+    first, again = served_bodies['quality_fresh'], served_bodies['quality_fresh_again']
+    metrics = _quality(first)['metrics']
+
+    assert first['served_at'] != again['served_at'], 'two reads, not one body twice'
+    assert json.dumps(first['QUALITY'], sort_keys=True) == json.dumps(again['QUALITY'], sort_keys=True)
+    seeded = {metric_id: metrics[metric_id]['headline']['value']
+              for metric_id in ('rejections_per_landing', 'all_role_usd')}
+    assert [band['form'] for band in seeded.values()] == ['mean', 'median'], seeded
+    assert all(band['lo'] < band['hi'] for band in seeded.values()), (
+        'a degenerate band cannot show the bootstrap is seeded by content'
+    )
+
+
+def test_quality_sketch_12_main_ahead_of_the_cursor_is_stale_until_the_next_tick(served_bodies):
+    behind, cleared = served_bodies['quality_main_ahead'], served_bodies['quality_main_ahead_cleared']
+
+    assert behind['QUALITY']['state'] == 'stale', behind['QUALITY']
+    assert behind['QUALITY']['reason'] == f'{len(QUALITY_PENDING_TRAIN)} landings not yet sampled'
+    assert _ordinals(_quality(behind))[-1] == QUALITY_STORED - 1, 'the stored series is still served'
+
+    assert cleared['QUALITY']['state'] == 'fresh', cleared['QUALITY']
+    assert cleared['QUALITY']['reason'] is None
+    assert datetime.fromisoformat(cleared['QUALITY']['as_of']) == (
+        datetime.fromisoformat(behind['QUALITY']['as_of']) + QUALITY_TICK
+    )
+    newest = _quality(cleared)['axis'][-len(QUALITY_PENDING_TRAIN):]
+    assert [point['task_id'] for point in newest] == list(QUALITY_PENDING_TRAIN)
+    assert len({point['unit_id'] for point in newest}) == 1, 'a train is one verify unit'
+
+
+def _alarm_and_marker(body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The rejection rate's first alarm, and the one derived routing marker the store holds."""
+    [alarm, *_] = _quality(body)['metrics']['rejected']['alarms']
+    [marker] = [marker for marker in body['QUALITY_MARKERS']['value']['markers']
+                if marker['source']['type'] == 'routing']
+    return alarm, marker
+
+
+def test_quality_sketch_9_an_alarm_is_explained_only_by_a_marker_near_its_onset(served_bodies):
+    near, near_marker = _alarm_and_marker(served_bodies['quality_alarm_explained'])
+    far, far_marker = _alarm_and_marker(served_bodies['quality_alarm_unexplained'])
+
+    assert near['onset_ordinal'] == far['onset_ordinal'], 'one shift, two marker placements'
+    assert (near['direction'], far['direction']) == ('up', 'up')
+    assert near['onset_ordinal'] - near_marker['ordinal'] == 10
+    assert far['onset_ordinal'] - far_marker['ordinal'] == 100
+    assert near['explained_by'] == near_marker['id']
+    assert far['explained_by'] is None
+
+
+def test_quality_module_drill_down_serves_the_landings_touching_the_module(served_bodies):
+    series = _quality(served_bodies['quality_module'])
+
+    assert _ordinals(series) == list(QUALITY_MODULE_ORDINALS)
+    for metric_id, metric in series['metrics'].items():
+        assert len(metric['points']) == len(QUALITY_MODULE_ORDINALS), metric_id

@@ -155,7 +155,9 @@ measured:
     and ``cleanup_test_collections`` also mutate unguarded, but only ever touch
     scratch ``_test_*`` substrate and never the shared store, so they are
     deliberately in neither column. Task 4293 wrote that reasoning, with the
-    premises that would kill it, into each of those two files.
+    premises that would kill it, into each of those two files. Task 7792 added
+    ``seed_scratch_reference_graph`` on the same footing: it writes only
+    ``evalmem_`` graphs on the scratch FalkorDB and never touches mem0 or Qdrant.
 
 ``tests/test_store_mutation_conformance.py`` is that mechanism now, for the
 RULE. The three columns above are all still hand-written prose rather than
@@ -492,5 +494,20 @@ PREFLIGHT_EXEMPT_SCRIPTS: dict[str, str] = {
         'standing exemption: it dies the moment this script constructs a '
         'MemoryService, or any input can widen PREFIXES past its two '
         'test-only names.'
+    ),
+    'seed_scratch_reference_graph.py': (
+        'Its unprobed mutations (RESTORE of the copy, graph.delete() of that '
+        'same fresh copy when verification fails, and SAVE) are FalkorDB-only '
+        'and bounded to the scratch server: the target comes from '
+        'scratch_falkordb_from_env, which raises ProductionFalkorDBTarget for '
+        'production, and every graph name passes require_scratch_name '
+        "(evalmem_ only). RESTORE never uses REPLACE and refuses a name the "
+        'target already holds, so it cannot overwrite anything. It constructs '
+        'no MemoryService and no Qdrant client, so it writes no mem0 SQLite '
+        'history and needs none of the capability this probe tests for. '
+        'Measured against this file as it stands (task 7792), not a standing '
+        'exemption: it dies the moment this script gains a MemoryService or a '
+        'Qdrant client, its target can resolve to production, or a graph name '
+        'can bypass require_scratch_name.'
     ),
 }

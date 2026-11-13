@@ -1,0 +1,514 @@
+prd: plans/review-all-s12-reconciliation-run-lifecycle-and-stage-interface-prd.md
+schema_version: 1
+signal_leaves: ["ω"]
+tasks:
+  - label: "α"
+    task_id: null
+    title: "Typed reconciliation run record: StageId-keyed reports, a RunError field, the journal as sole decoder"
+    note: "Closes fk-377a7036ac7f. Deps: 7876, 6721 (stats_verifier.py), S10 λ 9254 (harness.py), S19 α (recon_state/journal.py, lead ruling OQ-12). Subsumes task 5912 (cancel)."
+    capabilities:
+      - name: "typed-stage-map"
+        binding: "built here — fm/models/reconciliation.py::ReconciliationRun.stage_reports keyed by StageId, values StageReport only"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "stage_reports: dict\\[StageId, StageReport\\]"
+          paths: ["fused-memory/src/fused_memory/models/reconciliation.py"]
+          expect: present
+      - name: "run-error-type"
+        binding: "built here — fm/models/reconciliation.py::RunError, the typed run failure record"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RunError\\("
+          paths: ["fused-memory/src/fused_memory/models/reconciliation.py"]
+          expect: present
+      - name: "no-shape-branch-on-stage-3-report"
+        binding: "anti-inversion — the four isinstance(s3_report, dict) branches in harness.py go"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "isinstance\\(s3_report, dict\\)"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+  - label: "β1"
+    task_id: null
+    title: "One reconciliation run driver for full and backlog-chunk runs; the run row before any drain"
+    note: "Closes fk-0485729893fe; builds C1 for fk-8621784d79d3 (closed by β2). Deps: α, 6695 (lands the narrow fix first)."
+    capabilities:
+      - name: "run-kind-value"
+        binding: "built here — fm/reconciliation/run_context.py::RunKind (new module)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RunKind\\(StrEnum\\)"
+          paths: ["fused-memory/src/fused_memory/reconciliation/"]
+          expect: present
+      - name: "one-driver-entry"
+        binding: "built here — fm/reconciliation/harness.py::ReconciliationHarness.drive"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def drive\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: present
+      - name: "run-row-recovery-substrate"
+        binding: "substrate — `grep:fused-memory/src/fused_memory/reconciliation/drained_event_restore.py::restore_unless_completed` and ReconciliationHarness._recover_one_run already restore a running row's own drained events; β1 only orders start_run first"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def restore_unless_completed\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/drained_event_restore.py"]
+          expect: present
+  - label: "β2"
+    task_id: null
+    title: "Remediation is RunKind.remediation on the one driver; the second run lifecycle is deleted"
+    note: "Closes fk-8621784d79d3 (high), fk-2571f7726184. High: dependency of gate 6698. Deps: β1. _maybe_remediate calls drive outside its own try, so a remediation failure is filed once (boundary row 17)."
+    capabilities:
+      - name: "no-second-run-construction"
+        binding: "anti-inversion — _run_remediation_pass no longer builds its own ReconciliationRun; the driver maps RunKind to RunType"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "run_type=RunType\\.remediation"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+      - name: "no-second-cancel-arm"
+        binding: "anti-inversion — the remediation pass's own CancelledError arm goes; the driver's ladder serves every kind"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Remediation pass cancelled \\(shutdown"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+  - label: "γ0"
+    task_id: null
+    title: "Reconciliation stage tests build and run stages through one test helper"
+    note: "Contributes to fk-63b65973bd33 and fk-0cce86f5dbfe (test side); closes none. Deps: S13 ι (stage_builders.py imports IntegrityCheck, lead ruling OQ-8) only; the test files it shares with β2 and S10 μ1 9278 / μ2 9280 are rebase-only (lead's test-file rule). Test-only, uniform substitution over 34 modules."
+    capabilities:
+      - name: "stage-builders-module"
+        binding: "built here — fused-memory/tests/reconciliation/stage_builders.py::build_stage / run_stage, the one way a test constructs and runs a stage"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/reconciliation/stage_builders.py"]
+          expect: present
+  - label: "γ1"
+    task_id: null
+    title: "Stage payload interface: assemble_payload(..., run) returns PayloadResult; the per-run stashes go"
+    note: "Closes fk-0cce86f5dbfe. Deps: β2 (harness.py), γ0 (stage_builders.py, which γ0 creates), S10 α 9180 (task_knowledge_sync.py), S26 μ 9203 (memory_consolidator.py), S13 ι (verbatim task_knowledge_sync.py split; stages/integrity_check.py, lead ruling OQ-8)."
+    capabilities:
+      - name: "payload-result-type"
+        binding: "built here — fm/reconciliation/run_context.py::PayloadResult"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class PayloadResult"
+          paths: ["fused-memory/src/fused_memory/reconciliation/"]
+          expect: present
+      - name: "no-run-id-stash"
+        binding: "anti-inversion — TaskKnowledgeSync._current_run_id and its 9 read sites go; the run id arrives in RunContext"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "self\\._current_run_id"
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py"]
+          expect: absent
+  - label: "γ2"
+    task_id: null
+    title: "Reconciliation stages constructed with their collaborators and per-cycle inputs"
+    note: "Closes fk-63b65973bd33; contributes to fk-16baf39b1db6. Subsumes tasks 7343, 8835 and 7604 (cancel; θ finishes 7604's tests). Deps: γ1."
+    capabilities:
+      - name: "no-harness-set-attributes"
+        binding: "anti-inversion — the 'set by harness' class attributes on MemoryConsolidator, TaskKnowledgeSync and IntegrityCheck go (IntegrityCheck in stages/integrity_check.py after S13 ι; the check reads all of stages/)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "set by harness"
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/"]
+          expect: absent
+      - name: "no-configure-helpers"
+        binding: "anti-inversion — ReconciliationHarness._configure_consolidator goes (with _configure_task_sync and _propagate_escalation_queue)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _configure_consolidator"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+  - label: "δ"
+    task_id: null
+    title: "Recon stage identity and run id bound on the MCP transport; a differing value refused; the stage instructions swept; fused-memory URL from server config"
+    note: "Closes fk-a3598aec7dca (high), fk-d2c7f1b902ac. High: dependency of gate 6698. Deps: γ2, 6721 (S14 μ), S10 μ2 9280 (server/tools.py), S10 ν 9282 (middleware/task_interceptor.py, added by the OQ-3 ruling), S15 α (server/tool_context.py, lead ruling OQ-11), S19 β1 (recon_state/recon_self_model.py, lead ruling OQ-12). The recon-report MCP entry carries the same headers (lead ruling OQ-10). Sitting ruling OQ-3: a differing agent_id or _causation_id is refused (structured error naming both values, one log line per refusal); task filing reads the run id from the header; the instruction sweep (including the server's MCP instructions string, added at fold-verify) lands in the same commit; search's agent_id is an authoring-agent filter and is outside the refusal. Supersedes task 6895 (cancel)."
+    capabilities:
+      - name: "no-hard-coded-client-config"
+        binding: "anti-inversion — _find_fused_memory_server and its user-path .mcp.json candidate go"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "/home/leo/src/dark-factory/\\.mcp\\.json"
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/base.py"]
+          expect: absent
+      - name: "no-prompt-echoed-agent-id"
+        binding: "anti-inversion — the recon_context instruction asking the LLM to echo agent_id goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "agent_id.: \"recon-stage-"
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/base.py"]
+          expect: absent
+      - name: "server-reads-stage-header"
+        binding: "built here — _resolve_identity prefers STAGE_AGENT_ID_HEADER (C3), in fm/server/tool_context.py once S15 α has moved it there (fm/server/tools.py before); the check reads all of fm/server/"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "STAGE_AGENT_ID_HEADER"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "mcp-headers-substrate"
+        binding: "substrate — `grep:orchestrator/src/orchestrator/mcp_lifecycle.py` already writes a headers block into a Claude CLI http MCP entry (escalation identity); δ uses the same CLI capability"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "escalation_block\\['headers'\\]"
+          paths: ["orchestrator/src/orchestrator/mcp_lifecycle.py"]
+          expect: present
+      - name: "stage-identity-refusal-predicate"
+        binding: "built here — fm/server/tool_context.py::stage_identity_refusal, the one predicate that refuses an agent_id or _causation_id differing from its header (C3); the check reads all of fm/server/"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def stage_identity_refusal\\("
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "creation-journal-reads-run-header"
+        binding: "built here — fm/middleware/task_creation_journal.py::CreationAttribution.from_submission takes the run-id header as bound_causation_id"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "bound_causation_id"
+          paths: ["fused-memory/src/fused_memory/middleware/task_creation_journal.py"]
+          expect: present
+      - name: "stage-prompt-says-do-not-pass"
+        binding: "built here — stages/base.py's recon_context carries 'The connection already identifies you and this run. Do not pass agent_id or _causation_id.'"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Do not pass .agent_id. or ._causation_id."
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/base.py"]
+          expect: present
+      - name: "no-echoed-run-id-instruction"
+        binding: "anti-inversion — prompts/stage2.py's submit_task example and recon_self_model.py's accounting text stop asking for the _causation_id run id (the check reads all of fm/, so it holds across S19 β1's move of the self-model)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\"_causation_id\": <run_id>"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+      - name: "no-stage1-agent-id-example"
+        binding: "anti-inversion — prompts/stage1.py's propose_consolidation example drops agent_id='recon-stage-memory_consolidator'"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "agent_id='recon-stage-"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/"]
+          expect: absent
+      - name: "claude-md-stage-exception"
+        binding: "built here — CLAUDE.md §Write-Tagging Convention gains the exception that reconciliation stages pass neither agent_id nor _causation_id (CLAUDE.md names no _causation_id today)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_causation_id"
+          paths: ["CLAUDE.md"]
+          expect: present
+      - name: "memory-command-stage-exception"
+        binding: "built here — .claude/commands/memory.md gains the same exception beside 'Always include project_id and agent_id' (it names no _causation_id today)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_causation_id"
+          paths: [".claude/commands/memory.md"]
+          expect: present
+      - name: "server-instructions-stage-exception"
+        binding: "built here — fm/server/tools.py::FUSED_MEMORY_INSTRUCTIONS, the MCP instructions every client receives (stages included), amends its 'Include agent_id for attribution' convention with the stage exception; the check reads all of fm/server/, so it holds if S15 later moves the string"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "a reconciliation stage omits agent_id and _causation_id"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "no-misleading-stage-id-example"
+        binding: "anti-inversion — the reconciliation-stage-1 example leaves CLAUDE.md and docs/task-authoring.md"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reconciliation-stage-1"
+          paths: ["CLAUDE.md", "docs/task-authoring.md"]
+          expect: absent
+  - label: "ι1"
+    task_id: null
+    title: "Stage prompts render capabilities and the dedup rule from code; prompts and the harness import nothing from server"
+    note: "Closes fk-10c8c43d9e89 (high), fk-9850339b610c; the upward-import half of fk-20cb93d17ff3. High: dependency of gate 6698. Deps: δ, S10 μ2 9280 (server/main.py); S19 β1 (recon_state/recon_self_model.py, lead ruling OQ-12) is reached through δ."
+    capabilities:
+      - name: "capabilities-derived"
+        binding: "built here — fm/reconciliation/stage_capabilities.py::capabilities_for"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def capabilities_for\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/"]
+          expect: present
+      - name: "no-capability-literals"
+        binding: "anti-inversion — the can_file_tasks= / can_escalate= literals in the stage prompts go"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "can_(file_tasks|escalate)=(True|False)"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/"]
+          expect: absent
+      - name: "no-phantom-denial-name"
+        binding: "anti-inversion — the sentence naming DISALLOW_SUBTASK_CREATE, defined nowhere, goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "DISALLOW_SUBTASK_CREATE"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage2.py"]
+          expect: absent
+      - name: "no-internal-narration"
+        binding: "anti-inversion — the prompt passages narrating _derive_affected_ids go; the rule renders from recon_self_model"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_derive_affected_ids"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/"]
+          expect: absent
+      - name: "no-upward-import"
+        binding: "anti-inversion — neither the prompt modules nor harness.py import fused_memory.server (prompts/__init__.py's function-local server.recon_report import and prompts/stage1.py's server.grouped_read import are removed, not moved into the harness)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "(from|import) fused_memory\\.server"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/", "fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+  - label: "ι2"
+    task_id: null
+    title: "Prompt fragment library moves out of the package __init__ into prompts/fragments.py"
+    note: "Closes fk-20cb93d17ff3 (library half). Deps: ι1, κ2. Also repoints fused-memory/scripts/freeze_write_triage_population.py."
+    capabilities:
+      - name: "fragments-module"
+        binding: "built here — fm/reconciliation/prompts/fragments.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/fragments.py"]
+          expect: present
+      - name: "no-reach-back-into-package"
+        binding: "anti-inversion — stage1/2/3.py stop importing names from their parent package"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from fused_memory\\.reconciliation\\.prompts import"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py", "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py", "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py"]
+          expect: absent
+  - label: "ε"
+    task_id: null
+    title: "Consecutive-cycle recon alarms as RunStreak declarations over shared.streak.KeyedStreaks"
+    note: "Closes fk-90e488a174b7. Deps: ι1 (harness.py), γ2 (task_knowledge_sync.py), S1 ι1 (recon escalation registry C8 + FilingPolicy C1, lead ruling OQ-7), S13 ι (standing_decision_growth_sweep.py, lead ruling OQ-8). S14 λ 6712 is done. Fires at count >= threshold, repeats fold (sitting ruling OQ-1)."
+    capabilities:
+      - name: "streaks-on-shared-primitive"
+        binding: "built here — fm/reconciliation/run_streaks.py evaluates every RunStreak through KeyedStreaks"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "KeyedStreaks"
+          paths: ["fused-memory/src/fused_memory/reconciliation/run_streaks.py"]
+          expect: present
+      - name: "streaks-file-through-registry"
+        binding: "built here — each RunStreak names an S1/C8 ReconEscalation member and files through policy_for (recon chooses a policy only)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ReconEscalation"
+          paths: ["fused-memory/src/fused_memory/reconciliation/run_streaks.py"]
+          expect: present
+      - name: "no-snapshot-quartet"
+        binding: "anti-inversion — task_count_snapshot_cadence.py's streak compute goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def compute_snapshot_miss_streak"
+          paths: ["fused-memory/src/fused_memory/reconciliation/task_count_snapshot_cadence.py"]
+          expect: absent
+      - name: "no-growth-quartet"
+        binding: "anti-inversion — the growth-sweep streak compute goes, wherever the task_knowledge_sync.py split put it and under either name (stages/task_knowledge_sync.py today, reconciliation/standing_decision_growth_sweep.py after S13 ι, possibly made public there); the check reads all of fm/reconciliation/"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _?compute_growth_sweep_failure_streak\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/"]
+          expect: absent
+      - name: "keyed-streaks-substrate"
+        binding: "substrate — `grep:shared/src/shared/streak.py::KeyedStreaks` (S14 λ, task 6712, done)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class KeyedStreaks"
+          paths: ["shared/src/shared/streak.py"]
+          expect: present
+  - label: "ζ"
+    task_id: null
+    title: "Cycle-summary write state as a typed StageReport field"
+    note: "Closes fk-f23c6e137ce5. Deps: ε, 7877."
+    capabilities:
+      - name: "typed-cycle-summary-state"
+        binding: "built here — fm/models/reconciliation.py::CycleSummaryWrite"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class CycleSummaryWrite"
+          paths: ["fused-memory/src/fused_memory/models/reconciliation.py"]
+          expect: present
+      - name: "no-string-flag-parse"
+        binding: "anti-inversion — the write-recovered stats flag is no longer parsed in harness.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cycle_summary_write_recovered_backstop"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+  - label: "κ1"
+    task_id: null
+    title: "Targeted reconciler: one gated write path, classified outcomes, an event per fail-open arm; deferred writes replayed with causation"
+    note: "Closes fk-05443fb78da6, fk-be8ed2cd9ce9, fk-2bb6c913d747, fk-147a9951edc7. Deps: ζ, S10 μ2 9280, S10 ν 9282, 8144. Not S10 ο 9285 (it waits on 8528; different symbols of targeted.py, file locks order them). The reconciler factory is a provider member of S10 μ2's InterceptorCollaborators (lead ruling OQ-2); S15 D12 consumes it."
+    capabilities:
+      - name: "no-optional-interceptor"
+        binding: "anti-inversion — TargetedReconciler no longer starts with task_interceptor = None"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "self\\.task_interceptor: TaskInterceptor \\| None = None"
+          paths: ["fused-memory/src/fused_memory/reconciliation/targeted.py"]
+          expect: absent
+      - name: "no-post-construction-wiring"
+        binding: "anti-inversion — run_server no longer assigns targeted.task_interceptor"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "targeted\\.task_interceptor = task_interceptor"
+          paths: ["fused-memory/src/fused_memory/server/main.py"]
+          expect: absent
+      - name: "failed-replay-released"
+        binding: "built here — EventBuffer.release_deferred_write increments attempt_count and unclaims a failed replay, so the next cycle retries it (event_buffer.py is at its recon_state path after S19 α; the check reads all of fm/)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def release_deferred_write\\("
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "write-failure-reason-substrate"
+        binding: "substrate — `grep:shared/src/shared/mcp_envelope.py::write_failure_reason` is the classifier κ1 calls"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def write_failure_reason"
+          paths: ["shared/src/shared/mcp_envelope.py"]
+          expect: present
+  - label: "κ2"
+    task_id: null
+    title: "Reconciliation stages and harness write tasks only through the TaskInterceptor"
+    note: "Closes fk-875cca636438. Deps: κ1, S13 ι (policies/briefing_refresh.py, lead ruling OQ-8). The guard's one exemption, consolidation_auto_executor.py's hazard-gate filer, carries an INV-12 Policy row (lead ruling OQ-9)."
+    capabilities:
+      - name: "no-raw-add-task"
+        binding: "anti-inversion — queue_briefing_refresh_tasks submits through the interceptor, not taskmaster.add_task, wherever the split put it (stages/task_knowledge_sync.py today, reconciliation/policies/briefing_refresh.py after S13 ι)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "taskmaster\\.add_task\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py", "fused-memory/src/fused_memory/reconciliation/policies/"]
+          expect: absent
+      - name: "hazard-gate-exemption-ratified"
+        binding: "built here — docs/legibility/exception-ratifications.yaml row inv12-recon-hazard-gate-raw-backend, the Policy the guard's one exemption names (plans/memory-auto-consolidation-prd.md D8)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^- id: inv12-recon-hazard-gate-raw-backend"
+          paths: ["docs/legibility/exception-ratifications.yaml"]
+          expect: present
+  - label: "η1"
+    task_id: null
+    title: "harness.py partition I: the cycle-summary backstop and run recovery in their own modules"
+    note: "Contributes to fk-a88506a1e327 and fk-16baf39b1db6. Deps: κ2."
+    capabilities:
+      - name: "run-recovery-module"
+        binding: "built here — fm/reconciliation/run_recovery.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/reconciliation/run_recovery.py"]
+          expect: present
+      - name: "backstop-module"
+        binding: "built here — fm/reconciliation/cycle_summary_backstop.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/reconciliation/cycle_summary_backstop.py"]
+          expect: present
+  - label: "η2"
+    task_id: null
+    title: "harness.py partition II: cycle diagnostics, the finding gate and BacklogIterator in their own modules; prose rehomed"
+    note: "Closes fk-a88506a1e327; contributes to fk-16baf39b1db6. Subsumes task 6783 (cancel). Deps: η1."
+    capabilities:
+      - name: "backlog-iterator-module"
+        binding: "built here — fm/reconciliation/backlog_iterator.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/reconciliation/backlog_iterator.py"]
+          expect: present
+      - name: "iterator-left-harness"
+        binding: "anti-inversion — harness.py no longer defines BacklogIterator"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class BacklogIterator"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+  - label: "θ"
+    task_id: null
+    title: "Reconciliation harness tests drive public seams; the remaining private test seams are deleted"
+    note: "Closes fk-16baf39b1db6. Finishes task 7604's tests (7604 is cancelled onto γ2). Deps: η2 (not ι2: test files only, rebase-only)."
+    capabilities:
+      - name: "no-test-only-stages-attribute"
+        binding: "anti-inversion — ReconciliationHarness.stages, kept for tests, goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "stages: list\\[Any\\]"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+      - name: "no-module-sleep-seam"
+        binding: "anti-inversion — the module-level _sleep patch seam goes; the harness takes an injected sleep"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_sleep = asyncio\\.sleep"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: absent
+  - label: "ω"
+    task_id: null
+    title: "Integration gate: the run-lifecycle boundary suite and the live journal check"
+    note: "Signal leaf. No key. Deps: θ, ι2."
+    capabilities:
+      - name: "boundary-suite"
+        binding: "built here — fused-memory/tests/reconciliation/test_run_lifecycle_boundary.py (boundary rows 1-17, 10a-10d)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/reconciliation/test_run_lifecycle_boundary.py"]
+          expect: present
+      - name: "live-check-script"
+        binding: "built here — fused-memory/scripts/recon_run_lifecycle_check.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/scripts/recon_run_lifecycle_check.py"]
+          expect: present

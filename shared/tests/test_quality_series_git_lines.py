@@ -18,6 +18,9 @@ from shared.quality_series.git_lines import (
     module_key,
     path_class,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.mark.parametrize(

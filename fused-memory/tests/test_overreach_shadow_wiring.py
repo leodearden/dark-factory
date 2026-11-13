@@ -18,6 +18,7 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import install_identity_mocks
 from _fm_polling import poll_until
+from _queued_write_fixtures import queued
 
 from fused_memory.config.reload import RELOADABLE_FIELDS, apply_reload
 from fused_memory.server.main import _MEMORY_CLOSE_STEP_TIMEOUT
@@ -239,7 +240,7 @@ class TestTheWritePath:
             payload['memory_category'] = category
         assert live.service.durable_queue is not None
         await live.service.durable_queue.enqueue(
-            group_id=GROUP, operation='add_memory_graphiti', payload=payload,
+            queued('add_memory_graphiti', payload, group_id=GROUP),
         )
         await _completed(live.service, 1)
         assert (await _flagged(live.service), live.judge.calls) == ([], 0)

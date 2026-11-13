@@ -547,7 +547,7 @@ def read_last_census_at(path: Path) -> tuple[str, object]:
     by the nightly's pre-launch anchor and ``check_census_progress.py``'s
     live comparison, so the two sides of its exact-equality test agree.
 
-    QUIET: ``census_trigger.load_census_state`` owns the malformed WARNING
+    QUIET: ``census_state.load`` owns the malformed WARNING
     for this file. Timestamps are deliberately not validated: the trigger
     never FIREs on a malformed census-state, so no streak can be anchored
     on one."""

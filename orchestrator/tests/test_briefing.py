@@ -25,6 +25,7 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
+from _prompt_action_items import action_items
 from _roles_helpers import tool_is_granted
 from shared.capability_manifest import DeliveredCheckMeta
 from shared.task_text_fingerprint import TaskTextDrift
@@ -846,6 +847,28 @@ class TestRevalidationPriorProposal:
 
 
 @pytest.mark.asyncio
+class TestRevalidationConfirms:
+    """Every step-set prompt ends in confirm_plan (S9 Q-C1 (a)): a step-set edit clears confirmation."""
+
+    async def test_revalidation_prompt_ends_by_confirming_the_plan(self, briefing: BriefingAssembler):
+        prompt = await briefing.build_revalidation_prompt(
+            {'id': '9170', 'title': 'T', 'description': 'd'},
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        items = action_items(prompt)
+        options = next(i for i, item in enumerate(items) if 'create_plan(' in item)
+        final = items[-1]
+        assert options < len(items) - 1
+        assert 'confirm_plan()' in final
+        assert 'FINAL' in final
+        for path in ('(a)', '(b)', '(c)', 'create_plan'):
+            assert path in final, path
+
+
+@pytest.mark.asyncio
 class TestRevalidationTextDriftNotice:
     """Task 4031: a revalidating architect is told when the task text moved."""
 
@@ -875,6 +898,15 @@ class TestRevalidationTextDriftNotice:
         prompt = await self._prompt(briefing, TaskTextDrift.UNSTAMPED)
         assert '## The Task Text May Have Changed' in prompt
         assert '## The Task Text Has Changed' not in prompt
+
+    @pytest.mark.parametrize('text_drift', [TaskTextDrift.AMENDED, TaskTextDrift.UNSTAMPED])
+    async def test_the_notice_confirms_after_an_edit_too(
+        self, briefing: BriefingAssembler, text_drift: TaskTextDrift,
+    ):
+        prompt = await self._prompt(briefing, text_drift)
+        notice = prompt.split('## The Task Text', 1)[1].split('## Your Previous Plan', 1)[0]
+        assert 'then call confirm_plan()' in notice
+        assert 'only if' not in notice
 
     @pytest.mark.parametrize('text_drift', [None, TaskTextDrift.CURRENT])
     async def test_current_text_adds_no_notice(

@@ -15,6 +15,7 @@ import pytest_asyncio
 from _fastmcp_tool_result import tool_result_dict
 from _fm_git_repos import _init_git_repo
 from _fused_memory_tool_surface import FUSED_MEMORY_TOOL_PREFIX, registered_fused_memory_tools
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import CuratorConfig, TaskmasterConfig
@@ -37,6 +38,8 @@ from fused_memory.reconciliation import recon_self_model
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 WAIT_SECONDS = 30.0
 

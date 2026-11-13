@@ -111,12 +111,18 @@ async def _merge_cancel(server, request_id: str) -> dict[str, Any]:
     return await tool.fn(request_id=request_id)
 
 
-def _main_moved_under_it(advances: list[Any]) -> Any:
+def _main_moved_under_it(advances: list[Any], main: str) -> Any:
+    """A CAS that rebases onto *main*, as main moving under the request does.
+
+    The rebased commit is *main* itself, a real commit, so the rebased head's
+    dispatch can build its worktree (task 8525); the unreal ``rebased_from``
+    fails the overlap probe closed, so the gate fully re-verifies.
+    """
     async def _advance(*args: Any, **kwargs: Any) -> AdvanceOutcome:
         advances.append(args)
         return AdvanceOutcome(
             'rebased_pending_reverify',
-            advanced_sha='ab' * 20, rebased_from='ba' * 20, rebased_onto='cd' * 20,
+            advanced_sha=main, rebased_from='ba' * 20, rebased_onto=main,
         )
 
     return _advance
@@ -221,13 +227,14 @@ class TestCancellable:
         request = _request('gr', await _branch(git_ops, 'gr'), config)
         main_before = await git_ops.get_main_sha()
         advances: list[Any] = []
-        monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it(advances))
+        monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it(advances, main_before))
         async with running_lane(lane):
             await queue.put(request)
             await wait_responsive(
                 reverifying.wait(), timeout=_SCENE_TIMEOUT, label='the gate re-verify to start holding'
             )
-            assert lane_state(lane, request.request_id) == 'gate_reverify'
+            # The gate's re-verify is the rebased head's own dispatch (task 8525).
+            assert lane_state(lane, request.request_id) == 'verifying'
 
             verdict = lane.cancel_request(request.request_id)
             release.set()
@@ -240,17 +247,31 @@ class TestCancellable:
         assert len(advances) == 1, 'a cancelled request must not CAS again'
         assert await git_ops.get_main_sha() == main_before
 
-    async def test_a_gate_reverify_cancel_leaves_the_merge_worktree_to_the_lane(
-        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    async def test_a_parked_gate_cancel_leaves_the_merge_worktree_to_the_lane(
+        self, git_ops: GitOps, git_repo: Path, git_config: GitConfig, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Since task 8525 only a history leg runs inside a parked gate, in the
+        candidate's own merge worktree, so that is the cancel the lane cleans up after."""
+        entered, released = tmp_path / 'leg-entered', tmp_path / 'leg-released'
+        config = lane_scene_config(
+            git_repo, git_config, merge_gate_history_pure=True,
+            merge_gate_history_test_command=(
+                f'touch {entered}; while [ ! -e {released} ]; do sleep 0.05; done'
+            ),
+        )
         queue: asyncio.Queue[Any] = asyncio.Queue()
-        reverifying, release = asyncio.Event(), asyncio.Event()
-        lane = make_lane(git_ops, queue, verifier=FakeVerifier(
-            sequence=[passes(), hangs_until(release, entered=reverifying)],
-        ))
+        lane = make_lane(git_ops, queue, verifier=FakeVerifier())
         request = _request('gk', await _branch(git_ops, 'gk'), config)
-        monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it([]))
+        main = await git_ops.get_main_sha()
+
+        async def _rebased_onto_the_verified_tree(sha: str, *args: Any, **kwargs: Any) -> Any:
+            return AdvanceOutcome(
+                'rebased_pending_reverify',
+                advanced_sha=sha, rebased_from='ba' * 20, rebased_onto=main,
+            )
+
+        monkeypatch.setattr(git_ops, 'advance_main', _rebased_onto_the_verified_tree)
         server = create_server(
             EscalationQueue(tmp_path / 'esc'),
             orch_config=config,
@@ -260,21 +281,22 @@ class TestCancellable:
             ),
         )
         async with running_lane(lane):
-            await queue.put(request)
-            await wait_responsive(
-                reverifying.wait(), timeout=_SCENE_TIMEOUT, label='the gate re-verify to start holding'
-            )
-            [entry] = [
-                e for e in lane.snapshot()['entries']
-                if e['request_id'] == request.request_id
-            ]
-            tree = Path(entry['worktree'])
+            try:
+                await queue.put(request)
+                await _until(entered.exists, 'the gate history leg to start holding')
+                assert lane_state(lane, request.request_id) == 'gate_reverify'
+                [entry] = [
+                    e for e in lane.snapshot()['entries']
+                    if e['request_id'] == request.request_id
+                ]
+                tree = Path(entry['worktree'])
 
-            response = await _merge_cancel(server, request.request_id)
+                response = await _merge_cancel(server, request.request_id)
 
-            assert response['cancelled'] is True
-            assert tree.exists(), 'the re-verify still runs in this tree'
-            release.set()
+                assert response['cancelled'] is True
+                assert tree.exists(), 'the history leg still runs in this tree'
+            finally:
+                released.touch()
             await _until(lambda: lane_state(lane, request.request_id) is None, 'the drop')
             await _until(lambda: not tree.exists(), 'the lane disposing of its tree')
 

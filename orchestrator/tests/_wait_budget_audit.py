@@ -29,7 +29,9 @@ from _orch_helpers import (
     RESPONSIVE_WAIT_WALL_CAP,
     STOP_WORKER_JOIN_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
+    wait_responsive,
 )
+from _poll_responsive import poll_responsive
 
 # task 3492: the shared helper constants a scanned call site may spell without
 # importing them into its own namespace, plus the hidden defaults of the
@@ -192,29 +194,69 @@ def _wait_responsive_budget(call: ast.Call, visible: Mapping[str, float]) -> flo
     )
 
 
-def is_asyncio_wait_for_call(node: ast.AST) -> bool:
-    """Whether *node* is an ``asyncio.wait_for(...)`` call spelled through
-    the ``asyncio`` name: ``gate.wait_for(...)`` and ``self.wait_for(...)``
-    are not."""
+def _is_asyncio_call(node: ast.AST, attr: str) -> bool:
+    """Whether *node* is an ``asyncio.<attr>(...)`` call spelled through the
+    ``asyncio`` name: ``gate.<attr>(...)`` and ``self.<attr>(...)`` are not."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == 'wait_for'
+        and node.func.attr == attr
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == 'asyncio'
+    )
+
+
+def is_asyncio_wait_for_call(node: ast.AST) -> bool:
+    """Whether *node* is an ``asyncio.wait_for(...)`` call (``_is_asyncio_call``)."""
+    return _is_asyncio_call(node, 'wait_for')
+
+
+def is_asyncio_timeout_call(node: ast.AST) -> bool:
+    """Whether *node* is an ``asyncio.timeout(...)`` call (``_is_asyncio_call``)."""
+    return _is_asyncio_call(node, 'timeout')
+
+
+# The helpers that charge their deadline in loop-responsive time, by the name a
+# call site spells.  Derived from the functions themselves, so a rename cannot
+# desynchronise the audit.
+RESPONSIVE_WAIT_HELPERS: frozenset[str] = frozenset(
+    {wait_responsive.__name__, poll_responsive.__name__}
+)
+
+
+def is_responsive_wait_call(node: ast.AST) -> bool:
+    """Whether *node* calls a ``RESPONSIVE_WAIT_HELPERS`` helper by its bare
+    name: ``x.wait_responsive(...)`` is not."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in RESPONSIVE_WAIT_HELPERS
     )
 
 
 def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
     """Return the wait-budget contribution of a single ``ast.Call`` node.
 
-    Recognises exactly four call shapes -- ``asyncio.wait_for(..., timeout=N)``
-    (``is_asyncio_wait_for_call``), ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
+    Recognises exactly seven call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    (``is_asyncio_wait_for_call``), ``asyncio.timeout(N)`` (``is_asyncio_timeout_call``),
+    billed its ``delay`` exactly as wait_for's timeout, ``asyncio.timeout_at(when)``,
+    billed ``math.inf`` because its absolute deadline cannot be read as a
+    duration, ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
     when no ``timeout=`` kwarg is given), ``wait_responsive(...)``
-    (task 3980), billed by ``_wait_responsive_budget`` as an unconditional
-    upper bound on its wall clock, and the ``stop_merge_worker(...)`` teardown
+    (task 3980) and ``poll_responsive(...)`` (``is_responsive_wait_call``), both
+    billed by ``_wait_responsive_budget`` as an unconditional
+    upper bound on their wall clock, and the ``stop_merge_worker(...)`` teardown
     (``_merge_worker_drive.py::stop_merge_worker``), whose join is billed its
-    ``join_timeout=`` kwarg or hidden default ``STOP_WORKER_JOIN_TIMEOUT``. Within a recognised shape, a named value
+    ``join_timeout=`` kwarg or hidden default ``STOP_WORKER_JOIN_TIMEOUT``.
+    A timeout block's inner waits are billed too, which over-counts, like the
+    branch-blind sum documented on ``_method_wait_budget``.
+    A clock-deadline poll (``while loop.time() < deadline``) is deliberately NOT
+    billed: its bound is arithmetic in another statement, and the
+    ``clock() + X`` shape alone fabricates waits (measured:
+    ``time.time() + 7 * 24 * 3600`` in test_merge_lane_package.py, a clock
+    injection). Rule C (fused-memory/scripts/check_bare_magicmock_config.py)
+    flags every such loop, so each is recorded debt or migrated onto the
+    billed ``poll_responsive``. Within a recognised shape, a named value
     resolves through *visible* (the scanned module's numeric constants, else
     ``_KNOWN_WAIT_CONSTANTS``, never a name the method rebinds) and a value
     the scan cannot read bills ``math.inf`` (``_resolve_wait_value``), so a
@@ -237,7 +279,14 @@ def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
         if timeout is None:
             return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
         return _resolve_wait_value(timeout, visible)
-    if isinstance(func, ast.Name) and func.id == 'wait_responsive':
+    if is_asyncio_timeout_call(call):
+        delay = _keyword(call, 'delay')
+        if delay is None and call.args:
+            delay = call.args[0]
+        return _resolve_wait_value(delay, visible)
+    if _is_asyncio_call(call, 'timeout_at'):
+        return math.inf
+    if is_responsive_wait_call(call):
         return _wait_responsive_budget(call, visible)
     if isinstance(func, ast.Name) and func.id == 'stop_merge_worker':
         join_timeout = _keyword(call, 'join_timeout')

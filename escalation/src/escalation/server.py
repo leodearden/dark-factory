@@ -611,6 +611,35 @@ class _ProbeFailed(Exception):
         )
 
 
+@dataclass(frozen=True)
+class _HistoryRead:
+    """merge_status's one up-front cross-run read: the newest durable row, or that it failed."""
+
+    history: _DurableHistory | None
+    failed: bool
+
+    def __post_init__(self) -> None:
+        if self.failed and self.history is not None:
+            raise ValueError('_HistoryRead: a failed read carries no history row')
+
+    @classmethod
+    def found(cls, history: _DurableHistory | None) -> _HistoryRead:
+        return cls(history, failed=False)
+
+    @classmethod
+    def failure(cls) -> _HistoryRead:
+        return cls(None, failed=True)
+
+    def history_or_probe_failure(self) -> _DurableHistory | None:
+        """The cross-run tier's own answer: a failed read ends the walk at this tier."""
+        if self.failed:
+            raise _ProbeFailed(MergeStatusSource.event_store_cross_run)
+        return self.history
+
+    def last_outcome(self) -> LastOutcome | None:
+        return LastOutcome.from_row(self.history.row) if self.history is not None else None
+
+
 def _require_matching_project_root(wired_root: Path, project_root: str) -> str | None:
     """Return an error message if *project_root* doesn't match *wired_root*.
 
@@ -748,9 +777,16 @@ _DISMISS_ACTIONS: frozenset[str] = frozenset({'abandon', 'close_only'})
 # should import ``escalation.canonical.canonical_root_cause`` — it is exported
 # publicly for exactly that — rather than reimplementing the transform; and
 # because the server now folds near-duplicates itself, a rebuild sees ONE row
-# where it used to see two.  A rebuild that keeps comparing raw strings is
-# strictly MORE conservative than the server (it re-promotes a near-duplicate,
-# the server folds it and answers ``status:'updated'``), so it stays correct.
+# where it used to see two.  A rebuild that compares raw strings creates no
+# duplicate L2 (it re-promotes a near-duplicate, the server folds it and answers
+# ``status:'updated'``), but a fold is "no duplicate created", NOT "nothing
+# happened": ``EscalationQueue.add_members_to_l2`` records the new spelling as an
+# amendment and a ``root_cause_variants`` entry and bumps ``updated_at``, so any
+# triage-ack on that L2 goes stale (updated_at > triaged_at) and is re-triaged
+# under the stamp-then-skip protocol, and each new spelling advances the count
+# against ``_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD``, which can trigger
+# ``_report_root_cause_overfold``.  Canonical comparison is therefore the
+# EXPECTED client behaviour, not an optional refinement.
 #
 # The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
 # included so a compact drain can decide stamp-then-skip without a per-record
@@ -1432,7 +1468,7 @@ def create_server(
             # this server it is the only attribution that always resolves: the
             # middleware's `_identity` reads `agent_id` / `project_root` /
             # `project_id` off the call's own arguments; no escalation tool
-            # declares `agent_id` or `project_id`, and the five that accept an
+            # declares `agent_id` or `project_id`, and the tools that accept an
             # OPTIONAL `project_root` see it omitted by fleet callers, so
             # `project` below usually stays None. The record's own `task_id` is
             # the synthetic anchor, not the caller's, so without these two
@@ -2970,8 +3006,10 @@ def create_server(
         ``amendments``.  ``detail`` is the unbounded free-text field compact mode
         exists to keep out of a long-running watcher's context.
 
-        Two L2-cluster fields ARE returned, because they are bounded by
-        construction and load-bearing for triage (task 3997): ``root_cause``,
+        Two L2-cluster fields ARE returned, because they are load-bearing for
+        triage (task 3997) and short in practice — though NOT bounded in
+        principle; see the comment above :data:`_COMPACT_ESCALATION_FIELDS`:
+        ``root_cause``,
         the one-line dedup key ``promote_to_l2`` folds on, and ``member_ids``,
         the PROJECTION of the record's ``members`` list under a contract name
         (the raw ``members`` key stays dropped).  Together they make a drain
@@ -2982,9 +3020,13 @@ def create_server(
         promoted.  Since task 3998 the SERVER matches root causes on their
         CANONICAL form, so a client-side rebuild should compare
         ``escalation.canonical.canonical_root_cause(row['root_cause'])`` rather
-        than raw strings; comparing raw is still safe, just more conservative
-        (it re-promotes a near-duplicate and the server folds it, answering
-        ``status:'updated'`` without creating anything).
+        than raw strings.  Comparing raw creates no duplicate L2 (the server
+        folds a re-promoted near-duplicate, answering ``status:'updated'``) but
+        it is NOT free: the fold records the new spelling as an amendment and
+        ``root_cause_variants`` entry and bumps ``updated_at``, which
+        invalidates triage-acks on that L2 (updated_at > triaged_at) and
+        advances the over-fold variant count that can trigger an over-fold
+        report.
 
         Use this from a long-running watcher to keep context small as the
         pending pile grows; fetch the full record for a specific id via
@@ -3094,6 +3136,24 @@ def create_server(
             return [_compact_escalation(d, _COMPACT_PENDING_FIELDS) for d in dicts]
         return dicts
 
+    def _task_escalation_records(
+        task_id: str,
+        *,
+        status: str | None = None,
+        level: int | None = None,
+        agent_role: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        escalations = queue.get_by_task(
+            task_id, status=status, level=level, agent_role=agent_role,
+        )
+        if compact:
+            return [
+                _compact_escalation(d, _COMPACT_ESCALATION_FIELDS)
+                for d in (e.to_dict() for e in escalations)
+            ]
+        return [e.to_dict() for e in escalations]
+
     @mcp.tool()
     def get_task_escalations(
         task_id: str,
@@ -3101,7 +3161,8 @@ def create_server(
         level: int | None = None,
         agent_role: str | None = None,
         compact: bool = False,
-    ) -> list[dict[str, Any]]:
+        project_root: str | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """List EVERY escalation ever filed for a task — ARCHIVE-INCLUSIVE by default.
 
         This is the archive-inclusive counterpart to
@@ -3146,18 +3207,20 @@ def create_server(
         triage-relevant field subset ``get_pending_escalations(compact=True)``
         returns, so the two task-scoped lookups are shape-compatible.
 
+        *project_root* — optional. When given, it must name the project root
+        this store serves; otherwise the call returns ``{'error': ...}``
+        naming both stores (or naming the reconciliation store) instead of a
+        list. Omitted, the call is unchanged. The rule is
+        ``escalation.project_root_guard::ProjectRootGuard``'s.
+
         No connection-capability gate applies: this is a read-only lookup,
         mirroring ``get_escalation``.
         """
-        escalations = queue.get_by_task(
-            task_id, status=status, level=level, agent_role=agent_role,
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
+        return _task_escalation_records(
+            task_id, status=status, level=level, agent_role=agent_role, compact=compact,
         )
-        if compact:
-            return [
-                _compact_escalation(d, _COMPACT_ESCALATION_FIELDS)
-                for d in (e.to_dict() for e in escalations)
-            ]
-        return [e.to_dict() for e in escalations]
 
     @mcp.tool()
     def get_task_escalation_history(
@@ -3177,8 +3240,8 @@ def create_server(
         escalation was resolved. That ``[]`` means "none currently OPEN",
         never "none ever filed" — do not read it as evidence of absence.
 
-        Contrast with the sibling ``get_task_escalations``: both scan the
-        same underlying store (this tool delegates to it directly), but
+        Contrast with the sibling ``get_task_escalations``: both read
+        through the same scan of the same underlying store, but
         that tool is the general FILTERABLE form — it accepts ``status``,
         ``agent_role`` and ``compact``, and returns a bare list. Reach for
         THIS tool when the question is the unfiltered ever-filed one and
@@ -3215,8 +3278,9 @@ def create_server(
         escalation was ever filed for this task" — that confusion is the
         exact failure mode this tool exists to remove.
 
-        Inherits ``queue.get_by_task``'s documented dedup and cross-tier
-        pre-scan WARNING behaviour (queue.py:396-430) via the sibling.
+        Inherits the documented dedup and cross-tier pre-scan WARNING
+        behaviour of ``escalation/queue.py::EscalationQueue.get_by_task``
+        through the scan it shares with the sibling.
 
         A task with no matching records yields an empty envelope
         (``count == 0``), not an ``{'error': ...}`` dict — deliberately
@@ -3225,7 +3289,7 @@ def create_server(
         """
         if (refusal := project_root_guard.check(project_root)) is not None:
             return refusal
-        escalations = get_task_escalations(task_id, level=level)
+        escalations = _task_escalation_records(task_id, level=level)
         return {
             'task_id': task_id,
             'count': len(escalations),
@@ -5479,11 +5543,16 @@ def create_server(
     def _current_run_answer(key: _PollKey) -> MergeStatusAnswer | None:
         if event_store is None:
             return None
-        row = event_store.latest_merge_finalized(
-            request_id=key.request_id, branch=key.branch, task_id=key.task_id,
-        )
-        if row is None and key.request_id is not None:
-            row = event_store.merge_finalized_absorbing(key.request_id)
+        try:
+            row = event_store.latest_merge_finalized(
+                request_id=key.request_id, branch=key.branch, task_id=key.task_id,
+                fire_safe=False,
+            )
+            if row is None and key.request_id is not None:
+                row = event_store.merge_finalized_absorbing(key.request_id, fire_safe=False)
+        except Exception as exc:
+            logger.warning('merge_status: event store (current run) read failed', exc_info=True)
+            raise _ProbeFailed(MergeStatusSource.event_store) from exc
         if row is None:
             return None
         if not row['is_current_run']:
@@ -5496,7 +5565,7 @@ def create_server(
             'outcome': row['state'],
             'finished_at': row['finished_at'],
         }
-        for name in ('superseded_by', 'reason'):
+        for name in ('merge_sha', 'superseded_by', 'reason'):
             if row.get(name) is not None:
                 fields[name] = row[name]
         return MergeStatusAnswer.outcome(source=MergeStatusSource.event_store, fields=fields)
@@ -5521,26 +5590,34 @@ def create_server(
         matches = [e for e in entries if key.matches(e.request_id, e.branch, e.task_id)]
         return max(matches, key=lambda e: e.enqueued_at) if matches else None
 
-    def _durable_history(key: _PollKey) -> _DurableHistory | None:
+    def _durable_history(key: _PollKey) -> _HistoryRead:
         if event_store is None:
-            return None
-        row = event_store.latest_merge_finalized(
-            request_id=key.request_id, branch=key.branch, task_id=key.task_id,
-            cross_run=True,
-        )
-        if row is None and key.request_id is not None:
-            row = event_store.merge_finalized_absorbing(key.request_id, cross_run=True)
-        if row is not None:
-            return _DurableHistory(row, MergeReason.prior_run_terminal)
-        if key.request_id is not None:
-            members = event_store.merge_finalized_superseded_by(key.request_id, cross_run=True)
-            if members:
-                return _DurableHistory(members[-1], MergeReason.coalesce_train_id)
-        return None
+            return _HistoryRead.found(None)
+        try:
+            row = event_store.latest_merge_finalized(
+                request_id=key.request_id, branch=key.branch, task_id=key.task_id,
+                cross_run=True, fire_safe=False,
+            )
+            if row is None and key.request_id is not None:
+                row = event_store.merge_finalized_absorbing(
+                    key.request_id, cross_run=True, fire_safe=False,
+                )
+            if row is not None:
+                return _HistoryRead.found(_DurableHistory(row, MergeReason.prior_run_terminal))
+            if key.request_id is not None:
+                members = event_store.merge_finalized_superseded_by(
+                    key.request_id, cross_run=True, fire_safe=False,
+                )
+                if members:
+                    return _HistoryRead.found(
+                        _DurableHistory(members[-1], MergeReason.coalesce_train_id),
+                    )
+            return _HistoryRead.found(None)
+        except Exception:
+            logger.warning('merge_status: event store (cross run) read failed', exc_info=True)
+            return _HistoryRead.failure()
 
-    async def _walk_durable(
-        key: _PollKey, history: _DurableHistory | None,
-    ) -> MergeStatusAnswer:
+    async def _walk_durable(key: _PollKey, history_read: _HistoryRead) -> MergeStatusAnswer:
         current = _current_run_answer(key)
         if current is not None:
             return current
@@ -5566,6 +5643,7 @@ def create_server(
                 MergeState.journaled, reason(MergeReason.journaled_not_live),
                 entry.request_id, fields={'enqueued_at': entry.enqueued_at},
             )
+        history = history_read.history_or_probe_failure()
         if history is not None:
             return MergeStatusAnswer.epistemic(
                 MergeState.stale_record, reason(history.reason), key.request_id,
@@ -5576,13 +5654,12 @@ def create_server(
 
     async def _resolve(key: _PollKey) -> MergeStatusAnswer:
         """Walk the tiers, live first; the first probe that raises ends it as unknown."""
-        history = _durable_history(key)
+        history_read = _durable_history(key)
         try:
-            answer = _live_answer(key) or await _walk_durable(key, history)
+            answer = _live_answer(key) or await _walk_durable(key, history_read)
         except _ProbeFailed as failure:
             answer = failure.answer_for(key)
-        last_outcome = LastOutcome.from_row(history.row) if history is not None else None
-        return answer.with_last_outcome(last_outcome)
+        return answer.with_last_outcome(history_read.last_outcome())
 
     @mcp.tool()
     async def merge_status(
@@ -5602,7 +5679,10 @@ def create_server(
             → durable journal → event store (prior runs) → no_record
 
         The first tier that answers wins; the first probe that RAISES ends the
-        walk as ``unknown`` with ``source`` naming that tier.  The git tier
+        walk as ``unknown`` with ``source`` naming that tier.  The prior-run
+        history is read once, up front, for ``last_outcome``; if that read
+        fails it ends the walk only on reaching its own tier, and
+        ``last_outcome`` is None.  The git tier
         only consumes ``escalation/src/escalation/git_authority.py::probe_landing``'s
         verdict and needs a branch or task_id plus ``harness.git_ops`` and
         ``orch_config``.  The newest durable row of ANY run is attached to every

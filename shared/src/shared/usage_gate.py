@@ -386,6 +386,13 @@ class AccountState:
     # detect whether the account has re-transitioned since the lease was
     # taken — see `UsageGate.lease_is_current`.
     generation: int = 0
+    # Releases a PROBE_IN_FLIGHT claim whose holder has reported no verdict
+    # within UsageCapConfig.probe_slot_hold_secs (task 9327). Armed by
+    # `UsageGate._transition` on entering PROBE_IN_FLIGHT, cancelled on
+    # leaving it and by `UsageGate.shutdown`.
+    probe_hold_timer: asyncio.TimerHandle | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     # Per-(account, model) cap overlay (task 2855 / PRD scope substrate).
     # Lazily populated by later tasks when a scoped cap is observed; keys are a
@@ -958,7 +965,9 @@ class UsageGate:
         Also owns the per-phase side effects that used to be scattered
         across callers: starting/cancelling the resume and auth-reprobe
         background tasks, firing the ``cap_hit``/``auth_failed`` cost
-        events (entering CAPPED/AUTH_FAILED), stamping gate-level
+        events (entering CAPPED/AUTH_FAILED), arming the probe-hold timer on
+        entering PROBE_IN_FLIGHT and cancelling it on leaving by any edge
+        (task 9327, ``_arm_probe_hold``), stamping gate-level
         ``_pause_started_at``/``_paused_reason`` when the edge closes the
         gate for every account — and, symmetrically, consuming the elapsed
         gate-level pause into ``_total_pause_secs`` and clearing
@@ -1020,6 +1029,8 @@ class UsageGate:
             old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase == AccountPhase.AVAILABLE
         ):
             acct.probe_count = 0
+        if old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase != AccountPhase.PROBE_IN_FLIGHT:
+            self._disarm_probe_hold(acct)
         if old_phase in (AccountPhase.CAPPED, AccountPhase.AUTH_FAILED) and new_phase not in (
             AccountPhase.CAPPED,
             AccountPhase.AUTH_FAILED,
@@ -1118,6 +1129,8 @@ class UsageGate:
                 if resets_at is not None:
                     details['resets_at'] = resets_at.isoformat()
                 self._fire_cost_event(acct.name, 'auth_failed', json.dumps(details))
+        elif new_phase == AccountPhase.PROBE_IN_FLIGHT:
+            self._arm_probe_hold(acct)
 
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
@@ -1211,7 +1224,9 @@ class UsageGate:
                 continue
             if acct.probing:
                 # First task claims the probe slot — others block
-                # until confirm_account_ok() or _handle_cap_detected().
+                # until confirm_account_ok() or _handle_cap_detected(),
+                # or until the claim outlives
+                # UsageCapConfig.probe_slot_hold_secs (task 9327).
                 # _transition owns: the phase write, probe_count
                 # reset, and the centralized _open recompute.
                 self._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
@@ -1536,6 +1551,9 @@ class UsageGate:
                                 'account_count': self.account_count,
                                 'capped_accounts': list(self.capped_account_names),
                                 'auth_failed_accounts': list(self.auth_failed_account_names),
+                                'probe_in_flight_accounts': list(
+                                    self.probe_in_flight_account_names
+                                ),
                                 'soonest_open_at': (
                                     self.soonest_resets_at.isoformat()
                                     if self.soonest_resets_at
@@ -2307,6 +2325,45 @@ class UsageGate:
         except RuntimeError:
             pass
 
+    def _arm_probe_hold(self, acct: AccountState) -> None:
+        """Bound the probe claim just taken on *acct*; see
+        ``UsageCapConfig.probe_slot_hold_secs``.
+
+        A loop-less ``try_lease`` caller arms nothing: its contract is one
+        invocation at a time, so no second caller can starve.
+        """
+        if getattr(self, '_shutting_down', False):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._disarm_probe_hold(acct)
+        acct.probe_hold_timer = loop.call_later(
+            self._config.probe_slot_hold_secs,
+            self._expire_probe_hold,
+            acct,
+            acct.generation,
+        )
+
+    def _disarm_probe_hold(self, acct: AccountState) -> None:
+        if acct.probe_hold_timer is not None:
+            acct.probe_hold_timer.cancel()
+            acct.probe_hold_timer = None
+
+    def _expire_probe_hold(self, acct: AccountState, claim_generation: int) -> None:
+        acct.probe_hold_timer = None
+        # The legacy AccountState boolean setters write `phase` without
+        # `_transition`, so the claim this timer was armed for may be gone.
+        if acct.phase != AccountPhase.PROBE_IN_FLIGHT or acct.generation != claim_generation:
+            return
+        logger.info(
+            f'Account {acct.name}: probe slot held '
+            f'{self._config.probe_slot_hold_secs:g}s with no cap verdict — '
+            f'holder is being served; opening to all tasks',
+        )
+        self._transition(acct, AccountPhase.AVAILABLE, clear_near_cap=False)
+
     async def _write_cost_event(
         self,
         account_name: str,
@@ -2872,6 +2929,7 @@ class UsageGate:
         # would otherwise leak a background task past shutdown.
         self._shutting_down = True
         for acct in self._accounts:
+            self._disarm_probe_hold(acct)
             if acct.resume_task and not acct.resume_task.done():
                 acct.resume_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -2979,6 +3037,12 @@ class UsageGate:
     def auth_failed_account_names(self) -> tuple[str, ...]:
         """Names of the accounts currently AUTH_FAILED, in roster order."""
         return tuple(acct.name for acct in self._accounts if acct.auth_failed)
+
+    @property
+    def probe_in_flight_account_names(self) -> tuple[str, ...]:
+        """Names of the accounts whose probe claim awaits its holder's
+        verdict, in roster order."""
+        return tuple(acct.name for acct in self._accounts if acct.probe_in_flight)
 
     @property
     def capped_account_names(self) -> tuple[str, ...]:

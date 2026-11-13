@@ -22,8 +22,11 @@ from pathlib import Path
 import pytest
 import yaml
 from legibility import census_trigger as ct
-from legibility.config import Census as LegibilityCensus
+from legibility.config import Census, LegibilityConfig, NoveltySpike, load_config
 from shared.testing_mcp_stub import StubAnswer, StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
 
@@ -38,275 +41,6 @@ _NOT_YET = ct.Completion(ct.CompletionStatus.NOT_YET, RUN_ID, 70, share=0.5)
 _ERRORED = ct.Completion(
     ct.CompletionStatus.ERROR, RUN_ID, 70, detail="exit 2, store_unreachable"
 )
-
-
-# ---------------------------------------------------------------------------
-# step-1: RED — CensusConfig defaults + from_mapping merge
-# ---------------------------------------------------------------------------
-
-def test_census_config_defaults_match_prd_section_7_4():
-    config = ct.CensusConfig()
-    assert config.completion_threshold_pct == 70
-    assert config.novelty_spike_count == 4
-    assert config.novelty_spike_window_hours == 72
-    assert config.novelty_spike_multiple == 2
-    assert config.novelty_spike_baseline_days == 30
-    assert config.floor_days == 5
-
-
-def test_census_config_from_mapping_merges_partial_overrides_over_defaults():
-    config = ct.CensusConfig.from_mapping(
-        {"floor_days": 3, "novelty_spike": {"count": 9, "baseline_days": 14}}
-    )
-    assert config.floor_days == 3
-    assert config.novelty_spike_count == 9
-    assert config.novelty_spike_baseline_days == 14
-    assert config.novelty_spike_multiple == 2
-    # untouched fields keep their §7.4 defaults
-    assert config.completion_threshold_pct == 70
-    assert config.novelty_spike_window_hours == 72
-
-
-def test_census_config_from_mapping_none_returns_defaults():
-    assert ct.CensusConfig.from_mapping(None) == ct.CensusConfig()
-
-
-def test_census_config_from_mapping_empty_dict_returns_defaults():
-    assert ct.CensusConfig.from_mapping({}) == ct.CensusConfig()
-
-
-# ---------------------------------------------------------------------------
-# task 4085: the `census:` block is hand-edited, so an unusable threshold
-# VALUE is an expected input. VALIDATE, never coerce: unvalidated it raises
-# out of `evaluate()` and breaks `load_census_config`'s and
-# `decide_for_project`'s never-raises contract.
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "field,key,mapping_key",
-    [
-        ("floor_days", "floor_days", None),
-        ("novelty_spike_count", "count", "novelty_spike"),
-        ("novelty_spike_window_hours", "window_hours", "novelty_spike"),
-        ("novelty_spike_multiple", "multiple", "novelty_spike"),
-        ("novelty_spike_baseline_days", "baseline_days", "novelty_spike"),
-    ],
-)
-@pytest.mark.parametrize("bad", ["10", "", 10.0, 1.5, True, False, -1, None, [10], {"n": 10}])
-def test_census_config_from_mapping_rejects_unusable_threshold_values(
-    field, key, mapping_key, bad, caplog
-):
-    """Each non-negative §7.4 threshold falls back to its OWN default, alone,
-    with one WARNING naming the value and its type. `True`/`False` are in the
-    parameter list deliberately: `bool` is an `int` subclass, so an unquoted
-    YAML `true` would otherwise mean 1 in total silence. A negative is
-    definitionally impossible for a day/count threshold."""
-    override = {key: bad} if mapping_key is None else {mapping_key: {key: bad}}
-
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping(override)
-
-    # The bad field fell back; nothing else moved.
-    assert config == ct.CensusConfig()
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
-    assert key in message
-    assert type(bad).__name__ in message
-
-
-def test_census_config_from_mapping_rejects_a_non_mapping_novelty_spike(caplog):
-    """`census: {novelty_spike: [4, 72]}` used to raise AttributeError from
-    the `.get` on a list -- a raise from inside the config reader, which is
-    the one place that must not have one."""
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping({"novelty_spike": [4, 72], "floor_days": 3})
-
-    assert config.novelty_spike_count == ct.CensusConfig().novelty_spike_count
-    assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
-    # ...and the sibling override alongside it is still honoured.
-    assert config.floor_days == 3
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert "novelty_spike" in warnings[0].getMessage()
-
-
-def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplog):
-    """Per-FIELD fallback, per-BLOCK warning. The thresholds are
-    independent, so one typo must not disarm the others; but a single
-    hand-edited block is a single operator fault, and this WARNING is one
-    nightly journal line, so all of them are named in one message."""
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping(
-            {
-                "completion_threshold_pct": "70",
-                "floor_days": -1,
-                "novelty_spike": {"window_hours": None, "multiple": "2", "count": 9},
-            }
-        )
-
-    assert config.novelty_spike_count == 9
-    assert config.completion_threshold_pct == ct.CensusConfig().completion_threshold_pct
-    assert config.floor_days == ct.CensusConfig().floor_days
-    assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
-    assert config.novelty_spike_multiple == ct.CensusConfig().novelty_spike_multiple
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
-    for named in ("completion_threshold_pct", "floor_days", "window_hours", "multiple"):
-        assert named in message
-    assert "count" not in message
-
-
-def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
-    """Over-rejection guard. `0` is aggressive but legal (fire every day) and
-    must not be mistaken for a missing value, and there is no upper bound."""
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping(
-            {
-                "floor_days": 0,
-                "completion_threshold_pct": 100,
-                "novelty_spike": {
-                    "count": 0, "window_hours": 1, "multiple": 0, "baseline_days": 0,
-                },
-            }
-        )
-
-    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
-
-    assert config.floor_days == 0
-    assert config.completion_threshold_pct == 100
-    assert config.novelty_spike_count == 0
-    assert config.novelty_spike_window_hours == 1
-    assert config.novelty_spike_multiple == 0
-    assert config.novelty_spike_baseline_days == 0
-
-
-def test_census_config_completion_threshold_pct_defaults_to_seventy():
-    assert ct.CensusConfig().completion_threshold_pct == 70
-
-
-@pytest.mark.parametrize("value", [1, 85, 100])
-def test_census_config_from_mapping_accepts_a_completion_threshold_in_range_silently(
-    value, caplog
-):
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping({"completion_threshold_pct": value})
-
-    assert config.completion_threshold_pct == value
-    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
-
-
-@pytest.mark.parametrize("bad", [0, 101, -1, "70", 70.0, True, None, [70]])
-def test_census_config_from_mapping_rejects_a_completion_threshold_outside_1_to_100(
-    bad, caplog
-):
-    """check_run_completion rejects a threshold outside (0, 1] with a usage
-    error, so an unvalidated 0 would become a nightly completion ERROR
-    streak instead of one config WARNING naming the bound."""
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping({"completion_threshold_pct": bad})
-
-    assert config == ct.CensusConfig()
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
-    assert "completion_threshold_pct" in message
-    assert type(bad).__name__ in message
-    assert "1..100" in message
-
-
-# ---------------------------------------------------------------------------
-# retired census keys (plans/census-incremental-prd.md C7, L8b, row 13): a
-# not-yet-migrated legibility.yaml is accepted, the keys are ignored, and
-# one deprecation WARNING names them
-# ---------------------------------------------------------------------------
-
-_RETIRED_KEYS = ("max_interval_days", "tasks_landed_threshold", "tasks_landed_min_days")
-
-
-def _is_deprecation(message):
-    return "retired" in message and "ignored" in message
-
-
-def test_census_config_from_mapping_ignores_a_retired_key_with_one_deprecation_warning(caplog):
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping({"max_interval_days": 1})
-
-    assert config == ct.CensusConfig()
-    [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert "max_interval_days" in warning
-    assert _is_deprecation(warning)
-    assert "unusable value" not in warning
-
-
-def test_census_config_from_mapping_names_every_retired_key_apart_from_rejected_values(caplog):
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping(
-            {
-                "max_interval_days": 10,
-                "tasks_landed_threshold": 120,
-                "tasks_landed_min_days": 7,
-                "floor_days": -1,
-            }
-        )
-
-    assert config == ct.CensusConfig()
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    deprecations = [m for m in warnings if _is_deprecation(m)]
-    rejections = [m for m in warnings if "unusable value" in m]
-    assert len(warnings) == 2
-    [deprecation] = deprecations
-    for key in _RETIRED_KEYS:
-        assert key in deprecation
-    [rejection] = rejections
-    assert "floor_days" in rejection
-    assert not any(key in rejection for key in _RETIRED_KEYS)
-
-
-@pytest.mark.parametrize("junk", ["ten", True, None, [10]])
-def test_census_config_from_mapping_never_rejects_a_retired_keys_value(junk, caplog):
-    with caplog.at_level(logging.WARNING):
-        config = ct.CensusConfig.from_mapping({"tasks_landed_threshold": junk})
-
-    assert config == ct.CensusConfig()
-    [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert _is_deprecation(warning)
-    assert "unusable value" not in warning
-
-
-def test_dark_factorys_shipped_legibility_yaml_is_migrated(caplog):
-    repo_root = Path(__file__).resolve().parents[2]
-
-    with caplog.at_level(logging.WARNING):
-        config = ct.load_census_config(repo_root)
-
-    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
-    assert config.completion_threshold_pct == 70
-
-
-# ---------------------------------------------------------------------------
-# amendment pass (review finding #3): CensusConfig defaults must not
-# silently drift from task β's legibility.config.Census model, now that β
-# has landed and lives alongside this module in scripts/legibility/.
-# ---------------------------------------------------------------------------
-
-def test_census_config_defaults_match_legibility_config_census_model():
-    """Regression guard for the reuse fix: CensusConfig's field defaults are
-    sourced from legibility.config.Census (task β), not independently
-    hardcoded, so the two schemas cannot silently drift apart."""
-    beta_defaults = LegibilityCensus()
-    config = ct.CensusConfig()
-    assert config.novelty_spike_count == beta_defaults.novelty_spike.count
-    assert config.novelty_spike_window_hours == beta_defaults.novelty_spike.window_hours
-    assert config.novelty_spike_multiple == beta_defaults.novelty_spike.multiple
-    assert config.novelty_spike_baseline_days == beta_defaults.novelty_spike.baseline_days
-    assert config.floor_days == beta_defaults.floor_days
-    assert config.completion_threshold_pct == beta_defaults.completion_threshold_pct == 70
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +70,7 @@ def _evaluate_novelty(first_seens, config=None, now=NOW):
         floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, now - timedelta(days=6)),
         completion=_NOT_YET,
         candidate_first_seens=first_seens,
-        config=config or ct.CensusConfig(),
+        config=config or Census(),
     )
 
 
@@ -390,7 +124,7 @@ def test_novelty_spike_window_counts_72h_inclusive():
 
 def test_novelty_spike_baseline_days_zero_degenerates_to_the_absolute_rule():
     decision = _evaluate_novelty(
-        [_TODAY] * 4, config=ct.CensusConfig(novelty_spike_baseline_days=0)
+        [_TODAY] * 4, config=Census(novelty_spike=NoveltySpike(baseline_days=0))
     )
     assert decision.fire is True
     assert "baseline median 0" in _novelty_line(decision)
@@ -398,7 +132,8 @@ def test_novelty_spike_baseline_days_zero_degenerates_to_the_absolute_rule():
 
 def test_novelty_spike_multiple_is_honoured():
     decision = _evaluate_novelty(
-        _first_seens_over_a_baseline_of_40(90), config=ct.CensusConfig(novelty_spike_multiple=3)
+        _first_seens_over_a_baseline_of_40(90),
+        config=Census(novelty_spike=NoveltySpike(multiple=3)),
     )
     assert decision.fire is False
     assert _novelty_line(decision).endswith("(baseline median 40, x3)")
@@ -476,7 +211,7 @@ def _evaluate_floor(*, floor_anchor, completion=_NOT_YET, config=None):
         floor_anchor=floor_anchor,
         completion=completion,
         candidate_first_seens=[],
-        config=config or ct.CensusConfig(),
+        config=config or Census(),
     )
 
 
@@ -546,131 +281,7 @@ def test_evaluate_floor_never_fires_by_itself():
 
 
 # ---------------------------------------------------------------------------
-# step-11: RED — load_census_state() three-valued (ok/missing/malformed)
-# ---------------------------------------------------------------------------
-
-def test_load_census_state_missing_file_is_missing_with_no_warning(tmp_path, caplog):
-    path = tmp_path / "census-state.json"
-
-    with caplog.at_level(logging.WARNING):
-        status, data = ct.load_census_state(path)
-
-    assert status == "missing"
-    assert data is None
-    assert not any(r.levelno == logging.WARNING for r in caplog.records)
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        "not json{",
-        "null",
-        "[]",
-        '{"last_census_at": "not-a-date"}',
-    ],
-    ids=["invalid-json", "json-null", "non-dict-list", "unparseable-last-census-at"],
-)
-def test_load_census_state_malformed_variants_are_malformed_with_one_warning(
-    tmp_path, caplog, content
-):
-    path = tmp_path / "census-state.json"
-    path.write_text(content, encoding="utf-8")
-
-    with caplog.at_level(logging.WARNING):
-        status, data = ct.load_census_state(path)
-
-    assert status == "malformed"
-    assert data is None
-    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
-
-
-def test_load_census_state_valid_file_is_ok_with_no_warning(tmp_path, caplog):
-    path = tmp_path / "census-state.json"
-    path.write_text(
-        json.dumps(
-            {
-                "last_census_at": "2026-07-01T00:00:00+00:00",
-                "last_census_report": "plans/confusion-census-2026-07-01.md",
-                "last_census_done_count": 500,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with caplog.at_level(logging.WARNING):
-        status, data = ct.load_census_state(path)
-
-    assert status == "ok"
-    # tuple[str, dict | None] — None only for the missing/malformed statuses.
-    assert data is not None
-    assert data["last_census_at"] == "2026-07-01T00:00:00+00:00"
-    assert data["last_census_report"] == "plans/confusion-census-2026-07-01.md"
-    assert data["last_census_done_count"] == 500
-    assert not any(r.levelno == logging.WARNING for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# task 6397: the six-key census state, and the legacy shapes it replaces
-# ---------------------------------------------------------------------------
-
-_LEGACY_STATE = {
-    "last_census_at": "2026-10-03",
-    "last_census_report": "/home/leo/src/dark-factory/plans/confusion-census-2026-10-03.md",
-    "last_census_done_count": 2872,
-}
-
-_SIX_KEY_STATE = {
-    "last_census_at": "2026-10-06",
-    "last_census_run_id": "census-dark_factory-20261006",
-    "last_census_report": "plans/confusion-census-2026-10-06.md",
-    "last_census_as_of_sha": "a" * 40,
-    "session_watermark": "2026-10-06T00:00:00+00:00",
-    "last_census_done_count": 2900,
-}
-
-
-@pytest.mark.parametrize(
-    "state",
-    [
-        _LEGACY_STATE,
-        _SIX_KEY_STATE,
-        {"last_census_at": "2026-10-01T09:30:00+00:00", "last_census_report": "x.md"},
-        {**_SIX_KEY_STATE, "session_watermark": None},
-    ],
-    ids=["legacy", "six-key", "hand-seeded-datetime", "null-watermark"],
-)
-def test_load_census_state_accepts_every_supported_shape(tmp_path, caplog, state):
-    path = tmp_path / "census-state.json"
-    path.write_text(json.dumps(state), encoding="utf-8")
-
-    with caplog.at_level(logging.WARNING):
-        status, data = ct.load_census_state(path)
-
-    assert (status, data) == ("ok", state)
-    assert not any(r.levelno == logging.WARNING for r in caplog.records)
-
-
-@pytest.mark.parametrize("watermark", ["yesterday", 5])
-def test_load_census_state_unparseable_watermark_is_malformed_with_one_warning(
-    tmp_path, caplog, watermark,
-):
-    path = tmp_path / "census-state.json"
-    path.write_text(
-        json.dumps({**_SIX_KEY_STATE, "session_watermark": watermark}), encoding="utf-8",
-    )
-
-    with caplog.at_level(logging.WARNING):
-        status, data = ct.load_census_state(path)
-
-    assert (status, data) == ("malformed", None)
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert "session_watermark" in warnings[0].getMessage()
-    assert repr(watermark) in warnings[0].getMessage()
-
-
-# ---------------------------------------------------------------------------
-# step-13: RED — codebook_signal() + load_census_config()
+# step-13: RED — codebook_signal()
 # ---------------------------------------------------------------------------
 
 def _sighting(date, session="s"):
@@ -729,39 +340,9 @@ def test_codebook_signal_collects_earliest_across_entries_and_candidates():
     ]
 
 
-def test_load_census_config_absent_file_returns_defaults(tmp_path):
-    config = ct.load_census_config(tmp_path)
-    assert config == ct.CensusConfig()
-
-
-def test_load_census_config_partial_override_merges_over_defaults(tmp_path):
-    legibility_dir = tmp_path / "docs" / "legibility"
-    legibility_dir.mkdir(parents=True)
-    (legibility_dir / "legibility.yaml").write_text(
-        "census:\n  floor_days: 3\n  novelty_spike:\n    count: 9\n",
-        encoding="utf-8",
-    )
-    config = ct.load_census_config(tmp_path)
-    assert config.floor_days == 3
-    assert config.novelty_spike_count == 9
-    assert config.completion_threshold_pct == 70  # untouched -- still default
-
-
-def test_load_census_config_malformed_file_returns_defaults_with_one_warning(tmp_path, caplog):
-    legibility_dir = tmp_path / "docs" / "legibility"
-    legibility_dir.mkdir(parents=True)
-    (legibility_dir / "legibility.yaml").write_text("{", encoding="utf-8")
-
-    with caplog.at_level(logging.WARNING):
-        config = ct.load_census_config(tmp_path)
-
-    assert config == ct.CensusConfig()
-    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
-
-
 # ---------------------------------------------------------------------------
 # extract_statuses() — the validated {task id: status} mapping census.py's
-# outcome feed reads once per run (census._read_statuses).
+# outcome feed reads once per run (census_run.py::_read_statuses).
 # ---------------------------------------------------------------------------
 
 # fused-memory's `_normalize_project_root` hard-rejects a relative path with
@@ -817,7 +398,7 @@ def test_extract_statuses_raises_on_non_dict_payload(payload):
 
 
 # ---------------------------------------------------------------------------
-# `_bounded_repr` / `_bounded_keys` (task 4085): every journal line they
+# `bounded_repr` / `bounded_keys` (task 4085): every journal line they
 # feed stays one bounded line. These pin that PROPERTY -- output bounded,
 # elision marked, true size still reported -- not a private format string.
 # The two constants are read from the module, so retuning them does not
@@ -828,14 +409,14 @@ def test_bounded_repr_bounds_an_arbitrarily_large_value():
     """The point of the helper: census-state.json and a get_statuses payload
     are both arbitrarily large, and neither may dump itself into a journal
     line. A value small enough to print in full is left alone."""
-    assert "repr truncated" not in ct._bounded_repr({"n": 1})
+    assert "repr truncated" not in ct.bounded_repr({"n": 1})
 
     value = "x" * 100_000
-    result = ct._bounded_repr(value)
+    result = ct.bounded_repr(value)
 
     # Bounded, marked as elided, and the TRUE size still stated -- that number
     # is how an operator tells "slightly over" from "a whole payload".
-    assert len(result) < ct._MAX_REPR_CHARS + 100
+    assert len(result) < ct.MAX_REPR_CHARS + 100
     assert "repr truncated" in result
     assert str(len(repr(value))) in result
 
@@ -843,13 +424,13 @@ def test_bounded_repr_bounds_an_arbitrarily_large_value():
 def test_bounded_keys_bounds_an_arbitrarily_wide_mapping():
     """Same property for the key list: a get_statuses payload over a big
     project has thousands of keys, and the shape is all diagnosis needs."""
-    count = ct._MAX_REPORTED_KEYS + 5
+    count = ct.MAX_REPORTED_KEYS + 5
     mapping = {f"k{i:02d}": i for i in range(count)}
 
-    result = ct._bounded_keys(mapping)
+    result = ct.bounded_keys(mapping)
 
     shown = sum(1 for i in range(count) if f"'k{i:02d}'" in result)
-    assert shown == ct._MAX_REPORTED_KEYS
+    assert shown == ct.MAX_REPORTED_KEYS
     # The suffix reports the TRUE key count, not the number shown.
     assert str(count) in result
 
@@ -860,7 +441,7 @@ def test_bounded_keys_survives_mixed_type_keys():
     str -- i.e. the error path would fail while reporting a failure, which is
     the worst possible place for it. get_statuses payloads are server-supplied,
     so a mixed-key dict is exactly the malformed shape this reports on."""
-    result = ct._bounded_keys({1: "a", "b": "c", None: "d"})
+    result = ct.bounded_keys({1: "a", "b": "c", None: "d"})
 
     assert "1" in result
     assert "'b'" in result
@@ -1273,7 +854,7 @@ def _evaluate_completion(completion, *, watermark_days_ago=30):
         floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, watermark_days_ago),
         completion=completion,
         candidate_first_seens=_quiet_history(),
-        config=ct.CensusConfig(),
+        config=Census(),
     )
 
 
@@ -1318,7 +899,7 @@ _PREVIOUS_RUN = "census-p-20261001"
 
 def _completion_state(**overrides):
     return {
-        "last_census_at": (NOW - timedelta(days=30)).isoformat(),
+        "last_census_at": (NOW - timedelta(days=30)).date().isoformat(),
         "last_census_report": "plans/confusion-census-prior.md",
         "last_census_run_id": _PREVIOUS_RUN,
         "session_watermark": (NOW - timedelta(days=30)).isoformat(),
@@ -1331,7 +912,7 @@ def test_decide_for_project_fires_when_the_previous_run_has_landed(tmp_path):
     _write_census_state(tmp_path, **_completion_state())
     runner = _ScriptedRunner(0, _verdict_json("pass", 0.9))
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=runner)
 
     assert decision.fire is True
     [args] = runner.calls
@@ -1345,7 +926,7 @@ def test_decide_for_project_does_not_fire_while_the_previous_run_is_landing(tmp_
     _write_census_state(tmp_path, **_completion_state())
     runner = _ScriptedRunner(75, _verdict_json("not_yet", 0.5))
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=runner)
 
     assert decision.fire is False
     assert f"completion: 0.5 of {_PREVIOUS_RUN} (threshold 0.70)" in decision.reasons
@@ -1356,7 +937,7 @@ def test_decide_for_project_does_not_fire_when_the_check_fails(tmp_path):
     _write_census_state(tmp_path, **_completion_state())
     runner = _ScriptedRunner(2, _verdict_json("error", None, error="store_unreachable"))
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=runner)
 
     assert decision.fire is False
     assert any(
@@ -1371,7 +952,7 @@ def test_decide_for_project_a_stale_census_without_a_run_id_no_longer_fires(tmp_
     _write_census_state(tmp_path, **_completion_state(last_census_run_id=None))
     runner = _ScriptedRunner(0, _verdict_json("pass", 1.0))
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=runner)
 
     assert decision.fire is False
     assert decision.completion is not None
@@ -1384,7 +965,7 @@ def test_decide_for_project_a_never_censused_project_has_no_previous_run(tmp_pat
     _write_codebook(tmp_path, entries=[_entry_sighted("2026-06-01")])
     runner = _ScriptedRunner(0, _verdict_json("pass", 1.0))
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=runner)
 
     assert decision.completion is not None
     assert decision.completion.status is ct.CompletionStatus.NO_PREVIOUS_RUN
@@ -1404,11 +985,11 @@ def _entry_sighted(day):
 
 
 def _real_now_state(**overrides):
-    month_ago = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    month_ago = datetime.now(UTC) - timedelta(days=30)
     return {
-        "last_census_at": month_ago,
+        "last_census_at": month_ago.date().isoformat(),
         "last_census_report": "plans/confusion-census-prior.md",
-        "session_watermark": month_ago,
+        "session_watermark": month_ago.isoformat(),
         **overrides,
     }
 
@@ -1417,6 +998,7 @@ def test_cli_evaluate_without_a_previous_run_prints_a_completion_na_line(tmp_pat
     _write_codebook(tmp_path)
     _write_census_state(tmp_path, **_real_now_state())
 
+    _write_config(tmp_path)
     exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
 
     out = capsys.readouterr().out
@@ -1435,6 +1017,7 @@ def test_cli_evaluate_prints_the_previous_runs_completion_share(
     2 high done and 1 low pending weigh 6 landed of 7."""
     _write_codebook(tmp_path)
     _write_census_state(tmp_path, **_real_now_state(last_census_run_id=_PREVIOUS_RUN))
+    _write_config(tmp_path)
 
     with StubMcpServer(stateful=False, tools=_RunStore(_landed_run_rows())) as server:
         monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
@@ -1459,6 +1042,35 @@ def _write_codebook(project_root, entries=None, candidates=None):
     )
 
 
+def _config_yaml(project_root, census_yaml=""):
+    return (
+        "project_id: p\n"
+        f"project_root: {project_root}\n"
+        "escalation_port: 1\n"
+        f"cwd_prefixes: [{project_root}]\n"
+        f"{census_yaml}\n"
+    )
+
+
+def _write_config(project_root, census_yaml=""):
+    """A minimal valid docs/legibility/legibility.yaml for *project_root*."""
+    legibility_dir = project_root / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    path = legibility_dir / "legibility.yaml"
+    path.write_text(_config_yaml(project_root, census_yaml), encoding="utf-8")
+    return path
+
+
+def _cfg(project_root, **census_overrides):
+    return LegibilityConfig(
+        project_id="p",
+        project_root=str(project_root),
+        escalation_port=1,
+        cwd_prefixes=[str(project_root)],
+        census=Census(**census_overrides),
+    )
+
+
 def _write_census_state(project_root, **fields):
     legibility_dir = project_root / "docs" / "legibility"
     legibility_dir.mkdir(parents=True, exist_ok=True)
@@ -1476,7 +1088,7 @@ def test_decide_for_project_row1_missing_state_fires_from_earliest_sighting(tmp_
     _write_spike_codebook(tmp_path)
     # No census-state.json written -- never censused.
 
-    decision = ct.decide_for_project(tmp_path, now=NOW)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW)
 
     assert decision.fire is True
     assert any(
@@ -1488,25 +1100,19 @@ def test_decide_for_project_row1_missing_state_fires_from_earliest_sighting(tmp_
     )
 
 
-def _write_legibility_yaml(project_root, text):
-    legibility_dir = project_root / "docs" / "legibility"
-    legibility_dir.mkdir(parents=True, exist_ok=True)
-    (legibility_dir / "legibility.yaml").write_text(text, encoding="utf-8")
-
-
 def test_decide_for_project_legacy_state_floor_falls_back_to_last_census_at(tmp_path):
     _write_codebook(tmp_path)
     _write_census_state(
         tmp_path,
-        last_census_at=(NOW - timedelta(days=3)).isoformat(),
+        last_census_at=(NOW - timedelta(days=3)).date().isoformat(),
         last_census_report="plans/confusion-census-prior.md",
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW)
 
     assert decision.fire is False
     assert (
-        "floor: 3.0d since last_census_at (no watermark yet) (floor 5d) -> BLOCKS all conditions"
+        "floor: 3.5d since last_census_at (no watermark yet) (floor 5d) -> BLOCKS all conditions"
         in decision.reasons
     )
 
@@ -1529,7 +1135,7 @@ def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebo
         ],
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW)
 
     assert decision.fire is False
     floor_lines = [r for r in decision.reasons if r.startswith("floor:")]
@@ -1540,7 +1146,7 @@ def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebo
 
 def _watermarked_state(*, last_census_days_ago, watermark_days_ago) -> dict[str, str | None]:
     return {
-        "last_census_at": (NOW - timedelta(days=last_census_days_ago)).isoformat(),
+        "last_census_at": (NOW - timedelta(days=last_census_days_ago)).date().isoformat(),
         "last_census_report": "plans/confusion-census-prior.md",
         "last_census_run_id": "census-dark_factory-20260702",
         "session_watermark": (NOW - timedelta(days=watermark_days_ago)).isoformat(),
@@ -1561,7 +1167,7 @@ def test_decide_for_project_floor_reads_the_session_watermark_not_last_census_at
         tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=3)
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=_passing_runner())
 
     assert decision.completion is not None
     assert decision.completion.fires is True
@@ -1578,7 +1184,7 @@ def test_decide_for_project_floor_clears_on_an_old_watermark(tmp_path):
         tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=12)
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=_passing_runner())
 
     assert decision.fire is True
     assert any(r.startswith("completion:") and r.endswith("-> FIRE") for r in decision.reasons)
@@ -1597,10 +1203,10 @@ def test_decide_for_project_null_or_absent_watermark_falls_back_to_last_census_a
     _write_codebook(tmp_path)
     _write_census_state(tmp_path, **state)
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=_passing_runner())
 
     assert decision.fire is True
-    assert "floor: 12.0d since last_census_at (no watermark yet) (floor 5d)" in decision.reasons
+    assert "floor: 12.5d since last_census_at (no watermark yet) (floor 5d)" in decision.reasons
 
 
 @pytest.mark.parametrize(
@@ -1616,7 +1222,7 @@ def test_decide_for_project_ok_state_without_timestamps_blocks_on_no_anchor(tmp_
     _write_spike_codebook(tmp_path)
     _write_census_state(tmp_path, **state)
 
-    decision = ct.decide_for_project(tmp_path, now=NOW)
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW)
 
     assert any(
         r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
@@ -1643,7 +1249,7 @@ def test_decide_for_project_row4_novelty_spike_fires(tmp_path):
         tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=6)
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_landing_runner())
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=_landing_runner())
 
     assert decision.fire is True
     assert any(
@@ -1657,7 +1263,7 @@ def test_decide_for_project_row5_floor_blocks_novelty_spike_no_fire(tmp_path):
         tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=3)
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_landing_runner())
+    decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=_landing_runner())
 
     assert decision.fire is False
     assert (
@@ -1675,7 +1281,7 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
     runner = _ScriptedRunner(0, _verdict_json("pass", 1.0))
 
     with caplog.at_level(logging.WARNING):
-        decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+        decision = ct.decide_for_project(_cfg(tmp_path), now=NOW, completion_runner=runner)
 
     assert decision.fire is False
     assert decision.completion is None
@@ -1683,52 +1289,61 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
-def test_decide_for_project_ignores_a_retired_max_interval_days_and_says_so(tmp_path, caplog):
-    """A legibility.yaml still pinning `max_interval_days: 1` against a
-    census 30 days stale once fired daily; now it fires nothing and is named
-    once in a deprecation WARNING."""
-    _write_codebook(tmp_path)
-    _write_census_state(tmp_path, **_completion_state(last_census_run_id=None))
-    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
+def test_decide_for_project_reads_the_thresholds_it_is_handed_never_the_yaml_on_disk(
+    tmp_path,
+):
+    """Task 3269 / PRD D8: the trickle pins the config_path it resolved, so
+    the trigger must decide on the config it is handed, never re-read one."""
+    _write_config(tmp_path, "census: {floor_days: 100}")
+    _write_spike_codebook(tmp_path)
+    _write_census_state(
+        tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=6)
+    )
 
-    with caplog.at_level(logging.WARNING):
-        decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
+    decision = ct.decide_for_project(
+        _cfg(tmp_path, floor_days=0), now=NOW, completion_runner=_landing_runner()
+    )
 
-    assert decision.fire is False
-    assert not any(r.startswith("max-interval") for r in decision.reasons)
-    naming = [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING and "max_interval_days" in r.getMessage()
-    ]
-    assert len(naming) == 1
-    assert _is_deprecation(naming[0].getMessage())
-
-
-def test_decide_for_project_survives_a_quoted_completion_threshold(tmp_path, caplog):
-    """A quoted `completion_threshold_pct: '70'` in a hand-edited
-    legibility.yaml is rejected alone, with one config WARNING, and the
-    evaluation still decides on the default threshold."""
-    _write_codebook(tmp_path)
-    _write_census_state(tmp_path, **_completion_state())
-    _write_legibility_yaml(tmp_path, "census:\n  completion_threshold_pct: '70'\n")
-    runner = _passing_runner()
-
-    with caplog.at_level(logging.WARNING):
-        decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
-
-    assert isinstance(decision, ct.Decision)
+    (floor_line,) = [r for r in decision.reasons if r.startswith("floor:")]
+    assert "(floor 0d)" in floor_line
     assert decision.fire is True
-    assert f"completion: 0.9 of {_PREVIOUS_RUN} (threshold 0.70) -> FIRE" in decision.reasons
 
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+
+def test_a_retired_key_leaves_the_trigger_output_unchanged(tmp_path, caplog):
+    """PRD boundary row 13: a retired census key is ignored with one warning
+    at load_config, and changes nothing the trigger decides."""
+    project_root = tmp_path / "project"
+    _write_spike_codebook(project_root)
+    _write_census_state(
+        project_root, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=6)
+    )
+    plain_path = tmp_path / "plain.yaml"
+    plain_path.write_text(_config_yaml(project_root, "census: {floor_days: 5}"), encoding="utf-8")
+    retired_path = tmp_path / "retired.yaml"
+    retired_path.write_text(
+        _config_yaml(project_root, "census: {floor_days: 5, max_interval_days: 1}"),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        plain = load_config(plain_path)
+        retired = load_config(retired_path)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    message = warnings[0].getMessage()
-    assert "completion_threshold_pct" in message
-    assert "str" in message
+    assert "max_interval_days" in warnings[0]
+
+    plain_decision = ct.decide_for_project(plain, now=NOW, completion_runner=_landing_runner())
+    retired_decision = ct.decide_for_project(
+        retired, now=NOW, completion_runner=_landing_runner()
+    )
+    assert retired_decision.reasons == plain_decision.reasons
+    assert retired_decision.fire == plain_decision.fire
 
 
 # ---------------------------------------------------------------------------
-# step-19: RED — CLI `evaluate` subcommand (always exits 0, fail-safe)
+# step-19: RED — CLI `evaluate` subcommand: exits 1 only when the config
+# does not load; an evaluation error is a NO-FIRE
 # ---------------------------------------------------------------------------
 
 def test_cli_evaluate_dark_factory_like_project_prints_no_fire_and_exits_0(tmp_path, capsys):
@@ -1736,6 +1351,7 @@ def test_cli_evaluate_dark_factory_like_project_prints_no_fire_and_exits_0(tmp_p
     # dated sightings, no census-state.json.
     _write_codebook(tmp_path)
 
+    _write_config(tmp_path)
     exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
 
     captured = capsys.readouterr()
@@ -1748,6 +1364,7 @@ def test_cli_evaluate_fire_inducing_fixture_prints_fire_and_exits_0(tmp_path, ca
     today = datetime.combine(datetime.now(UTC).date(), datetime.min.time(), tzinfo=UTC)
     _write_spike_codebook(tmp_path, today=today)
 
+    _write_config(tmp_path)
     exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
 
     captured = capsys.readouterr()
@@ -1765,6 +1382,7 @@ def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys
     legibility_dir.mkdir(parents=True, exist_ok=True)
     (legibility_dir / "census-state.json").write_text("not json{", encoding="utf-8")
 
+    _write_config(tmp_path)
     exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
 
     captured = capsys.readouterr()
@@ -1773,6 +1391,7 @@ def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys
 
 
 def _cli_floor_line(tmp_path, capsys):
+    _write_config(tmp_path)
     exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -1802,3 +1421,96 @@ def test_cli_evaluate_prints_a_floor_line_naming_its_anchor(tmp_path, capsys):
 
     assert "since session watermark" in _cli_floor_line(tmp_path, capsys)
 
+
+
+def test_cli_evaluate_prints_the_validated_thresholds(tmp_path, capsys):
+    config_path = _write_config(tmp_path, "census: {floor_days: 7, completion_threshold_pct: 85}")
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_real_now_state())
+
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    (config_line,) = [line for line in out.splitlines() if line.startswith("config: ")]
+    assert str(config_path) in config_line
+    assert "floor_days=7" in config_line
+    assert "completion_threshold_pct=85" in config_line
+    (floor_line,) = [line for line in out.splitlines() if line.startswith("floor:")]
+    assert "(floor 7d)" in floor_line
+
+
+def test_cli_evaluate_rejects_a_malformed_census_value(tmp_path, capsys):
+    config_path = _write_config(tmp_path, "census: {floor_days: -1}")
+    _write_codebook(tmp_path)
+
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert str(config_path) in captured.err
+    assert "floor_days" in captured.err
+    assert "input_value=-1" in captured.err
+    assert "DECISION" not in captured.out
+
+
+def test_cli_evaluate_reads_the_config_that_config_names(tmp_path, capsys):
+    project_root = tmp_path / "project"
+    _write_codebook(project_root)
+    _write_census_state(project_root, **_real_now_state())
+    pinned = tmp_path / "pinned" / "legibility.yaml"
+    pinned.parent.mkdir()
+    pinned.write_text(_config_yaml(project_root, "census: {floor_days: 7}"), encoding="utf-8")
+
+    exit_code = ct.main(
+        ["evaluate", "--project-root", str(project_root), "--config", str(pinned)]
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    (config_line,) = [line for line in out.splitlines() if line.startswith("config: ")]
+    assert str(pinned) in config_line
+    assert "floor_days=7" in config_line
+
+
+def test_cli_evaluate_refuses_a_config_naming_another_project_root(tmp_path, capsys):
+    """A worktree's legibility.yaml names the main checkout: evaluating it
+    would read one tree's state against the other's config."""
+    worktree = tmp_path / "worktree"
+    main_checkout = tmp_path / "main"
+    main_checkout.mkdir()
+    _write_codebook(worktree)
+    config_path = worktree / "docs" / "legibility" / "legibility.yaml"
+    config_path.write_text(_config_yaml(main_checkout), encoding="utf-8")
+
+    exit_code = ct.main(["evaluate", "--project-root", str(worktree)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert str(worktree) in captured.err
+    assert str(main_checkout) in captured.err
+    assert str(config_path) in captured.err
+    assert "DECISION" not in captured.out
+
+
+def test_cli_evaluate_defaults_the_project_root_to_the_cwd(tmp_path, capsys, monkeypatch):
+    _write_config(tmp_path)
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_real_now_state())
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = ct.main(["evaluate"])
+
+    assert exit_code == 0
+    assert "DECISION:" in capsys.readouterr().out
+
+
+def test_cli_evaluate_without_a_config_exits_1_naming_the_expected_path(tmp_path, capsys):
+    _write_codebook(tmp_path)
+
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert str(tmp_path / "docs" / "legibility" / "legibility.yaml") in captured.err
+    assert "DECISION" not in captured.out

@@ -17,6 +17,7 @@ from _fm_helpers import load_script_module
 from _mock_openai_server import mock_openai_server
 from shared.cli_boundary import EXIT_STDOUT_FAILED
 from shared.memory_eval_metrics import Metric
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness._fakes import (
     FINISHED_AT,
@@ -75,7 +76,10 @@ from fused_memory.arm_harness.screening_evidence import ArmEvidencePaths, load_a
 from fused_memory.arm_harness.slate import load_llm_slate
 from fused_memory.arm_harness.topology import EDGE_CYPHER, NODE_CYPHER, read_topology, topology_hash
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
+from fused_memory.config.falkordb_endpoints import ProductionFalkorDBTarget
 from fused_memory.config.schema import FusedMemoryConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LME_DIR = Path(__file__).parents[2] / 'scripts' / 'local_memory_models_eval'
 STAMP = '20261005T120000Z'
@@ -1360,3 +1364,28 @@ def test_topology_refuses_a_protected_graph_before_any_dependency(harness, live,
     assert code == harness.EXIT_SCRATCH_GUARD
     assert live.log.factory_calls == 0
     assert live.falkor.calls == []
+
+
+# --- live dependencies -----------------------------------------------------------------
+
+
+def test_live_deps_write_to_the_scratch_falkordb_and_read_the_corpus_where_it_lives(
+    harness, monkeypatch
+):
+    monkeypatch.setenv('FALKORDB_URI', 'redis://corpus.invalid:7001')
+    monkeypatch.setenv('FALKOR_HOST', '127.0.0.1')
+    monkeypatch.setenv('FALKOR_PORT', '16380')
+
+    live = harness.build_live_deps()
+
+    assert live.base_config.graphiti.falkordb.uri == 'redis://127.0.0.1:16380'
+    assert live.base_config.graphiti.falkordb.password is None
+    corpus_reader = live.episode_reader(CORPUS_GRAPH)
+    assert (corpus_reader.host, corpus_reader.port) == ('corpus.invalid', 7001)
+
+
+def test_live_deps_refuse_a_scratch_target_that_is_production(harness, monkeypatch):
+    monkeypatch.setenv('FALKOR_PORT', '6379')
+
+    with pytest.raises(ProductionFalkorDBTarget):
+        harness.build_live_deps()

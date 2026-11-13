@@ -146,6 +146,36 @@ class TestInstallOperatorStopHandlerIntegration:
         assert main_mod._operator_stop_received is True
         assert cb_invoked == [True]
 
+    def test_two_sigterms_within_milliseconds_do_not_force_exit(self):
+        s1 = SimpleNamespace(should_exit=False, force_exit=False)
+        s2 = SimpleNamespace(should_exit=False, force_exit=False)
+        stop = _make_operator_stop_callback(s1, s2)
+        invocations = []
+
+        async def _run() -> None:
+            second_received = asyncio.Event()
+
+            def _counting_stop() -> None:
+                stop()
+                invocations.append(True)
+                if len(invocations) == 2:
+                    second_received.set()
+
+            _install_operator_stop_handler(_counting_stop)
+            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGTERM)
+            # noqa: wall-clock-deadline — hang guard on self-delivered signals  # debt: ticket tkt_0RWXHMRTEJ3RQZ46X2R1VMP7HS
+            await asyncio.wait_for(second_received.wait(), timeout=2.0)
+
+        with asyncio.Runner() as runner:
+            runner.run(_run())
+
+        assert main_mod._operator_stop_received is True
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is False
+        assert s2.force_exit is False
+
 
 class TestMainExitCode:
     """main() must exit 0 when the operator-stop flag is set, exit 1 otherwise.
@@ -220,30 +250,117 @@ class TestMainExitCode:
         mock_exit.assert_called_once_with(1)
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 class TestOperatorStopCallbackForceExit:
-    """Survey finding D1 (second gap): the operator-stop callback must escalate
-    on a second signal.  uvicorn's own default signal handler supports a
-    graceful-then-forced escape hatch (1st SIGINT/SIGTERM graceful, 2nd forces
-    exit), but that handler is neutered here (install_signal_handlers = lambda:
-    None) so our own callback must reproduce the escalation — otherwise an
-    operator has no way to force-exit a wedged shutdown.
+    """The first stop signal drains; a repeat inside the window is the same stop
+    delivered twice (task 9493); a later second signal still forces exit, which
+    is uvicorn's deliberate-second-Ctrl-C escape hatch, lost otherwise because
+    ``install_signal_handlers`` is neutered.
+
+    The policy tests pass an explicit window, so they pin the behaviour rather
+    than the production value; the ``default`` tests pin that value.
     """
+
+    _WINDOW = 1.0
 
     def _make_fake_server(self) -> SimpleNamespace:
         return SimpleNamespace(should_exit=False, force_exit=False)
 
+    def _stop_callback(self, *servers: SimpleNamespace, clock: _FakeClock):
+        return _make_operator_stop_callback(
+            *servers, clock=clock, repeat_window_secs=self._WINDOW,
+        )
+
+    def _signal_at(self, clock: _FakeClock, cb, *times: float) -> None:
+        for t in times:
+            clock.now = t
+            cb()
+
     def test_first_call_sets_should_exit_but_not_force_exit(self):
         s1, s2 = self._make_fake_server(), self._make_fake_server()
-        cb = _make_operator_stop_callback(s1, s2)
+        clock = _FakeClock()
+        cb = self._stop_callback(s1, s2, clock=clock)
 
-        cb()
+        self._signal_at(clock, cb, 0.0)
 
         assert s1.should_exit is True
         assert s2.should_exit is True
         assert s1.force_exit is False
         assert s2.force_exit is False
 
-    def test_second_call_also_sets_force_exit(self):
+    @pytest.mark.parametrize('repeat_at', [0.005, 0.999])
+    def test_repeat_inside_the_window_still_drains(self, repeat_at):
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        clock = _FakeClock()
+        cb = self._stop_callback(s1, s2, clock=clock)
+
+        self._signal_at(clock, cb, 0.0, repeat_at)
+
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is False
+        assert s2.force_exit is False
+
+    def test_later_second_signal_forces_exit(self):
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        clock = _FakeClock()
+        cb = self._stop_callback(s1, s2, clock=clock)
+
+        self._signal_at(clock, cb, 0.0, 1.5)
+
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is True
+        assert s2.force_exit is True
+
+    def test_window_is_measured_from_the_first_signal(self):
+        """Repeats must not postpone force-exit indefinitely."""
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        clock = _FakeClock()
+        cb = self._stop_callback(s1, s2, clock=clock)
+
+        self._signal_at(clock, cb, 0.0, 0.6)
+        assert s1.force_exit is False
+        assert s2.force_exit is False
+
+        self._signal_at(clock, cb, 1.2)
+        assert s1.force_exit is True
+        assert s2.force_exit is True
+
+    def test_signal_after_forcing_keeps_force_exit(self):
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        clock = _FakeClock()
+        cb = self._stop_callback(s1, s2, clock=clock)
+
+        self._signal_at(clock, cb, 0.0, 1.5, 2.0)
+
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is True
+        assert s2.force_exit is True
+
+    def test_default_window_absorbs_the_latest_measured_repeat(self):
+        """The measurement is in fused-memory/tests/test_server_shutdown.py's
+        module docstring."""
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        clock = _FakeClock()
+        cb = _make_operator_stop_callback(s1, s2, clock=clock)
+
+        self._signal_at(clock, cb, 0.0, 1.542)
+
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is False
+        assert s2.force_exit is False
+
+    def test_default_clock_and_window_do_not_force_on_back_to_back_calls(self):
         s1, s2 = self._make_fake_server(), self._make_fake_server()
         cb = _make_operator_stop_callback(s1, s2)
 
@@ -252,19 +369,5 @@ class TestOperatorStopCallbackForceExit:
 
         assert s1.should_exit is True
         assert s2.should_exit is True
-        assert s1.force_exit is True
-        assert s2.force_exit is True
-
-    def test_third_call_force_exit_remains_true(self):
-        """Idempotent: a 3rd+ signal must not error and must leave force_exit set."""
-        s1, s2 = self._make_fake_server(), self._make_fake_server()
-        cb = _make_operator_stop_callback(s1, s2)
-
-        cb()
-        cb()
-        cb()
-
-        assert s1.should_exit is True
-        assert s2.should_exit is True
-        assert s1.force_exit is True
-        assert s2.force_exit is True
+        assert s1.force_exit is False
+        assert s2.force_exit is False

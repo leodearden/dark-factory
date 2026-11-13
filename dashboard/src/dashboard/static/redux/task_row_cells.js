@@ -1,18 +1,19 @@
-// task_row_cells.js — the pure render DECISIONS behind the two cells that make
-// up a task row's claim column, for the Tasks tab (tab_tasks.jsx) and the
-// Orchestrators tab (tabs.jsx):
+// task_row_cells.js — the pure render DECISIONS behind a task row's cells, for
+// the Tasks tab (tab_tasks.jsx) and the Orchestrators tab (tabs.jsx):
 //
 //   1. the stranded badge (strandBadgeState), at three sites;
 //   2. the agent cell it sits beside (agentCellState), at two of them;
 //   3. the Locks cell of that same row, at two: whether anything is known
 //      about the project's locks (schedulerLocksDatum) and what the cell draws
 //      for that answer (locksCellState), for tabs.jsx::LocksCell and the
-//      Task-detail tab_tasks.jsx::ModuleLocksSection.
+//      Task-detail tab_tasks.jsx::ModuleLocksSection;
+//   4. the filed cell (filedCellState), at one site: tab_tasks.jsx::TaskDetail's
+//      'filed' kv row — the task's filing time and its named proxy.
 //
-// THE THIRD ONE ARRIVED LAST AND FOR THE SAME REASON THE FIRST TWO DID. The
+// THE LOCKS CELL JOINED FOR THE SAME REASON THE FIRST TWO ARE HERE. The
 // Locks column is a cell of the identical task row, and its decision was a
 // branch inside tabs.jsx — un-executable JSX, which is how its offline-
-// scheduler arm came to be un-asserted at all. Housing the row's three render
+// scheduler arm came to be un-asserted at all. Housing the row's render
 // decisions together is what makes a change to the row visible in ONE diff,
 // the same argument agentCellState's note below makes for the first two. It
 // also keeps tabs.jsx (at its soft size ceiling) from growing a branch.
@@ -259,13 +260,45 @@ function schedulerLocksDatum(scheduler, project, receipts) {
   return plainRowDatum(scheduler, SCHEDULER_ENDPOINT, receipts);
 }
 
+// ── When was this task filed, and how is that known? ──
+// {text, title}: the UTC date of created_at beside its proxy, or the
+// placeholder with a title saying why there is no date. The proxy is shown
+// verbatim: its closed vocabulary is shared/src/shared/task_created_at.py::
+// CreatedAtSource and is not restated here. Never rendered in TaskDetail's
+// .sub line beside fmtAge's unlabelled updated_at reading, so each age proxy
+// on the pane is named.
+const NO_FILING_TIME = 'no creation time is recorded for this task';
+
+function filedCellState(task) {
+  const t = task || {};
+  const raw = t.created_at;
+  if (raw === null || raw === undefined) {
+    return { text: DATUM_PLACEHOLDER, title: NO_FILING_TIME };
+  }
+  const instant = typeof raw === 'string' ? new Date(raw) : null;
+  if (instant === null || Number.isNaN(instant.getTime())) {
+    return {
+      text: DATUM_PLACEHOLDER,
+      title: `${NO_FILING_TIME}: created_at ${JSON.stringify(raw)} is not a timestamp`,
+    };
+  }
+  const iso = instant.toISOString();
+  const date = iso.slice(0, 10);
+  const source = t.created_at_source;
+  if (typeof source === 'string' && source !== '') {
+    return { text: `${date} (${source})`, title: `filed ${iso}; time proxy: ${source}` };
+  }
+  return { text: `${date} (source not recorded)`, title: `filed ${iso}; time proxy not recorded` };
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced at
 // runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision
 // here would leave window.DF_TASK_ROW_CELLS undefined and break the
 // top-level destructures in tab_tasks.jsx and tabs.jsx.
 const TASK_ROW_CELLS_API = {
-  strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum, STRAND_TITLE, MUTED_COLOR,
+  strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum, filedCellState,
+  STRAND_TITLE, MUTED_COLOR,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

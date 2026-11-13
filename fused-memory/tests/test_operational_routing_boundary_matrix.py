@@ -42,11 +42,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 
 from fused_memory.middleware.curator_types import CuratorDecision
 from fused_memory.middleware.operational_ask_registry import OperationalAskEntry
 from fused_memory.middleware.operational_routing_guard import OPERATIONAL_LLM_GATE_MARKER_KEY
 from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.reconciliation.consolidation_gate import build_consolidation_gate_task
 from fused_memory.server.tools import create_mcp_server
 
 
@@ -165,10 +167,11 @@ async def _get_task_meta(server, root: str, task_id: str) -> dict:
 
 
 async def _submit_normal_and_get(
-    stack: tuple, root: str, metadata: dict, monkeypatch: pytest.MonkeyPatch,
-) -> dict:
+    stack: tuple, root: str, metadata: dict | None, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict, dict]:
     """Drive a NORMAL (non-planning_mode) submit_task -> resolve_ticket ->
     get_task round-trip, with the curator neutralized to a no-op 'create'.
+    Returns ``(submit_result, stored_metadata)``.
 
     Monkeypatches ``TaskCurator.curate_prepared`` at the CLASS level to an
     async stub that answers every bundle with a plain ``action='create'``
@@ -213,7 +216,7 @@ async def _submit_normal_and_get(
     assert resolved.get('status') == 'created', f'resolve_ticket did not create: {resolved!r}'
     task_id = resolved['task_id']
 
-    return await _get_task_meta(server, root, task_id)
+    return submit_result, await _get_task_meta(server, root, task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +369,7 @@ async def test_normal_submit_operational_gate_coerces_to_pure_gate(
     """
     root = str(tmp_path / 'proj')
 
-    meta = await _submit_normal_and_get(
+    _, meta = await _submit_normal_and_get(
         _real_stack,
         root,
         {'execution_class': 'operational', 'operational_mode': 'gate'},
@@ -406,6 +409,19 @@ def _inject_operational_registry(
     )
 
 
+_LEGACY_PROBE_ENTRY = OperationalAskEntry(
+    name='zeta_legacy_probe',
+    reason="ζ scenario 5: untagged-legacy operational maintenance probe",
+    title_substrings=['legacy operational maintenance'],
+    description_substrings=['dry-run then apply against a live external store'],
+)
+_LEGACY_PROBE_TITLE = 'Zeta boundary probe: legacy operational maintenance ask'
+_LEGACY_PROBE_DESCRIPTION = (
+    'Recurring housekeeping: dry-run then apply against a live '
+    'external store, zero repo files modified.'
+)
+
+
 # ---------------------------------------------------------------------------
 # Scenario 5 — untagged legacy ask -> curator substring fallback intact
 # (matrix row 5: the delta-retained untagged-legacy path; NOT owned by the
@@ -429,13 +445,7 @@ async def test_untagged_legacy_ask_still_routed_by_curator_fallback(
     post-boundary, short-circuiting before any LLM call
     (task_curator.py:1261).
     """
-    entry = OperationalAskEntry(
-        name='zeta_legacy_probe',
-        reason="ζ scenario 5: untagged-legacy operational maintenance probe",
-        title_substrings=['legacy operational maintenance'],
-        description_substrings=['dry-run then apply against a live external store'],
-    )
-    _inject_operational_registry(monkeypatch, entry)
+    _inject_operational_registry(monkeypatch, _LEGACY_PROBE_ENTRY)
 
     server, _interceptor = _real_stack
     root = str(tmp_path / 'proj')
@@ -444,11 +454,8 @@ async def test_untagged_legacy_ask_still_routed_by_curator_fallback(
         'submit_task',
         {
             'project_root': root,
-            'title': 'Zeta boundary probe: legacy operational maintenance ask',
-            'description': (
-                'Recurring housekeeping: dry-run then apply against a live '
-                'external store, zero repo files modified.'
-            ),
+            'title': _LEGACY_PROBE_TITLE,
+            'description': _LEGACY_PROBE_DESCRIPTION,
         },
     )
     assert 'error' not in submit_result, f'submit_task failed unexpectedly: {submit_result!r}'
@@ -465,6 +472,277 @@ async def test_untagged_legacy_ask_still_routed_by_curator_fallback(
 
     assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
     assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert meta[PURE_GATE_FROM_KEY] == 'operational_ask_registry', f'got {meta!r}'
+    # The curator decides route_deterministic inside the ticket worker, after
+    # submit_task has already returned the ticket, so this path's record is the
+    # stamp plus resolve_ticket's route_deterministic reason, never a notice.
+    assert 'routing_notice' not in submit_result, f'got {submit_result!r}'
+
+
+# ---------------------------------------------------------------------------
+# Provenance stamp — every conversion records what triggered it in
+# metadata.pure_gate_from, and the stamp survives both write paths.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_operational_stamp_preserves_siblings_and_survives_update_merge(
+    _real_stack, tmp_path,
+):
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Pure-gate provenance probe: planning_mode stamp',
+            'description': 'Operational ask carrying sibling metadata keys, via planning_mode.',
+            'planning_mode': True,
+            'metadata': {
+                'execution_class': 'operational',
+                'files': ['docs/x.md'],
+                'prd_path': 'plans/x.md',
+                'x_probe_sibling': 'kept',
+            },
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+    task_id = result['task_id']
+
+    meta = await _get_task_meta(server, root, task_id)
+
+    assert meta[PURE_GATE_FROM_KEY] == 'execution_class=operational', f'got {meta!r}'
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert meta['files'] == ['docs/x.md'], f'got {meta!r}'
+    assert meta['prd_path'] == 'plans/x.md', f'got {meta!r}'
+    assert meta['x_probe_sibling'] == 'kept', f'got {meta!r}'
+    assert meta['human_decomposed'] is True, f'got {meta!r}'
+
+    updated = await server._tool_manager.call_tool(
+        'update_task', {'id': task_id, 'project_root': root, 'metadata': {'x_followup': 1}},
+    )
+    assert 'error' not in updated, f'update_task failed unexpectedly: {updated!r}'
+
+    after = await _get_task_meta(server, root, task_id)
+
+    assert after[PURE_GATE_FROM_KEY] == 'execution_class=operational', f'got {after!r}'
+    assert after['files'] == ['docs/x.md'], f'got {after!r}'
+    assert after['prd_path'] == 'plans/x.md', f'got {after!r}'
+    assert after['x_probe_sibling'] == 'kept', f'got {after!r}'
+    assert after['x_followup'] == 1, f'got {after!r}'
+
+
+@pytest.mark.asyncio
+async def test_normal_submit_operational_stamp_reaches_stored_task(
+    _real_stack, tmp_path, monkeypatch,
+):
+    root = str(tmp_path / 'proj')
+
+    _, meta = await _submit_normal_and_get(
+        _real_stack,
+        root,
+        {'execution_class': 'decision', 'files': ['docs/y.md']},
+        monkeypatch,
+    )
+
+    assert meta[PURE_GATE_FROM_KEY] == 'execution_class=decision', f'got {meta!r}'
+    assert meta['files'] == ['docs/y.md'], f'got {meta!r}'
+
+
+# ---------------------------------------------------------------------------
+# Routing notice — the submit response says when a submit path converted the
+# submission, on both creation paths, and stays silent otherwise.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_operational_response_carries_routing_notice(_real_stack, tmp_path):
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Routing notice probe: planning_mode',
+            'description': 'Operational ask, submitted via planning_mode.',
+            'planning_mode': True,
+            'metadata': {'execution_class': 'operational'},
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+
+    assert result['routing_notice']['pure_gate_from'] == 'execution_class=operational', f'got {result!r}'
+    meta = await _get_task_meta(server, root, result['task_id'])
+    assert meta[PURE_GATE_FROM_KEY] == 'execution_class=operational', f'got {meta!r}'
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+async def test_normal_submit_operational_ticket_response_carries_routing_notice(
+    _real_stack, tmp_path, monkeypatch,
+):
+    root = str(tmp_path / 'proj')
+
+    submit_result, meta = await _submit_normal_and_get(
+        _real_stack, root, {'execution_class': 'operational'}, monkeypatch,
+    )
+
+    assert 'ticket' in submit_result, f'got {submit_result!r}'
+    assert submit_result['routing_notice']['pure_gate_from'] == 'execution_class=operational', (
+        f'got {submit_result!r}'
+    )
+    assert meta[PURE_GATE_FROM_KEY] == 'execution_class=operational', f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('metadata', [None, {'execution_class': 'code_tdd'}], ids=['none', 'code_tdd'])
+async def test_unconverted_submission_carries_no_routing_notice_or_stamp(
+    _real_stack, tmp_path, metadata,
+):
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Routing notice probe: unconverted',
+            'description': 'An ordinary agent-executable submission, via planning_mode.',
+            'planning_mode': True,
+            'metadata': metadata,
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+
+    assert 'routing_notice' not in result, f'got {result!r}'
+    meta = await _get_task_meta(server, root, result['task_id'])
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('metadata', [None, {'execution_class': 'code_tdd'}], ids=['none', 'code_tdd'])
+async def test_normal_submit_unconverted_ticket_carries_no_routing_notice_or_stamp(
+    _real_stack, tmp_path, monkeypatch, metadata,
+):
+    root = str(tmp_path / 'proj')
+
+    submit_result, meta = await _submit_normal_and_get(_real_stack, root, metadata, monkeypatch)
+
+    assert 'ticket' in submit_result, f'got {submit_result!r}'
+    assert 'routing_notice' not in submit_result, f'got {submit_result!r}'
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_failed_write_carries_no_routing_notice(_real_stack, tmp_path, monkeypatch):
+    server, interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+    monkeypatch.setattr(
+        interceptor.taskmaster, 'add_task', AsyncMock(side_effect=RuntimeError('backend down')),
+    )
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Routing notice probe: failed planning_mode write',
+            'description': 'Operational ask whose planning_mode insert fails.',
+            'planning_mode': True,
+            'metadata': {'execution_class': 'operational'},
+        },
+    )
+
+    assert result.get('error_type') == 'RuntimeError', f'got {result!r}'
+    assert 'routing_notice' not in result, f'got {result!r}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('task_kind', 'metadata'),
+    [
+        ('deterministic', {'always_escalates': True, 'execution_class': 'operational'}),
+        ('normal', {'execution_class': 'code_tdd'}),
+    ],
+    ids=['declared_gate', 'code_tdd'],
+)
+async def test_caller_supplied_stamp_is_dropped_at_the_submit_boundary(
+    _real_stack, tmp_path, task_kind, metadata,
+):
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Routing notice probe: caller-supplied stamp',
+            'description': 'Metadata cloned from get_task, still carrying a pure_gate_from stamp.',
+            'planning_mode': True,
+            'task_kind': task_kind,
+            'metadata': {**metadata, PURE_GATE_FROM_KEY: 'execution_class=operational'},
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+
+    assert 'routing_notice' not in result, f'got {result!r}'
+    meta = await _get_task_meta(server, root, result['task_id'])
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_declared_consolidation_gate_gets_no_notice_or_stamp(_real_stack, tmp_path):
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+    spec = build_consolidation_gate_task(topic='routing-notice-declared-gate')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task', {**spec.as_submit_task_kwargs(), 'project_root': root, 'planning_mode': True},
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+
+    assert 'routing_notice' not in result, f'got {result!r}'
+    meta = await _get_task_meta(server, root, result['task_id'])
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert meta['execution_class'] == 'operational', f'got {meta!r}'
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+async def test_untagged_declared_gate_routed_by_registry_is_not_stamped(
+    _real_stack, tmp_path, monkeypatch,
+):
+    _inject_operational_registry(monkeypatch, _LEGACY_PROBE_ENTRY)
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    submit_result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': _LEGACY_PROBE_TITLE,
+            'description': _LEGACY_PROBE_DESCRIPTION,
+            'task_kind': 'deterministic',
+            'metadata': {'always_escalates': True},
+        },
+    )
+    assert 'error' not in submit_result, f'submit_task failed unexpectedly: {submit_result!r}'
+
+    resolved = await server._tool_manager.call_tool(
+        'resolve_ticket',
+        {'ticket': submit_result['ticket'], 'project_root': root, 'timeout_seconds': 30},
+    )
+    assert resolved.get('status') == 'created', f'resolve_ticket did not create: {resolved!r}'
+    assert resolved['reason'].startswith('create: route_deterministic'), f'got {resolved!r}'
+
+    meta = await _get_task_meta(server, root, resolved['task_id'])
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +763,7 @@ async def test_invalid_operational_mode_rejected_and_no_task_created(
     reject invalid ``operational_mode`` values by design (see its module
     docstring: ``operational`` + any mode other than ``llm`` takes the plain
     pure-gate branch, preserving the declared ``operational_mode`` verbatim
-    via ``_inject_deterministic_pure_gate``'s shallow copy) — rejection is
+    via ``pure_gate_stamped``'s shallow copy) — rejection is
     owned by the shared ``TaskMetadata`` ``Literal['gate', 'llm']`` enforced
     at the backend WRITE boundary (``parse_metadata(direction='write',
     enforce=True)``), which only an ENFORCE-mode backend

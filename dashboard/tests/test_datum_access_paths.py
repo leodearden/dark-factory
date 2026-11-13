@@ -6,7 +6,9 @@ greps with one executed check: ``fetch_tasks``, ``fetch_task_page``,
 only where an :class:`AccessGrant` below says so, and the one named exemption
 is ``app.py::_fanout_probe_completion``. The apparatus — a finder, fixture tests
 of its matcher, then acceptance tests over a scan set that fails loudly — is
-``test_clock_discipline.py``'s.
+``test_clock_discipline.py``'s. A second vocabulary, runs.db's per-landing quality
+sources named in SQL text plus the shared producer's reads, is guarded the same way
+under :data:`_QUALITY_GRANTS` (``plans/quality-dashboard-prd.md`` decisions 14 and 15).
 
 The old-path census (sketch #14) follows in the same shape: :data:`_RETIRED`
 is one typed table of the paths PRD decision 16 deleted, each kind checked by
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -27,7 +30,8 @@ from typing import Any, TypeVar
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
 
-from _dashboard_helpers import ScriptTagCollector, node_path
+from _dashboard_helpers import node_path
+from _jsx_source_helpers import ScriptTagCollector
 
 # ---------------------------------------------------------------------------
 # The finder
@@ -322,7 +326,7 @@ def _scanned_modules() -> dict[str, Path]:
         f'only {len(modules)} modules found under {_PACKAGE_DIR} — fewer than '
         f'the {_MIN_SCANNED_MODULES} this guard was written against'
     )
-    missing = sorted({grant.module for grant in _GRANTS} - set(modules))
+    missing = sorted({grant.module for grant in (*_GRANTS, *_QUALITY_GRANTS)} - set(modules))
     assert not missing, f'granted module(s) missing from the scan: {missing}'
     return modules
 
@@ -364,11 +368,13 @@ def test_every_task_read_has_one_access_path():
     )
 
 
-def test_every_grant_is_exercised():
-    uses = _real_uses()
-    stale = [
+def _stale_grants(
+    grants: Iterable[AccessGrant], uses: Mapping[str, Sequence[AccessUse]],
+) -> list[str]:
+    """Each granted name no real use exercises, as ``module::scope name``."""
+    return [
         f'{grant.module}::{grant.scope or "<whole module>"} {name}'
-        for grant in _GRANTS
+        for grant in grants
         for name in sorted(grant.names)
         if not any(
             use.name == name and grant.excuses(module, use)
@@ -377,9 +383,302 @@ def test_every_grant_is_exercised():
         )
     ]
 
+
+def test_every_grant_is_exercised():
+    stale = _stale_grants(_GRANTS, _real_uses())
+
     assert not stale, (
         'grant(s) that excuse no real use — a stale grant silently widens the '
         'allowlist for whatever arrives next, so narrow or delete it:\n  '
+        + '\n  '.join(stale)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The second vocabulary: runs.db's per-landing quality sources
+# ---------------------------------------------------------------------------
+
+GUARDED_QUALITY_SOURCES = frozenset({
+    'merge_finalized', 'train_merged', 'merge_blocked', 'review_completed', 'merge_verify',
+    'workflow_verify', 'flake_occurrence', 'flake_debt', 'flake_debt_due',
+})
+GUARDED_QUALITY_READS = frozenset({'landings', 'rows_for', 'recorded_landing_keys'})
+
+
+_QUALITY_SOURCE_WORD = re.compile(r'\b(' + '|'.join(sorted(GUARDED_QUALITY_SOURCES)) + r')\b')
+_PRODUCER_PACKAGE = 'shared.quality_series'
+
+
+_PRODUCER_DIR = Path(__file__).resolve().parents[2] / 'shared' / 'src' / 'shared' / 'quality_series'
+
+
+def _producer_modules() -> frozenset[str]:
+    """The producer package and every module in it, as an import statement names them."""
+    stems = {path.stem for path in _PRODUCER_DIR.glob('*.py')} - {'__init__'}
+    assert {'landings', 'rows'} <= stems, f'the producer modules are not under {_PRODUCER_DIR}'
+    return frozenset({_PRODUCER_PACKAGE, *(f'{_PRODUCER_PACKAGE}.{stem}' for stem in stems)})
+
+
+_PRODUCER_MODULES = _producer_modules()
+
+
+def _in_producer_package(module: str) -> bool:
+    return module == _PRODUCER_PACKAGE or module.startswith(f'{_PRODUCER_PACKAGE}.')
+
+
+def _dotted(node: ast.expr) -> str | None:
+    """``a.b.c`` for a chain of attributes on a name; None for anything else."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return None if base is None else f'{base}.{node.attr}'
+    return None
+
+
+class _QualityUseFinder(_UseFinder):
+    """Collects each quality source a non-docstring string names, and Loads of imported reads,
+    whether imported by name or reached as an attribute of a producer module an import binds."""
+
+    def __init__(
+        self, aliases: Mapping[str, str], bindings: Mapping[str, str], docstrings: frozenset[int],
+    ) -> None:
+        super().__init__(aliases)
+        self._bindings = bindings
+        self._docstrings = docstrings
+
+    def _module_of(self, node: ast.expr) -> str | None:
+        dotted = _dotted(node)
+        if dotted is None:
+            return None
+        head, _, rest = dotted.partition('.')
+        bound = self._bindings.get(head)
+        if bound is None:
+            return None
+        return f'{bound}.{rest}' if rest else bound
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if (isinstance(node.ctx, ast.Load) and node.attr in GUARDED_QUALITY_READS
+                and self._module_of(node.value) in _PRODUCER_MODULES):
+            self._record(node, node.attr)
+            return
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str) and id(node) not in self._docstrings:
+            for name in sorted(set(_QUALITY_SOURCE_WORD.findall(node.value))):
+                self._record(node, name)
+
+
+def _docstring_ids(tree: ast.Module) -> frozenset[int]:
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    return frozenset(
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, owners) and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    )
+
+
+def _import_bindings(tree: ast.Module) -> dict[str, str]:
+    """Each name an import binds, mapped to the dotted path it names (``import a.b`` binds ``a``)."""
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname is None:
+                    head = alias.name.partition('.')[0]
+                    bindings[head] = head
+                else:
+                    bindings[alias.asname] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module is not None and not node.level:
+            for alias in node.names:
+                bindings[alias.asname or alias.name] = f'{node.module}.{alias.name}'
+    return bindings
+
+
+def find_quality_source_uses(source: str) -> list[AccessUse]:
+    """Every quality source named in a string constant that is not a docstring (one use per
+    source per constant, whole words only), and every Load of a read the shared producer
+    exports: imported by name (reported under its imported name) or reached as an attribute of
+    a module of the producer package that an import binds."""
+    tree = ast.parse(source)
+    aliases = {
+        alias.asname or alias.name: alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+        and _in_producer_package(node.module)
+        for alias in node.names
+        if alias.name in GUARDED_QUALITY_READS
+    }
+    finder = _QualityUseFinder(aliases, _import_bindings(tree), _docstring_ids(tree))
+    finder.visit(tree)
+    return finder.uses
+
+
+_MERGE_QUEUE_TRAINS = (
+    "the merge-queue tab's train listing and train throughput over its look-back window: "
+    'a merge-queue fact, not a per-landing quality fact'
+)
+
+_QUALITY_GRANTS: tuple[AccessGrant, ...] = (
+    AccessGrant(
+        'data/quality_series.py', None,
+        frozenset({'merge_blocked', 'merge_verify', 'review_completed', 'flake_occurrence',
+                   'recorded_landing_keys'}),
+        'the one access implementation of per-landing quality facts: its rules name their '
+        'sources and it counts recorded landings not yet sampled (plans/quality-dashboard-prd.md '
+        'decisions 14, 15, 22)',
+    ),
+    AccessGrant(
+        'data/quality_sampler.py', '_measure_root', frozenset({'landings', 'rows_for'}),
+        'the producer that turns runs.db and git into quality.db rows (decision 14)',
+    ),
+    AccessGrant('data/merge_queue.py', 'recent_train_events._query',
+                frozenset({'train_merged'}), _MERGE_QUEUE_TRAINS),
+    AccessGrant('data/merge_queue.py', 'train_throughput_stats._query',
+                frozenset({'train_merged'}), _MERGE_QUEUE_TRAINS),
+    AccessGrant('data/merge_queue.py', 'train_throughput_stats',
+                frozenset({'train_merged'}), _MERGE_QUEUE_TRAINS),
+)
+
+
+def test_a_sql_constant_naming_a_quality_source_is_a_use():
+    source = (
+        'def recent(conn):\n'
+        "    return conn.execute(\"SELECT data FROM events WHERE event_type = 'train_merged'\")\n"
+    )
+    assert find_quality_source_uses(source) == [AccessUse(2, 'recent', 'train_merged')]
+
+
+def test_an_implicitly_concatenated_sql_string_is_one_use_per_named_source():
+    source = (
+        'class Q:\n'
+        '    def q(self):\n'
+        '        return (\n'
+        "            \"SELECT 1 FROM events WHERE event_type IN ('merge_finalized',\"\n"
+        "            \" 'train_merged') AND kind != 'merge_finalized'\"\n"
+        '        )\n'
+    )
+    assert find_quality_source_uses(source) == [
+        AccessUse(4, 'Q.q', 'merge_finalized'),
+        AccessUse(4, 'Q.q', 'train_merged'),
+    ]
+
+
+def test_docstrings_and_comments_naming_a_source_are_not_uses():
+    source = (
+        '"""Module docstring naming merge_finalized."""\n'
+        '# a comment naming train_merged\n'
+        'class C:\n'
+        '    """Reads review_completed, says the docstring."""\n'
+        '    def m(self):\n'
+        '        """And flake_occurrence."""\n'
+        '        return 1\n'
+    )
+    assert find_quality_source_uses(source) == []
+
+
+def test_a_source_is_matched_as_a_whole_word():
+    source = (
+        "DUE = 'flake_debt_due'\n"
+        "COLUMNS = 'SELECT flake_confirmed FROM t WHERE category = \"post_merge_verify\"'\n"
+    )
+    assert find_quality_source_uses(source) == [AccessUse(1, '<module>', 'flake_debt_due')]
+
+
+def test_a_read_imported_from_the_shared_producer_is_a_use_under_its_name():
+    source = (
+        'from shared.quality_series.landings import landings as L\n'
+        'from shared.quality_series.rows import rows_for\n'
+        'def tick(conn, root):\n'
+        '    return rows_for(L(conn, root, None), conn, root, 1.0)\n'
+    )
+    assert find_quality_source_uses(source) == [
+        AccessUse(4, 'tick', 'rows_for'),
+        AccessUse(4, 'tick', 'landings'),
+    ]
+
+
+def test_a_read_reached_through_an_aliased_producer_module_is_a_use():
+    source = (
+        'import shared.quality_series.landings as ql\n'
+        'from shared.quality_series import rows as qr\n'
+        'def tick(c, root):\n'
+        '    keys = ql.recorded_landing_keys(c, recorded_after=None)\n'
+        '    return qr.rows_for(keys, c, root, 1.0)\n'
+    )
+    assert find_quality_source_uses(source) == [
+        AccessUse(4, 'tick', 'recorded_landing_keys'),
+        AccessUse(5, 'tick', 'rows_for'),
+    ]
+
+
+def test_a_read_reached_through_a_dotted_producer_module_path_is_one_use():
+    source = (
+        'import shared.quality_series.landings\n'
+        'from shared import quality_series\n'
+        'def tick(c, root):\n'
+        '    shared.quality_series.landings.recorded_landing_keys(c, recorded_after=None)\n'
+        '    return quality_series.landings.landings(c, root, None)\n'
+    )
+    assert find_quality_source_uses(source) == [
+        AccessUse(4, 'tick', 'recorded_landing_keys'),
+        AccessUse(5, 'tick', 'landings'),
+    ]
+
+
+def test_a_read_named_attribute_of_another_module_is_not_a_use():
+    source = (
+        'import elsewhere.landings as el\n'
+        'from shared.quality_series.landings import GitCrossCheck\n'
+        'def f(c):\n'
+        '    return el.recorded_landing_keys(c), GitCrossCheck.landings\n'
+    )
+    assert find_quality_source_uses(source) == []
+
+
+def test_a_local_or_attribute_named_like_a_read_is_not_a_use():
+    source = (
+        'from elsewhere import rows_for\n'
+        'def f(batch):\n'
+        '    landings = batch.landings\n'
+        '    return rows_for(landings)\n'
+    )
+    assert find_quality_source_uses(source) == []
+
+
+def _real_quality_uses() -> dict[str, list[AccessUse]]:
+    return {
+        module: find_quality_source_uses(path.read_text())
+        for module, path in _scanned_modules().items()
+    }
+
+
+def test_every_quality_source_has_one_access_path():
+    found = violations(_real_quality_uses(), _QUALITY_GRANTS)
+
+    assert not found, (
+        'A per-landing quality source is read outside its access path. Per-landing quality '
+        'facts are served by data/quality_series.py and produced by data/quality_sampler.py '
+        '(plans/quality-dashboard-prd.md decisions 14, 15 and 22); read through them, or '
+        'record why this is a different datum in a grant:\n'
+        + '\n'.join(
+            f'  {module}:{use.line} {use.qualname} {use.name} — would need '
+            f'AccessGrant({module!r}, {use.qualname!r}, '
+            f'frozenset({{{use.name!r}}}), reason=...)'
+            for module, use in found
+        )
+    )
+
+
+def test_every_quality_grant_is_exercised():
+    stale = _stale_grants(_QUALITY_GRANTS, _real_quality_uses())
+
+    assert not stale, (
+        'quality grant(s) that excuse no real use — narrow or delete them:\n  '
         + '\n  '.join(stale)
     )
 

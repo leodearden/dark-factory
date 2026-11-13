@@ -1,0 +1,854 @@
+prd: plans/review-all-s8-harness-composition-root-and-slot-registry-prd.md
+schema_version: 1
+signal_leaves: ["ω"]
+tasks:
+  - label: "η"
+    task_id: 9212
+    title: "convert_to_blocked_enforce defaults to True (S8-7, step 1)"
+    note: "complexity=simple. First, with no dependency; δ and θ depend on it (same config.py; δ deletes the field η flips, S8-7's order). Its fleet-wide deploy, not an edge, releases the lead's best-effort removal of the key from the eight other project yamls (D18 step 2). No behaviour change: all nine projects set true."
+    capabilities:
+      - name: "log-mode-no-longer-the-shipped-default"
+        binding: "anti-inversion (D18 step 1) — the field's description stops calling log mode the shipped default; stays satisfied after δ deletes the field"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "is LOG MODE: the reconcile sweep logs"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: absent
+      - name: "enforce-is-the-default"
+        binding: "behavioural — boundary row 12a: OrchestratorConfig().convert_to_blocked_enforce is True"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_convert_to_blocked.py (row 12a); a grep would go vacuous once δ deletes the field"
+  - label: "α"
+    task_id: 9216
+    title: "SlotRegistry: one frozen per-slot record, one identity-guarded release"
+    note: "Closes fk-c1ac3df8e44d. Lands C1, D1a, D2a. Deletes the 8 slot containers and slot_lease.py (merged). SlotRegistry implements S3 C2 WorkflowSlots (S3 OQ-7 ruled (a)); Harness.cancel_workflow deleted; Harness.is_workflow_active kept as a one-line forwarder until S3 ζ (ω deletes it: the S3-1 / S8-2 cycle keeps β off S3 ζ). Depends on S3 δ. Deterministic slots refuse cancel (S8-4)."
+    capabilities:
+      - name: "slot-registry-module-exists"
+        binding: "capability→producer (α) — orchestrator/src/orchestrator/slot_registry.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/slot_registry.py"]
+          expect: present
+      - name: "registry-implements-workflow-slots"
+        binding: "capability→producer (α; S3 C2 WorkflowSlots) — wait_cleared on the registry"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def wait_cleared"
+          paths: ["orchestrator/src/orchestrator/slot_registry.py"]
+          expect: present
+      - name: "terminal-scan-skips-deterministic"
+        binding: "rejection-mechanism (N2) — boundary row 1c; a terminal row never cancels or force-releases a live gate"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_harness_terminal_status_watcher.py row 1c"
+      - name: "duplicate-registration-is-typed"
+        binding: "capability→producer (α; D1a) — SlotAlreadyLive"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class SlotAlreadyLive"
+          paths: ["orchestrator/src/orchestrator/slot_registry.py"]
+          expect: present
+      - name: "one-liveness-definition"
+        binding: "anti-inversion — the second liveness container is gone from Harness"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_workflow_cancel_events"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "escalation-events-container-gone"
+        binding: "anti-inversion — the resolve path reads the registry"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_escalation_events"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "force-released-report-set-gone"
+        binding: "anti-inversion (D2a) — a force-released slot's late report is dropped on release() returning False"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_force_released_slot_tasks"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "slot-lease-folded-into-registry"
+        binding: "anti-inversion — slot_lease.py deleted; SlotLease lives in slot_registry.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/slot_lease.py"]
+          expect: absent
+      - name: "deterministic-slot-is-live-to-release-workflow"
+        binding: "rejection-mechanism — boundary row 1; a running gate reports released=False, slot_cleared=False and parks nothing"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_slot_registry.py row 1 against a real DeterministicRunner"
+  - label: "β0"
+    task_id: 9217
+    title: "make_scheduler test factory and passthrough_gates(); the _workflow_cancel_at shim goes"
+    note: "Contributes to fk-5d0a66a2d32e. Mechanical codemod of 392 Scheduler( sites in 60 test files (measured at e634cfe658) onto one factory; 13 shim test files re-pointed. Exempt from the 15-file trigger by statement."
+    capabilities:
+      - name: "scheduler-test-factory-exists"
+        binding: "capability→producer (β0) — orchestrator/tests/_scheduler_factory.py::make_scheduler"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/_scheduler_factory.py"]
+          expect: present
+      - name: "passthrough-gates-constructor"
+        binding: "capability→producer (β0; D3) — a named 'gates nothing' choice instead of None"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def passthrough_gates"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+      - name: "cancel-at-shim-gone"
+        binding: "anti-inversion — tests read scheduler.workflow_cancel_recent, not a Harness shim over a Scheduler private"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _workflow_cancel_at"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "β"
+    task_id: 9218
+    title: "Harness as a composition root: hooks and stores at construction, stores fail closed, teardown by registration order"
+    note: "Closes fk-d8f08696dd66 (GitOps half delivered by S5 γ/ι under OQ-10), fk-fc3c4cba6a0f, fk-5d0a66a2d32e. Lands C3/C3b/C4, D4a (S8-8 fail closed), D5, D6. Subsumes 7698, 6625, 6768, 7107. Depends on 7247, 8268, 8269, 8270 (ruled), 8559, 8926; S3 β/δ, S4 β/ι3/κ (κ: per-file order on harness.py, lead ruling 2026-11-10; S4's host wiring lands first), S5 γ/ι, S6 γ1/γ2/α/κ/θ, S10 β1/β2 if filed; NOT S3 ε1/ε2/ζ (cycle via 4651). S4-1: β keeps the one VerifyHost.process() call (never fresh()) in the composition root."
+    capabilities:
+      - name: "scheduler-callbacks-bundle-substrate"
+        binding: "substrate — scheduler.py::SchedulerCallbacks (task 2235); green by design"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate — green by design (deliberation.md §Launching 4c)"
+      - name: "required-gate-field-on-bundle"
+        binding: "capability→producer (β) — already_landed_gate as a non-Optional SchedulerCallbacks field"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^\\s+already_landed_gate: AlreadyLandedGate\\s*(#.*)?$"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+      - name: "required-outbox-gate-field-on-bundle"
+        binding: "capability→producer (β) — landed_outbox_gate as a non-Optional SchedulerCallbacks field; β defines LandedOutboxGate"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^\\s+landed_outbox_gate: LandedOutboxGate\\s*(#.*)?$"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+      - name: "no-post-construction-gate-install"
+        binding: "anti-inversion — the private gate writes leave Harness.__init__"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "self\\.scheduler\\._landed_outbox_gate ="
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "no-run-time-usage-gate-writes"
+        binding: "anti-inversion — UsageGate receives cost_store/project_id/run_id at construction"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "self\\.usage_gate\\._cost_store"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "no-hand-ordered-teardown"
+        binding: "anti-inversion — usage_gate/cost_store/mcp are ManagedServices torn down by stop_all"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "await self\\.usage_gate\\.shutdown\\(\\)"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "usage-gate-registered-as-a-service"
+        binding: "capability→producer (β; C4) — usage-gate registered first so stop_all tears it down last"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "name='usage-gate'"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "no-module-global-hook-write"
+        binding: "anti-inversion — the archive failure hook travels with the archive collaborator"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "set_archival_failure_hook"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "no-optional-escalation-import"
+        binding: "anti-inversion (D6; INV-11; task 6625) — a broken escalation import fails startup"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "HAS_ESCALATION"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "stores-fail-closed"
+        binding: "anti-inversion (D4a; S8-8 option A) — the three try/except store degrades in Harness.run are gone; a store that cannot be built raises after one born-at-L2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Failed to create (event|cost) store|persistence is DISABLED"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "store-failure-files-one-l2-and-raises"
+        binding: "rejection-mechanism (D4a; C3b) — boundary rows 8b and 8c: read-only data/ raises StoreUnavailable with one critical born-at-L2 on store-unavailable-startup; a locked db is retried, nothing filed"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_harness_store_fail_closed.py rows 8b and 8c"
+      - name: "lifecycle-registry-substrate"
+        binding: "substrate — background_service.py::LifecycleRegistry (task 2241); green by design"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate — green by design (deliberation.md §Launching 4c)"
+  - label: "δ"
+    task_id: 9219
+    title: "RECOVERY_RULES with condition columns; the sweep applies the decision verbatim (R6)"
+    note: "Closes fk-17b789fe3ce6, fk-5cad48d24b6f (recovery half; legality half stale). Lands C2, D7, D16, D18 step 3. Depends on η (same field), 7277, 6615; S6 γ1, S9 ι if filed. S8-7 option B: deletes convert_to_blocked_enforce and this repo's yaml line (η flipped the default first; the lead's yaml edits in eight repos are recorded in this task, best effort, no dependency). S8-6 (a): landing evidence in TruthReport. Subsumes 6682. HIGH: dependency of gate 6698."
+    capabilities:
+      - name: "classifier-substrate"
+        binding: "substrate — task_ground_truth.py::TaskGroundTruth.recovery_for (task 2242); green by design"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate — green by design (deliberation.md §Launching 4c)"
+      - name: "rule-table-exists"
+        binding: "capability→producer (δ) — RecoveryRule / RECOVERY_RULES with a column per _RecoveryShape dimension"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RecoveryRule"
+          paths: ["orchestrator/src/orchestrator/task_ground_truth.py"]
+          expect: present
+      - name: "handler-outcome-typed"
+        binding: "capability→producer (δ; D16) — handlers return HandlerOutcome"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class HandlerOutcome"
+          paths: ["orchestrator/src/orchestrator/task_ground_truth.py"]
+          expect: present
+      - name: "equivalence-golden-table"
+        binding: "guards-exercise-behaviour (D7) — the rule table reproduces today's classifier plus the four rewrites"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_recovery_rules_equivalence.py"]
+          expect: present
+      - name: "no-sweep-side-rewrite"
+        binding: "anti-inversion — the LEAVE→MARK_DONE rewrite is a row"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "action = RecoveryAction\\.MARK_DONE_WITH_PROVENANCE"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "sweep-reads-no-config"
+        binding: "anti-inversion — convert_to_blocked_enforce is not read by the sweep"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "convert_to_blocked_enforce"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "enforce-field-deleted"
+        binding: "anti-inversion (S8-7 option B; D18 step 3) — the field leaves OrchestratorConfig"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "convert_to_blocked_enforce"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: absent
+      - name: "this-repo-yaml-key-deleted"
+        binding: "anti-inversion (S8-7; D18 step 3) — this repo's yaml stops setting the deleted key"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^convert_to_blocked_enforce:"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: absent
+      - name: "in-flight-merge-is-a-truth-fact"
+        binding: "capability→producer (δ, after 7277) — TruthReport.merge_in_flight; boundary row 13"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_in_flight: bool"
+          paths: ["orchestrator/src/orchestrator/task_ground_truth.py"]
+          expect: present
+  - label: "γ"
+    task_id: 9220
+    title: "SessionResumeStorm: the detector and its vocabulary leave harness.py"
+    note: "Closes fk-d0c02dc767dd. Lands C6. Moves the 8 session-resume methods (653 lines, measured at e634cfe658). Subsumes 5536. Not StormCounter (reset-on-success semantics). Both orders: imports S9 C7 (ResumeFailure, ResumeOutcomeSink, RestoreOutcome.is_by_design) if S9 ζ1 landed, else moves BY_DESIGN_RESTORE_OUTCOMES into session_resume_storm.py for S9 ζ1 to replace."
+    capabilities:
+      - name: "storm-module-exists"
+        binding: "capability→producer (γ) — orchestrator/src/orchestrator/session_resume_storm.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/session_resume_storm.py"]
+          expect: present
+      - name: "reach-back-import-gone"
+        binding: "anti-inversion — storm_window_bound imports downward from C6"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from orchestrator\\.harness import"
+          paths: ["orchestrator/src/orchestrator/storm_window_bound.py"]
+          expect: absent
+      - name: "vocabulary-has-one-home"
+        binding: "anti-inversion — the by-design session-resume reasons are defined in C6 only"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_BY_DESIGN_SESSION_RESUME_REASONS"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "archive-latch-has-a-home"
+        binding: "anti-inversion (m10) — the log-once latch is SessionResumeStorm instance state"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_archive_available_fault_logged"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "ε1a"
+    task_id: 9221
+    title: "CrashRecovery: the boot worktree scan as a class reading TruthReport (D15)"
+    note: "Closes fk-e6a18c90d2fe. Lands C7 (S8-5). Moves _recover_crashed_tasks and task 8267's per-entry _recover_worktree_entry (879 lines with the adopt and transcript methods, measured at e634cfe658). Subsumes 7436. 7349 gains a dependency on this leaf. Both orders: LaneEvidence.plan_state is S9 C1 PlanState if S9 β landed, else today's plan read (plan_steps) for S9 β to re-type."
+    capabilities:
+      - name: "crash-recovery-module-exists"
+        binding: "capability→producer (ε1a)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/crash_recovery.py"]
+          expect: present
+      - name: "one-lane-decision"
+        binding: "capability→producer (ε1a; C7) — decide_lane(truth, lane) is the one decision both former branches read"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def decide_lane\\("
+          paths: ["orchestrator/src/orchestrator/crash_recovery.py"]
+          expect: present
+      - name: "boot-scan-left-harness"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _recover_crashed_tasks"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "public-recovery-result"
+        binding: "capability→producer (ε1a; task 7436) — CrashRecoveryResult"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class CrashRecoveryResult"
+          paths: ["orchestrator/src/orchestrator/crash_recovery.py"]
+          expect: present
+      - name: "recovered-work-ledger"
+        binding: "capability→producer (ε1a; D8, C7) — one RecoveredWork ledger that _run_slot claims from and the done-writer discards from"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RecoveredWork[:(]"
+          paths: ["orchestrator/src/orchestrator/crash_recovery.py"]
+          expect: present
+  - label: "ε1b"
+    task_id: 9222
+    title: "LaneReconciler: lane reconciliation as a class"
+    note: "Contributes to fk-bf4197a9a7d9. 644 lines moved with task 8267's per-entry bodies _reconcile_one_lane_checkout and _reap_orphan_entry (measured at e634cfe658)."
+    capabilities:
+      - name: "lane-reconcile-module-exists"
+        binding: "capability→producer (ε1b)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/lane_reconcile.py"]
+          expect: present
+      - name: "lane-reconcile-left-harness"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _reconcile_lane_checkouts"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "ε2a"
+    task_id: 9223
+    title: "StrandedReconciler: the stranded sweep as a class dispatching on RecoveryDecision"
+    note: "Closes fk-bf4197a9a7d9. HIGH: dependency of gate 6698. 1,390 lines moved incl. _reconcile_stranded_at_startup (measured at e634cfe658). _mark_in_progress_done and _delivered_checks_block become one GatedDoneWriter injected into StrandedReconciler and Harness (the already-landed dispatch gate calls it too). Transitional Harness callables: disposition emitter, veto-streak release, verified-green submit (ε2b replaces), _escalate_reconcile_failure (ζ1b replaces). Task 4651 depends on this leaf (S8-2 = A); S8's decompose seat then removes 4651's temporary parking edge on 5040. S3 ε1 depends on ε2b, not on this leaf."
+    capabilities:
+      - name: "stranded-reconciler-module-exists"
+        binding: "capability→producer (ε2a)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/stranded_reconcile.py"]
+          expect: present
+      - name: "applier-left-harness"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _reconcile_one_stranded"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "tests-construct-the-class"
+        binding: "tests stance — test_reconcile_stranded.py builds StrandedReconciler directly"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "StrandedReconciler\\("
+          paths: ["orchestrator/tests/test_reconcile_stranded.py"]
+          expect: present
+      - name: "one-gated-done-writer"
+        binding: "capability→producer (ε2a; D8, C7) — GatedDoneWriter, shared by the stranded sweep and the already-landed dispatch gate"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class GatedDoneWriter"
+          paths: ["orchestrator/src/orchestrator/stranded_reconcile.py"]
+          expect: present
+      - name: "done-writer-left-harness"
+        binding: "anti-inversion (ε2a; D8) — the gated done-write is no Harness method"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _mark_in_progress_done"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "ε2b"
+    task_id: 9224
+    title: "RecoveryDispositions and the verified-green trio join the reconciler"
+    note: "Contributes to fk-bf4197a9a7d9. HIGH: dependency of gate 6698. RecoveryDispositions takes task 4147's veto-streak inheritance and _rearm_recovery_process_notice too (377 lines measured at e634cfe658, plus 20 at bb1c659562); the zero-progress half of the startup inheritance stays with _apply_retry_cap. S3 ε1 depends on this leaf (lead sequencing ruling 2026-11-10). Ownership ruled in S8's favour (lead, 2026-11-02): S9's consumers import from stranded_reconcile.py. Depends on S9 θ, one-way (lead ruling): S9 θ re-points Harness._on_stranded_merge_done onto C5 in harness.py first; ε2b moves the re-pointed method."
+    capabilities:
+      - name: "dispositions-class-exists"
+        binding: "capability→producer (ε2b; D8) — one emitter shared by StrandedReconciler, DeterministicReconSweep and Harness._escalation_hold"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RecoveryDispositions"
+          paths: ["orchestrator/src/orchestrator/recovery_emission.py"]
+          expect: present
+      - name: "verified-green-submit-left-harness"
+        binding: "anti-inversion (B1) — the submit/marker/callback trio lives in StrandedReconciler"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _maybe_submit_stranded_verified_green"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "ε3"
+    task_id: 9225
+    title: "DeterministicReconSweep: the deterministic recon sweep as a class"
+    note: "No key of its own; contributes to fk-bf4197a9a7d9 (closed by ε2a). Delivers task 9030's unit-inspector seam by constructor injection (one inspector, shared with the scheduled-deploy-settle pass). Depends on ε2b and on S3 ζ (lead sequencing ruling 2026-11-10: S3 ε1/ε2/ζ edit harness.py between ε2b and ε3). Receives revalidate_open_l2 as a callable until ζ2 rebinds it."
+    capabilities:
+      - name: "deterministic-recon-module-exists"
+        binding: "capability→producer (ε3)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/deterministic_recon.py"]
+          expect: present
+      - name: "sweep-left-harness"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _run_deterministic_recon_sweep"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "ζ1a"
+    task_id: 9226
+    title: "DispatchGateFilers: the dispatch-gate filers as a class"
+    note: "Contributes to fk-1e13b183c961. Moves 9 methods incl. task 5516's _file_harness_l1 (listed in the PRD). Depends on 7170."
+    capabilities:
+      - name: "dispatch-gate-filers-module-exists"
+        binding: "capability→producer (ζ1a)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/dispatch_gate_filers.py"]
+          expect: present
+      - name: "dispatch-filers-left-harness"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _block_and_escalate_external_dep"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "tripwire-covers-dispatch-filers"
+        binding: "guards-exercise-behaviour — the AST scan names the new module"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "dispatch_gate_filers"
+          paths: ["orchestrator/tests/test_harness_escalation_filing_identity.py"]
+          expect: present
+  - label: "ζ1b"
+    task_id: 9227
+    title: "InfraFilers: the infrastructure filers and resolvers as a class"
+    note: "Closes fk-1e13b183c961. Moves 19 methods (listed in the PRD); the two pause filers stay for 4687/4691. Depends on 8826. Takes the _pool_storage_absent_maybe_pending flag with its filer pair and rebinds the pool-storage callables of ε1a/ε1b and ε2a's _escalate_reconcile_failure onto InfraFilers."
+    capabilities:
+      - name: "infra-filers-module-exists"
+        binding: "capability→producer (ζ1b)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/infra_filers.py"]
+          expect: present
+      - name: "infra-filers-left-harness"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _file_structural_exhaustion_l2"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "tripwire-covers-infra-filers"
+        binding: "guards-exercise-behaviour — the AST scan names the new module"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "infra_filers"
+          paths: ["orchestrator/tests/test_harness_escalation_filing_identity.py"]
+          expect: present
+  - label: "ζ2"
+    task_id: 9228
+    title: "EscalationRecordSweeps: orphan-L0 reaper, stale strands and revalidation as a class"
+    note: "No key of its own; contributes to fk-1e13b183c961. Subsumes 7262. Reads C1. Depends on 5200, 7385, 8659. Deletes the reaper freshness arms after S9 ε. Rebinds ε3's revalidate_open_l2 callable onto the class."
+    capabilities:
+      - name: "record-sweeps-module-exists"
+        binding: "capability→producer (ζ2)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/escalation_record_sweeps.py"]
+          expect: present
+      - name: "reaper-left-harness"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _reap_orphan_l0_escalations"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "reaper-reads-the-registry"
+        binding: "capability→producer (α upstream) — liveness from SlotRegistry"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SlotRegistry"
+          paths: ["orchestrator/src/orchestrator/escalation_record_sweeps.py"]
+          expect: present
+      - name: "tripwire-covers-record-sweeps"
+        binding: "guards-exercise-behaviour — the AST scan names the new module"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "escalation_record_sweeps"
+          paths: ["orchestrator/tests/test_harness_escalation_filing_identity.py"]
+          expect: present
+  - label: "θ"
+    task_id: 9229
+    title: "Durable steward spend per task; $25 default (S8-1)"
+    note: "Closes fk-a1085af3a290 (S8-1 option A plus Leo's $25 raise). One commit: durable spend, config.py and defaults.yaml 25.0, this repo's 20.0 yaml line and comment deleted (D17). Spend forgotten 7 days after the task's last steward spend (PersistentMap TTL tracks the last bump). Depends on 5819 (same file), η and δ (config.py and this repo's yaml; θ waits rather than putting 5819 and S9's steward.py leaves on the high δ's path). No harness.py edit. Subsumes 3566."
+    capabilities:
+      - name: "guard-store-substrate"
+        binding: "substrate — guard_state.py::PersistentMap (task 5352); green by design"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate — green by design (deliberation.md §Launching 4c)"
+      - name: "durable-spend-home"
+        binding: "capability→producer (θ; D17) — one PersistentMap home for a task's steward spend"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "steward_lifetime_spend"
+          paths: ["orchestrator/src/orchestrator/steward.py"]
+          expect: present
+      - name: "default-cap-25-in-config"
+        binding: "capability→producer (θ; S8-1 raise) — the OrchestratorConfig default is 25.0"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "steward_lifetime_budget: float = Field\\(default=25\\.0"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "default-cap-25-in-defaults-yaml"
+        binding: "capability→producer (θ; S8-1 raise) — defaults.yaml agrees with config.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^steward_lifetime_budget: 25\\.0"
+          paths: ["orchestrator/src/orchestrator/defaults.yaml"]
+          expect: present
+      - name: "no-lower-project-cap"
+        binding: "anti-inversion (S8-1) — this repo's yaml sets no steward_lifetime_budget override"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^steward_lifetime_budget:"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: absent
+  - label: "ι"
+    task_id: 9230
+    title: "One event writer: EventStore.emit enqueues, one connection commits batches, reads drain first"
+    note: "With ι2, closes fk-f1a7f57fa58e. Lands C5 (S8-3 option A). Subsumes 4443; delivers task 4197's finding 2. INV-8. No reader call-site edits: read-your-writes is a property of EventStore."
+    capabilities:
+      - name: "sync-flush-surface-exists"
+        binding: "capability→producer (ι) — EventStore.flush, sync, callable from any thread"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^    def flush\\(self"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "async-flush-surface-exists"
+        binding: "capability→producer (ι) — EventStore.aflush"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def aflush"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "writer-registered-as-a-service"
+        binding: "capability→producer (ι) — prepended so it stops last (C4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "name='event-writer'"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "read-your-writes"
+        binding: "behavioural — boundary row 17b (emit then latest_merge_finalized, from the loop and a thread)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; asserted by test_event_store_writer.py row 17b"
+      - name: "per-emit-cost-measured"
+        binding: "INV-8 — loop occupancy per emit before/after, recorded in the task record"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a host measurement, not a tree property"
+  - label: "ι2"
+    task_id: 9231
+    title: "Every in-process events read is an EventStore method; the raw-SQL guard (S8-3)"
+    note: "With ι, closes fk-f1a7f57fa58e. digest.py (7 raw SQL lines) and strict_event_reads.py (1) move onto typed EventStore reads; five offline tools and scheduler.py's printed recipe allow-listed with reasons; guard test on raw FROM/JOIN events in orchestrator/src (D19). Depends on ι (same file) and task 8563 (same digest.py function). Cross-package read model: follow-up routed to S22."
+    capabilities:
+      - name: "events-encapsulation-guard"
+        binding: "guards-exercise-behaviour (D19) — the guard test exists and fails on a planted raw reader (row 17c)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_event_store_encapsulation.py"]
+          expect: present
+      - name: "digest-raw-sql-gone"
+        binding: "anti-inversion (S8-3) — the digest reads events through EventStore methods"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FROM events"
+          paths: ["orchestrator/src/orchestrator/digest.py"]
+          expect: absent
+      - name: "strict-reader-raw-sql-gone"
+        binding: "anti-inversion (S8-3) — the scheduler's zero-progress gate reads through EventStore"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FROM events"
+          paths: ["orchestrator/src/orchestrator/strict_event_reads.py"]
+          expect: absent
+  - label: "κ1"
+    task_id: 9232
+    title: "The invocation carries its sandbox backend"
+    note: "Closes fk-a97501641592. The process-global backend becomes a parameter; dry_run_unblock.py and evals/shadow_isolation.py (new readers since d40ba048e9) take it too. 17 files, above the 15-file trigger by statement (mechanical)."
+    capabilities:
+      - name: "process-global-backend-gone"
+        binding: "anti-inversion — the backend travels with invoke_agent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def set_backend"
+          paths: ["orchestrator/src/orchestrator/agents/sandbox_dispatch.py"]
+          expect: absent
+      - name: "dry-run-reads-no-global"
+        binding: "anti-inversion — the dry-run investigation resolves the configured backend, not the process global"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "get_backend"
+          paths: ["orchestrator/src/orchestrator/dry_run_unblock.py"]
+          expect: absent
+      - name: "restore-fixtures-gone"
+        binding: "tests stance — no autouse snapshot of a process global"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_restore_sandbox_backend"
+          paths: ["conftest.py", "orchestrator/tests/conftest.py"]
+          expect: absent
+  - label: "κ2"
+    task_id: 9233
+    title: "Non-claude backends write under .task/; one claude spawn recipe"
+    note: "Closes fk-58d1f3489c98, fk-9854bd9a928f. Subsumes 7311. 6993 gains a dependency on this leaf. Depends on κ1 (same file agents/invoke.py)."
+    capabilities:
+      - name: "shared-invoker-accepts-sandbox-wrap"
+        binding: "substrate — cli_invoke.py::invoke_claude_agent(sandbox_wrap=); green by design"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate — green by design (deliberation.md §Launching 4c)"
+      - name: "claude-recipe-deduplicated"
+        binding: "anti-inversion — the sandboxed branch calls invoke_claude_agent; the private parser import goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_parse_claude_output"
+          paths: ["orchestrator/src/orchestrator/agents/invoke.py"]
+          expect: absent
+      - name: "pi-never-renames-a-tracked-file"
+        binding: "rejection-mechanism — boundary row 20; refusal names the tracked path"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pi-invoke-backup"
+          paths: ["orchestrator/src/orchestrator/agents/invoke.py"]
+          expect: absent
+      - name: "gemini-pi-config-levers"
+        binding: "neither CLI installed on the verify host at e634cfe658; the leaf measures the installed CLI; floor = fail-loud refusal"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "depends on the installed CLI's flags; the refusal floor is checked by row 20"
+      - name: "non-claude-backends-use-the-env-rule"
+        binding: "capability→producer (κ2; task 7311) — agent_subprocess_env in the three backends"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "agent_subprocess_env already appears in invoke.py for the claude path, so a presence grep is vacuous; asserted by child-env tests per backend"
+  - label: "μ1"
+    task_id: 9234
+    title: "The harness path carries its MCP session"
+    note: "Harness half of fk-538940c8d347. Scheduler's mcp_session becomes required; cli.py and evals/runner.py open their own McpSession. Depends on κ1 (same file harness.py)."
+    capabilities:
+      - name: "scheduler-session-substrate"
+        binding: "substrate — scheduler.py::Scheduler.__init__(mcp_session=); green by design"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate — green by design (deliberation.md §Launching 4c)"
+      - name: "scheduler-session-required"
+        binding: "capability→producer (μ1) — the optional session annotation is gone from Scheduler"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "mcp_session: McpSessionLike \\| None"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+      - name: "module-global-session-gone"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_session: McpSession"
+          paths: ["orchestrator/src/orchestrator/mcp_lifecycle.py"]
+          expect: absent
+      - name: "rstrip-misparse-gone"
+        binding: "anti-inversion — removesuffix"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rstrip\\('/mcp'\\)"
+          paths: ["orchestrator/src/orchestrator/mcp_lifecycle.py"]
+          expect: absent
+  - label: "μ2"
+    task_id: 9235
+    title: "Briefing and recall carry the session; out-of-harness entry points own theirs"
+    note: "Closes fk-538940c8d347. D13a: MemoryRecall(session: McpSession | None); None disables recall with one WARNING. 14 test construction files (measured at e634cfe658). Above the 15-file trigger by statement (one constructor change over its sites)."
+    capabilities:
+      - name: "memory-recall-receives-a-session"
+        binding: "anti-inversion — BriefingAssembler no longer builds MemoryRecall from a url"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "MemoryRecall\\(config\\.fused_memory\\.url"
+          paths: ["orchestrator/src/orchestrator/agents/briefing.py"]
+          expect: absent
+      - name: "memory-recall-session-parameter"
+        binding: "capability→producer (μ2; D13a)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "session: McpSession \\| None"
+          paths: ["orchestrator/src/orchestrator/agents/memory_recall.py"]
+          expect: present
+  - label: "ω"
+    task_id: 9236
+    title: "Integration gate: boundary matrix green, __new__ fixtures retired, the liveness forwarder deleted, harness.py re-measured"
+    note: "Closes fk-d470c7828682, fk-b1c6965066ed. Signal leaf. Depends on μ2 and κ2 (every leaf, transitively) and on S3 ζ (deletes the is_workflow_active forwarder after the pin classifier is rebound)."
+    capabilities:
+      - name: "no-constructor-bypass-in-tests"
+        binding: "tests stance"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Harness\\.__new__\\(Harness\\)"
+          paths: ["orchestrator/tests/"]
+          expect: absent
+      - name: "no-tolerance-reads"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "getattr\\(self, '_"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "fixture-initialiser-gone"
+        binding: "anti-inversion"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_init_harness_state_for_test"
+          paths: ["orchestrator/tests/"]
+          expect: absent
+      - name: "harness-liveness-forwarder-gone"
+        binding: "anti-inversion (S3 OQ-7 (a)) — ω deletes the is_workflow_active forwarder α kept, after S3 ζ rebinds the pin classifier"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_workflow_active"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "boundary-matrix-exists"
+        binding: "G2 — rows 1–22c run in CI against real fixtures"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_harness_integration_gate.py"]
+          expect: present
+      - name: "h14-re-measurement-recorded"
+        binding: "heuristic 14 — the post-batch measurement sits beside the e634cfe658 baseline (19,562 lines / 46.9% prose / 248 methods) in the task record"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a measurement in the task record, not a tree property"

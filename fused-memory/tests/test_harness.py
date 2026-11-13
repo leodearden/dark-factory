@@ -28,7 +28,9 @@ from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
 from shared.scheduler_state import SchedulerStateSnapshot
 from shared.testing import make_gate_mock
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     EventSource,
@@ -39,7 +41,13 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageReport,
 )
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope, Scope
+from fused_memory.models.scope import (
+    KNOWN_PROJECT_ROOTS_ENV,
+    ProjectId,
+    ProjectRoot,
+    ProjectScope,
+    Scope,
+)
 from fused_memory.reconciliation.cli_stage_runner import (
     recon_archive_root,
     recon_config_base_dir,
@@ -49,6 +57,8 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.known_projects_section import render_known_projects_section
 from fused_memory.reconciliation.task_count_snapshot_cadence import SNAPSHOT_WRITTEN_STAT_KEY
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _async_is_live(result: bool):
@@ -12832,25 +12842,14 @@ class TestKnownProjectsInjection:
     """Tests for the known_projects DI kwarg on ReconciliationHarness (task 1164)."""
 
     def test_harness_accepts_known_projects_kwarg_and_uses_it(
-        self, journal, event_buffer, mock_memory_service, monkeypatch
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch
     ):
-        """Injected known_projects dict wins; build_known_projects_map is NOT called.
-
-        Patching build_known_projects_map to raise proves that the DI path skips
-        the env-var-consulting factory entirely — not just that the result differs.
-        """
-
-        def _must_not_be_called(*args, **kwargs):
-            raise AssertionError(
-                "build_known_projects_map must not be called when known_projects is injected"
-            )
-
-        monkeypatch.setattr(
-            'fused_memory.reconciliation.harness.build_known_projects_map',
-            _must_not_be_called,
-        )
-
+        """An injected registry wins over the configured one, and is copied."""
+        env_root = tmp_path / 'Env-Proj'
+        env_root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(env_root))
         injected = {'pid_a': '/path/a', 'pid_b': '/path/b'}
+
         harness = make_harness(
             journal=journal,
             event_buffer=event_buffer,
@@ -12858,27 +12857,34 @@ class TestKnownProjectsInjection:
             taskmaster=None,
             known_projects=injected,
         )
-        # The harness stores a defensive copy equal to the injected dict.
-        assert harness._known_projects == {'pid_a': '/path/a', 'pid_b': '/path/b'}
+        injected['pid_c'] = '/path/c'
 
-    def test_harness_default_known_projects_kwarg_falls_back_to_build_known_projects_map(
-        self, journal, event_buffer, mock_memory_service
+        assert harness.known_projects == {'pid_a': '/path/a', 'pid_b': '/path/b'}
+
+    def test_harness_without_known_projects_derives_the_configured_registry(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch
     ):
-        """When known_projects kwarg is omitted, harness falls back to build_known_projects_map.
-
-        This verifies back-compat: all existing tests that construct ReconciliationHarness
-        without the kwarg continue to get the env-derived map.
-        """
-        from fused_memory.models.scope import build_known_projects_map
+        """Omitting the kwarg registers taskmaster.project_root plus the env roots."""
+        primary = tmp_path / 'Primary-Proj'
+        env_root = tmp_path / 'Env-Proj'
+        primary.mkdir()
+        env_root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(env_root))
+        config = make_harness_config()
+        config.taskmaster = TaskmasterConfig(project_root=str(primary))
 
         harness = make_harness(
             journal=journal,
             event_buffer=event_buffer,
             memory_service=mock_memory_service,
             taskmaster=None,
+            config=config,
         )
-        expected = build_known_projects_map(harness._project_root)
-        assert harness._known_projects == expected
+
+        assert harness.known_projects == {
+            'primary_proj': str(primary.resolve()),
+            'env_proj': str(env_root.resolve()),
+        }
 
 
 # ── Deferred-write ordering tests (task 1474) ──────────────────────────────

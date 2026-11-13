@@ -50,6 +50,9 @@ from shared.merge_state import (
     MergeState,
     MergeSubmitStatus,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Same src-root expression as shared/tests/conftest.py and
 # test_pure_stdlib_leaves.py — read the LOCAL tree, never an installed copy.

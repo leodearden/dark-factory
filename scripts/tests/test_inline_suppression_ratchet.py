@@ -52,6 +52,9 @@ from inline_suppression_scan import scan_tree
 from shared.governed_exceptions import INLINE_MARKER_FORMS, Policy
 from shared.ratchet import BASELINE_README, SCHEMA_VERSION, load
 from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'inline_suppressions.py'

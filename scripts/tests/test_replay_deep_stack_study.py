@@ -4,7 +4,11 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
 from replay_deep_stack_study import merge_commit_index
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _git(repo: Path, *args: str) -> str:

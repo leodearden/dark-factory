@@ -69,6 +69,10 @@ from wildcard_mcp_scoping_scan import (
     records_worth_scanning,
 )
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _SYNTHETIC = 'synthetic/module.py'
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 

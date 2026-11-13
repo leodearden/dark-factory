@@ -51,6 +51,7 @@ from shared.scheduler_state import (
     SchedulerStateSnapshot,
 )
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
+from shared.task_metadata import Milestone
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_read import (
     TaskAbsent,
@@ -89,7 +90,7 @@ from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.hold_history import HoldHistory
 from orchestrator.id_tie_break import id_tie_break
-from orchestrator.lock_table import ModuleLockTable
+from orchestrator.lock_table import ModuleLockTable, UncontestedAcquisition
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
@@ -156,6 +157,7 @@ if TYPE_CHECKING:
     # (get_by_task) on an injected EscalationQueue instance (harness.py wires
     # the real one at startup) — no runtime import needed, avoiding a
     # scheduler<->escalation module-load coupling.
+    from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
 # Geometric emission schedule for per-task diagnostics that can repeat every
@@ -1013,6 +1015,9 @@ class SchedulerFacade(Protocol):
         *,
         persist_files: list[str] | None = ...,
     ) -> BlastRadiusResult: ...
+    async def acquire_uncontested(
+        self, task_id: str, modules: list[str], /, *, reason: str,
+    ) -> UncontestedAcquisition: ...
     async def get_status(self, task_id: str, /) -> str | None: ...
     async def get_task(self, task_id: str, /) -> dict | None: ...
     async def update_task(
@@ -1392,6 +1397,17 @@ def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> dict[str, s
         own_cgroup = sample.own_cgroup or '(unresolved)'
         degraded['own_cgroup'] = f'own cgroup {own_cgroup}: own_cpu_some_avg10 arm inert'
     return degraded
+
+
+def _describe_records_flipped_past(rows: Sequence[Escalation]) -> str:
+    """Name the open records a stranded-blocked flip went past; the caller
+    has already decided that none of them pins."""
+    if not rows:
+        return 'no open escalation'
+    return 'open escalation(s) that do not pin: ' + ', '.join(
+        f'{e.id} (severity={e.severity}, level={e.level}, category={e.category})'
+        for e in rows
+    )
 
 
 class Scheduler:
@@ -4516,98 +4532,48 @@ class Scheduler:
         """Return True when *task* must be withheld from dispatch by its
         ``metadata.milestone`` time gate (task 2335 β).
 
-        Pure predicate — sibling to :meth:`_deferred_watch_gated`.  Reads the
-        RAW ``metadata.milestone`` dict directly, NOT the heavier
-        :func:`~shared.task_metadata.parse_metadata` pipeline used by
-        ``dependency_verdict.py::task_external_deps``: the α ``Milestone``
-        model-validator and δ's submit guard already validate at write time,
-        so this gate is defense-in-depth, not the primary validation path.
-
-        Modes (``metadata.milestone['mode']``):
-        - ``'dated'``: withhold while ``now_wall < milestone['at']``.
-        - ``'delayed'``: withhold while
-          ``metadata.milestone_deps_satisfied_at`` is unset, OR while
-          ``now_wall < anchor + after_secs``.  The anchor is stamped once,
-          frozen-once, by :meth:`_stamp_milestone_deps_satisfied`.
+        Pure predicate — sibling to :meth:`_deferred_watch_gated`.  The rule
+        itself lives in :meth:`shared.task_metadata.Milestone.fired`; this
+        method only parses the raw ``metadata.milestone`` dict into a
+        ``Milestone``, hands it the frozen-once
+        ``metadata.milestone_deps_satisfied_at`` anchor (stamped by
+        :meth:`_stamp_milestone_deps_satisfied`) and *now_wall*, and maps the
+        outcome onto a withhold decision.
 
         No ``metadata.milestone`` (missing/falsy) → not gated (``False``).
-        Any malformed or unrecognised value — a non-dict milestone, an
-        unknown mode, an unparseable ``at``/anchor timestamp, or an
-        ``after_secs`` that can't combine with a timestamp — fails safe:
-        withhold (``True``) plus a WARNING log, rather than crash the
-        dispatch tick or let a broken milestone spec dispatch early.  The
-        WARNING is deduped per (task_id, malformed value) by
-        :meth:`_note_milestone_malformed` so a permanently-broken spec logs
-        once instead of spamming every tick; it re-fires if the malformed
-        value actually changes.  A task that fails safe here has no other
-        path to human attention (no automatic escalation) — this is a
-        known, deliberately deferred gap (task 2335 β amendment: reviewer_
-        comprehensive robustness finding; see commit message for rationale).
-
-        ``at``/anchor timestamps that parse as tz-naive are normalized to
-        UTC (``.replace(tzinfo=UTC)``): the α model only requires
-        ``datetime.fromisoformat``-parseable, not tz-aware, but comparing a
-        tz-naive and tz-aware datetime directly raises ``TypeError`` — left
-        unhandled that would otherwise fall into the fail-safe branch and
-        withhold the task forever.
+        A delayed milestone whose anchor is still unset is withheld without a
+        warning (it is simply not due yet).  Anything malformed — a non-dict
+        milestone, a spec ``Milestone`` rejects, a non-string or unparseable
+        anchor, an anchor + ``after_secs`` deadline that cannot be
+        represented — fails safe: withhold (``True``) plus a WARNING deduped per
+        (task_id, malformed value) by :meth:`_note_milestone_malformed`.
+        That WARNING is a malformed spec's only route to human attention.
         """
         metadata = task.get('metadata') or {}
-        milestone = metadata.get('milestone')
-        if not milestone:
+        raw = metadata.get('milestone')
+        if not raw:
             return False
         task_id = str(task.get('id', '?'))
-        if not isinstance(milestone, dict):
+        if not isinstance(raw, dict):
             self._note_milestone_malformed(
-                task_id, f'not-a-dict:{milestone!r}',
+                task_id, f'not-a-dict:{raw!r}',
                 'Task %s: metadata.milestone is not a dict (%r) — fail-safe '
                 'withhold (this task will remain pending indefinitely until '
                 'metadata.milestone is corrected)',
-                task_id, milestone,
+                task_id, raw,
             )
             return True
 
-        mode = milestone.get('mode')
+        anchor = metadata.get('milestone_deps_satisfied_at')
         try:
-            if mode == 'dated':
-                at_raw = milestone.get('at')
-                if not isinstance(at_raw, str):
-                    raise ValueError(f'milestone.at must be a string, got {at_raw!r}')
-                at_dt = datetime.fromisoformat(at_raw)
-                if at_dt.tzinfo is None:
-                    at_dt = at_dt.replace(tzinfo=UTC)
-                return now_wall < at_dt
-            elif mode == 'delayed':
-                anchor_raw = metadata.get('milestone_deps_satisfied_at')
-                if not anchor_raw:
-                    return True
-                if not isinstance(anchor_raw, str):
-                    raise ValueError(
-                        f'milestone_deps_satisfied_at must be a string, got {anchor_raw!r}'
-                    )
-                anchor_dt = datetime.fromisoformat(anchor_raw)
-                if anchor_dt.tzinfo is None:
-                    anchor_dt = anchor_dt.replace(tzinfo=UTC)
-                after_secs = milestone.get('after_secs')
-                if not isinstance(after_secs, int):
-                    raise ValueError(f'milestone.after_secs must be an int, got {after_secs!r}')
-                fire_at = anchor_dt + timedelta(seconds=after_secs)
-                return now_wall < fire_at
-            else:
-                self._note_milestone_malformed(
-                    task_id, f'unknown-mode:{mode!r}',
-                    'Task %s: metadata.milestone has unknown mode %r — fail-safe '
-                    'withhold (this task will remain pending indefinitely until '
-                    'metadata.milestone is corrected)',
-                    task_id, mode,
-                )
-                return True
-        except Exception:
+            return not Milestone.model_validate(raw).fired(anchor, now_wall)
+        except ValueError:
             self._note_milestone_malformed(
-                task_id, f'exception:{milestone!r}',
+                task_id, f'invalid:{raw!r}:{anchor!r}',
                 'Task %s: malformed metadata.milestone %r — fail-safe withhold '
                 '(this task will remain pending indefinitely until '
                 'metadata.milestone is corrected)',
-                task_id, milestone,
+                task_id, raw,
                 exc_info=True,
             )
             return True
@@ -6396,7 +6362,8 @@ class Scheduler:
         QUEUE_HANDOFF (L1/L2, or an L0 whose filer is still live) pins; a
         DEAD_L0 does not, because its handoff has no consumer left; an
         ``info`` record never pins at any level; and a record set consisting
-        ENTIRELY of merge-remediable categories does not pin, because those
+        ENTIRELY of merge-remediable categories does not pin, unless one of
+        them needs a human (``escalation.pins.needs_human``), because those
         records ASK for the remediation this sweep performs.  The precedence
         chain itself is documented once, in ``escalation/pins.py``.
 
@@ -6547,7 +6514,11 @@ class Scheduler:
                 # provably dead.  Every escape hatch against a redispatch loop
                 # is untouched above: the kill switch, the `_dispatched`
                 # membership gate, `workflow_cancel_recent`, the requeue
-                # cooldown, `_deps_satisfied`, and the reblock guard.
+                # cooldown and `_deps_satisfied`.  The reblock guard is not
+                # one: `Harness._check_reblock_guard` counts only
+                # escalation-resolution flips, never this one, so it is the
+                # predicate's needs-a-human exemption that keeps a merge-entry
+                # gate from re-pending here (task 6145).
                 #
                 # `live_claimant=False` is EXACT, not an assumption:
                 # `is_stranded_blocked(task, ...)` returned True immediately
@@ -6573,8 +6544,9 @@ class Scheduler:
                     continue
                 logger.warning(
                     'Task %s: crash-stranded-blocked-redispatch — flipping blocked -> '
-                    'pending (no live claimant, deps satisfied, no open escalation)',
+                    'pending (no live claimant, deps satisfied, %s)',
                     tid,
+                    _describe_records_flipped_past(rows),
                 )
                 await self.clear_claim_then_set_status(tid, 'pending')
             except Exception:
@@ -8073,6 +8045,33 @@ class Scheduler:
                 task_id,
             )
         return updated
+
+    async def acquire_uncontested(
+        self, task_id: str, modules: list[str], *, reason: str,
+    ) -> UncontestedAcquisition:
+        """The live-slot widen: take every free key of *modules*, name the rest.
+
+        For a task whose workflow is running. Unlike
+        :meth:`handle_blast_radius_expansion`, which re-pends the row and
+        releases every lock on a conflict and so must never be used mid-EXECUTE
+        (task 3090 ruling), this never re-pends, never releases and never
+        writes status. A contested key comes back as a Blocker naming its
+        holder. Acquired keys emit ``lock_acquired`` with *reason* through the
+        single lock-event writer and refresh the module cache through its
+        single writer.
+        """
+        result = self.lock_table.acquire_uncontested(task_id, modules)
+        if result.acquired:
+            self._emit_lock_event(
+                EventType.lock_acquired,
+                task_id=task_id,
+                modules=list(result.acquired),
+                reason=reason,
+            )
+            self._write_module_cache(
+                task_id, sorted(self.lock_table.held_modules(task_id))
+            )
+        return result
 
     async def handle_blast_radius_expansion(
         self,

@@ -26,6 +26,7 @@ import pytest
 from _fm_helpers import load_script_module
 from escalation.models import RESOLUTION_CLASSES, Escalation
 from escalation.queue import EscalationQueue
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
@@ -33,6 +34,8 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
 )
 from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'derive_orphaned_recon_escalations.py'

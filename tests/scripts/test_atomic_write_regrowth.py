@@ -70,6 +70,9 @@ from typing import NamedTuple
 
 import pytest
 from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # tests/scripts/<file>.py and shared/tests/<file>.py are both exactly two levels
 # below the repo root, so this constant carried over verbatim from the guard's
@@ -327,12 +330,6 @@ _ALLOWED_RENAMERS = {
         'This is NOT a blanket \'scripts/ cannot import shared\': '
         'scripts/legibility/census.py does exactly that, via a '
         '__file__-relative sys.path insert.',
-    ('scripts/legibility/census.py', 'advance_census_state'):
-        'Out of task 3223 enumerated scope; left alone deliberately. '
-        'mkstemp(prefix=\'.census-state-\') + os.replace. This module is '
-        'census-state.json\'s SOLE writer, so a migration must keep its '
-        'atomicity: the census trigger reads that file every night, and a '
-        'torn write would read as malformed and fail the trigger safe.',
     ('scripts/legibility/codebook.py', 'dump'):
         'Out of task 3223 enumerated scope; left alone deliberately. '
         'mkstemp(prefix=\'.codebook-\') + os.replace of a canonical '

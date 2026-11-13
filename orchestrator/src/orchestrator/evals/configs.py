@@ -30,7 +30,7 @@ class EvalConfig:
     """One model/backend configuration for evaluation."""
 
     name: str
-    backend: str          # 'claude' | 'codex' | 'gemini'
+    backend: str          # 'claude' | 'codex' | 'gemini' | 'pi' | 'zcode' | 'mimo'
     model: str            # model name for that backend
     effort: str | None    # backend-specific effort/reasoning level
     # Which ROLE this candidate puts under test (eval-revival θ / C4 OFAT
@@ -478,8 +478,8 @@ ARCHITECT_EVAL_CONFIGS = [
 def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name (implementer, architect, OR ν/ξ candidates).
 
-    ν's ``claude_endpoint_candidates()`` and ξ's ``codex_pi_candidates()``
-    bundles are searched LAST, and built only when no static config matched:
+    ν's ``claude_endpoint_candidates()``, ξ's ``codex_pi_candidates()``,
+    ω's ``zcode_candidates()`` and ``mimo_code_candidates()`` bundles are searched LAST, and built only when no static config matched:
     they are built fresh per call, and building a ν bundle logs a WARNING for
     each missing credential or base URL, which a static lookup must not emit.
     This stays the single by-name resolver for every eval config family
@@ -529,6 +529,8 @@ def _find_registered(name: str) -> EvalConfig | None:
         lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
         claude_endpoint_candidates,
         codex_pi_candidates,
+        zcode_candidates,
+        mimo_code_candidates,
     )
     for build_family in families:
         for cfg in build_family():
@@ -665,11 +667,12 @@ KIMI_BASE_URL = 'https://api.moonshot.ai/anthropic'
 
 # Z.ai GLM access is a GLM Coding Plan (Leo, 2026-09-11), and a Coding Plan key
 # answers ONLY on the Plan's two coding endpoints: GLM_BASE_URL, the Anthropic
-# protocol the claude-harness bundles drive, and ZAI_CODING_BASE_URL, the
-# OpenAI protocol asserted at startup by
-# orchestrator/src/orchestrator/evals/zai_probe.py::require_zai_coding_endpoint
-# and used by the ZCode arm (task 5399). The general /api/paas/v4 errors with
-# a Coding Plan key, so it is deliberately not a constant.
+# protocol that both the claude-harness bundles and the ZCode arm drive (ZCode's
+# own Coding Plan template uses it; plans/zcode-harness-probe-2026-11.md), and
+# ZAI_CODING_BASE_URL, the OpenAI protocol asserted at startup by
+# orchestrator/src/orchestrator/evals/zai_probe.py::require_zai_coding_endpoint.
+# The general /api/paas/v4 errors with a Coding Plan key, so it is deliberately
+# not a constant.
 GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
 ZAI_CODING_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
 
@@ -751,6 +754,19 @@ def _claude_endpoint_config(
     )
 
 
+def _glm_endpoint_config() -> EvalConfig:
+    return _claude_endpoint_config(
+        'glm-5.3-endpoint', GLM_MODEL,
+        base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
+    )
+
+
+def _mimo_endpoint_config(name: str, model: str) -> EvalConfig:
+    return _claude_endpoint_config(
+        name, model, base_url=_mimo_base_url(), auth_token_env=MIMO_AUTH_TOKEN_ENV,
+    )
+
+
 def claude_endpoint_candidates() -> list[EvalConfig]:
     """Incumbents (native cloud Opus/Sonnet) + the non-incumbent endpoint bundles.
 
@@ -769,17 +785,13 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     its provider's AUTH_TOKEN env var fresh rather than caching a stale/empty
     value from import time.
     """
-    mimo_base_url = _mimo_base_url()
     return [
         *_cloud_implementer_incumbents(),
         _claude_endpoint_config(
             'minimax-m3.1-flash-endpoint', MINIMAX_MODEL,
             base_url=MINIMAX_BASE_URL, auth_token_env=MINIMAX_AUTH_TOKEN_ENV,
         ),
-        _claude_endpoint_config(
-            'glm-5.3-endpoint', GLM_MODEL,
-            base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
-        ),
+        _glm_endpoint_config(),
         _claude_endpoint_config(
             'glm-5.3-flash-endpoint', GLM_FLASH_MODEL,
             base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
@@ -792,14 +804,8 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
             'kimi-endpoint', KIMI_MODEL,
             base_url=KIMI_BASE_URL, auth_token_env=KIMI_AUTH_TOKEN_ENV,
         ),
-        _claude_endpoint_config(
-            'mimo-v2.6-pro-endpoint', MIMO_PRO_MODEL,
-            base_url=mimo_base_url, auth_token_env=MIMO_AUTH_TOKEN_ENV,
-        ),
-        _claude_endpoint_config(
-            'mimo-v2.6-flash-endpoint', MIMO_FLASH_MODEL,
-            base_url=mimo_base_url, auth_token_env=MIMO_AUTH_TOKEN_ENV,
-        ),
+        _mimo_endpoint_config('mimo-v2.6-pro-endpoint', MIMO_PRO_MODEL),
+        _mimo_endpoint_config('mimo-v2.6-flash-endpoint', MIMO_FLASH_MODEL),
     ]
 
 
@@ -920,4 +926,17 @@ def codex_pi_candidates() -> list[EvalConfig]:
         EvalConfig(
             'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role=RoleUnderTest.IMPLEMENTER,
         ),
+    ]
+
+
+def zcode_candidates() -> list[EvalConfig]:
+    """GLM-5.3 on ZCode, its official harness; glm-5.3-endpoint is its mandatory paired control."""
+    return [replace(_glm_endpoint_config(), name='glm-5.3-zcode', backend='zcode')]
+
+
+def mimo_code_candidates() -> list[EvalConfig]:
+    """MiMo V2.6 Pro and Flash on MiMo Code, their official harness; each '-endpoint' bundle is its mandatory paired control."""
+    return [
+        replace(_mimo_endpoint_config(f'{stem}-endpoint', model), name=f'{stem}-mimocode', backend='mimo')
+        for stem, model in (('mimo-v2.6-pro', MIMO_PRO_MODEL), ('mimo-v2.6-flash', MIMO_FLASH_MODEL))
     ]

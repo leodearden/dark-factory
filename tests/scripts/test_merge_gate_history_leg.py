@@ -44,8 +44,11 @@ from _pytest.mark.expression import Expression
 from orchestrator.config import ModuleConfig, OrchestratorConfig, _discover_module_configs
 from orchestrator.pytest_markers import locate_pytest_config, resolve_marker_expression
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify_cmd
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 MARKER = 'reads_git_history'
@@ -63,6 +66,10 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     ),
     'dashboard/tests/test_tab_tasks_deferral.py': _PARSES_CACHE_BUSTER_TEXT_ONLY,
     'dashboard/tests/test_tab_tasks_invariant_chip.py': _PARSES_CACHE_BUSTER_TEXT_ONLY,
+    'escalation/tests/_rebased_landing_git.py': (
+        'every builder takes a caller-built repo root and caps discovery there'
+    ),
+    'escalation/tests/test_merge_status_git_authority.py': _SEEDS_ITS_OWN_REPO,
     'fused-memory/tests/server/test_topic_cluster_store.py': (
         'the match is memory-text prose passed to pytest.param; no git runs'
     ),
@@ -85,6 +92,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_group_merge_candidate_ordering.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_harness_plan_step_rederive.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_harness_warm_lane_wiring.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_info_l0_router_boundary.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_landlock.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_chain_unstack.py': 'GitOps over a tmp_path repo',
     'orchestrator/tests/test_merge_gate_already_on_main.py': _SEEDS_ITS_OWN_REPO,
@@ -102,6 +110,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_merge_queue_deep_dispatch.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_landing.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_queue_deep_reservation.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_speculation.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_plan_tools_server.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebase_branch_reset_guard.py': _SEEDS_ITS_OWN_REPO,

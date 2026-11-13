@@ -212,6 +212,68 @@ the 34.3 baseline) or above 46 min; landings per 2 h below the baseline over
 at least 4 ticks; any oom_kill; MemAvailable below 16 GB; or reify or a solar
 project resuming.
 
+### 2026-11-11 — 3 -> 2 (progressive-slot rule, step-down)
+
+Stepped down at 2026-11-11 13:26Z under the 2026-11-10 entry's trigger: two
+consecutive local merge verifies of different tasks at 3 slots ran over the
+41-min line (20% over the 34.3-min baseline):
+
+| Run end | Task | Runner | Duration | Host PSI during run |
+|---|---|---|---|---|
+| 12:28Z | 6425 | local | 44.8 min, passed | 30.6 |
+| 13:17Z | 9308 | local | 43.6 min, passed | — |
+
+Laptop merge verifies over the same window were 19.7-24.1 min. Context at the
+step: host PSI 2 h median 30.5, mean idle 4.0 threads, task-leg admission
+wait 2.9 min (n 22), 6 landings in 2 h, MemAvailable 65 GB, oom_kill 0. The
+3-slot period ran 2026-11-10 21:00Z to 11-11 13:26Z, but most of it was
+confounded: a fleet-restart drain (21:00-23:48Z) and an account-pool usage
+cap (about 01:00-10:33Z) left little verify demand. Its 3-slot evidence is
+roughly the 3 h after 10:33Z.
+
+Re-raise to 3 under the same rule (2 h mean task wait >= 5 min and idle
+>= 0.5 threads), no earlier than 2 h after this step.
+
+### 2026-11-11 — 2 -> 3 (progressive-slot rule, re-raise)
+
+Re-raised at 2026-11-11 23:27Z, 10 h after the step-down. Two earlier ticks
+met the rule's numbers on a single burst that then cleared (16:11-16:34Z, and
+21:51-22:06Z). The operator held each for one tick and required legs admitted
+after the burst to queue too. That condition was met at 23:26Z:
+
+| Measure | Value | Rule |
+|---|---|---|
+| task-leg admission wait, 2 h mean | 8.6 min (n 12) | >= 5 |
+| task legs admitted after the 21:51 burst | waited 0.3 / 7.7 / 9.9 min | still queueing |
+| mean idle threads, last 30 min | 6.4 of 32 | >= 0.5 |
+| oldest background waiter (23:19Z heartbeat) | 28.5 min | — |
+| local merge-verify median at 2 slots | 33.4 min (n 3) | baseline stays 34.3 |
+| MemAvailable | 73 GB | — |
+| oom_kill | 0 | — |
+
+Same step-down triggers as the 2026-11-10 entry (local merge-verify median
+over 41 min on two consecutive runs of different tasks, or over 46 min;
+landings below baseline over 4 ticks; any oom_kill; MemAvailable under
+16 GB; a paused project resuming).
+
+### 2026-11-12 — 3 -> 2 (progressive-slot rule, step-down)
+
+Stepped down at 2026-11-12 04:27Z. Two consecutive local merge verifies of
+different tasks ran over the 46-min ceiling:
+
+| Run end | Task | Runner | Duration |
+|---|---|---|---|
+| 04:23Z | 8525 | local | 52.3 min, passed |
+| 04:24Z | 7341 | local | 52.9 min, passed |
+
+Context: host PSI 30-min median 53.0 (2 h 28.0), root CPU 32 of 32, mean
+idle 1.7 threads. In the 10 s cgroup sample `orchestrator-reify.service` drew
+15.6 cores: reify's scheduler is still halted, but its unit was re-seeding warm
+lanes (`seed-warm-lane.sh` onto base gen 642) and running cargo-nextest. dark
+factory's task slots do not govern that load. Task-leg admission wait was
+1.0 min, landings 1 in 2 h. The 3-slot period (11-11 23:27Z to 11-12 04:27Z)
+had local merge verifies of 20-28 min until reify's warm-lane work began.
+
 ---
 
 ## 2026-09-27 — task 5797: 48h gate on the 1 -> 2 raise

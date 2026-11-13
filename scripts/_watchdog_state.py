@@ -209,11 +209,15 @@ def stamp_clock(path: str, log: LogSink) -> bool:
     )
 
 
-def within_min_interval(secs: int, read_epoch: Callable[[], float | None]) -> bool:
-    """Return True iff *read_epoch*'s clock is newer than *secs* seconds ago.
+def min_interval_remaining_secs(
+    secs: int, read_epoch: Callable[[], float | None], *, now: float | None = None
+) -> float:
+    """Return how many seconds *read_epoch*'s clock still holds a *secs* cap; 0.0 once it does not.
 
-    The shared min-interval GATE, extracted so every cap shares one
-    definition of "too soon" rather than a copy each that could drift.
+    The shared min-interval arithmetic, extracted so every cap shares one
+    definition of "too soon" rather than a copy each that could drift. A cap
+    that must say how long it still holds reads the clock once, here. *now*
+    defaults to the wall clock; a caller that owns its tick time passes it.
 
     Takes the clock READER rather than a path, so each caller keeps its own
     test seam: the watchdog's caps each pass a named reader
@@ -227,10 +231,19 @@ def within_min_interval(secs: int, read_epoch: Callable[[], float | None]) -> bo
       - a None epoch (missing/corrupt/unreadable clock) counts as OUTSIDE the
         window. Failing the other way would let one unreadable file suppress
         every future restart indefinitely.
+    A future-dated clock holds for longer than *secs*; nothing here clamps it.
     """
     if secs <= 0:
-        return False
+        return 0.0
     last = read_epoch()
     if last is None:
-        return False
-    return (time.time() - last) < secs
+        return 0.0
+    current = time.time() if now is None else now
+    return max(0.0, secs - (current - last))
+
+
+def within_min_interval(
+    secs: int, read_epoch: Callable[[], float | None], *, now: float | None = None
+) -> bool:
+    """Return True iff the cap still holds; see min_interval_remaining_secs."""
+    return min_interval_remaining_secs(secs, read_epoch, now=now) > 0

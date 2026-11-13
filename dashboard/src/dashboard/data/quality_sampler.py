@@ -6,13 +6,12 @@ Design: plans/quality-dashboard-prd.md decision 14 and open question 3.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 import aiosqlite
@@ -20,8 +19,15 @@ from shared.project_id import project_id_for_root
 from shared.project_layout import runs_db
 from shared.quality_series.landings import GitCrossCheck, landings
 from shared.quality_series.rows import LandingRow, rows_for
-from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
+from shared.tasks_db_readonly import connect_ro
 
+from dashboard.data.quality_root_tick import (
+    describe_root_failure,
+    describe_unreadable,
+    git_checkouts,
+    run_in_root_threads,
+    store_root,
+)
 from dashboard.data.quality_store import (
     QualitySample,
     insert_sample,
@@ -37,6 +43,7 @@ __all__ = [
     'QUALITY_REV_LIST_TIMEOUT_SECONDS',
     'QUALITY_SAMPLE_INTERVAL_SECONDS',
     'collect_quality',
+    'describe_unreadable',
 ]
 
 logger = logging.getLogger(__name__)
@@ -75,40 +82,10 @@ def _measure_root(
     return _RootMeasurement(tuple(rows), batch.git_check, len(batch.landings) - len(rows))
 
 
-async def _measure_all(
-    checkouts: Sequence[Path],
-    project_ids: Sequence[str],
-    resume: Sequence[str | None],
-    git_budget_s: float,
-    per_root_budget_s: float,
-) -> list[_RootMeasurement | BaseException]:
-    """Measure every root at once on threads of their own, so git never holds a request's thread.
-
-    A root that overruns *per_root_budget_s* is abandoned to finish on its own thread.
-    """
-    loop = asyncio.get_running_loop()
-    pool = ThreadPoolExecutor(max_workers=max(1, len(checkouts)), thread_name_prefix='quality')
-    try:
-        return await asyncio.gather(
-            *(
-                asyncio.wait_for(
-                    loop.run_in_executor(pool, _measure_root, root, pid, cursor, git_budget_s),
-                    timeout=per_root_budget_s,
-                )
-                for root, pid, cursor in zip(checkouts, project_ids, resume, strict=True)
-            ),
-            return_exceptions=True,
-        )
-    finally:
-        pool.shutdown(wait=False)
-
-
-def _failure_reason(exc: BaseException, per_root_budget_s: float) -> str:
-    if isinstance(exc, TimeoutError):
-        return f'quality sampling exceeded the {per_root_budget_s}s per-root budget'
-    if isinstance(exc, TaskDbUnreadable):
-        return f'{type(exc).__name__}: {exc.path}: {exc.reason.value}'
-    return f'{type(exc).__name__}: {exc}'
+async def _write_gap(
+    conn: aiosqlite.Connection, project_id: str, now: datetime, reason: str,
+) -> None:
+    await insert_sample(conn, QualitySample.gap(project_id, now, reason))
 
 
 async def _write_sample(
@@ -121,8 +98,8 @@ async def _write_sample(
 ) -> None:
     if isinstance(result, BaseException):
         logger.warning('Quality sampling failed for %s', root, exc_info=result)
-        reason = _failure_reason(result, per_root_budget_s)
-        await insert_sample(conn, QualitySample.gap(project_id, now, reason))
+        await _write_gap(conn, project_id, now,
+                         describe_root_failure(result, 'quality sampling', per_root_budget_s))
         return
     await upsert_landing_rows(conn, result.rows, sampled_at=now)
     await insert_sample(conn, QualitySample.value(
@@ -132,21 +109,6 @@ async def _write_sample(
         landings_deferred=result.deferred,
         git_check=result.git_check,
     ))
-
-
-async def _commit_or_roll_back(
-    conn: aiosqlite.Connection, root: Path, write: Awaitable[None],
-) -> Exception | None:
-    """Await *write* and commit it; on failure log, roll back, and hand back the exception."""
-    try:
-        await write
-        await conn.commit()
-    except Exception as exc:
-        logger.warning('Failed to write the quality sample for %s', root, exc_info=True)
-        with contextlib.suppress(Exception):
-            await conn.rollback()
-        return exc
-    return None
 
 
 async def collect_quality(
@@ -168,24 +130,24 @@ async def collect_quality(
     """
     try:
         now_dt = resolve_now(now)
-        checkouts = [root for root in roots if (root / '.git').exists()]
+        checkouts = git_checkouts(roots)
         project_ids = [project_id_for_root(root) for root in checkouts]
         settled_by = now_dt - timedelta(seconds=DISPATCH_ROW_SETTLE_SECONDS)
         resume = [await stored_cursor(conn, pid, landed_by=settled_by) for pid in project_ids]
 
-        results = await _measure_all(
-            checkouts, project_ids, resume, git_budget_s, per_root_budget_s,
+        results: list[_RootMeasurement | BaseException] = await run_in_root_threads(
+            _measure_root,
+            [(root, pid, cursor, git_budget_s)
+             for root, pid, cursor in zip(checkouts, project_ids, resume, strict=True)],
+            per_root_budget_s,
+            thread_name_prefix='quality',
         )
 
         for root, pid, result in zip(checkouts, project_ids, results, strict=True):
-            failure = await _commit_or_roll_back(
+            await store_root(
                 conn, root, _write_sample(conn, root, pid, now_dt, result, per_root_budget_s),
+                partial(_write_gap, conn, pid, now_dt), what='sample',
             )
-            if failure is not None:
-                reason = f'sample write failed: {type(failure).__name__}: {failure}'
-                await _commit_or_roll_back(
-                    conn, root, insert_sample(conn, QualitySample.gap(pid, now_dt, reason)),
-                )
     except Exception:
         with contextlib.suppress(Exception):
             await conn.rollback()

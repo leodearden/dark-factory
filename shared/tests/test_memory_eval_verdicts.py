@@ -38,6 +38,9 @@ from shared.memory_eval_verdicts import (
     storm_fingerprint,
     verdict_entries,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _FIXTURES = Path(__file__).parent / 'fixtures' / 'memory_eval'
 _EVAL_ID = 'e1-retrieval-health'

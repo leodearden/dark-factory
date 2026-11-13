@@ -1,20 +1,25 @@
 """What a test needs to drive a live FalkorDB safely: connection constants,
 reachability gate, per-run graph names, and the index-readiness barrier.
 
-_falkor_index_live.py builds the index-provisioning fixtures on top of it.
+The connection constants name the SCRATCH FalkorDB, never production
+(OPERATIONS.md "The scratch FalkorDB"). _falkor_index_live.py builds the
+index-provisioning fixtures on top of this module.
 
 Lives outside conftest.py, imported by name, under the convention stated in
 _fm_helpers' module docstring.
 """
 
 import contextlib
-import os
 import uuid
+from collections.abc import MutableMapping
+from pathlib import Path
 
 import pytest
 from _fm_polling import poll_until
+from shared.lane_probe import runs_under_offline_lane
 
 from fused_memory.backends.falkor_indices import IndexHeaderShapeError, resolve_header_positions
+from fused_memory.config.falkordb_endpoints import scratch_falkordb_from_env
 
 # ---------------------------------------------------------------------------
 # Shared FalkorDB test scaffolding (task 3502)
@@ -27,57 +32,39 @@ from fused_memory.backends.falkor_indices import IndexHeaderShapeError, resolve_
 # enforces that no test module forks this scaffolding back into itself.
 # ---------------------------------------------------------------------------
 
-def _falkor_host_from_env() -> str:
-    """Derive the FalkorDB host from FALKOR_HOST, defaulting to localhost.
+# Resolved once at import, so a FALKOR_HOST/FALKOR_PORT aimed at production
+# fails every live module loudly at collection (ProductionFalkorDBTarget).
+_SESSION_FALKORDB = scratch_falkordb_from_env()
+FALKOR_HOST: str = _SESSION_FALKORDB.host
+FALKOR_PORT: int = _SESSION_FALKORDB.port
 
-    A named function rather than an expression inlined at the constant's
-    assignment, so the derivation is reachable at call time and can be tested
-    under a monkeypatched environment without ``importlib.reload``.
+_COMPOSE_FILE = Path(__file__).resolve().parents[1] / 'docker' / 'docker-compose.yml'
+
+
+class ScratchFalkorDBUnreachable(RuntimeError):
+    """An offline-lane session found no scratch FalkorDB to run against."""
+
+
+def prepare_scratch_falkordb_session(environ: MutableMapping[str, str]) -> None:
+    """Aim config-built FalkorDB clients at the session's scratch server; under the lane, require it.
+
+    Sets ``FALKORDB_URI`` in *environ* before collection, so module-scoped
+    fixtures and backends built from the config see it too; a test-body
+    ``monkeypatch.setenv`` still wins. Under the offline lane an unreachable
+    server ends the session: a pass that skipped every FalkorDB test would
+    read as green.
+
+    Raises:
+        ScratchFalkorDBUnreachable: under the offline lane, `_falkor_available()` is False.
     """
-    return os.environ.get('FALKOR_HOST', 'localhost')
-
-
-def _falkor_port_from_env() -> int:
-    """Derive the FalkorDB port from FALKOR_PORT, defaulting to 6379.
-
-    The ``int()`` is load-bearing, not cosmetic: ``os.environ`` yields str, and
-    ``FalkorDB(port='6379')`` fails or misbehaves on a str port.
-
-    Unset *or empty* takes the default. Empty is what a CI template like
-    ``FALKOR_PORT: ${FALKOR_PORT}`` produces when the variable is not set, and
-    it is the same shape ``known_project_roots_from_env`` (models/scope.py)
-    already treats as unset.
-
-    A non-empty, non-numeric value is an operator error and raises
-    ``RuntimeError`` naming the offending value.
-
-    That raise fires at *import* of this module, so a malformed FALKOR_PORT
-    fails every module that imports it — the live-FalkorDB modules — as a loud
-    collection error, never a silent skip. This is intentional, and is
-    faithful to the behaviour it replaces: each of the six migrated modules
-    already did a bare ``int(os.environ.get('FALKOR_PORT', 6379))`` at its own
-    import, so a malformed value was always fatal. What changes is the
-    message — actionable text naming the offending value, rather than a
-    ``ValueError`` traceback into a shared helper. Deferring the raise into
-    ``_falkor_available()`` would let a typo'd port read as "FalkorDB not
-    reachable" and silently skip the live lane rather than reporting the typo.
-    Failing loudly is the better trade.
-    """
-    raw = os.environ.get('FALKOR_PORT', '').strip()
-    if not raw:
-        return 6379
-    try:
-        return int(raw)
-    except ValueError:
-        raise RuntimeError(
-            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
-            f'default (6379), or set it to the port your FalkorDB listens on.'
-        ) from None
-
-
-# Evaluated once at import; consumers import the constants, not the helpers.
-FALKOR_HOST: str = _falkor_host_from_env()
-FALKOR_PORT: int = _falkor_port_from_env()
+    environ['FALKORDB_URI'] = _SESSION_FALKORDB.uri
+    if runs_under_offline_lane(environ) and not _falkor_available():
+        raise ScratchFalkorDBUnreachable(
+            f'the scratch FalkorDB at {_SESSION_FALKORDB.uri} is not reachable, and an '
+            f'offline-lane session must not pass by skipping every FalkorDB test. Start it '
+            f'with `docker compose -f {_COMPOSE_FILE} up -d --no-deps falkordb-scratch` '
+            f'(OPERATIONS.md "The scratch FalkorDB").'
+        )
 
 
 def _falkor_available() -> bool:
@@ -207,8 +194,10 @@ async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
     than hardcoded to its current position (7 of 9), so a FalkorDB column
     reorder fails loudly here instead of silently reading the wrong column and
     turning the barrier into a no-op. Resolution goes through
-    ``falkor_indices.resolve_header_positions``, the single home shared with
-    ``GraphitiBackend.list_indices``.
+    ``falkor_indices.resolve_header_positions``, the helper shared with
+    ``falkor_indices.index_records_from_rows``. The production barrier is
+    ``falkor_indices.await_index_catalog_settled``, which deliberately differs
+    on an empty catalog (see ``falkor_indices.unsettled_index_statuses``).
 
     Readiness is an **exact** match on ``'OPERATIONAL'`` for every row, never a
     substring test for ``'UNDER CONSTRUCTION'``: the live not-ready value

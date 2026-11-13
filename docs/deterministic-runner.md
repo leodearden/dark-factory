@@ -413,10 +413,12 @@ downstream (`_format_outcome_echo`, task 3286) — the same constraint
 section 2's predicate subsection documents, so both note-writing sites in
 `deterministic_runner.py` read consistently.
 
-BOTH gate closes cite the resolving `milestone_gate` record through
-`done_provenance.escalation_id` (task 5241, PRD C5): the curator close
-since task 3341, the PLAIN pure-gate close as of 5241, via the one shared
-rule in `_cite_gate_escalation_id`. The two notes still differ — that
+BOTH gate closes cite the resolving gate record through
+`done_provenance.escalation_id` (task 5241, PRD C5): `milestone_gate`, or
+`review_due` for a `trigger_chain` human gate
+(plans/completion-driven-triggers-prd.md C4). The curator close has cited
+it since task 3341 and the PLAIN pure-gate close since 5241, both via the
+one shared rule in `_cite_gate_escalation_id`. The two notes still differ — that
 discriminator is deliberate and load-bearing — but neither close is
 uncitable any more, and fused-memory now REFUSES a
 `kind='deterministic-gate'` blob that names no record. Ordering note for

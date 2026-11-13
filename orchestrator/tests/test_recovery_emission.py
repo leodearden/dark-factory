@@ -11,6 +11,7 @@ import dataclasses
 import json
 
 import pytest
+from _null_task_escalation import submit_null_task_escalation
 
 from orchestrator.recovery_emission import (
     STREAK_CHARGING_SITES,
@@ -1404,6 +1405,26 @@ class TestInheritVetoStreakAlarms:
         assert inherited == frozenset()
         assert memo == {}
         assert tuple(tracker.tracked()) == ()
+
+    @pytest.mark.parametrize('null_record_role', ['fused-memory', _streak_role()])
+    def test_a_null_task_id_record_beside_a_real_alarm_is_skipped(
+        self, tmp_path, null_record_role,
+    ):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        submit_null_task_escalation(queue, agent_role=null_record_role)
+        _file_alarm(queue, '3535')
+        memo: dict[str, int] = {}
+        tracker = _tracker()
+
+        inherited = _inherit(
+            queue.get_pending(), filed_at=memo, tracker=tracker, sites=_RELEASED_SITES,
+        )
+
+        assert inherited == frozenset({'3535'})
+        assert memo == {'3535': 0}
+        assert set(tracker.tracked()) == {(str(site), '3535') for site in _RELEASED_SITES}
 
     def test_the_inherited_alarm_resolves_when_its_adopted_key_is_released(
         self, tmp_path,

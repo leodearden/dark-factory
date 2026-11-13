@@ -10,11 +10,12 @@ import os
 import socket
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -43,7 +44,8 @@ from fused_memory.models.scope import (
     ProjectId,
     ProjectRoot,
     ProjectScope,
-    build_known_projects_map,
+    configured_known_projects_map,
+    configured_primary_root,
 )
 from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -70,7 +72,7 @@ from fused_memory.reconciliation.finding_task_escalation import (
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
-from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.judge import Judge, NoVerdict, NoVerdictReason
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.overreach_flags import (
     acknowledge_overreach_flags,
@@ -116,6 +118,7 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.services.id_resolver import IdResolver
 from fused_memory.services.live_workflow_detector import (
+    TaskLiveness,
     corroboration_for_task,
     is_pure_gate_metadata,
     is_workflow_live_for_task,
@@ -262,6 +265,11 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # escalates within a watchable window (≈ 10–180 minutes depending on cycle
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
+
+#: Detail key on a persistent-finding escalation listing the cited task ids
+#: whose liveness probe failed: the escalation filed because none was confirmed
+#: live, not because each was confirmed not live (task 5370).
+LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
 
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
@@ -834,25 +842,17 @@ class ReconciliationHarness:
         # accepting connections.  None when no recon_report server is started.
         self._server_ready_event = server_ready_event
         self._recon_report_port: int = config.server.recon_report_port
-        _raw_root = config.taskmaster.project_root if config.taskmaster else ''
-        if _raw_root:
-            _raw_root = os.path.expanduser(_raw_root)
-        self._project_root = str(Path(_raw_root).resolve()) if _raw_root else ''
+        self._project_root = configured_primary_root(config.taskmaster)
         self.config = config.reconciliation
         self._full_cycle_deadline = full_cycle_deadline
         self._backlog_policy = backlog_policy
-        # Multi-project routing: build a {project_id → project_root} map from
-        # the configured project + DASHBOARD_KNOWN_PROJECT_ROOTS env var so
-        # Stage 2 can surface other projects to its LLM and authorise
-        # cross-project task filing.  Reuses the dashboard's existing env var
-        # to avoid two sources of truth — see plans/deep-squishing-lagoon.md
-        # for the trade-off (rename to a neutral name is a tracked followup).
-        # When a known_projects kwarg is supplied (server startup), the harness
-        # uses that snapshot instead of building its own — single source of
-        # truth across harness, ticket janitor, and path-scope guard (task 1164).
+        # Multi-project routing: Stage 2 surfaces the registered projects to
+        # its LLM and authorises cross-project task filing.  Server startup
+        # passes its known_projects snapshot (task 1164); otherwise derive it
+        # by the same rule, models/scope.py::configured_known_projects_map.
         self._known_projects: dict[str, str] = (
             dict(known_projects) if known_projects is not None
-            else build_known_projects_map(self._project_root)
+            else configured_known_projects_map(config.taskmaster)
         )
         # Task 2998 GAP A: seed the policy's project_root cache NOW, at
         # construction.  Its only other writer is BacklogPolicy.check(), which
@@ -1157,6 +1157,11 @@ class ReconciliationHarness:
         scope-returning per task 2146 β).
         """
         return self._project_root
+
+    @property
+    def known_projects(self) -> Mapping[str, str]:
+        """The ``{project_id: project_root}`` registry this harness routes by, read-only."""
+        return MappingProxyType(self._known_projects)
 
     def _known_project_scope_for(self, project_id: str) -> ProjectScope:
         """Return the canonical ProjectScope for *project_id* from the registry.
@@ -2730,6 +2735,8 @@ class ReconciliationHarness:
         finding: dict,
         persistence: int,
         task_id: str | None = None,
+        *,
+        liveness_unknown: bool = False,
     ) -> str | None:
         """File a level-0 record for *finding* on its named task's ORCHESTRATOR queue.
 
@@ -2774,6 +2781,10 @@ class ReconciliationHarness:
         A7b note: this WRITES but never RESOLVES, and the queue it writes is
         NOT the recon queue the A7b invariant governs — see the contract block
         at the top of this module.
+
+        *liveness_unknown* says the target is filed because its liveness probe
+        failed, not because it was confirmed not live (task 5370). It marks the
+        WARNING-level filed log line; the record's detail does not carry it.
         """
         # Mirrors _escalate's guard: on ImportError the module-level names are
         # left UNBOUND (not set to None as in targeted.py), so `HAS_ESCALATION`
@@ -2884,7 +2895,8 @@ class ReconciliationHarness:
                 task_id, project_id, run_id, e,
             )
             return None
-        logger.info(
+        logger.log(
+            logging.WARNING if liveness_unknown else logging.INFO,
             'reconciliation.finding_task_escalation_filed',
             extra={
                 'project_id': project_id,
@@ -2893,6 +2905,7 @@ class ReconciliationHarness:
                 'escalation_id': esc_id,
                 'finding_category': finding.get('category', ''),
                 'persistence': persistence,
+                'liveness_unknown': liveness_unknown,
             },
         )
         return esc_id
@@ -3398,10 +3411,15 @@ class ReconciliationHarness:
         try:
             assert self.judge is not None
             verdict = await self.judge.review_run(run_id)
-            if verdict:
-                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
+            if isinstance(verdict, NoVerdict):
+                logger.log(
+                    logging.INFO if verdict.reason is NoVerdictReason.PROJECT_HALTED
+                    else logging.WARNING,
+                    'Judge produced no verdict for run %s: reason=%s detail=%s',
+                    run_id, verdict.reason.value, verdict.detail,
+                )
             else:
-                logger.warning(f'Judge returned no verdict for run {run_id}')
+                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
         except asyncio.CancelledError:
             # Shutdown drain (or a cycle-aware restart) cancelled the judge
             # mid-review, before add_verdict's atomic marker-clear ran. The
@@ -5774,26 +5792,35 @@ class ReconciliationHarness:
                 # its call only because its read-to-use gap is microseconds; this
                 # one's is not, so the read moves to the use.
                 #
-                # Both are constant for this project_root over the gate loop below,
-                # and both are wrapped fail-safe → None: a None simply means that
-                # corroborating signal cannot fire (corroboration_for_task tolerates
-                # None inputs and never raises on them), which leaves the verdict
-                # biased toward "not corroborated" — the direction that lets a
-                # stranded escalation through only when nothing at all vouches for
-                # the task. read_scheduler_state already returns
+                # Both are constant for this project_root over the gate loop below.
+                # A read that raises leaves its signal unable to fire, so a False
+                # corroboration computed without it is not a confirmed one:
+                # `_corroboration_inputs_failed` makes `_task_liveness` report such
+                # a negative as UNKNOWN. read_scheduler_state already returns
                 # SchedulerStateSnapshot.empty() for an absent/invalid file;
                 # orchestrator_started_at returns None for an absent or
                 # unparseable lock.
+                _corroboration_inputs_failed = False
                 try:
                     _sched_state: SchedulerStateSnapshot | None = read_scheduler_state(
                         Path(project_root)
                     )
                 except Exception:
+                    logger.warning(
+                        'read_scheduler_state failed for %s; negative liveness '
+                        'verdicts this pass are unknown', project_root, exc_info=True,
+                    )
                     _sched_state = None
+                    _corroboration_inputs_failed = True
                 try:
                     _orch_started: datetime | None = orchestrator_started_at(project_root)
                 except Exception:
+                    logger.warning(
+                        'orchestrator_started_at failed for %s; negative liveness '
+                        'verdicts this pass are unknown', project_root, exc_info=True,
+                    )
                     _orch_started = None
+                    _corroboration_inputs_failed = True
 
                 # Task 3778: hoist the whole-repo `git worktree list --porcelain`
                 # out of the cited-task fan-out below, the same way
@@ -5812,25 +5839,21 @@ class ReconciliationHarness:
                 # tasks). A known-empty repo arrives as {'worktree_index': {}}.
                 _index_kwargs: dict = await worktree_index_kwargs(project_root)
 
-                async def _task_is_live(tid: str) -> bool:
+                async def _task_liveness(tid: str) -> TaskLiveness:
                     """Is task *tid* covered by a live workflow right now?
 
-                    Extracted verbatim (task 4821) from the per-cited-task body
-                    of the live-workflow gate below so a SECOND consumer — the
-                    routed-filing gate on the escalate branch — asks the exact
-                    same question of the exact same inputs.  A re-implementation
-                    would be free to drift; a shared helper cannot.
+                    Shared (task 4821) by the cited-task gate and the
+                    routed-target gate below, so both ask the same question of
+                    the same pass-local, loop-constant inputs (`task_by_id`,
+                    `_tasks_snapshot_at`, `_sched_state`, `_orch_started`,
+                    `_index_kwargs`).
 
-                    Closes over the five pass-local, loop-constant inputs
-                    (`task_by_id`, `_tasks_snapshot_at`, `_sched_state`,
-                    `_orch_started`, `_index_kwargs`) plus `project_root`, so
-                    the caller supplies only the task id.
-
-                    Fail-safe direction is UNCHANGED from the inline version it
-                    replaces: a corroboration error leaves the gate inert
-                    (`corroborated=None`), and a detector error is treated as
-                    NOT live — biasing toward escalating rather than toward
-                    silencing a genuine stranded-work escalation.
+                    LIVE suppresses an escalation here, so a probe that could
+                    not run must never answer LIVE (task 5370). A corroboration
+                    error reaches the detector as corroborated=False, which
+                    demands genuine per-task evidence; a negative verdict that
+                    rests on a failed corroboration or failed inputs is UNKNOWN,
+                    and so is a detector error.
                     """
                     _task = task_by_id.get(tid)
                     _metadata = _task.get('metadata') if _task else None
@@ -5839,6 +5862,7 @@ class ReconciliationHarness:
                     # `task.get('status') == 'in-progress'` guard so all
                     # three consumers gate corroboration identically.
                     corroborated: bool | None = None
+                    corroboration_known = True
                     if _status == 'in-progress' and _task is not None:
                         try:
                             corroborated = corroboration_for_task(
@@ -5852,17 +5876,22 @@ class ReconciliationHarness:
                                 scheduler_state=_sched_state,
                                 orchestrator_started_at=_orch_started,
                             )
-                        except Exception as _corr_exc:
-                            logger.debug(
-                                'corroboration_for_task error for task %s; '
-                                'leaving the gate inert: %s',
-                                tid, _corr_exc,
+                            corroboration_known = (
+                                corroborated or not _corroboration_inputs_failed
                             )
+                        except Exception:
+                            logger.warning(
+                                'corroboration_for_task failed for task %s; '
+                                'requiring per-task evidence of liveness',
+                                tid, exc_info=True,
+                            )
+                            corroborated = False
+                            corroboration_known = False
                     try:
                         # Awaited (task 3778): the detector's three git
                         # probes are async now, so this gate no longer
                         # blocks the loop this pass runs on.
-                        return bool(await is_workflow_live_for_task(
+                        live = await is_workflow_live_for_task(
                             tid, project_root,
                             status=_status,
                             **_index_kwargs,
@@ -5883,23 +5912,26 @@ class ReconciliationHarness:
                             # exists to establish.
                             pure_gate=is_pure_gate_metadata(_metadata),
                             corroborated=corroborated,
-                        ))
-                    except Exception as _det_exc:
-                        logger.debug(
-                            'live_workflow_detector error for task %s; treating as not-live: %s',
-                            tid, _det_exc,
                         )
-                        return False
+                    except Exception:
+                        logger.warning(
+                            'live_workflow_detector failed for task %s; liveness unknown',
+                            tid, exc_info=True,
+                        )
+                        return TaskLiveness.UNKNOWN
+                    if live:
+                        return TaskLiveness.LIVE
+                    return TaskLiveness.NOT_LIVE if corroboration_known else TaskLiveness.UNKNOWN
 
                 # Task 5550: liveness is loop-constant per task id here, like
                 # `_sched_state` above, so each id's git probes run once per pass.
-                _live_by_task: dict[str, bool] = {}
+                _liveness_by_task: dict[str, TaskLiveness] = {}
 
-                async def _task_is_live_memoised(tid: str) -> bool:
-                    """`_task_is_live`, asked once per id per pass."""
-                    if tid not in _live_by_task:
-                        _live_by_task[tid] = await _task_is_live(tid)
-                    return _live_by_task[tid]
+                async def _task_liveness_memoised(tid: str) -> TaskLiveness:
+                    """`_task_liveness`, asked once per id per pass."""
+                    if tid not in _liveness_by_task:
+                        _liveness_by_task[tid] = await _task_liveness(tid)
+                    return _liveness_by_task[tid]
 
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
@@ -5909,8 +5941,9 @@ class ReconciliationHarness:
                         # orchestrator), suppress this cycle's escalation with an INFO log.
                         # The finding keeps recurring and will escalate after the workflow
                         # finishes — so genuine stranded cases (all signals False) still
-                        # escalate.  Guard detector errors as not-live (fail toward escalating
-                        # rather than toward silencing a genuine stranded-work escalation).
+                        # escalate.  Only a LIVE verdict suppresses: a probe that failed is
+                        # UNKNOWN, which escalates rather than silencing a genuine
+                        # stranded-work escalation.
                         # Task 2031: cited tasks in a never-dispatched status
                         # (deferred/done/cancelled, via task_by_id above) drop the
                         # project-wide orchestrator_live signal, so a deferred task stuck
@@ -5938,14 +5971,12 @@ class ReconciliationHarness:
                         # with no recent commit. Post-2963 the renderer downgrades
                         # that to indeterminate and drops the task, while this gate
                         # still read it as live and silenced the stranded-work
-                        # escalation indefinitely. The fail-safe direction here is
-                        # UNCHANGED: any assembly error, a non-in-progress status,
-                        # or an absent task_by_id entry all leave corroborated=None,
-                        # the detector's gate stays inert, and the escalation is
-                        # still suppressed — this is never a new silencing path.
-                        # Only an explicit corroborated=False (nothing at all
-                        # vouches for the task) now lets a stranded escalation
-                        # through.
+                        # escalation indefinitely. A non-in-progress status or an
+                        # absent task_by_id entry leaves corroborated=None and the
+                        # detector's gate inert. A corroboration that could not be
+                        # computed is passed as False, so it cannot suppress
+                        # (task 5370); the escalation then lists the task under
+                        # LIVENESS_UNKNOWN_DETAIL_KEY.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,
@@ -5959,10 +5990,14 @@ class ReconciliationHarness:
                             if isinstance(c, dict) and 'task_id' in c
                         ]
                         any_live = False
+                        liveness_unknown: set[str] = set()
                         for tid in cited_task_ids:
-                            if await _task_is_live_memoised(tid):
+                            liveness = await _task_liveness_memoised(tid)
+                            if liveness is TaskLiveness.LIVE:
                                 any_live = True
                                 break
+                            if liveness is TaskLiveness.UNKNOWN:
+                                liveness_unknown.add(tid)
                         if any_live:
                             logger.info(
                                 'reconciliation.integrity_escalation_suppressed_live_workflow',
@@ -5975,15 +6010,25 @@ class ReconciliationHarness:
                                 },
                             )
                         else:
+                            escalation_detail = {**finding, 'persistence': persistence}
+                            if liveness_unknown:
+                                escalation_detail[LIVENESS_UNKNOWN_DETAIL_KEY] = sorted(
+                                    liveness_unknown
+                                )
+                                logger.warning(
+                                    'reconciliation.integrity_escalation_liveness_unknown',
+                                    extra={
+                                        'project_id': project_id,
+                                        'run_id': run_id,
+                                        'task_ids': sorted(liveness_unknown),
+                                    },
+                                )
                             self._escalate(
                                 _RECON_INTEGRITY_ISSUE_CATEGORY,
                                 run_id,
                                 f'Persistently unresolved after remediation '
                                 f'({persistence} cycles): {finding.get("description", "?")}',
-                                detail=json.dumps(
-                                    {**finding, 'persistence': persistence},
-                                    default=str,
-                                ),
+                                detail=json.dumps(escalation_detail, default=str),
                                 finding=finding,
                                 resolved_fps=resolved_fps,
                             )
@@ -6021,7 +6066,7 @@ class ReconciliationHarness:
                             # named task has live work in flight.  Gate the
                             # resolved target explicitly, skipping the recheck
                             # when it is already a cited id (the loop above just
-                            # proved that one not-live, and a recheck would spend
+                            # proved that one not LIVE, and a recheck would spend
                             # git subprocess calls to re-derive the same answer).
                             #
                             # The `_escalate` gate above is deliberately NOT
@@ -6101,7 +6146,8 @@ class ReconciliationHarness:
                                 )
                             elif (
                                 routed_task_id not in cited_task_ids
-                                and await _task_is_live_memoised(routed_task_id)
+                                and await _task_liveness_memoised(routed_task_id)
+                                is TaskLiveness.LIVE
                             ):
                                 logger.info(
                                     'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',
@@ -6118,9 +6164,17 @@ class ReconciliationHarness:
                                 # per DISTINCT persistent finding per task, and
                                 # none filed behind an open routed L1 — see
                                 # `finding_task_escalation.py::routed_record_covers_finding`.
+                                # Memoised: the cited loop or the gate above
+                                # has already probed this id.
+                                routed_liveness = await _task_liveness_memoised(
+                                    routed_task_id
+                                )
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
                                     task_id=routed_task_id,
+                                    liveness_unknown=(
+                                        routed_liveness is TaskLiveness.UNKNOWN
+                                    ),
                                 )
                     else:
                         logger.info(

@@ -92,6 +92,7 @@ import _checkout as _checkout
 # invoke this via `python -m`. It is the single home for the tasks.db path; the
 # read-only open is shared.tasks_db_readonly's.
 from _task_db_scan import tasks_db_path
+from fused_memory.middleware.metadata_dict import extract_metadata_dict
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
     EXIT_CLOSED,
@@ -127,12 +128,12 @@ class UsageError(Exception):
 def extract_gate_block(metadata: Any) -> dict:
     """Return the gate block from a task's *metadata*, or raise UsageError.
 
-    *metadata* may be a dict or a JSON string: normalised through the seam's
-    own ``TaskInterceptor._extract_metadata_dict`` (a staticmethod), never a
-    hand-rolled ``json.loads``, so the CLI and the seam apply one shape
-    policy to the same blob.
+    *metadata* may be a dict or a JSON string: normalised through
+    ``metadata_dict.py::extract_metadata_dict``, the function the seam itself
+    calls, never a hand-rolled ``json.loads``, so the CLI and the seam apply
+    one shape policy to the same blob.
     """
-    meta = TaskInterceptor._extract_metadata_dict(metadata)
+    meta = extract_metadata_dict(metadata, source='check_consolidation_closure')
     if not isinstance(meta, dict):
         raise UsageError(
             "metadata could not be parsed as a dict, so there is no gate "

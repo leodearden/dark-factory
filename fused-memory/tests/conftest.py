@@ -119,6 +119,10 @@ def pytest_configure(config):
     httpx-reaping fixtures, are imported function-locally because a
     module-level import after this file's ``sys.path`` setup would need a new
     ``E402`` suppression, which ``scripts/inline_suppressions.py`` refuses.
+
+    ``_aim_falkordb_at_scratch`` ends the session with a usage error (exit 4)
+    when it is aimed at the production FalkorDB, or, under the offline lane,
+    when the scratch FalkorDB is unreachable (task 7792).
     """
     reject_unsafe_basetemp(config)
     arm_leaked_drain_process_guard(config)
@@ -127,6 +131,21 @@ def pytest_configure(config):
 
     arm_usage_gate_sweep_confinement(config, usage_gate)
     track_async_httpx_clients()
+    _aim_falkordb_at_scratch()
+
+
+def _aim_falkordb_at_scratch() -> None:
+    """Importing ``_fm_falkor_live`` resolves the scratch endpoint, so the import is where production is refused."""
+    from fused_memory.config.falkordb_endpoints import ProductionFalkorDBTarget
+
+    try:
+        from _fm_falkor_live import ScratchFalkorDBUnreachable, prepare_scratch_falkordb_session
+    except ProductionFalkorDBTarget as error:
+        raise pytest.UsageError(str(error)) from None
+    try:
+        prepare_scratch_falkordb_session(os.environ)
+    except ScratchFalkorDBUnreachable as error:
+        raise pytest.UsageError(str(error)) from None
 
 
 @pytest.fixture(scope='session')

@@ -17,6 +17,9 @@ from pathlib import Path
 import pytest
 
 from shared.finding_key import KEY_PATTERN, finding_key, is_finding_key, normalise_anchor
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INTERIM_CLI = REPO_ROOT / "skills" / "hotspot-survey" / "scripts" / "findings_artefact.py"

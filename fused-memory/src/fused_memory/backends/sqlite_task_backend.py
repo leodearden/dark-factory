@@ -37,6 +37,7 @@ from shared.elision import elide_at_word
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
 from shared.sqlite_column_migration import add_column_if_missing
+from shared.task_created_at import CreatedAtSource
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
     SchemaWarning,
@@ -46,6 +47,7 @@ from shared.task_metadata import (
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL, TaskStatus
 from shared.task_store_schema import TASK_STORE_DDL
+from shared.task_timestamp import format_task_timestamp
 
 from fused_memory.backends.defect_records import (
     DEFECT_RECORD_KEYS,
@@ -66,6 +68,7 @@ from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     MetadataNotAnObjectError,
     MetadataTooDeepError,
+    NoFieldsToUpdateError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
@@ -83,7 +86,10 @@ from fused_memory.backends.task_backend_types import (
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
-from fused_memory.backends.task_projection import parse_task_projection
+from fused_memory.backends.task_projection import (
+    SCHEMA_OPTIONAL_ROW_KEYS,
+    parse_task_projection,
+)
 from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -114,7 +120,11 @@ logger = logging.getLogger(__name__)
 #       plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1). No
 #       column or index change — a pure metadata back-fill. See
 #       ``_migrate_v4_to_v5``.
-_SCHEMA_VERSION = 5
+#   v6: + created_at / created_at_source columns (task 8558, PRD
+#       plans/instruments-honesty-prd.md decision 3); stamped by add_task,
+#       backfilled only by scripts/backfill_task_created_at.py. See
+#       ``_migrate_v5_to_v6``.
+_SCHEMA_VERSION = 6
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -205,20 +215,15 @@ class _StatusWriteNotPersisted(Exception):
 
 
 def task_timestamp_now() -> str:
-    """The current UTC instant in the task store's timestamp format.
+    """The current UTC instant in the task store's timestamp form.
 
-    Exactly ``%Y-%m-%dT%H:%M:%S.mmmZ`` — millisecond precision, literal ``Z``
-    suffix — matching the Taskmaster ``updatedAt`` format, which is the shape
-    every timestamp this store writes must carry: ``updated_at``,
-    ``heartbeat_at``, and ``metadata.pending_since``.
+    The form itself lives in ``shared/src/shared/task_timestamp.py::format_task_timestamp``.
 
-    PUBLIC because that format is a CONTRACT, not an implementation detail.
+    PUBLIC because that form is a CONTRACT, not an implementation detail.
     ``TaskInterceptor``'s CSV ``set_task_status`` branch computes one value
     here and threads it through ``pending_since_now`` so a whole batch lands
     on one instant (task 3816, PRD §C1 rule 5); it must not substitute its own
-    ``datetime.now(UTC).isoformat()`` helper, whose offset-suffixed
-    microsecond shape would give the live-stamped and the back-filled
-    populations two incommensurable string shapes for one column.
+    ``datetime.now(UTC).isoformat()`` helper.
 
     ONE clock reading, deliberately: composing the value from two
     ``datetime.now(UTC)`` calls can straddle a second boundary and emit a
@@ -226,8 +231,7 @@ def task_timestamp_now() -> str:
     milliseconds from the next second), which the anchor's
     monotone-non-decreasing invariant cannot tolerate.
     """
-    reading = datetime.now(UTC)
-    return reading.strftime('%Y-%m-%dT%H:%M:%S.') + f'{reading.microsecond // 1000:03d}Z'
+    return format_task_timestamp(datetime.now(UTC))
 
 
 def _parse_task_id(raw: str | int) -> int:
@@ -358,6 +362,11 @@ async def _migrate(
       ``metadata.pending_since`` back-fill (task 3816). Gated on a RE-READ of
       ``PRAGMA user_version``, not on the local ``version``, because the
       preceding step is self-gating (see the dispatch below).
+    * v5 → v6: see :func:`_migrate_v5_to_v6` — add ``created_at`` /
+      ``created_at_source`` (task 8558). Only a store that reached v5 is
+      stamped 6. A store the self-gating v3 → v4 step held below v4 still
+      gains both columns, unstamped, because ``add_task`` names them on every
+      INSERT; its version catches up through this ladder once the index lands.
 
     Each ALTER step is column-presence-guarded, so a fresh DB whose
     ``TASK_STORE_DDL`` already created every column runs all steps as no-op
@@ -463,6 +472,13 @@ async def _migrate(
 
     if version >= 4 and version < 5:
         await _migrate_v4_to_v5(conn)
+        version = 5
+
+    if version == 5:
+        await _migrate_v5_to_v6(conn)
+    else:
+        await _add_created_at_columns(conn)
+        await conn.commit()
 
 
 async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
@@ -1052,6 +1068,31 @@ async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+async def _add_created_at_columns(conn: aiosqlite.Connection) -> None:
+    """Add the nullable ``created_at`` / ``created_at_source`` pair; never commits."""
+    await add_column_if_missing(conn, 'tasks', 'created_at', 'TEXT')
+    await add_column_if_missing(conn, 'tasks', 'created_at_source', 'TEXT')
+
+
+async def _migrate_v5_to_v6(conn: aiosqlite.Connection) -> None:
+    """v5 -> v6 (task 8558, PRD plans/instruments-honesty-prd.md decision 3):
+    add the ``created_at`` / ``created_at_source`` columns.
+
+    Adds whichever column is missing, then stamps ``user_version = 6``. No
+    row gains a value here: a pre-existing row reads NULL until
+    ``scripts/backfill_task_created_at.py`` fills it, because this open-time
+    step is lazy per store and must not reach into another store's runs.db.
+
+    IMPORTANT: never short-circuit to just stamping the version.
+    ``TASK_STORE_DDL`` uses ``CREATE TABLE IF NOT EXISTS`` and never adds
+    columns to an existing table, so a v5 production store would silently
+    keep missing columns forever if this step only stamped the version.
+    """
+    await _add_created_at_columns(conn)
+    await conn.execute('PRAGMA user_version = 6')
+    await conn.commit()
+
+
 def _warn_malformed_metadata_once(
     project_root: str,
     tag: str,
@@ -1416,7 +1457,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
             metadata = {}
 
     row_keys = row.keys()
-    return {
+    task: dict[str, Any] = {
         'id': str(row['id']),
         'title': row['title'],
         'description': row['description'] or '',
@@ -1435,6 +1476,12 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'heartbeat_at': row['heartbeat_at'] if 'heartbeat_at' in row_keys else None,
         'candidate_key': row['candidate_key'] if 'candidate_key' in row_keys else None,
     }
+    # Omitted, not None, on a connection whose v6 ALTER never landed: None is
+    # reserved for a migrated row the backfill has not reached yet.
+    for key in SCHEMA_OPTIONAL_ROW_KEYS:
+        if key in row_keys:
+            task[key] = row[key]
+    return task
 
 
 def _updated_task_response(
@@ -2969,12 +3016,13 @@ class SqliteTaskBackend:
                 # BEFORE _validate_metadata_on_write deliberately: that call
                 # must see the blob that is actually persisted, or enforce-mode
                 # validates a different value than the one on disk. One hoisted
-                # `now` is bound to BOTH the anchor and the INSERT's
-                # updated_at, so a freshly inserted pending row satisfies
-                # `pending_since == updated_at` exactly -- the same identity the
-                # one-shot v4->v5 back-fill establishes for the legacy
-                # population, rather than two `task_timestamp_now()` calls a millisecond
-                # apart. `candidate_key` above stays on the pre-stamp value: it
+                # `now` is bound to the anchor and to the INSERT's updated_at
+                # and created_at, so a freshly inserted pending row satisfies
+                # `pending_since == updated_at == created_at` exactly, rather
+                # than three `task_timestamp_now()` calls a millisecond apart;
+                # the first equality is the identity the one-shot v4->v5
+                # back-fill establishes for the legacy population.
+                # `candidate_key` above stays on the pre-stamp value: it
                 # keys off title + metadata['files'] only — neither stripped
                 # key participates, so the strip below cannot move it.
                 #
@@ -3041,14 +3089,15 @@ class SqliteTaskBackend:
                     """
                         INSERT INTO tasks (tag, id, title, description,
                                            details, test_strategy, status, priority,
-                                           metadata, updated_at, candidate_key)
-                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                                           metadata, updated_at, candidate_key,
+                                           created_at, created_at_source)
+                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
                         """,
                     (
                         tag, next_id, title,
                         description or '', details or '',
                         status, priority or 'medium', metadata, now,
-                        candidate_key,
+                        candidate_key, now, CreatedAtSource.STAMPED.value,
                     ),
                 )
                 if self._after_insert_fault_hook is not None:
@@ -3185,7 +3234,7 @@ class SqliteTaskBackend:
             parsed_metadata = strip_machine_authored_metadata(
                 parsed_metadata, project_root=project_root, task_ref=task_id,
             )
-        # Third pre-connection floor, and the last one: reject an append=True
+        # Third pre-connection floor: reject an append=True
         # write aimed at a REPLACE-ONLY column. Placed here deliberately —
         # after the two write-authority floors and BEFORE _resolve_metadata_mode
         # and ensure_connected() — so the rejection precedes existence and
@@ -3232,6 +3281,13 @@ class SqliteTaskBackend:
         resolved_mode = _resolve_metadata_mode(
             metadata_mode, append, metadata_present=metadata is not None,
         )
+
+        # Last pre-connection floor (task 4867), after every refusal of a
+        # supplied-but-wrong argument: with no mutating argument there is
+        # nothing to be wrong, and a bad ``status`` or ``metadata_mode`` is
+        # the more specific mistake to report. Before ensure_connected() so a
+        # fieldless call never reaches the row, never bumps ``updated_at``.
+        _refuse_update_with_no_mutating_field(task_id, arguments_as_received)
 
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -3421,8 +3477,9 @@ class SqliteTaskBackend:
                             candidate_key=new_candidate_key,
                         )
 
-            # updated_at always advances, even on a no-op write — matches
-            # the original behaviour and avoids surprising "stale" reads.
+            # updated_at always advances on a write that supplies a mutating
+            # field, even one whose values equal the stored ones; a call that
+            # supplies none never gets here (_refuse_update_with_no_mutating_field).
             set_columns.append('updated_at = ?')
             set_values.append(task_timestamp_now())
 
@@ -3562,9 +3619,22 @@ class SqliteTaskBackend:
         off the 12-method contract prevents other callers from treating it as
         sanctioned public surface.
         """
-        await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
+        # Same caller -> store metadata boundary as the three above, so the
+        # same sanitizer (task 3816 review remediation). Privileged and
+        # interceptor-only, so the stakes are lower than the public
+        # writers — applied anyway so the authority rule is UNIFORMLY
+        # enforced from one implementation rather than being a per-site
+        # judgement call. Emptiness is judged on the SANITISED dict (task
+        # 4867): fields that are all stripped write nothing, so refuse before
+        # the connection and the row, as update_task does.
+        sanitized_fields = strip_machine_authored_metadata(
+            fields, project_root=project_root, tag=tag, task_id=tid,
+        )
+        if not sanitized_fields:
+            raise NoFieldsToUpdateError('stamp_audit_metadata', task_id)
+        await self.ensure_connected()
         async with self._write_unit(project_root) as conn:
             cursor = await conn.execute(
                 'SELECT metadata FROM tasks WHERE tag = ? AND id = ?',
@@ -3576,15 +3646,6 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
-            # Same caller -> store metadata boundary as the three above, so the
-            # same sanitizer (task 3816 review remediation). Privileged and
-            # interceptor-only, so the stakes are lower than the public
-            # writers — applied anyway so the authority rule is UNIFORMLY
-            # enforced from one implementation rather than being a per-site
-            # judgement call.
-            sanitized_fields = strip_machine_authored_metadata(
-                fields, project_root=project_root, tag=tag, task_id=tid,
-            )
             new_metadata = _merge_metadata(
                 row['metadata'], json.dumps(sanitized_fields),
                 mode='merge',
@@ -4128,6 +4189,29 @@ def _resolve_metadata_mode(
 
 
 _REPLACE_ONLY_FIELDS: tuple[str, ...] = ('title', 'description', 'priority')
+
+# The update_task parameters that make a call a write. ``status`` is absent
+# because it is refused unconditionally; ``task_id``, ``project_root``,
+# ``tag``, ``append`` and ``metadata_mode`` only steer how a write is applied.
+_MUTATING_UPDATE_FIELDS: tuple[str, ...] = (
+    'prompt', 'metadata', 'title', 'description', 'details', 'priority',
+    'dependencies',
+)
+
+
+def _refuse_update_with_no_mutating_field(
+    task_id: str, arguments: Mapping[str, object],
+) -> None:
+    """Raise :class:`NoFieldsToUpdateError` when every mutating argument is ``None``.
+
+    Keyed on the supplied arguments, never on which columns the write would
+    set: ``dependencies=[]`` writes outside the column list and
+    ``metadata='{}'`` is a real write, and both are not ``None``. A name in
+    ``_MUTATING_UPDATE_FIELDS`` missing from *arguments* raises ``KeyError``,
+    so the constant and the update_task signature cannot drift apart silently.
+    """
+    if all(arguments[name] is None for name in _MUTATING_UPDATE_FIELDS):
+        raise NoFieldsToUpdateError('update_task', task_id, _MUTATING_UPDATE_FIELDS)
 
 
 def _reject_append_on_replace_only_fields(

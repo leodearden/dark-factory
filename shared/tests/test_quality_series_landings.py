@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,10 @@ from quality_series_fixtures import (
 from shared.project_id import project_id_for_root
 from shared.quality_series import CursorNotOnMain, Landing, UnrecognisedTrainEvent, landings
 from shared.quality_series.git_lines import GitUnavailable
-from shared.quality_series.landings import LandingSource, LinesBase
+from shared.quality_series.landings import LandingSource, LinesBase, recorded_landing_keys
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture(scope='module')
@@ -299,3 +303,59 @@ class TestTrainAttribution:
         with pytest.raises(UnrecognisedTrainEvent) as excinfo:
             landings(db.conn, repo.root, since_cursor=None)
         assert len(excinfo.value.event_ids) == 1
+
+
+class TestRecordedLandingKeys:
+    """The landings runs.db records, read without git so a request path may count them."""
+
+    @pytest.fixture
+    def db(self, tmp_path: Path) -> RunsDbBuilder:
+        """A runs.db outside any git repository; the reader takes the connection and no repo."""
+        return RunsDbBuilder(tmp_path / 'not-a-repo' / 'runs.db')
+
+    def test_a_done_merge_counts_once_and_any_other_state_not_at_all(
+        self, db: RunsDbBuilder
+    ) -> None:
+        db.merge_done(at_hour(1.0), '401', 'sha-a')
+        db.merge_done(at_hour(2.0), '401', 'sha-a')
+        db.merge_state(at_hour(3.0), '402', 'blocked')
+        db.merge_state(at_hour(4.0), '403', 'superseded', superseded_by='404')
+
+        assert recorded_landing_keys(db.conn, recorded_after=None) == frozenset({('sha-a', '401')})
+
+    def test_a_coalesced_train_records_each_member_under_its_merge_commit(
+        self, db: RunsDbBuilder
+    ) -> None:
+        db.train_merged(at_hour(1.0), '503', ['501', '502', '503'], 'train-sha', 'base-sha')
+
+        assert recorded_landing_keys(db.conn, recorded_after=None) == frozenset({
+            ('train-sha', '501'), ('train-sha', '502'), ('train-sha', '503'),
+        })
+
+    def test_an_attributed_solo_passer_records_its_own_task(self, db: RunsDbBuilder) -> None:
+        db.train_attributed(at_hour(1.0), '601', 'train-x', 'solo-sha')
+
+        assert recorded_landing_keys(db.conn, recorded_after=None) == frozenset({
+            ('solo-sha', '601'),
+        })
+
+    def test_only_landings_recorded_strictly_after_the_instant_count(
+        self, db: RunsDbBuilder
+    ) -> None:
+        plus_one = timezone(timedelta(hours=1))
+        db.merge_done(at_hour(9.0), '701', 'before')
+        db.merge_done(at_hour(10.0).astimezone(plus_one), '702', 'at-the-instant')
+        db.merge_done(at_hour(10.5).astimezone(plus_one), '703', 'after')
+        db.train_merged(at_hour(11.0), '705', ['704', '705'], 'train-after', 'base')
+
+        assert recorded_landing_keys(db.conn, recorded_after=at_hour(10.0)) == frozenset({
+            ('after', '703'), ('train-after', '704'), ('train-after', '705'),
+        })
+
+    def test_an_unrecognised_train_payload_is_the_same_typed_refusal(
+        self, db: RunsDbBuilder
+    ) -> None:
+        db.event(at_hour(1.0), 'train_merged', '801', {'train_id': 'train-z', 'verdict': 'other'})
+
+        with pytest.raises(UnrecognisedTrainEvent):
+            recorded_landing_keys(db.conn, recorded_after=None)

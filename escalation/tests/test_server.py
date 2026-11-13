@@ -4949,14 +4949,34 @@ class TestGetMergeQueue:
     @staticmethod
     async def _finalize_through_gate(worker, entry) -> bool:
         """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
-        re-verify (task 6155), as
+        re-verify (task 6155) and following its rebased head when the gate's
+        re-verify became a dispatch (task 8525), as
         ``orchestrator/tests/_merge_queue_harness.py::finalize_through_gate``
         does for the orchestrator suite.  Returns True iff main advanced.
+
+        This suite's entries carry ``verify_task=None``, a pre-established
+        pass, so the followed head is launched as one too.
         """
+        from orchestrator.merge_lane.worker import InflightEntry
+
+        async def _launch_passed(head):
+            return InflightEntry(
+                item=head, lease=None, verify_task=None, merge_wt=head.merge_wt,
+                was_speculative=False,
+            )
+
         while True:
             advanced = await worker._finalize_inflight(entry)
-            if entry.gate is None:
-                return advanced
+            if entry.gate is not None:
+                continue
+            if advanced:
+                return True
+            followed = await worker.dispatch_parked_rebased_head(
+                entry.item.request.request_id, _launch_passed,
+            )
+            if followed is None:
+                return False
+            entry = followed
 
     def _make_finalize_fixture(
         self,

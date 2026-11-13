@@ -78,7 +78,8 @@ re-synced by **task 5566** at reify HEAD
 `63ac8d9b4b5faf761bf3fbe79339d56120f31431` (2026-09-17), which is where
 reify's task 7244 landed; nothing else was re-copied at that HEAD, so do not
 read the pair's dates as moving the anchor for the rest of the table. See
-Delta 11.
+Delta 11. Both files have since diverged from that re-sync on the merge arm:
+see Delta 19.
 
 **`warm-lane-gc.sh` carries a second, behaviour-only partial re-sync.** Its
 row stays at `973fde7955`, and that anchor still governs the rest of the
@@ -1110,7 +1111,8 @@ feeding idiom — is **unexercised here**, because nothing here calls it.
 names the split in its docstring rather than claiming whole-file coverage.
 
 **What the vendored lib still says about reify, and why it was left saying it.**
-`lib_task_citation.sh` is byte-identical to reify, header included, so it
+`lib_task_citation.sh` was byte-identical to reify, header included, until
+Delta 19, so it
 carries three references that resolve only there: line 16's rule *"DO NOT
 re-inline any ERE in a consumer … and `tests/infra/test_lib_task_citation.sh`
 fails if one reappears"*, and lines 74 and 111 citing that same file's Blocks G
@@ -1663,6 +1665,54 @@ header included, so one more comment hunk costs the drift check nothing.
 reify's own copy carries the same stale header, although reify's thin has
 sourced the lib since reify task 5823. That fix is left to reify. A future
 re-sync of this file must re-apply this hunk along with Delta 15's.
+
+### Delta 19 — `lib_task_citation.sh` and `warm-lane-degenerate-ref-check.sh` take the merge arm from `shared.merge_subject`
+
+**Both files now diverge from reify on the merge arm.** Added by **task 6716**
+(S14 δ, `plans/review-all-s14-shared-leaves-prd.md`): the merge-commit subject
+is one fact, defined once in `shared/src/shared/merge_subject.py`, and every
+dark-factory reader derives from it. The lib's merge arm spelled that subject
+itself, so it was a second definition.
+
+- **`lib_task_citation.sh`** no longer spells the merge subject on an
+  executable line. `task_citation_message_cites` takes two more parameters,
+  `<merge_head_re> <merge_into_re>`, and greps
+  `^<merge_head_re><id><merge_into_re>`; `task_citation_peer_ids` forwards
+  them. The pair is `shared/src/shared/merge_subject.py::rendered_prefix`'s ERE
+  `(head, into)`. Its own docstring defines that line form, so the arm stays a
+  prefix match: a superset of `git_ops.py`'s anchored `{merge_subject}` arm,
+  which the header's arm-by-arm comparison now says. The purity contract is
+  unchanged. The pair is a parameter, and both entry points refuse an empty
+  one: they print one line naming the two parameters to stderr and return 2,
+  with no verdict. Without that check an empty pair would turn the arm into
+  `^<id>`, which cites any line that starts with the id's digits.
+- **`warm-lane-degenerate-ref-check.sh`** renders the pair once, after argument
+  validation and before the structural preflight. It locates `shared/src` three
+  levels above `SCRIPT_DIR` by path arithmetic (no `dirname` fork, Delta 7),
+  checks `shared/merge_subject.py` exists there, and runs
+  `python3 -I -c` with that directory as the only added `sys.path` entry. The
+  module is stdlib-only, so no venv is preferred, unlike `lib_lane_state.sh`'s
+  bridge (Delta 4).
+
+**Failure mode: exit 2.** A missing `shared/src`, no `python3`, a non-zero
+render, or output that is not a non-empty head/into pair prints one `[error]`
+line naming `shared.merge_subject.rendered_prefix`, the interpreter and
+`shared_src`, then exits 2. That is the wiring class of a missing lib (Delta 11).
+There is no static fallback, because a fallback would be a second spelling of
+the subject. The caller is already fail-soft:
+`GitOps.warm_lane_ref_is_degenerate` reads every non-zero exit as
+not-degenerate.
+
+This ends Delta 11's "byte-identical to reify" for `lib_task_citation.sh`. A
+re-sync of either file from reify must re-apply this delta. reify's consumers
+call the three-argument form, and this copy's two extra parameters are not
+optional: a three-argument call returns 2 rather than a verdict.
+
+**Pinned by** `orchestrator/tests/warm-lane/test_warm_lane_degenerate_ref.sh`
+Block M (tests README Delta 9), and by
+`orchestrator/tests/test_merge_subject_readers.py::TestLibTaskCitationFedRenderedPrefix`.
+The latter feeds the lib a `rendered_prefix` pair, and a pair rendered for
+another prefix must not cite.
 
 ## Sibling-seed defaults, and who resolves them
 

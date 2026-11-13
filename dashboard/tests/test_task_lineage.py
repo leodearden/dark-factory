@@ -267,7 +267,7 @@ class TestAcquireLineage:
         self, dummy_client, dummy_config, quick_waits, monkeypatch,
     ):
         monkeypatch.setattr(task_lineage, 'LINEAGE_READ_TIMEOUT', 5.0)
-        canned = CannedMCP(_rows(), projection_delay=0.5)
+        canned = CannedMCP(_rows(), metadata_projection_delay=0.5)
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             loop = asyncio.get_running_loop()
             started = loop.time()
@@ -420,12 +420,12 @@ class TestAcquireLineage:
     async def test_a_read_abandoned_by_clear_does_not_repopulate_the_store(
         self, dummy_client, dummy_config, quick_waits,
     ):
-        canned = CannedMCP(_rows(), projection_delay=0.15)
+        canned = CannedMCP(_rows(), metadata_projection_delay=0.15)
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
             clear_lineage_state()
             await asyncio.sleep(0.25)
-            canned.projection_delay = 0.0
+            canned.metadata_projection_delay = 0.0
             datum = await acquire_lineage(
                 dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=1),
             )

@@ -720,3 +720,15 @@ graphs. They are not trigger measurements.
   decide whether a stronger extraction model belongs among the levers.
 * Sidecar retention (task 7487) now **depends on 9040**. No rows may be
   pruned until 9040 has ruled, because its evidence is in the sidecar.
+
+### 10.4 Re-opened lever choice (task 9040, 2026-11-10)
+
+Task 9040 measured the re-opened choice in
+`docs/ruling-overreach-lever-reopen-2026-11-10/`, whose `design.md` is now
+authoritative over §6.1 here. O1, replayed on the same 48 episodes, reduced
+overreach to 0.59× per minted edge and 0.72× per day, short of the halving
+bar. The O3+O4 composite retired flagged edges at 0.937 precision [0.811–0.981].
+So **the composite, as it runs today, is the lever**: the judge stays
+record-only, Stage 1 keeps retiring its flags, the §6.1 trigger to an
+enforcing marker is withdrawn, and a stronger extraction model (O6) is the
+next lever to measure, with a costed trigger.

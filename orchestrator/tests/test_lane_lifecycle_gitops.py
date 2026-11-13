@@ -19,9 +19,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _review_loop_harness import review_loop_workflow
 from _review_payloads import blocking_review
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
@@ -49,7 +49,7 @@ from orchestrator.workflow import WorkflowOutcome
 # jumps by those three orders with no other signal.
 # WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
 # ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

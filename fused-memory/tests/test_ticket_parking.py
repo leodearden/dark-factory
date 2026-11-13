@@ -30,6 +30,7 @@ from _curator_helpers import (
 )
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.usage_gate import PoolFrozen
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.middleware.candidate_key import normalize_title
@@ -45,6 +46,8 @@ from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ROOT = '/project'
 RESOLVE_DEADLINE_SECONDS = 30.0
@@ -314,6 +317,7 @@ class TestUncappedCurationUnchanged:
         }
         assert taskmaster.added_metadata() == [{
             **_FILED_METADATA, 'task_kind': 'deterministic', 'always_escalates': True,
+            'pure_gate_from': 'operational_ask_registry',
         }]
 
 

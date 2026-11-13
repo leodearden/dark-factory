@@ -37,6 +37,9 @@ from fused_memory.reconciliation.consolidation_gate import (
     build_consolidation_gate_task,
 )
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _EXECUTOR_FAKES_PATH = (
     Path(__file__).resolve().parents[2] / 'fused-memory' / 'tests' / '_auto_consolidation_fakes.py'

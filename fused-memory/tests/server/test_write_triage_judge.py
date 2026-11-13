@@ -31,7 +31,7 @@ import subprocess
 import sys
 import types
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -43,7 +43,8 @@ import pytest
 from _mock_openai_server import mock_openai_server
 from _real_openai_sdk import connect_error, connect_timeout, read_timeout, real_sdk_over
 from _sdk_client_stubs import sdk_client_double
-from _unreached_provider import skip_if_provider_unreached
+from _unreached_provider import FailOpenCauses, skip_if_provider_unreached
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import (
@@ -107,6 +108,8 @@ from fused_memory.server.write_triage_judge import (
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
 from fused_memory.utils.clip_disclosure import TruncationFact, elision_marker
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _payload(word: object, candidate_id: object = None) -> str:
@@ -2886,17 +2889,30 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         assert counter.live_count() == 0
 
 
-def _frontier_arm_judge(
-    verdicts: list[TriageJudgeVerdict],
-) -> Callable[..., Awaitable[TriageJudgeVerdict]]:
-    """`judge_write`, recording each verdict into *verdicts*; it skips only when the provider was never reached."""
+_UNREACHED_PROVIDER_CASES = [
+    pytest.param(connect_timeout, 'ConnectTimeout', id='connect-timeout'),
+    pytest.param(connect_error, 'ConnectError', id='connect-error'),
+]
+
+
+async def _frontier_arm_triage(
+    service: Any, *, content: str, verdicts: list[TriageJudgeVerdict],
+) -> BandDecision:
+    """`triage_write` through `judge_write`, recording each verdict; a fail-open skips only when its cause was an unreached provider."""
 
     async def _judge(**kwargs: Any) -> TriageJudgeVerdict:
-        verdict = await skip_if_provider_unreached(judge_write(**kwargs))
+        verdict = await judge_write(**kwargs)
         verdicts.append(verdict)
         return verdict
 
-    return _judge
+    counter = TriageFailOpenCounter()
+    causes = FailOpenCauses()
+    decision = await triage_write(
+        service, content=content, project_id='p',
+        counter=counter, judge=causes.recording(_judge),
+    )
+    causes.assert_no_fail_open_unless_unreached(counter.live_count())
+    return decision
 
 
 @pytest.mark.integration
@@ -2933,13 +2949,10 @@ class TestTheFrontierArmLive:
             config=config, search=AsyncMock(return_value=SearchResults(slate)),
         )
         verdicts: list[TriageJudgeVerdict] = []
-        counter = TriageFailOpenCounter()
-        decision = await triage_write(
-            service, content=duplicate['content'], project_id='p',
-            counter=counter, judge=_frontier_arm_judge(verdicts),
+        decision = await _frontier_arm_triage(
+            service, content=duplicate['content'], verdicts=verdicts,
         )
 
-        assert counter.live_count() == 0
         assert decision.outcome in TRIAGE_OUTCOMES
         if decision.judged_candidate_id is not None:
             assert decision.judged_candidate_id in {result.id for result in slate}
@@ -2961,53 +2974,52 @@ def _failing_on_skip(instead: str) -> Iterator[None]:
 
 
 class TestTheFrontierArmSkipGuard:
-    """`_frontier_arm_judge` skips only an unreached provider; any other judge failure fails open and stays red."""
+    """`_frontier_arm_triage` skips only when the judge's fail-open was an unreached provider; any other fail-open fails the live test."""
 
     @pytest.mark.asyncio
-    async def test_a_connect_timeout_skips_naming_the_unreached_host(self) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)), \
+    @pytest.mark.parametrize(('handler', 'cause'), _UNREACHED_PROVIDER_CASES)
+    async def test_an_unreached_provider_skips_naming_the_host_and_cause(
+        self, handler: Callable[[httpx.Request], httpx.Response], cause: str,
+    ) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
-            await triage_write(
-                _mid_band_service(), content='c', project_id='p',
-                counter=TriageFailOpenCounter(), judge=_frontier_arm_judge([]),
-            )
+            await _frontier_arm_triage(_mid_band_service(), content='c', verdicts=[])
 
         reason = str(excinfo.value)
         assert 'api.openai.com' in reason
-        assert 'ConnectTimeout' in reason
+        assert cause in reason
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('construct', 'write_triage'),
+        ('construct', 'write_triage', 'recorded'),
         [
-            pytest.param(_hanging_sdk, {'judge_timeout_seconds': 0.01}, id='budget-expiry'),
-            pytest.param(real_sdk_over(connect_error), {}, id='connect-error'),
-            pytest.param(real_sdk_over(read_timeout), {}, id='read-timeout'),
+            pytest.param(
+                _hanging_sdk, {'judge_timeout_seconds': 0.01}, 'TimeoutError',
+                id='budget-expiry',
+            ),
+            pytest.param(real_sdk_over(read_timeout), {}, 'APITimeoutError', id='read-timeout'),
             pytest.param(
                 real_sdk_over(lambda request: httpx.Response(500, request=request)), {},
-                id='provider-5xx',
+                'InternalServerError', id='provider-5xx',
             ),
             pytest.param(
                 real_sdk_over(lambda request: httpx.Response(429, request=request)), {},
-                id='provider-429',
+                'RateLimitError', id='provider-429',
             ),
         ],
     )
     async def test_any_other_judge_failure_fails_open_and_keeps_the_live_test_red(
-        self, construct: Callable[..., object], write_triage: dict[str, Any],
+        self, construct: Callable[..., object], write_triage: dict[str, Any], recorded: str,
     ) -> None:
-        counter = TriageFailOpenCounter()
         verdicts: list[TriageJudgeVerdict] = []
 
         with patch('openai.AsyncOpenAI', side_effect=construct), \
-                _failing_on_skip('failing open'):
-            decision = await triage_write(
-                _mid_band_service(**write_triage), content='c', project_id='p',
-                counter=counter, judge=_frontier_arm_judge(verdicts),
+                _failing_on_skip('failing'), pytest.raises(pytest.fail.Exception) as excinfo:
+            await _frontier_arm_triage(
+                _mid_band_service(**write_triage), content='c', verdicts=verdicts,
             )
 
-        assert decision.outcome == OUTCOME_STORED
-        assert counter.live_count() == 1
+        assert recorded in str(excinfo.value)
         assert verdicts == []
 
 
@@ -3022,14 +3034,15 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
 async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
     """`judge_write`'s verdict; no verdict for a provider-side reason skips, every other failure stays red.
 
-    A budget expiry, a provider 5xx, a transient 429 and a connect timeout (the provider was
-    never reached) each yield no verdict, so they say nothing about the wording. Connection
-    errors other than a connect timeout, read or SDK timeouts with no connect-timeout cause,
+    A budget expiry, a provider 5xx, a transient 429 and a connect-phase failure (the provider
+    was never reached) each yield no verdict, so they say nothing about the wording. Connection
+    failures after the connect phase, read or SDK timeouts with no connect-phase cause,
     other 4xx and unusable answers stay red, and so does a 429 whose code is
     `insufficient_quota`: an account out of credit is a lasting fault, and skipping it would
     silently retire every wording check on every run.
-    TestTheFrontierArmLive skips only an unreached provider and keeps a judge-budget expiry
-    red: it is the live edge for the fail-open/latency dimension.
+    TestTheFrontierArmLive applies the same unreached-provider rule to the judge's fail-open
+    (`_frontier_arm_triage`) and keeps a judge-budget expiry red: it is the live edge for the
+    fail-open/latency dimension.
     """
     try:
         return await skip_if_provider_unreached(judge_write(**judge_kwargs))
@@ -3087,14 +3100,17 @@ class TestTheLiveWordingBudgetGuard:
         assert '0.01' in reason
 
     @pytest.mark.asyncio
-    async def test_a_connect_timeout_skips_naming_the_unreached_host(self) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)), \
+    @pytest.mark.parametrize(('handler', 'cause'), _UNREACHED_PROVIDER_CASES)
+    async def test_an_unreached_provider_skips_naming_the_host_and_cause(
+        self, handler: Callable[[httpx.Request], httpx.Response], cause: str,
+    ) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
             await _live_judge_verdict(**self._judge_kwargs())
 
         reason = str(excinfo.value)
         assert 'api.openai.com' in reason
-        assert 'ConnectTimeout' in reason
+        assert cause in reason
 
     @pytest.mark.asyncio
     async def test_a_verdict_is_returned_as_is(self) -> None:
@@ -3141,17 +3157,8 @@ class TestTheLiveWordingBudgetGuard:
         assert excinfo.value is error
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        'handler',
-        [
-            pytest.param(connect_error, id='connect-error'),
-            pytest.param(read_timeout, id='read-timeout'),
-        ],
-    )
-    async def test_a_connection_failure_other_than_a_connect_timeout_stays_red(
-        self, handler: Callable[[httpx.Request], httpx.Response],
-    ) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
+    async def test_a_read_timeout_after_connect_stays_red(self) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(read_timeout)), \
                 _raises_without_skipping(openai.APIConnectionError):
             await _live_judge_verdict(**self._judge_kwargs())
 

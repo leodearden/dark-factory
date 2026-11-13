@@ -14,6 +14,10 @@ import sys
 
 import pytest
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _CHILD = """
 import json, os, sys
 from shared.systemd_listeners import take_systemd_listeners

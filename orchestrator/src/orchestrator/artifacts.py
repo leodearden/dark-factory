@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import re
 import shutil
 import stat
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager, nullcontext
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 from shared import safe_io
 from shared.plan_deviation import DeviationRecord
@@ -23,6 +25,7 @@ from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
 from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
+from orchestrator.scope_drift import InvalidScopeRequest, ScopeDriftReport, ScopeRequest
 
 logger = logging.getLogger(__name__)
 
@@ -35,21 +38,6 @@ PLAN_MUTEX_TIMEOUT_SECS = 60.0
 
 ORCHESTRATOR_ITERATION_SOURCES: frozenset[str] = frozenset({'orchestrator', 'amendment'})
 """The only ``source`` values :meth:`TaskArtifacts.append_iteration_log` writes."""
-
-
-def _plan_stamp(plan: Mapping[str, object], key: str) -> str | None:
-    stamped = plan.get(key)
-    return stamped if isinstance(stamped, str) and stamped else None
-
-
-def plan_base_commit(plan: Mapping[str, object]) -> str | None:
-    """The main SHA *plan* was last validated against (plans/task-meta-task-keying-prd.md §M2); None when unstamped or malformed."""
-    return _plan_stamp(plan, PLAN_BASE_COMMIT_KEY)
-
-
-def plan_task_text_fp(plan: Mapping[str, object]) -> str | None:
-    """The task-text fingerprint *plan* was authored against; None when unstamped or malformed."""
-    return _plan_stamp(plan, PLAN_TASK_TEXT_FP_KEY)
 
 
 def iteration_entry_written_by_orchestrator(entry: object) -> bool:
@@ -301,6 +289,328 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     return plan, modified
 
 
+class PlanState(StrEnum):
+    SHELL = 'shell'
+    PARTIAL = 'partial'
+    CONFIRMED = 'confirmed'
+    STAMPED = 'stamped'
+
+
+class PlanConfirmation(StrEnum):
+    ARCHITECT = 'architect'
+    INJECTED = 'injected'
+
+
+_LIFECYCLE_KEYS: Mapping[str, str] = MappingProxyType({
+    'session_id': '_session_id',
+    'created_at': '_created_at',
+    'confirmed_at': '_finalized_at',
+    'confirmed_by': '_confirmed_by',
+    'revalidated_at': '_revalidated_at',
+    'revalidated_by_session': '_revalidated_by_session',
+    'task_text_fp': PLAN_TASK_TEXT_FP_KEY,
+    'base_commit': PLAN_BASE_COMMIT_KEY,
+    'schema_version': '_schema_version',
+})
+_LIFECYCLE_DISK_KEYS = frozenset(_LIFECYCLE_KEYS.values())
+_CONFIRMER_VALUES = frozenset(confirmer.value for confirmer in PlanConfirmation)
+_LIFECYCLE_REQUIREMENTS: Mapping[str, str] = MappingProxyType({
+    'confirmed_by': 'must be a PlanConfirmation or None',
+    'schema_version': 'must be an int (not a bool) or None',
+})
+_STR_LIFECYCLE_REQUIREMENT = 'must be a non-empty str or None'
+
+
+def _well_formed(name: str, value: object) -> bool:
+    """Whether *value* may be held by the set PlanLifecycle field *name*: the one definition parse and construction share."""
+    if name == 'confirmed_by':
+        return isinstance(value, PlanConfirmation)
+    if name == 'schema_version':
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, str) and bool(value)
+
+
+def _unpaired_confirmer(confirmed_by: object, confirmed_at: object) -> bool:
+    return confirmed_by is not None and confirmed_at is None
+
+
+def _malformed_lifecycle(name: str, value: object, requirement: str) -> ValueError:
+    return ValueError(f'PlanLifecycle.{name} {requirement}; got {value!r}')
+
+
+@dataclass(frozen=True)
+class PlanLifecycle:
+    """The typed lifecycle markers of a plan document; a field is None when absent on disk."""
+
+    session_id: str | None = None
+    created_at: str | None = None
+    confirmed_at: str | None = None
+    confirmed_by: PlanConfirmation | None = None
+    revalidated_at: str | None = None
+    revalidated_by_session: str | None = None
+    task_text_fp: str | None = None
+    base_commit: str | None = None
+    schema_version: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in _LIFECYCLE_KEYS:
+            value = getattr(self, name)
+            if value is not None and not _well_formed(name, value):
+                raise _malformed_lifecycle(name, value, _LIFECYCLE_REQUIREMENTS.get(name, _STR_LIFECYCLE_REQUIREMENT))
+        if _unpaired_confirmer(self.confirmed_by, self.confirmed_at):
+            raise _malformed_lifecycle('confirmed_by', self.confirmed_by, 'is set without confirmed_at')
+
+    @property
+    def confirmation(self) -> PlanConfirmation | None:
+        """Who confirmed the plan; a legacy marker with no confirmer reads as the architect."""
+        if self.confirmed_at is None:
+            return None
+        return self.confirmed_by or PlanConfirmation.ARCHITECT
+
+    def owned_by(self, session_id: str) -> bool:
+        """Whether *session_id* planned this plan or last revalidated it."""
+        return session_id in (self.session_id, self.revalidated_by_session)
+
+    def markers_present(self) -> tuple[str, ...]:
+        """The on-disk keys of the fields that are set, sorted."""
+        return tuple(sorted(key for name, key in _LIFECYCLE_KEYS.items() if getattr(self, name) is not None))
+
+
+def _decoded_marker(name: str, value: object) -> object:
+    if name == 'confirmed_by' and isinstance(value, str) and value in _CONFIRMER_VALUES:
+        return PlanConfirmation(value)
+    return value
+
+
+def _parse_lifecycle(data: Mapping[str, object]) -> tuple[PlanLifecycle, frozenset[str]]:
+    """The typed lifecycle of *data*, and the lifecycle-named keys whose values are malformed."""
+    fields: dict[str, Any] = {}
+    malformed: set[str] = set()
+    for name, key in _LIFECYCLE_KEYS.items():
+        if key not in data:
+            continue
+        value = _decoded_marker(name, data[key])
+        if _well_formed(name, value):
+            fields[name] = value
+        else:
+            malformed.add(key)
+    if _unpaired_confirmer(fields.get('confirmed_by'), fields.get('confirmed_at')):
+        del fields['confirmed_by']
+        malformed.add(_LIFECYCLE_KEYS['confirmed_by'])
+    return PlanLifecycle(**fields), frozenset(malformed)
+
+
+def plan_base_commit(plan: Mapping[str, object]) -> str | None:
+    """The main SHA *plan* was last validated against (plans/task-meta-task-keying-prd.md §M2); None when unstamped or malformed."""
+    return _parse_lifecycle(plan)[0].base_commit
+
+
+def plan_task_text_fp(plan: Mapping[str, object]) -> str | None:
+    """The task-text fingerprint *plan* was authored against; None when unstamped or malformed."""
+    return _parse_lifecycle(plan)[0].task_text_fp
+
+
+def _frozen(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _frozen(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_frozen(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _thawed(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thawed(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thawed(item) for item in value]
+    return copy.deepcopy(value)
+
+
+def _is_step_list(value: object) -> bool:
+    return isinstance(value, (list, tuple)) and all(isinstance(step, Mapping) for step in value)
+
+
+def _freeze_steps(steps: list | tuple) -> tuple[Mapping[str, Any], ...]:
+    return tuple(_frozen(step) for step in steps)
+
+
+def _freeze_body(body: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType({key: _frozen(value) for key, value in body.items()})
+
+
+class PlanNotConfirmed(ValueError):
+    """A lifecycle move that needs a confirmed plan met a plan in another state."""
+
+    def __init__(self, *, task_id: object, state: PlanState, markers: tuple[str, ...], action: str) -> None:
+        self.task_id = task_id
+        self.state = state
+        self.markers = markers
+        self.action = action
+        super().__init__(
+            f'cannot {action} the plan of task {task_id!r} in state {state.value!r}; '
+            f'lifecycle markers present: {list(markers)}'
+        )
+
+
+@dataclass(frozen=True)
+class Plan:
+    """One plan.json document: the typed lifecycle, the steps, and every other key verbatim.
+
+    Immutable all the way down: nested mappings are read-only proxies and
+    lists are tuples. :meth:`to_json` hands back a fresh, editable document.
+    """
+
+    lifecycle: PlanLifecycle
+    steps: tuple[Mapping[str, Any], ...]
+    body: Mapping[str, Any]
+    key_order: tuple[str, ...] = field(default=(), compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        shadowed = sorted(set(self.lifecycle.markers_present()) & set(self.body))
+        if shadowed:
+            raise ValueError(f'Plan body repeats lifecycle keys its lifecycle sets: {shadowed}')
+        if 'steps' in self.body and (self.steps or _is_step_list(self.body['steps'])):
+            raise ValueError("Plan body holds 'steps' that belong in the steps tuple")
+
+    @property
+    def state(self) -> PlanState:
+        if not self.steps:
+            return PlanState.SHELL
+        if self.lifecycle.confirmed_at is None:
+            return PlanState.PARTIAL
+        if self.lifecycle.session_id is None:
+            return PlanState.CONFIRMED
+        return PlanState.STAMPED
+
+    @classmethod
+    def from_json(cls, data: object) -> Plan:
+        if not isinstance(data, Mapping):
+            raise TypeError(f'a plan document must be a mapping, not {type(data).__name__}')
+        lifecycle, malformed = _parse_lifecycle(data)
+        typed_steps = _is_step_list(data.get('steps'))
+        body = {
+            key: value for key, value in data.items()
+            if (key not in _LIFECYCLE_DISK_KEYS or key in malformed) and not (key == 'steps' and typed_steps)
+        }
+        return cls(
+            lifecycle=lifecycle,
+            steps=_freeze_steps(data['steps']) if typed_steps else (),
+            body=_freeze_body(body),
+            key_order=tuple(data),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        fresh = {key: _thawed(value) for key, value in self.body.items()}
+        if 'steps' not in fresh and (self.steps or 'steps' in self.key_order):
+            fresh['steps'] = [_thawed(step) for step in self.steps]
+        for name, key in _LIFECYCLE_KEYS.items():
+            value = getattr(self.lifecycle, name)
+            if value is not None:
+                fresh[key] = value.value if isinstance(value, PlanConfirmation) else value
+        document = {key: fresh[key] for key in self.key_order if key in fresh}
+        document.update(fresh)
+        return document
+
+    def recreated(
+        self, *, task_id: str, title: str, analysis: str, files: list[str], carried: Mapping[str, Any],
+    ) -> Plan:
+        """The fresh create_plan shell that replaces this plan wholesale, carrying *carried* keys.
+
+        Nothing of this plan survives, its lifecycle included.
+        """
+        refused = sorted((_LIFECYCLE_DISK_KEYS | {'steps'}) & set(carried))
+        if refused:
+            raise ValueError(f'create_plan cannot carry lifecycle keys or steps: {refused}')
+        return Plan.from_json({
+            'task_id': task_id, 'title': title, 'analysis': analysis, 'files': files,
+            'prerequisites': [], 'steps': [], 'design_decisions': [], 'reuse': [], 'dropped_files': [], **carried,
+        })
+
+    def restructured(self, **changes: Any) -> Plan:
+        """A step-set edit: *changes* applied and confirmation cleared."""
+        return self._with_body(changes)._with_markers(confirmed_at=None, confirmed_by=None)
+
+    def confirmed(self, *, at: str, by: PlanConfirmation) -> Plan:
+        """Confirmed at *at* by *by*, which dates the LATEST confirm, never the first.
+
+        Also sets ``revalidated_at``, the fallback after ``created_at`` that
+        ``workflow.py::TaskWorkflow._can_skip_revalidation`` ages the plan by.
+        Only :meth:`restructured` and :meth:`recreated` clear a confirmation.
+        """
+        if not self.steps:
+            raise self._refusal('confirm')
+        return self._with_markers(confirmed_at=at, confirmed_by=by, revalidated_at=at)
+
+    def stamped(self, *, session_id: str, at: str, task_text_fp: str | None, base_commit: str | None) -> Plan:
+        if self.state not in (PlanState.CONFIRMED, PlanState.STAMPED):
+            raise self._refusal('stamp')
+        markers: dict[str, str] = {'session_id': session_id, 'created_at': at}
+        if task_text_fp:
+            markers['task_text_fp'] = task_text_fp
+        if base_commit:
+            markers['base_commit'] = base_commit
+        return self._with_markers(**markers)
+
+    def with_files(self, files: list[str], *, owner: str, at: str) -> Plan:
+        """A files-only edit that keeps confirmation and makes *owner* own the plan."""
+        edited = self._with_body({'files': files})
+        if self.lifecycle.owned_by(owner):
+            return edited
+        return edited._with_markers(session_id=owner, created_at=self.lifecycle.created_at or at)
+
+    def revalidated(self, *, at: str, by_session: str, base_commit: str | None) -> Plan:
+        markers: dict[str, str] = {'revalidated_at': at, 'revalidated_by_session': by_session}
+        if base_commit:
+            markers['base_commit'] = base_commit
+        return self._with_markers(**markers)
+
+    def confirmed_since(self, pre: Plan) -> bool:
+        """Whether this plan carries a confirmation *pre* did not."""
+        confirmed_at = self.lifecycle.confirmed_at
+        return confirmed_at is not None and confirmed_at != pre.lifecycle.confirmed_at
+
+    def with_lifecycle(self, lifecycle: PlanLifecycle) -> Plan:
+        return self._under(lifecycle, stripped=frozenset(lifecycle.markers_present()))
+
+    def _with_markers(self, **fields: Any) -> Plan:
+        return self._under(
+            replace(self.lifecycle, **fields), stripped=frozenset(_LIFECYCLE_KEYS[name] for name in fields),
+        )
+
+    def _under(self, lifecycle: PlanLifecycle, *, stripped: frozenset[str]) -> Plan:
+        body = MappingProxyType({key: value for key, value in self.body.items() if key not in stripped})
+        return Plan(lifecycle=lifecycle, steps=self.steps, body=body, key_order=self.key_order)
+
+    def _with_body(self, changes: Mapping[str, Any]) -> Plan:
+        refused = sorted(_LIFECYCLE_DISK_KEYS & set(changes))
+        if refused:
+            raise ValueError(f'lifecycle keys cannot change through a body edit: {refused}')
+        body = dict(self.body)
+        steps = self.steps
+        key_order = self.key_order
+        if 'steps' in changes:
+            body.pop('steps', None)
+            if _is_step_list(changes['steps']):
+                steps = _freeze_steps(changes['steps'])
+                if 'steps' not in key_order:
+                    key_order = (*key_order, 'steps')
+            else:
+                steps = ()
+                body['steps'] = changes['steps']
+        body.update((key, value) for key, value in changes.items() if key != 'steps')
+        return Plan(lifecycle=self.lifecycle, steps=steps, body=_freeze_body(body), key_order=key_order)
+
+    def _refusal(self, action: str) -> PlanNotConfirmed:
+        return PlanNotConfirmed(
+            task_id=self.body.get('task_id'), state=self.state,
+            markers=self.lifecycle.markers_present(), action=action,
+        )
+
+
+def _at_current_schema(plan: Plan) -> Plan:
+    return plan.with_lifecycle(replace(plan.lifecycle, schema_version=PLAN_SCHEMA_VERSION))
+
+
 _VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 
 
@@ -368,6 +678,8 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'ready_to_merge.json': ArtifactRoot.LANE,
     'false_premise.json': ArtifactRoot.LANE,
     'unactionable_task.json': ArtifactRoot.LANE,
+    'scope_requests.json': ArtifactRoot.LANE,
+    'scope_drift_brief.json': ArtifactRoot.TASK,
     'plan.json': ArtifactRoot.TASK,
     'plan.lock': ArtifactRoot.TASK,
     'iterations.jsonl': ArtifactRoot.TASK,
@@ -670,40 +982,52 @@ class TaskArtifacts:
         workflow in the orchestrator stalls. Keep critical sections short, and
         never hold one across a subprocess the plan does not depend on.
         """
-        lock_path = self._plan_mutex_path()
+        with self._artifact_mutex('plan.json'):
+            yield
+
+    @contextmanager
+    def _artifact_mutex(self, name: str) -> Iterator[None]:
+        """The cross-process lock for a read-modify-write of artifact *name*.
+
+        The policy :meth:`plan_mutex` documents, for any artifact: keyed on
+        the RESOLVED path, and no lock once the root is gone.
+        """
+        lock_path = self._artifact_mutex_path(name)
         if lock_path is None:
             yield
             return
         with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
             yield
 
-    def _plan_mutex_path(self) -> Path | None:
-        lock_path = Path(os.path.realpath(self.artifact_path('plan.json'))).with_name('plan.json.mutex')
+    def _artifact_mutex_path(self, name: str) -> Path | None:
+        lock_path = Path(os.path.realpath(self.artifact_path(name))).with_name(f'{name}.mutex')
         return lock_path if lock_path.parent.is_dir() else None
 
-    def write_plan(self, plan: dict, *, mutex_held: bool = False) -> None:
-        """Write .task/plan.json — the structured plan.
+    def write_plan_model(self, plan: Plan, *, mutex_held: bool = False) -> Plan:
+        """Write .task/plan.json, stamped with the current schema version: its only writer.
+
+        Returns the Plan as written, which is *plan* at the current schema version.
 
         A bare overwrite holds ``plan_mutex()`` for the write alone. The write
         that ends a read-modify-write passes ``mutex_held=True``, a claim that
         is VERIFIED: if the calling thread does not hold the mutex it raises
         :class:`PlanMutexNotHeld` and writes nothing.
         """
-        plan['_schema_version'] = PLAN_SCHEMA_VERSION
-        if mutex_held:
-            self._write_held_plan(plan)
-            return
-        with self.plan_mutex():
-            self._write_held_plan(plan)
+        written = _at_current_schema(plan)
+        with nullcontext() if mutex_held else self.plan_mutex():
+            lock_path = self._artifact_mutex_path('plan.json')
+            if lock_path is not None and not file_mutex.held(lock_path):
+                raise PlanMutexNotHeld(
+                    f'{self.artifact_path("plan.json")} reached its write without {lock_path} held: '
+                    'run the whole read-modify-write inside plan_mutex()'
+                )
+            self._write_json('plan.json', written.to_json())
+        return written
 
-    def _write_held_plan(self, plan: dict) -> None:
-        lock_path = self._plan_mutex_path()
-        if lock_path is not None and not file_mutex.held(lock_path):
-            raise PlanMutexNotHeld(
-                f'{self.artifact_path("plan.json")} reached its write without {lock_path} held: '
-                'run the whole read-modify-write inside plan_mutex()'
-            )
-        self._write_json('plan.json', plan)
+    def write_plan(self, plan: dict, *, mutex_held: bool = False) -> None:
+        """The dict adapter over :meth:`write_plan_model`; also stamps the schema version on *plan* itself."""
+        plan['_schema_version'] = PLAN_SCHEMA_VERSION
+        self.write_plan_model(Plan.from_json(plan), mutex_held=mutex_held)
 
     def ensure_lane_symlinks(self) -> None:
         """Expose each ``LANE_SYMLINKED_ARTIFACTS`` name in the lane ``.task/``.
@@ -765,6 +1089,76 @@ class TaskArtifacts:
         subsequent architect invocation does not see a stale report.
         """
         self._clear_path('blocking_dependency.json')
+
+    def write_scope_request(self, request: ScopeRequest) -> int:
+        """Record a writer agent's request to add an existing file to its scope.
+
+        One entry per path: a repeat replaces the earlier entry and moves to
+        the end. Returns how many requests are now pending. The plan-tools
+        server runs concurrent tool calls on threads, so the read-modify-write
+        holds its :meth:`_artifact_mutex`. The workflow applies and removes
+        them at each writer boundary
+        (``workflow.py::TaskWorkflow._apply_scope_requests``).
+        """
+        with self._artifact_mutex('scope_requests.json'):
+            kept = [r for r in self.read_scope_requests() if r.path != request.path]
+            entries = [r.to_mapping() for r in (*kept, request)]
+            self._write_json('scope_requests.json', {'requests': entries})
+            return len(entries)
+
+    def read_scope_requests(self) -> tuple[ScopeRequest, ...]:
+        """The recorded scope requests in write order; each invalid entry is dropped with a warning."""
+        data = self._read_json_object('scope_requests.json') or {}
+        entries = data.get('requests', [])
+        if not isinstance(entries, list):
+            logger.warning('Malformed scope_requests.json: requests is %r', entries)
+            return ()
+        requests: list[ScopeRequest] = []
+        for entry in entries:
+            try:
+                requests.append(ScopeRequest.from_mapping(entry))
+            except InvalidScopeRequest as exc:
+                logger.warning('Dropping scope request %r from scope_requests.json: %s', entry, exc)
+        return tuple(requests)
+
+    def clear_scope_requests(self, applied: Iterable[ScopeRequest]) -> None:
+        """Remove the *applied* requests, keeping any filed since they were read.
+
+        The artifact goes once nothing is left in it.
+        """
+        done = set(applied)
+        with self._artifact_mutex('scope_requests.json'):
+            remaining = [r for r in self.read_scope_requests() if r not in done]
+            if remaining:
+                self._write_json(
+                    'scope_requests.json', {'requests': [r.to_mapping() for r in remaining]},
+                )
+            else:
+                self._clear_path('scope_requests.json')
+
+    def read_scope_drift_brief(self) -> ScopeDriftReport | None:
+        """The scope-drift report no writer session has received yet, or None.
+
+        TASK-rooted, so a brief outlives the dispatch that recorded it: a
+        requeue or restart before the next writer session still briefs it.
+        Only the workflow writes it, and reads it once per dispatch
+        (``workflow.py::TaskWorkflow._hold_scope_drift_brief``). A malformed
+        file reads as None with a warning.
+        """
+        data = self._read_json_object('scope_drift_brief.json')
+        if data is None:
+            return None
+        try:
+            return ScopeDriftReport.from_event_data(data)
+        except ValueError as exc:
+            logger.warning('Ignoring malformed scope_drift_brief.json: %s', exc)
+            return None
+
+    def write_scope_drift_brief(self, report: ScopeDriftReport) -> None:
+        self._write_json('scope_drift_brief.json', report.event_data())
+
+    def clear_scope_drift_brief(self) -> None:
+        self._clear_path('scope_drift_brief.json')
 
     # ──────────────────────────────────────────────────────────────────
     # Architect task-rejection artifacts (paired with plan-tools MCP)
@@ -1060,34 +1454,46 @@ class TaskArtifacts:
 
     def read_plan(self) -> dict:
         """Read current plan state, auto-normalizing malformed shapes."""
-        plan, modified = self._read_normalized_plan()
-        if not modified:
-            return plan
-        with self.plan_mutex():
-            plan, modified = self._read_normalized_plan()
-            if modified:
-                logger.warning(
-                    'Plan normalization applied — writing corrected plan to %s',
-                    self.artifact_path('plan.json'),
-                )
-                self._write_held_plan(plan)
-        return plan
+        plan = self.read_plan_model()
+        return plan.to_json() if plan is not None else {}
 
     def peek_plan(self) -> dict:
-        """Return the plan exactly as :meth:`read_plan` would, but never repair
-        it on disk: no ``plan_mutex`` is taken and nothing is written.
+        """Return the plan exactly as :meth:`read_plan` would, but never repair it on disk."""
+        plan = self.peek_plan_model()
+        return plan.to_json() if plan is not None else {}
 
-        For observers that poll a live task's plan (such as
+    def read_plan_model(self) -> Plan | None:
+        """The plan, None iff plan.json is absent; a malformed shape is repaired on disk and returned as written."""
+        document, modified = self._read_normalized_plan()
+        if modified:
+            with self.plan_mutex():
+                document, modified = self._read_normalized_plan()
+                if modified and document is not None:
+                    logger.warning(
+                        'Plan normalization applied — writing corrected plan to %s',
+                        self.artifact_path('plan.json'),
+                    )
+                    return self.write_plan_model(Plan.from_json(document), mutex_held=True)
+        return Plan.from_json(document) if document is not None else None
+
+    def peek_plan_model(self) -> Plan | None:
+        """The plan exactly as :meth:`read_plan_model` would return it, but never repaired on disk.
+
+        No ``plan_mutex`` is taken and nothing is written. For observers that
+        poll a live task's plan (such as
         ``orchestrator/task_runtime.py::_read_task_entry``) and must not
         rewrite it under the agent that owns it.
         """
-        plan, _needs_repair = self._read_normalized_plan()
-        return plan
+        document, needs_repair = self._read_normalized_plan()
+        if document is None:
+            return None
+        plan = Plan.from_json(document)
+        return _at_current_schema(plan) if needs_repair else plan
 
-    def _read_normalized_plan(self) -> tuple[dict, bool]:
+    def _read_normalized_plan(self) -> tuple[dict | None, bool]:
         plan_path = self.artifact_path('plan.json')
         if not plan_path.exists():
-            return {}, False
+            return None, False
         return _normalize_plan(json.loads(plan_path.read_text()))
 
     def update_step_status(
@@ -1111,7 +1517,7 @@ class TaskArtifacts:
                         item['status'] = status
                         if commit is not None:
                             item['commit'] = commit
-                        self._write_held_plan(plan)
+                        self.write_plan_model(Plan.from_json(plan), mutex_held=True)
                         return
 
         logger.warning(f'Step {step_id} not found in plan')
@@ -1144,7 +1550,7 @@ class TaskArtifacts:
                             *(existing if isinstance(existing, list) else []),
                             record.to_dict(),
                         ]
-                        self.write_plan(plan, mutex_held=True)
+                        self.write_plan_model(Plan.from_json(plan), mutex_held=True)
                         return len(item['deviations'])
 
         logger.warning(f'Step {step_id} not found in plan')
@@ -1188,7 +1594,7 @@ class TaskArtifacts:
                         # with a different sha.
                         description = _COMMITTED_TAG_RE.sub('', item.get('description') or '')
                         item['description'] = f'{tag} {description}'
-                        self.write_plan(plan, mutex_held=True)
+                        self.write_plan_model(Plan.from_json(plan), mutex_held=True)
                         return True
 
         logger.warning(f'Step {step_id} not found in plan')
@@ -1401,26 +1807,24 @@ class TaskArtifacts:
                 callers should never invoke this on an empty plan.
         """
         with self.plan_mutex():
-            plan = self.read_plan()
-            if not plan.get('steps'):
+            plan = self.read_plan_model()
+            if plan is None or not plan.steps:
                 raise ValueError(
                     'bump_revalidation_stamp called before plan.json contains a '
                     'valid plan (missing or empty steps).'
                 )
-            plan['_revalidated_at'] = datetime.now(UTC).isoformat()
-            plan['_revalidated_by_session'] = session_id
-            if base_commit:
-                plan[PLAN_BASE_COMMIT_KEY] = base_commit
-            self._write_held_plan(plan)
+            revalidated = plan.revalidated(
+                at=datetime.now(UTC).isoformat(), by_session=session_id, base_commit=base_commit,
+            )
+            self.write_plan_model(revalidated, mutex_held=True)
 
     def stamp_plan_provenance(
         self, session_id: str, *, task_text_fp: str | None = None,
         base_commit: str | None = None,
-    ) -> None:
-        """Stamp _session_id and _created_at into plan.json.
+    ) -> Plan:
+        """Stamp _session_id and _created_at into plan.json, and return the Plan written.
 
-        Reads current plan.json, adds provenance fields, writes back.
-        ``task_text_fp=None`` leaves an existing fingerprint untouched (the
+        A falsy ``task_text_fp`` leaves an existing fingerprint untouched (the
         per-iteration and recovered-plan stamps rely on this); a falsy
         ``base_commit`` likewise leaves an existing ``_base_commit`` untouched.
 
@@ -1429,27 +1833,28 @@ class TaskArtifacts:
                 This prevents silently creating a provenance-only stub that passes
                 bool() checks but has no actual plan content.
         """
+        now = datetime.now(UTC).isoformat()
         with self.plan_mutex():
-            plan = self.read_plan()
-            if not plan.get('steps'):
+            plan = self.read_plan_model()
+            if plan is None or not plan.steps:
                 raise ValueError(
                     'stamp_plan_provenance called before plan.json contains a valid plan '
                     '(missing or empty steps). '
                     'Ensure the architect has written a complete plan before stamping provenance.'
                 )
-            plan['_session_id'] = session_id
-            plan['_created_at'] = datetime.now(UTC).isoformat()
-            # Invariant: a provenance-stamped plan is a complete plan, so it must
-            # carry the completeness marker.  The architect's confirm_plan normally
-            # sets this already (idempotent setdefault); paths that inject a
-            # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
-            # plan is not mistaken for an interrupted partial on a later requeue.
-            plan.setdefault('_finalized_at', plan['_created_at'])
-            if task_text_fp is not None:
-                plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
-            if base_commit:
-                plan[PLAN_BASE_COMMIT_KEY] = base_commit
-            self._write_held_plan(plan)
+            if plan.state is PlanState.PARTIAL:
+                # Transitional until beta: plans/review-all-s9-workflow-phase-spine-and-recovery-ledger-prd.md D3.
+                logger.warning(
+                    'stamp_plan_provenance: confirming the %s plan of task %r as %s before stamping '
+                    '(lifecycle markers present: %s)',
+                    plan.state.value, plan.body.get('task_id'), PlanConfirmation.INJECTED.value,
+                    list(plan.lifecycle.markers_present()),
+                )
+                plan = plan.confirmed(at=now, by=PlanConfirmation.INJECTED)
+            stamped = plan.stamped(
+                session_id=session_id, at=now, task_text_fp=task_text_fp, base_commit=base_commit,
+            )
+            return self.write_plan_model(stamped, mutex_held=True)
 
     def validate_plan_owner(self, session_id: str) -> bool:
         """Return True if *session_id* owns plan.json.
@@ -1467,9 +1872,7 @@ class TaskArtifacts:
         try:
             plan_path = self.artifact_path('plan.json')
             data = json.loads(plan_path.read_text())
-            if data.get('_session_id') == session_id:
-                return True
-            return data.get('_revalidated_by_session') == session_id
+            return Plan.from_json(data).lifecycle.owned_by(session_id)
         except Exception as exc:
             logger.warning(
                 'validate_plan_owner: failed to read/parse plan.json — treating as mismatch: %s',
@@ -1497,16 +1900,9 @@ class TaskArtifacts:
         for audit rather than being promoted.
         """
         with self.plan_mutex():
-            plan = self.read_plan()
-            plan['files'] = files
-            already_owner = (
-                plan.get('_session_id') == session_id
-                or plan.get('_revalidated_by_session') == session_id
-            )
-            if not already_owner:
-                plan['_session_id'] = session_id
-                plan.setdefault('_created_at', datetime.now(UTC).isoformat())
-            self._write_held_plan(plan)
+            plan = self.read_plan_model() or Plan.from_json({})
+            edited = plan.with_files(files, owner=session_id, at=datetime.now(UTC).isoformat())
+            self.write_plan_model(edited, mutex_held=True)
 
     # ──────────────────────────────────────────────────────────────────
     # Agent-session sidecar — marker for "an agent subprocess is in flight".

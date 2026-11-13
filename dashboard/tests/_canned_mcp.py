@@ -12,6 +12,7 @@ contract tests stub with.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Mapping
 
 import httpx
@@ -36,6 +37,19 @@ class CannedMCP:
       holding only the requested keys PRESENT on the row. Requesting
       ``metadata`` itself keeps the whole dict. Mirrored, not imported:
       dashboard tests may not depend on fused-memory.
+    * ``fields`` is validated first, as ``fused_memory/server/tools.py::_validate_fields``
+      does through ``task_projection.py::parse_task_projection``: an entry
+      that is neither a row key nor ``metadata.<key>`` with ``<key>``
+      matching ``[A-Za-z_][A-Za-z0-9_]*`` fails the WHOLE read with the
+      server's ``ValidationError`` payload, which the dashboard reads as that
+      URL failing.
+    * With :attr:`audit_projection` set, a ``get_tasks`` carrying ``fields``
+      serves its rows UNPROJECTED instead, and every ``get`` / ``[]`` / ``in``
+      of a key the projection would have dropped lands in
+      :attr:`unprojected_reads`, spelled as it is in ``fields``
+      (``'title'``, ``'metadata.routing'``). Full rows keep every branch that
+      tests a value reachable, so a reader of an omitted key is caught whether
+      or not the projection would have hidden its answer.
     * ``get_statuses`` slices a deterministic total order and answers with the
       five-key ``pagination`` envelope
       (``total``/``offset``/``page_size``/``returned``/``has_more``) exactly
@@ -65,8 +79,10 @@ class CannedMCP:
             disables it.
         task_delays: ``{int id: seconds}`` — how long ``get_task`` takes to
             answer for that id. Absent ids answer at once.
-        projection_delay: Seconds a ``get_tasks`` call carrying ``fields``
-            waits before answering. Zero answers at once.
+        metadata_projection_delay: Seconds a metadata projection
+            (:func:`is_metadata_projection`, the lineage read) waits before
+            answering. A row read carrying ``fields`` is not delayed. Zero
+            answers at once.
 
     Mutable after construction so one instance can change behaviour between a
     test's two acquisitions. :attr:`fail_when` is a predicate over the
@@ -86,14 +102,16 @@ class CannedMCP:
         status_page_size: int | None = None,
         short_page_by: int = 0,
         task_delays: Mapping[int, float] | None = None,
-        projection_delay: float = 0.0,
+        metadata_projection_delay: float = 0.0,
     ) -> None:
         self.rows = [dict(row) for row in rows]
         self.status_map = dict(status_map or {})
         self.status_page_size = status_page_size
         self.short_page_by = short_page_by
         self.task_delays = dict(task_delays or {})
-        self.projection_delay = projection_delay
+        self.metadata_projection_delay = metadata_projection_delay
+        self.audit_projection: bool = False
+        self.unprojected_reads: set[str] = set()
         self.fail_when: Callable[[dict], bool] = lambda call: False
         self.calls: list[dict] = []
         self.max_in_flight = 0
@@ -114,8 +132,8 @@ class CannedMCP:
         if tool == 'get_statuses':
             return self._statuses(args)
         if tool == 'get_tasks':
-            if args.get('fields') is not None:
-                await asyncio.sleep(self.projection_delay)
+            if is_metadata_projection(args):
+                await asyncio.sleep(self.metadata_projection_delay)
             return self._tasks(args)
         if tool == 'get_task':
             return await self._task(args)
@@ -142,6 +160,10 @@ class CannedMCP:
         }
 
     def _tasks(self, args: dict) -> dict:
+        fields = args.get('fields')
+        refusal = _projection_refusal(fields)
+        if refusal is not None:
+            return refusal
         statuses = args.get('statuses')
         selected = [
             row for row in self.rows
@@ -152,8 +174,9 @@ class CannedMCP:
         if page_size is not None:
             start = args.get('offset') or 0
             selected = selected[start:start + page_size]
-        fields = args.get('fields')
-        if fields is not None:
+        if fields is not None and self.audit_projection:
+            selected = [_audited(row, fields, self.unprojected_reads) for row in selected]
+        elif fields is not None:
             selected = [_project(row, fields) for row in selected]
         return {'tasks': selected}
 
@@ -175,16 +198,120 @@ class CannedMCP:
 
 
 _METADATA_FIELD_PREFIX = 'metadata.'
+_TASK_ROW_KEYS: tuple[str, ...] = (
+    'id', 'title', 'description', 'details', 'testStrategy', 'status', 'dependencies',
+    'priority', 'subtasks', 'updatedAt', 'metadata', 'claimant_run_id', 'heartbeat_at',
+    'candidate_key', 'created_at', 'created_at_source',
+)
+"""``task_projection.py::TASK_ROW_KEYS``: the top-level keys a projection may name."""
+_METADATA_KEY_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+_ALLOWED_FIELDS: tuple[str, ...] = (*_TASK_ROW_KEYS, f'{_METADATA_FIELD_PREFIX}<key>')
+
+
+def _projectable(entry: object) -> bool:
+    """Whether ``parse_task_projection`` accepts *entry* as one ``fields`` entry."""
+    if not isinstance(entry, str):
+        return False
+    if entry in _TASK_ROW_KEYS:
+        return True
+    return entry.startswith(_METADATA_FIELD_PREFIX) and bool(
+        _METADATA_KEY_PATTERN.fullmatch(entry.removeprefix(_METADATA_FIELD_PREFIX)),
+    )
+
+
+def _projection_refusal(fields: object) -> dict | None:
+    """The server's answer to a ``get_tasks`` whose *fields* it refuses, else ``None``."""
+    if fields is None:
+        return None
+    if isinstance(fields, (list, tuple)):
+        unprojectable = [entry for entry in fields if not _projectable(entry)]
+        if not unprojectable:
+            return None
+        refused = unprojectable[0]
+    else:
+        refused = fields
+    return {
+        'error': (
+            f'cannot project {refused!r}: fields must be a list of entries drawn from '
+            f'{list(_ALLOWED_FIELDS)}, where <key> matches {_METADATA_KEY_PATTERN.pattern}'
+        ),
+        'error_type': 'ValidationError',
+        'field': refused,
+        'allowed': list(_ALLOWED_FIELDS),
+    }
+
+
+def is_metadata_projection(args: Mapping) -> bool:
+    """Whether a ``get_tasks`` *args* asks for ids and metadata keys only.
+
+    That is the shape ``dashboard.data.tasks::fetch_metadata_projection`` builds
+    for the lineage read, and no row read can take it: a row read names
+    top-level keys such as ``title``.
+    """
+    fields = args.get('fields')
+    return fields is not None and all(
+        entry == 'id' or entry.startswith(_METADATA_FIELD_PREFIX) for entry in fields
+    )
+
+
+def _row_keys(fields: list[str]) -> set[str]:
+    """The top-level keys a projection to *fields* keeps."""
+    return {'id'} | {entry for entry in fields if not entry.startswith(_METADATA_FIELD_PREFIX)}
+
+
+def _metadata_keys(fields: list[str]) -> list[str]:
+    """The metadata keys a projection to *fields* names."""
+    return [
+        entry.removeprefix(_METADATA_FIELD_PREFIX)
+        for entry in fields if entry.startswith(_METADATA_FIELD_PREFIX)
+    ]
+
+
+class _AuditedDict(dict):
+    """A served dict that records each read of a key outside *allowed* into *reads*."""
+
+    def __init__(self, data: Mapping, *, allowed: set[str], spelling: str, reads: set[str]) -> None:
+        super().__init__(data)
+        self._allowed = allowed
+        self._spelling = spelling
+        self._reads = reads
+
+    def _note(self, key) -> None:
+        if key not in self._allowed:
+            self._reads.add(f'{self._spelling}{key}')
+
+    def get(self, key, default=None):
+        self._note(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self._note(key)
+        return super().__getitem__(key)
+
+    def __contains__(self, key) -> bool:
+        self._note(key)
+        return super().__contains__(key)
+
+
+def _audited(row: dict, fields: list[str], reads: set[str]) -> dict:
+    """*row* served whole, recording reads of what a projection to *fields* would drop."""
+    row_keys = _row_keys(fields)
+    metadata_keys = set(_metadata_keys(fields))
+    served = dict(row)
+    metadata = served.get('metadata')
+    if isinstance(metadata, dict) and 'metadata' not in row_keys:
+        served['metadata'] = _AuditedDict(
+            metadata, allowed=metadata_keys, spelling=_METADATA_FIELD_PREFIX, reads=reads,
+        )
+    served_keys = row_keys | ({'metadata'} if metadata_keys else set())
+    return _AuditedDict(served, allowed=served_keys, spelling='', reads=reads)
 
 
 def _project(row: dict, fields: list[str]) -> dict:
     """*row* as α's ``TaskProjection.apply`` projects it for *fields*."""
-    row_keys = {'id'} | {entry for entry in fields if not entry.startswith(_METADATA_FIELD_PREFIX)}
+    row_keys = _row_keys(fields)
     projected = {key: value for key, value in row.items() if key in row_keys}
-    metadata_keys = [
-        entry.removeprefix(_METADATA_FIELD_PREFIX)
-        for entry in fields if entry.startswith(_METADATA_FIELD_PREFIX)
-    ]
+    metadata_keys = _metadata_keys(fields)
     if metadata_keys and 'metadata' not in row_keys:
         metadata = row.get('metadata') or {}
         projected['metadata'] = {key: metadata[key] for key in metadata_keys if key in metadata}

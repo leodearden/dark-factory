@@ -10,19 +10,26 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from _fm_polling import poll_until
+from _queued_write_fixtures import insert_raw_row, queued
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.llm_token_usage import measure_llm_tokens
+from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware.dead_letter_escalator import (
     _REPORTED_TO_CALLER,
     _REPORTED_TO_CALLER_DEFAULT,
 )
 from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _mock_backends(svc: MemoryService) -> MemoryService:
@@ -599,13 +606,13 @@ class TestConcurrencyStress:
         call_index = 0
         lock = asyncio.Lock()
 
-        async def selective_fail(operation, payload):
+        async def selective_fail(value):
             nonlocal call_index
             async with lock:
                 _ = call_index
                 call_index += 1
-            # Items with index 0-based, every 5th one has 'fail' in content
-            if payload.get('should_fail'):
+            # Every 5th item carries the ' fail' marker in its content
+            if value.content.endswith(' fail'):
                 raise RuntimeError('permanent failure')
             return {'ok': True}
 
@@ -614,20 +621,15 @@ class TestConcurrencyStress:
 
         tasks = []
         for i in range(50):
-            should_fail = (i % 5 == 0)
+            marker = ' fail' if i % 5 == 0 else ''
             tasks.append(
-                svc.durable_queue.enqueue(
-                    group_id='test',
-                    operation='add_memory_graphiti',
-                    payload={
+                svc.durable_queue.enqueue(queued('add_memory_graphiti', {
                         'name': f'memory_{i}',
-                        'content': f'item {i}',
+                        'content': f'item {i}{marker}',
                         'source': 'text',
                         'group_id': 'test',
                         'source_description': 'test',
-                        'should_fail': should_fail,
-                    },
-                )
+                    }, group_id='test'))
             )
         await asyncio.gather(*tasks)
 
@@ -667,16 +669,12 @@ class TestQueueStats:
         svc.graphiti.add_episode = slow_graphiti
 
         for i in range(10):
-            await svc.durable_queue.enqueue(
-                group_id='test',
-                operation='add_episode',
-                payload={
+            await svc.durable_queue.enqueue(queued('add_episode', {
                     'content': f'item {i}',
                     'group_id': 'test',
                     'name': f'ep{i}',
                     'source': 'text',
-                },
-            )
+                }, group_id='test'))
 
         # Poll until processing has genuinely started (at least one item has
         # left 'pending'), instead of a fixed sleep, so the mid-flight
@@ -711,16 +709,12 @@ class TestQueueStats:
         svc.graphiti.add_episode = AsyncMock(return_value={'ok': True})
 
         for i in range(15):
-            await svc.durable_queue.enqueue(
-                group_id='test',
-                operation='add_episode',
-                payload={
+            await svc.durable_queue.enqueue(queued('add_episode', {
                     'content': f'item {i}',
                     'group_id': 'test',
                     'name': f'ep{i}',
                     'source': 'text',
-                },
-            )
+                }, group_id='test'))
 
         # Poll until all items complete, delegating to the shared helper
         # (task 2377) instead of a hand-rolled bounded loop.
@@ -1209,12 +1203,8 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
         # Enqueued directly, exactly as `_dual_write_callback` does it: one
         # item per extracted fact, in the project's mem0_ group, with no
         # `_write_op_id` because there is no write_ops row to join back to.
-        await svc.durable_queue.enqueue(
-            group_id='mem0_main',
-            operation='mem0_classify_and_add',
-            payload={'fact_text': 'a derived fact nobody will ever see',
-                     'project_id': 'main'},
-        )
+        await svc.durable_queue.enqueue(queued('mem0_classify_and_add', {'fact_text': 'a derived fact nobody will ever see',
+                     'project_id': 'main'}, group_id='mem0_main'))
 
         filed = await _poll_for_escalation(tmp_path)
         detail = filed[0]['detail']
@@ -1225,3 +1215,59 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
             'alarm exists to close'
         )
         assert _REPORTED_TO_CALLER_DEFAULT in detail, detail
+
+
+class TestUndecodableRowIsRefusedNotExecuted:
+    """A row whose operation no producer writes must die loudly, not be guessed at."""
+
+    @pytest.mark.asyncio
+    async def test_a_typo_operation_dead_letters_unexecuted_and_alarms_with_its_raw_body(
+        self, mock_config, tmp_path, monkeypatch,
+    ):
+        filed: list[dict] = []
+        monkeypatch.setattr(
+            dead_letter_escalator, 'emit_dead_letter_escalation',
+            lambda *args, **kwargs: filed.append(kwargs),
+        )
+        body = json.dumps({
+            'content': 'looks exactly like an add_episode body',
+            'group_id': 'main',
+            'name': 'typo-episode',
+            'source': 'text',
+            'source_description': 'hand inserted',
+        })
+
+        # The row is written by another build: it is already in the store
+        # when this service starts, and startup recovery picks it up.
+        writer = _mock_backends(MemoryService(mock_config))
+        await writer.initialize()
+        await writer.close()
+        await insert_raw_row(
+            Path(mock_config.queue.data_dir) / 'write_queue.db',
+            group_id='main', operation='typo_op', payload_text=body,
+        )
+
+        svc = _mock_backends(MemoryService(mock_config))
+        graphiti_add_episode = AsyncMock(return_value=None)
+        svc.graphiti.add_episode = graphiti_add_episode
+        svc.set_known_projects({'main': str(tmp_path)})
+        await svc.initialize()
+        try:
+            queue = svc.durable_queue
+            assert queue is not None
+
+            async def _dead():
+                items = await queue.get_dead_items()
+                return items or None
+
+            dead = await poll_until(_dead, timeout=20.0, interval=0.05)
+            await poll_until(lambda: filed or None, timeout=20.0, interval=0.05)
+        finally:
+            await svc.close()
+
+        assert len(dead) == 1
+        assert dead[0]['operation'] == 'typo_op'
+        assert dead[0]['attempts'] == 1
+        assert dead[0]['error'].startswith('UnknownQueueOperation: '), dead[0]['error']
+        graphiti_add_episode.assert_not_awaited()
+        assert [call['content_preview'] for call in filed] == [body]

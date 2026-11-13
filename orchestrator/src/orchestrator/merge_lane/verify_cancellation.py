@@ -32,6 +32,8 @@ class VerifyCancelCause(StrEnum):
     SHUTDOWN = 'shutdown'
     #: A passthrough finalize failed and tore down a parked gate.
     FINALIZE_ERROR = 'finalize_error'
+    #: A head's gate re-verify became a dispatch, so its stacked successor's verify was cancelled.
+    GATE_REANCHOR = 'gate_reanchor'
 
 
 @dataclasses.dataclass(frozen=True)

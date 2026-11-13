@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
+from _jsx_source_helpers import extract_function_body, strip_js_comments, walk_balanced
 
 
 @pytest.fixture(scope='module')

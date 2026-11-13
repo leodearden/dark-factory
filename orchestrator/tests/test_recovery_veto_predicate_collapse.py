@@ -105,14 +105,30 @@ def _gate_check_calls(function: str) -> list[tuple[int, frozenset[str]]]:
         (node.lineno, frozenset(kw.arg for kw in node.keywords if kw.arg))
         for node in ast.walk(enclosing)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == 'get_by_task'
+        and _reads_get_by_task(node)
         and any(
             kw.arg == 'agent_role'
             and ast.unparse(kw.value) == 'DETERMINISTIC_AGENT_ROLE'
             for kw in node.keywords
         )
     ]
+
+
+def _reads_get_by_task(call: ast.Call) -> bool:
+    """True for `<q>.get_by_task(...)` and for `asyncio.to_thread(<q>.get_by_task, ...)`.
+
+    The off-loop form passes the bound method as to_thread's first argument
+    and forwards the keywords unchanged, so both shapes carry the read's
+    keywords on the same ast.Call node.
+    """
+    if isinstance(call.func, ast.Attribute) and call.func.attr == 'get_by_task':
+        return True
+    return (
+        ast.unparse(call.func) == 'asyncio.to_thread'
+        and bool(call.args)
+        and isinstance(call.args[0], ast.Attribute)
+        and call.args[0].attr == 'get_by_task'
+    )
 
 
 class _BareTest(NamedTuple):

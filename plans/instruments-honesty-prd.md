@@ -80,8 +80,8 @@ against the live stores together:
    `snapshot_age_s` and cross-checks the runs.db `scheduler_state` row, which is the pause fact's home.
 3. **`tasks.created_at`** (fused-memory `backends/sqlite_task_backend.py`, `task_projection.py`, a backfill
    script, dashboard task view): v5→v6 additive column plus `created_at_source`; stamped in `add_task`;
-   backfilled by a script from the earliest runs.db event, else a non-backfilled `pending_since`, else
-   `updated_at`.
+   backfilled by a script with the earliest usable of the runs.db event, a non-backfilled `pending_since`
+   and `updated_at` (decision 3).
 4. **Ledger counters** (orchestrator `harness.py`, `workflow.py`, `run_store.py`): lifetime `review_cycles`;
    cap-pause fields set before `finish_run`; a persisted digest window end.
 5. **Merge-halt events** (`event_store.py::EventType`, `merge_lane/halt.py::HaltState`,
@@ -134,9 +134,13 @@ against the live stores together:
    `SqliteTaskBackend.add_task` from the `now` it already reads for `pending_since` and `updated_at`; that is
    the only INSERT into `tasks` (six callers, all through it). Backfill is a separate idempotent script, not
    the open-time migration: the migration is lazy per store and must not open another store's runs.db.
-   Backfill order: earliest runs.db event for the task id (5,747 of 8,515 df tasks), else `pending_since`
-   where `pending_since_backfilled` is absent, else `updated_at`; blank `updated_at` rows are skipped and
-   counted. Timestamps are normalised to the task store's `Z` millisecond form.
+   Backfill rule (amended by task 8558 review, 2026-11-12): the backfill stores the EARLIEST usable of the
+   task's earliest runs.db event (`first_event`; 5,747 of 8,515 df tasks have one), its un-back-filled
+   `metadata.pending_since` (`pending_since`), and its `updated_at` or the v4→v5 back-filled `pending_since`
+   copy of it (`updated_at`); ties go in that order. Each proxy is an upper bound on the filing time, and a
+   long-waiting task's first event is often the starvation watchdog's alarm, so the event cannot simply win.
+   Rows with no usable proxy are skipped and counted. Timestamps are normalised to the task store's `Z`
+   millisecond form.
 4. **The watchdog's clock is not changed.** `eligible_since` measures time as a dispatch candidate, which is
    what a dispatch-fairness alarm should measure (task 3821's decision). Age since filing is a different
    question and `created_at` answers it on the dashboard and in `get_task`. Every age column a reader shows
@@ -289,11 +293,11 @@ calls `flush_state_snapshot()` after every pause, resume, restore and before shu
 tasks.created_at TEXT NULL            -- task-store 'Z' millisecond form, stamped in add_task
 tasks.created_at_source TEXT NULL     -- 'stamped' | 'first_event' | 'pending_since' | 'updated_at'
 _SCHEMA_VERSION = 6; _migrate_v5_to_v6 adds both columns (add_column_if_missing)
-scripts/backfill_task_created_at.py --project-root R [--dry-run] -> counts per source, rows skipped (blank updated_at)
+scripts/backfill_task_created_at.py --project-root R [--dry-run] -> counts per source, rows skipped (no usable proxy)
 ```
 Invariants: every row inserted after the migration has `created_at` and `created_at_source='stamped'`;
 backfill never overwrites a `stamped` row; `get_task`/`get_tasks` carry both keys (`task_projection.py::TASK_ROW_KEYS`)
-and omit them on an unmigrated store rather than failing; the dashboard task view shows "Filed <date> (<source>)".
+and omit them on a connection whose v6 ALTER never landed rather than failing; the dashboard task view shows "Filed <date> (<source>)".
 
 ### Merge-halt events (`orchestrator/src/orchestrator/event_store.py`, `merge_lane/halt.py`)
 
@@ -338,8 +342,8 @@ previous end, never at a fixed 24 h lookback, except on a store with no row.
 | 4 | stale snapshot (fixture) | snapshot says running, runs.db row says paused | reader serves `is_paused=true`, `pause_disagreement=true`; dashboard paused list includes the project |
 | 5 | restore path (fixture) | restart with a persisted pause row | snapshot rewritten at restore; shutdown rewrites once more |
 | 6 | new task | `submit_task` on a migrated store | `get_task` carries `created_at` (= `pending_since`) and `created_at_source='stamped'` |
-| 7 | backfill | a store with rows having an event, a non-backfilled `pending_since`, only `updated_at`, blank `updated_at` | sources counted per rule; `stamped` rows untouched; second run changes nothing |
-| 8 | unmigrated read | read-only `get_tasks` on a v5 store | rows served without the two keys, no error |
+| 7 | backfill | a store with rows having an event, a non-backfilled `pending_since`, only `updated_at`, blank `updated_at`, a row whose first event is later than its `updated_at` | sources counted per rule; each row takes its earliest usable proxy; no `created_at` later than its row's `updated_at`; `stamped` rows untouched; second run changes nothing |
+| 8 | unmigrated read | `get_tasks` on a connection whose v6 ALTER never landed (the store reports v6 without the two columns). A v5 store read through fused-memory is not this case: `_get_read_access` awaits `_get_write_access`, so that read migrates it (amended by task 8558 review, 2026-11-12) | rows served without the two keys, no error; a migrated row the backfill has not reached serves both keys as None |
 | 9 | review rounds | a task blocked twice then passed | `task_results.review_cycles=2`; `review_completed` max cycle agrees |
 | 10 | cap pause | a run whose gate recorded `total_pause_secs > 0` and finished cleanly | `runs.paused_for_cap=1`, `cap_pause_secs>0` on the row |
 | 11 | verify duration rule | the `event_store.py` comment and `docs/data-map.md` | both say verify durations live in `data.duration_ms` and the column is NULL by convention; a reader coalescing to 0 is named as the error |
@@ -388,6 +392,8 @@ G7 walk (advisory, author mode): INV-9 one-fact-one-home (decisions 5, 12, 14); 
    `== 0` or all done rows is the reviewer-trial owner's call. **Suggested resolution:** correct the docstring
    in β, leave the predicate, note it for the eval owner.
 2. **Backfill timestamp for tasks whose first event predates runs.db history (2026-04-09).** **Suggested
-   resolution:** `first_event` is still the best lower bound; record it as such.
+   resolution:** `first_event` is an upper bound on the filing time, like the other two proxies. For a task
+   filed before runs.db history began, the earliest of the three is the tightest bound available, and the
+   value is recorded as such.
 3. **Halt-hours window.** 7 days matches the brief; the quality dashboard may want landings-windowed halts
    later. Decide in γ.

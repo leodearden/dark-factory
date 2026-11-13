@@ -15,7 +15,11 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / 'install-memory-eval-timer.sh'
 TEMPLATES_DIR = Path(__file__).parent.parent

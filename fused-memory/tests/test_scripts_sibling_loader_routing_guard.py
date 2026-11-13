@@ -17,6 +17,9 @@ import pathlib
 
 import pytest
 from _ast_guard import calls_named, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_ROOT = pathlib.Path(__file__).parent.parent / 'scripts'
 
@@ -27,8 +30,6 @@ LOADER_FACTORIES = frozenset({'spec_from_file_location', 'spec_from_loader', 'So
 # same file is still caught.
 EXEMPT_LOADERS = frozenset(
     {
-        # Same policy as load_script; migration owned by pending task 6569.
-        ('normalize_topic_slugs.py', 'load_census_module'),
         # Different policy; migration owned by pending task 7123.
         # Reuses the cache only when it has a FusedMemoryClient attribute.
         ('normalize_topic_slugs.py', 'load_mcp_client_module'),

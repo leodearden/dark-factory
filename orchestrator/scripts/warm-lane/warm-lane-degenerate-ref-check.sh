@@ -33,8 +33,10 @@
 #
 # The citation predicate is NOT defined here. It lives in
 # scripts/lib_task_citation.sh, the single copy of a grammar that is normative
-# across the reify/dark-factory seam, which this script sources: a
-# `Merge <prefix><id> into …` line, a conventional-commit subject citing the id
+# across the reify/dark-factory seam, which this script sources: a line opening
+# with the landing subject of <prefix><id> (its merge arm, which this script
+# renders once from shared/src/shared/merge_subject.py::rendered_prefix and
+# passes in; see README.md "Delta 19"), a conventional-commit subject citing the id
 # (`impl(<id>): …`, dark-factory's kind list), OR a `#<id>` reference, each
 # boundary-safe (task/1 does not match "Merge task/10 into main"; impl(5) does
 # not match impl(50); #45 does not match #4588). Do not re-inline it here — see
@@ -99,11 +101,14 @@
 # Exit codes (single-ref mode; audit mode always exits 0 on a completed sweep):
 #   0  — degenerate  (count==0, tip does not cite N — skip-sweep / prune-safe)
 #   1  — live        (count>0 — own commits ahead of main)
-#   2  — usage/WIRING error: an unknown flag, a missing flag value, OR a
-#        missing sibling library (scripts/lib_task_citation.sh). The library
-#        case is a wiring error, not a runtime one: nothing about the
-#        invocation could have avoided it and no retry will fix it — the
-#        deployment is incomplete. Same class as an unknown flag, hence 2.
+#   2  — usage/WIRING error: an unknown flag, a missing flag value, a
+#        missing sibling library (scripts/lib_task_citation.sh), OR a merge
+#        arm that cannot be rendered from shared.merge_subject (no
+#        shared/src three levels up, no python3, or a failed render). The
+#        library and render cases are wiring errors, not runtime ones: nothing
+#        about the invocation could have avoided them and no retry will fix
+#        them — the deployment is incomplete. Same class as an unknown flag,
+#        hence 2.
 #   3  — structural  (not a git work tree, or --main-ref unresolvable)
 #   4  — landed      (count==0, tip DOES cite N — genuinely merged)
 #   5  — absent      (no such ref)
@@ -169,7 +174,8 @@ Usage: $(basename "$0") --task <id> [OPTIONS]
 
   Exit codes: 0=degenerate 1=live 2=usage/wiring 3=structural 4=landed
               5=absent
-    2 also covers a missing sibling scripts/lib_task_citation.sh.
+    2 also covers a missing sibling scripts/lib_task_citation.sh, and a
+    merge arm shared.merge_subject cannot render.
 
   See: docs/design/warm-lane-degenerate-ref-seam.md
 EOF
@@ -229,6 +235,44 @@ if [ -n "$TASK_ID" ] && ! [[ "$TASK_ID" =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
+# ── the merge arm, rendered from shared.merge_subject ─────────────────────────
+# The citation lib's merge arm is NOT spelled here: shared.merge_subject's
+# rendered_prefix renders its ERE (head, into) for --branch-prefix, once.
+# shared/src sits three levels above this script's directory, located by path
+# arithmetic, and the module is stdlib-only, so `python3 -I` with that one
+# sys.path entry imports it whatever the caller's environment. Any failure
+# exits 2: an incomplete deployment, the same wiring class as a missing lib,
+# never a classification. See README.md "Delta 19".
+_MERGE_ARM_PY='import sys
+sys.path.insert(0, sys.argv[1])
+from shared.merge_subject import rendered_prefix
+head, into = rendered_prefix(sys.argv[2])
+print(head)
+print(into)'
+
+SHARED_SRC="$SCRIPT_DIR/../../../shared/src"
+if [ -d "$SHARED_SRC" ]; then
+    SHARED_SRC="$(cd "$SHARED_SRC" && pwd)"
+fi
+
+_merge_arm_unrenderable() {
+    err "cannot render the merge arm with shared.merge_subject.rendered_prefix" \
+        "(interpreter: python3, shared_src: $SHARED_SRC): $1"
+    exit 2
+}
+
+[ -f "$SHARED_SRC/shared/merge_subject.py" ] \
+    || _merge_arm_unrenderable "shared/merge_subject.py not found"
+_rendered="$(python3 -I -c "$_MERGE_ARM_PY" "$SHARED_SRC" "$BRANCH_PREFIX")" \
+    || _merge_arm_unrenderable "the render exited $?"
+[[ "$_rendered" == *$'\n'* ]] \
+    || _merge_arm_unrenderable "the render printed no head/into pair"
+MERGE_HEAD_RE="${_rendered%%$'\n'*}"
+MERGE_INTO_RE="${_rendered#*$'\n'}"
+[ -n "$MERGE_HEAD_RE" ] && [ -n "$MERGE_INTO_RE" ] \
+    || _merge_arm_unrenderable "the render printed an empty head or into"
+unset _rendered
+
 # ── structural preflight (shared by single-ref and audit modes) ──────────────
 [ -n "$REPO_DIR" ] || REPO_DIR="."
 
@@ -266,7 +310,8 @@ BRANCH_PREFIX_RE="$(_regex_escape "$BRANCH_PREFIX")"
 _cites_task() {
     local commit="$1" id="$2" msg
     msg="$(git -C "$REPO_DIR" log -1 --format=%B "$commit" 2>/dev/null || true)"
-    task_citation_message_cites "$msg" "$id" "$BRANCH_PREFIX_RE"
+    task_citation_message_cites "$msg" "$id" "$BRANCH_PREFIX_RE" \
+        "$MERGE_HEAD_RE" "$MERGE_INTO_RE"
 }
 
 # _classify_ref <id>

@@ -115,11 +115,9 @@ _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
 
 # Outer wall-clock sanity bound for invoke_with_cap_retry's cap patience,
 # covering both its cap-retry loop and the gate's park on a pool frozen at
-# spawn (shared/src/shared/cli_invoke.py cap-wait policy table). This is a
-# fire-and-forget, best-effort block-time investigation — it must NOT inherit
-# the 14-day default, which would leave a background task pending for weeks
-# under a sustained cap storm. Mirrors the 1800s reconciliation-stage
-# precedent (short-lived stage runners, same table).
+# spawn. This is a fire-and-forget, best-effort block-time investigation — it
+# must NOT inherit the 14-day default, which would leave a background task
+# pending for weeks under a sustained cap storm.
 _DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 

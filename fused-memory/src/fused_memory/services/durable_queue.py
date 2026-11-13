@@ -12,9 +12,10 @@ import json
 import logging
 import random
 import time
-from collections.abc import Callable, Coroutine, Iterable, Iterator
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,15 @@ from shared.async_sqlite_base import (
     connect_daemon,
 )
 from shared.sqlite_column_migration import add_column_if_missing
+
+from fused_memory.services.queued_writes import (
+    QueueCallback,
+    QueueDecodeError,
+    QueuedWrite,
+    check_callback_pairing,
+    decode_queue_callback,
+    decode_queued_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,18 +147,25 @@ class QueueItem:
             self.executed,
         ) = row
 
-    def parsed_payload(self) -> dict[str, Any]:
-        return json.loads(self.payload)
-
 
 # -- Queue --------------------------------------------------------------------
 
-CallbackFn = Callable[[str, Any, dict[str, Any]], Coroutine[Any, Any, None]]
+class FailureClass(StrEnum):
+    """Which retry budget a failed attempt draws on; logged as ``[<value>]``."""
+
+    PERMANENT = 'permanent'
+    TRANSIENT = 'transient'
+    NORMAL = 'normal'
+
+
+# (value, backend result) -> None. Receives the same value object the executor did.
+CallbackFn = Callable[[QueuedWrite, Any], Coroutine[Any, Any, None]]
 
 # (write_op_id, terminal_status, error) -> None. Invoked once per item when it
 # reaches a TERMINAL state ('completed' or 'dead'), never on an intermediate
-# retry. An injected callback rather than a WriteJournal reference, preserving
-# this module's deliberate independence from fused-memory-specific components.
+# retry. An injected callback rather than a WriteJournal reference: the queue
+# imports its value vocabulary (queued_writes, a leaf) and nothing else of
+# fused-memory's.
 TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
 
 
@@ -173,6 +190,11 @@ class DeadLetterEvent:
     failing, so a blind replay DUPLICATES it. The prefix is still applied to
     ``error`` — nothing about the journal contract changes — but a consumer
     branching on remediation should read this flag rather than re-parse it.
+
+    ``operation`` is the row's raw string, which an undecodable row may not
+    hold as a ``QueueOperation``. ``value`` is the decoded write, or ``None``
+    when the row's payload could not be decoded; ``raw_payload`` is the row's
+    payload text either way, and the only content such a row has.
     """
 
     item_id: int
@@ -181,13 +203,13 @@ class DeadLetterEvent:
     attempts: int
     error: str | None
     write_op_id: str | None
-    payload: dict[str, Any] | None
+    value: QueuedWrite | None
+    raw_payload: str
     post_execute: bool
 
 
 # (event) -> None. Invoked once per item that reaches 'dead', and never on
-# 'completed' or an intermediate retry. Injected exactly as ``on_terminal`` is,
-# keeping this module free of any fused-memory-specific import.
+# 'completed' or an intermediate retry. Injected exactly as ``on_terminal`` is.
 DeadLetterHookFn = Callable[[DeadLetterEvent], Coroutine[Any, Any, None]]
 
 # Prefix applied to the reported error when an item dead-letters after a
@@ -210,7 +232,7 @@ class DurableWriteQueue:
         self,
         *,
         data_dir: str | Path,
-        execute_write: Callable[..., Coroutine[Any, Any, Any]],
+        execute_write: Callable[[QueuedWrite], Coroutine[Any, Any, Any]],
         workers_per_group: int = 3,
         semaphore_limit: int = 20,
         max_attempts: int = 5,
@@ -242,7 +264,7 @@ class DurableWriteQueue:
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
         self._access: AtomicConnection | None = None
-        self._callbacks: dict[str, CallbackFn] = {}
+        self._callbacks: dict[QueueCallback, CallbackFn] = {}
         self._group_events: dict[str, asyncio.Event] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
         self._worker_tasks: dict[str, list[asyncio.Task]] = {}
@@ -313,19 +335,21 @@ class DurableWriteQueue:
 
     # -- callbacks ------------------------------------------------------------
 
-    def register_callback(self, name: str, fn: CallbackFn) -> None:
-        self._callbacks[name] = fn
+    def register_callback(self, callback: QueueCallback, fn: CallbackFn) -> None:
+        self._callbacks[callback] = fn
 
     # -- enqueue --------------------------------------------------------------
 
     async def enqueue(
-        self,
-        group_id: str,
-        operation: str,
-        payload: dict[str, Any],
-        callback_type: str | None = None,
+        self, value: QueuedWrite, *, callback: QueueCallback | None = None,
     ) -> int:
-        """Persist a write item and signal workers. Returns item id."""
+        """Persist *value* under its envelope's group and signal workers. Returns item id.
+
+        Raises :class:`TypeError`, persisting nothing, when *callback* cannot take *value*.
+        """
+        if callback is not None:
+            check_callback_pairing(value, callback)
+        group_id = value.envelope.group_id
         now = time.time()
         async with self._require_access().write() as db:
             cursor = await db.execute(
@@ -335,7 +359,8 @@ class DurableWriteQueue:
                 '(group_id, operation, payload, callback_type, status, attempts, '
                 ' max_attempts, next_retry_at, created_at, executed) '
                 'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
-                (group_id, operation, json.dumps(payload), callback_type,
+                (group_id, value.operation.value, value.to_json(),
+                 callback.value if callback is not None else None,
                  'pending', self._max_attempts, now),
             )
             item_id = cursor.lastrowid
@@ -344,31 +369,30 @@ class DurableWriteQueue:
         return item_id  # type: ignore[return-value]
 
     async def enqueue_batch(
-        self, items: list[dict[str, Any]]
+        self, values: Sequence[tuple[QueuedWrite, QueueCallback | None]]
     ) -> list[int]:
-        """Bulk insert in ONE write unit: a failure anywhere persists no row.
-
-        Each dict needs group_id, operation, payload, and optionally
-        callback_type.
-        """
+        """Bulk insert ``(value, callback)`` pairs in ONE write unit: a failure anywhere persists no row."""
+        for value, callback in values:
+            if callback is not None:
+                check_callback_pairing(value, callback)
         now = time.time()
         ids: list[int] = []
         groups_seen: set[str] = set()
         async with self._require_access().write() as db:
-            for item in items:
+            for value, callback in values:
+                group_id = value.envelope.group_id
                 cursor = await db.execute(
                     # Explicit `executed = 0` for the same reason as enqueue().
                     'INSERT INTO write_queue '
                     '(group_id, operation, payload, callback_type, status, attempts, '
                     ' max_attempts, next_retry_at, created_at, executed) '
                     'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
-                    (item['group_id'], item['operation'],
-                     json.dumps(item['payload']),
-                     item.get('callback_type'),
+                    (group_id, value.operation.value, value.to_json(),
+                     callback.value if callback is not None else None,
                      'pending', self._max_attempts, now),
                 )
                 ids.append(cursor.lastrowid)  # type: ignore[arg-type]
-                groups_seen.add(item['group_id'])
+                groups_seen.add(group_id)
         for g in groups_seen:
             self._ensure_workers(g)
             self._signal_group(g)
@@ -449,6 +473,7 @@ class DurableWriteQueue:
         ``_notify_dead_letter`` (the operator alarm).
         """
         terminal: tuple[str, str | None] | None = None
+        value: QueuedWrite | None = None
         write_op_id: str | None = None
         # Seeded from the row, since an earlier attempt may already have
         # landed. A NULL (unknown) row seeds False: the prefix asserts a
@@ -456,17 +481,19 @@ class DurableWriteQueue:
         executed = bool(item.executed)
         async with self._semaphore:
             try:
-                # Parsed ONCE, and the join key captured BEFORE dispatch:
-                # _execute_write pops '_write_op_id' (and '_causation_id' /
-                # 'temporal_context') off the dict it is handed. Parsing inside
-                # the try keeps a malformed payload routed to _handle_failure
-                # exactly as before, with write_op_id left None so the hook is
-                # skipped.
-                payload = item.parsed_payload()
-                write_op_id = payload.get('_write_op_id')
+                # Inside the try, so an undecodable row reaches _handle_failure
+                # as a QueueDecodeError. The payload first: a row whose callback
+                # alone is bad still hands its write_op_id to _notify_terminal.
+                value = decode_queued_write(
+                    item.operation, item.payload, group_id=item.group_id, row_id=item.id,
+                )
+                write_op_id = value.envelope.write_op_id
+                callback = decode_queue_callback(
+                    item.callback_type, value, row_id=item.id, raw_payload=item.payload,
+                )
                 with self._executing(item):
                     result = await asyncio.wait_for(
-                        self._execute_write(item.operation, payload),
+                        self._execute_write(value),
                         timeout=self._write_timeout_seconds,
                     )
                 # The backend write LANDED. Anything that fails below is a
@@ -477,12 +504,8 @@ class DurableWriteQueue:
                 executed = True
                 await self._mark_executed(item)
                 # Fire callback before marking completed — failure retries item.
-                # A FRESH parse, deliberately not `payload`: _execute_write pops
-                # journal metadata that the callbacks read back out.
-                if item.callback_type and item.callback_type in self._callbacks:
-                    await self._callbacks[item.callback_type](
-                        item.callback_type, result, item.parsed_payload()
-                    )
+                if callback is not None and callback in self._callbacks:
+                    await self._callbacks[callback](value, result)
                 await self._mark_completed(item)
                 terminal = ('completed', None)
             except Exception as exc:
@@ -498,7 +521,7 @@ class DurableWriteQueue:
                 # trail must land before the best-effort alarm gets a chance to
                 # misbehave.
                 await self._notify_dead_letter(
-                    item, write_op_id, error, post_execute=executed
+                    item, value, write_op_id, error, post_execute=executed
                 )
 
     @contextlib.contextmanager
@@ -541,10 +564,10 @@ class DurableWriteQueue:
         correctness regression), and the hook's own work must not hold a slot
         in a pool shared across every group.
 
-        A raising hook is logged and swallowed. A payload with no
-        ``_write_op_id`` (``replay_from_store``, ``mem0_classify_and_add``) or
-        one that would not parse is skipped silently: there is nothing to join
-        back to.
+        A raising hook is logged and swallowed. A value with no
+        ``write_op_id`` (``replay_from_store``, ``mem0_classify_and_add``) or a
+        row that could not be decoded is skipped silently: there is nothing to
+        join back to.
         """
         if self._on_terminal is None or not write_op_id:
             return
@@ -586,6 +609,7 @@ class DurableWriteQueue:
     async def _notify_dead_letter(
         self,
         item: QueueItem,
+        value: QueuedWrite | None,
         write_op_id: str | None,
         error: str | None,
         *,
@@ -614,12 +638,6 @@ class DurableWriteQueue:
         """
         if self._on_dead_letter is None:
             return
-        try:
-            payload: dict[str, Any] | None = item.parsed_payload()
-        except (ValueError, TypeError):
-            # A payload that will not parse still has to raise the alarm — the
-            # unparseable payload is itself part of what went wrong.
-            payload = None
         event = DeadLetterEvent(
             item_id=item.id,
             group_id=item.group_id,
@@ -628,7 +646,8 @@ class DurableWriteQueue:
             attempts=item.attempts + 1,
             error=error,
             write_op_id=write_op_id,
-            payload=payload,
+            value=value,
+            raw_payload=item.payload,
             # Structured, so the consumer never re-parses POST_EXECUTE_DEAD_PREFIX.
             post_execute=post_execute,
         )
@@ -656,15 +675,18 @@ class DurableWriteQueue:
         """
         return any(c.__name__ in self._transient_error_names for c in type(exc).__mro__)
 
-    def _classify_failure(self, item: QueueItem, exc: BaseException) -> tuple[str, int]:
+    def _classify_failure(self, item: QueueItem, exc: BaseException) -> tuple[FailureClass, int]:
         """Return (classification, attempts_limit) for *exc* on *item*.
 
-        A transient error gets ``('transient', transient_max_attempts)``;
-        anything else gets ``('normal', item.max_attempts)``.
+        A row that cannot be decoded is PERMANENT with a limit of 1, decided by
+        the exception's type; a transient error gets ``transient_max_attempts``;
+        anything else is NORMAL with ``item.max_attempts``.
         """
+        if isinstance(exc, QueueDecodeError):
+            return (FailureClass.PERMANENT, 1)
         if self._is_transient(exc):
-            return ('transient', self._transient_max_attempts)
-        return ('normal', item.max_attempts)
+            return (FailureClass.TRANSIENT, self._transient_max_attempts)
+        return (FailureClass.NORMAL, item.max_attempts)
 
     async def _handle_failure(
         self, item: QueueItem, exc: Exception, *, executed: bool
@@ -694,8 +716,7 @@ class DurableWriteQueue:
                 # operation / group_id / classification are what a triager needs
                 # first, and the log line is all that survives once the queue row is
                 # deleted — after that, get_dead_items can no longer supply them.
-                # The classification names which retry budget, transient or
-                # normal, the item exhausted.
+                # The classification names which retry budget the item exhausted.
                 logger.warning(
                     'Item %d (%s, group_id=%s) dead-lettered after %d attempts [%s]: %s',
                     item.id, item.operation, item.group_id, new_attempts,
@@ -1031,10 +1052,18 @@ class DurableWriteQueue:
                 'id': item.id,
                 'group_id': item.group_id,
                 'operation': item.operation,
-                'payload': item.parsed_payload(),
+                'payload': _payload_for_display(item.payload),
                 'attempts': item.attempts,
                 'error': item.error,
                 'created_at': item.created_at,
                 'executed': None if item.executed is None else bool(item.executed),
             })
         return results
+
+
+def _payload_for_display(payload: str) -> Any:
+    """A dead row's payload as JSON when it parses, else its raw text, so one corrupt row cannot fail the listing."""
+    try:
+        return json.loads(payload)
+    except ValueError:
+        return payload

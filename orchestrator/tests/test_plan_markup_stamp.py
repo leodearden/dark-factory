@@ -59,12 +59,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _plan_model_helpers import read_model
 from _plan_mutex_race import PROBE_SECS
 from shared.mcp_markup_middleware import FACT_MARKUP_DETECTED
 from shared.toolcall_markup import ENVELOPE_LITERALS, detect
 
-from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_markup_stamp
+from orchestrator.artifacts import PlanState, TaskArtifacts
+from orchestrator.mcp import plan_markup_stamp, plan_tools
 
 # ---------------------------------------------------------------------------
 # Sentinel BUILDERS — the only way markup enters this module.
@@ -902,8 +903,6 @@ def artifacts(tmp_path) -> TaskArtifacts:
 
 def seed_plan(artifacts: TaskArtifacts) -> dict[str, Any]:
     """A plan built through the REAL writer, as ``_create_plan`` builds one."""
-    from orchestrator.mcp import plan_tools
-
     plan_tools._create_plan(
         artifacts,
         'test-1',
@@ -924,6 +923,21 @@ def plan_on_disk(artifacts: TaskArtifacts) -> dict[str, Any]:
 
 class TestThePlanStampRecordsTheRefusal:
     """The sink's happy path: one fact in, one accumulated block on disk."""
+
+    @pytest.mark.asyncio
+    async def test_a_stamped_plan_stays_stamped(self, artifacts: TaskArtifacts):
+        seed_plan(artifacts)
+        assert plan_tools._confirm_plan(artifacts)['status'] == 'ok'
+        stamped = artifacts.stamp_plan_provenance('stamper')
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        assert await stamp(make_fact()) is not None
+
+        plan = read_model(artifacts)
+        assert plan.state is PlanState.STAMPED
+        assert plan.lifecycle.confirmed_at == stamped.lifecycle.confirmed_at
+        assert plan.lifecycle.session_id == stamped.lifecycle.session_id
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY in plan.body
 
     @pytest.mark.asyncio
     async def test_one_fact_lands_as_a_one_event_block(self, artifacts: TaskArtifacts):
@@ -1030,7 +1044,7 @@ class TestThePlanStampNeverRaises:
         def boom(plan, **_kwargs):
             raise OSError('the plan is unwritable')
 
-        monkeypatch.setattr(artifacts, 'write_plan', boom)
+        monkeypatch.setattr(artifacts, 'write_plan_model', boom)
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
 
         assert await stamp(make_fact()) is None
@@ -1237,8 +1251,6 @@ class TestTheStampSerialisesWithEveryPlanWriter:
     async def test_an_accepted_write_inside_the_stamps_window_survives(
         self, artifacts: TaskArtifacts, monkeypatch
     ):
-        from orchestrator.mcp import plan_tools
-
         seed_plan(artifacts)
         real_read = artifacts.read_plan
         accepted: list[threading.Thread] = []
@@ -1277,8 +1289,6 @@ class TestTheStampSerialisesWithEveryPlanWriter:
     def test_a_refusal_arriving_mid_create_plan_stamps_the_new_plan(
         self, artifacts: TaskArtifacts
     ):
-        from orchestrator.mcp import plan_tools
-
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
 
         async def refuse() -> None:

@@ -51,6 +51,9 @@ from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import resolve_claude_binary
 from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -442,15 +445,6 @@ def _write_multi_mb_transcript(
     path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
 
 
-def test_nightly_cap_is_an_alias_of_the_sampler_cap_not_a_second_literal():
-    """``DEFAULT_MAX_DIGEST_BYTES`` and ``sampling.DEFAULT_DIGEST_MAX_BYTES``
-    are a word-order swap apart. If they were independent literals, a drift
-    between the cost basis and the render basis would be invisible to every
-    test — so nightly's name BINDS to the sampler's rather than re-declaring
-    it (reviewer_comprehensive, task 3268 amendment pass)."""
-    assert nightly.DEFAULT_MAX_DIGEST_BYTES is nightly.sampling.DEFAULT_DIGEST_MAX_BYTES
-
-
 def test_select_digest_sessions_charges_real_digest_bytes(tmp_path):
     """The cost basis handed to the sampler must be the REAL rendered digest
     size -- what makes ``max_daily_digest_bytes`` mean what it says.
@@ -479,7 +473,7 @@ def test_select_digest_sessions_charges_real_digest_bytes(tmp_path):
         digest.build_digest(
             record.path,
             agent_class_override=record.stratum,
-            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+            max_bytes=digest.DEFAULT_MAX_BYTES,
         ).encode('utf-8')
     )
     assert sample.bytes_used == expected
@@ -514,15 +508,15 @@ def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_wit
     sample = nightly.select_digest_sessions(
         cfg, projects_root, date(2026, 7, 13), build=recording_build,
     )
-    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES], (
-        'the sampler must charge at the nightly cap, not at build_digest\'s own default'
+    assert caps == [digest.DEFAULT_MAX_BYTES], (
+        'the sampler must charge at the cap build_digests renders with'
     )
 
     # RENDER side: build_digests, called by run_nightly with no max_bytes
     # override, must reach the renderer with that SAME cap.
     caps.clear()
     nightly.build_digests(sample.selected, build=recording_build)
-    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES]
+    assert caps == [digest.DEFAULT_MAX_BYTES]
 
 
 def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_path):
@@ -641,7 +635,7 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
     assert digests == [
         digest.build_digest(
             session_path, agent_class_override=sample.selected[0].stratum,
-            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+            max_bytes=digest.DEFAULT_MAX_BYTES,
         )
     ], 'the cached digest must be byte-identical to a fresh render'
 
@@ -765,7 +759,7 @@ def test_git_status_changed_detects_dirty_codebook(tmp_path):
 def test_evaluate_census_step_no_fire_never_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(
             fire=False,
             reasons=['completion: 0.5 of census-proj_a-20260601 (threshold 0.70)'],
@@ -790,7 +784,7 @@ def test_evaluate_census_step_no_fire_never_launches(tmp_path):
 def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_path, caplog):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
@@ -809,7 +803,7 @@ def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_pa
 def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
@@ -821,6 +815,25 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
 
     assert fire is True
     assert launcher_calls == [1]
+
+
+def test_evaluate_census_step_decides_on_the_config_it_was_handed(tmp_path):
+    """Task 3269 / PRD D8: the trigger decides on the very config the trickle
+    loaded from its pinned config_path, never a re-read of one."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+    received = []
+
+    def recording_decide(cfg, *, now=None, completion_runner=None):
+        received.append(cfg)
+        return census_trigger.Decision(fire=False, reasons=['completion: N/A'])
+
+    nightly.evaluate_census_step(
+        cfg, now=None, decide=recording_decide,
+        entrypoint_exists=lambda: True, launcher=lambda **kwargs: None,
+    )
+
+    assert len(received) == 1
+    assert received[0] is cfg
 
 
 def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplog):
@@ -838,7 +851,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     """
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=[
             'completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE',
         ])
@@ -879,7 +892,7 @@ def test_evaluate_census_step_logs_a_failed_evaluation_too(tmp_path, caplog):
     an operator greps for the healthy one."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
@@ -911,7 +924,7 @@ def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
     `entrypoint_exists` is even consulted."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     launcher_calls = []
@@ -956,7 +969,7 @@ def test_evaluate_census_step_bounds_a_huge_decide_failure(tmp_path, caplog):
     is the opposite of the legible failure this trigger exists for."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise RuntimeError('boom ' + 'x' * 50_000 + '\nsecond line')
 
     with caplog.at_level('WARNING', logger='legibility.nightly'):
@@ -1076,7 +1089,7 @@ def _adjacent_pair(argv: list[str], flag: str) -> list[str] | None:
     return None
 
 
-def _fire_decide(project_root, *, now=None, completion_runner=None):
+def _fire_decide(cfg, *, now=None, completion_runner=None):
     return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
 
@@ -1314,6 +1327,36 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
     assert Path(kwargs['config_path']).is_absolute()
     # The launch and the config path name the SAME project.
     assert args == (str(project_root),)
+
+
+def test_the_completion_streak_alarm_reproduces_with_the_config_the_nights_loaded(tmp_path):
+    project_root = tmp_path / 'proj_a'
+    config_path = _write_config(project_root, project_id='proj_a')
+    _write_census_state(project_root, _OLD_CENSUS)
+    launcher, _launches = _recording_census_launcher()
+    failing_check = _scripted_completion_runner(
+        2, {'run': _PREVIOUS_RUN, 'verdict': 'error', 'error': 'store_unreachable'},
+    )
+    posted: list[dict] = []
+
+    for night in range(3):
+        nightly.run_nightly(
+            config_path=config_path,
+            projects_root=tmp_path / 'projects',
+            target_date=date(2026, 7, 13) + timedelta(days=night),
+            now=datetime(2026, 7, 14 + night, 3, 0, tzinfo=UTC),
+            invoke=lambda prompt, model: '{"proposals": []}',
+            completion_runner=failing_check,
+            poster=lambda url, arguments: posted.append(arguments),
+            census_launcher=launcher,
+            pass_kind=nightly.PassKind.MANUAL,
+        )
+
+    [streak_alarm] = [post for post in posted if 'completion check' in post['summary']]
+    assert (
+        f'evaluate --project-root {project_root} --config {config_path.resolve()}'
+        in streak_alarm['detail']
+    )
 
 
 @pytest.mark.parametrize('fire', [True, False], ids=['fire', 'no-fire'])
@@ -1947,6 +1990,20 @@ def test_resolve_config_path_unknown_id_raises(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         nightly.resolve_config_path("does-not-exist", search_roots=[tmp_path])
+
+
+def test_resolve_config_path_unknown_id_names_each_candidate_that_failed_to_load(tmp_path):
+    _write_config(tmp_path / "proj-a", project_id="proj_a")
+    broken = _write_config(tmp_path / "proj-b", project_id="proj_b")
+    broken.write_text(broken.read_text() + "census: {floor_days: '5'}\n")
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        nightly.resolve_config_path("proj_b", search_roots=[tmp_path])
+
+    message = str(excinfo.value)
+    assert str(broken) in message
+    assert "floor_days" in message
+    assert "input_value='5'" in message
 
 
 def test_resolve_config_path_env_override(tmp_path, monkeypatch):
@@ -4247,9 +4304,10 @@ class TestRunNightlyRecordsTheCensusObservation:
         with caplog.at_level('WARNING'):
             runner.night(13, 'quiet')
 
+        state_path = str(_census_state(runner.repo))
         malformed = [
             r.getMessage() for r in caplog.records
-            if 'census state at' in r.getMessage()
+            if state_path in r.getMessage()
         ]
         assert len(malformed) == 1, malformed
         assert launches == []

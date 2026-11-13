@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from _canned_mcp import CannedMCP, _raw_row
+from _canned_mcp import CannedMCP, _raw_row, is_metadata_projection
 from shared.process_identity import Liveness, ProcessIdentity, capture
 from shared.task_deferral import HeldBySessionDeferral, PlanningDeferral, record_to_json
 
@@ -91,6 +91,123 @@ class TestCannedMCP:
                              'page_size': 2, 'offset': 1})
 
         assert [row['id'] for row in page['tasks']] == ['3', '5']
+
+    def test_a_metadata_projection_names_only_id_and_metadata_keys(self):
+        assert is_metadata_projection({'fields': ['id', 'metadata.prd_path']})
+        assert is_metadata_projection({'fields': ['metadata.prd_path']})
+        assert not is_metadata_projection({'fields': ['id', 'title', 'metadata.files']})
+        assert not is_metadata_projection({'project_root': '/p'})
+        assert not is_metadata_projection({'fields': None})
+
+    async def test_the_metadata_projection_delay_spares_a_row_projection(self):
+        canned = CannedMCP(rows=[_raw_row(1, 'pending')], metadata_projection_delay=10.0)
+        assert canned.metadata_projection_delay == 10.0
+
+        rows = await asyncio.wait_for(
+            canned(None, 'u', 'get_tasks', {'project_root': '/p', 'fields': ['id', 'title']}),
+            0.5,
+        )
+        assert rows['tasks'] == [{'id': '1', 'title': 'task 1'}]
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                canned(None, 'u', 'get_tasks',
+                       {'project_root': '/p', 'fields': ['id', 'metadata.prd_path']}),
+                0.5,
+            )
+
+    @staticmethod
+    def _audited_row():
+        return _raw_row(1, 'pending', description='prose',
+                        metadata={'files': ['a.py'], 'routing': {'model': 'm'}})
+
+    async def test_the_audit_records_reads_of_keys_the_projection_omitted(self):
+        canned = CannedMCP(rows=[self._audited_row(), _raw_row(2, 'done')])
+        canned.audit_projection = True
+
+        answer = await canned(None, 'u', 'get_tasks',
+                              {'project_root': '/p', 'statuses': ['pending'],
+                               'fields': ['id', 'metadata.files']})
+        [row] = answer['tasks']
+        assert row['metadata']['routing'] == {'model': 'm'}, 'served unprojected'
+        canned.unprojected_reads.clear()
+
+        row.get('id')
+        _ = row['metadata']['files']
+        assert canned.unprojected_reads == set(), 'projected keys are not recorded'
+
+        row.get('title')
+        _ = row['description']
+        _ = 'title' in row
+        row['metadata'].get('routing')
+        assert canned.unprojected_reads == {'title', 'description', 'metadata.routing'}
+
+    async def test_the_audit_ignores_the_substrates_own_filtering(self):
+        canned = CannedMCP(rows=[self._audited_row(), _raw_row(2, 'done')])
+        canned.audit_projection = True
+
+        await canned(None, 'u', 'get_tasks',
+                     {'project_root': '/p', 'statuses': ['pending'], 'page_size': 5,
+                      'offset': 0, 'fields': ['id']})
+
+        assert canned.unprojected_reads == set()
+
+    async def test_the_audit_records_nothing_on_an_unprojected_read(self):
+        canned = CannedMCP(rows=[self._audited_row()])
+        canned.audit_projection = True
+
+        [row] = (await canned(None, 'u', 'get_tasks', {'project_root': '/p'}))['tasks']
+        row.get('title')
+        _ = row['description']
+        row['metadata'].get('routing')
+
+        assert canned.unprojected_reads == set()
+
+    async def test_without_the_audit_a_projected_read_is_plainly_projected(self):
+        canned = CannedMCP(rows=[self._audited_row()])
+        assert canned.audit_projection is False
+
+        [row] = (await canned(None, 'u', 'get_tasks',
+                              {'project_root': '/p', 'fields': ['id', 'metadata.files']}))['tasks']
+
+        assert row == {'id': '1', 'metadata': {'files': ['a.py']}}
+        assert type(row) is dict
+
+    @pytest.mark.parametrize('audit', [False, True])
+    @pytest.mark.parametrize('refused', [
+        'complexity', 'metadata.delivered-checks', 'metadata.', 'metadata.a.b', 7,
+    ])
+    async def test_a_field_the_server_refuses_fails_the_whole_read(self, refused, audit):
+        canned = CannedMCP(rows=[_raw_row(1, 'pending')])
+        canned.audit_projection = audit
+
+        answer = await canned(None, 'u', 'get_tasks',
+                              {'project_root': '/p', 'fields': ['id', 'title', refused]})
+
+        assert 'tasks' not in answer
+        assert answer['error_type'] == 'ValidationError'
+        assert answer['field'] == refused
+        assert 'metadata.<key>' in answer['allowed']
+
+    async def test_fields_that_are_not_a_list_are_refused_whole(self):
+        canned = CannedMCP(rows=[_raw_row(1, 'pending')])
+
+        answer = await canned(None, 'u', 'get_tasks', {'project_root': '/p', 'fields': 'title'})
+
+        assert answer['error_type'] == 'ValidationError'
+        assert answer['field'] == 'title'
+
+    async def test_every_row_key_and_a_well_formed_metadata_key_are_accepted(self):
+        canned = CannedMCP(rows=[_raw_row(1, 'pending')])
+        row_keys = ['id', 'title', 'description', 'details', 'testStrategy', 'status',
+                    'dependencies', 'priority', 'subtasks', 'updatedAt', 'metadata',
+                    'claimant_run_id', 'heartbeat_at', 'candidate_key',
+                    'created_at', 'created_at_source']
+
+        answer = await canned(None, 'u', 'get_tasks',
+                              {'project_root': '/p', 'fields': [*row_keys, 'metadata.x_Key_2']})
+
+        assert [row['id'] for row in answer['tasks']] == ['1']
 
 
 # ---------------------------------------------------------------------------

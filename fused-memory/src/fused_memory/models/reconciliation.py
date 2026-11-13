@@ -88,6 +88,15 @@ class ContextItem:
             self.token_estimate = len(self.formatted) // 4
 
 
+@dataclass(frozen=True)
+class ContextFetchFailure:
+    """An event whose related context could not be fetched: absent context for it is unknown, not empty."""
+
+    event_id: str
+    event_type: str
+    error: str
+
+
 @dataclass
 class AssembledPayload:
     """Result of the ContextAssembler — a token-budgeted chunk of events with
@@ -98,6 +107,7 @@ class AssembledPayload:
     total_tokens: int = 0
     events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
     token_budget: int = 0
+    context_fetch_failures: tuple[ContextFetchFailure, ...] = ()
 
     def budget_report(self) -> dict[str, int]:
         """How much of token_budget this chunk spent, and on how many events and context items."""

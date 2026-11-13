@@ -26,7 +26,7 @@ from unittest.mock import patch
 import pytest
 from _cache_buster_helpers import redux_cache_buster_versions
 from _canned_mcp import CannedMCP
-from _dashboard_helpers import ScriptTagCollector, assert_script_loads_before, node_path
+from _dashboard_helpers import node_path
 from _deferral_fixture import (
     NOW,
     FixtureRow,
@@ -36,6 +36,7 @@ from _deferral_fixture import (
     second_project_fixture,
     status_map,
 )
+from _jsx_source_helpers import ScriptTagCollector, assert_script_loads_before
 from shared.process_identity import capture
 
 from dashboard.config import DashboardConfig

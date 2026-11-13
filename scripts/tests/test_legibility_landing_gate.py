@@ -15,8 +15,11 @@ from pathlib import Path
 
 import pytest
 from legibility import config, landing_gate
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from df_pytest_isolation import read_leaked_pid, wait_pid_gone
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 GateStatus = landing_gate.GateStatus
 

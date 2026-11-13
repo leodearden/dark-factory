@@ -36,6 +36,7 @@ from orchestrator.merge_lane.outcome_facts import ConflictEvidence
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_LOGGED_OVERLAP_PATHS,
     GateClearance,
+    ReverifyDispatch,
     ReverifyGateDecision,
     ReverifyGateReason,
     emit_reverify_gate_decision,
@@ -485,7 +486,7 @@ before this prefix may be used, and for the three traps a naive version misses.
 ALREADY_LANDED_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'\(#?{tid}([ ,/][^)]*)?\)!?:'
-    r'|^Merge task/{tid} into '
+    r'|{merge_subject}'
 )
 r"""Scope-position citation template for :func:`_resolve_already_landed_branch`.
 
@@ -521,7 +522,9 @@ scope``).  Anything this template misses falls through to the UNCHANGED
 ``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
 
 Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
-``find_task_citation_commit`` requires of any override.
+``find_task_citation_commit`` requires of any override; its ``{merge_subject}``
+arm is filled by ``orchestrator/src/orchestrator/git_ops.py::render_citation_pattern``
+from the GitOps config.
 """
 
 
@@ -3485,7 +3488,8 @@ async def _reverify_rebased_tree(
     keep_worktrees: Collection[Path] | None = None,
     run_post_merge_verify: Callable[..., Awaitable[MergeOutcome | None]],
     event_store: EventStore | None,
-) -> MergeOutcome | GateClearance:
+    dispatch_reverify: bool = False,
+) -> MergeOutcome | GateClearance | ReverifyDispatch:
     """Shared gate for the disjoint-delta re-verify check.
 
     Called by both CAS loops after ``advance_main`` returns
@@ -3495,8 +3499,9 @@ async def _reverify_rebased_tree(
     every member's commits, so the branch-touched set is the train's union
     footprint, not the tip member's own diff.
 
-    Returns the :class:`GateClearance` the caller may advance on, or the
-    ``MergeOutcome`` that ends the attempt.
+    Returns the :class:`GateClearance` the caller may advance on, the
+    ``MergeOutcome`` that ends the attempt, or, under *dispatch_reverify*, the
+    :class:`ReverifyDispatch` that hands a full re-verify back to the caller.
 
     Algorithm
     ---------
@@ -3528,7 +3533,11 @@ async def _reverify_rebased_tree(
        the worker's handles it carries write the re-verify's ``merge_verify``
        row.  ``None`` from it → ``GateClearance.reverified``; a
        ``MergeOutcome`` → verification failed or the disk guard fired, and
-       *merge_wt* has already been cleaned up.
+       *merge_wt* has already been cleaned up.  Under the keyword-only
+       *dispatch_reverify* opt-in this arm runs no verify and returns
+       ``ReverifyDispatch(decision)`` instead: the single-branch caller
+       re-verifies the rebased tree as an ordinary dispatch of the rebased
+       head (task 8525).  The history leg still runs here.
 
     Parameters
     ----------
@@ -3558,6 +3567,9 @@ async def _reverify_rebased_tree(
         ``history_leg_command``, on a same tree.
     event_store:
         Receives the decision row only.
+    dispatch_reverify:
+        Hand a full re-verify back as a :class:`ReverifyDispatch` rather than
+        running it.  Trains leave it False and re-verify inline.
     """
     decision = await _decide_reverify_gate(
         git_ops, req,
@@ -3570,6 +3582,8 @@ async def _reverify_rebased_tree(
     emit_reverify_gate_decision(event_store, decision)
     if (clearance := decision.reason.skip_clearance) is not None:
         return clearance
+    if dispatch_reverify and decision.dispatches:
+        return ReverifyDispatch(decision)
     failure = await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,

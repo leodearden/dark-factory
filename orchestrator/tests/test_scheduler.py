@@ -3,6 +3,7 @@
 
 import asyncio
 import dataclasses
+import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -7565,6 +7566,13 @@ class TestDeferredWatchDispatchGate:
 # Milestone time-gate (task 2335 β — docs/prds/milestone-tasks.md §6.2)
 # ---------------------------------------------------------------------------
 
+def _delayed_milestone_metadata(after_secs: object, anchor: object) -> dict:
+    return {
+        'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+        'milestone_deps_satisfied_at': anchor,
+    }
+
+
 class TestMilestoneTimeGate:
     """Unit tests for the pure predicate Scheduler._milestone_time_gated.
 
@@ -7685,6 +7693,71 @@ class TestMilestoneTimeGate:
             task, datetime(2026, 9, 1, tzinfo=UTC)
         ) is False
 
+    def test_tz_naive_anchor_is_treated_as_utc(self):
+        naive_anchor = datetime(2026, 7, 25, 9, 0, 0)  # no tzinfo
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': 3600},
+            'milestone_deps_satisfied_at': naive_anchor.isoformat(),
+        })
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 9, 59, tzinfo=UTC)
+        ) is True
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
+        ) is False
+
+    def test_delayed_without_anchor_withholds_silently(self, caplog):
+        """An unset anchor means 'not due yet', not 'malformed': no WARNING."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with({'milestone': {'mode': 'delayed', 'after_secs': 60}})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.parametrize('metadata', [
+        pytest.param(_delayed_milestone_metadata(60, 12345), id='non_str_anchor'),
+        pytest.param(_delayed_milestone_metadata(60, 0), id='falsy_non_str_anchor'),
+        pytest.param(
+            _delayed_milestone_metadata(60, 'not-a-timestamp'), id='unparseable_anchor'
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**12, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e12',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**15, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e15',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(0, '2026-11-01T00:00:00+00:00'),
+            id='milestone_rejects_zero_after_secs',
+        ),
+        pytest.param(
+            {'milestone': {
+                'mode': 'dated', 'at': '2026-11-01T00:00:00+00:00', 'after_secs': 60,
+            }},
+            id='milestone_rejects_dated_with_after_secs',
+        ),
+    ])
+    def test_malformed_input_fails_safe_and_warns_once(self, metadata, caplog):
+        """``now`` is after every anchor and ``at``, so a lenient read would dispatch."""
+        now = datetime(2026, 11, 13, tzinfo=UTC)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with(metadata)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert scheduler._milestone_time_gated(task, now) is True
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
     def test_malformed_milestone_warning_deduped_per_task_and_cause(self, caplog):
         """reviewer_comprehensive observability finding (task 2335 β
         amendment): _milestone_time_gated is invoked once per candidate loop
@@ -7718,7 +7791,7 @@ class TestMilestoneTimeGate:
             assert scheduler._milestone_time_gated(task_changed, datetime.now(UTC)) is True
 
         unknown_mode_warnings = [
-            r for r in caplog.records if 'unknown mode' in r.getMessage()
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
         ]
         assert len(unknown_mode_warnings) == 1, (
             f'Expected a fresh WARNING when the malformed cause changes; '
@@ -7867,6 +7940,45 @@ class TestMilestoneEligibilityGate:
         assert result_after is not None and result_after.task_id == '4005', (
             'Milestone must dispatch once now_wall >= at'
         )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_withholds_milestone_rejected_spec_and_warns_once(
+        self, monkeypatch, caplog
+    ):
+        """A delayed spec Milestone rejects (after_secs=0) whose anchor is long
+        past is withheld tick after tick, with exactly one WARNING."""
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        task = {
+            'id': '4008',
+            'title': 'Milestone-rejected delayed task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': _delayed_milestone_metadata(
+                0, (now - timedelta(days=1)).isoformat()
+            ),
+        }
+        task_response = {
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps({'tasks': [task]})}]
+            }
+        }
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1), wall_time_source=lambda: now
+        )
+        scheduler.finish_startup()
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert await scheduler.acquire_next() is None
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
 
 
 class TestClaimantLivenessDispatchGate:

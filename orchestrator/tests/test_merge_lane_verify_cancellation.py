@@ -132,5 +132,5 @@ class TestRecordedDispatches:
 def test_cause_vocabulary_is_closed() -> None:
     assert {cause.value for cause in VerifyCancelCause} == {
         'cascade', 'abandoned', 'operator_halt', 'no_progress', 'tip_adopted',
-        'shutdown', 'finalize_error',
+        'shutdown', 'finalize_error', 'gate_reanchor',
     }

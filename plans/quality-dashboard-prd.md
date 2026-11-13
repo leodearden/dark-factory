@@ -210,11 +210,102 @@ negative, so an EWMA chart can never show improvement at these rates.
     Datum[list[SnapshotPoint]], WINDOW, served_at}`. Window vocabulary = landings (`100`, `300`, `all`;
     Leo, 11-04) with its own `_parse_window` vocabulary and `window_chip.js` entry; the x-axis is landing
     ordinal with date ticks.
+
+    **Correction (γ, 2026-11-10).** What shipped, and where each part is homed:
+    - "Main ahead of the cursor" counts runs.db landings that the store lacks, never git. The reader
+      takes the `(merge_sha, task_id)` keys runs.db records after the cursor landing
+      (`shared/src/shared/quality_series/landings.py::recorded_landing_keys`, which reuses α's
+      landing-recognition SQL) and subtracts the stored keys. A train of 3 is one commit, so it
+      reads "3 landings not yet sampled". A rev-parse could not count that, and it differs from the
+      cursor after any non-landing commit. When runs.db cannot be read, or holds a landing event the
+      landing rule refuses (an unrecognised train_merged payload, a timestamp without an offset),
+      the datum is `stale` with a reason naming the store, never `fresh`.
+    - The read side is `dashboard/src/dashboard/data/quality_series.py::read_quality_series`. It is
+      `unknown` until a value sample exists: with no sample it says nothing was sampled, and with
+      only gaps it gives the newest gap's reason verbatim. It is `stale` when a gap follows the
+      newest value, when landings are not yet sampled, or once the value sample is older than
+      `::QUALITY_FRESHNESS_BOUND_SECONDS` (2 × 600 s). Otherwise it is `fresh`, as of the newest value
+      sample. The two newest samples are read without loading the sample history
+      (`dashboard/src/dashboard/data/quality_store.py::newest_samples`).
+    - The window is a landing count with its own served type. The parser is
+      `dashboard/src/dashboard/api/window.py::parse_landing_window`, which shares one decline rule
+      with the day parser. It echoes `WINDOW = {requested, served, landings}`
+      (`::ServedLandingWindow`, `landings: null` for `all`), never a `days` field. The vocabulary is
+      `dashboard/src/dashboard/api/quality.py::_QUALITY_WINDOWS`.
+    - `?project=` takes the root's label or its project id in any spelling `fold_project_token` folds
+      (`dashboard/src/dashboard/api/quality.py::_project_root`), because df's label is `dark-factory`
+      and its id is `dark_factory`. A missing token, or one that resolves to no configured root,
+      answers 200 with an `unknown` `QUALITY` saying so, never an empty series.
+    - `QUALITY_MARKERS` and `QUALITY_SNAPSHOTS` are `unknown` Datums whose reasons start "no producer
+      has written here" until δ and ι land. `read_quality_series` already takes `events`
+      (`RegimeEvent`s), so δ only has to supply them. Until then, alarms carry `explained_by: null`
+      and `before_after` is `[]`.
+    - The access-path guard got a second vocabulary rather than an extended `GUARDED`. The quality
+      sources are SQL words, not Python names, so the Load finder could never see them.
+      `dashboard/tests/test_datum_access_paths.py::GUARDED_QUALITY_SOURCES` matches the event types in
+      non-docstring string constants. `::GUARDED_QUALITY_READS` matches Loads of α's runs.db readers
+      imported from `shared.quality_series`. `::_QUALITY_GRANTS` grants the reader, the sampler's
+      `_measure_root`, and `data/merge_queue.py`'s three `train_merged` reads (the merge-queue tab's
+      train listing and throughput).
+    - The client half is ε's. γ adds the route to the boundary suite: the
+      `dashboard/tests/_boundary_payloads.py::_quality_family` scenarios, server-half tests for
+      sketch rows 3, 4, 5, 10 and 12 in `dashboard/tests/test_boundary_js.py`, and the
+      `qualityMetric` / `qualityPayload` builders in `dashboard/tests/js/wire_fixtures.mjs`. It does
+      not touch `data.js::endpointsFor` or its `EXPECTED_ENDPOINT_KEYS` pin (now in
+      `dashboard/tests/js/data_apply.test.mjs`). A polled row could not name the per-project
+      `?project=`, so the registration and the window chip entry are ε's to design.
+    - Measured 2026-11-10 against the live df store (3,564 stored landings, host load average ~62):
+      one `read_quality_series` call took 0.54–1.30 s, the first call the slowest. A warm split was
+      about 0.2 s reading quality.db, 0.06 s counting unsampled landings in runs.db, and 0.24 s for
+      the pure view at `window=100`.
 16. **Front end.** New `static/redux/tab_quality.jsx` (`tabs.jsx` is at its ceiling); `charts.jsx::LineChart`
     gains a `band` prop (`lo`/`hi` arrays, null holes respected) and a shared `Markers` overlay taking
     server-resolved `ordinal` fractions; `tab_escalation_analytics.jsx` consumes the lifted overlay through
     an adapter from its date labels. No view is computed in JS (`deriveVelocitySeries` is the
     counter-precedent).
+
+    **Correction (ε, 2026-11-12).** What shipped, and where each part is homed:
+    - `/api/v2/dashboard/quality` is an on-demand read, never polled: one read costs 0.5–1.3 s, its data
+      moves on the sampler's 600 s tick, and a polled row cannot carry `?project=`. It is the `quality`
+      row of `dashboard/src/dashboard/static/redux/data.js::ON_DEMAND_KEYS`. The param is the canonical
+      query `data.js::qualityQuery` builds (project, window, module, in that order), an opaque identity
+      that nothing parses back. The body's keys are fixed while their values depend on the param, so the
+      row declares `fields` (`QUALITY`, `QUALITY_MARKERS`, `QUALITY_SNAPSHOTS`), each landed under
+      `<FIELD>:<query>` and read from the body by `data.js::fromBody`. `data.js::onDemandReceipt` exposes
+      the request's receipt and its `WINDOW` echo. `endpointsFor` and its pins are unchanged.
+    - The landing window belongs to the tab, not the global chip. The vocabulary is
+      `dashboard/src/dashboard/static/redux/window_chip.js::WINDOW_SETS` (`landings`, default
+      `::LANDING_DEFAULT_WINDOW`), and `::TAB_WINDOWS` has no `quality` entry. Two facts force this. An
+      on-demand receipt is keyed by its query, not by a path the global chip can look up. And the global
+      window is also sent to the day-windowed chrome endpoints. One echo validator,
+      `window_chip.js::receiptWindow`, accepts both day and landing echoes, so the label, highlight and
+      pending functions are shared.
+    - `?module=` drills down on the server. `dashboard/src/dashboard/data/quality_series.py::read_quality_series(module=)`
+      keeps only the stored landings whose lines touch the module, and
+      `dashboard/src/dashboard/api/quality.py::api_quality` passes the parameter through. The filter
+      runs after the freshness check, so "N landings not yet sampled" still describes the whole
+      project's store. Train members share modules, so verify units stay whole.
+    - The overlay is an HTML layer over the chart (`dashboard/src/dashboard/static/redux/charts.jsx::Markers`,
+      wrapped with its chart by `::MarkedChart`). It is positioned from the one `charts.jsx::PLOT_PAD`
+      that `LineChart` and `StackedAreaChart` also use. Its decisions live in
+      `dashboard/src/dashboard/static/redux/chart_marks.js`: the style for each marker kind, placement
+      on a gapped ordinal axis or a date-label axis, the hover text and the legend. The server places
+      each marker at a landing ordinal; turning that ordinal into a fraction of the served axis is
+      placement (`chart_marks.js::fractionAt`), not a view. Escalation analytics uses the overlay through
+      `chart_marks.js::dateLabelMarks`, and its regime marks render exactly the DOM its old
+      `RegimeMarkers` did (sketch row 21).
+    - The tab is `dashboard/src/dashboard/static/redux/tab_quality.jsx::QualityTab`. Its quality-specific
+      decisions live in `dashboard/src/dashboard/static/redux/quality_view.js`: the layout, the text of a
+      headline, rule, alarm verdict, before/after comparison and cost-model reading, the chart arrays
+      (served verbatim) and each metric's marks. While the tab is open it polls only `/orchestrators`,
+      for its project selector (`poll_scope.js::TAB_ENDPOINTS`).
+    - Two wire limits are rendered around, not computed. The wire carries no per-landing residual
+      series: the cost model is shown as `cost_model.reference_cost_100` and
+      `cost_model.residual_median`. The wire carries no occurrence-cap field: mass events reach the
+      tab only as the served `artefact` markers, drawn as hatched ranges.
+    - Tests: the client half of quality sketch rows 3, 4, 5, 9, 10 and 12 is
+      `dashboard/tests/js/boundary_quality.test.mjs`. The tab's render cases are in
+      `dashboard/tests/js/jsx_render_quality.test.mjs`.
 17. **Item 2: measurement identity.** Schema 3 `params` adds `python_version` and `instrument` (blob
     shas of `scripts/quality_metrics_snapshot.py` and `scripts/source_measures.py`); identity =
     (`as_of_sha`, `params`); a test pins byte-identity below `run_id` and `cost` for two runs at one
@@ -451,6 +542,49 @@ SnapshotPoint = {as_of_sha, committed_at, params, complete, baseline: bool, memb
 `validate_datum` runs at shaping; a metric whose `measured_since` is after the window start serves
 `null` points before it and `headline.state='unknown'` with the reason naming the source date.
 
+**Correction (γ, 2026-11-10).** The shipped wire extends the block above, and it replaces two of
+its shapes: the headline value and the `modules` entries. Its single home is
+`dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire`.
+- Replaced: a headline's value is `{form: rate | k_of_n | mean | median, n, k, value, lo, hi}`,
+  not `number|{k,n}`. `k` is the event count of a rate and null otherwise. The band is the Wilson
+  interval for a rate, and a bootstrap seeded by the window's task ids for a count or a cost.
+- Replaced: `modules` entries are flat `{module, landings, tasks, allocated_lines, allocated_usd,
+  usd_per_100_lines, ranked}`. There is no `metrics` key.
+- Added: each axis point carries `git_first_parent` and `late_claim`. Off-first-parent landings and
+  late claims stay on the axis (sketch row 3).
+- Added: each metric carries `kind` (`rate` | `count` | `cost`), so a chart type is never inferred
+  from an id.
+- Added: `before_after` entries carry `metric`.
+- Added: `QualitySeries` carries a top-level `git_check = {off_first_parent,
+  merges_without_landing, late_claims, disagreement}` taken from the newest value sample, or null.
+
+"No producer has written here" (INV-13) is a structured state: `rule.measured_since` is null, the
+points are null, and the headline is `unknown` with a reason starting with that phrase. A series
+flips by data, with no code change. `charter_blocked` flips once any stored row carries
+`charter_class_source = 'charter_class'`; a source flips once it has a `SourceEpochs` epoch.
+`reverts` stays in that state until `late_events` has a writer. `review_rounds_ge2` and
+`execute_iterations` have no source epoch: they are measured from the first stored landing that
+carries the value. Until one does, the source has a producer, so the headline does not say "no
+producer has written here". Its reason names what no stored landing carries, for example "no stored
+landing of this project carries a review round count" (`::Since`).
+
+Baseline, EWMA, CUSUM and the cost model run over the project's full stored history, and the window
+only slices what is served. The headline is always the last-100-measured block
+(`rule.window_landings = 100`), whatever the window chip says. Counts are per verify unit: the
+value sits on the unit's head landing and is 0 on the other members. The cost model fits per-unit
+points, at most 200 baseline units. `::validate_quality_series` refuses, with `VALUE_CONTRACT`, an
+array whose length differs from the axis, an unordered axis, or an alarm off the served axis.
+
+This amends decision 13's "absent below" for the baseline in force. A regime segment's own
+baseline (p0, or the cost model) takes force once that segment has ≥100 measured landings (≥100
+costed units for the cost model). Until then the previous segment's baseline stays in force, while
+the CUSUM still resets at the marker. That keeps a shift just after a marker alarmed and explained
+(sketch row 9). The served `baseline` and `cost_model` are the ones in force at the newest landing,
+and `baseline.since_ordinal` is the start of the segment that measured it, which can be before the
+newest marker. "Absent" means only that no segment has yet reached 100. Artefact-excluded landings
+are dropped from the EWMA and CUSUM inputs. Homes:
+`dashboard/src/dashboard/data/quality_series.py::_control_chart` and `::_cost_analysis`.
+
 ### Markers (`dashboard/src/dashboard/data/quality_markers.py`)
 
 `derived_markers(runs_db, project_id, snapshots) -> list[Marker]` (decision 11 rules, idempotent, persisted
@@ -458,6 +592,72 @@ to `markers_derived` by the loop with a per-(project, role) last-seen key); `loa
 -> (list[Marker], parse_failures)` fail-soft, unknown keys ignored, old entries valid with
 `kind='regime'`, `scope='fleet'`, `series=None`; `resolve_ordinals(markers, axis)` sets `ordinal` to the
 first landing at or after `at`.
+
+**Correction (δ, 2026-11-11).** What shipped, and where each part is homed. Symbols prefixed `::`
+are in `dashboard/src/dashboard/data/quality_markers.py`.
+- `QUALITY_MARKERS` is `Datum[MarkerStream]`, not a bare marker list. Its value is `{markers,
+  availability, prompt_coverage, curated_parse_failures, skipped_records}` (`::MarkerStream.to_wire`).
+  `availability` holds the role-default fallbacks, served apart from the markers
+  (`::AvailabilityFlag`: role, from_at, until_at, decisions, model). `prompt_coverage` is
+  `{state: written | not_yet_written, since, roles_py_landings, counted_since, reason}`
+  (`::PromptCoverage`). It is written from the first routing decision that carries a prompt digest.
+  Until then it counts the first-parent `main` merges touching
+  `orchestrator/src/orchestrator/agents/roles.py` in the factory checkout since the newest in-scope
+  curated `prompt` entry, else since the project's first routing decision. If git cannot give a
+  count, it gives the reason instead. The datum is unknown until the marker tick has derived the
+  project once. It is stale while the routing fold is incomplete or the newest refresh failed
+  (`::marker_datum`).
+- `Marker` adds `until_ordinal` (the last landing at or before an artefact's `until`) and `tasks`.
+  `scope` is the project id or `fleet`. `source` is `{type, ...the details that type carries}`
+  (`::MarkerSource`). Ordinals are resolved at serve time against the project's full stored landing
+  axis and never stored (`::resolve_ordinals`). The placement is
+  `shared/src/shared/quality_series/stats.py::regime_segments`'s.
+- Kind alone sets the regime role (`::REGIME_ROLE`). model, effort, budget, turns, prompt,
+  reviewer_policy, routing_rule, cli and regime are boundaries. artefact is an exclusion range.
+  deploy and instrument are not landing-axis events. Derived markers carry `series = null`, so each
+  is a regime event for every series. The route passes the stream's `regime_events()` to
+  `read_quality_series` (`dashboard/src/dashboard/api/quality.py::api_quality`). Before the
+  project's first derivation, when `QUALITY_MARKERS` is unknown, it passes the curated markers in
+  the project's scope instead, so a curated artefact is excluded from the start
+  (`dashboard/src/dashboard/api/quality.py::_regime_events`).
+- Steps (`::fold_routing_decisions`): a role's steps are run-length encoded from its decisions
+  with `source_layer ∈ {config, role_default}` that no policy rule matched (`rule_id` null).
+  `orchestrator/src/orchestrator/routing.py::resolve_route` applies a matched rule's effort,
+  budget and turns even when it refuses the rule's model, which leaves the layer `config` or
+  `role_default`. Such a row feeds only its rule's span. A row naming a layer outside
+  `::SourceLayer` is skipped and counted.
+- Persistence (decision 11, in `::_persists` and `::_counted_groups`): a non-start step counts iff
+  it has ≥3 decisions and either spans ≥24 h, or the next step changes a field it did not. The span
+  runs to the next step's first dispatch, or for the open step to the fold's newest decision.
+  Role-default runs bracketed by equal config steps are removed first and served as availability
+  flags. Kind is the first changed field by precedence model > effort > prompt > budget > turns,
+  and the label lists every changed field. An absent prompt digest never splits a step.
+- Dating (`::_cause`): a routing marker is dated at the earliest `config_reload` in the same
+  project's runs.db that names a changed field's config path, within 48 h before the first
+  dispatch. With no such reload it is dated at the first dispatch. A git commit is never a dating
+  source. Only an applied `review.reviewer_briefing` change is a standalone marker
+  (`reviewer_policy`). A policy rule's disappearance is a marker once the rule has not fired for
+  `::RULE_QUIET_DAYS` (7) at the fold's newest decision.
+- Store: the "per-(project, role) last-seen key" is the stored routing fold. quality.db holds it in
+  `routing_steps`, `routing_rules` and `marker_state`. `marker_state` carries the cursor, the fold
+  bounds, digest_since, completeness, the skip counts, the prompt coverage and
+  refreshed/attempted/failure. `markers_derived` is reshaped to `(project_id, marker_id, kind, at,
+  label, source, ref)` with no ordinal column. `_QualityStore.open()` drops and recreates the β
+  table (`dashboard/src/dashboard/data/quality_store.py::ensure_marker_tables`).
+- Tick: `dashboard/src/dashboard/data/quality_marker_sampler.py::refresh_markers` runs after
+  `collect_quality` in `dashboard/src/dashboard/loops.py::_quality_loop`. Each tick folds at most
+  `MARKER_ROUTING_BATCH` (500,000) routing rows per root and re-derives every marker from the fold
+  plus the small sources. Measured 2026-11-12, df's 27,152 routing rows fold in 0.32 s, so a cold
+  start completes in one tick. The tick resumes from the stored fold alone
+  (`dashboard/src/dashboard/data/quality_store.py::read_routing_fold`). A stored fold that no
+  longer decodes is folded again from the start, and that root's write replaces it. Both quality
+  ticks share their per-root machinery (`dashboard/src/dashboard/data/quality_root_tick.py`).
+- `load_curated_markers(path)` returns `CuratedMarkers(markers, parse_failures)`. `kind` takes the
+  whole marker vocabulary. `until` (artefact only) is the inclusive end of its UTC day. Every
+  rejected entry is counted. `derived_markers(runs_db, project_id, snapshots)` is the stateless full
+  derivation, equal to folding in batches.
+- The instrument rule (f) takes `SnapshotIdentity` values (`::instrument_markers`). The loop passes
+  none until ι supplies a snapshot reader.
 
 ### Orchestrator fields
 
