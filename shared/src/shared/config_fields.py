@@ -118,7 +118,8 @@ def _walk(
         _reject_nested_markers(path, info.annotation)
         shape = _shape(info.annotation)
         green = green_above or any(marker is Reload.GREEN for marker in info.metadata)
-        restart_rows = _checked_restart_rows(path, info, shape, green)
+        _check_table_marker_placement(path, info, shape)
+        restart_rows = _restart_only_rows(path, info, shape, green)
         yield DeclaredField(segments, info, shape, green and not row_restart_only, in_row)
         if isinstance(shape, Submodel):
             yield from _walk(
@@ -181,23 +182,25 @@ def _reject_nested_markers(path: str, annotation: object) -> None:
         _reject_nested_markers(path, arg)
 
 
-def _checked_restart_rows(
-    path: str, info: FieldInfo, shape: Shape, green: bool
-) -> frozenset[str]:
+def _check_table_marker_placement(path: str, info: FieldInfo, shape: Shape) -> None:
+    if isinstance(shape, Table):
+        return
     for marker in info.metadata:
-        if isinstance(marker, (RestartOnlyRows, TableLegacy)) and not isinstance(shape, Table):
+        if isinstance(marker, (RestartOnlyRows, TableLegacy)):
             raise ConfigDeclarationError(
                 f'{path}: {_describe(marker)} belongs on a Mapping[StrEnum, BaseModel] '
                 f'table field, and this field is not one'
             )
-        if isinstance(marker, RestartOnlyRows) and not green:
-            raise ConfigDeclarationError(
-                f'{path}: {_describe(marker)} is only meaningful on a Reload.GREEN '
-                f'table; every row of this table is restart-only already'
-            )
-    restart_rows = frozenset(
-        row for marker in info.metadata if isinstance(marker, RestartOnlyRows) for row in marker.rows
-    )
+
+
+def _restart_only_rows(path: str, info: FieldInfo, shape: Shape, green: bool) -> frozenset[str]:
+    markers = [marker for marker in info.metadata if isinstance(marker, RestartOnlyRows)]
+    if markers and not green:
+        raise ConfigDeclarationError(
+            f'{path}: {_describe(markers[0])} is only meaningful on a Reload.GREEN '
+            f'table; every row of this table is restart-only already'
+        )
+    restart_rows = frozenset(row for marker in markers for row in marker.rows)
     if isinstance(shape, Table):
         _require_rows(path, shape, restart_rows, 'RestartOnlyRows')
     return restart_rows
