@@ -14,14 +14,11 @@ from shared.memory_eval_metrics import canonical_json_text
 from fused_memory.arm_harness import corpus
 from fused_memory.arm_harness.arm_spec import ContentSha
 from fused_memory.arm_harness.frozen_model import FrozenModel
-from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.falkor_fulltext import build_edge_queries
 
 SCHEMA_VERSION: Final = 1
 TRANSCRIPT_QUERY_CAP = 500
 FULLTEXT_TERM_CUTOFF = search_utils.MAX_QUERY_LENGTH
-
-_ONE_SEARCH_GROUP = ('evalmem_probe_set',)
-"""A known-item search passes exactly one group id, the arm's scratch graph."""
 
 _ALNUM_RUN = re.compile(r'[^\W_]+')
 
@@ -97,7 +94,7 @@ def derive_query_words(transcript_queries: Sequence[str]) -> int:
 
 def _bm25_leg_survives(term_count: int) -> bool:
     terms = ' '.join(f'term{index}' for index in range(term_count))
-    return build_query(terms, list(_ONE_SEARCH_GROUP), FULLTEXT_TERM_CUTOFF) != ''
+    return build_edge_queries(terms, FULLTEXT_TERM_CUTOFF).union != ''
 
 
 def build_probe_set(

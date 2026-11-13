@@ -195,8 +195,8 @@ def test_no_cited_episode_is_refused():
 
 
 def test_a_known_item_query_whose_tokens_split_past_the_cutoff_is_refused():
-    dotted = '.'.join('bcdefghijklmnopq')
-    episodes = ((UUID_A, ' '.join([dotted] * 5)), *EPISODES[:1], *EPISODES[2:])
+    dotted = '.'.join('bcdefghijklmnopqr')
+    episodes = ((UUID_A, ' '.join([dotted] * 4)), *EPISODES[:1], *EPISODES[2:])
 
     with pytest.raises(ProbeSetError, match=UUID_A):
         _build(episodes=episodes)
