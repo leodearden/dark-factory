@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
-from graphiti_core.driver.driver import GraphDriver, GraphProvider
+from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
@@ -32,12 +32,6 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
-from graphiti_core.search.search_filters import (
-    ComparisonOperator,
-    DateFilter,
-    SearchFilters,
-    edge_search_filter_query_constructor,
-)
 
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
@@ -101,6 +95,7 @@ from fused_memory.backends.paged_read import (
 )
 from fused_memory.backends.paged_read import paged_ro_query as _paged_ro_query
 from fused_memory.backends.recent_episodes import read_recent_group_episodes
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE, active_edge_filter
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
@@ -395,7 +390,7 @@ class EdgeDict(TypedDict):
 class EdgeWithEndpoints(TypedDict):
     """A RELATES_TO edge with its endpoint names, as get_edges_by_uuids returns it.
 
-    ``active`` is ``_ACTIVE_EDGE_PREDICATE`` evaluated on the edge.
+    ``active`` is ``ACTIVE_EDGE_PREDICATE`` evaluated on the edge.
     """
 
     uuid: str
@@ -532,37 +527,6 @@ class IncompleteEnumerationError(Exception):
     """
 
 
-# An edge is ACTIVE iff `invalid_at` IS NULL.  `expired_at` is deliberately NOT
-# part of it: graphiti_core never sets `expired_at` without also setting
-# `invalid_at` (graphiti_core/utils/maintenance/edge_operations.py::
-# resolve_extracted_edge and ::resolve_edge_contradictions), so it retires
-# nothing `invalid_at` misses — while the restore hooks clear `invalid_at` and
-# keep `expired_at` as the restored-edge signature (redirect_node_edges), so an
-# `expired_at` clause would hide exactly the edges they restore (task 4714,
-# esc-4714-9).
-#
-# Every read answering "what is currently true?" applies this invariant: reads
-# through graphiti's own search pass `_active_edge_filter()`, and Cypher written
-# here interpolates `_ACTIVE_EDGE_PREDICATE`, which is compiled from that filter.
-# Maintenance, audit, and uuid-keyed paths deliberately do NOT — they must see
-# retired edges; `count_foreign_relationships` most emphatically so.
-def _active_edge_filter() -> SearchFilters:
-    """The active-edge invariant as graphiti SearchFilters, for reads through graphiti's own search."""
-    return SearchFilters(invalid_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]])
-
-
-def _compile_active_edge_predicate() -> str:
-    [predicate], params = edge_search_filter_query_constructor(
-        _active_edge_filter(), GraphProvider.FALKORDB,
-    )
-    if params:
-        raise RuntimeError(f'the active-edge predicate must bind no parameters, got {params!r}')
-    return predicate
-
-
-_ACTIVE_EDGE_PREDICATE = _compile_active_edge_predicate()
-
-
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
 # IDENTICAL MATCH/WHERE so the two numbers describe the same population and
 # are therefore directly comparable.
@@ -573,7 +537,7 @@ _ACTIVE_EDGE_PREDICATE = _compile_active_edge_predicate()
 # reshuffle at a boundary drops rows permanently and silently.
 _ALL_VALID_EDGES_MATCH = (
     'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    f'WHERE {_ACTIVE_EDGE_PREDICATE} '
+    f'WHERE {ACTIVE_EDGE_PREDICATE} '
 )
 _VALID_EDGE_ROWS_PAGE_TAIL = (
     'RETURN n.uuid, e.uuid, e.fact, e.name '
@@ -1048,7 +1012,7 @@ _UUID_MEANS_LOAD = (
 # tests/test_write_time_identity.py::TestEnumerateRankedEntityNodesLiveFalkorDB,
 # which checks the two agree on a real server.
 _PROVENANCE_RANK_CLAUSE = (
-    f'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE {_ACTIVE_EDGE_PREDICATE} '
+    f'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE {ACTIVE_EDGE_PREDICATE} '
     'WITH n, count(DISTINCT e) AS edge_count '
     'OPTIONAL MATCH (:Episodic)-[m:MENTIONS]->(n) '
     'WITH n, edge_count, count(DISTINCT m) AS mentions_count '
@@ -1677,7 +1641,7 @@ class GraphitiBackend:
                 group_ids=gids,
                 num_results=num_results,
                 center_node_uuid=center_node_uuid,
-                search_filter=_active_edge_filter(),
+                search_filter=active_edge_filter(),
                 driver=driver,
             ),
             'search',
@@ -2421,7 +2385,7 @@ class GraphitiBackend:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
         Matches the node as either source or target (undirected) and excludes
-        retired edges per ``_ACTIVE_EDGE_PREDICATE`` (``invalid_at`` set).
+        retired edges per ``ACTIVE_EDGE_PREDICATE`` (``invalid_at`` set).
 
         Deduplicates in Python, keyed on e.uuid. RELATES_TO edge uuids are
         unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
@@ -2440,7 +2404,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
-            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
+            f'WHERE {ACTIVE_EDGE_PREDICATE} '
             'RETURN e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -2480,7 +2444,7 @@ class GraphitiBackend:
         WHAT IT ANSWERS, contrasted with its neighbour above.
         :meth:`get_valid_edges_for_node` answers "does this node still carry
         LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
-        ``_ACTIVE_EDGE_PREDICATE``.  This one answers a different question:
+        ``ACTIVE_EDGE_PREDICATE``.  This one answers a different question:
         "would deleting this node DESTROY ANYTHING?"  It is therefore
         deliberately UNTYPED and UNFILTERED, because
         :meth:`delete_entity_node` issues a bare
@@ -2584,7 +2548,7 @@ class GraphitiBackend:
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 
-        Queries all active RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``) and
+        Queries all active RELATES_TO edges (``ACTIVE_EDGE_PREDICATE``) and
         excludes the node itself (self-loops excluded via ``m.uuid <> $uuid``).
 
         Collects neighbours BEFORE deletion so the caller can refresh their
@@ -2603,7 +2567,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            f'WHERE {_ACTIVE_EDGE_PREDICATE} AND m.uuid <> $uuid '
+            f'WHERE {ACTIVE_EDGE_PREDICATE} AND m.uuid <> $uuid '
             'RETURN DISTINCT m.uuid'
         )
         result = await graph.ro_query(cypher, {'uuid': uuid})
@@ -2841,7 +2805,7 @@ class GraphitiBackend:
         ``resolve_extracted_edges`` fast-path can catch, since those only
         see the edges before they converge onto the same node pair.
 
-        Queries the node's active (``_ACTIVE_EDGE_PREDICATE``) incident
+        Queries the node's active (``ACTIVE_EDGE_PREDICATE``) incident
         edges (undirected, so directed and reverse-directed exact
         duplicates both collapse), delegates grouping + survivor selection
         to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
@@ -2862,7 +2826,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
+            f'WHERE {ACTIVE_EDGE_PREDICATE} '
             'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -4360,7 +4324,7 @@ class GraphitiBackend:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
-        RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``), deduplicates their facts
+        RELATES_TO edges (``ACTIVE_EDGE_PREDICATE``), deduplicates their facts
         (preserving order), joins them with newlines, and writes the result
         back to the node's summary property.
 
@@ -4936,7 +4900,7 @@ class GraphitiBackend:
             return []
         result = await self._graph_for(group_id).ro_query(
             'MATCH (a)-[e:RELATES_TO]->(b) WHERE e.uuid IN $uuids '
-            f'RETURN e.uuid, e.fact, a.name, b.name, e.episodes, {_ACTIVE_EDGE_PREDICATE}',
+            f'RETURN e.uuid, e.fact, a.name, b.name, e.episodes, {ACTIVE_EDGE_PREDICATE}',
             {'uuids': list(uuids)},
         )
         by_uuid: dict[str, EdgeWithEndpoints] = {}

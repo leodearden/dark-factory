@@ -43,10 +43,7 @@ from graphiti_core.search.search_filters import (
 
 from fused_memory.backends.falkor_entity_edges import bind_entity_endpoints, read_entity_edges
 from fused_memory.backends.falkor_fulltext import build_edge_queries
-
-# A copy of fused_memory/backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE;
-# graphiti_client imports this module, so importing it from there is a cycle.
-_ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL'
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE
 
 # The origin labels graphiti's SearchInterface.edge_bfs_search documents; edge
 # BFS and node BFS both start from them.
@@ -112,8 +109,9 @@ async def _promoted_uuids(
 ) -> list[str]:
     """The live edges matching every identifier term, promoted only when all of them fit in the leg.
 
-    Under the leg's own filters, plus ``_ACTIVE_EDGE_PREDICATE``: the read path
-    discards retired edges after fusion, so promoting one would spend a slot.
+    Under the leg's own filters, plus ``relates_to_schema.py::ACTIVE_EDGE_PREDICATE``:
+    the read path discards retired edges after fusion, so promoting one would
+    spend a slot.
     ``limit + 1`` rows are read so an overflowing tier is told apart from one
     that fits.
     """
@@ -125,7 +123,7 @@ async def _promoted_uuids(
     records, _, _ = await driver.execute_query(
         bind_entity_endpoints(
             f'{fulltext_hits} YIELD relationship AS e',
-            [*filter_queries, _ACTIVE_EDGE_PREDICATE],
+            [*filter_queries, ACTIVE_EDGE_PREDICATE],
         )
         + ' RETURN e.uuid AS uuid LIMIT $tier_cap',
         query=identifiers,
