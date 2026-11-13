@@ -693,9 +693,11 @@ class Milestone(BaseModel):
         fires. A tz-naive ``at`` or anchor is read as UTC.
 
         A malformed spec cannot be a ``Milestone``, so "never fires" for
-        malformed metadata belongs to the caller; an unparseable *anchor*
-        raises ``ValueError``. ``Scheduler._milestone_time_gated`` delegates here
-        and owns the fail-safe withhold plus its deduplicated WARNING.
+        malformed metadata belongs to the caller. An *anchor* that is
+        unparseable, or that cannot be combined with ``after_secs`` into a
+        representable datetime, raises ``ValueError``.
+        ``Scheduler._milestone_time_gated`` delegates here and owns the
+        fail-safe withhold plus its deduplicated WARNING.
         """
         if self.mode == 'dated':
             assert self.at is not None
@@ -703,7 +705,15 @@ class Milestone(BaseModel):
         if not anchor:
             return False
         assert self.after_secs is not None
-        deadline = _as_utc(datetime.fromisoformat(anchor)) + timedelta(seconds=self.after_secs)
+        try:
+            deadline = _as_utc(datetime.fromisoformat(anchor)) + timedelta(
+                seconds=self.after_secs
+            )
+        except OverflowError as exc:
+            raise ValueError(
+                f'Milestone: anchor={anchor!r} + after_secs={self.after_secs} is not a '
+                f'representable datetime: {exc}'
+            ) from exc
         return deadline <= now
 
 

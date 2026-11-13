@@ -4544,7 +4544,8 @@ class Scheduler:
         A delayed milestone whose anchor is still unset is withheld without a
         warning (it is simply not due yet).  Anything malformed — a non-dict
         milestone, a spec ``Milestone`` rejects, a non-string or unparseable
-        anchor — fails safe: withhold (``True``) plus a WARNING deduped per
+        anchor, an anchor + ``after_secs`` deadline that cannot be
+        represented — fails safe: withhold (``True``) plus a WARNING deduped per
         (task_id, malformed value) by :meth:`_note_milestone_malformed`.
         That WARNING is a malformed spec's only route to human attention.
         """
