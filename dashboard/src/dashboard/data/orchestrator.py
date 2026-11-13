@@ -115,13 +115,8 @@ def _read_project_root_from_config(config_path: str) -> Path | None:
     Handles ``${VAR:default}`` env-var expansion for the project_root value.
     Returns ``None`` if the file can't be read or doesn't contain project_root.
     """
-    import yaml
-
-    try:
-        raw = yaml.safe_load(Path(config_path).read_text())
-    except (FileNotFoundError, yaml.YAMLError, OSError):
-        return None
-    if not isinstance(raw, dict):
+    raw = _load_config_mapping(Path(config_path))
+    if raw is None:
         return None
     value = raw.get('project_root')
     if not isinstance(value, str):
@@ -130,8 +125,24 @@ def _read_project_root_from_config(config_path: str) -> Path | None:
     return p.resolve() if p.is_absolute() else None
 
 
+_config_mapping_cache: dict[Path, tuple[tuple[int, int], dict | None]] = {}
+"""Parsed config per path, valid while the file's ``(st_mtime_ns, st_size)`` holds.
+
+One entry per path (a changed file replaces its entry), so the cache is bounded
+by the number of distinct config paths ever seen. A parse failure is cached
+under the same key as a success: fixing the file changes the key.
+"""
+
+
 def _load_config_mapping(path: Path) -> dict | None:
-    """``yaml.safe_load`` *path* and return it if it is a mapping, else ``None``.
+    """Parse *path* as YAML and return it if it is a mapping, else ``None``.
+
+    The parse is cached on the file's ``(st_mtime_ns, st_size)``: this is
+    reached from every ``/orchestrators`` request (via
+    :func:`_read_project_root_from_config`) as well as the burndown collector,
+    and the pure-Python YAML parse is measurable on the event loop. An edited
+    file is re-parsed on the next call. A file that cannot be stat-ed is never
+    cached. Callers must treat the returned mapping as read-only.
 
     Never raises: this runs inside the burndown collector loop, where an
     exception would take down a whole collection cycle — strictly worse than
@@ -141,11 +152,28 @@ def _load_config_mapping(path: Path) -> dict | None:
     import yaml
 
     try:
-        raw = yaml.safe_load(path.read_text())
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+        st = path.stat()
+    except OSError as exc:
         logger.debug('Unreadable orchestrator config %s: %s', path, exc)
         return None
-    return raw if isinstance(raw, dict) else None
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _config_mapping_cache.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    try:
+        text = path.read_text()
+    except (OSError, ValueError) as exc:
+        logger.debug('Unreadable orchestrator config %s: %s', path, exc)
+        return None
+    try:
+        raw = yaml.safe_load(text)
+    except (ValueError, yaml.YAMLError) as exc:
+        logger.debug('Unparseable orchestrator config %s: %s', path, exc)
+        raw = None
+    mapping = raw if isinstance(raw, dict) else None
+    _config_mapping_cache[path] = (key, mapping)
+    return mapping
 
 
 # FORMAT COUPLING item 2 (see the module docstring). Restates

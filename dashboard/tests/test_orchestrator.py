@@ -466,6 +466,66 @@ class TestDiscoverOrchestrators:
         assert result[0]["project_root"] == str(real_dir)
 
 
+class TestDiscoverOrchestratorsConfigParseCache:
+    """``--config`` roots are parsed once per file version, not once per request."""
+
+    @staticmethod
+    async def _discover(tmp_path, config_file):
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        procs = [{'pid': 1, 'prd': None, 'config_path': str(config_file), 'running': True, 'started': 'Mar18'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=procs):
+            return await discover_orchestrators(DashboardConfig(project_root=tmp_path))
+
+    async def test_unchanged_config_is_parsed_once(self, tmp_path, no_mcp):
+        from unittest.mock import patch
+
+        import yaml
+
+        root = tmp_path / 'proj'
+        root.mkdir()
+        config_file = tmp_path / 'cfg-unchanged.yaml'
+        config_file.write_text(f'project_root: {root}\n')
+
+        with patch('yaml.safe_load', wraps=yaml.safe_load) as parse:
+            first = await self._discover(tmp_path, config_file)
+            second = await self._discover(tmp_path, config_file)
+
+        assert first[0]['project_root'] == second[0]['project_root'] == str(root.resolve())
+        assert parse.call_count == 1
+
+    async def test_edited_config_is_picked_up(self, tmp_path, no_mcp):
+        root_a = tmp_path / 'proj_a'
+        root_b = tmp_path / 'proj_b_longer_name'
+        root_a.mkdir()
+        root_b.mkdir()
+        config_file = tmp_path / 'cfg-edited.yaml'
+        config_file.write_text(f'project_root: {root_a}\n')
+        before = await self._discover(tmp_path, config_file)
+
+        config_file.write_text(f'project_root: {root_b}\n')
+        after = await self._discover(tmp_path, config_file)
+
+        assert before[0]['project_root'] == str(root_a.resolve())
+        assert after[0]['project_root'] == str(root_b.resolve())
+
+    async def test_fixed_config_replaces_cached_failure(self, tmp_path, no_mcp):
+        root = tmp_path / 'proj'
+        root.mkdir()
+        config_file = tmp_path / 'cfg-fixed.yaml'
+        config_file.write_text('project_root: [unclosed\n')
+        broken = await self._discover(tmp_path, config_file)
+
+        config_file.write_text(f'project_root: {root}\n')
+        fixed = await self._discover(tmp_path, config_file)
+
+        assert broken[0]['project_root'] == str(tmp_path.resolve())
+        assert fixed[0]['project_root'] == str(root.resolve())
+
+
 class TestResolveProjectRoot:
     """Tests for _resolve_project_root — finds project root from PRD path."""
 
