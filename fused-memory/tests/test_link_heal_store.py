@@ -11,7 +11,7 @@ import contextlib
 import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import pytest
 from _fm_qdrant_live import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
@@ -28,9 +28,6 @@ from fused_memory.maintenance.link_heal_store import (
     WriteReply,
     text_sha256,
 )
-
-if TYPE_CHECKING:
-    from fused_memory.backends.mem0_client import Mem0Backend
 
 PROJECT = 'dark_factory'
 CHILD = '11111111-1111-1111-1111-111111111111'
@@ -389,7 +386,7 @@ class TestQdrantLinkCensus:
         as_uuid = uuid.UUID('22222222-2222-2222-2222-222222222222')
         backend = _FakeScrollBackend([_Point(as_uuid), _Point(CHILD)])
 
-        ids = await QdrantLinkCensus(cast('Mem0Backend', backend), 'fused').linked_ids(PROJECT)
+        ids = await QdrantLinkCensus(backend, 'fused').linked_ids(PROJECT)
 
         assert ids == [str(as_uuid), CHILD]
 
@@ -399,7 +396,7 @@ class TestQdrantLinkCensus:
 
         backend = _FakeScrollBackend([])
 
-        await QdrantLinkCensus(cast('Mem0Backend', backend), 'fused').linked_ids(PROJECT)
+        await QdrantLinkCensus(backend, 'fused').linked_ids(PROJECT)
 
         (collection, scroll_filter), = backend.scrolls
         assert collection == 'fused_dark_factory'
@@ -412,7 +409,7 @@ class TestQdrantLinkCensus:
         backend = _FakeScrollBackend([_Point(CHILD), _Point(NIL_UUID)], fail_after=1)
 
         with pytest.raises(CensusFailed) as excinfo:
-            await QdrantLinkCensus(cast('Mem0Backend', backend), 'fused').linked_ids(PROJECT)
+            await QdrantLinkCensus(backend, 'fused').linked_ids(PROJECT)
 
         assert excinfo.value.project_id == PROJECT
         assert excinfo.value.error_type == 'ConnectionError'
@@ -426,7 +423,7 @@ class TestQdrantLinkCensus:
             _Point(outside, {'parent_id': 'p', 'created_at': '2026-11-11T20:00:00-07:00'}),
             _Point(unknown, {'parent_id': 'p'}),
         ])
-        census = QdrantLinkCensus(cast('Mem0Backend', backend), 'fused')
+        census = QdrantLinkCensus(backend, 'fused')
 
         ids = await census.linked_ids(
             PROJECT, created_in=CreatedWindow(since=SINCE, until=UNTIL),
@@ -442,7 +439,7 @@ class TestQdrantLinkCensus:
             _Point(ids[1], {'parent_id': 'p', 'created_at': '2020-01-01T00:00:00+00:00'}),
         ])
 
-        found = await QdrantLinkCensus(cast('Mem0Backend', backend), 'fused').linked_ids(PROJECT)
+        found = await QdrantLinkCensus(backend, 'fused').linked_ids(PROJECT)
 
         assert found == ids
 

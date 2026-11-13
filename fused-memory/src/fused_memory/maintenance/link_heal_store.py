@@ -26,16 +26,13 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 from qdrant_client.models import Filter, IsEmptyCondition, PayloadField
 from shared.mcp_post import call_mcp_tool, open_mcp_client
 
 from fused_memory.models.scope import Scope
 from fused_memory.server.grouped_read import PARENT_ID_KEY
-
-if TYPE_CHECKING:
-    from fused_memory.backends.mem0_client import Mem0Backend
 
 #: An MCP ``tools/call``: the tool's reply dict, or ``None`` when none arrived.
 ToolCaller = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]]
@@ -337,10 +334,18 @@ class LinkCensus(Protocol):
     ) -> list[str]: ...
 
 
+class PointScroller(Protocol):
+    """The one backend read the census makes: a filtered scroll of a collection's points."""
+
+    def scroll_collection_pages(
+        self, collection_name: str, *, scroll_filter: Any = None,
+    ) -> AsyncIterator[Any]: ...
+
+
 class QdrantLinkCensus:
     """A read-only scroll of a project's collection for linked record ids."""
 
-    def __init__(self, backend: Mem0Backend, collection_prefix: str) -> None:
+    def __init__(self, backend: PointScroller, collection_prefix: str) -> None:
         self._backend = backend
         self._collection_prefix = collection_prefix
 
