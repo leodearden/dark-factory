@@ -29,8 +29,11 @@ from graphiti_core.search.search_filters import SearchFilters
 
 from fused_memory.backends import graphiti_client
 from fused_memory.backends.falkor_fulltext import (
+    EdgeFulltextQueries,
+    build_edge_queries,
     build_query,
     escape_group_id,
+    is_identifier_term,
     is_searchable_term,
 )
 from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
@@ -639,3 +642,63 @@ class TestMultiTenantDriverWiring:
         """The 128 default must reach ``build_query``, not be silently unbounded."""
         long_text = ' '.join(f'w{i}' for i in range(200))
         assert self._driver().build_fulltext_query(long_text, ['g']) == ''
+
+
+class TestIsIdentifierTerm:
+    """A term carrying a digit is an identifier: a task id, a sha, ``C1``."""
+
+    @pytest.mark.parametrize('term', ['877', 'C1', '3ef4c09f', '٣'])
+    def test_digit_bearing_terms_are_identifiers(self, term: str) -> None:
+        assert is_identifier_term(term)
+
+    @pytest.mark.parametrize('term', ['alpha', '_'])
+    def test_digit_free_terms_are_not_identifiers(self, term: str) -> None:
+        assert not is_identifier_term(term)
+
+
+class TestBuildEdgeQueries:
+    """The edge BM25 leg's two RediSearch queries, from ALREADY-sanitized text."""
+
+    def test_union_carries_no_group_filter(self) -> None:
+        assert build_edge_queries('alpha beta', 128).union == ' (alpha | beta)'
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'task 3334 note about RediSearch',
+            'the quick brown fox',
+            'Please note _ is the Python throwaway variable',
+            'café naïve 日本語 note',
+        ],
+    )
+    def test_union_is_the_ungrouped_build_query(self, text: str) -> None:
+        assert build_edge_queries(text, 128).union == build_query(text, None, 128)
+
+    def test_union_keeps_the_unsearchable_term_hardening(self) -> None:
+        assert build_edge_queries('note _ alpha', 128).union == ' (note | alpha)'
+
+    @pytest.mark.parametrize(
+        ('text', 'identifiers'),
+        [
+            ('task 877 context and related decisions', '(877)'),
+            ('why are graphiti edges 3ef4c09f and 912e58e8 orphaned', '(3ef4c09f 912e58e8)'),
+            ('esc 2184 1', '(2184 1)'),
+            ('task context and related decisions', ''),
+        ],
+    )
+    def test_identifiers_intersect_the_digit_bearing_terms_in_query_order(
+        self, text: str, identifiers: str
+    ) -> None:
+        assert build_edge_queries(text, 128).identifiers == identifiers
+
+    def test_no_searchable_term_gives_no_queries(self) -> None:
+        assert build_edge_queries('the and of', 128) == EdgeFulltextQueries(union='', identifiers='')
+
+    def test_64_terms_survive_the_length_guard_without_a_group_filter(self) -> None:
+        queries = build_edge_queries(' '.join(f'w{i}' for i in range(64)), 128)
+        assert queries.union != ''
+        assert queries.identifiers != ''
+
+    def test_the_identifier_tier_dies_with_an_over_length_union(self) -> None:
+        queries = build_edge_queries(' '.join(f'w{i}' for i in range(65)), 128)
+        assert queries == EdgeFulltextQueries(union='', identifiers='')
