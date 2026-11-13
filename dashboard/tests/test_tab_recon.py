@@ -33,7 +33,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 # The store's vocabulary plus the two spellings it has never written. Any
 # `status === '<one of these>'` left in the recon UI means a call site is

@@ -35,10 +35,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from _dashboard_helpers import (
+from _dashboard_helpers import node_path
+from _jsx_source_helpers import (
     destructure_bindings,
     extract_function_body,
-    node_path,
     strip_js_comments,
     walk_balanced,
 )

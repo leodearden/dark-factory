@@ -22,7 +22,7 @@ from _cache_buster_helpers import (
     resolve_redux_base_state,
     sole_cache_buster_version,
 )
-from _dashboard_helpers import assert_script_loads_before, find_script_position, strip_js_comments
+from _jsx_source_helpers import assert_script_loads_before, find_script_position, strip_js_comments
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

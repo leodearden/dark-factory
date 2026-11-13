@@ -38,7 +38,7 @@ import pathlib
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     extract_function_body,
     find_function_params,
     jsx_open_tag_end,
@@ -365,7 +365,7 @@ def _tag_end(source: str, start: int, site: str) -> int:
 
     RAISES where the shared walk answers ``None``, because the census's absence
     probes over a lost or runaway span are a silent false GREEN.  The walk
-    itself is ``_dashboard_helpers.py::jsx_open_tag_end``.
+    itself is ``_jsx_source_helpers.py::jsx_open_tag_end``.
     """
     end = jsx_open_tag_end(source, start)
     if end is None:

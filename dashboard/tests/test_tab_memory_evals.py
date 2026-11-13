@@ -16,7 +16,7 @@ import re
 from typing import NamedTuple
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     assert_script_loads_before,
     extract_df_data_block,
     extract_function_body,
@@ -176,7 +176,7 @@ def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
     so the test fails claiming the element is GONE — against behaviourally
     correct code.  The previous spelling pushed that onto future authors as a
     style rule ("hoist comparisons into locals"); this walks the tag instead
-    with ``_dashboard_helpers.py::jsx_open_tag_end``, the way
+    with ``_jsx_source_helpers.py::jsx_open_tag_end``, the way
     ``extract_function_body`` and ``_enclosing_function`` already walk braces
     rather than spanning them.  Its ``None`` means "not this candidate" here,
     since a miss is the expected answer while probing starts backwards.
@@ -214,7 +214,7 @@ def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
     delimiter pair, so one walk serves both the ``PARITY_REFINEMENT`` object
     and the ``PARITY_PLAIN`` array.
 
-    Stays LOCAL to this module rather than joining ``_dashboard_helpers``:
+    Stays LOCAL to this module rather than joining ``_jsx_source_helpers``:
     this anchor has exactly one consumer (memory_evals_fmt.js's two parity
     declarations), so hoisting it would move code no other suite can reach.
     The duplication worth removing was the walk, and that is gone.

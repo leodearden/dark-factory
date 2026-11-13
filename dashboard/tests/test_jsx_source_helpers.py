@@ -1,13 +1,12 @@
-"""Contract for the shared JSX source-slicing helpers in `_dashboard_helpers`.
+"""Contract for the shared JSX source-slicing helpers in `_jsx_source_helpers`.
 
-The dashboard suite asserts structural contracts against the *served* .jsx
-text (there is no JS runtime in this project), and nearly every such
-assertion first needs to scope itself to one function's body — otherwise a
-token appearing anywhere else in the file satisfies it and the test proves
-nothing.  That scoping helper used to be copied into each consuming module,
-which meant a fix to it had to be applied nine times or not at all.  This
-file owns its contract so the single shared implementation can be changed
-with confidence.
+These helpers serve the Python suites that assert structural contracts
+against the *served* .jsx text, and nearly every such assertion first needs
+to scope itself to one function's body — otherwise a token appearing
+anywhere else in the file satisfies it and the test proves nothing.  That
+scoping helper used to be copied into each consuming module, which meant a
+fix to it had to be applied nine times or not at all.  This file owns its
+contract so the single shared implementation can be changed with confidence.
 
 `extract_function_body` is the brace-walk variant: it returns exactly the
 brace-delimited block of a named `function` declaration, signature excluded,
@@ -29,7 +28,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     DF_CHARTS_DESTRUCTURE_RE,
     DF_CHARTS_EXPORT_RE,
     ScriptTagCollector,
