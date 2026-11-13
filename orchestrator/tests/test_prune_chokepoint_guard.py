@@ -22,8 +22,6 @@ phrase (e.g. verify.py's DD5 notes, git_ops.py's own docstrings) are never
 matched, avoiding false positives. A literal only counts as "inside the
 chokepoint" when it falls within a ``_prune_registrations`` method defined
 directly on the ``GitOps`` class (not merely any same-named function).
-Mirrors the AST-walk / offender file:line list / skip-self pattern used by
-orchestrator/tests/test_event_loop_antipattern_guard.py.
 """
 from __future__ import annotations
 
@@ -33,7 +31,6 @@ from pathlib import Path
 from typing import TypeGuard
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
     ORCHESTRATOR_SRC_DIR,
     TREE_PASS_XDIST_GROUP,
@@ -42,8 +39,9 @@ from _tree_scan import (
     TreePass,
     python_files,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),

@@ -18,7 +18,6 @@ from pathlib import Path
 import config_dir_archival_allowlist
 import loop_blocking_allowlist
 import pytest
-import shared_timeout_marker_grandfathered
 import silent_fallthrough_allowlist
 
 from shared.governed_exceptions import (
@@ -30,6 +29,9 @@ from shared.governed_exceptions import (
     governed_exceptions,
 )
 from shared.task_metadata import _BLESSED_METADATA_KEYS, _LEGACY_RETRY_LEDGER_COUNTER_KEYS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -148,7 +150,7 @@ CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
     'being archived first, either by design or as a recorded gap.',
     _occurrence_keys((site['path'], site['qualname']) for site in _UNARCHIVED_CONFIG_DIR_SITES),
     default=Policy('inv12-config-dir-unarchived-by-design'),
-    default_covers=3,
+    default_covers=4,
 )
 
 BLESSED_TASK_METADATA_KEYS = governed_exceptions(
@@ -158,6 +160,14 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     sorted(_BLESSED_METADATA_KEYS),
     default=Policy('inv12-task-metadata-blessed-keys'),
     default_covers=56,
+    dispositions={
+        'cancel_dispositions': Policy('inv12-task-metadata-blessed-keys'),
+        'predicate_recheck': Policy('inv12-task-metadata-blessed-keys'),
+        'predicate_verdict': Policy('inv12-task-metadata-blessed-keys'),
+        'pure_gate_from': Policy('inv12-task-metadata-blessed-keys'),
+        'superseded_by': Policy('inv12-task-metadata-blessed-keys'),
+        'trigger_chain': Policy('inv12-task-metadata-blessed-keys'),
+    },
 )
 
 LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(
@@ -177,17 +187,8 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     dispositions={
         'tool.ruff.lint.ignore::E501': Policy('inv12-ruff-e501-line-length'),
         'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
+        'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::src/**/*.py::TID251': Debt(TaskRef(8622)),
     },
-)
-
-
-SHARED_TIMEOUT_MARKER_GRANDFATHERED = governed_exceptions(
-    'shared.tests.shared_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED',
-    'An in-band timeout-marker site in shared/tests that predates the timeout-marker '
-    'inversion guard, exempt from it until migrated; entries may only be removed.',
-    sorted('::'.join(site) for site in shared_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED),
-    default=Debt(TaskRef(6337)),
-    default_covers=1,
 )
 
 
@@ -206,7 +207,6 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._persist_stage_reports_then_gc_config_dir::f05da1451b63': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::0787c60051a4': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::cc7999e2d4b6': Debt(TaskRef(5270)),
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._resume_interrupted_runs::bc3672ec502c': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._record_failed_run::652fc88d57ad': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._maybe_escalate_stale_task_count_snapshot::560696057da1': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._maybe_remediate::1fbc50761be3': Debt(TaskRef(5270)),
@@ -214,14 +214,14 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._maybe_remediate::8c9728223345': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::c5a47e52ad4b': Debt(TicketRef('tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH')),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::9e5ae6eb2503': Debt(TicketRef('tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH')),
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::58434c3060da': Debt(TaskRef(5270)),
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::920dc9ba5dbb': Debt(TaskRef(5270)),
+        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::edd9a8720cf9': Debt(TaskRef(5270)),
+        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::a4c939b65449': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::ec953752e2f1': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_write_task_count_snapshot::e08ddda37175': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/reconciliation/stale_priority_override_edge_sweep.py::read_live_override_state::7ebd882c849b': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler._sweep_cancelled_descendants::b9609c7cf5b4': Debt(TicketRef('tkt_0RT7RKWJG17W03JRC947R8FZZN')),
         'fused-memory/src/fused_memory/server/main.py::run_server::8a884f86a26c': Debt(TaskRef(7572)),
-        'fused-memory/src/fused_memory/server/main.py::run_server::beb5b61c6b9a': Debt(TaskRef(7572)),
+        'fused-memory/src/fused_memory/server/main.py::run_server::f6a7ff40db1f': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/server/main.py::run_server::43c97372205c': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_tasks::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_statuses::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),

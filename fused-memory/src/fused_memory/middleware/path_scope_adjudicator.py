@@ -41,7 +41,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
@@ -57,6 +57,7 @@ from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import PathScopeAdjudicatorConfig
@@ -131,6 +132,9 @@ Do not add explanatory text outside the JSON.
 # The curator uses a longer cap-wait because it runs out-of-band; here speed
 # of failure matters more than exhausting wait-for-cap credit.
 _ADJUDICATOR_CAP_WAIT_SANITY_SECS: float = 60.0
+
+# The invocations-ledger role this adjudicator's calls are recorded under.
+_LEDGER_ROLE = 'path_scope_adjudicator'
 
 
 # ---------------------------------------------------------------------------
@@ -221,11 +225,13 @@ class PathScopeAdjudicator:
         cwd: Path | None = None,
         scope_violation_escalator: ScopeViolationEscalator | None = None,
         *,
+        cost_store: CostStore | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._clock = clock
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._cwd = cwd
         self._escalator = scope_violation_escalator
 
@@ -271,6 +277,20 @@ class PathScopeAdjudicator:
             f'\n'
             f'Task description:\n{desc_text}\n'
         )
+
+    # ------------------------------------------------------------------
+    # LLM call
+    # ------------------------------------------------------------------
+
+    def _ledger_kwargs(self) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that land a call in the invocations ledger.
+
+        ``run_id`` is read from the gate, so adjudicator invocations and the gate's
+        own account events share one run key, as in
+        ``fused_memory/middleware/task_curator.py::TaskCurator._ledger_kwargs``.
+        """
+        run_id = (self._usage_gate.run_id or '') if self._usage_gate is not None else ''
+        return {'cost_store': self._cost_store, 'role': _LEDGER_ROLE, 'run_id': run_id}
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -345,6 +365,7 @@ class PathScopeAdjudicator:
                 permission_mode='bypassPermissions',
                 timeout_seconds=self._config.timeout_seconds,
                 cap_wait_sanity_secs=_ADJUDICATOR_CAP_WAIT_SANITY_SECS,
+                **self._ledger_kwargs(),
             )
         except Exception as exc:
             logger.warning(

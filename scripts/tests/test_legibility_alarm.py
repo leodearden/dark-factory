@@ -200,6 +200,30 @@ def test_inside_own_endpoint_the_default_poster_lands_one_escalate_info():
     ]
 
 
+def test_post_tool_call_outside_own_endpoint_is_refused_before_any_request():
+    with StubMcpServer(stateful=True) as server:
+        with pytest.raises(alarm.RealPostRefusedUnderTest, match="submit_task"):
+            alarm.post_tool_call(server.url, "submit_task", {"title": "t"}, timeout=5.0)
+        requests = server.requests
+
+    assert requests == ()
+
+
+def test_post_tool_call_inside_own_endpoint_returns_the_reply_to_one_tools_call():
+    payload = {"ticket": "tkt_1"}
+    with StubMcpServer(stateful=True, payload=payload) as server:
+        with alarm.own_endpoint():
+            reply = alarm.post_tool_call(server.url, "submit_task", {"title": "t"}, timeout=5.0)
+        paths = {request.path for request in server.requests}
+        tool_calls = _tool_calls(server)
+
+    assert reply == payload
+    assert paths == {"/mcp"}
+    assert [call["params"] for call in tool_calls] == [
+        {"name": "submit_task", "arguments": {"title": "t"}},
+    ]
+
+
 def test_the_own_endpoint_grant_does_not_outlive_its_block():
     url = "http://localhost:8103"
 

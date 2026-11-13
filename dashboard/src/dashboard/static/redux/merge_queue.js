@@ -1,6 +1,6 @@
 // merge_queue.js — the CLIENT twin of dashboard/src/dashboard/data/merge_queue.py,
-// and the ONE reader of the /merge-queue Datums — in_queue, speculative and
-// recent_total — and of each queued row's enqueue instant. MergeTab's tiles,
+// and the ONE reader of the /merge-queue Datums — in_queue, speculative,
+// recent_total, depth and attempts — and of each queued row's enqueue instant. MergeTab's tiles,
 // pips and captions, the Overview live feed and the rail badge all read them
 // here, so no two of them can disagree. Named for its server twin (the
 // datum.js precedent).
@@ -18,8 +18,8 @@
 //
 // THE CLIENT NEVER ALTERS A SERVED COUNT. Each project's `in_queue` is the
 // server's Datum — the live probe, or its own sampled history's last value,
-// stale and saying why — and its `speculative` and `recent_total` are its
-// runs.db window reads, unknown when that read failed. The only envelopes built
+// stale and saying why — and its `speculative`, `recent_total`, `depth` and
+// `attempts` are its runs.db window reads, unknown when that read failed. The only envelopes built
 // here are datum.js's own: a receipt stamp, an unknown placeholder, and a
 // combined total in which a hole anywhere is a hole in the sum.
 //
@@ -28,8 +28,8 @@
 // configured root may run no orchestrator), so it is outside every in-queue
 // total and spark rather than a hole that blanks them for good. A probed
 // project that cannot be read IS a hole: its own datum says why. The
-// speculative total is NOT so scoped: its counts come from each project's
-// runs.db, which that probe has no bearing on.
+// speculative and attempts totals are NOT so scoped: their counts come from
+// each project's runs.db, which that probe has no bearing on.
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
@@ -131,17 +131,28 @@ function recentTotal(data, project) {
 // The speculative counts summed over `projects` (null: every payload project).
 // A window with no attempts has no rate, so the total is a hole rather than 0%.
 function speculativeOver(data, projects) {
-  if (!queueReceipts(data)[MERGE_QUEUE_ENDPOINT]) return unknownQueueDatum(QUEUE_NOT_YET_FETCHED);
-  const scope = projects === null ? Object.keys(queueEntries(data)) : projects;
-  const total = combineQueueDatums(
-    scope.map(project => [project, projectSpeculative(data, project)]),
-    sumSpeculativeCounts,
-    'no project is in scope',
-  );
+  const total = runsDbOver(data, projects, projectSpeculative, sumSpeculativeCounts);
   if (total.state !== 'unknown' && total.value.total === 0) {
     return unknownQueueDatum('no speculative attempts in this window');
   }
   return total;
+}
+
+// Every payload project for a null scope; the runs.db readings are not scoped
+// to the probed projects.
+function runsDbScope(data, projects) {
+  return projects === null ? Object.keys(queueEntries(data)) : projects;
+}
+
+// Each in-scope project's `reader` Datum, combined: a hole before the
+// endpoint's first receipt, and a hole anywhere in scope is a hole in it.
+function runsDbOver(data, projects, reader, combine) {
+  if (!queueReceipts(data)[MERGE_QUEUE_ENDPOINT]) return unknownQueueDatum(QUEUE_NOT_YET_FETCHED);
+  return combineQueueDatums(
+    runsDbScope(data, projects).map(project => [project, reader(data, project)]),
+    combine,
+    'no project is in scope',
+  );
 }
 
 function sumSpeculativeCounts(parts) {
@@ -153,6 +164,62 @@ function sumSpeculativeCounts(parts) {
     }),
     { hit_count: 0, discard_count: 0, total: 0 },
   );
+}
+
+// *project*'s merge_attempt counts per bucket over the window, leading empty
+// buckets trimmed by the server.
+function projectDepth(data, project) {
+  return projectServed(data, project, 'depth');
+}
+
+// *project*'s window of attempts: ONE read behind the donut and the latency.
+function projectAttempts(data, project) {
+  return projectServed(data, project, 'attempts');
+}
+
+// How many attempts one known attempts value holds: its donut's total.
+function attemptCount(attempts) {
+  return attempts.outcomes.values.reduce((sum, n) => sum + n, 0);
+}
+
+// The attempts summed over `projects` (null: every payload project). A
+// measured window with no attempts is a measured 0.
+function attemptsOver(data, projects) {
+  return runsDbOver(
+    data, projects, projectAttempts, parts => parts.reduce((sum, part) => sum + attemptCount(part), 0),
+  );
+}
+
+// The attempts tile's spark: the in-scope depth series summed per label over
+// the union of their labels. Every series is epoch-aligned at one width and
+// ends at the same bucket, so a label one series lacks is a leading zero the
+// server trimmed, and counts 0 for it. An unread series is no such zero: one
+// anywhere in scope blanks the spark rather than draw a dip that never happened.
+function attemptsHistory(data, projects) {
+  const depths = runsDbScope(data, projects).map(project => projectDepth(data, project));
+  if (depths.some(depth => depth.state === 'unknown')) return [];
+  const byLabel = new Map();
+  for (const { value } of depths) {
+    value.labels.forEach((label, i) => {
+      byLabel.set(label, (byLabel.get(label) || 0) + (Number(value.values[i]) || 0));
+    });
+  }
+  return [...byLabel.keys()].sort().map(label => byLabel.get(label));
+}
+
+// The worst p95 over the in-scope projects whose window holds a timed attempt,
+// and how many did. No timed project has no worst centile: a hole, not 0.
+function worstP95Over(data, projects) {
+  const worst = runsDbOver(data, projects, projectAttempts, worstTimedP95);
+  if (worst.state !== 'unknown' && worst.value.timed_projects === 0) {
+    return unknownQueueDatum('no timed merges in this window');
+  }
+  return worst;
+}
+
+function worstTimedP95(parts) {
+  const timed = parts.map(part => part.latency.p95).filter(p95 => p95 !== null && p95 !== undefined);
+  return { p95_ms: timed.length > 0 ? Math.max(...timed) : null, timed_projects: timed.length };
 }
 
 function hitRateText(counts) {
@@ -192,6 +259,12 @@ const MERGE_QUEUE_API = {
   recentTotal,
   latencyCaption,
   depthBucketCaption,
+  projectDepth,
+  projectAttempts,
+  attemptCount,
+  attemptsOver,
+  attemptsHistory,
+  worstP95Over,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

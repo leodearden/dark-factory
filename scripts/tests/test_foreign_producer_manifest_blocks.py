@@ -15,6 +15,9 @@ from audit_delivered_checks import load_manifest_checks
 from committed_git_repo import committed_repo
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # The tracked manifest blocks whose PRODUCER lives in another project's

@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     make_placeholder_future,
@@ -948,10 +948,7 @@ def _make_mock_req(tmp_path: Path) -> MagicMock:
     """Build a minimal MergeRequest stub."""
     req = MagicMock()
     req.task_id = 'task-1710'
-    req.config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(warm_verify_shadow_compare=True),
-    )
+    req.config = lane_scene_config(tmp_path, GitConfig(warm_verify_shadow_compare=True))
     return req
 
 
@@ -1445,7 +1442,7 @@ def _make_shadow_config(
         warm_verify_shadow_compare_every_n_merges=every_n,
         warm_verify_shadow_compare_nightly_interval_secs=nightly_interval,
     )
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 class TestMaybeScheduleShadowCompare:
@@ -1688,7 +1685,7 @@ def _make_warm_cold_config(
         warm_verify_shadow_compare=shadow_compare,
         warm_verify_shadow_compare_every_n_merges=1,  # always due in tests
     )
-    return OrchestratorConfig(project_root=project_root, git=git)
+    return lane_scene_config(project_root, git)
 
 
 #: A warm verify output that PARSES into a per-test map.  The map is what
@@ -1746,7 +1743,7 @@ class TestRunPostMergeVerifyOnResultCallback:
         merge_wt = tmp_path / 'wt'
         merge_wt.mkdir()
         req = MagicMock()
-        req.config = OrchestratorConfig(project_root=tmp_path, git=GitConfig())
+        req.config = lane_scene_config(tmp_path, GitConfig())
         req.task_files = None
         req.module_configs = []
         req.task_id = 'task-15'

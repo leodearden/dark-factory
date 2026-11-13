@@ -422,7 +422,7 @@ async def test_record_run_session_persists_and_increments_attempt(journal):
     assert loaded.stage_cursor == 'memory_consolidator'
     assert loaded.attempt == 1
 
-    # Same snapshot is visible via the _row_to_run recovery read path (σ).
+    # Same snapshot is visible via the _row_to_run recovery read path.
     running = {r.id: r for r in await journal.get_running_runs()}
     assert running[run_id].session_id == 'S1'
     assert running[run_id].stage_cursor == 'memory_consolidator'
@@ -1666,14 +1666,15 @@ class TestGetRunStageExecution:
     async def test_resumed_reports_whether_the_run_was_adopted_for_resume(
         self, journal
     ):
-        """``status`` alone cannot tell a settled run from one that is running
-        again: ``harness.py::_resume_interrupted_runs`` adopts an interrupted
-        run and ``run_full_cycle`` marks it running only on the in-memory
-        object, leaving the column ``'interrupted'``. The adopt pass does
-        persist its ``_resume`` bookkeeping first, so that key is the one
-        durable signal that the blob may be a stale mid-flight snapshot, and
-        the projection surfaces it rather than making every caller re-parse
-        ``stage_reports`` to find out."""
+        """``status`` alone cannot tell a settled legacy row from one that was
+        running again: before task 5514 retired resume, the startup
+        adopt-and-resume pass took over an interrupted run and
+        ``run_full_cycle`` marked it running only on the in-memory object,
+        leaving the column ``'interrupted'``. The adopt pass did persist its
+        ``_resume`` bookkeeping first, so that key is the one durable signal
+        that the blob may be a stale mid-flight snapshot, and the projection
+        surfaces it rather than making every caller re-parse ``stage_reports``
+        to find out."""
         settled = str(uuid.uuid4())
         await self._start(journal, settled)
         await journal.update_run_stage_reports(settled, {'_error': {'error': 'boom'}})
@@ -1740,12 +1741,13 @@ class TestGetRunStageExecution:
     async def test_interrupted_settles_only_when_it_was_never_adopted(
         self, journal, adopted, settled
     ):
-        """``interrupted`` is the one terminal status a run can leave: the
-        adopt-and-resume pass persists its ``_resume`` bookkeeping and then
-        re-runs the run behind a status column only ``complete_run`` ever
-        writes. So the SAME terminal status means "finished account" or
-        "executing again" depending on that key, and the projection — not its
-        caller — is what knows the difference."""
+        """``interrupted`` was the one terminal status a run could leave: the
+        adopt-and-resume pass (retired by task 5514) persisted its ``_resume``
+        bookkeeping and then re-ran the run behind a status column only
+        ``complete_run`` ever writes. So on a legacy row the SAME terminal
+        status means "finished account" or "was executing again" depending on
+        that key, and the projection — not its caller — is what knows the
+        difference."""
         run_id = str(uuid.uuid4())
         await self._start(journal, run_id)
         if adopted:

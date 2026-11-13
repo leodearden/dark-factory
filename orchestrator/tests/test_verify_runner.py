@@ -12,20 +12,32 @@ from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _gate_fixtures import gate_argv, gated_remote_runner
+from _gate_fixtures import (
+    TEST_CODE_CHECKOUT,
+    TEST_DEPLOYED_SHA,
+    TEST_DF_REMOTE,
+    TEST_GATE_ROOT,
+    gate_argv,
+    gated_remote_runner,
+    gated_run,
+)
 from _orch_helpers import pydantic_spec, wait_responsive
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    CANCEL_PROBE_INTERVAL_SECS,
+    GIT_PUSH_SSH_CONFIG,
     HEARTBEAT_STOP_JOIN_SECS,
     LocalRunner,
     MergeVerifySpec,
+    RemoteRunner,
     UnscopedTypecheckSpec,
     VerifyCommand,
     VerifyRunner,
     VerifyRunnerPool,
+    poll_until_clean,
     result_from_dict,
     result_from_json,
     result_to_dict,
@@ -318,6 +330,48 @@ class TestMergeVerifySpec:
         legacy.pop("verify_cold_preprovision_command", None)
         restored = MergeVerifySpec.from_dict(legacy)
         assert restored.verify_cold_preprovision_command == ''
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs ride the spec ---
+
+    def test_scope_cargo_and_config_only_globs_round_trip(self):
+        spec = dataclasses.replace(
+            self._make_spec(),
+            scope_cargo=False,
+            merge_config_only_full_gate_globs=(
+                'dark-factory-orchestrator.yaml', 'crates/*/Cargo.toml',
+            ),
+        )
+        restored = MergeVerifySpec.from_dict(spec.to_dict())
+        assert restored == spec
+        assert isinstance(restored.merge_config_only_full_gate_globs, tuple)
+        assert spec_from_json(spec_to_json(spec)) == spec
+
+    def test_scope_cargo_and_config_only_globs_default_to_not_carried(self):
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+        )
+        assert spec.scope_cargo is None
+        assert spec.merge_config_only_full_gate_globs is None
+
+    def test_from_dict_back_compat_missing_scope_cargo_and_globs(self):
+        """BACK-COMPAT: a pre-7465 dispatcher's dict lacks both keys and decodes
+        to None, which leaves the consuming host's own values in force."""
+        legacy = self._make_spec().to_dict()
+        legacy.pop("scope_cargo", None)
+        legacy.pop("merge_config_only_full_gate_globs", None)
+        restored = MergeVerifySpec.from_dict(legacy)
+        assert restored.scope_cargo is None
+        assert restored.merge_config_only_full_gate_globs is None
+
+    def test_empty_globs_round_trip_as_carried(self):
+        """() is a carried value that replaces the host's globs, never None."""
+        spec = dataclasses.replace(self._make_spec(), merge_config_only_full_gate_globs=())
+        assert MergeVerifySpec.from_dict(spec.to_dict()).merge_config_only_full_gate_globs == ()
+        assert spec_from_json(spec_to_json(spec)).merge_config_only_full_gate_globs == ()
 
 
 # ---------------------------------------------------------------------------
@@ -1679,6 +1733,90 @@ class TestDispatchChainItems:
 
 
 @pytest.mark.asyncio
+class TestDispatchFacts:
+    """``runner_reason``/``base_relation`` on the merge_verify event (task 8523).
+
+    Always present, None when the caller reported no allocation decision —
+    the same reader contract as ``depth``.
+    """
+
+    def _make_pool(self, runners):
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+        pool = VerifyRunnerPool(runners, event_store=event_store, task_id='t-facts')
+        return pool, emitted
+
+    def _fake_runner(self, name, *, raises=None):
+        runner = MagicMock(spec=VerifyRunner)
+        runner.name = name
+        runner.is_local = name == 'local'
+        runner.run_merge_verify = AsyncMock(
+            return_value=_make_pass_result(), side_effect=raises,
+        )
+        return runner
+
+    async def test_dispatch_facts_are_emitted_as_wire_strings(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_verify_facts import (
+            BaseRelation,
+            MergeVerifyDispatchFacts,
+            RunnerReason,
+        )
+
+        pool, emitted = self._make_pool([self._fake_runner('local')])
+
+        await pool.dispatch(
+            'sha-facts', _make_spec(),
+            dispatch_facts=MergeVerifyDispatchFacts(
+                RunnerReason.PREFER_REMOTE_FREE, BaseRelation.STACKED,
+            ),
+        )
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        assert kwargs['data']['runner_reason'] == 'prefer_remote_free'
+        assert kwargs['data']['base_relation'] == 'stacked'
+
+    async def test_bare_dispatch_emits_both_keys_null(self):
+        pool, emitted = self._make_pool([self._fake_runner('local')])
+
+        await pool.dispatch('sha-bare', _make_spec())
+
+        data = emitted[-1][1]['data']
+        assert 'runner_reason' in data and data['runner_reason'] is None
+        assert 'base_relation' in data and data['base_relation'] is None
+
+    async def test_unavailable_remote_fallback_reports_remote_quarantined(self):
+        from orchestrator.merge_verify_facts import (
+            BaseRelation,
+            MergeVerifyDispatchFacts,
+            RunnerReason,
+        )
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        pool, emitted = self._make_pool([
+            self._fake_runner('local'),
+            self._fake_runner('laptop', raises=RunnerUnavailable('host down')),
+        ])
+
+        await pool.dispatch(
+            'sha-fallback', _make_spec(),
+            dispatch_facts=MergeVerifyDispatchFacts(
+                RunnerReason.PREFER_REMOTE_FREE, BaseRelation.MAIN,
+            ),
+        )
+
+        assert len(emitted) == 1
+        data = emitted[0][1]['data']
+        assert data['runner'] == 'local'
+        assert data['runner_reason'] == 'remote_quarantined'
+        assert data['base_relation'] == 'main'
+
+
+@pytest.mark.asyncio
 class TestDispatchDurationWiring:
     """The persisted merge_verify payload's ``duration_ms`` is the runner's real wall time.
 
@@ -2019,17 +2157,24 @@ class TestRetryScopeEventFields:
 class TestBuildMergeVerifySpec:
     """build_merge_verify_spec projects config + module_configs into a MergeVerifySpec."""
 
-    def _make_module_config(self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None):
+    def _make_module_config(
+        self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None, scope_cargo=None,
+    ):
         mc = MagicMock()
         mc.prefix = prefix
         mc.test_command = test_cmd
         mc.lint_command = lint_cmd
         mc.type_check_command = type_check_cmd
+        # Task 7465: collapsed_module_overrides reads these; a bare MagicMock
+        # attr is non-None and truthy, so it would flag every mock module.
+        mc.scope_cargo = scope_cargo
+        mc.verify_env = None
         return mc
 
     def _make_config(
         self, *, verify_env=None, cold_timeout=None,
         test_cmd=None, lint_cmd=None, type_check_cmd=None,
+        scope_cargo=True, config_only_globs=(),
     ):
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.verify_env = verify_env or {}
@@ -2050,6 +2195,9 @@ class TestBuildMergeVerifySpec:
         config.type_check_command = type_check_cmd
         # Task 6127: projected onto the spec, so it needs a real (JSON-native) value.
         config.verify_cold_preprovision_command = ''
+        # Task 7465: both projected onto the spec, so they need real values.
+        config.scope_cargo = scope_cargo
+        config.git = GitConfig(merge_config_only_full_gate_globs=list(config_only_globs))
         return config
 
     def test_verify_commands_project_module_fields(self):
@@ -2236,6 +2384,52 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         spec = build_merge_verify_spec(OrchestratorConfig(), [], None)
         assert spec.verify_cold_preprovision_command == ''
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs ride the spec ---
+
+    @pytest.mark.parametrize('scope_cargo', [True, False])
+    def test_scope_cargo_projected_from_config(self, scope_cargo):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(scope_cargo=scope_cargo), [], None)
+        assert spec.scope_cargo is scope_cargo
+
+    def test_config_only_globs_projected_from_config_git(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = self._make_config(config_only_globs=('dark-factory-orchestrator.yaml',))
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.merge_config_only_full_gate_globs == ('dark-factory-orchestrator.yaml',)
+
+        config.git.merge_config_only_full_gate_globs.append('later.yaml')
+
+        assert spec.merge_config_only_full_gate_globs == ('dark-factory-orchestrator.yaml',)
+
+    def _collapsing_modules(self, override):
+        return [
+            ModuleConfig(prefix='crates/a', test_command='cargo test --workspace', scope_cargo=override),
+            ModuleConfig(prefix='crates/b', test_command='cargo test --workspace'),
+        ]
+
+    @pytest.mark.parametrize('override', [False, True])
+    def test_collapsed_per_module_scope_cargo_ships_scope_cargo_false(self, override):
+        """A per-module scope_cargo cannot ride the spec, so the spec ships False,
+        which on the remote can only widen cargo scope.
+
+        The spec is also built for LOCAL merges, so a collapse must never raise.
+        """
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True), self._collapsing_modules(override), None,
+        )
+        assert spec.scope_cargo is False
+
+    def test_per_module_verify_env_alone_leaves_scope_cargo_carried(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True),
+            [ModuleConfig(prefix='m', verify_env={'X': '1'})],
+            None,
+        )
+        assert spec.scope_cargo is True
 
 
 # ---------------------------------------------------------------------------
@@ -2960,6 +3154,73 @@ class TestRunMergeVerifyOnWorktree:
         )
 
         assert effective_config.verify_cold_preprovision_command == 'HOST_PROVISION'
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs reach the remote leg
+
+    _CONFIG_ONLY_GLOB = 'dark-factory-orchestrator.yaml'
+
+    @pytest.mark.parametrize(('host_scope_cargo', 'spec_scope_cargo'), [(True, False), (False, True)])
+    async def test_spec_scope_cargo_overrides_host_scope_cargo(
+        self, host_scope_cargo, spec_scope_cargo,
+    ):
+        caller_config = self._host_config(scope_cargo=host_scope_cargo)
+        spec = dataclasses.replace(self._preprovision_spec(''), scope_cargo=spec_scope_cargo)
+
+        effective_config = await self._effective_config(caller_config, spec)
+
+        assert effective_config.scope_cargo is spec_scope_cargo
+        assert caller_config.scope_cargo is host_scope_cargo
+
+    @pytest.mark.parametrize(('host_globs', 'spec_globs'), [
+        pytest.param([], (_CONFIG_ONLY_GLOB,), id='carried_glob_fills_an_empty_host'),
+        pytest.param(['host.yaml'], (), id='carried_empty_wipes_the_host'),
+    ])
+    async def test_spec_config_only_globs_override_host_globs(self, host_globs, spec_globs):
+        caller_config = self._host_config(
+            git=GitConfig(main_branch='trunk', merge_config_only_full_gate_globs=host_globs),
+        )
+        caller_git = caller_config.git
+        spec = dataclasses.replace(
+            self._preprovision_spec(''), merge_config_only_full_gate_globs=spec_globs,
+        )
+
+        effective_config = await self._effective_config(caller_config, spec)
+
+        assert effective_config.git.merge_config_only_full_gate_globs == list(spec_globs)
+        assert effective_config.git.main_branch == 'trunk'
+        assert caller_config.git is caller_git
+        assert caller_config.git.merge_config_only_full_gate_globs == host_globs
+
+    async def test_legacy_spec_keeps_host_scope_cargo_and_globs(self):
+        config = self._host_config(
+            scope_cargo=True, git=GitConfig(merge_config_only_full_gate_globs=['host.yaml']),
+        )
+        legacy = dataclasses.replace(
+            self._preprovision_spec(''),
+            scope_cargo=False,
+            merge_config_only_full_gate_globs=('spec.yaml',),
+        ).to_dict()
+        legacy.pop('scope_cargo')
+        legacy.pop('merge_config_only_full_gate_globs')
+
+        effective_config = await self._effective_config(config, MergeVerifySpec.from_dict(legacy))
+
+        assert effective_config.scope_cargo is True
+        assert effective_config.git.merge_config_only_full_gate_globs == ['host.yaml']
+
+    async def test_collapsed_per_module_scope_cargo_reaches_the_remote_as_false(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        dispatcher = OrchestratorConfig(scope_cargo=True)
+        module = ModuleConfig(
+            prefix='crates/a', test_command='cargo test --workspace', scope_cargo=False,
+        )
+        spec = spec_from_json(spec_to_json(
+            build_merge_verify_spec(dispatcher, [module], ('crates/a/src/lib.rs',)),
+        ))
+
+        effective_config = await self._effective_config(self._host_config(scope_cargo=True), spec)
+
+        assert effective_config.scope_cargo is False
 
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
@@ -5901,6 +6162,7 @@ class TestDriftDetectorCheckEnvFaithful:
         assert result.verdict == DriftVerdict.AGREE
         assert result.is_faithful is True
         assert result.drift_dimensions == ()
+        assert result.unavailable_reason is None
 
     async def test_matching_probes_emit_exactly_one_parity_event(self):
         from orchestrator.event_store import EventType
@@ -6028,6 +6290,7 @@ class TestDriftDetectorCheckEnvDivergence:
         assert result.verdict == DriftVerdict.DIVERGE
         assert result.is_faithful is False
         assert result.drift_dimensions == ('extra_probes',)
+        assert result.unavailable_reason is None
 
     async def test_divergence_event_emitted_exactly_once(self):
         from orchestrator.event_store import EventType
@@ -6405,6 +6668,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         result = await detector.check_env([], local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
         assert result.drift_dimensions == ()
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6429,6 +6693,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6448,6 +6713,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
 
     async def test_remote_without_env_probe_run_is_inconclusive(self):
         """A non-RemoteRunner stand-in: duck-typed, so VerifyRunner stays unwidened.
@@ -6470,6 +6736,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6484,6 +6751,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason == 'laptop unreachable'
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6495,6 +6763,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason == 'local seam down'
 
     async def test_inconclusive_does_not_quarantine(self):
         from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
@@ -6504,6 +6773,100 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert pool.is_quarantined('laptop') is False
+
+
+class TestEnvDriftCheckResultUnavailableReasonInvariant:
+    """A reason rides only on a faithful INCONCLUSIVE: check_env_safely trusts it to mean that."""
+
+    def test_reason_on_a_faithful_inconclusive_is_accepted(self):
+        from orchestrator.verify_runner import DriftVerdict, EnvDriftCheckResult
+        result = EnvDriftCheckResult(
+            verdict=DriftVerdict.INCONCLUSIVE, is_faithful=True, unavailable_reason='ssh down',
+        )
+        assert result.unavailable_reason == 'ssh down'
+
+    @pytest.mark.parametrize(
+        ('verdict_name', 'is_faithful'),
+        [('AGREE', True), ('DIVERGE', False), ('INCONCLUSIVE', False)],
+    )
+    def test_reason_on_any_other_result_is_rejected(self, verdict_name, is_faithful):
+        from orchestrator.verify_runner import DriftVerdict, EnvDriftCheckResult
+        verdict = DriftVerdict[verdict_name]
+        with pytest.raises(ValueError) as excinfo:
+            EnvDriftCheckResult(
+                verdict=verdict, is_faithful=is_faithful, unavailable_reason='ssh down',
+            )
+        assert f'verdict={verdict}' in str(excinfo.value)
+        assert f'is_faithful={is_faithful}' in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvSafelyInconclusiveReason:
+    """check_env_safely(): the land-hook path is where an INCONCLUSIVE's reason is seen.
+
+    check_env_safely is the only production caller of check_env and discards
+    its result, so a reason that lived only on the result would never reach
+    the journal, and a dispatcher-side ssh fault would leave the env check
+    silently INCONCLUSIVE forever.  A sleeping laptop is the common case, so
+    the record is INFO, never a WARNING per check.
+    """
+
+    async def test_runner_unavailable_reason_is_logged_at_info_not_warning(self, caplog):
+        import logging
+
+        from orchestrator.config import EnvProbeConfig
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        reason = (
+            "ssh laptop.local exited 255 probing 'true': unix_listener: cannot "
+            'bind to path /home/leo/.df-env-probe-0123abcd.XyZ: Permission denied'
+        )
+        pool, _, _ = _make_env_drift_pool(remote_raises=RunnerUnavailable(reason))
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(
+            pool, event_store=event_store, escalation_queue=queue,
+            task_id='task-7481-probe',
+        )
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_runner'):
+            await detector.check_env_safely(
+                [EnvProbeConfig(key='uv', argv=['uv', '--version'])]
+            )
+
+        verify_runner_records = [
+            r for r in caplog.records if r.name == 'orchestrator.verify_runner'
+        ]
+        reason_records = [
+            r for r in verify_runner_records
+            if r.levelno == logging.INFO
+            and 'unix_listener: cannot bind to path' in r.getMessage()
+            and 'task-7481-probe' in r.getMessage()
+        ]
+        assert len(reason_records) == 1, (
+            'expected exactly one INFO record naming the task and the '
+            f'RunnerUnavailable reason; saw: '
+            f'{[(r.levelname, r.getMessage()) for r in verify_runner_records]!r}'
+        )
+        assert [r for r in verify_runner_records if r.levelno >= logging.WARNING] == []
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_not_taken_guard_logs_nothing(self, caplog):
+        """The shipped default (verify_env_probes: []) stays silent."""
+        import logging
+
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_env_drift_pool()
+        detector = DriftDetector(
+            pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue(),
+            task_id='task-7481-probe',
+        )
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_runner'):
+            await detector.check_env_safely([])
+
+        assert [
+            r for r in caplog.records
+            if r.name == 'orchestrator.verify_runner' and r.levelno >= logging.INFO
+        ] == []
 
 
 # ---------------------------------------------------------------------------
@@ -6667,6 +7030,46 @@ class TestDriftDetectorCheckEnvUnreachableRemote:
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
         assert queue.submitted == []
+
+    async def test_unbindable_control_path_reason_survives_on_the_result(self):
+        """A dispatcher-side ssh fault must be told apart from a sleeping laptop.
+
+        Both exit 255 and both are INCONCLUSIVE, so the verdict alone cannot
+        say whether the probe master's ControlPath could not be bound on THIS
+        host (fixable here, and the check never runs until it is) or the remote
+        is simply asleep (the common, self-healing case).  ssh's own stderr is
+        what distinguishes them, so it has to reach the result.
+        """
+        from orchestrator.verify_runner import DriftVerdict
+        control_path_fault = (
+            _SSH_UNREACHABLE_RC,
+            '',
+            'unix_listener: cannot bind to path '
+            '/home/leo/.df-env-probe-0123abcd.XyZ: Permission denied',
+        )
+        detector, pool, event_store, queue = self._detector(
+            _make_ssh_seam(default=control_path_fault)
+        )
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        unbindable = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+
+        assert unbindable.verdict == DriftVerdict.INCONCLUSIVE
+        assert unbindable.is_faithful is True
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+        assert pool.is_quarantined('laptop') is False
+        assert unbindable.unavailable_reason is not None
+        assert 'unix_listener: cannot bind to path' in unbindable.unavailable_reason
+        assert 'laptop.local' in unbindable.unavailable_reason
+
+        asleep_detector, _, _, _ = self._detector(_make_ssh_seam())
+        asleep = await asleep_detector.check_env(
+            _ENV_PROBE_SPECS, local_run=_make_probe_run(_MATCHING_PROBE_OUTPUT)
+        )
+        assert asleep.verdict == DriftVerdict.INCONCLUSIVE
+        assert asleep.unavailable_reason is not None
+        assert 'No route to host' in asleep.unavailable_reason
+        assert asleep.unavailable_reason != unbindable.unavailable_reason
 
     async def test_remote_binary_absent_is_still_real_divergence(self):
         """The guard must not over-broaden to 'any non-zero rc is transport'.
@@ -7240,7 +7643,7 @@ class TestRemoteRunnerMainBranchPush:
 
 @pytest.mark.asyncio
 class TestRemoteRunnerRequestId:
-    """run_merge_verify passes --request-id <id> appended to the ssh argv."""
+    """run_merge_verify passes --request-id <id> in the ssh argv, ahead of --spec."""
 
     def _make_runner_and_calls(self, *, config_path=None):
         """Return (runner, calls) where calls tracks (argv, cwd) pairs."""
@@ -7265,7 +7668,7 @@ class TestRemoteRunnerRequestId:
         return runner, calls
 
     async def test_request_id_in_remote_cmd(self):
-        """ssh remote command contains --request-id fixed-id (appended)."""
+        """ssh remote command contains --request-id fixed-id."""
 
         runner, calls = self._make_runner_and_calls()
         await runner.run_merge_verify('abc123', _make_spec())
@@ -7307,31 +7710,18 @@ class TestRemoteRunnerRequestId:
         parsed = gate_argv(ssh_call[0][-1])
         assert parsed[:3] == ['verify-merge', '--sha', 'abc123']
 
-    async def test_request_id_appended_after_spec(self):
-        """--request-id appears after --spec (appended at end)."""
+    @pytest.mark.parametrize('config_path', [None, '/etc/orch.yaml'])
+    async def test_request_id_precedes_the_spec_and_the_config(self, config_path):
+        """--request-id follows --sha, ahead of the unbounded --spec JSON, so the
+        cancel probe's pgrep finds it inside a 4096-byte command-line read."""
 
-        runner, calls = self._make_runner_and_calls()
+        runner, calls = self._make_runner_and_calls(config_path=config_path)
         await runner.run_merge_verify('abc123', _make_spec())
 
         ssh_call = next(c for c in calls if c[0][0] == 'ssh')
         parsed = gate_argv(ssh_call[0][-1])
 
-        spec_idx = parsed.index('--spec')
-        rid_idx = parsed.index('--request-id')
-        assert rid_idx > spec_idx, '--request-id must be appended after --spec'
-
-    async def test_request_id_with_config_path(self):
-        """--request-id is still appended after --config when config_path is set."""
-
-        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml')
-        await runner.run_merge_verify('abc123', _make_spec())
-
-        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
-        parsed = gate_argv(ssh_call[0][-1])
-
-        cfg_idx = parsed.index('--config')
-        rid_idx = parsed.index('--request-id')
-        assert rid_idx > cfg_idx, '--request-id must come after --config'
+        assert parsed[:6] == ['verify-merge', '--sha', 'abc123', '--request-id', 'fixed-id', '--spec']
 
     async def test_dispatch_not_in_flight_after_exception(self):
         """The dispatch is no longer in flight after RunnerUnavailable (cleared in the finally)."""
@@ -7422,8 +7812,8 @@ class TestRemoteRunnerCancelVerify:
         )
         return runner, calls
 
-    async def _cancel_mid_verify(self, *, config_path=None, cancel_rc=0):
-        """Cancel a real dispatch while its verify ssh is held; return (cancel rc, recorded argvs)."""
+    async def _cancel_mid_verify(self, *, config_path=None, cancel_rc=0, probe_rc=1, probe_error=None):
+        """Cancel a real dispatch while its verify ssh is held; return (cancel rc, recorded argvs, runner)."""
         from orchestrator.verify_runner import RunnerUnavailable
 
         calls: list[list[str]] = []
@@ -7436,7 +7826,9 @@ class TestRemoteRunnerCancelVerify:
             if 'cancel-verify' in argv[-1]:
                 return (cancel_rc, '', '')
             if 'pgrep' in argv[-1]:
-                return (1, '', '')
+                if probe_error is not None:
+                    raise probe_error
+                return (probe_rc, '', '')
             entered.set()
             await release.wait()
             return (137, '', 'Killed')
@@ -7456,7 +7848,7 @@ class TestRemoteRunnerCancelVerify:
         release.set()
         with pytest.raises(RunnerUnavailable):
             await dispatch
-        return rc, calls
+        return rc, calls, runner
 
     @staticmethod
     def _cancel_ssh_calls(calls):
@@ -7473,7 +7865,7 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_issues_correct_argv(self):
         """cancel_verify() issues ssh BatchMode/ConnectTimeout cancel-verify --request-id."""
 
-        _, calls = await self._cancel_mid_verify(cancel_rc=0)
+        _, calls, _ = await self._cancel_mid_verify(cancel_rc=0)
 
         ssh_calls = self._cancel_ssh_calls(calls)
         assert len(ssh_calls) == 1
@@ -7491,7 +7883,7 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_appends_config_when_set(self):
         """cancel_verify() appends --config <path> when config_path is set."""
 
-        _, calls = await self._cancel_mid_verify(config_path='/etc/orch.yaml', cancel_rc=0)
+        _, calls, _ = await self._cancel_mid_verify(config_path='/etc/orch.yaml', cancel_rc=0)
 
         ssh_calls = self._cancel_ssh_calls(calls)
         remote_cmd = ssh_calls[0][-1]
@@ -7501,12 +7893,19 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_cancel_verify_returns_ssh_rc(self):
         """cancel_verify() returns the ssh return code."""
-        rc, _ = await self._cancel_mid_verify(cancel_rc=1)
+        rc, _, _ = await self._cancel_mid_verify(cancel_rc=1)
         assert rc == 1
 
+    async def test_probe_clean_without_a_cancel_issues_no_ssh(self):
+        """probe_clean() with nothing cancelled → True with no ssh at all."""
+        runner, calls = self._make_runner_and_calls(probe_rc=0)
+        assert await runner.probe_clean() is True
+        assert calls == []
+
     async def test_probe_clean_true_when_pgrep_rc_is_1(self):
-        """probe_clean() issues ssh pgrep -f verify-merge; rc==1 (no match) → True."""
-        runner, calls = self._make_runner_and_calls(probe_rc=1)
+        """probe_clean() pgreps the cancelled request's verify; rc==1 (no match) → True."""
+        _, calls, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=1)
+        calls.clear()
         result = await runner.probe_clean()
         assert result is True
 
@@ -7514,31 +7913,26 @@ class TestRemoteRunnerCancelVerify:
         assert len(ssh_calls) == 1
         remote_cmd = ssh_calls[0][-1]
         assert 'pgrep' in remote_cmd
+        assert 'req-42' in remote_cmd
         assert 'verify-merge' in remote_cmd
+        assert 'verify-task' in remote_cmd
 
     async def test_probe_clean_false_when_pgrep_rc_is_0(self):
-        """probe_clean() rc==0 (process running) → False."""
-        runner, calls = self._make_runner_and_calls(probe_rc=0)
+        """probe_clean() rc==0 (the cancelled request still runs) → False."""
+        _, _, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=0)
         result = await runner.probe_clean()
         assert result is False
 
     async def test_probe_clean_false_when_pgrep_rc_is_2(self):
         """probe_clean() rc>=2 (error) → False (conservative: stay parked)."""
-        runner, _ = self._make_runner_and_calls(probe_rc=2)
+        _, _, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=2)
         result = await runner.probe_clean()
         assert result is False
 
     async def test_probe_clean_false_on_oserror(self):
         """probe_clean() on OSError → False (fail-safe)."""
-        async def raising_run(argv, *, cwd=None):
-            raise OSError('connection refused')
-
-        runner = gated_remote_runner(
-            name='laptop',
-            ssh_host='laptop.local',
-            git_remote='origin',
-            cwd='/repo',
-            run=raising_run,
+        _, _, runner = await self._cancel_mid_verify(
+            cancel_rc=1, probe_error=OSError('connection refused'),
         )
         result = await runner.probe_clean()
         assert result is False
@@ -8375,7 +8769,7 @@ class TestRemoteRunnerStderrArchival:
 class TestRemoteRunnerStreamArchival:
     """RemoteRunner archives test/lint/type output streams on failure (task 1921).
 
-    Mirrors _archive_merge_verify_logs via a synthetic runs projection.
+    Mirrors archive_verify_logs via a synthetic runs projection.
     Filename pattern: attempt-1.remote-<name>.{label}-<utc_ts>.log
                       attempt-1.remote-<name>.summary-<utc_ts>.json
     """
@@ -8666,8 +9060,8 @@ class TestRemoteRunnerStreamArchival:
     async def test_stream_archival_exception_is_swallowed_result_unchanged(self, tmp_path, monkeypatch):
         """Non-OSError in _archive_failure_streams → swallowed; VerifyResult returned unchanged.
 
-        Monkeypatches orchestrator.verify_runner._archive_merge_verify_logs to raise
-        RuntimeError('boom') — a non-OSError that _archive_merge_verify_logs's internal
+        Monkeypatches orchestrator.verify_runner.archive_verify_logs to raise
+        RuntimeError('boom') — a non-OSError that archive_verify_logs's internal
         OSError handler does not catch.  Verifies that run_merge_verify:
           (1) does NOT raise;
           (2) returns the VerifyResult unchanged.
@@ -8680,7 +9074,7 @@ class TestRemoteRunnerStreamArchival:
         def boom(*args, **kwargs):
             raise RuntimeError('boom')
 
-        monkeypatch.setattr(_vrmod, '_archive_merge_verify_logs', boom)
+        monkeypatch.setattr(_vrmod, 'archive_verify_logs', boom)
 
         fail_result = VerifyResult(
             passed=False, test_output='FAILED', lint_output='', type_output='',
@@ -9402,3 +9796,124 @@ class TestRemoteRunnerMainPushMirror:
         result = await runner.run_merge_verify('abc123', _make_spec(), event_store=None)
         assert result == expected
         assert '+main:refs/heads/main' in _push_refspecs(calls)
+
+
+@pytest.mark.asyncio
+class TestPollUntilClean:
+    """The one cancel-probe loop the merge allocator and the task host pool share."""
+
+    @staticmethod
+    def _probe(*answers: bool):
+        reads = iter(answers)
+        probes: list[int] = []
+
+        async def probe() -> bool:
+            probes.append(1)
+            return next(reads)
+
+        return probe, probes
+
+    async def test_polls_interval_apart_with_no_sleep_after_the_last(self):
+        probe, probes = self._probe(False, False, False)
+        slept: list[float] = []
+
+        async def sleep(secs: float) -> None:
+            slept.append(secs)
+
+        assert await poll_until_clean(probe, attempts=3, sleep=sleep) is False
+        assert (len(probes), slept) == (3, [CANCEL_PROBE_INTERVAL_SECS] * 2)
+
+    async def test_stops_at_the_first_clean_read(self):
+        probe, probes = self._probe(False, True, False)
+        slept: list[float] = []
+
+        async def sleep(secs: float) -> None:
+            slept.append(secs)
+
+        assert await poll_until_clean(probe, attempts=3, sleep=sleep) is True
+        assert (len(probes), len(slept)) == (2, 1)
+
+
+def _raw_recording_runner(inner):
+    """A main_branch='main' RemoteRunner on the gate layout, plus every argv it runs, verbatim.
+
+    Unlike :func:`gated_remote_runner`, which strips ``GIT_PUSH_SSH_CONFIG``
+    before *inner* sees a push, the recorder sits outside the gate wrapping, so
+    it keeps each push's transport options.  *inner* still sees plain argvs.
+    """
+    raw_argvs: list[list[str]] = []
+    gated = gated_run(inner)
+
+    async def recording_run(argv, *, cwd=None):
+        raw_argvs.append(list(argv))
+        return await gated(argv, cwd=cwd)
+
+    runner = RemoteRunner(
+        'laptop', 'laptop.local', 'origin', '/repo',
+        main_branch='main',
+        run=recording_run,
+        id_factory=lambda: 'fixed-id',
+        df_remote_checkout=TEST_DF_REMOTE,
+        gate_checkouts_path=TEST_GATE_ROOT,
+        deployed_sha=TEST_DEPLOYED_SHA,
+        code_checkout=TEST_CODE_CHECKOUT,
+    )
+    return runner, raw_argvs
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerPushTransport:
+    """Every RemoteRunner push rides GIT_PUSH_SSH_CONFIG under a deadline (task 8121)."""
+
+    _PASS = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+    _PUSH_PREFIX: ClassVar[list[str]] = ['git', *GIT_PUSH_SSH_CONFIG, 'push', 'origin']
+
+    async def test_fast_forward_and_force_pushes_carry_the_ssh_bounds(self):
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[:2] == ['git', 'push'] and argv[3] == 'main:refs/heads/main':
+                return (1, '', 'rejected: non-fast-forward')
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, raw_argvs = _raw_recording_runner(inner)
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert self._PUSH_PREFIX + ['main:refs/heads/main'] in raw_argvs
+        assert self._PUSH_PREFIX + ['+main:refs/heads/main'] in raw_argvs
+
+    async def test_ref_cleanup_push_carries_the_ssh_bounds(self):
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, raw_argvs = _raw_recording_runner(inner)
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert self._PUSH_PREFIX + ['--delete', 'refs/merge-verify/fixed-id'] in raw_argvs
+
+    @pytest.mark.parametrize('hung_arg', ['refs/heads/main', '--delete'])
+    async def test_a_best_effort_push_that_never_returns_cannot_stall_the_verify(
+        self, monkeypatch, hung_arg,
+    ):
+        """A hung main-mirror push (FF and force alike) or ref cleanup is cut off and swallowed."""
+        monkeypatch.setattr('orchestrator.verify_runner.ENSURE_CLIENT_TIMEOUT_SECS', 0.05)
+
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[:2] == ['git', 'push'] and any(hung_arg in arg for arg in argv[2:]):
+                await asyncio.Event().wait()
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, _ = _raw_recording_runner(inner)
+        result = await asyncio.wait_for(runner.run_merge_verify('abc123', _make_spec()), timeout=5)
+
+        assert result == self._PASS

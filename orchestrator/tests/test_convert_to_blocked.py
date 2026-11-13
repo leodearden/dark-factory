@@ -1241,7 +1241,7 @@ async def _land_via_merge(
     """Commit *paths_content* on *branch*, then no-ff merge it into *main*.
 
     The merge subject defaults to the canonical ``Merge <branch> into <main>``
-    that ``git_ops._merge_subject`` derives and ``find_merge_marker`` greps
+    that ``shared.merge_subject.format_merge_subject`` derives (git_ops' writer) and ``find_merge_marker`` greps
     for — writer and reader share one derivation in production, and this
     helper reproduces that exact string so the probe under test is exercised
     against the real format rather than a paraphrase.  Returns the merge SHA.
@@ -2108,13 +2108,15 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert 'task_citation' in reason
         assert kwargs.get('escalate_to_human') is not True
 
-    async def test_the_predicate_is_given_the_branch_and_the_recorded_base(
+    async def test_the_predicate_is_given_the_branch_and_the_own_work_base(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
         """The predicate cannot measure the range or find the marker without
         both, and a plausible-looking wiring that passes neither would make
         every case fail closed — i.e. silently restore the bug."""
         wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+        wf.artifacts.init(wf.task_id, 'T', 'd', base_commit='stored_sha')
         seen: list = []
         self._stub_predicate(monkeypatch, self._landed(), seen=seen)
         self._wire(wf, monkeypatch)
@@ -2124,7 +2126,10 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert len(seen) == 1
         plan_files, base_sha, branch_head, kw = seen[0]
         assert plan_files == ['a.py', 'b.py', 'c.py']
-        assert base_sha == 'base_sha', 'the branch\'s RECORDED base, not HEAD'
+        assert base_sha == 'stored_sha', (
+            'the own-work base (here the stored base: the fixture worktree is '
+            'not a checkout), not wf._base_commit and not HEAD'
+        )
         assert branch_head == 'fake_head_sha'
         assert kw.get('task_id') == wf.task_id
         # EXACT, not a substring: the merge-marker probe greps for the literal
@@ -2196,7 +2201,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def boom(*a, **k):  # noqa: ARG001
             raise _ReachedEnqueue
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.register_and_enqueue_merge_request', boom,
+            'orchestrator.merge_lane.intake.register_and_enqueue_merge_request', boom,
         )
 
         with pytest.raises(_ReachedEnqueue):
@@ -2441,12 +2446,19 @@ class TestLandedButPinnedZombieLoop:
 
     # --- ENTRY half ---------------------------------------------------------
 
+    @pytest.mark.parametrize('creation_base', ['re_cut', 'rebased_away'])
     async def test_entry_the_gate_no_longer_mints_the_pin(
         self, git_repo: Path, git_ops: GitOps, tmp_path: Path, monkeypatch,
+        creation_base: str,
     ) -> None:
         """Over a REAL repo in the measured parked shape, the gate must not
         produce the ``escalate_to_human=True`` block whose default
-        ``category='task_failure'`` is the loop's only fuel."""
+        ``category='task_failure'`` is the loop's only fuel.
+
+        The stored base is ``parked`` either way: from the re-cut, or from an
+        inter-iteration rebase that dropped every commit while the
+        creation-time base stayed on main before the landing (task 7668)."""
+        pre_landing = await git_ops.get_main_sha()
         merge_sha = await _land_via_merge(
             git_repo, 'task/3717',
             {f: f'# {f}\n' for f in self._PLAN_FILES},
@@ -2460,7 +2472,9 @@ class TestLandedButPinnedZombieLoop:
 
         wf = _make_workflow(tmp_path=tmp_path / 'wf', task_id='3717')
         wf.plan = {'files': list(self._PLAN_FILES)}
-        wf._base_commit = parked
+        wf._base_commit = parked if creation_base == 're_cut' else pre_landing
+        assert wf.artifacts is not None
+        wf.artifacts.init('3717', 'T', 'd', base_commit=parked)
         wf.git_ops = git_ops
         wf.config.project_root = git_repo
 

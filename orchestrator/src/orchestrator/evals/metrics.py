@@ -319,7 +319,7 @@ def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
 
     Returns ``None`` for BOTH a missing key and an explicit ``None`` — the two
     are indistinguishable to a consumer that only wants the kind, and both mean
-    UNMEASURED. ``report.build_plan_quality_report``'s
+    UNMEASURED. ``plan_quality_report.py::build_plan_quality_report``'s
     ``terminal_kind_unmeasured`` counts them TOGETHER, through this accessor,
     on purpose: over the architect rows it counts, the two shapes state one
     fact, and a third arm for the explicit null would read that cell back as
@@ -611,7 +611,7 @@ def blend_composite(
     *quality* is the pure :func:`compute_composite` score; *cost_score* and
     *latency_score* are per-fixture NORMALIZED efficiency scores in ``[0, 1]``
     (``1.0`` == the cheapest / fastest run of the fixture — see
-    ``report._ratio_score``), supplied by the report layer where the
+    ``composite_report.py::_ratio_score``), supplied by the report layer where the
     cross-config context to normalize exists. PURE and additive: this does not
     touch ``compute_composite``.
 
@@ -763,7 +763,7 @@ def compose_cost_source(primary: str, *, secondary_cost_usd: float) -> str:
     - they DISAGREE — ``'mixed'``.
 
     ``'mixed'`` is deliberately the SAME label
-    :func:`~orchestrator.evals.report._summarize_cost_source` already emits for
+    ``composite_report.py::_summarize_cost_source`` already emits for
     the structurally identical situation one aggregation level up ("this figure
     blends more than one distinct cost source, so no single source honestly
     labels it"). Reusing the word keeps ONE vocabulary across the cell and the

@@ -11,13 +11,21 @@ import os
 import re
 import tempfile
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Generic, Literal, TypedDict, TypeVar
 
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation import archive
+from escalation.amendments import (
+    MAX_AMENDMENT_DETAIL_CHARS,
+    MAX_AMENDMENT_LINE_CHARS,
+    append_amendment_capped,
+    elide,
+    has_framing,
+)
 
 # escalation.canonical is a LEAF (zero intra-package imports), which is what
 # makes this import legal at all: dedupe.py imports THIS module at module level,
@@ -44,11 +52,12 @@ from escalation.models import (
     PERSIST_CHECK_UNREADABLE,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
-    Amendment,
     Escalation,
     LateResolution,
+    cascade_resolved_by,
     max_severity,
     note_to_file_class_conflict,
+    recut_action_conflict,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,50 +156,12 @@ _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
 # ``.json`` record, so it would otherwise look permanently orphaned).
 SEQ_COUNTER_SUFFIX = '.seq'
 
-# Hard cap on the NUMBER of Escalation.amendments entries (see
-# _append_amendment_capped, the single home of the append-and-trim policy for
-# every writer of that list).  Worst case is repeated folds of one cluster
-# inside a single AFK window, and amendments are deliberately NOT in the server's
-# compact projection, so they never inflate a watcher's drain no matter how deep
-# the list gets.  Past the cap the OLDEST are shed — the ORIGINAL framing is never
-# in this list at all (it lives permanently in the record's own immutable
-# root_cause/detail/options/summary), so the oldest amendment is the
-# least-informative entry and a rotation triaging NOW needs the most recent
-# framing.  Each drop increments the record's `amendments_truncated`, so the loss
-# is a durable structured fact rather than log-only.
-# SIZED AGAINST THE POST-CANONICALISATION FOLD RATE (task 3998), which raises the
-# fold rate BY DESIGN — a cap tuned to today's rate would be immediately wrong.
-_MAX_AMENDMENTS = 20
-
-# Per-ENTRY character caps.  An entry count alone is NOT a size bound: each
-# entry's `detail` is the promote's unbounded free-text `evidence` argument —
-# the very field compact mode exists to keep off the wire — so a hot-folding L2
-# could stay "inside the cap" while growing by hundreds of KB, and EVERY reader
-# of a full record pays that (get_escalation, get_pending_escalations(compact=
-# False), every sweep's JSON parse).  These caps are what make the envelope
-# ARITHMETIC rather than assertion:
-#
-#   kept text per entry <= 2*300 (root_cause + summary) + 1200 (detail)
-#                          + 6*300 (options)                    = 3600 chars
-#   + at most 9 elision markers (~70 chars each) + role/timestamp  ~  800 chars
-#   whole list <= _MAX_AMENDMENTS * ~4.4 KB                      ~=   88 KB
-#
-# root_cause and summary are one-LINERS by contract (a dedup key and a one-line
-# hypothesis), and each option is an 'A: ...' style choice, so they share one
-# line-sized cap; `detail` gets the larger share because it is the only field
-# meant to carry prose.  Elision is per-field and marked in-band; the characters
-# dropped are counted on the record in `amendments_chars_elided`, exactly as
-# shed ENTRIES are counted in `amendments_truncated` — the loss is a durable
-# structured fact either way, never log-only.
-_MAX_AMENDMENT_LINE_CHARS = 300
-_MAX_AMENDMENT_DETAIL_CHARS = 1200
-_MAX_AMENDMENT_OPTIONS = 6
-
 # Hard cap on the NUMBER of Escalation.late_resolutions entries — the
 # substantive resolutions that arrived after an automated sweep had already
 # closed the record (task 4495; see `_is_late_resolution_worth_capturing` for
 # why that is rare).  Same sole-writer/sole-trimmer, oldest-shed,
-# count-every-drop policy as `_MAX_AMENDMENTS` above: `resolve()`'s
+# count-every-drop policy as
+# `escalation/src/escalation/amendments.py::MAX_AMENDMENTS`: `resolve()`'s
 # already-terminal branch owns both, and each shed entry increments the
 # record's `late_resolutions_truncated` so the TRUE total
 # (`len(list) + truncated`) never plateaus.
@@ -200,8 +171,9 @@ _MAX_AMENDMENT_OPTIONS = 6
 # status/resolution/resolved_by, so nothing anchoring is stored only in this
 # list, and a reader triaging NOW wants the most recent finding.
 #
-# SIZED SMALLER THAN `_MAX_AMENDMENTS` (20) on purpose: an L2 folds repeatedly
-# by design, but a SECOND late resolution on one already-swept record means the
+# SIZED SMALLER THAN `escalation/src/escalation/amendments.py::MAX_AMENDMENTS`
+# (20) on purpose: an L2 folds repeatedly by design, but a SECOND late
+# resolution on one already-swept record means the
 # race recurred on the same escalation — a shape that should be exceptional, so
 # a low cap costs nothing real and keeps the envelope tight.
 #   whole list <= 8 * (1200 kept + ~70 marker + ~180 timestamp/keys) ~= 11 KB
@@ -211,20 +183,20 @@ _MAX_LATE_RESOLUTIONS = 8
 # Per-ENTRY character cap on a captured `resolution`.  An entry count alone is
 # NOT a size bound: `resolution` is unbounded caller free text (an agent's full
 # finding), so 8 uncapped entries could add hundreds of KB to a record every
-# reader of a full record then parses.  Shares `_MAX_AMENDMENT_DETAIL_CHARS`'s
+# reader of a full record then parses.  Shares `MAX_AMENDMENT_DETAIL_CHARS`'s
 # sizing — both are the "prose" field of their entry — and the same in-band
 # marked elision, with the dropped characters counted on the record in
 # `late_resolutions_chars_elided` exactly as shed ENTRIES are counted in
 # `late_resolutions_truncated`.  The loss is a durable structured fact either
 # way, never log-only (INV-8).
-_MAX_LATE_RESOLUTION_CHARS = _MAX_AMENDMENT_DETAIL_CHARS
+_MAX_LATE_RESOLUTION_CHARS = MAX_AMENDMENT_DETAIL_CHARS
 
 # Hard cap on the NUMBER of Escalation.root_cause_variants entries — the DISTINCT
 # pre-canonical root_cause spellings one L2 has been addressed by (task 3998).
 # Same sole-writer/sole-trimmer, oldest-shed, count-every-drop policy as
-# `_MAX_AMENDMENTS` above, and sized against the same post-canonicalisation fold
-# rate; each entry is one elided LINE (a dedup key), so the whole list is bounded
-# by 20 * ~370 chars ~= 7 KB.
+# `escalation/src/escalation/amendments.py::MAX_AMENDMENTS`, and sized against
+# the same post-canonicalisation fold rate; each entry is one elided LINE (a
+# dedup key), so the whole list is bounded by 20 * ~370 chars ~= 7 KB.
 # DELIBERATELY WELL ABOVE the server's over-fold alarm threshold
 # (`_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD = 5`): the cap must never be what
 # decides whether the signal fires, or a tighter cap would silently mute the
@@ -293,7 +265,8 @@ class AmendmentOutcome(TypedDict):
     """
 
     recorded: bool  # THIS call appended an amendment
-    dropped: int    # entries THIS call shed at the _MAX_AMENDMENTS cap
+    dropped: int    # entries THIS call shed at the amendment-count cap,
+                    # escalation/src/escalation/amendments.py::MAX_AMENDMENTS
     # THIS call added a previously-unseen PRE-canonical root_cause spelling
     # (task 3998).  Same TOCTOU argument as `recorded`: "is this spelling new to
     # the record" is only answerable against the record as it is INSIDE the lock.
@@ -312,7 +285,8 @@ class AmendWithRecord(TypedDict):
     status: Literal['amended', 'repeat_framing', 'not_pending']
     escalation: Escalation  # as amended, or as found when nothing was recorded
     recorded: bool          # THIS call appended an amendment
-    dropped: int            # entries THIS call shed at the _MAX_AMENDMENTS cap
+    dropped: int            # entries THIS call shed at the amendment-count cap,
+                            # escalation/src/escalation/amendments.py::MAX_AMENDMENTS
 
 
 class AmendWithoutRecord(TypedDict):
@@ -333,15 +307,35 @@ class AmendWithoutRecord(TypedDict):
 AmendResult = AmendWithRecord | AmendWithoutRecord
 
 
+R = TypeVar('R')
+
+
+@dataclass(frozen=True)
+class ClaimResult(Generic[R]):
+    """What ONE :meth:`EscalationQueue.claim_policy_class` call did.
+
+    ``record`` is the claimed record, or ``refusal`` is what the caller's
+    refuse callback returned; never both. Both ``None`` means the id was not
+    found in the queue root, failed to parse, or is not pending.
+    """
+
+    record: Escalation | None
+    refusal: R | None
+
+    def __post_init__(self) -> None:
+        if self.record is not None and self.refusal is not None:
+            raise ValueError('a claim cannot both succeed and be refused')
+
+
 class ResolveOutcome(TypedDict):
     """What ONE :meth:`EscalationQueue.resolve` call actually DID (task 4495).
 
-    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: the
-    ``Escalation`` is ``resolve()``'s primary return value and every existing
-    call site reads it directly, so widening the return into a tuple would churn
-    all of them — the member cascade, ``dismiss_all_pending``, the steward, the
-    five workflow auto-dismiss backstops — for a fact only ``server.resolve_issue``
-    wants.
+    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: only
+    ``server.resolve_issue`` and ``dismiss_all_pending`` want this fact, while the
+    ``Escalation`` is ``resolve()``'s primary return value and every other call
+    site reads it directly — the member cascade, the steward, the five workflow
+    auto-dismiss backstops — so widening the return into a tuple would churn all
+    of them.
 
     WHY IT EXISTS: ``resolve()``'s already-terminal branch is a no-op, so a caller
     whose text did NOT apply gets back a perfectly healthy-looking ``Escalation``
@@ -377,28 +371,6 @@ def blank_resolve_outcome() -> ResolveOutcome:
         'late_resolution_captured': False,
         'resolution_class_corrected': None,
     }
-
-
-def _elide(text: str, limit: int, what: str = 'amendment field') -> tuple[str, int]:
-    """Return (*text* capped at *limit*, characters dropped).
-
-    The elision is MARKED IN-BAND and names both the count and the cap, so a
-    human reading a preserved framing can tell "this is all of it" from "this
-    is the head of it" without cross-referencing anything.  Silent truncation
-    of decision context would be the loud-over-silent norm inverted.
-
-    *what* names WHICH cap did the eliding, so a reader of a marker on a
-    late-resolution entry is not told it hit an "amendment field cap" it has
-    nothing to do with.  It defaults to the amendment wording, keeping every
-    pre-existing caller's output byte-identical.
-    """
-    if len(text) <= limit:
-        return text, 0
-    dropped = len(text) - limit
-    return (
-        f'{text[:limit]}\n[... {dropped} char(s) elided at the '
-        f'{limit}-char {what} cap ...]'
-    ), dropped
 
 
 def _stamped_resolution_class(
@@ -482,8 +454,9 @@ def _build_late_resolution(
 ) -> tuple[LateResolution, int]:
     """Build one :class:`~escalation.models.LateResolution`, size-bounded.
 
-    Modelled on :func:`_build_amendment`: the single site that maps a
-    ``resolve()`` argument set onto the entry's key names, and the single site
+    Modelled on ``escalation/src/escalation/amendments.py::_build_amendment``:
+    the single site that maps a ``resolve()`` argument set onto the entry's key
+    names, and the single site
     that applies the per-entry character cap (``_MAX_LATE_RESOLUTION_CHARS``)
     that turns ``_MAX_LATE_RESOLUTIONS`` from an entry count into an actual size
     bound.  Elision is marked in-band and the dropped total is returned so the
@@ -500,7 +473,7 @@ def _build_late_resolution(
 
     Returns ``(entry, chars_elided)``.
     """
-    kept, lost = _elide(resolution, _MAX_LATE_RESOLUTION_CHARS, 'late-resolution')
+    kept, lost = elide(resolution, _MAX_LATE_RESOLUTION_CHARS, 'late-resolution')
     entry: LateResolution = {
         'timestamp': timestamp,
         'resolution': kept,
@@ -509,212 +482,6 @@ def _build_late_resolution(
         'prior_resolution_class': prior_resolution_class,
     }
     return entry, lost
-
-
-def _build_amendment(
-    *, root_cause: str, summary: str, evidence: str, options: list[str] | None,
-    agent_role: str, timestamp: str,
-) -> tuple[Amendment, int]:
-    """Build one :class:`~escalation.models.Amendment`, size-bounded.
-
-    THE single site that maps the promote's ARGUMENT names onto the Amendment's
-    KEY names — notably *evidence* onto ``detail``, the same field the create
-    path writes that argument into.  It builds both the entry actually appended
-    AND the projection of the record's OWN framing that repeat detection
-    compares against (see :func:`_is_repeat_framing`), so those two can never
-    drift into comparing differently-shaped dicts — and, because BOTH sides are
-    elided by this one function, repeat detection keeps working verbatim on
-    framing large enough to be elided.
-
-    Every free-text field is capped (see ``_MAX_AMENDMENT_LINE_CHARS`` /
-    ``_MAX_AMENDMENT_DETAIL_CHARS``) and the options LIST is capped in length
-    (``_MAX_AMENDMENT_OPTIONS``), which is what turns ``_MAX_AMENDMENTS`` from
-    an entry count into an actual size bound.  Options past the cap are shed
-    whole and their full length counts as elided, so the returned total covers
-    everything the entry did not keep.
-
-    Returns ``(amendment, chars_elided)``.
-    """
-    kept_root_cause, rc_lost = _elide(root_cause, _MAX_AMENDMENT_LINE_CHARS)
-    kept_summary, sm_lost = _elide(summary, _MAX_AMENDMENT_LINE_CHARS)
-    kept_detail, dt_lost = _elide(evidence, _MAX_AMENDMENT_DETAIL_CHARS)
-
-    incoming_options = list(options or [])
-    # Shed the TAIL of an over-long options list, the opposite of the entry-cap
-    # policy: options are ordered proposals ('A: ...', 'B: ...'), so the leading
-    # ones are the ones a reader is being asked to choose between.
-    opt_lost = sum(len(o) for o in incoming_options[_MAX_AMENDMENT_OPTIONS:])
-    kept_options: list[str] = []
-    for option in incoming_options[:_MAX_AMENDMENT_OPTIONS]:
-        kept, lost = _elide(option, _MAX_AMENDMENT_LINE_CHARS)
-        kept_options.append(kept)
-        opt_lost += lost
-
-    amendment: Amendment = {
-        'timestamp': timestamp,
-        'agent_role': agent_role,
-        'root_cause': kept_root_cause,
-        'summary': kept_summary,
-        'detail': kept_detail,
-        'options': kept_options,
-    }
-    return amendment, rc_lost + sm_lost + dt_lost + opt_lost
-
-
-def _framing_view(a: Amendment) -> tuple[str, str, str, list[str]]:
-    """The comparable framing of *a*: WHAT was said, normalised.
-
-    ``agent_role`` is deliberately excluded — it records WHO said it, not WHAT
-    was said, and two roles submitting identical framing is not new framing.
-    ``timestamp`` likewise: the queue stamps it, so it always differs and would
-    defeat the comparison entirely.
-
-    ``root_cause`` is compared RAW-STRIPPED — deliberately NOT canonicalised,
-    even though ``find_pending_l2_by_root_cause`` now matches canonically (task
-    3998).  Canonicalising here would suppress exactly the record the system
-    needs: a fold whose root_cause differs only in case/whitespace/punctuation is
-    a re-SPELLING of the cause, and that pre-canonical spelling is the ONLY
-    evidence that canonicalisation folded it.  It must therefore read as NEW
-    framing and be recorded (the entry lands in ``Amendment.root_cause``, which
-    is documented as the pre-canonical incoming root cause, and feeds the
-    over-fold detector's distinct-variant count).  Treating it as a repeat would
-    make an over-fold — distinct causes silently merged under one canonical key —
-    unobservable, which is the failure mode canonicalisation introduces.
-
-    The cost is amendment-cap churn from trivial re-spellings; that is bounded by
-    ``_MAX_AMENDMENTS``, counted in ``amendments_truncated``, and was budgeted:
-    that constant is sized against the post-canonicalisation fold rate.
-
-    ``.strip()`` (rather than nothing) is kept because the create path stores
-    ``root_cause.strip()`` on the record itself, so comparing unstripped text
-    against a stripped field would report new framing for a pure no-op.
-    """
-    return (
-        a.get('root_cause', '').strip(),
-        a.get('summary', ''),
-        a.get('detail', ''),
-        list(a.get('options', [])),
-    )
-
-
-def _is_repeat_framing(esc: Escalation, candidate: Amendment) -> bool:
-    """True when *candidate* repeats the framing the record ALREADY carries.
-
-    A watcher rotation re-promoting the same cluster with UNCHANGED text has
-    contributed nothing: recording it again would (a) manufacture a spurious
-    ``updated_at`` bump and re-trigger the re-assess protocol on a true no-op —
-    the contract task 3976 pinned — and (b) burn cap budget, so that
-    ``_MAX_AMENDMENTS`` worth of identical rows would push genuinely-distinct
-    earlier framings out via the drop-oldest policy.  Both are the opposite of
-    what preserving framing is for.
-
-    THE BASELINE IS THE RECORD'S CURRENT POSITION, which is the LAST amendment
-    when there is one and **the record's OWN framing when there is not**.  The
-    empty-list case is not a special case to skip: an L2's first re-promote is
-    exactly the one most likely to carry text byte-identical to the create
-    (the watcher recomputes the same cluster and re-sends the same framing),
-    and treating "no amendments yet" as "nothing to compare against" recorded a
-    verbatim copy of the record's own root_cause/detail/options/summary — one
-    spurious ``updated_at`` bump per L2, one wasted cap slot, and a re-assess
-    re-triggered on a genuine no-op.  The record's own framing IS the implicit
-    ``amendments[-1]``, so it is projected through :func:`_build_amendment` and
-    compared the same way.
-
-    Compared against the LAST position only, not all of them: an A -> B -> A
-    reframing genuinely returns to a previous position and IS new relative to
-    what the record currently says.
-    """
-    if esc.amendments:
-        baseline = esc.amendments[-1]
-    else:
-        # Built through the SAME function as the candidate, so the record's own
-        # framing is elided identically — a re-promote of framing long enough to
-        # be elided still compares equal instead of reading as new every time.
-        baseline, _ = _build_amendment(
-            root_cause=esc.root_cause, summary=esc.summary, evidence=esc.detail,
-            options=esc.options, agent_role='', timestamp='',
-        )
-    return _framing_view(baseline) == _framing_view(candidate)
-
-
-def _has_framing(
-    *, root_cause: str, summary: str, evidence: str, options: list[str] | None,
-) -> bool:
-    """True when incoming framing carries anything an amendment could record.
-
-    THE one definition of "empty framing", read by every writer that must tell
-    a no-op apart from a write before it decides what to do: an empty amendment
-    carries no information and would still burn a ``_MAX_AMENDMENTS`` slot.
-    """
-    return bool(root_cause or summary or evidence or options)
-
-
-def _append_amendment_capped(
-    esc: Escalation, *, root_cause: str, summary: str, evidence: str,
-    options: list[str] | None, agent_role: str, caller: str,
-) -> tuple[bool, int]:
-    """Append one framing :class:`~escalation.models.Amendment` to *esc*, capped.
-
-    THE single home of the ``amendments`` append-and-trim policy, whichever
-    queue method carries the framing in: build the entry through
-    :func:`_build_amendment` (per-field elision), suppress it when
-    :func:`_is_repeat_framing`, count elided characters in
-    ``amendments_chars_elided``, and shed the OLDEST entries past
-    ``_MAX_AMENDMENTS`` into ``amendments_truncated``.  Every loss is a durable
-    structured fact on the record and a WARNING, never log-only.
-
-    Framing that fails :func:`_has_framing` records nothing.
-
-    Mutates *esc* in memory only.  The caller holds ``escalation_id_lock``, owns
-    the single ``_rewrite``, and decides whether to bump ``updated_at``, so the
-    append stays atomic with whatever else that caller writes.  The timestamp is
-    stamped HERE, so the write chokepoint owns the clock and no caller can
-    backdate an entry.  *caller* only prefixes the WARNING lines.
-
-    Returns ``(recorded, dropped)``: whether an entry was appended, and how many
-    oldest entries the cap shed.
-    """
-    if not _has_framing(
-        root_cause=root_cause, summary=summary, evidence=evidence, options=options,
-    ):
-        return False, 0
-    candidate, chars_elided = _build_amendment(
-        root_cause=root_cause, summary=summary, evidence=evidence,
-        options=options, agent_role=agent_role,
-        timestamp=datetime.now(UTC).isoformat(),
-    )
-    # Built BEFORE the repeat check, and the check reads the built entry: the
-    # stored form is what a later amendment will be compared against, so
-    # comparing anything else would let two entries the record cannot tell
-    # apart both be recorded.
-    if _is_repeat_framing(esc, candidate):
-        return False, 0
-    esc.amendments.append(candidate)
-    if chars_elided:
-        esc.amendments_chars_elided += chars_elided
-        logger.warning(
-            '%s: %s elided %d char(s) of incoming framing at the per-field '
-            "amendment caps (running total elided=%d); the record's own "
-            'framing is unaffected',
-            caller, esc.id, chars_elided, esc.amendments_chars_elided,
-        )
-    dropped = 0
-    if len(esc.amendments) > _MAX_AMENDMENTS:
-        dropped = len(esc.amendments) - _MAX_AMENDMENTS
-        del esc.amendments[:dropped]
-        esc.amendments_truncated += dropped
-        logger.warning(
-            '%s: %s shed %d oldest amendment(s) at the _MAX_AMENDMENTS=%d cap '
-            "(running total truncated=%d); the record's own original framing "
-            'is unaffected',
-            caller, esc.id, dropped, _MAX_AMENDMENTS, esc.amendments_truncated,
-        )
-    return True, dropped
-
-
-def amendment_room(esc: Escalation) -> int:
-    """How many more amendments *esc* takes before the cap sheds its oldest one."""
-    return max(0, _MAX_AMENDMENTS - len(esc.amendments))
 
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
@@ -950,11 +717,38 @@ def read_escalation_for_scan(
         return None, 'unparsable'
 
 
+def _warn_cross_tier_duplicates(root_paths: list[Path], archive_paths: list[Path]) -> None:
+    """WARN once per escalation id that has a copy in BOTH the queue root and the archive.
+
+    That signals a crash-mid-resolve or a backup-restore needing reconciliation.
+    Each path's tier is known from which list it came in, so ids are matched
+    by filename alone, with no JSON parsing and no per-path ``.parent``.  An id
+    present in several dated archive subdirs but not the root is NOT warned
+    about: ``queue.py::EscalationQueue._locate_path`` selects the newest copy.
+    """
+    root_names = {path.name for path in root_paths}
+    archive_copies: dict[str, list[Path]] = {}
+    for path in archive_paths:
+        if path.name in root_names:
+            archive_copies.setdefault(path.name, []).append(path)
+    for root_copy in root_paths:
+        copies = archive_copies.get(root_copy.name)
+        if copies:
+            esc_paths = [root_copy, *copies]
+            logger.warning(
+                f'Escalation {root_copy.stem!r} exists in both queue_dir and archive: '
+                f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
+            )
+
+
 class EscalationQueue:
     """Filesystem queue for escalations.
 
     Each escalation is a JSON file named {id}.json in the queue directory.
     Writes are atomic (tmp file + rename). Reads tolerate partial writes.
+    The read paths (``get`` / ``get_by_task`` / ``get_pending``) may run on
+    worker threads while writes run on the loop thread, which is why
+    iteration over the archive-listing memo is snapshot-based.
     """
 
     def __init__(self, queue_dir: Path):
@@ -1142,7 +936,7 @@ class EscalationQueue:
         listing = self._get_archive_listing()
         candidates = [
             archive_root / subdir / f'{escalation_id}.json'
-            for subdir, stems in listing.items()
+            for subdir, stems in list(listing.items())
             if escalation_id in stems
             and (archive_root / subdir / f'{escalation_id}.json').exists()
         ]
@@ -1328,8 +1122,7 @@ class EscalationQueue:
         anyway.
 
         Recovery is further gated to a ``'vanished'`` path whose parent is
-        the queue ROOT (the same root/archive tier test the pre-scan above
-        already makes).  An archive-tier path going ``'vanished'`` is
+        the queue ROOT.  An archive-tier path going ``'vanished'`` is
         overwhelmingly ``archive.prune_archive`` rmtree-ing its whole dated
         subdir wholesale — a genuine deletion recovery cannot help with, not
         the root -> archive move this recovery targets — and re-locating it
@@ -1338,42 +1131,15 @@ class EscalationQueue:
         that is genuinely gone.  This deliberately leaves a second,
         archive-to-archive relocation (e.g. a re-date) unrecovered.
         """
-        # Build the candidate path list.
-        paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
-        if status != 'pending':
-            paths.extend(self._iter_archive_paths('esc-*.json'))
-
-        # Pre-scan: detect ids that span both queue_dir root and archive subtree.
-        # Uses filename stems only (no JSON parsing) to avoid extra I/O.
-        #
-        # Tier-membership: classify each path by comparing its parent directory
-        # to self.queue_dir.  Files written by queue_dir.glob('esc-*.json') are
-        # non-recursive, so their parent IS self.queue_dir (root tier).  Files
-        # from _iter_archive_paths come from archive_root.rglob(...) and land
-        # inside a dated subdir (e.g. archive/2025-06-15/); their parent is that
-        # date dir, NOT self.queue_dir (archive tier).
-        #
-        # A single id can legitimately appear multiple times within the archive
-        # tier (the same stem in two different dated subdirs after a requeue or
-        # backup-restore).  That situation is handled by get()'s newest-by-date
-        # selection (queue.py:102-117) and is NOT a cross-tier inconsistency.
-        # We warn only when an id has members in BOTH tiers — that signals a
-        # crash-mid-resolve or backup-restore scenario requiring reconciliation.
-        id_to_paths: dict[str, list[Path]] = {}
-        for path in paths:
-            id_to_paths.setdefault(path.stem, []).append(path)
-        for esc_id, esc_paths in id_to_paths.items():
-            has_root = any(p.parent == self.queue_dir for p in esc_paths)
-            has_archive = any(p.parent != self.queue_dir for p in esc_paths)
-            if has_root and has_archive:
-                logger.warning(
-                    f'Escalation {esc_id!r} exists in both queue_dir and archive: '
-                    f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
-                )
+        root_paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
+        archive_paths: list[Path] = (
+            list(self._iter_archive_paths('esc-*.json')) if status != 'pending' else []
+        )
+        _warn_cross_tier_duplicates(root_paths, archive_paths)
 
         seen: set[str] = set()
         results = []
-        for path in paths:
+        for path in root_paths + archive_paths:
             # The glob above snapshotted the listing; nothing holds a lock over
             # these reads, so a concurrent resolve()/sweep can relocate any of
             # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
@@ -1388,8 +1154,7 @@ class EscalationQueue:
                 # vanish -- re-locate it fresh and retry the read once before
                 # giving up on it.
                 #
-                # Gated to the ROOT tier (path.parent == self.queue_dir), the
-                # same root/archive test the pre-scan above already uses.
+                # Gated to the ROOT tier (path.parent == self.queue_dir).
                 # An ARCHIVE-tier path going 'vanished' is overwhelmingly
                 # archive.prune_archive rmtree-ing its whole dated subdir --
                 # a genuine deletion this recovery cannot help with, not the
@@ -1430,7 +1195,13 @@ class EscalationQueue:
             results.append(esc)
         return results
 
-    def has_open_l1(self, task_id: str, *, category: str | None = None) -> bool:
+    def has_open_l1(
+        self,
+        task_id: str,
+        *,
+        category: str | None = None,
+        dedupe_fingerprint: str | None = None,
+    ) -> bool:
         """Return True when the task has at least one pending level-1 escalation.
 
         Level-1 is the handed-to-human tier: the presence of one signals that
@@ -1440,8 +1211,12 @@ class EscalationQueue:
         ``.category`` matches — a signature filter (task 2757).  This lets a NEW
         root cause (a different failure category) escape being silently
         suppressed by an UNRELATED open L1.  Default None preserves the exact
-        prior behavior (any pending L1 counts).  A non-None ``category`` outside
-        ``escalation.categories.EscalationCategory`` raises
+        prior behavior (any pending L1 counts).  ``dedupe_fingerprint``, when
+        given, further restricts the check to open L1s carrying that exact
+        ``.dedupe_fingerprint``; its first caller is
+        ``fused-memory/scripts/memory_eval_runner.py``, which files many
+        fingerprints under one synthetic task id.  A non-None ``category``
+        outside ``escalation.categories.EscalationCategory`` raises
         ``UnregisteredEscalationCategory``.
         """
         if category is not None:
@@ -1449,6 +1224,10 @@ class EscalationQueue:
         open_l1s = self.get_by_task(task_id, status='pending', level=1)
         if category is not None:
             open_l1s = [esc for esc in open_l1s if esc.category == category]
+        if dedupe_fingerprint is not None:
+            open_l1s = [
+                esc for esc in open_l1s if esc.dedupe_fingerprint == dedupe_fingerprint
+            ]
         return bool(open_l1s)
 
     def dismiss_if_covered(self, esc: Escalation, *, resolver: str) -> list[str]:
@@ -1585,12 +1364,32 @@ class EscalationQueue:
                 results.append(esc)
         return results
 
+    def get_pending_by_task(self) -> dict[str, list[Escalation]]:
+        """``get_pending`` grouped by task id, deduplicated as ``get_by_task`` is.
+
+        For any task id, ``result.get(task_id, [])`` is row for row what
+        ``get_by_task(task_id, status='pending')`` returns over the same
+        listing, whose first-copy-wins dedup on ``Escalation.id`` is scoped to
+        one task. One listing serves every task, which is the point: the root
+        also holds thousands of ``.lock`` and ``.seq`` sidecars, so a per-task
+        call pays for the glob each time (task 8073).
+        """
+        grouped: dict[str, list[Escalation]] = {}
+        seen: set[tuple[str, str]] = set()
+        for esc in self.get_pending():
+            if (esc.task_id, esc.id) in seen:
+                continue
+            seen.add((esc.task_id, esc.id))
+            grouped.setdefault(esc.task_id, []).append(esc)
+        return grouped
+
     def resolve(
         self, escalation_id: str, resolution: str, dismiss: bool = False,
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
         resolution_action: str | None = None,
+        recut: bool = False,
         outcome: ResolveOutcome | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
@@ -1609,6 +1408,14 @@ class EscalationQueue:
         path, and not propagated through the member cascade.  Legality is the
         caller's job: ``escalation/action_effects.py::effect_for`` is the
         authority ``escalation/server.py::resolve_issue`` consults first.
+
+        ``recut`` (task 5516): qualifies a ``'restart'`` resolution — the next
+        dispatch re-cuts the task fresh off main.  Any other pairing
+        (``models.recut_action_conflict``) raises ``ValueError`` BEFORE the
+        lock, so nothing is persisted (INV-1).  Stamped beside
+        ``resolution_action`` on the applied path only; never on the
+        already-terminal path and not propagated through the member cascade —
+        a cascade member inherits it from its parent, as it does the action.
 
         ``resolution_class`` (plans/escalation-lifecycle-dashboard-prd.md Seam 1):
         an optional explicit ``'benign' | 'actionable'`` classification stamp,
@@ -1652,9 +1459,10 @@ class EscalationQueue:
 
         Cascade: if the escalation is an L2 with a non-empty ``members`` list,
         after archiving the L2 each member id is resolved recursively with the
-        same *resolution* text.  The cascade uses
-        ``resolved_by='l2-cascade:{escalation_id}'`` so the audit trail
-        distinguishes direct resolves from cascades.  *dismiss* is propagated
+        same *resolution* text.  The cascade stamps
+        ``resolved_by=models.cascade_resolved_by(escalation_id)`` (read back by
+        ``models.cascade_parent_id``) so the audit trail distinguishes direct
+        resolves from cascades.  *dismiss* is propagated
         so a dismissed L2 dismisses its members too.
 
         Cascade contract:
@@ -1698,6 +1506,8 @@ class EscalationQueue:
                 f'invalid resolution_class {resolution_class!r}; '
                 f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
             )
+        if (conflict := recut_action_conflict(resolution_action, recut)) is not None:
+            raise ValueError(conflict)
 
         # Seed BEFORE the lock so the early returns below leave a complete dict
         # rather than a stale caller-supplied one (the add_members_to_l2
@@ -1754,6 +1564,7 @@ class EscalationQueue:
                 esc.granted_files = granted_files
             if resolution_action is not None:
                 esc.resolution_action = resolution_action
+            esc.recut = recut
 
             self._atomic_write(escalation_id, esc.to_json())
             self._archive_resolved(escalation_id, esc.resolved_at)
@@ -1781,14 +1592,14 @@ class EscalationQueue:
         # Cascade to member L1s (L2 clusters only — L0/L1 have empty members).
         # Recursion is bounded: L1 members carry empty members[], so no deeper nesting.
         if esc.members:
-            cascade_resolved_by = f'l2-cascade:{escalation_id}'
+            member_resolved_by = cascade_resolved_by(escalation_id)
             for member_id in esc.members:
                 try:
                     self.resolve(
                         member_id,
                         resolution,
                         dismiss=dismiss,
-                        resolved_by=cascade_resolved_by,
+                        resolved_by=member_resolved_by,
                         resolution_class=esc.resolution_class,
                     )
                 except Exception as e:
@@ -2030,7 +1841,7 @@ class EscalationQueue:
                         )
                         continue
                     # In-memory cascade signal only; no disk write.
-                    member.resolved_by = f'l2-cascade:{escalation_id}'
+                    member.resolved_by = cascade_resolved_by(escalation_id)
                     if self._resolve_callback:
                         try:
                             self._resolve_callback(member)
@@ -2265,8 +2076,9 @@ class EscalationQueue:
         framing appends no amendment, so every existing two-positional-arg
         caller is byte-unchanged.  Framing byte-identical to what the record
         ALREADY says is likewise not re-recorded (see
-        :func:`_is_repeat_framing`): a re-promote with unchanged text has
-        contributed nothing, so it stays a true no-op and does NOT bump
+        ``escalation/src/escalation/amendments.py::_is_repeat_framing``): a
+        re-promote with unchanged text has contributed nothing, so it stays a
+        true no-op and does NOT bump
         ``updated_at``.  "What the record already says" is the LAST amendment
         when there is one and **the record's OWN framing when there is not** —
         so the FIRST re-promote of a freshly-created L2, the one most likely to
@@ -2274,16 +2086,19 @@ class EscalationQueue:
         copy of the record's own fields.
 
         **Each entry is size-bounded too.**  Every free-text field is elided to
-        its named per-field cap (``_MAX_AMENDMENT_LINE_CHARS`` /
-        ``_MAX_AMENDMENT_DETAIL_CHARS``) with an in-band marker, and the options
-        list is capped at ``_MAX_AMENDMENT_OPTIONS`` — without that, the entry
-        count alone would bound nothing, since *evidence* is unbounded free
+        its named per-field cap (``MAX_AMENDMENT_LINE_CHARS`` /
+        ``MAX_AMENDMENT_DETAIL_CHARS``) with an in-band marker, and the options
+        list is capped at
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENT_OPTIONS`` —
+        without that, the entry count alone would bound nothing, since
+        *evidence* is unbounded free
         text.  Characters dropped are added to ``amendments_chars_elided``,
         the byte-side counterpart of ``amendments_truncated``.
 
-        **The list is capped at** :data:`_MAX_AMENDMENTS`.  The trim happens at
-        write time (:func:`_append_amendment_capped`), in the same critical
-        section and the same single ``_rewrite`` as the append — so cap
+        **The list is capped at**
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS``.  The trim
+        happens at write time (:func:`append_amendment_capped`), in the same
+        critical section and the same single ``_rewrite`` as the append — so cap
         enforcement is atomic with it and no over-cap list is ever durable.  It
         sheds the OLDEST entries, which is
         safe because the ORIGINAL framing is never in this list at all: it lives
@@ -2352,7 +2167,7 @@ class EscalationQueue:
                 logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
                 return None
 
-            incoming_framing = _has_framing(
+            incoming_framing = has_framing(
                 root_cause=root_cause, summary=summary, evidence=evidence,
                 options=options,
             )
@@ -2384,9 +2199,11 @@ class EscalationQueue:
             # union-preservation is inherited from the lock rather than
             # re-established.
             variant_added = False
-            # STRIPPED, exactly as `_framing_view` compares root_cause and as the
-            # create path stores it: a key differing only in surrounding
-            # whitespace was folded by the lookup even BEFORE canonicalisation,
+            # STRIPPED, exactly as
+            # `escalation/src/escalation/amendments.py::_framing_view` compares
+            # root_cause and as the create path stores it: a key differing only
+            # in surrounding whitespace was folded by the lookup even BEFORE
+            # canonicalisation,
             # so it is not a distinct SPELLING and carries no over-fold
             # information.  Recording it would also contradict the pinned
             # contract that such a fold is a no-op (no spurious `updated_at`
@@ -2397,13 +2214,14 @@ class EscalationQueue:
                 # every spelling the cluster has EVER been addressed by rather
                 # than only the post-mint ones.
                 if not esc.root_cause_variants and esc.root_cause.strip():
-                    seeded, _ = _elide(esc.root_cause.strip(), _MAX_AMENDMENT_LINE_CHARS)
+                    seeded, _ = elide(esc.root_cause.strip(), MAX_AMENDMENT_LINE_CHARS)
                     esc.root_cause_variants.append(seeded)
                 # Elide through the SAME helper as amendment fields, so an
                 # over-long spelling is capped with the in-band marker rather
                 # than silently truncated — and so the comparison below is
-                # against the STORED form, exactly as _is_repeat_framing does.
-                incoming, _ = _elide(incoming_variant, _MAX_AMENDMENT_LINE_CHARS)
+                # against the STORED form, exactly as
+                # `escalation/src/escalation/amendments.py::_is_repeat_framing` does.
+                incoming, _ = elide(incoming_variant, MAX_AMENDMENT_LINE_CHARS)
                 if incoming not in esc.root_cause_variants:
                     esc.root_cause_variants.append(incoming)
                     variant_added = True
@@ -2425,7 +2243,7 @@ class EscalationQueue:
             # Preserve the incoming framing rather than discarding it, inside
             # the SAME critical section as the member append, so it lands in
             # the same single _rewrite below.
-            amendment_recorded, dropped_entries = _append_amendment_capped(
+            amendment_recorded, dropped_entries = append_amendment_capped(
                 esc, root_cause=root_cause, summary=summary, evidence=evidence,
                 options=options, agent_role=agent_role,
                 caller='add_members_to_l2',
@@ -2465,6 +2283,22 @@ class EscalationQueue:
                     len(esc.root_cause_variants) + esc.root_cause_variants_truncated
                 )
             return esc
+
+    def _load_root_pending(self, escalation_id: str) -> Escalation | None:
+        """The pending record at the queue root, or ``None`` when absent, unparsable or not pending.
+
+        Never falls back to the archive, so a caller that rewrites the result
+        cannot resurrect an archived record. Call it under ``escalation_id_lock``.
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        if not path.exists():
+            return None
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+            return None
+        return esc if esc.status == 'pending' else None
 
     def stamp_triage(
         self, escalation_id: str, *, triaged_by: str | None = None, triage_note: str = '',
@@ -2510,16 +2344,8 @@ class EscalationQueue:
         (archived/resolved/dismissed).
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return None
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return None
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return None
 
             esc.triaged_at = datetime.now(UTC).isoformat()
@@ -2531,6 +2357,42 @@ class EscalationQueue:
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc
 
+    def claim_policy_class(
+        self, escalation_id: str, *, policy_class: str, claimed_by: str,
+        refuse: Callable[[Escalation], R | None],
+    ) -> ClaimResult[R]:
+        """Stamp a policy-class claim on a pending escalation (task 8422).
+
+        The sole writer of ``policy_class`` / ``claimed_at`` / ``claimed_by``.
+        It has :meth:`stamp_triage`'s write shape for the same reasons: it is
+        serialized per id by ``escalation_id_lock``, it loads from the queue
+        root only, so an archived record is refused rather than resurrected, it
+        refuses a non-pending record, and it leaves ``updated_at`` alone
+        because a claim is not a content change.
+
+        *refuse* is evaluated on the record as read under the lock, so a
+        check on the existing claim cannot race another claim. A non-``None``
+        return is handed back as the refusal and nothing is written. This
+        method owns ``claimed_at``'s clock, as :meth:`stamp_triage` owns
+        ``triaged_at``'s.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
+                return ClaimResult(record=None, refusal=None)
+            refusal = refuse(esc)
+            if refusal is not None:
+                return ClaimResult(record=None, refusal=refusal)
+
+            esc.policy_class = policy_class
+            esc.claimed_at = datetime.now(UTC).isoformat()
+            esc.claimed_by = claimed_by
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'claim_policy_class: %s claimed %s as %s', claimed_by, escalation_id, policy_class,
+            )
+            return ClaimResult(record=esc, refusal=None)
+
     def amend(
         self, escalation_id: str, *, root_cause: str = '', summary: str = '',
         detail: str = '', options: list[str] | None = None, agent_role: str = '',
@@ -2540,9 +2402,11 @@ class EscalationQueue:
         The explicit counterpart of the framing a ``promote_to_l2`` fold carries
         in: a ruling made elsewhere can be written onto the record it rules on
         WITHOUT a fold's side effects.  APPEND-ONLY through
-        :func:`_append_amendment_capped`, so the per-field elision, repeat
-        suppression and ``_MAX_AMENDMENTS`` oldest-shed policy are exactly the
-        fold's.  *detail* lands under the amendment's ``detail`` key.
+        :func:`append_amendment_capped`, so the per-field elision, repeat
+        suppression and
+        ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS`` oldest-shed
+        policy are exactly the fold's.  *detail* lands under the amendment's
+        ``detail`` key.
 
         It NEVER writes ``status``, ``severity``, ``level``, ``members``,
         ``resolution`` / ``resolved_at`` / ``resolved_by`` /
@@ -2562,7 +2426,7 @@ class EscalationQueue:
         Serialized per-id by ``escalation_id_lock``; the result is computed
         inside it.  See :class:`AmendResult`.
         """
-        if not _has_framing(
+        if not has_framing(
             root_cause=root_cause, summary=summary, evidence=detail, options=options,
         ):
             return {'status': 'no_framing', 'escalation': None, 'recorded': False, 'dropped': 0}
@@ -2579,11 +2443,11 @@ class EscalationQueue:
             if esc.status != 'pending':
                 return {'status': 'not_pending', 'escalation': esc, 'recorded': False, 'dropped': 0}
 
-            recorded, dropped = _append_amendment_capped(
+            recorded, dropped = append_amendment_capped(
                 esc, root_cause=root_cause, summary=summary, evidence=detail,
                 options=options, agent_role=agent_role, caller='amend',
             )
-            # Framing already passed _has_framing above, so nothing recorded
+            # Framing already passed has_framing above, so nothing recorded
             # can only mean the record already says it.
             if not recorded:
                 return {
@@ -2655,16 +2519,8 @@ class EscalationQueue:
         *declared_by* normalises to nothing new.
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return None
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return None
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return None
 
             existing = list(esc.pin_declared_by)
@@ -3156,16 +3012,17 @@ class EscalationQueue:
         notes survive for the orphan reaper
         (plans/info-l0-disposition-router-prd.md boundary #16).
 
-        Returns the number of escalations where resolve() returned non-None.
-        This is an UPPER BOUND on the records this call dismissed, not an exact
-        count.  Other processes, among them fused-memory's middlewares and
-        reconciliation, write this queue directory concurrently, so a record
-        one of them resolves between get_pending() and resolve() is still
-        counted: resolve() on an already-terminal record is a no-op that
-        returns the stored record.  Nor does the count distinguish the three
-        per-record outcomes — age-annotated, strand-stamped, or
-        ``pending_secs=unknown`` for a record whose timestamp would not parse;
-        a caller that needs that detail reads the resolved records themselves.
+        Returns the exact number of records THIS call dismissed: a record is
+        counted only when resolve()'s ``ResolveOutcome`` reports it applied.
+        Other processes, among them fused-memory's middlewares and
+        reconciliation, routinely write this queue directory, so a record one
+        of them resolves between get_pending() and resolve() is an
+        already-terminal no-op here and is not counted.  The stale-strand tally
+        in the INFO line is counted the same way.  The count does not
+        distinguish the three per-record outcomes — age-annotated,
+        strand-stamped, or ``pending_secs=unknown`` for a record whose
+        timestamp would not parse; a caller that needs that detail reads the
+        resolved records themselves.
         """
         pending = self.get_pending()
         now = now or datetime.now(UTC)
@@ -3196,14 +3053,16 @@ class EscalationQueue:
                 else:
                     is_strand = False
                     per_record = f'{resolution} [pending_secs=unknown severity={esc.severity}]'
-                resolved = self.resolve(
+                outcome = blank_resolve_outcome()
+                self.resolve(
                     esc.id,
                     per_record,
                     dismiss=True,
                     resolved_by='auto-dismissed',
                     resolution_class='stale-strand' if is_strand else None,
+                    outcome=outcome,
                 )
-                if resolved is not None:
+                if outcome['applied']:
                     count += 1
                     strands += int(is_strand)
             except Exception as e:

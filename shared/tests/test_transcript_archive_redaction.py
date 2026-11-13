@@ -19,6 +19,9 @@ import pytest
 
 from shared import transcript_archive as transcript_archive_module
 from shared.transcript_archive import archive_before_delete, archive_task_transcripts
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 ENC = '-home-leo-src-dark-factory'
 SID = 'sess-redact'

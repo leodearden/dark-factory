@@ -1,0 +1,358 @@
+# Machine-readable twin of follow-up-filing-shape-prd.capability-manifest.md
+# Schema: shared/src/shared/capability_manifest.py::CapabilityManifestDoc
+# task_id values are stamped by commit_planning at decompose.
+prd: plans/follow-up-filing-shape-prd.md
+schema_version: 1
+signal_leaves: ["ι"]
+tasks:
+  - label: "α"
+    task_id: 8413
+    title: "Declared-scope class stamped at the submit boundary, immutable, with a reader allowlist"
+    capabilities:
+      - name: "declared-scope-model"
+        binding: "capability→producer — new shared/src/shared/declared_scope.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class DeclaredScope\\("
+          paths: ["shared/src/shared/declared_scope.py"]
+          expect: present
+      - name: "derive-declared-scope"
+        binding: "capability→producer — the one pure threshold function"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def derive_declared_scope\\("
+          paths: ["shared/src/shared/declared_scope.py"]
+          expect: present
+      - name: "declared-scope-submodel-registered"
+        binding: "capability→producer — register_metadata_submodel under the quoted key literal"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "['\"]declared_scope['\"]"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "stamp-wired-at-submit-boundary"
+        binding: "capability→producer (wired) — TaskInterceptor.submit_task before the planning_mode split"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "derive_declared_scope"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "write-authority-refusal"
+        binding: "rejection-mechanism — sketch row 6; created by α"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class DeclaredScopeWriteAuthorityError"
+          paths: ["fused-memory/src/", "shared/src/"]
+          expect: present
+      - name: "reader-allowlist-test"
+        binding: "capability→producer — structural test over real importers (decision 8)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/tests/test_declared_scope_readers.py"]
+          expect: present
+      - name: "undeclared-band-via-get-task"
+        binding: "manual — sketch row 20, stamp half; the curator-render half is γ's"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "observed through submit_task then get_task on a fileless task"
+  - label: "β"
+    task_id: 8414
+    title: "Follow-up items contract, server-derived keys, bundling filing prompt, briefing render"
+    capabilities:
+      - name: "followup-item-model"
+        binding: "capability→producer — new shared/src/shared/followup_items.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class FollowupItem\\("
+          paths: ["shared/src/shared/followup_items.py"]
+          expect: present
+      - name: "merge-items"
+        binding: "capability→producer — the one merge used by every writer"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def merge_items\\("
+          paths: ["shared/src/shared/followup_items.py"]
+          expect: present
+      - name: "keys-derived-at-submit"
+        binding: "capability→producer (wired) — interceptor fills item keys and the top-level R4 pair"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "followup_items"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "bundling-filing-prompt"
+        binding: "capability→producer — _FOLLOWUP_FILING_INSTRUCTIONS asks for one bundle per area"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "followup_items"
+          paths: ["orchestrator/src/orchestrator/agents/roles.py"]
+          expect: present
+      - name: "briefing-renders-items"
+        binding: "capability→producer — briefing.py renders the list like delivered checks"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "followup_items"
+          paths: ["orchestrator/src/orchestrator/agents/briefing.py"]
+          expect: present
+      - name: "one-bundle-in-production"
+        binding: "manual — sketch row 1 minus the hold"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "agent behaviour at dispatch; counted by the θ report"
+  - label: "γ"
+    task_id: 8415
+    title: "Item-preserving combine, item-aware R4, combine re-stamp of declared scope, audit fields, holder excluded from curator pools and combine targets"
+    capabilities:
+      - name: "combine-audit-items"
+        binding: "capability→producer — _append_combine_audit gains items_before/items_after"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "items_before"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "combine-audit-candidate-source"
+        binding: "capability→producer — audit row names the candidate's source"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "candidate_source"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "pool-entry-item-count"
+        binding: "capability→producer — PoolEntry.item_count"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "item_count"
+          paths: ["fused-memory/src/fused_memory/middleware/curator_types.py"]
+          expect: present
+      - name: "curator-renders-band"
+        binding: "capability→producer — pool render line and candidate section"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "declared_scope"
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: present
+      - name: "tiny-prose-rule-replaced"
+        binding: "rejection-mechanism — the prose tiny rule is gone once the band replaces it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Either task alone is tiny"
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: absent
+      - name: "holder-predicate"
+        binding: "capability→producer — re-homed at decompose: γ creates followup_hold.py with the marker key and is_holder; ε extends it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_holder\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_hold.py"]
+          expect: present
+      - name: "item-aware-r4"
+        binding: "manual — sketch rows 2, 3, 3b"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behaviour through submit_task and resolve_ticket; asserted again by ι"
+  - label: "δ"
+    task_id: 8416
+    title: "Lift batch rule 2: within-batch combine"
+    capabilities:
+      - name: "batch-rule-2-lifted"
+        binding: "rejection-mechanism — the prohibition text leaves _BATCH_CONTRACT"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Combine between two new batch items is NOT supported"
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: absent
+      - name: "non-create-target-degrades-audited"
+        binding: "capability→producer — sketch row 5"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "batch-target-not-create"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "harness-version-bumped"
+        binding: "manual — _CURATOR_PROMPT_HARNESS_VERSION moves past its value at δ's base"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "task 6707 may take the next version first, so no fixed literal is safe"
+  - label: "ε"
+    task_id: 8417
+    title: "Follow-up holder task, hold at filing, backfill at server startup, holder protection"
+    capabilities:
+      - name: "holder-mint"
+        binding: "capability→producer — ensure_holder in followup_hold.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def ensure_holder\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_hold.py"]
+          expect: present
+      - name: "backfill"
+        binding: "capability→producer — backfill in followup_hold.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def backfill\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_hold.py"]
+          expect: present
+      - name: "backfill-one-event-per-project"
+        binding: "capability→producer — storm escape (INV-4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "followup_hold_backfilled"
+          paths: ["fused-memory/src/fused_memory/middleware/followup_hold.py"]
+          expect: present
+      - name: "backfill-wired-at-startup"
+        binding: "capability→producer (wired) — server/main.py after the interceptor start"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "followup_hold"
+          paths: ["fused-memory/src/fused_memory/server/main.py"]
+          expect: present
+      - name: "holder-protection-error"
+        binding: "rejection-mechanism — sketch rows 14 and 14b; created by ε"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class FollowupHolderProtectedError"
+          paths: ["fused-memory/src/"]
+          expect: present
+      - name: "release-holder-parameter"
+        binding: "capability→producer — set_task_status release_holder on the MCP surface"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "release_holder"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "held-task-absent-from-candidates"
+        binding: "capability→producer (wired, existing) — deps_verdict at Scheduler._eligible_for_dispatch; sketch row 18 before"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "existing scheduler behaviour over the new edge; asserted by ι"
+  - label: "ζ"
+    task_id: 8418
+    title: "Promotion closure and its triggers; findings-contract and skill edits"
+    capabilities:
+      - name: "promote"
+        binding: "capability→producer — promote in followup_hold.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def promote\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_hold.py"]
+          expect: present
+      - name: "promote-dependencies-of"
+        binding: "capability→producer — the status-chokepoint and edge-insert entry"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def promote_dependencies_of\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_hold.py"]
+          expect: present
+      - name: "promotion-wired-in-interceptor"
+        binding: "capability→producer (wired) — _apply_status_transition and add_dependency"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "promote_dependencies_of"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "promoted-event"
+        binding: "capability→producer — followup_promoted, including row 15's by=human events moved from ε"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "followup_promoted"
+          paths: ["fused-memory/src/"]
+          expect: present
+      - name: "doc-and-skill-edits"
+        binding: "manual — quality-findings-contract §8, decompose-mode, cancel-with-children §4.2"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "prose edits; judged by review, never by a wording grep"
+  - label: "η"
+    task_id: 8419
+    title: "Done-time declared_scope_outcome event and the burndown held series"
+    capabilities:
+      - name: "outcome-event-at-done"
+        binding: "capability→producer — workflow.py done-time reconcile"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "declared_scope_outcome"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "burndown-held-series"
+        binding: "capability→producer — collect_snapshot carries held beside pending"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "['\"]held['\"]"
+          paths: ["dashboard/src/dashboard/data/burndown.py"]
+          expect: present
+      - name: "no-holder-renders-null"
+        binding: "manual — INV-13 no-producer state distinct from zero"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rendering judgment over a project with and without a holder"
+  - label: "ι"
+    task_id: 8420
+    title: "Integration gate: the follow-up filing shape boundary-test sketch end to end"
+    capabilities:
+      - name: "boundary-suite"
+        binding: "capability→producer — new integration module driving public interfaces only"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/integration/test_followup_filing_shape.py"]
+          expect: present
+      - name: "every-row-green"
+        binding: "manual — every §4.4 row except 19 passes on the integrated tree"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the gate's own verify run is the evidence"
+  - label: "θ"
+    task_id: 8421
+    title: "Follow-up filing shape observation report, 14 days after the integration gate"
+    capabilities:
+      - name: "report-script"
+        binding: "capability→producer — new read-only report script"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/followup_filing_shape_report.py"]
+          expect: present
+      - name: "dated-report"
+        binding: "manual — delayed milestone; dated report under plans/portfolio-review-2026-11-01/followups/"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a measurement over live stores, judged by the report it writes"

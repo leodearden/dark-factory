@@ -75,6 +75,7 @@ def arm_at(arms: list[tuple[datetime, str]], ts: datetime) -> str:
     return cur
 
 
+# Twin of scripts/load-threshold-calibration.py::pct (rationale there); this copy keeps banker's rounding.
 def pct(xs: list[float], p: float) -> float:
     if not xs:
         return float('nan')

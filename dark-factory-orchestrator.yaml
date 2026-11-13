@@ -6,6 +6,22 @@
 # had finished implementing and sat in verify, measured at 44 of 48, several for
 # 8h+. Each held its dispatch slot while contributing ~1.8 test legs to the
 # single-slot admission queue. Red tier: takes effect at restart.
+# 24 -> 18 (Leo, 2026-11-02, ruling after the 2026-11-01 portfolio review, seat Q3):
+# the per-project task-verify slot is saturated (a waiter is present in 92-99% of
+# heartbeat samples, W43-W44). A closed-loop queue model fitted to W44 keeps the slot
+# >= 97.6% busy at 18 while roughly halving verify wait (2.9 h -> 1.5 h) and rebase
+# drift (the W44 median was 34 commits, up from 13 in W42). Tripwire: if the weekly
+# waiter-present share falls below 0.90 or landings/day fall below the W44 rate,
+# revert at the next redeploy; raise again when task 7977's remote task legs reach
+# this project. Red tier: takes effect at the next redeploy.
+# 18 -> 24 (Leo, 2026-11-12, after the three-gates scheduling study): the tripwire
+# above fired. With verify_admission_task_slots at 2, a verify waiter was present in
+# 53% of the minutes in which agents could run (2026-11-09..11-12, measured per
+# minute against the 0.90 per-sample line), and task 7977 is done. Neither value has
+# a measured throughput effect: the six extra starts go into a merge lane that was
+# full in 80% of those minutes and an agent allowance that was capped for 24% of
+# them, so watch the merge-phase share of slot time after the redeploy.
+# Red tier: takes effect at the next redeploy.
 max_concurrent_tasks: 24
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
@@ -94,7 +110,7 @@ lock_depth: 12
 # no longer collide. The ledger keys are the RETIRED array path, kept because
 # pending tasks still declare it, and the directory's one fixed file. A PARK on
 # these keys takes one of the key's slots instead of reserving it exclusively
-# (orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._iter_blocking_park_owners).
+# (orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._iter_blocking_park_owners).
 # Same red tier as above.
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
@@ -102,6 +118,22 @@ module_overrides:
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
   orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
+  # DOCUMENTATION FILES (Leo's ruling of 2026-11-12): unbounded for the same reason
+  # as the ratchet paths. OPERATIONS.md is declared by 171 pending tasks and was at
+  # capacity 99% of 2026-11-09..11-12; two edits of a prose file conflict textually,
+  # at rebase. INTERIM for task 5467, which strips docs/ and root-level Markdown
+  # from lock derivation for every project: remove these ten keys when it lands.
+  # skills/ is deliberately not listed (agent instructions; no ruling).
+  OPERATIONS.md: 99
+  ARCHITECTURE.md: 99
+  CHANGELOG.md: 99
+  CLAUDE.md: 99
+  CONTRIBUTING.md: 99
+  DESIGN.md: 99
+  README.md: 99
+  RECONCILIATION_PLAN.md: 99
+  SETUP.md: 99
+  docs/task-authoring.md: 99
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its
@@ -731,7 +763,8 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # warm <= cold is asserted (tasks 3350 and 3397, test_fallback_verify_config.py).
 #
 # THE COST. A genuinely WEDGED run holds a verify slot for 2h warm / 3h cold,
-# and verify_admission_task_slots is 1, so that is the whole task-verify lane.
+# so for that whole time the task-verify lane has one fewer of its
+# verify_admission_task_slots slots (below).
 # Accepted against the false-red rate the raise ended (esc-4211-6).
 #
 # WHAT THE GUARDS DO NOT DO. The floor guard fails if this warm value drops below
@@ -901,94 +934,20 @@ verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
 # move in the SAME COMMIT as any change to the value below.
 verify_admission_pytest_n: "8"
 
-# TASK-ROLE VERIFY ADMISSION WIDTH (1 -> 3 on 09-03, -> 1 on 09-08, -> 2 on
-# 09-23, -> 1 on 09-27; 2026).
-#
-# The code default is 1 (config.py::OrchestratorConfig.verify_admission_task_slots)
-# and it had never been set in either yaml, so ONE task-role pytest ran at a
-# time host-wide against max_concurrent_tasks: 48. That was tolerable while the
-# scheduler could only dispatch ~4.26 tasks/h; it stopped being tolerable when
-# the marker-index fix (fe4b34714c) lifted dispatch to ~24.7/h and mean
-# in-flight went 20.6 -> 39.9, because ~40 concurrent tasks then queued behind
-# this one flock.
-#
-# MEASURED across 34 runs: correlation between mean in-flight and MEDIAN TASK
-# DURATION is r=0.858, at ~+14 min of duration per additional concurrent task.
-# Controlling for run length (~8.3h runs only): ~20 in-flight -> ~3.9h duration,
-# ~40 in-flight -> ~6.8h. Duration then collided with the ~8.3h fleet-restart
-# window, so most attempts were killed before finishing: task 3728 needed NINE
-# dispatches over six days, and the only one that landed took 5.24h — the sole
-# attempt shorter than the window.
-#
-# This knob is GREEN-tier (config.py RELOADABLE_FIELDS), so it applies via
-# reload_config with no restart — which matters, because a restart is precisely
-# what destroys the in-flight work this is trying to protect.
-#
-# REVERSIBLE AND UNDER OBSERVATION: if median task duration does not fall on the
-# next run, put this back to 1 rather than raising it further — the box is CPU
-# constrained (verify was ~72% of a 99.3%-busy 32-core host on 2026-08-28) and
-# more verify concurrency is not free.
-#
-# PUT BACK TO 1 (operator decision, Leo 2026-09-08, load-tuning session). The
-# "REVERSIBLE AND UNDER OBSERVATION" clause above fired: median task duration
-# did not fall, it rose. Measured from the same event store, orchestrator-module
-# TASK-LEG verify only:
-#   1 slot  (30 legs before 2026-09-03 15:58Z): median 2300s, 10% hit the 3600s wall
-#   3 slots (49 legs after):                    median censored at 3600s, 80% hit it
-# Merge verify median moved 2572s -> 3199s across the same step, and journal
-# timeouts/day went 2,1,3,7,13,9,7 (08-28..09-07). Dose-response against the
-# number of OTHER concurrent orchestrator-suite fan-outs: 0-0.5 others -> 1978s
-# median, 0/12 timeouts; >=0.5 others -> 3600s censored, 29/52 timeouts. So 2
-# slots is not a middle ground either.
-# CORRECTED 2026-09-18: an earlier version of this block said slot time was not
-# the constraint ("~240 legs/14d, ~5.5h/day, ~23% of ONE slot"). That counted one
-# module's legs only (the basis lines above are orchestrator-module only, and
-# orchestrator is 34% of gated arrivals), so it undercounted slot-gated task
-# legs by 6.3x: measured arrivals are 107.5 legs/day (n=578 over 5.38d), not
-# ~17.1/day. Priced at service times from the same period, offered work is
-# 23.9 h/day, so the ONE slot is ~99% utilised, not ~23%. The orchestrator
-# full-suite task leg alone is 22% of arrivals and 86% of slot work, and its
-# mean service time rose from 644s (July) to 3,066s (from 2026-09-12).
-# Sources, in plans/verify-merge-queue-policy-study-2026-09-18/:
-# measure-sem.md, and critic.md finding 1 (summary: SYNTHESIS.md §1).
-# With the slot saturated and in-flight tasks pinned at max_concurrent_tasks,
-# mean task duration is set by WIP and leg service time, not by slot ordering.
-# The host is: 32 threads, 99% busy, runqueue p50 136 / p90 380 (PSI cpu-some
-# 49-72 and non-discriminating at this load, per task 3590).
-# The main-tip sweep (background role) shares this slot and was already live in
-# the 1-slot regime the 2300s figure comes from.
-# RAISED 1 -> 2 (operator decision, Leo 2026-09-23). Deliberately overrides the
-# "So 2 slots is not a middle ground either" line above, which was written from
-# the 09-03 3-slot episode and never tested 2 directly. What changed since:
-#   - merge rate  9.71 -> 16.29 /day (first vs second 7d of 09-09..09-22)
-#   - merge verify duration 64.3 -> 55.2 min mean over the same split (~49 today)
-#   - 24/24 concurrency slots occupied while only 4 tasks execute; 20 park at
-#     `phase_enter verify` behind this one flock
-#   - backlog +16.6 pending/day (burndown.db 992 -> 1080 over 5.3d), median
-#     pending age 14.2d, 225 high-priority waiting
-# UNDER OBSERVATION, WITH A DATED REVERT: task 5797 fires 48h after this lands
-# and re-measures; if median task duration or timeouts/day worsen, put this back
-# to 1. That is the same reversibility clause the 09-03 raise carried, which did
-# fire and was honoured.
-# MEASUREMENT GAP, stated rather than papered over: the "~23% of ONE slot"
-# figure (corrected above) could NOT be re-verified on 2026-09-23 —
-# `workflow_verify` events carry only {base_sha, branch, passed, tip_sha} and NO
-# duration, so task-lane slot-hours are not derivable from the event store at
-# all. Only the leg COUNT is: 572 workflow_verify events in 14.4d versus the
-# ~240/14d that figure was computed from. Task 5798 closes that gap. Until it
-# lands, this knob is being tuned on merge-lane duration plus queue-depth
-# observation, not on task-lane slot utilisation.
-# PUT BACK TO 1 (task 5797 gate, 2026-09-27). The dated-revert clause above
-# fired. Equal 4.3d arms on either side of the 09-23 reload:
-#   orchestrator-suite task-leg verify (verify-summary census):
-#     median 3233s -> 4995s, >=3600s share 27.3% -> 63.3%
-#   task-lane verify after a rebase, all modules (runs.db rebase_verify_cost):
-#     median  222s ->  633s, >=3600s share 11.0% -> 28.1%
-# Journal timeouts 0 -> 2 (fused-memory, 09-24). Merge verify was flat (p50
-# 51.5 -> 54.7 min), and landings/day fell 17.1 -> 14.1. Full before/after on
-# all five measures, with sources and caveats:
+# TASK-ROLE VERIFY ADMISSION WIDTH. How many task- and background-role verify
+# test legs run at once, admitted through the per-project flock; merge legs never
+# take a slot. The code default is 1
+# (config.py::OrchestratorConfig.verify_admission_task_slots).
+# 2 since 2026-11-12 04:27Z: stepped down from 3 under Leo's progressive-slot
+# rule (two local merge verifies over 46 min while reify rebuilt a warm lane).
+# Basis, step-down triggers and the dated value history:
 # plans/verify-admission-task-slots-gate.md.
-verify_admission_task_slots: 1
+# Any change to this value appends a dated entry there AND rewrites the
+# "N since DATE" sentence above, in the same commit.
+# GREEN-tier (config.py::RELOADABLE_FIELDS) and re-read at each grant, so it
+# applies via reload_config with no restart, which matters: a restart destroys
+# the in-flight work this knob protects.
+verify_admission_task_slots: 2
 
 # TASK-VERIFY ADMISSION ORDER (arrival; 2026-10-16, task 5629, PRD task beta of
 # plans/verify-admission-fifo-prd.md). Grant waiters in arrival order within a
@@ -1622,9 +1581,11 @@ merge_verify_max_concurrent_modules: 1
 # sha under gate_checkouts_path, cloned from df_checkout_path (task 6565). Both are
 # laptop paths and are restart-tier.
 # Laptop-side knobs live on leo-laptop, not here: its dark-factory-laptop.yaml sets
-# merge_verify_max_concurrent_modules: 1 and verify_use_cgroup_scope: true, and a systemd
-# drop-in caps each verify scope at MemoryMax=24G (a memory kill reports RED, not a
-# local fallback, until task 6106).
+# merge_verify_max_concurrent_modules: 1 and verify_use_cgroup_scope: true.
+# verify_cgroup_memory (orchestrator/src/orchestrator/config.py::VerifyCgroupMemoryConfig,
+# task 6106) is the field that replaces the laptop's per-scope systemd drop-ins; moving
+# leo-laptop onto it, with the ruled values, and removing the drop-ins is task 8384.
+# A memory-killed leg is a no-verdict that falls back to local (task 6667).
 # TRUST-ANCHOR TRADE-OFF, EYES OPEN: prefer-local existed because local is the trust
 # anchor (a laptop false green landed a red commit, #5120). Under prefer_remote nearly
 # every verdict is a REMOTE verdict, so verify_drift_check_every_n_lands is the
@@ -1650,6 +1611,21 @@ verify_runners:
 verify_host_policy: prefer_remote
 verify_drift_check_every_n_lands: 10
 verify_cross_check_remote_green: false
+# Remote TASK verifies (task 6670, plans/remote-task-leg-verify-prd.md §5.7): the four
+# verify_task_* keys let an implement-phase task verify run on a verify_runners host
+# (one queue per host, shared with the merge lane's bench). All four are green tier,
+# read per dispatch and per remote grant; every routed call leaves a dispatch sidecar
+# data/verify-logs/<task>/attempt-N.dispatch-*.json.
+# 2026-11-10, gate 6673 (task ε) step 4: the three-day parity window opens on these
+# values. Both parity knobs are on for the window only; Leo rules at its end (PRD §12
+# Q7: cross-check 0 and red-confirm off after a zero-disagreement window, the 5416
+# precedent). The laptop side (verify_admission_task_slots: 1,
+# verify_admission_pytest_n: "8") lives in leo-laptop's dark-factory-laptop.yaml.
+verify_task_host_policy: remote_modules        # local | remote_modules | remote_all
+verify_task_remote_modules: [orchestrator]     # must be non-empty under remote_modules
+verify_task_remote_red_confirms_locally: true  # a remote red re-runs locally, local wins
+verify_task_remote_cross_check_every_n: 5      # every 5th remote verdict (per process) is re-run locally, local wins
+# ROLLBACK: verify_task_host_policy: local (or delete the keys) + mcp__escalation__reload_config.
 
 # Pre-merge rebase: the merge phase only REBASES (Leo, 2026-10-09, task 6580).
 # workflow.py's merge phase rebases the task branch onto main and submits it to the
@@ -1788,11 +1764,20 @@ convert_to_blocked_enforce: true
 # window. Restart-only, so it goes live at the next fleet restart.
 workflow_exit_contract_enforce: true
 
-psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
+# INTERIM (Leo 2026-11-13): raise the starvation watchdog's lock_refused/dual
+# threshold from the default 50 so a task must be refused in more scans before
+# it is announced. That cuts the post-restart bursts of the auto-pin cap L1
+# (plans/starvation-cap-study-2026-11-12.md). The cap itself stays 3. Task 9636
+# makes that L1 change-driven and restart-safe, and DELETES this block when it
+# lands. Green tier: applied with reload_config.
+starvation_watchdog:
+  skip_threshold: 150
+
+psi_admission:           # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
   mem_some_avg10: 15.0
   mem_full_avg10: 3.0
   io_some_avg10: 40.0
-  runqueue_ratio: 4.0     # provisional (D9); the calibration gate re-derives it
+  runqueue_ratio: 6.0     # calibrated: plans/load-threshold-calibration-2026-11-03.md (esc-5219-1)
   min_inflight_floor: 3
   # cpu_some_avg10 and own_cpu_some_avg10 deliberately absent: off (D1, D2)
 

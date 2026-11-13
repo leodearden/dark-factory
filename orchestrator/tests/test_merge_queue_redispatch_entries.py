@@ -1,10 +1,10 @@
-"""Tests for _redispatch observability in snapshot()['entries'] (task 2068).
+"""Tests for redispatch-park observability in snapshot()['entries'] (task 2068).
 
 Follow-up from orphan L1 esc-2063-2, discovered while characterizing task 2063
 (I4 speculation-permit conservation). snapshot()['entries'] is built from
 _finalizing_head, _inflight, _remerging_item, _verifier_queue, _inflight_req,
-_lane_buffers, and _queue — but never iterates self._redispatch. A request
-parked on _redispatch (a speculative item awaiting a host when hosts <
+the lane buffers, and _queue — but never iterated the redispatch park. A request
+parked on the redispatch park (a speculative item awaiting a host when hosts <
 speculation_depth, or a cascade-remerged item awaiting re-dispatch) was
 therefore absent from snapshot()['entries'] and invisible to dashboard/
 heartbeat depth+occupancy while it waits.
@@ -12,7 +12,7 @@ heartbeat depth+occupancy while it waits.
 Task 2063 fixed only the conservation COUNT (_inflight_speculative_count());
 this closes the matching entries-visibility gap.
 
-FIX: snapshot() gains a new section (1c) iterating self._redispatch,
+FIX: snapshot() gains a new section (1c) iterating self._intake.pending_redispatch(),
 mirroring the existing _remerging_item transient-window entry, emitting a
 'state': 'awaiting_host' entry per parked item.
 
@@ -30,7 +30,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from _merge_lane_fakes import lane_entry, make_lane
+from _merge_lane_fakes import lane_entry, lane_scene_config, make_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -75,7 +75,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_req(
@@ -100,19 +100,19 @@ def _make_req(
 
 @pytest.mark.asyncio
 class TestSnapshotRedispatchEntries:
-    """snapshot()['entries'] must surface items parked on self._redispatch.
+    """snapshot()['entries'] must surface items parked on self._intake.pending_redispatch().
 
-    RED until snapshot() adds a section iterating self._redispatch.
+    RED until snapshot() adds a section iterating self._intake.pending_redispatch().
     """
 
     async def test_redispatch_parked_item_appears_in_entries(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """A speculative item awaiting a host on _redispatch must show up in
+        """A speculative item awaiting a host on the redispatch park must show up in
         snapshot()['entries'] with its request_id/branch/state so dashboard
         depth+occupancy reflect it while it waits.
 
-        RED: snapshot() never reads self._redispatch, so the item is absent
+        RED: snapshot() never reads self._intake.pending_redispatch(), so the item is absent
         from entries and depth undercounts by one.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -126,14 +126,14 @@ class TestSnapshotRedispatchEntries:
             base_sha='deadbeef',
             speculative=True,
         )
-        worker._redispatch.append(item)
+        worker._intake.request_redispatch(item)
 
         snap = worker.snapshot()
 
         entry_task_ids = [e['task_id'] for e in snap['entries']]
         assert 'rd-parked' in entry_task_ids, (
             f"Expected 'rd-parked' in snapshot entries, got {entry_task_ids}. "
-            "RED: snapshot() never iterates self._redispatch."
+            "RED: snapshot() never iterates self._intake.pending_redispatch()."
         )
         assert snap['depth'] == 1, (
             f"Expected depth==1 (the redispatch-parked item), got {snap['depth']}."
@@ -150,7 +150,7 @@ class TestSnapshotRedispatchEntries:
     async def test_no_redispatch_items_unchanged(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """With an empty _redispatch, snapshot() is unaffected (regression guard)."""
+        """With an empty redispatch park, snapshot() is unaffected (regression guard)."""
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = make_lane(git_ops, q)
 
@@ -162,7 +162,7 @@ class TestSnapshotRedispatchEntries:
     async def test_redispatch_entries_precede_awaiting_verify_entries(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """_redispatch is front-priority (drained by the verifier loop's
+        """The redispatch park is front-priority (drained by the verifier loop's
         DISPATCH-FILL ahead of _verifier_queue), so section 1c must place its
         entries BEFORE any awaiting_verify entry in snapshot()['entries'] —
         presence alone isn't enough.
@@ -172,7 +172,7 @@ class TestSnapshotRedispatchEntries:
         the redispatch entry present (and depth correct) while silently
         breaking the head-of-line / position semantics dashboard consumers
         rely on. Without this test, that regression would pass both
-        test_redispatch_parked_item_appears_in_entries (only _redispatch is
+        test_redispatch_parked_item_appears_in_entries (only the redispatch park is
         populated there) and the depth/entries-presence checks.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -186,7 +186,7 @@ class TestSnapshotRedispatchEntries:
             base_sha='deadbeef',
             speculative=True,
         )
-        worker._redispatch.append(rd_item)
+        worker._intake.request_redispatch(rd_item)
 
         av_req = _make_req('av-waiting', 'task/av-waiting', config, git_repo)
         av_item = RealMergeItem(
@@ -209,21 +209,21 @@ class TestSnapshotRedispatchEntries:
         av_index = entry_task_ids.index('av-waiting')
         assert rd_index < av_index, (
             f"Expected the redispatch entry (index {rd_index}) to precede the "
-            f"awaiting_verify entry (index {av_index}) since _redispatch is "
+            f"awaiting_verify entry (index {av_index}) since the redispatch park is "
             f"front-priority over _verifier_queue. Got order: {entry_task_ids}."
         )
 
     async def test_redispatch_decided_item_has_none_worktree(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """A DecidedItem parked on _redispatch must surface with worktree=None.
+        """A DecidedItem parked on the redispatch park must surface with worktree=None.
 
-        _redispatch is typed deque[SpeculativeItem] (RealMergeItem |
+        the redispatch park is typed deque[SpeculativeItem] (RealMergeItem |
         DecidedItem), and this isn't just type-possible: _remerge() returns
         SpeculativeItem and can resolve to a DecidedItem (e.g. an
         already-merged/conflict outcome hit during a cascade-remerge), and
         both cascade-remerge call sites push its result straight onto
-        _redispatch (append/appendleft). A DecidedItem never owns a merge
+        the redispatch park (``request_redispatch``). A DecidedItem never owns a merge
         worktree — item_merge_wt's DecidedItem arm always returns None — so
         section 1c's worktree_path=item_merge_wt(_rd_item) must resolve to
         None for this case rather than raising or defaulting incorrectly.
@@ -238,7 +238,7 @@ class TestSnapshotRedispatchEntries:
             base_sha='deadbeef',
             speculative=False,
         )
-        worker._redispatch.append(item)
+        worker._intake.request_redispatch(item)
 
         snap = worker.snapshot()
 
@@ -250,6 +250,6 @@ class TestSnapshotRedispatchEntries:
         assert rd_entry is not None, 'the parked item is absent from the census'
         assert rd_entry['state'] == 'awaiting_host'
         assert rd_entry['worktree'] is None, (
-            "Expected worktree is None for a DecidedItem parked on _redispatch "
+            "Expected worktree is None for a DecidedItem parked on the redispatch park "
             f"(it never owns a merge worktree), got {rd_entry['worktree']!r}."
         )

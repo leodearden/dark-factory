@@ -77,17 +77,19 @@ def sha256_16(data: str) -> str:
 
     Canonical shape contract: every 16-char sha256-hex token in this module
     (``suggestion_hash``, ``_combine_suggestion_hashes``) is produced through
-    this helper.  Two fused-memory sites use equivalent inline
-    ``hashlib.sha256(...).hexdigest()[:16]`` expressions and share the same
-    shape contract (stdlib-only — ``fused-memory`` does not depend on
-    ``orchestrator``, so routing through this helper is not possible without
-    adding a new workspace dependency edge):
+    this helper.  Two fused-memory sites and one shared site use equivalent
+    inline ``hashlib.sha256(...).hexdigest()[:16]`` expressions and share the
+    same shape contract (stdlib-only — neither ``fused-memory`` nor ``shared``
+    depends on ``orchestrator``, so routing through this helper is not
+    possible without adding a new workspace dependency edge):
 
     * ``fused_memory/src/fused_memory/middleware/curator_types.py::CandidateTask.payload_hash``
       — curator decision-cache key; combine-on-combine drift guard.
     * ``fused_memory/src/fused_memory/middleware/candidate_key.py::compute_candidate_key``
       — the task "sameness" key; ``TaskCurator._normalize_key`` delegates to it
       for the R3 pre-LLM short-circuit.
+    * ``shared/src/shared/followup_items.py::_sha256_16`` — behind ``item_key``
+      and the follow-up bundle's server-derived ``suggestion_hash``.
 
     The ``cleanup_needed`` R4 snippet in ``skills/escalation-watcher/SKILL.md``
     also uses an equivalent inline expression for the same stdlib-only reason.

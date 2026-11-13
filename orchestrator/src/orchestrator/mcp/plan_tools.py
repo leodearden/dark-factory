@@ -16,7 +16,7 @@ MCP tool-call envelope markup that leaked into their prose fields when the
 harness mis-closed an argument — a trailing mis-close, or a whole sibling
 parameter absorbed into the value before it.  Every entry point that opens
 an existing plan goes through :func:`_read_plan_repaired`, which repairs
-what it can, writes the result back through ``TaskArtifacts.write_plan``,
+what it can, writes the result back through ``TaskArtifacts.write_plan_model``,
 and reports every repair and every refusal on the response's
 ``markup_repairs`` key.  EVERY plan.json write -- repair write-back and
 tool mutation alike -- goes through that one method, which owns the byte
@@ -105,8 +105,9 @@ from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator import plan_descope
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
+from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest, pending_scope_paths
 
 logger = logging.getLogger(__name__)
 
@@ -636,7 +637,7 @@ def _repair_one_field(
         #   RECOVERED value. Declining here would blank the field, and
         #   because the fact still reads ``outcome: 'repaired'``,
         #   ``_read_plan_repaired`` would persist that blank through
-        #   ``TaskArtifacts.write_plan`` — authored text destroyed on
+        #   ``TaskArtifacts.write_plan_model`` — authored text destroyed on
         #   disk,
         #   unrecoverable on the next read. That is the same
         #   silent-authored-text-loss this whole surface exists to end,
@@ -953,7 +954,7 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
     if not facts:
         return repaired, facts
 
-    plan_path = artifacts.root / 'plan.json'
+    plan_path = artifacts.artifact_path('plan.json')
     reportable = _report_markup_facts(plan_path, repaired, facts)
 
     if not any(fact['outcome'] == 'repaired' for fact in facts):
@@ -965,10 +966,10 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
         return repaired, reportable
 
     try:
-        artifacts.write_plan(repaired)
+        artifacts.write_plan_model(_body_edit(repaired))
     except Exception as exc:
         # Broad on purpose: the caller must receive the repaired plan whatever
-        # went wrong on the way to disk. TaskArtifacts.write_plan can raise an
+        # went wrong on the way to disk. TaskArtifacts.write_plan_model can raise an
         # OSError family member (EACCES, ENOSPC, the ArtifactWriteError
         # dangling-symlink refusal) or a TypeError/ValueError out of its
         # json.dumps, so narrowing here would turn a persistence failure into
@@ -1025,6 +1026,16 @@ def _with_markup_repairs(
     if facts:
         response['markup_repairs'] = facts
     return response
+
+
+def _body_edit(plan: dict[str, Any]) -> Plan:
+    """*plan* edited outside its step set: its confirmation is kept."""
+    return Plan.from_json(plan)
+
+
+def _step_set_edit(plan: dict[str, Any]) -> Plan:
+    """*plan* after a step-set edit: its confirmation is cleared (``artifacts.py::Plan.restructured``)."""
+    return Plan.from_json(plan).restructured()
 
 
 # ---------------------------------------------------------------------------
@@ -1088,17 +1099,8 @@ def _create_plan(
     # passed the inbound guard on `record_descoped_step`. Do not "simplify"
     # it onto `_read_plan_repaired`.
     files = _coerce_files(files)
-    plan = {
-        'task_id': task_id,
-        'title': title,
-        'analysis': analysis,
-        'files': files,
-        'prerequisites': [],
-        'steps': [],
-        'design_decisions': [],
-        'reuse': [],
-        'dropped_files': [],
-    }
+    carried: dict[str, Any] = {}
+    replaced = Plan.from_json({})
     try:
         # TWO BOOKKEEPING MOVES, both required and for DIFFERENT reasons
         # (task 4597).
@@ -1129,17 +1131,18 @@ def _create_plan(
         # DROPPED rather than laundered into a present-and-zero key that would
         # contradict this key's contract that its PRESENCE is the signal.
         existing = artifacts.read_plan()
-        carried = plan_markup_stamp.normalize_block(
+        block = plan_markup_stamp.normalize_block(
             existing.get(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY)
             if isinstance(existing, dict) else None
         )
-        if carried is not None:
-            plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = carried
-        plan_markup_stamp.drain_pending(plan)
+        if block is not None:
+            carried[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = block
+        plan_markup_stamp.drain_pending(carried)
         # The descope record is the one trace of a done step a revalidation
         # dropped; a wholesale overwrite must not erase it.
         if isinstance(existing, dict):
-            plan.update(plan_descope.descope_record_of(existing))
+            carried.update(plan_descope.descope_record_of(existing))
+            replaced = Plan.from_json(existing)
     except Exception:
         # BOOKKEEPING CAN NEVER FAIL A create_plan. The counter is a legibility
         # aid; the plan is the work. Losing the count is a cost an operator
@@ -1148,7 +1151,10 @@ def _create_plan(
             'markup stamp: could not carry the rejection counter into the new '
             'plan for %s; the plan itself is unaffected', task_id,
         )
-    artifacts.write_plan(plan, mutex_held=True)
+    recreated = replaced.recreated(
+        task_id=task_id, title=title, analysis=analysis, files=files, carried=carried,
+    )
+    artifacts.write_plan_model(recreated, mutex_held=True)
     return {'status': 'ok', 'task_id': task_id}
 
 
@@ -1187,7 +1193,7 @@ def _add_plan_step(
         'status': 'pending',
         'commit': None,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
         markup_facts,
@@ -1223,7 +1229,7 @@ def _add_prerequisite(
         'commit': None,
         'tests': [],
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
 
 
@@ -1241,7 +1247,7 @@ def _add_design_decision(
         'decision': decision,
         'rationale': rationale,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_decisions': len(plan['design_decisions'])},
         markup_facts,
@@ -1264,7 +1270,7 @@ def _add_reuse_item(
         'where': where,
         'how': how,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
     )
@@ -1302,7 +1308,7 @@ def _drop_plan_file(
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
 
-    # Every refusal below returns BEFORE any artifacts.write_plan call — the
+    # Every refusal below returns BEFORE any artifacts.write_plan_model call — the
     # module-wide convention that a refusal envelope always implies no write.
     if not reason or not reason.strip():
         return _with_markup_repairs(
@@ -1357,7 +1363,7 @@ def _drop_plan_file(
         'path': path,
         'reason': reason,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1557,7 +1563,7 @@ def _record_descoped_step(
         _session_identity_in_hand(artifacts, plan) or plan_descope.RESCOPED_BY_UNKNOWN
     )
     plan[plan_descope.RESCOPED_NOTE_KEY] = note
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'commit': commit, 'descoped_steps': len(entries)},
         markup_facts,
@@ -1584,7 +1590,7 @@ def _update_plan_metadata(
         _forget_redeclared_drops(plan)
     if analysis is not None:
         plan['analysis'] = analysis
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1631,7 +1637,7 @@ def _remove_plan_step(
                         markup_facts,
                     )
                 items.pop(i)
-                artifacts.write_plan(plan, mutex_held=True)
+                artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'removed': step_id, 'collection': collection},
                     markup_facts,
@@ -1673,7 +1679,7 @@ def _replace_plan_step(
                     )
                 item['type'] = step_type
                 item['description'] = description
-                artifacts.write_plan(plan, mutex_held=True)
+                artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'replaced': step_id}, markup_facts
                 )
@@ -1736,7 +1742,8 @@ def _confirm_plan(
 
     if not plan:
         return _respond({'status': 'error', 'message': 'No plan exists.'})
-    if not plan.get('steps'):
+    model = Plan.from_json(plan)
+    if model.state is PlanState.SHELL:
         return _respond(
             {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'}
         )
@@ -1749,28 +1756,13 @@ def _confirm_plan(
             ),
         })
 
-    now = datetime.now(UTC).isoformat()
-    # ``_finalized_at`` is the durable completeness marker.  Its PRESENCE means
-    # the architect declared the plan complete; the workflow requires it before
-    # a plan may advance to execution (workflow._plan), and salvages a plan that
-    # carries it even when the CLI run failed on a budget/turn cap.  Its ABSENCE
-    # on a plan that already has steps means a prior session was interrupted
-    # mid-build — the workflow routes that partial to a completion pass instead
-    # of discarding it.  ``_revalidated_at`` is retained for revalidation-age
-    # checks (see workflow._can_skip_revalidation).
-    #
-    # ``_finalized_at`` dates the LAST confirm: every re-confirm, revalidation
-    # and amendment re-confirms included, overwrites it.  ``_created_at``,
-    # stamped by ``orchestrator/artifacts.py::TaskArtifacts.stamp_plan_provenance``,
-    # is a post-hoc provenance stamp and is always later.  Neither dates the
-    # moment the plan was first frozen.
-    plan['_finalized_at'] = now
-    plan['_revalidated_at'] = now
-    artifacts.write_plan(plan, mutex_held=True)
+    # What confirmation records, and what clears it: ``orchestrator/artifacts.py::Plan.confirmed``.
+    confirmed = model.confirmed(at=datetime.now(UTC).isoformat(), by=PlanConfirmation.ARCHITECT)
+    artifacts.write_plan_model(confirmed, mutex_held=True)
     return _respond({
         'status': 'ok',
         'finalized': True,
-        'steps': len(plan['steps']),
+        'steps': len(model.steps),
         'files': len(plan.get('files', [])),
     })
 
@@ -1873,6 +1865,37 @@ def _report_false_premise(
         proposed_resolution=proposed_resolution,
     )
     return {'status': 'ok', 'classification': classification}
+
+
+def _report_missing_plan_file(
+    artifacts: TaskArtifacts,
+    path: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record a writer's request to add an existing file to the declared scope.
+
+    The workflow applies it at the next writer boundary
+    (``workflow.py::TaskWorkflow._apply_scope_requests``). Reads the declared
+    files with ``peek_plan``, which never writes plan.json. A path naming no
+    file in the worktree is refused, so a typo never reaches plan.files.
+    """
+    try:
+        request = ScopeRequest(path, reason)
+    except InvalidScopeRequest as exc:
+        return {'status': 'error', 'field': exc.field, 'message': str(exc)}
+    if not (artifacts.worktree / request.path).is_file():
+        return {
+            'status': 'error',
+            'field': 'path',
+            'message': (
+                f'path {request.path!r} names no file in the worktree; '
+                'a file you create needs no report'
+            ),
+        }
+    if not pending_scope_paths([request], artifacts.peek_plan().get('files', [])):
+        return {'status': 'already_in_scope', 'path': request.path}
+    pending = artifacts.write_scope_request(request)
+    return {'status': 'ok', 'path': request.path, 'pending': pending}
 
 
 def _resolve_main_sha(worktree: Path) -> str:
@@ -2136,8 +2159,8 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
         plan = artifacts.read_plan()
     except Exception:
         logger.warning(
-            'markup guard: could not read the plan for attribution under %s; '
-            'falling back to the worktree name', artifacts.root,
+            'markup guard: could not read the plan for attribution at %s; '
+            'falling back to the worktree name', artifacts.artifact_path('plan.json'),
         )
         plan = {}
     task_id = plan.get('task_id') if isinstance(plan, dict) else None
@@ -2748,8 +2771,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             reason: One-line explanation of what's missing — file/symbol
                 names and where this task expected to find them.
         """
-        # ``artifacts.root`` is a SIBLING of the worktree once a meta_root is
-        # supplied (`.task-meta/<name>/`), so `artifacts.root.parent` is the
+        # ``artifacts.lane_root`` is a SIBLING of the worktree once a meta_root
+        # is supplied (`.task-meta/<name>/`), so its parent is the
         # `.task-meta` base, NOT the worktree. `artifacts.worktree` is always
         # correct, legacy or relocated (see TaskArtifacts.__init__).
         worktree = artifacts.worktree
@@ -2901,6 +2924,33 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             artifacts, classification, premise, evidence, proposed_resolution
         )
 
+    @mcp.tool()
+    @accepts_markup_override
+    def report_missing_plan_file(
+        path: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Report an EXISTING file you must edit that the plan's ``files`` omits.
+
+        Use this BEFORE editing such a file when the list was merely
+        incomplete. You may then make the edit and keep working; there is no
+        need to stop. When this session ends the orchestrator tries to take
+        the file's lock and adds it to plan.json ``files``. Your next
+        briefing reports it granted, or contested with the task holding it.
+        If it is contested, revert your edits to it, or call
+        ``escalate_blocker(category='scope_violation')`` with the design
+        reason it must change.
+
+        A file you CREATE needs no report. A file that is out of scope for a
+        DESIGN reason (another owner's module, another PRD) is
+        ``escalate_blocker``, not this tool.
+
+        Args:
+            path: The repo-relative path of the existing file.
+            reason: One line: why this task must edit it.
+        """
+        return _report_missing_plan_file(artifacts, path, reason)
+
     return mcp
 
 
@@ -2910,15 +2960,13 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
 
 def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
-    """Parse ``--worktree``/``--meta-root`` and return the corresponding
-    ``TaskArtifacts``.
+    """Parse ``--worktree``/``--meta-root``/``--task-root`` and return the
+    corresponding ``TaskArtifacts``.
 
-    Mirrors workflow.py's orchestrator-side construction
-    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) so both
-    sides resolve the IDENTICAL meta_root for a given worktree
-    (worktree-lane-lifecycle PRD task ε1). When ``--meta-root`` is omitted,
-    behaviour is byte-identical to before this argument existed: the root
-    dir checked for existence is the legacy ``<worktree>/.task``.
+    Mirrors workflow.py's orchestrator-side construction so both sides
+    resolve the IDENTICAL roots for a given dispatch (worktree-lane-lifecycle
+    PRD task ε1; the task root, task 3155). Each root must already exist;
+    omitting both flags leaves the legacy ``<worktree>/.task`` single root.
     """
     parser = argparse.ArgumentParser(description='Plan-tools MCP server (stdio)')
     parser.add_argument(
@@ -2933,20 +2981,29 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
             '<worktree>/.task location.'
         ),
     )
+    parser.add_argument(
+        '--task-root', type=Path, default=None,
+        help=(
+            'Optional task-lifetime `.task-meta/task-<id>` root. When '
+            'omitted, every artifact resolves against the lane root.'
+        ),
+    )
     args = parser.parse_args(argv)
 
-    worktree = args.worktree.resolve()
-    meta_root = args.meta_root.resolve() if args.meta_root is not None else None
-    root_to_check = meta_root if meta_root is not None else worktree / '.task'
-    if not root_to_check.is_dir():
-        print(f'Error: {root_to_check} does not exist', file=sys.stderr)
-        sys.exit(1)
-
-    return TaskArtifacts(worktree, meta_root)
+    artifacts = TaskArtifacts(
+        args.worktree.resolve(),
+        args.meta_root.resolve() if args.meta_root is not None else None,
+        args.task_root.resolve() if args.task_root is not None else None,
+    )
+    for root in (artifacts.lane_root, artifacts.task_root):
+        if not root.is_dir():
+            print(f'Error: {root} does not exist', file=sys.stderr)
+            sys.exit(1)
+    return artifacts
 
 
 def main() -> None:
-    """Parse --worktree/--meta-root and run the stdio MCP server."""
+    """Parse the worktree and artifact roots and run the stdio MCP server."""
     artifacts = _artifacts_from_args()
     server = create_server(artifacts)
     # show_banner=False suppresses FastMCP's decorative startup banner and its

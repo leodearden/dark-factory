@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "step-7: real-git tests of the claim-carrying _remerge need the worker's speculation ledger and _remerge itself; each read is factored into one helper (_ledger, _remerge) in test_merge_queue_chain_intact.py",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_chain_intact.py",
+      "baseline": 68,
+      "current": 70
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6423,
+      "current": 6425
+    }
+  ]
+}

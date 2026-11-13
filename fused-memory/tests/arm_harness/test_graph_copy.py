@@ -1,6 +1,7 @@
 """An arm's re-embedded copy of the frozen reference graph (arm_harness/graph_copy.py)."""
 
 import copy
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
@@ -8,9 +9,10 @@ from typing import Any
 import pytest
 from redis.exceptions import ResponseError
 
-from arm_harness._fakes import PROTECTED_GRAPHS
+from arm_harness._fakes import PROTECTED_GRAPHS, FakeForkServer
 from fused_memory.arm_harness import graph_copy
 from fused_memory.arm_harness.arm_embedder import DocumentEmbeddings
+from fused_memory.arm_harness.fork_slot import ForkHolder, ForkSlotUnreadable
 from fused_memory.arm_harness.graph_copy import (
     GraphReembed,
     ReembedCensusError,
@@ -107,6 +109,9 @@ class FakeGraph:
 
     async def copy(self, clone: str) -> None:
         self.client.calls.append(('copy', self.name, clone))
+        self.client.copy_times.append(self.client.connection.now)
+        if self.client.connection.holders():
+            raise _fork_refusal()
         if self.copy_errors:
             raise self.copy_errors.pop(0)
         self.client.graphs[clone] = FakeGraph(
@@ -116,9 +121,11 @@ class FakeGraph:
 
 
 class FakeGraphClient:
-    def __init__(self) -> None:
+    def __init__(self, server: FakeForkServer | None = None) -> None:
         self.graphs: dict[str, FakeGraph] = {}
         self.calls: list[tuple[str, ...]] = []
+        self.connection = FakeForkServer() if server is None else server
+        self.copy_times: list[float] = []
 
     async def list_graphs(self) -> list[str]:
         self.calls.append(('list_graphs',))
@@ -127,6 +134,15 @@ class FakeGraphClient:
     def select_graph(self, name: str) -> FakeGraph:
         self.calls.append(('select_graph', name))
         return self.graphs[name]
+
+
+class FlaglessForkServer(FakeForkServer):
+    """A server whose INFO persistence reply omits the module-fork flag."""
+
+    async def info(self, section: str, /) -> dict[str, int]:
+        reply = await super().info(section)
+        del reply[ForkHolder.MODULE_FORK.value]
+        return reply
 
 
 def _reference_graph(
@@ -276,7 +292,7 @@ async def test_copy_reference_graph_retries_a_fork_refusal_until_the_copy_lands(
     assert client.graphs[TARGET].nodes == reference.nodes
     assert client.graphs[TARGET].edges == reference.edges
     assert _copy_calls(client) == [('copy', REFERENCE, TARGET)] * 3
-    assert sleep.waits == [graph_copy.COPY_RETRY_INTERVAL_S] * 2
+    assert sleep.waits == [graph_copy.FORK_POLL_INTERVAL_S] * 2
 
 
 @pytest.mark.asyncio
@@ -290,7 +306,7 @@ async def test_copy_reference_graph_retries_a_fork_refusal_that_carries_a_reason
 
     assert client.graphs[TARGET].nodes == reference.nodes
     assert _copy_calls(client) == [('copy', REFERENCE, TARGET)] * 2
-    assert sleep.waits == [graph_copy.COPY_RETRY_INTERVAL_S]
+    assert sleep.waits == [graph_copy.FORK_POLL_INTERVAL_S]
 
 
 @pytest.mark.asyncio
@@ -322,8 +338,9 @@ async def test_copy_reference_graph_gives_up_after_its_attempts_naming_the_refus
     refused = caught.value
     assert (refused.reference, refused.target, refused.attempts) == (
         REFERENCE, TARGET, graph_copy.COPY_ATTEMPTS)
-    assert refused.waited_s == (graph_copy.COPY_ATTEMPTS - 1) * graph_copy.COPY_RETRY_INTERVAL_S
+    assert refused.waited_s == (graph_copy.COPY_ATTEMPTS - 1) * graph_copy.FORK_POLL_INTERVAL_S
     assert refused.reply == graph_copy.COPY_FORK_REFUSAL
+    assert refused.holders == frozenset()
     message = str(refused)
     assert REFERENCE in message
     assert TARGET in message
@@ -331,8 +348,101 @@ async def test_copy_reference_graph_gives_up_after_its_attempts_naming_the_refus
     assert graph_copy.COPY_FORK_REFUSAL in message
     assert refused.__cause__ is refusals[-1]
     assert len(_copy_calls(client)) == graph_copy.COPY_ATTEMPTS
-    assert sleep.waits == [graph_copy.COPY_RETRY_INTERVAL_S] * (graph_copy.COPY_ATTEMPTS - 1)
+    assert sleep.waits == [graph_copy.FORK_POLL_INTERVAL_S] * (graph_copy.COPY_ATTEMPTS - 1)
     assert TARGET not in client.graphs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('holder', list(ForkHolder))
+@pytest.mark.parametrize('lifetime_intervals', [3, 2 * graph_copy.COPY_ATTEMPTS])
+async def test_a_copy_refused_while_a_child_holds_the_fork_is_reissued_once_the_child_exits(
+    holder, lifetime_intervals
+):
+    lifetime = lifetime_intervals * graph_copy.FORK_POLL_INTERVAL_S
+    server = FakeForkServer([(holder, 0.0, lifetime)])
+    client = FakeGraphClient(server)
+    reference = _reference_graph(client)
+
+    await copy_reference_graph(client, REFERENCE, TARGET, sleep=server.sleep)
+
+    assert client.graphs[TARGET].nodes == reference.nodes
+    assert client.graphs[TARGET].edges == reference.edges
+    assert len(_copy_calls(client)) == 2
+    assert lifetime <= client.copy_times[-1] < lifetime + graph_copy.FORK_POLL_INTERVAL_S
+
+
+@pytest.mark.asyncio
+async def test_a_copy_waits_out_each_child_it_meets_in_turn():
+    server = FakeForkServer([(ForkHolder.RDB_SAVE, 0.0, 50.0), (ForkHolder.AOF_REWRITE, 50.0, 90.0)])
+    client = FakeGraphClient(server)
+    _reference_graph(client)
+
+    await copy_reference_graph(client, REFERENCE, TARGET, sleep=server.sleep)
+
+    assert len(_copy_calls(client)) == 2
+    assert 90.0 <= client.copy_times[-1] < 90.0 + graph_copy.FORK_POLL_INTERVAL_S
+
+
+@pytest.mark.asyncio
+async def test_a_copy_that_gives_up_names_the_children_it_waited_out_and_the_time_slept():
+    server = FakeForkServer([(ForkHolder.MODULE_FORK, 0.0, 5.0)])
+    client = FakeGraphClient(server)
+    refusals = [_fork_refusal() for _ in range(graph_copy.COPY_ATTEMPTS)]
+    _reference_graph(client, copy_errors=refusals)
+
+    with pytest.raises(graph_copy.GraphCopyRefused) as caught:
+        await copy_reference_graph(client, REFERENCE, TARGET, sleep=server.sleep)
+
+    refused = caught.value
+    assert refused.holders == frozenset({ForkHolder.MODULE_FORK})
+    assert refused.attempts == graph_copy.COPY_ATTEMPTS
+    assert refused.waited_s == sum(server.waits)
+    assert TARGET not in client.graphs
+
+
+@pytest.mark.asyncio
+async def test_a_refused_copy_on_a_server_whose_fork_slot_is_unreadable_is_not_retried():
+    server = FlaglessForkServer()
+    client = FakeGraphClient(server)
+    _reference_graph(client, copy_errors=[_fork_refusal()])
+
+    with pytest.raises(ForkSlotUnreadable) as caught:
+        await copy_reference_graph(client, REFERENCE, TARGET, sleep=server.sleep)
+
+    assert caught.value.missing == (ForkHolder.MODULE_FORK.value,)
+    assert len(_copy_calls(client)) == 1
+    assert TARGET not in client.graphs
+
+
+@pytest.mark.asyncio
+async def test_a_long_wait_is_logged_when_its_holders_change_and_at_a_coarse_cadence(caplog):
+    every = graph_copy.FORK_WAIT_REPORT_EVERY_POLLS
+    interval = graph_copy.FORK_POLL_INTERVAL_S
+    save_ends = (2 * every + 5) * interval
+    rewrite_ends = save_ends + 5 * interval
+    server = FakeForkServer(
+        [(ForkHolder.RDB_SAVE, 0.0, save_ends), (ForkHolder.AOF_REWRITE, save_ends, rewrite_ends)]
+    )
+    client = FakeGraphClient(server)
+    _reference_graph(client)
+    caplog.set_level(logging.INFO, logger=graph_copy.__name__)
+
+    await copy_reference_graph(client, REFERENCE, TARGET, sleep=server.sleep)
+
+    messages = [
+        record.getMessage() for record in caplog.records if record.name == graph_copy.__name__
+    ]
+    expected = [
+        (ForkHolder.RDB_SAVE, interval),
+        (ForkHolder.RDB_SAVE, every * interval),
+        (ForkHolder.RDB_SAVE, 2 * every * interval),
+        (ForkHolder.AOF_REWRITE, save_ends),
+    ]
+    assert len(messages) == len(expected)
+    for message, (holder, waited_s) in zip(messages, expected, strict=True):
+        assert holder.value in message
+        assert f'waited {waited_s:.0f}s' in message
+    assert len(_copy_calls(client)) == 2
 
 
 # --- group id ---------------------------------------------------------------------------

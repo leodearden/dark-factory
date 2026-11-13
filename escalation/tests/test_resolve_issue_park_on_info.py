@@ -17,17 +17,13 @@ from typing import Any
 import pytest
 from _escalation_http import escalation_http_call
 from _escalation_seed import seed_escalation
+from _resolve_issue_call import call_resolve_issue
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
 pytestmark = pytest.mark.asyncio
-
-
-async def _resolve_issue(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('resolve_issue')
-    return tool.fn(**kwargs)
 
 
 def _seed(queue: EscalationQueue, *, level: int, task_id: str, **kw: Any) -> Escalation:
@@ -68,7 +64,7 @@ class TestParkOnInfoRefused:
     async def test_info_l2_park_is_refused_with_structured_ids(self, queue, server, fired):
         rec = _seed(queue, level=2, task_id='6578-a', severity='info')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='hold it', action='park',
         )
 
@@ -82,7 +78,7 @@ class TestParkOnInfoRefused:
     ):
         rec = _seed(queue, level=2, task_id='6578-b', severity=severity)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='hold it', action='park',
         )
 
@@ -91,7 +87,7 @@ class TestParkOnInfoRefused:
     async def test_info_l1_park_is_refused_and_not_promoted(self, queue, server, fired):
         rec = _seed(queue, level=1, task_id='6578-c', severity='info')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='hold it', action='park',
         )
 
@@ -106,7 +102,7 @@ class TestParkOnInfoRefused:
         assert before is not None
         snapshot = before.to_dict()
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='hold it', action='park',
         )
 
@@ -128,7 +124,7 @@ class TestParkOnInfoRefused:
             queue, level=2, task_id='6578-e', severity='info', members=[member.id],
         )
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=head.id, resolution='hold it', action='park',
         )
 
@@ -146,7 +142,7 @@ class TestParkOnInfoRefused:
         snapshot = parked.to_dict()
         fired.clear()
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='hold it again', action='park',
         )
 
@@ -166,7 +162,7 @@ class TestGateDoesNotOverReach:
         fails an unknown severity safe to pinning, so that park does hold."""
         rec = _seed(queue, level=2, task_id='6578-g', severity=severity)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='hold it', action='park',
         )
 
@@ -179,7 +175,7 @@ class TestGateDoesNotOverReach:
     async def test_blocking_l1_park_still_promotes(self, queue, server, fired):
         rec = _seed(queue, level=1, task_id='6578-h', severity='blocking')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='hold it', action='park',
         )
 
@@ -204,7 +200,7 @@ class TestGateDoesNotOverReach:
             members=[blocking_member.id, info_member.id],
         )
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=head.id, resolution='hold it', action='park',
         )
 
@@ -217,7 +213,7 @@ class TestGateDoesNotOverReach:
     async def test_info_l2_close_only_still_dismisses(self, queue, server, fired):
         rec = _seed(queue, level=2, task_id='6578-j1', severity='info')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='closing', action='close_only',
         )
 
@@ -229,7 +225,7 @@ class TestGateDoesNotOverReach:
     async def test_info_l2_resume_still_resolves(self, queue, server, fired):
         rec = _seed(queue, level=2, task_id='6578-j2', severity='info')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='go on', action='resume',
         )
 

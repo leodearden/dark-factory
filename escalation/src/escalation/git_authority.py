@@ -43,8 +43,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 from shared.merge_state import MergeState
+from shared.task_read import TaskAbsent, TaskFound
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,9 @@ class GitAuthorityOutcome(enum.StrEnum):
     ``landed_unconfirmed``, ``no_signal`` and ``probe_failed`` are DIFFERENT
     PROPOSITIONS and that is the whole reason all three exist: the first
     means git positively established a landing (the branch is an ancestor of
-    main, or a merge marker was found) but attribution or effect-survival
-    could not be confirmed; the second means the probe ran and established
+    main, a merge marker was found, or every branch commit is
+    patch-equivalent on main) but attribution or effect-survival could not
+    be confirmed; the second means the probe ran and established
     nothing; the third means the probe raised, so nothing could be
     established either way.
 
@@ -85,21 +87,28 @@ class GitAuthorityArm(enum.StrEnum):
 
     A ``StrEnum`` for the same reason :class:`GitAuthorityOutcome` is one
     (heuristic 12, structured data instead of meaningful strings): ``arm`` is
-    a closed two-member set a consumer switches on, not free text.
+    a closed three-member set a consumer switches on, not free text.
     ``ancestor`` — the branch ref still exists and its tip is an ancestor of
     main; ``marker`` — the ref is gone and a merge marker for it was found on
-    main.  The two arms carry different evidence and different guards, which
-    is why the verdict names the one it came from.
+    main; ``patch_id`` — the ref still exists, its tip is NOT an ancestor of
+    main, and
+    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``
+    decided the verdict (patch-id containment, behind its degeneracy and
+    empty-net-diff guards).  That last is the shape a worker-rebased solo
+    landing leaves: ``GitOps.advance_main``'s rebased path retains the ref at
+    its pre-rebase tip.  The arms carry different evidence and different
+    guards, which is why the verdict names the one it came from.
     """
 
     ancestor = 'ancestor'
     marker = 'marker'
+    patch_id = 'patch_id'
 
 
 def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, Any]:
     """Build the git-authority Tier-3.5 done/found_on_main response.
 
-    ``merge_sha`` is a commit ON MAIN on both resolution paths, with one
+    ``merge_sha`` is a commit ON MAIN on all three resolution paths, with one
     explicit exception — Exception 1 below (task 3103); Exception 2
     weakens a different guarantee and leaves this one intact:
 
@@ -108,13 +117,25 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
       whose subject cites the task.
     - **Deleted-branch path** (``find_merge_marker`` hit): the
       merge-commit SHA found on main via ``git log``.
+    - **Patch-id path** (a live branch that is NOT an ancestor of main,
+      every commit patch-equivalent on main — the worker-rebased landing):
+      ``branch_work_landed``'s ``evidence_sha``, the most recent commit on
+      main whose subject cites the task by the project's
+      ``git.commit_citation_pattern`` (none on a ``''`` opt-out), else the
+      branch tip's patch-id twin on main.
 
-    Both are effect-present-checked against current main HEAD before
-    being returned, so ``merge_sha`` is safe to record as provenance
-    as-is — EXCEPT in the two cases below, which
+    The first two are effect-present-checked against current main HEAD
+    before being returned.  The patch-id path is NOT, by
+    ``docs/prds/landed-not-done-recovery.md`` D1's non-decay contract: it
+    is checked by containment instead, and a later revert does not unland
+    it.  So ``merge_sha`` is safe to record as provenance as-is on every
+    path — EXCEPT in the two cases below, which
     :attr:`GitAuthorityVerdict.merge_sha_fully_guarded` answers as one
-    question.  (Before task 3103 the live-branch path returned the *branch
-    tip*, which for a ``--no-ff`` merge is a distinct commit that is not
+    question.  Neither exception applies to the patch-id path: it never
+    consults the delivered checks, and on a ``''`` opt-out its sha is still
+    a commit on main carrying the tip's diff.  (Before task 3103 the
+    live-branch path returned the *branch tip*, which for a ``--no-ff``
+    merge is a distinct commit that is not
     on main's first-parent chain — callers were told to prefer the
     deleted-branch path's value.  That caveat no longer applies.)
 
@@ -171,9 +192,9 @@ class TaskMetadataResult:
     """Task metadata PLUS whether the fetch that produced it actually worked.
 
     ``metadata == {}`` alone is not proof that a task carries no metadata —
-    it is equally what a missing harness, an absent scheduler or a raising
-    ``get_task`` produces.  Read it TOGETHER with ``unavailable``, which is
-    True only when the fetch FAILED.
+    it is equally what a missing harness, an absent scheduler, a raising
+    ``read_task`` or a failed read produces.  Read it TOGETHER with
+    ``unavailable``, which is True only when the fetch FAILED.
 
     Copies the shape of
     ``orchestrator/src/orchestrator/task_ground_truth.py::TruthReport``
@@ -197,16 +218,17 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
     """Best-effort task metadata for the git-authority guards (task 3103).
 
     Returns ``metadata == {}`` on EVERY failure mode — no harness, no
-    ``scheduler`` attribute, ``get_task`` raising, or a None/metadata-less
-    task — and never raises.  A scheduler fault must degrade a single guard,
-    not swallow the whole probe.
+    ``scheduler`` attribute, ``read_task`` raising, ``read_task`` reporting a
+    failed read (a fused-memory error reply, a dispatch fault, an unreadable
+    envelope), or an absent or metadata-less task — and never raises.  A
+    scheduler fault must degrade a single guard, not swallow the whole probe.
 
     The ``{}`` is qualified by :attr:`TaskMetadataResult.unavailable`, which
-    separates a FAULT from a FACT: the first three modes above set it True
+    separates a FAULT from a FACT: the first four modes above set it True
     ("we could not read"), while a healthy read that finds no metadata — or
-    finds no such task — leaves it False ("there is genuinely nothing
-    there").  "No such task" is deliberately a fact, not a fault: the
-    discriminant is READ SUCCESS, because a present-but-metadata-less record
+    finds no such task (``TaskAbsent``) — leaves it False ("there is
+    genuinely nothing there").  "No such task" is deliberately a fact, not a
+    fault: the discriminant is READ SUCCESS, because a present-but-metadata-less record
     is equally unable to answer the degeneracy question yet is plainly not a
     fault, and flagging an absent record True would make ``unavailable``
     mean a fault OR a legitimately-absent task — the very conflation it
@@ -224,7 +246,7 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
 
     Args:
         harness: The orchestrator harness, duck-typed — only
-            ``harness.scheduler.get_task`` is ever touched, and ``None`` is
+            ``harness.scheduler.read_task`` is ever touched, and ``None`` is
             a supported value.  It was a ``create_server`` capture with no
             module-level fallback, so extraction makes it an explicit
             parameter.
@@ -235,7 +257,10 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
             ``'merge_request'``), interpolated into the degradation
             warning.  Without it a scheduler fault on the SUBMIT path was
             logged as a merge_status failure, so an operator grepping for a
-            submit-path degradation would not find it (review #3).
+            submit-path degradation would not find it (review #3).  Why a
+            read failed is logged once, by its owner
+            ``orchestrator/src/orchestrator/scheduler.py::Scheduler.read_task``;
+            this warning adds only the site and what it skipped.
     """
     if harness is None:
         return TaskMetadataResult(metadata={}, unavailable=True)
@@ -243,17 +268,24 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
     if scheduler is None:
         return TaskMetadataResult(metadata={}, unavailable=True)
     try:
-        task = await scheduler.get_task(tid)
+        read = await scheduler.read_task(tid)
     except Exception:
         logger.warning(
-            '%s: scheduler.get_task(%s) failed — proceeding without task '
+            '%s: scheduler.read_task(%s) raised — proceeding without task '
             'metadata (degeneracy check skipped)',
             site, tid, exc_info=True,
         )
         return TaskMetadataResult(metadata={}, unavailable=True)
-    if not task:
+    if isinstance(read, TaskAbsent):
         return TaskMetadataResult(metadata={})
-    return TaskMetadataResult(metadata=task.get('metadata') or {})
+    if isinstance(read, TaskFound):
+        return TaskMetadataResult(metadata=read.task.get('metadata') or {})
+    logger.warning(
+        '%s: task %s metadata unavailable — proceeding without it '
+        '(degeneracy check skipped)',
+        site, tid,
+    )
+    return TaskMetadataResult(metadata={}, unavailable=True)
 
 
 @dataclass(frozen=True)
@@ -263,8 +295,9 @@ class GitAuthorityVerdict:
     ``landed_unconfirmed`` and ``no_signal`` are the whole reason this is a
     verdict rather than a boolean.  ``landed_unconfirmed`` means git
     POSITIVELY ESTABLISHED that this branch's work is on main — the branch
-    is an ancestor of main, or a merge marker for it was found — and only
-    ATTRIBUTION or EFFECT-SURVIVAL could not be confirmed.  ``no_signal``
+    is an ancestor of main, a merge marker for it was found, or every
+    branch commit is patch-equivalent on main — and only ATTRIBUTION or
+    EFFECT-SURVIVAL could not be confirmed.  ``no_signal``
     means no landing was established at all.  A caller that cannot tell them
     apart cannot tell "we found the landing but could not verify it" from
     "we found nothing".
@@ -327,6 +360,11 @@ class GitAuthorityVerdict:
         False on ``landed_unconfirmed``, ``no_signal`` and ``probe_failed``
         because there is no sha to stamp at all; that is NOT a claim that the
         branch did not land.
+
+        A ``patch_id``-arm ``found_on_main`` is fully guarded: that path is
+        checked by containment rather than effect survival, which is
+        ``docs/prds/landed-not-done-recovery.md`` D1's contract and not a
+        weakening.
         """
         return (
             self.outcome is GitAuthorityOutcome.found_on_main
@@ -348,9 +386,9 @@ async def _evidence_verdict(
 ) -> GitAuthorityVerdict:
     """Run the landing-evidence gate for one arm and render its verdict.
 
-    Both arms of :func:`probe_landing` end identically once their own guard
-    has passed — validate, then accept or report the landing as unconfirmed
-    — so that sequence lives here ONCE (heuristic 11) and the arms differ
+    :func:`_ancestor_arm` and :func:`_marker_arm` end identically once their
+    own guard has passed — validate, then accept or report the landing as
+    unconfirmed — so that sequence lives here ONCE (heuristic 11) and the arms differ
     only in the ``arm`` they label and the evidence keywords they pass.
     ``candidate_sha=None`` selects ``validate_landing_evidence``'s DISCOVERY
     mode, where a commit on main must positively cite the task (FIX 2) AND
@@ -440,6 +478,139 @@ async def _evidence_verdict(
     )
 
 
+async def _marker_arm(
+    git_ops: Any,
+    tid: str,
+    full_branch: str,
+    fetch: TaskMetadataResult,
+    *,
+    marker: str,
+) -> GitAuthorityVerdict:
+    """Judge a merge marker found on main for a deleted branch ref.
+
+    Predates-this-incarnation veto (task 3103, mirroring the harness marker
+    arm): when the branch was deleted and recreated under the SAME task id, a
+    marker older than this incarnation's ``branch_base_sha`` is a previous
+    run's merge, so it establishes nothing about this one.  Otherwise the
+    marker is the candidate :func:`_evidence_verdict` checks.
+    """
+    from orchestrator.merge_lane.landing_evidence import is_valid_sha_40
+    branch_base_sha = fetch.metadata.get('branch_base_sha')
+    # Validity is checked first so a missing or malformed base never reaches
+    # is_ancestor as an argument.
+    if is_valid_sha_40(branch_base_sha) and await git_ops.is_ancestor(
+        marker, branch_base_sha,
+    ):
+        return GitAuthorityVerdict(
+            outcome=GitAuthorityOutcome.no_signal, metadata_unavailable=fetch.unavailable,
+        )
+    return await _evidence_verdict(
+        git_ops, tid, full_branch, GitAuthorityArm.marker, fetch,
+        branch_tip_sha=None, candidate_sha=marker,
+    )
+
+
+async def _ancestor_arm(
+    git_ops: Any,
+    tid: str,
+    full_branch: str,
+    fetch: TaskMetadataResult,
+    *,
+    branch_tip_sha: str,
+    pattern: str | None,
+) -> GitAuthorityVerdict:
+    """Judge a live branch whose tip is an ancestor of main but not main's tip.
+
+    The degeneracy guard (task 3103) runs FIRST and independently of the
+    citation gate.  A tip still equal to the recorded ``branch_base_sha``
+    means no commit was ever pushed past the creation point: the branch is
+    parked at an OLD main commit, which passes both dispatch checks, and a
+    citing commit on main would otherwise stamp a confident ``done`` against
+    a commit holding none of the task's work (reify 5493).  It judges the
+    SAME tip the dispatch's ``is_ancestor`` ran on (task 3103 review #2), so a
+    warm-lane reseed cannot split the two observations.
+
+    *pattern* is ``git.commit_citation_pattern``.  ``''`` is the documented
+    per-project opt-out: ``find_task_citation_commit`` then returns None for
+    everything, so running the gate would reject unconditionally and turn
+    this arm into dead code.  The opt-out instead returns the raw BRANCH TIP
+    with ``citation_gate_skipped`` set (see :func:`found_on_main_response`,
+    Exception 1).  ``None`` means "use the built-in default pattern" and is
+    NOT the opt-out.
+    """
+    from orchestrator.merge_lane.landing_evidence import branch_is_degenerate
+    if await branch_is_degenerate(
+        git_ops, full_branch, fetch.metadata, branch_tip_sha=branch_tip_sha,
+    ):
+        return GitAuthorityVerdict(
+            outcome=GitAuthorityOutcome.no_signal, metadata_unavailable=fetch.unavailable,
+        )
+    if pattern == '':
+        return GitAuthorityVerdict(
+            outcome=GitAuthorityOutcome.found_on_main, merge_sha=branch_tip_sha,
+            arm=GitAuthorityArm.ancestor, citation_gate_skipped=True,
+            metadata_unavailable=fetch.unavailable,
+        )
+    return await _evidence_verdict(
+        git_ops, tid, full_branch, GitAuthorityArm.ancestor, fetch,
+        branch_tip_sha=branch_tip_sha, pattern_template=pattern,
+    )
+
+
+async def _patch_id_arm(
+    git_ops: Any,
+    tid: str,
+    full_branch: str,
+    fetch: TaskMetadataResult,
+    *,
+    branch_tip_sha: str,
+    pattern: str | None,
+    site: str,
+) -> GitAuthorityVerdict:
+    """Decide the patch-id arm through ``branch_work_landed`` and render its verdict.
+
+    The producer owns the whole decision and its normative guard order
+    (``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``);
+    this only maps its ``LandingReason`` onto a :class:`GitAuthorityOutcome`:
+    ``no_attribution`` (containment proven, nothing attributable) is
+    ``landed_unconfirmed``; ``git_error`` (the detector could not look) is
+    ``probe_failed``, never a negative; every other reject establishes no
+    landing.  The mapping stays inside the function because a module-level
+    table keyed by ``LandingReason`` would hoist the reverse import, which is
+    runtime-only for the same reason as :func:`_evidence_verdict`'s.  No
+    escalation queue is passed: ``None`` is the producer's documented
+    supported shape, and this tier is a read-only probe.  *pattern* is
+    forwarded so this arm and :func:`_ancestor_arm` apply one citation policy.
+    """
+    from orchestrator.merge_lane.landing_evidence import LandingReason, branch_work_landed
+    verdict = await branch_work_landed(
+        git_ops, tid, full_branch, branch_tip_sha=branch_tip_sha, metadata=fetch.metadata,
+        pattern_template=pattern,
+    )
+    reason = str(verdict.reason)
+    if verdict.accepted and verdict.evidence_sha is not None:
+        return GitAuthorityVerdict(
+            outcome=GitAuthorityOutcome.found_on_main,
+            merge_sha=verdict.evidence_sha, arm=GitAuthorityArm.patch_id, reason=reason,
+            evidence_sha=verdict.evidence_sha, metadata_unavailable=fetch.unavailable,
+        )
+    if verdict.reason == LandingReason.no_attribution:
+        outcome = GitAuthorityOutcome.landed_unconfirmed
+    elif verdict.reason == LandingReason.git_error:
+        logger.warning(
+            '%s: patch-id arm could not answer for %s (git_error at stage %s) '
+            '— returning probe_failed',
+            site, full_branch, verdict.probe.get('git_error_stage'),
+        )
+        outcome = GitAuthorityOutcome.probe_failed
+    else:
+        outcome = GitAuthorityOutcome.no_signal
+    return GitAuthorityVerdict(
+        outcome=outcome, arm=GitAuthorityArm.patch_id,
+        reason=reason, metadata_unavailable=fetch.unavailable,
+    )
+
+
 async def probe_landing(
     git_ops: Any,
     key: str,
@@ -450,13 +621,24 @@ async def probe_landing(
 ) -> GitAuthorityVerdict:
     """Ask git whether *key*'s branch landed on main, and how confidently.
 
-    *key* is a branch name or a bare task id; it is normalised through
-    ``canonical_queued_branch_name``.  Returns a VERDICT, not an MCP
+    *key* is a branch name or a bare task id; the ref is derived through
+    ``canonical_queued_branch_name`` and the task id through
+    ``bare_queued_branch_id``.  Returns a VERDICT, not an MCP
     response — which is what lets a periodic writer (PRD leaf η, task 4651)
     reuse the fully-guarded decision ``merge_status`` computes and throws
     away.  It is also why ``request_id`` is not a parameter: it was only
     ever used to build the response, so moving the rendering out to
     :func:`found_on_main_response` removed it from this body entirely.
+
+    Three arms, one per :class:`GitAuthorityArm`: a gone ref goes to the
+    marker search (:func:`_marker_arm`); a live ref not at main's tip goes to
+    :func:`_ancestor_arm` when its tip is an ancestor of main, and otherwise
+    to :func:`_patch_id_arm`, whose guards (degeneracy, empty net diff) and
+    containment check all belong to
+    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``.
+    A ref sitting at exactly main's tip is ``no_signal``.  Every arm that
+    reads task metadata is handed it already fetched, so the fetch's
+    ``unavailable`` flag reaches the verdict even when the arm then raises.
 
     ``orch_config`` and ``harness`` are KEYWORD-ONLY because all three
     collaborators are typed ``Any`` and are therefore interchangeable to a
@@ -471,8 +653,8 @@ async def probe_landing(
     invoked).  ``merge_status`` takes the default; every other consumer —
     leaf η's periodic writer first — passes its own.
 
-    FIRE-SAFE: every failure — including an ImportError from the runtime
-    reverse import below — degrades to ``probe_failed`` and is logged; this
+    FIRE-SAFE: every failure — including an ImportError from an arm's
+    runtime reverse import — degrades to ``probe_failed`` and is logged; this
     never raises.  The wrapper lives HERE rather than at the call site so
     every consumer inherits the fire-safety instead of re-adding it.  A
     clean miss is ``no_signal``, never ``probe_failed``.
@@ -485,104 +667,39 @@ async def probe_landing(
         )
 
     try:
-        prefix = orch_config.git.branch_prefix
-        full_branch = canonical_queued_branch_name(key, prefix)
+        git_config = orch_config.git
+        full_branch = canonical_queued_branch_name(key, git_config.branch_prefix)
         tip = await git_ops.resolve_branch_sha(full_branch)
-        main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
-        tid = full_branch.removeprefix(prefix)
-        # Runtime-only reverse import: orchestrator depends on escalation,
-        # not vice versa, so this lazy import deliberately avoids a static
-        # cycle (same shape as server.py:1423 / :2049 / :2148).  It resolves
-        # at runtime because the escalation server is hosted inside the
-        # orchestrator process.  An ImportError is an Exception and therefore
-        # already degrades to probe_failed via the wrapper below.
-        from orchestrator.merge_lane.landing_evidence import (
-            branch_is_degenerate,
-            is_valid_sha_40,
-        )
-        if (tip is not None and tip != main_tip
-                and await git_ops.is_ancestor(tip, orch_config.git.main_branch)):
-            # Live branch is already an ancestor of main (normal merged case).
-            # tip != main_tip guards against the no-op case: a branch sitting at
-            # exactly main's HEAD satisfies is_ancestor trivially (a commit is
-            # its own ancestor) but nothing has been merged.
-            # Degeneracy guard (task 3103): a tip still equal to the
-            # recorded branch_base_sha proves ZERO commits were ever
-            # pushed beyond the creation point.  Such a branch is parked
-            # at an OLD main commit, which makes it an ancestor of main
-            # AND distinct from main_tip — both conjuncts above pass — so
-            # without this guard the tier stamps a confident `done`
-            # against a commit containing none of the task's work.  A
-            # degenerate branch falls through to no_signal.  Runs FIRST
-            # and independently of the citation gate:
-            # a degenerate branch whose task DOES have a citing commit on
-            # main (reify 5493) is caught only by this ordering.
-            # branch_tip_sha=tip: the probe judges degeneracy against the
-            # SAME tip the is_ancestor check above just ran on, instead of
-            # re-reading the ref (review #2) — one subprocess fewer, and no
-            # window for a warm-lane reseed to split the two observations.
+        main_tip = await git_ops.resolve_branch_sha(git_config.main_branch)
+        tid = bare_queued_branch_id(key, git_config.branch_prefix)
+        if tip is None:
+            # Branch ref gone — the canonical 4352 deleted-branch shape.
+            # find_merge_marker gates on branch existence internally.
+            marker = await git_ops.find_merge_marker(full_branch)
+            if marker is None:
+                return _verdict(GitAuthorityOutcome.no_signal)
             fetch = await task_metadata(harness, tid, site=site)
             metadata_unavailable = fetch.unavailable
-            if not await branch_is_degenerate(
-                git_ops, full_branch, fetch.metadata, branch_tip_sha=tip,
-            ):
-                # Citation gate.  Read the pattern off orch_config.git for
-                # consistency with the adjacent .main_branch / .branch_prefix
-                # reads (same object as git_ops.config in production).
-                pattern = orch_config.git.commit_citation_pattern
-                if pattern == '':
-                    # Documented per-project opt-out (config.py
-                    # commit_citation_pattern): '' disables the citation
-                    # check entirely for projects without citation
-                    # conventions, and find_task_citation_commit honours it
-                    # by returning None for EVERYTHING.  Running the gate
-                    # here would therefore reject unconditionally and turn
-                    # Tier 3.5 into dead code rather than merely un-gated —
-                    # a silent capability loss for an explicit opt-in.
-                    # Note: None means "use the built-in
-                    # DEFAULT_COMMIT_CITATION_PATTERN" and is NOT the
-                    # opt-out.  The degeneracy guard above still applies.
-                    # merge_sha is therefore the raw BRANCH TIP, and
-                    # citation_gate_skipped is what tells a caller so —
-                    # see GitAuthorityVerdict and found_on_main_response.
-                    return _verdict(
-                        GitAuthorityOutcome.found_on_main, merge_sha=tip,
-                        arm=GitAuthorityArm.ancestor, citation_gate_skipped=True,
-                    )
-                return await _evidence_verdict(
-                    git_ops, tid, full_branch, GitAuthorityArm.ancestor, fetch,
-                    branch_tip_sha=tip, pattern_template=pattern,
-                )
-        elif tip is None:
-            # Branch ref gone — the canonical 4352 deleted-branch shape.
-            # find_merge_marker internally gates on branch existence so it only
-            # fires when the ref is gone (consistent with the cheaper-common-path
-            # ordering: cheaper is_ancestor check first, find_merge_marker only
-            # when the branch has been deleted).
-            marker = await git_ops.find_merge_marker(full_branch)
-            if marker is not None:
-                fetch = await task_metadata(harness, tid, site=site)
-                metadata_unavailable = fetch.unavailable
-                branch_base_sha = fetch.metadata.get('branch_base_sha')
-                # Predates-this-incarnation veto (task 3103, mirroring
-                # the harness marker arm): the branch was deleted and
-                # recreated under the SAME task id, so a marker older
-                # than this incarnation's base attributes a previous
-                # run's merge to the current task.  is_valid_sha_40 sits
-                # on the LEFT of the `and` so a missing or malformed
-                # base never reaches is_ancestor with a bad argument.
-                if not (
-                    is_valid_sha_40(branch_base_sha)
-                    and await git_ops.is_ancestor(marker, branch_base_sha)
-                ):
-                    return await _evidence_verdict(
-                        git_ops, tid, full_branch, GitAuthorityArm.marker, fetch,
-                        branch_tip_sha=None, candidate_sha=marker,
-                    )
+            return await _marker_arm(git_ops, tid, full_branch, fetch, marker=marker)
+        if tip == main_tip:
+            # A commit is its own ancestor, so a branch at exactly main's HEAD
+            # passes is_ancestor while nothing has been merged.
+            return _verdict(GitAuthorityOutcome.no_signal)
+        tip_is_ancestor = await git_ops.is_ancestor(tip, git_config.main_branch)
+        fetch = await task_metadata(harness, tid, site=site)
+        metadata_unavailable = fetch.unavailable
+        if tip_is_ancestor:
+            return await _ancestor_arm(
+                git_ops, tid, full_branch, fetch,
+                branch_tip_sha=tip, pattern=git_config.commit_citation_pattern,
+            )
+        return await _patch_id_arm(
+            git_ops, tid, full_branch, fetch, branch_tip_sha=tip,
+            pattern=git_config.commit_citation_pattern, site=site,
+        )
     except Exception:
         logger.warning(
             '%s: git-authority probe failed for %s — returning probe_failed',
             site, key, exc_info=True,
         )
         return _verdict(GitAuthorityOutcome.probe_failed)
-    return _verdict(GitAuthorityOutcome.no_signal)

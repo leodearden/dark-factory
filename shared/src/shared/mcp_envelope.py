@@ -1,15 +1,24 @@
-"""Loud-and-safe MCP envelope parser.
+"""Loud-and-safe MCP envelope parser, plus the quiet envelope readers.
 
-Provides a single shared primitive that replaces the silent ``parse_guard_fallthrough``
-family (family A in the remediation doc).  Every abnormal envelope shape produces a
-distinct ``logger.warning`` and a non-``None`` ``EnvelopeParseError`` — guaranteeing
-that callers can always distinguish "got a value" from "something went wrong".
+``parse_tool_result`` replaces the silent ``parse_guard_fallthrough`` family
+(family A in the remediation doc).  Every abnormal envelope shape it meets
+produces a distinct ``logger.warning`` and a non-``None`` ``EnvelopeParseError``,
+so its callers can always distinguish "got a value" from "something went wrong".
+
+``tool_text_blocks`` and ``tool_error_text`` are quiet readers: they never log.
+They take one level less than ``parse_tool_result`` does: the CallToolResult,
+which is the JSON-RPC body's ``result`` member, never the whole body. They find
+its text blocks by the same locator ``parse_tool_result`` applies to
+``result['result']``, so the readers and the parser cannot disagree on which
+blocks hold text.
 
 Public API::
 
     from shared.mcp_envelope import (
         parse_tool_result,
         resolver_failed,
+        tool_error_text,
+        tool_text_blocks,
         write_failure_reason,
         EnvelopeParseError,
         EnvelopeShape,
@@ -25,11 +34,14 @@ from __future__ import annotations
 import enum
 import json
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 __all__ = [
     'parse_tool_result',
     'resolver_failed',
+    'tool_error_text',
+    'tool_text_blocks',
     'write_failure_reason',
     'EnvelopeParseError',
     'EnvelopeShape',
@@ -118,17 +130,48 @@ def _fail(
 
 
 # ---------------------------------------------------------------------------
-# parse_tool_result
+# Text blocks of a tool result — the quiet readers
 # ---------------------------------------------------------------------------
 
 
-def _first_text_block(content: Any) -> dict | None:
+def _text_content_blocks(reply: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """The ``type=='text'`` blocks of a CallToolResult, in order; none when ``content`` is missing, null or not a list."""
+    content = reply.get('content')
     if not isinstance(content, list):
+        return ()
+    return tuple(b for b in content if isinstance(b, dict) and b.get('type') == 'text')
+
+
+def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
+    """The text of each ``text`` content block of the CallToolResult *reply*, in order.
+
+    *reply* is the JSON-RPC body's ``result`` member. A *reply* whose ``content``
+    is missing, null or not a list carries no text, so the whole body yields ().
+    """
+    return tuple(str(block.get('text', '')) for block in _text_content_blocks(reply))
+
+
+def tool_error_text(reply: Mapping[str, Any]) -> str | None:
+    """The error prose of a tool-level failure, or None if the tool succeeded.
+
+    An MCP tool reports its own failure in the response body, as a
+    well-formed envelope carrying ``isError``, not by breaking the transport.
+    Nothing about that envelope's shape says it failed, so a reader that
+    checks only the shape would take the error prose for a result.
+
+    *reply* is the CallToolResult, the JSON-RPC body's ``result`` member,
+    which is where ``isError`` lives. The whole body has no ``isError``, so
+    passing it yields None and a failure would read as success.
+    """
+    if not reply.get('isError'):
         return None
-    for block in content:
-        if isinstance(block, dict) and block.get('type') == 'text':
-            return block
-    return None
+    texts = tool_text_blocks(reply)
+    return texts[0] if texts else ''
+
+
+# ---------------------------------------------------------------------------
+# parse_tool_result
+# ---------------------------------------------------------------------------
 
 
 def _payload_of(result: dict, key: str | None) -> tuple[Any, EnvelopeParseError | None]:
@@ -145,10 +188,10 @@ def _payload_of(result: dict, key: str | None) -> tuple[Any, EnvelopeParseError 
     if isinstance(structured, dict):
         return structured, None
 
-    text_block = _first_text_block(inner_result.get('content', []))
-    if text_block is None:
+    blocks = _text_content_blocks(inner_result)
+    if not blocks:
         return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
-    raw_text = text_block.get('text', '')
+    raw_text = blocks[0].get('text', '')
     try:
         return json.loads(raw_text), None
     except (ValueError, TypeError):

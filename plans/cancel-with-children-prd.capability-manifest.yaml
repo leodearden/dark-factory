@@ -1,0 +1,186 @@
+# Machine-readable twin of cancel-with-children-prd.capability-manifest.md.
+# Schema: shared/src/shared/capability_manifest.py::CapabilityManifestDoc.
+# task_id values stay null until commit_planning stamps them.
+prd: plans/cancel-with-children-prd.md
+schema_version: 1
+signal_leaves: ["ζ"]
+tasks:
+  - label: "α"
+    task_id: 8142
+    title: "Cancel-disposition contract module + vocabulary"
+    capabilities:
+      - name: "contract-module-exists"
+        binding: "capability→producer (new file) — α creates shared/src/shared/cancel_dispositions.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths: ["shared/src/shared/cancel_dispositions.py"]
+      - name: "child-disposition-model"
+        binding: "capability→producer — α defines ChildDisposition (PRD §4.2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ChildDisposition"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "cancel-dispositions-key-blessed"
+        binding: "capability→producer — α blesses + registers cancel_dispositions in task_metadata.py (PRD §4.8)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cancel_dispositions"
+          paths: ["shared/src/shared/task_metadata.py"]
+          expect: present
+      - name: "escalation-cancel-children-field"
+        binding: "capability→producer — α adds Escalation.cancel_children (PRD §4.11)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cancel_children"
+          paths: ["escalation/src/escalation/models.py"]
+          expect: present
+  - label: "β"
+    task_id: 8143
+    title: "Interceptor gate (observe mode), executor, get_cancel_children, late path"
+    capabilities:
+      - name: "gate-module-exists"
+        binding: "capability→producer (new file) — β creates cancel_children_gate.py (PRD §7)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths: ["fused-memory/src/fused_memory/middleware/cancel_children_gate.py"]
+      - name: "get-cancel-children-tool"
+        binding: "capability→producer — β adds the MCP read tool (PRD §4.1)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def get_cancel_children"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "undispositioned-refusal-slug"
+        binding: "rejection-mechanism — β emits cancel_children_undispositioned (PRD §4.4); exercised by §6 rows 1 and 27"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cancel_children_undispositioned"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "known-project-roots-accessor"
+        binding: "capability→producer — β adds BacklogPolicy.known_project_roots (PRD §4.3, Appendix A item 7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def known_project_roots"
+          paths: ["fused-memory/src/fused_memory/reconciliation/backlog_policy.py", "fused-memory/src/fused_memory/recon_state/backlog_policy.py"]
+          expect: present
+      - name: "enforce-flag-hot-reloadable"
+        binding: "capability→producer — β allowlists cancel_children.enforce in config/reload.py (PRD §4.14)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cancel_children\\.enforce"
+          paths: ["fused-memory/src/fused_memory/config/reload.py"]
+          expect: present
+      - name: "no-deadlock-and-observe-mode"
+        binding: "behaviour — §6 rows 28 (late mode under the real lock) and 31 (observe mode) in β's real-backend tests"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "liveness and mode behaviour are test properties, not greppable"
+  - label: "γ"
+    task_id: 8144
+    title: "Backstop sweep rewrite"
+    capabilities:
+      - name: "backstop-module-exists"
+        binding: "capability→producer (new file) — γ extracts cancel_backstop.py (PRD §4.11)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths: ["fused-memory/src/fused_memory/reconciliation/cancel_backstop.py"]
+      - name: "prefix-recursion-guard-retired"
+        binding: "rejection of the string-prefix route — γ replaces it with cancel_cause (PRD §4.11, Appendix A item 4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_PARENT_CANCELLED_REOPEN_PREFIX"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+  - label: "δ"
+    task_id: 8145
+    title: "Abandon path: pre-flight, persistence, pass-through, loud re-file"
+    capabilities:
+      - name: "typed-cancel-children-rejection"
+        binding: "capability→producer — δ adds CancelChildrenRejection in the scheduler (PRD §4.12 step 5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class CancelChildrenRejection"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "abandon-preflight-probe"
+        binding: "capability→producer — δ adds Harness.cancel_children_blocker (PRD §4.12 step 2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def cancel_children_blocker"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "terminal-head-refusal"
+        binding: "rejection-mechanism — δ emits cancel_children_parent_terminal (PRD §4.12); §6 row 33"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cancel_children_parent_terminal"
+          paths: ["orchestrator/src/", "escalation/src/"]
+          expect: present
+  - label: "ε"
+    task_id: 8146
+    title: "Skill + prose sites + Stage 2 render"
+    capabilities:
+      - name: "skill-exists"
+        binding: "capability→producer (new file) — ε writes the skill (PRD §5, §7)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths: ["skills/cancel-with-children/SKILL.md"]
+      - name: "watcher-blanket-repoint-rule-retired"
+        binding: "rejection — ε replaces the carve-out's blanket repoint rule with a pointer to the skill (PRD §4.15)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "[Rr]epoint every"
+          paths: ["skills/escalation-watcher/SKILL.md"]
+          expect: absent
+      - name: "stage2-consumes-the-read-tool"
+        binding: "capability→consumer (wired) — ε renders the rules into the Stage 2 prompt (PRD §4.13, §5.1)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "get_cancel_children"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/"]
+          expect: present
+  - label: "ζ"
+    task_id: 8147
+    title: "Integration gate + enforce flip"
+    capabilities:
+      - name: "end-to-end-and-production-observation"
+        binding: "integration — §6 table green on a real stack; enforce flipped in config.yaml after the would-refuse review"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "end-to-end behaviour and a production observation are judged by the gate task, not a grep"
+  - label: "η"
+    task_id: 8148
+    title: "Production observation + retire the cancel_children.enforce flag"
+    note: "delayed milestone, 7 days after ζ is done"
+    capabilities:
+      - name: "flag-removed"
+        binding: "INV-13 production observation (live store shows cancel_dispositions written by real cancels) + removal of β's observe-mode flag (PRD §4.14)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the flag does not exist yet, so an expect-absent grep would be vacuous today"

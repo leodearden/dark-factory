@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
+from _merge_lane_fakes import lane_scene_config
 from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import make_placeholder_future, wait_responsive
 
@@ -73,7 +74,7 @@ def _make_persistent_config(git_repo: Path, *, persistent: bool) -> Orchestrator
         push_after_advance=False,
         persistent_merge_worktree=persistent,
     )
-    return OrchestratorConfig(project_root=git_repo, git=git)
+    return lane_scene_config(git_repo, git)
 
 
 async def _make_branch_with_file(
@@ -129,7 +130,7 @@ def _make_config(
         persistent_merge_worktree=persistent,
         persistent_merge_worktree_safety_valve_every_n=safety_valve,
     )
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +518,7 @@ class TestSafetyValveIntegration:
             persistent_merge_worktree=True,
             persistent_merge_worktree_safety_valve_every_n=1,
         )
-        cfg = OrchestratorConfig(project_root=git_repo, git=cfg_git)
+        cfg = lane_scene_config(git_repo, cfg_git)
 
         wt = await _make_branch_with_file(git_ops, 'valve-test', 'valve.py', 'z = 3\n')
         req = _make_merge_request('valve-test', 'valve-test', wt, cfg)

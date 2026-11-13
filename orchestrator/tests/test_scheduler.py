@@ -3,6 +3,7 @@
 
 import asyncio
 import dataclasses
+import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.pause_policy import (
     HaltNotPermittedError,
     PauseClass,
@@ -34,7 +36,6 @@ from orchestrator.pause_policy import (
 from orchestrator.scheduler import (
     BlastRadiusResult,
     ExternalResolverError,
-    ModuleLockTable,
     Scheduler,
     SchedulerCallbacks,
     TickContext,
@@ -3199,9 +3200,10 @@ class TestFairness:
         # H's park on m1 blocks ALL other tasks (including shadowed L).
         assert not scheduler.lock_table.try_acquire('X', ['m1'])   # stranger blocked
         assert not scheduler.lock_table.try_acquire('L', ['m1'])   # shadowed L blocked (INV-2)
-        # L's park on m2 remains active — H cannot acquire m2.
+        # L's park on m2 remains active: it blocks a parkless task, and H,
+        # which outranks it, passes it (task 7799, INV-8).
         assert not scheduler.lock_table.try_acquire('Y', ['m2'])   # L's active park
-        assert not scheduler.lock_table.try_acquire('H', ['m2'])   # H cannot acquire L's m2
+        assert scheduler.lock_table.park_owners_blocking('H', ['m2']) == []
 
         # L's skip_count was NOT cleared by preemption.
         assert scheduler._skip_count['L'] == 3
@@ -7564,6 +7566,13 @@ class TestDeferredWatchDispatchGate:
 # Milestone time-gate (task 2335 β — docs/prds/milestone-tasks.md §6.2)
 # ---------------------------------------------------------------------------
 
+def _delayed_milestone_metadata(after_secs: object, anchor: object) -> dict:
+    return {
+        'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+        'milestone_deps_satisfied_at': anchor,
+    }
+
+
 class TestMilestoneTimeGate:
     """Unit tests for the pure predicate Scheduler._milestone_time_gated.
 
@@ -7684,6 +7693,71 @@ class TestMilestoneTimeGate:
             task, datetime(2026, 9, 1, tzinfo=UTC)
         ) is False
 
+    def test_tz_naive_anchor_is_treated_as_utc(self):
+        naive_anchor = datetime(2026, 7, 25, 9, 0, 0)  # no tzinfo
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': 3600},
+            'milestone_deps_satisfied_at': naive_anchor.isoformat(),
+        })
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 9, 59, tzinfo=UTC)
+        ) is True
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
+        ) is False
+
+    def test_delayed_without_anchor_withholds_silently(self, caplog):
+        """An unset anchor means 'not due yet', not 'malformed': no WARNING."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with({'milestone': {'mode': 'delayed', 'after_secs': 60}})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.parametrize('metadata', [
+        pytest.param(_delayed_milestone_metadata(60, 12345), id='non_str_anchor'),
+        pytest.param(_delayed_milestone_metadata(60, 0), id='falsy_non_str_anchor'),
+        pytest.param(
+            _delayed_milestone_metadata(60, 'not-a-timestamp'), id='unparseable_anchor'
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**12, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e12',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**15, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e15',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(0, '2026-11-01T00:00:00+00:00'),
+            id='milestone_rejects_zero_after_secs',
+        ),
+        pytest.param(
+            {'milestone': {
+                'mode': 'dated', 'at': '2026-11-01T00:00:00+00:00', 'after_secs': 60,
+            }},
+            id='milestone_rejects_dated_with_after_secs',
+        ),
+    ])
+    def test_malformed_input_fails_safe_and_warns_once(self, metadata, caplog):
+        """``now`` is after every anchor and ``at``, so a lenient read would dispatch."""
+        now = datetime(2026, 11, 13, tzinfo=UTC)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with(metadata)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert scheduler._milestone_time_gated(task, now) is True
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
     def test_malformed_milestone_warning_deduped_per_task_and_cause(self, caplog):
         """reviewer_comprehensive observability finding (task 2335 β
         amendment): _milestone_time_gated is invoked once per candidate loop
@@ -7717,7 +7791,7 @@ class TestMilestoneTimeGate:
             assert scheduler._milestone_time_gated(task_changed, datetime.now(UTC)) is True
 
         unknown_mode_warnings = [
-            r for r in caplog.records if 'unknown mode' in r.getMessage()
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
         ]
         assert len(unknown_mode_warnings) == 1, (
             f'Expected a fresh WARNING when the malformed cause changes; '
@@ -7866,6 +7940,45 @@ class TestMilestoneEligibilityGate:
         assert result_after is not None and result_after.task_id == '4005', (
             'Milestone must dispatch once now_wall >= at'
         )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_withholds_milestone_rejected_spec_and_warns_once(
+        self, monkeypatch, caplog
+    ):
+        """A delayed spec Milestone rejects (after_secs=0) whose anchor is long
+        past is withheld tick after tick, with exactly one WARNING."""
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        task = {
+            'id': '4008',
+            'title': 'Milestone-rejected delayed task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': _delayed_milestone_metadata(
+                0, (now - timedelta(days=1)).isoformat()
+            ),
+        }
+        task_response = {
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps({'tasks': [task]})}]
+            }
+        }
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1), wall_time_source=lambda: now
+        )
+        scheduler.finish_startup()
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert await scheduler.acquire_next() is None
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
 
 
 class TestClaimantLivenessDispatchGate:
@@ -12992,6 +13105,83 @@ class TestConsultAlreadyLanded:
         assert {call.args[0] for call in gate.await_args_list} == {'Z', 'Y'}
         assert all(call.kwargs['tick_view'] is None for call in gate.await_args_list)
         assert any(record.levelname == 'WARNING' for record in caplog.records)
+
+    async def test_the_pending_escalations_are_read_once_after_the_view_and_threaded(self):
+        """Task 8073: one store read per consult, whatever the candidate count."""
+        reads: list[str] = []
+        snapshot = {'B': []}
+
+        async def read_view() -> AlreadyLandedTickView:
+            reads.append('view')
+            return AlreadyLandedTickView(local_branches=frozenset())
+
+        async def read_escalations() -> dict:
+            reads.append('escalations')
+            return snapshot
+
+        async def gate(task_id: str, **kwargs) -> bool:
+            reads.append(f'gate:{task_id}')
+            return False
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=read_view,
+                read_pending_escalations_by_task=read_escalations,
+            ),
+        )
+        scheduler.finish_startup()
+        spy = AsyncMock(side_effect=gate)
+        scheduler._already_landed_gate = spy
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        assert reads == ['view', 'escalations', 'gate:A', 'gate:B', 'gate:C']
+        assert all(
+            call.kwargs['pending_escalations'] is snapshot for call in spy.await_args_list
+        )
+
+    async def test_without_an_escalation_reader_the_gate_reads_per_candidate(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+
+        await scheduler._consult_already_landed([_pending_task('Z')])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['pending_escalations'] is None
+
+    async def test_a_raising_escalation_reader_fails_open_to_per_candidate_reads(
+        self, caplog,
+    ):
+        caplog.set_level('WARNING')
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=AsyncMock(return_value=view),
+                read_pending_escalations_by_task=AsyncMock(
+                    side_effect=OSError('escalation queue dir unreadable'),
+                ),
+            ),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert all(call.kwargs['pending_escalations'] is None for call in gate.await_args_list)
+        assert all(call.kwargs['tick_view'] is view for call in gate.await_args_list)
+        assert any(
+            record.levelname == 'WARNING' and 'pending escalation snapshot' in record.getMessage()
+            for record in caplog.records
+        )
 
     async def test_without_a_gate_the_tick_view_is_not_read(self):
         reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))

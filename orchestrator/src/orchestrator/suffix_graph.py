@@ -7,35 +7,35 @@ sentinel empty instance) — plus a NEW :class:`SuffixConflictTracker` class
 that owns the state (``graph`` / ``signature`` / ``last_known_main_sha`` /
 ``bounce_registry``) and logic (``recompute()`` /
 ``bounce_conflicting_suffix_items()``) that previously lived directly on
-``SpeculativeMergeWorker``.  The worker imports all three names from here at
-module level; the pre-package alias module that also re-exported them is
-gone (task 5037).  This module is a lane component kept outside the package.
+``SpeculativeMergeWorker``.  The pre-package alias module that also
+re-exported them is gone (task 5037).  This module is a lane component kept
+outside the package.
 
-``SpeculativeMergeWorker`` delegates to a ``SuffixConflictTracker`` instance
-(``self._suffix_tracker``) via thin property/method wrappers that preserve
-the worker's original attribute names (``_suffix_conflict_graph``,
-``_suffix_conflict_signature``, ``_last_known_main_sha``,
-``_bounce_registry``) and method signatures
-(``recompute_suffix_conflict_graph()``, ``_bounce_conflicting_suffix_items()``)
-so the existing conflict-graph and bounce test suites keep passing with zero
-churn.  The tracker itself never holds a worker reference: GitOps access,
-lane-buffer access, frozen-prefix reads, and lifecycle retirement are
-injected as narrow *re-reading* callables (``git_ops``, ``lane_buffers``,
-``frozen_requests``, ``frozen_prefix_tip``, ``retire_item``) that look up the
-caller's live attribute on every call — not a value or bound method captured
-once at construction — so the tracker is unit-testable standalone AND stays
-correct if the caller later reassigns e.g. ``worker._git_ops`` (amend: reviewer
+``orchestrator.merge_lane.intake_buffers::MergeIntake`` owns the one
+``SuffixConflictTracker`` instance, beside the lane buffers it reads, and
+exposes its state as read properties (``suffix_conflict_graph``,
+``suffix_conflict_signature``, ``last_known_main_sha``, ``bounce_registry``)
+and two thin async methods (``recompute_suffix_conflict_graph()``,
+``bounce_conflicting_suffix_items()``).  The tracker itself never holds a
+worker reference: GitOps access, lane-buffer access, frozen-prefix reads, and
+lifecycle retirement are injected as narrow *re-reading* callables
+(``git_ops``, ``lane_buffers``, ``frozen_requests``, ``frozen_prefix_tip``,
+``retire_item``) that look up the caller's live attribute on every call — not
+a value or bound method captured once at construction — so the tracker is
+unit-testable standalone AND stays correct if the caller later reassigns e.g.
+``worker._git_ops`` (amend: reviewer
 robustness_stale_reference / consistency, task δ=1988).
 
-A moved method that reads a worker-resident constant (``MERGE_LANES``,
-``MERGE_BOUNCE_CAP``, ``NEEDS_REBASE_REASON_PREFIX``) — these stay in
-``merge_lane/worker.py`` and are NOT moved — resolves it through a
-function-local (deferred) import from :mod:`orchestrator.merge_lane.worker`
-rather than a top-level import.  This mirrors the reach-back convention of
-:mod:`orchestrator.merge_lane.liveness` / :mod:`orchestrator.merge_lane.drift` and
-keeps this module free of any top-level import of the worker (which would
-deadlock module load, since the worker imports this module at module level
-and needs it fully defined first).
+A moved method that reads a worker-resident constant (``MERGE_BOUNCE_CAP``,
+``NEEDS_REBASE_REASON_PREFIX``, which stay in ``merge_lane/worker.py``)
+resolves it through a function-local (deferred) import from
+:mod:`orchestrator.merge_lane.worker` rather than a top-level import.  This
+mirrors the reach-back convention of :mod:`orchestrator.merge_lane.liveness` /
+:mod:`orchestrator.merge_lane.drift` and keeps this module free of any
+top-level import of the worker (which would deadlock module load, since the
+worker imports this module at module level and needs it fully defined first).
+``MERGE_LANES`` is imported at the top from :mod:`orchestrator.merge_lane.intake`,
+which loads neither the worker nor this module.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from collections.abc import Callable, Mapping
 from types import MappingProxyType
 
 from orchestrator.git_ops import ConflictProbe, GitOps
+from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.types import (
     GroupMergeRequest,
@@ -159,36 +160,36 @@ EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
 
 
 @functools.lru_cache(maxsize=1)
-def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
-    """Resolve MERGE_LANES / MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
+def _worker_constants() -> tuple[int, str]:
+    """Resolve MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
 
-    These three constants stay in ``merge_lane/worker.py`` (not moved — see
-    module docstring).  The function-local (deferred) import is required to
-    avoid deadlocking the worker's own module load, but that constraint only binds
-    at *module import time*; by the time :meth:`SuffixConflictTracker.recompute`
-    or :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items` actually
-    run (the merge-acquire hot path), both modules are already fully loaded.
-    Memoizing the lookup here means those hot-path calls pay for the
-    sys.modules dict lookup + attribute rebind once, not on every call
-    (amend: reviewer performance).
+    Both stay in ``merge_lane/worker.py`` (see module docstring).  The
+    function-local (deferred) import is required to avoid deadlocking the
+    worker's own module load, but that constraint only binds at *module import
+    time*; by the time :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items`
+    or its escalation path actually run (the merge-acquire hot path), both
+    modules are already fully loaded.  Memoizing the lookup here means those
+    hot-path calls pay for the sys.modules dict lookup + attribute rebind once,
+    not on every call (amend: reviewer performance).
     """
     from orchestrator.merge_lane.worker import (
         MERGE_BOUNCE_CAP,
-        MERGE_LANES,
         NEEDS_REBASE_REASON_PREFIX,
     )
-    return MERGE_LANES, MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX
+    return MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX
 
 
 class SuffixConflictTracker:
     """Owns the two-layer suffix-conflict state + logic (task δ=1988).
 
-    Constructed with five narrow accessor callables — ``git_ops``,
+    Constructed with six narrow accessor callables — ``git_ops``,
     ``lane_buffers``, ``frozen_requests``, ``frozen_prefix_tip``,
-    ``retire_item`` — instead of a worker reference, so the tracker is fully
-    unit-testable without a :class:`SpeculativeMergeWorker`.  ``retire_item``
-    is required: a request diverted out of its lane must leave the caller's
-    lifecycle registry too.  All five are captured as callables (not
+    ``retire_item``, ``is_reserved`` — instead of a worker reference, so the
+    tracker is fully unit-testable without a :class:`SpeculativeMergeWorker`.
+    ``retire_item`` is required: a request diverted out of its lane must leave
+    the caller's lifecycle registry too. ``is_reserved`` names the requests a
+    deep chain holds for its tip verify, which the bounce leaves alone.  All
+    six are captured as callables (not
     their values, and not a bound-method snapshot) so the tracker always
     re-reads the caller's live state at call time, including a
     :class:`~orchestrator.git_ops.GitOps` reassigned on the caller *after*
@@ -214,8 +215,10 @@ class SuffixConflictTracker:
         frozen_requests: Callable[[], tuple[MergeRequest, ...]],
         frozen_prefix_tip: Callable[[str], str],
         retire_item: Callable[[str], None],
+        is_reserved: Callable[[str], bool],
     ) -> None:
         self._git_ops = git_ops
+        self._is_reserved = is_reserved
         self._lane_buffers = lane_buffers
         self._frozen_requests = frozen_requests
         self._frozen_prefix_tip = frozen_prefix_tip
@@ -242,7 +245,7 @@ class SuffixConflictTracker:
         item that never lands.  Accepted: the steward resolves it, and if the
         frozen item fails, the branch requeues without prejudice.
         """
-        _, _, NEEDS_REBASE_REASON_PREFIX = _merge_queue_constants()
+        _, NEEDS_REBASE_REASON_PREFIX = _worker_constants()
         self._escalations_issued += 1
         ordinal = self._escalations_issued
         branch = req.branch.bare_id
@@ -295,10 +298,6 @@ class SuffixConflictTracker:
         This method is async (forks git subprocesses) while snapshot() stays
         synchronous and cheap (reads the stored graph; no await).
         """
-        # Deferred reach-back, memoized after the first call — see
-        # _merge_queue_constants() (amend: reviewer performance).
-        MERGE_LANES, _, _ = _merge_queue_constants()
-
         # ── 1. Build ordered suffix list ──────────────────────────────────────
         # ε=1890 defensive exclusion: frozen items (currently verifying) must
         # never appear as suffix-graph nodes — the frozen/suffix partition is
@@ -543,7 +542,7 @@ class SuffixConflictTracker:
         For each request_id in ``graph.conflicts_with_main``:
 
         1. Skip :class:`GroupMergeRequest` items (trains keep their existing
-           TRAIN_REBASE_CONFLICT path).
+           TRAIN_REBASE_CONFLICT path), and requests a deep chain reserves.
         2. Emit a structured ``needs_rebase`` log line.
         3. Bump the bounce registry; if the count exceeds :data:`MERGE_BOUNCE_CAP`
            → escalate via :meth:`_escalate` (ordinal-bearing reason) WITHOUT
@@ -560,15 +559,15 @@ class SuffixConflictTracker:
         rebased item from being re-bounced off a stale graph).
 
         Called by :meth:`SpeculativeMergeWorker._acquire_next_request`
-        immediately after :meth:`recompute` and before ``_pop_next_pickable()``,
+        immediately after :meth:`recompute` and before ``MergeIntake.pop_next_pickable()``,
         so bounced/escalated items are diverted before consuming a verify slot.
 
         Fail-open: if ``get_main_sha()`` raises, log a warning and return
         without touching any item.
         """
         # Deferred reach-back, memoized after the first call — see
-        # _merge_queue_constants() (amend: reviewer performance).
-        MERGE_LANES, MERGE_BOUNCE_CAP, _ = _merge_queue_constants()
+        # _worker_constants() (amend: reviewer performance).
+        MERGE_BOUNCE_CAP, _ = _worker_constants()
 
         if not self.graph.conflicts_with_main:
             return  # nothing to bounce — leave signature intact
@@ -612,6 +611,10 @@ class SuffixConflictTracker:
             lane, req = found
             if isinstance(req, GroupMergeRequest):
                 continue  # trains keep their own TRAIN_REBASE_CONFLICT path
+            if self._is_reserved(rid):
+                # A deep chain's link (task 7720): its tree is under a tip
+                # verify, and the walk lands its built merge commit, not its branch.
+                continue
 
             branch = req.branch.bare_id
             logger.info(
@@ -643,7 +646,7 @@ class SuffixConflictTracker:
                 # Future and merge_first_enqueued_at are untouched.
                 #
                 # Downstream path note (design_double_rebase): the next call to
-                # _pop_next_pickable() may pick this item for dispatch.  The
+                # MergeIntake.pop_next_pickable() may pick this item for dispatch.  The
                 # dispatch loop calls merge_to_main() which performs a
                 # ``git merge --no-ff`` — NOT another rebase — so there is no
                 # double-rebase hazard.  If actual_main has advanced past

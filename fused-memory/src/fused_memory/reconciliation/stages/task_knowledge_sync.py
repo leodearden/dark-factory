@@ -18,14 +18,15 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
+from shared.elision import elide_at_word
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
 )
 from fused_memory.middleware.task_creation_journal import read_run_creation_outcomes
-from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -3514,7 +3515,6 @@ class TaskKnowledgeSync(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Capture run_id, run briefing-refresh hook, delegate to BaseStage.run(), then
         apply the same-run Stage 1 human_operator_required dedup post-processor.
@@ -3550,7 +3550,6 @@ class TaskKnowledgeSync(BaseStage):
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # --- missing-run_id marker stat (task 1257) ---
@@ -4646,7 +4645,6 @@ class IntegrityCheck(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Execute Stage 3 and post-process with task-dump spot-check.
 
@@ -4681,7 +4679,6 @@ class IntegrityCheck(BaseStage):
         """
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # Layer 3 (finding-side) gate for blocked-snapshot false positives.
@@ -4940,9 +4937,11 @@ def _format_flagged(
     stage-specific shortfall warning.
 
     Edge case: if the very first item's JSON alone exceeds *budget_chars*, a
-    truncated fragment is always rendered (with a ``… [item truncated]`` marker)
-    so the LLM receives at least some signal rather than an opaque footer-only
-    body.  ``rendered`` stays 0 (the fragment is not a full render) and the
+    truncated fragment is always rendered so the LLM receives at least some
+    signal rather than an opaque footer-only body.  The fragment is cut by
+    ``shared/elision.py::elide_at_word``, whose counted marker keeps the line
+    within *budget_chars*; a budget too small to hold that marker raises its
+    ``ValueError``.  ``rendered`` stays 0 (the fragment is not a full render) and the
     warning's ``extra`` includes ``first_item_fragmented=True`` so
     callers/telemetry can distinguish fragmented-first-item from all-dropped.
     """
@@ -4962,11 +4961,8 @@ def _format_flagged(
                 # First item alone exceeds the budget.  Always show at least a
                 # truncated fragment so the LLM has some signal rather than an
                 # opaque footer-only body.
-                marker = '… [item truncated]'
-                available = budget_chars - len('- ') - len(marker)
-                if available > 0:
-                    lines.append(f'- {json_str[:available]}{marker}')
-                    first_item_fragmented = True
+                lines.append(f'- {elide_at_word(json_str, budget_chars - len("- "))}')
+                first_item_fragmented = True
             dropped = len(items) - idx
             # Footer shows only items that are completely absent (not the
             # fragmented first item, which already appears as a truncated line).

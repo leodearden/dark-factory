@@ -28,19 +28,22 @@ import importlib.util
 import json
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
 from _ast_guard import parse_python_module
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.ticket_store import CurationBacklog
-from fused_memory.services.write_journal import JournalGrowthSample
+from fused_memory.services.write_journal import JournalGrowthSample, Mem0RetryBacklog
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: Applied PER CLASS rather than as a module-level ``pytestmark``, so the
 #: pairwise anchor-collision regression at the foot of this file keeps running
@@ -602,6 +605,19 @@ def _journal_growth(ceiling: str) -> Callable[[Any, str], object]:
     return fire
 
 
+def _mem0_retry_backlog(module: Any, project_root: str) -> object:
+    now = datetime(2026, 11, 3, 12, tzinfo=UTC)
+    return module.emit_mem0_retry_backlog_escalation(
+        project_root,
+        backlog=Mem0RetryBacklog(
+            project_id='dark_factory', count=1,
+            oldest_created_at=now - timedelta(hours=2), max_attempts=3,
+        ),
+        now=now,
+        max_age=timedelta(hours=1),
+    )
+
+
 def _unverified_claim(module: Any, project_root: str) -> object:
     return module.emit_unverified_claim_escalation(
         project_root,
@@ -725,6 +741,12 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             storm={'count': 5, 'threshold': 5, 'window_seconds': 3600.0,
                    'labels': ['llm_error']},
         ),
+        1,
+    ),
+    _Filer(
+        'mem0_retry_backlog_alarm',
+        'fused_memory.services.mem0_retry_backlog_alarm',
+        _mem0_retry_backlog,
         1,
     ),
     _Filer(
@@ -1011,6 +1033,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.services.journal_growth_alarm import (
         _INSERT_RATE_ANCHOR_TASK_ID as JOURNAL_RATE_ANCHOR,
     )
+    from fused_memory.services.mem0_retry_backlog_alarm import (
+        ANCHOR_TASK_ID as MEM0_RETRY_BACKLOG_ANCHOR,
+    )
     from fused_memory.services.memory_metadata_census import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
     )
@@ -1033,6 +1058,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'journal_growth_alarm file_size': JOURNAL_SIZE_ANCHOR,
         'journal_growth_alarm insert_rate': JOURNAL_RATE_ANCHOR,
         'classification_fallback_alarm': CLASSIFICATION_FALLBACK_ANCHOR,
+        'mem0_retry_backlog_alarm': MEM0_RETRY_BACKLOG_ANCHOR,
         # -- markup_guard, which CALLS the tripwire's filers with anchors of
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,

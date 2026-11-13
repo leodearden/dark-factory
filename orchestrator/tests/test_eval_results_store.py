@@ -355,7 +355,7 @@ class TestLegacyInvocationErrorRule:
         ]
 
     def test_a_two_marker_string_is_one_record_driven_by_the_first(self):
-        from orchestrator.evals.report import format_invocation_errors
+        from orchestrator.evals.measurement import format_invocation_errors
 
         marker = 'architect:timeout: no answer within 60m; judge:raised: RuntimeError: x'
         normalized = normalize_legacy_metrics({'invocation_error': marker})
@@ -364,7 +364,7 @@ class TestLegacyInvocationErrorRule:
         assert format_invocation_errors(normalized['invocation_errors']) == marker
 
     def test_a_clipped_reason_keeps_its_trailing_space(self):
-        from orchestrator.evals.report import format_invocation_errors
+        from orchestrator.evals.measurement import format_invocation_errors
 
         marker = 'architect:cap_exhausted: all accounts capped after 1 '
         normalized = normalize_legacy_metrics({'invocation_error': marker})

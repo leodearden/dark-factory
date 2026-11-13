@@ -9,7 +9,8 @@ answer).
 Sections: landings/day, the four-segment lead-time split, verify duration by
 runner, remote-host occupancy (three estimators, side by side), heartbeat queue
 depth, merge_attempt/merge_finalized outcome mixes, and — behind flags — the
-speculation and merge-ahead-chain sections.
+speculation and merge-ahead-chain sections, plus `--policy`: the lane policy
+signals of `plans/merge-lane-policy-prd.md` D10.
 
 STRICTLY READ-ONLY.  Every connection is a `mode=ro` SQLite URI
 (:func:`_connect_ro`); this script writes nothing, files nothing, and emits no
@@ -1062,10 +1063,11 @@ def compute_speculation(
 # Mirrors `orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES` — the OutcomeKind members
 # for which the attempt/merge is still live. Copied as literal strings, NOT
 # imported: scripts/ must stay importable without the orchestrator package
-# (this module's test gate runs under `uv run --project shared`). The set is
-# documented there as a FROZEN CONTRACT that names this copy as its mirror,
-# so a change there must update this set in the same commit.
-_NON_TERMINAL_OUTCOMES = frozenset({
+# (this module's test gate runs under `uv run --project shared`). The name is
+# public because the set is a cross-layer contract:
+# `orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract`
+# loads this file by path and fails if the two sets differ.
+NON_TERMINAL_OUTCOMES = frozenset({
     'cas_retry', 'gate_retry', 'post_merge_generation_chained',
     'plan_files_narrowed',
 })
@@ -1122,7 +1124,7 @@ def compute_mixes(
     row with the key missing buckets under :data:`UNKNOWN`.
 
     Outcomes are additionally split terminal / non-terminal (see
-    :data:`_NON_TERMINAL_OUTCOMES`): ``gate_retry`` and ``cas_retry`` mean the
+    :data:`NON_TERMINAL_OUTCOMES`): ``gate_retry`` and ``cas_retry`` mean the
     attempt is still live, so folding them in with terminal outcomes makes the
     mix read as a landing tally when it is not.
 
@@ -1133,9 +1135,9 @@ def compute_mixes(
     )
     counts: dict[str, int] = outcomes['counts']
     non_terminal = {
-        k: v for k, v in counts.items() if k in _NON_TERMINAL_OUTCOMES
+        k: v for k, v in counts.items() if k in NON_TERMINAL_OUTCOMES
     }
-    terminal = {k: v for k, v in counts.items() if k not in _NON_TERMINAL_OUTCOMES}
+    terminal = {k: v for k, v in counts.items() if k not in NON_TERMINAL_OUTCOMES}
     outcomes.update({
         'non_terminal': non_terminal,
         'terminal': terminal,
@@ -1227,11 +1229,93 @@ def compute_chains(
 
 
 # ---------------------------------------------------------------------------
+# Section: lane policy signals (--policy) — merge-lane-policy PRD D10.
+# ---------------------------------------------------------------------------
+
+
+def _usable_number(raw: Any) -> float | None:
+    """*raw* as a float, or ``None`` for a missing, null, bool or non-numeric value."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw)
+
+
+def _observed(events: Iterable[dict[str, Any]], key: str) -> dict[str, Any]:
+    """Tally ``data[key]`` as observed; a missing or null value is :data:`UNKNOWN`."""
+    return _tally(str(e.get('data', {}).get(key) or UNKNOWN) for e in events)
+
+
+def _cancelled_verifies(cancelled_events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    datas = [e.get('data', {}) for e in cancelled_events]
+    elapsed = [ms for d in datas if (ms := _usable_number(d.get('elapsed_ms'))) is not None]
+    fractions = [f for d in datas if (f := _usable_number(d.get('fraction'))) is not None]
+    return {
+        'n': len(datas),
+        'causes': _observed(cancelled_events, 'cause'),
+        'elapsed_hours': sum(elapsed) / 3_600_000.0,
+        'fraction_p50': _percentile(fractions, 50),
+    }
+
+
+def _killer_site(data: dict[str, Any]) -> str:
+    killer = data.get('killer')
+    site = killer.get('site') if isinstance(killer, dict) else None
+    return str(site or UNKNOWN)
+
+
+def _void_provenance(voided_events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    datas = [e.get('data', {}) for e in voided_events]
+    return {
+        'n': len(datas),
+        'n_with_item_commit': sum(1 for d in datas if d.get('item_commit')),
+        'killer_sites': _tally(_killer_site(d) for d in datas),
+    }
+
+
+def _queue_to_land(finalized_events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    done = [
+        e.get('data', {}) for e in finalized_events
+        if e.get('data', {}).get('state') == 'done'
+    ]
+    secs = [s for d in done if (s := _usable_number(d.get('queue_to_land_secs'))) is not None]
+    return {**_series(secs), 'n_missing': len(done) - len(secs)}
+
+
+def compute_policy_signals(
+    verify_events: Sequence[dict[str, Any]],
+    cancelled_events: Sequence[dict[str, Any]],
+    voided_events: Sequence[dict[str, Any]],
+    finalized_events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """The merge-lane-policy PRD D10 signals the lane has emitted since task 8523.
+
+    Values are read AS OBSERVED, like :func:`compute_mixes`: no vocabulary is
+    imported from the orchestrator.  A row written before the instrumentation
+    landed lacks the key and buckets under :data:`UNKNOWN`, as does a null.
+
+    ``cancelled.elapsed_hours`` sums the verify time each cancel threw away;
+    ``fraction_p50`` is over the rows whose host had a median to divide by.
+    ``queue_to_land`` covers ``state == 'done'`` rows only, with
+    ``n_missing`` counting landings that predate the key.
+
+    Returns ``{'runner_reason', 'base_relation', 'cancelled', 'voided',
+    'queue_to_land'}``.
+    """
+    return {
+        'runner_reason': _observed(verify_events, 'runner_reason'),
+        'base_relation': _observed(verify_events, 'base_relation'),
+        'cancelled': _cancelled_verifies(cancelled_events),
+        'voided': _void_provenance(voided_events),
+        'queue_to_land': _queue_to_land(finalized_events),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Multi-project rim: one runs.db per project root, one labelled bundle each.
 # ---------------------------------------------------------------------------
 
-# The always-on sections, in report order. `chains` and `speculation` are
-# behind flags and appended after these.
+# The always-on sections, in report order. `speculation`, `chains` and
+# `policy_signals` are behind flags and appended after these.
 _ALWAYS_ON_SECTIONS = (
     'landings_per_day', 'lead_time', 'verify_by_runner',
     'occupancy', 'queue_depth', 'mixes',
@@ -1279,6 +1363,7 @@ def collect_project(
     *,
     chains: bool = False,
     speculation: bool = False,
+    policy: bool = False,
 ) -> dict[str, Any]:
     """Read one project's runs.db and return one LABELLED result bundle.
 
@@ -1329,7 +1414,7 @@ def collect_project(
             for event_type in (
                 'merge_queued', 'merge_dequeued', 'merge_verify',
                 'merge_finalized', 'merge_heartbeat', 'merge_attempt',
-                'speculative_merge', 'verdict_voided',
+                'speculative_merge', 'verdict_voided', 'merge_verify_cancelled',
             )
         }
     except sqlite3.Error as exc:
@@ -1366,6 +1451,11 @@ def collect_project(
         sections['chains'] = compute_chains(
             loaded['merge_finalized'], loaded['merge_verify']
         )
+    if policy:
+        sections['policy_signals'] = compute_policy_signals(
+            loaded['merge_verify'], loaded['merge_verify_cancelled'],
+            loaded['verdict_voided'], loaded['merge_finalized'],
+        )
     bundle['sections'] = sections
     return bundle
 
@@ -1377,6 +1467,7 @@ def collect_projects(
     *,
     chains: bool = False,
     speculation: bool = False,
+    policy: bool = False,
 ) -> list[dict[str, Any]]:
     """One :func:`collect_project` bundle per root, in the order given.
 
@@ -1385,7 +1476,9 @@ def collect_projects(
     the operator the other project's rows.
     """
     return [
-        collect_project(root, lo, hi, chains=chains, speculation=speculation)
+        collect_project(
+            root, lo, hi, chains=chains, speculation=speculation, policy=policy,
+        )
         for root in roots
     ]
 
@@ -1476,6 +1569,14 @@ def build_parser() -> argparse.ArgumentParser:
         '--speculation', action='store_true',
         help='Add the speculation section, incl. void rate by project (off by default).',
     )
+    parser.add_argument(
+        '--policy', action='store_true',
+        help=(
+            'Add the merge-lane-policy PRD D10 section: runner_reason, '
+            'base_relation, cancelled verifies, void provenance, queue-to-land '
+            '(off by default).'
+        ),
+    )
     return parser
 
 
@@ -1499,6 +1600,7 @@ SECTION_TITLES = {
     'mixes': 'outcome mixes',
     'speculation': 'speculation',
     'chains': 'merge-ahead chains',
+    'policy_signals': 'lane policy signals',
 }
 
 VOID_RATE_BY_PROJECT_TITLE = 'void rate by project'
@@ -1756,6 +1858,35 @@ def _format_chains(
     return lines
 
 
+def _format_policy_signals(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    cancelled = section['cancelled']
+    voided = section['voided']
+    queue_to_land = section['queue_to_land']
+    lines = [_section(SECTION_TITLES['policy_signals'], window)]
+    for key in ('runner_reason', 'base_relation'):
+        lines.append(f"    merge_verify {key} (n={section[key]['total']}):")
+        lines += _format_tally(section[key])
+    lines.append(
+        f"    merge_verify_cancelled {cancelled['n']}: "
+        f"{_num(cancelled['elapsed_hours'], 2)} verify-hour(s) thrown away, "
+        f"fraction p50 {_num(cancelled['fraction_p50'], 2)}"
+    )
+    lines += _format_tally(cancelled['causes'])
+    lines.append(
+        f"    verdict_voided {voided['n']}, {voided['n_with_item_commit']} with "
+        f"item_commit; killer sites:"
+    )
+    lines += _format_tally(voided['killer_sites'])
+    lines.append(
+        f"    queue-to-land (done): p50 {_num(queue_to_land['p50'])}s"
+        f"  p90 {_num(queue_to_land['p90'])}s over {queue_to_land['n']} "
+        f"landing(s), {queue_to_land['n_missing']} without the key"
+    )
+    return lines
+
+
 _SECTION_FORMATTERS = {
     'landings_per_day': _format_landings,
     'lead_time': _format_lead_time,
@@ -1765,11 +1896,12 @@ _SECTION_FORMATTERS = {
     'mixes': _format_mixes,
     'speculation': _format_speculation,
     'chains': _format_chains,
+    'policy_signals': _format_policy_signals,
 }
 
 # Report order. A bundle only renders the sections it actually carries, so the
 # flagged ones simply do not appear unless they were requested.
-_SECTION_ORDER = (*_ALWAYS_ON_SECTIONS, 'speculation', 'chains')
+_SECTION_ORDER = (*_ALWAYS_ON_SECTIONS, 'speculation', 'chains', 'policy_signals')
 
 
 def format_report(bundles: Sequence[dict[str, Any]]) -> str:
@@ -1858,7 +1990,8 @@ def main(argv: Sequence[str], now: datetime | None = None) -> int:
 
     roots = resolve_project_roots(args.project_root)
     bundles = collect_projects(
-        roots, lo, hi, chains=args.chains, speculation=args.speculation
+        roots, lo, hi,
+        chains=args.chains, speculation=args.speculation, policy=args.policy,
     )
     for bundle in bundles:
         if bundle['error'] is not None:

@@ -37,6 +37,7 @@ class TicketStatus(enum.StrEnum):
     COMBINED = "combined"
     REFUSED = "refused"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)

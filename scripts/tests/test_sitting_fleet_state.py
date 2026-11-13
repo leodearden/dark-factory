@@ -12,11 +12,14 @@ import pytest
 from escalation.models import Escalation
 from escalation.shadow_ruling import ShadowRuling, agreement_report
 from orchestrator.session_registry import DecisionRecord, normalize_escalations_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import fleet_state as mod
 from sitting import inventory, payloads
 from sitting.payloads import AgreedMarker, PreparedMarker
 
 from orchestrator import digest
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 WINDOW = mod.Window(NOW - timedelta(days=1), NOW)

@@ -24,6 +24,8 @@ import contextlib
 import copy
 import dataclasses
 import json
+import sys
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -35,8 +37,11 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'normalize_topic_slugs.py'
 
@@ -863,9 +868,12 @@ class TestCensusCategoriesAreImportedNotRestated:
             c.value for c in census.CENSUS_CATEGORIES
         ]
 
-    def test_the_census_module_is_loaded_once(self):
-        """``sys.modules``-first, memoized — re-executing hands back new classes."""
-        assert _mod.load_census_module() is _mod.load_census_module()
+    def test_the_census_module_is_whatever_its_key_holds(self, monkeypatch):
+        """Every loader of ``census_memory_metadata`` shares one module object."""
+        _mod.load_census_module()
+        sentinel = types.ModuleType('census_memory_metadata')
+        monkeypatch.setitem(sys.modules, 'census_memory_metadata', sentinel)
+        assert _mod.load_census_module() is sentinel
 
 
 # ===========================================================================

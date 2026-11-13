@@ -29,7 +29,8 @@ from _falkor_index_live import (
     missing_production_indices,
     scratch_graphs,
 )
-from _fm_helpers import await_index_operational, falkor_skipif, retry_until_observed
+from _fm_falkor_live import await_index_operational, falkor_skipif
+from _fm_polling import retry_until_observed
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.graph_queries import (
     NEO4J_TO_FALKORDB_MAPPING,
@@ -49,10 +50,6 @@ from fused_memory.backends.graphiti_client import GraphitiBackend
 
 pytestmark = [
     falkor_skipif(),
-    # Provisioning and settling are bounded well under this; `timeout_method =
-    # "thread"` os._exit(1)s the xdist worker, so an under-budget timeout would
-    # read as an infrastructure crash.
-    pytest.mark.timeout(120),
     pytest.mark.integration,
 ]
 

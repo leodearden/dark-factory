@@ -45,6 +45,9 @@ import lms_manifest
 import lms_vram
 import pytest
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers

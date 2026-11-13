@@ -53,10 +53,11 @@ CITATION_REPAIRS_KEY = 'citation_repairs'
 # REFUSING yields a loud, recoverable error. So a status absent from the
 # enum-of-today must land on the refusing side by default.
 #
-# These four are genuinely terminal: nothing re-adopts them. ``interrupted`` is
-# excluded precisely because something does — ``get_interrupted_runs()`` feeds
-# the startup adopt-and-resume pass, and the resumed cycle rewrites the whole
-# stage_reports blob from its own loaded copy.
+# These four are genuinely terminal. ``interrupted`` stays excluded as a legacy
+# status (task 5514): nothing writes it any more, but the startup sweep
+# ``harness.py::ReconciliationHarness._recover_legacy_interrupted_runs`` still
+# converts each such row to ``failed`` with a ``complete_run_if_status``
+# wholesale stage_reports write from its own loaded copy.
 #
 # It lives here, beside CITATION_REPAIRS_KEY, because it is also this layer's
 # invariant: a write that does not carry repairs forward must never land on a
@@ -292,7 +293,7 @@ class ReconciliationJournal:
             # Safe migration: add session-capture columns to existing DBs (task 2744).
             # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
             # session (cleared between stages); attempt is a monotonic count of
-            # stage-subprocess launches, the substrate task σ's resume gate consumes.
+            # stage-subprocess launches, kept as durable launch history.
             await add_column_if_missing(db, 'runs', 'session_id', 'TEXT')
             await add_column_if_missing(db, 'runs', 'stage_cursor', 'TEXT')
             await add_column_if_missing(db, 'runs', 'attempt', 'INTEGER DEFAULT 0')
@@ -546,10 +547,8 @@ class ReconciliationJournal:
         such a retry the CLI's live session differs from the value stored here.
         Note too that ``attempt`` counts ``BaseStage.run`` stage invocations, not
         the underlying subprocess spawns — a cap retry spawns again without
-        bumping ``attempt``. Task σ's resume gate therefore must treat this
-        snapshot as best-effort: validate that the transcript for the persisted
-        session actually exists before trusting it to ``--resume`` rather than
-        resuming the persisted id blindly.
+        bumping ``attempt``. Any reader must therefore treat this snapshot as
+        best-effort rather than as the CLI's live session id.
         """
         async with self._require_access().write() as db:
             await db.execute(
@@ -610,21 +609,20 @@ class ReconciliationJournal:
         """Is ``stage_reports`` a FINISHED account of the run, safe to read as
         evidence that a stage did or did not execute?
 
-        A persisted status is necessary but not sufficient, because
-        ``'interrupted'`` is the one terminal status a run can leave: the
-        startup pass (``reconciliation/harness.py::_resume_interrupted_runs``)
-        adopts exactly those runs, and ``run_full_cycle`` marks the adopted run
-        running only on the in-memory object — :meth:`complete_run` is the sole
-        writer of the column, so a run re-executing this very stage still reads
-        back ``'interrupted'`` on disk. Pairing that terminal-looking status
-        with the stale blob its interrupted attempt flushed is worse than the
-        empty first-attempt case: the stage key is absent precisely BECAUSE
-        this attempt has not re-filed it yet, which is the shape most likely to
-        be a genuine lost write.
+        A persisted status is necessary but not sufficient for a legacy
+        ``'interrupted'`` row. Before task 5514 retired resume, the startup
+        adopt-and-resume pass took over exactly those runs, and ``run_full_cycle``
+        marked the adopted run running only on the in-memory object —
+        :meth:`complete_run` is the sole writer of the column, so a run
+        re-executing a stage still read back ``'interrupted'`` on disk. Pairing
+        that terminal-looking status with the stale blob its interrupted attempt
+        flushed is worse than the empty first-attempt case: the stage key is
+        absent precisely BECAUSE that attempt had not re-filed it yet, which is
+        the shape most likely to be a genuine lost write.
 
-        ``_resume`` bookkeeping is persisted before the adopt, so its presence
+        ``_resume`` bookkeeping was persisted before each adopt, so its presence
         is the durable signal. A resumed run that has since reached any other
-        terminal status has been flushed by that run's own ``finally`` and is
+        terminal status was flushed by that run's own ``finally`` and is
         settled again, which is why this narrows ``'interrupted'`` alone rather
         than distrusting every run that was ever resumed.
         """
@@ -657,22 +655,22 @@ class ReconciliationJournal:
           silently suppress a real data-loss finding.
 
         The membership test is keyed on ``stage``, never "is there any report at
-        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` and
-        ``_resume`` keys straight into ``run.stage_reports`` before persisting,
-        and a run holding only those did not run the stage.
+        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` key
+        (and, before task 5514, ``_resume``) straight into ``run.stage_reports``
+        before persisting, and a run holding only those did not run the stage.
 
         ``settled`` is the signal a caller weighing ``stage_ran`` as evidence
         should consume: ``stage_ran=False`` means "the stage never ran" ONLY
         when the blob is a finished account of the run. Deciding that needs
         harness lifecycle knowledge — which statuses flush the blob, and that
-        an adopted run is executing again behind a terminal-looking disk status
-        — so it is answered here, next to the read, rather than re-derived by
+        a legacy adopted run may have been executing again behind a
+        terminal-looking disk status — so it is answered here, next to the read, rather than re-derived by
         every consumer (see :meth:`_stage_reports_are_settled`).
 
         ``resumed`` is the raw evidence behind that verdict: whether the
-        ``_resume`` key is present, i.e. whether the startup adopt-and-resume
-        pass (``reconciliation/harness.py::_resume_interrupted_runs``) has taken
-        this run over at least once. It is three-valued for the same reason
+        ``_resume`` key is present, i.e. whether task 2717's startup
+        adopt-and-resume pass (retired by task 5514) took this run over at
+        least once. It is three-valued for the same reason
         ``stage_ran`` is — an unparseable blob answers neither question, and
         collapsing it to ``False`` would read as positive evidence the run was
         never adopted.
@@ -1003,12 +1001,10 @@ class ReconciliationJournal:
     async def get_interrupted_runs(self) -> list[ReconciliationRun]:
         """Return every run marked 'interrupted', with no age filter.
 
-        Mirrors ``get_running_runs`` but filters the restart-interrupt status
-        (see ``RunStatus.interrupted``). Consumed by the startup
-        adopt-and-resume pass (task σ / ``_resume_interrupted_runs``): a run left
-        ``interrupted`` by a dead predecessor still carries its session_id /
-        stage_cursor snapshot and its drained events, so the pass can --resume
-        the same run_id rather than re-run it from scratch.
+        Mirrors ``get_running_runs`` but filters the legacy status (see
+        ``RunStatus.interrupted``). Consumed by the startup sweep
+        ``harness.py::ReconciliationHarness._recover_legacy_interrupted_runs``,
+        which converts each row a pre-5514 process left behind to ``failed``.
         """
         rows = await self._require_access().read_all(
             "SELECT * FROM runs WHERE status = 'interrupted'"

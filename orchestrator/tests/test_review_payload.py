@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 import pytest
+from escalation.disposition import ReviewerDisposition
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals import compare
@@ -18,10 +19,12 @@ from orchestrator.evals.results import EvalResult
 from orchestrator.evals.scoring import quality_from_review_artifact
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.review_payload import (
+    NoteDisposition,
     ReviewPayload,
     ReviewPayloadError,
     Verdict,
     normalize_review,
+    parse_note_dispositions,
 )
 
 _REVIEWER = 'reviewer_comprehensive'
@@ -178,6 +181,127 @@ class TestReviewPayload:
 
         with pytest.raises(TypeError, match="unhashable type: 'ReviewPayload'"):
             hash(payload)
+
+
+_ADDRESSED_RAW = {
+    'escalation_id': 'esc-42-1', 'disposition': 'addressed', 'rationale': 'fixed in foo.py',
+}
+_WORK_RAW = {
+    'escalation_id': 'esc-42-2', 'disposition': 'work', 'rationale': 'needs its own task',
+}
+_ADDRESSED = NoteDisposition('esc-42-1', ReviewerDisposition.ADDRESSED, 'fixed in foo.py')
+_WORK = NoteDisposition('esc-42-2', ReviewerDisposition.WORK, 'needs its own task')
+
+
+def _with_notes(raw: object, verdict: str = 'PASS') -> dict:
+    return {**_payload(verdict, issues=[]), 'note_dispositions': raw}
+
+
+class TestNoteDispositions:
+    @pytest.mark.parametrize('shape', ['flat', 'envelope'])
+    def test_dispositions_normalise_to_typed_values_in_order(self, shape: str):
+        payload = _with_notes([dict(_ADDRESSED_RAW), dict(_WORK_RAW)])
+        artifact = (
+            payload if shape == 'flat'
+            else _verdict_tools._envelope(_REVIEWER, 'sid', payload)
+        )
+
+        assert normalize_review(artifact).note_dispositions == (_ADDRESSED, _WORK)
+
+    def test_absent_or_null_dispositions_are_empty(self):
+        assert normalize_review(_payload('PASS', issues=[])).note_dispositions == ()
+        assert normalize_review(_with_notes(None)).note_dispositions == ()
+        assert parse_note_dispositions(None) == ()
+
+    def test_error_verdict_drops_dispositions(self):
+        payload = normalize_review(_with_notes([dict(_ADDRESSED_RAW)], verdict='ERROR'))
+
+        assert payload.note_dispositions == ()
+
+    def test_error_payload_with_dispositions_is_rejected_at_construction(self):
+        with pytest.raises(ReviewPayloadError):
+            ReviewPayload(
+                Verdict.ERROR, issues=(), reviewer='r', note_dispositions=(_ADDRESSED,),
+            )
+
+    def test_non_list_value_raises_naming_the_value(self):
+        with pytest.raises(ReviewPayloadError, match='addressed-everything'):
+            normalize_review(_with_notes('addressed-everything'))
+
+    @pytest.mark.parametrize(
+        ('entry', 'named'),
+        [
+            pytest.param('esc-42-2', 'str', id='entry-not-a-mapping'),
+            pytest.param(
+                {'disposition': 'work', 'rationale': 'r'}, 'escalation_id', id='missing-id',
+            ),
+            pytest.param(
+                {'escalation_id': '  ', 'disposition': 'work', 'rationale': 'r'},
+                "'  '",
+                id='blank-id',
+            ),
+            pytest.param(
+                {'escalation_id': 7, 'disposition': 'work', 'rationale': 'r'}, '7', id='int-id',
+            ),
+            pytest.param(
+                {'escalation_id': 'esc-42-2', 'disposition': 'fixed', 'rationale': 'r'},
+                'fixed',
+                id='unknown-disposition',
+            ),
+            pytest.param(
+                {'escalation_id': 'esc-42-2', 'disposition': 'work'}, 'rationale', id='missing-rationale',
+            ),
+            pytest.param(
+                {'escalation_id': 'esc-42-2', 'disposition': 'work', 'rationale': ['r']},
+                r"\['r'\]",
+                id='non-str-rationale',
+            ),
+        ],
+    )
+    def test_malformed_entry_raises_naming_its_index_and_value(self, entry: object, named: str):
+        with pytest.raises(ReviewPayloadError, match=named) as raised:
+            normalize_review(_with_notes([dict(_ADDRESSED_RAW), entry]))
+
+        assert 'entry 1' in str(raised.value)
+        assert _REVIEWER in str(raised.value)
+
+    def test_unknown_disposition_lists_the_valid_values(self):
+        entry = {'escalation_id': 'esc-42-2', 'disposition': 'fixed', 'rationale': 'r'}
+
+        with pytest.raises(ReviewPayloadError) as raised:
+            parse_note_dispositions([entry], reviewer=_REVIEWER)
+
+        for value in ReviewerDisposition:
+            assert repr(value.value) in str(raised.value)
+
+    def test_duplicated_escalation_id_names_both_indices(self):
+        duplicate = {**_WORK_RAW, 'escalation_id': 'esc-42-1'}
+
+        with pytest.raises(ReviewPayloadError, match='esc-42-1') as raised:
+            parse_note_dispositions(
+                [dict(_ADDRESSED_RAW), dict(_WORK_RAW), duplicate], reviewer=_REVIEWER,
+            )
+
+        assert 'entries 0 and 2' in str(raised.value)
+
+    def test_to_record_carries_dispositions_and_round_trips(self):
+        payload = normalize_review(_with_notes([dict(_ADDRESSED_RAW), dict(_WORK_RAW)]))
+        record = payload.to_record()
+
+        assert record['note_dispositions'] == [_ADDRESSED_RAW, _WORK_RAW]
+        assert type(record['note_dispositions'][0]['disposition']) is str
+        json.dumps(record)
+        assert normalize_review(record) == payload
+
+    def test_to_record_without_dispositions_keeps_the_four_keys(self):
+        record = normalize_review(_payload('PASS', issues=[])).to_record()
+
+        assert set(record) == {'reviewer', 'verdict', 'issues', 'summary'}
+
+    def test_note_disposition_is_frozen(self):
+        pytest.raises(
+            dataclasses.FrozenInstanceError, setattr, _ADDRESSED, 'rationale', 'other',
+        )
 
 
 def _task_artifacts(root: Path) -> TaskArtifacts:

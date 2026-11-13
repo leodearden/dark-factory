@@ -1,0 +1,692 @@
+prd: plans/review-all-s1-one-escalation-filing-entry-point-prd.md
+schema_version: 1
+signal_leaves: ["ω", "λ2", "μ"]
+tasks:
+  - label: "α"
+    task_id: 9686
+    title: "The filing entry point: escalation/filing.py, the registry of system escalation ids and the level-parameterised open-record lookup"
+    note: "Keys fk-7d1f3a0d12ca, fk-333277fb4bd7, fk-32903f2e64e0; carries fk-14e1510916ab (task 6609 cancelled into α). Deps: 9181 (S3 ι, server.py order; transitively 9157 S3 β, the deliver_on and _mutate_pending substrate, and S2 β2 through 9177 under S2-3 (a)); S2 α (wave 3; Leo's S2-3 (a), applied to S1/OQ-4 by the lead). Lead edges: 9188 (S3 ε1) and 9187 (S10 β1) depend on β, not α. Priority high."
+    capabilities:
+      - name: "filing-module"
+        binding: "built here — escalation/src/escalation/filing.py (C1); absent at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["escalation/src/escalation/filing.py"]
+          expect: present
+      - name: "filer-class"
+        binding: "built here — EscalationFiler with file / file_soon / file_blocking / drain / resolve_filed (C1); no match at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class EscalationFiler\\b"
+          paths: ["escalation/src/"]
+          expect: present
+      - name: "refresh-open-dedup-member"
+        binding: "built here — RefreshOpen in the Dedup sum type (C1, D13); no match at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RefreshOpen\\b"
+          paths: ["escalation/src/"]
+          expect: present
+      - name: "chokepoint-closure-gone"
+        binding: "anti-inversion (α) — the definition server.py::create_server._chokepoint_or_submit present at a85cb1ad78; scanned over all of escalation/src so a move into S3's filing_tools.py cannot pass it; anchored on the def line so prose mentions in comments cannot hold it red"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _chokepoint_or_submit\\("
+          paths: ["escalation/src/"]
+          expect: absent
+      - name: "attach-or-submit-split"
+        binding: "anti-inversion (α) — dedupe.py::attach_or_submit present at a85cb1ad78; it splits into attach_to_parent and the filer's own write (D6), so row 20 sees only escalation.filing"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def attach_or_submit\\("
+          paths: ["escalation/src/escalation/dedupe.py"]
+          expect: absent
+      - name: "has-open-level-parameterised"
+        binding: "built here — EscalationQueue.has_open(task_id, *, level, ...) (C3); only has_open_l1 exists at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def has_open\\("
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: present
+      - name: "sentinel-registry"
+        binding: "built here — escalation/src/escalation/models.py::Sentinel StrEnum (C3), values byte-identical to today's literals, dunder and prefix forms (D2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class Sentinel\\(StrEnum\\)"
+          paths: ["escalation/src/escalation/models.py"]
+          expect: present
+      - name: "role-predicate-in-models"
+        binding: "built here — models.is_harness_sentinel_role (moved from server.py::_is_harness_sentinel_role; task 6609's residue)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_harness_sentinel_role\\("
+          paths: ["escalation/src/escalation/models.py"]
+          expect: present
+      - name: "offload-entry-shape"
+        binding: "built here — D1 (OQ-1, ruled by Leo 2026-11-12): offload decided by entry point (file / file_soon / file_blocking), not a FilingPolicy field; file_blocking refuses on a loop thread with FilingOnLoopThread (boundary row 6); no match at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class FilingOnLoopThread\\b"
+          paths: ["escalation/src/"]
+          expect: present
+      - name: "promotion-policy-shape"
+        binding: "built here — D3 (OQ-7, ruled by the lead): FilingPolicy.promoted_l2(root_cause) stamps level 2 with no role downgrade and no claimant lookup, and refuses any dedup but RootCause (boundary row 10b); no match at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def promoted_l2\\("
+          paths: ["escalation/src/"]
+          expect: present
+      - name: "eval-lane-scope"
+        binding: "built here — D14 (OQ-8, ruled by Leo 2026-11-12): EvalLaneScope.ABOVE_L0 by default, ALL_LEVELS for the ladder MCP tools; the door does not contain an in-process level-0 record, a backstop for the future (boundary rows 4, 4b); no match at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class EvalLaneScope\\(StrEnum\\)"
+          paths: ["escalation/src/"]
+          expect: present
+      - name: "notify-delivery-substrate"
+        binding: "substrate — producer:task-9157 (S3 β, C4 set_notify_callback(..., deliver_on=loop) and _mutate_pending) upstream of α through 9181; the off-loop write and RefreshOpen need it (dedupe.py's comment above submit_or_dedupe_off_loop)"
+        verdict: PASS
+      - name: "observed-response-substrate"
+        binding: "`grep:escalation/src/escalation/queue.py::observed_submit_response` substrate; the filer returns Filed/Unpersisted from it unchanged"
+        verdict: PASS
+      - name: "category-registry-substrate"
+        binding: "`grep:escalation/src/escalation/categories.py::EscalationCategory` `grep:escalation/src/escalation/categories.py::require_registered_category` substrate"
+        verdict: PASS
+      - name: "eval-lane-predicate-substrate"
+        binding: "`grep:shared/src/shared/eval_lane.py::eval_lane_provenance` substrate (C2 step 3)"
+        verdict: PASS
+      - name: "fold-mechanics-substrate"
+        binding: "`grep:escalation/src/escalation/dedupe.py::resolve_dedupe_parent` `grep:escalation/src/escalation/dedupe.py::DedupeConfig` substrate (Fingerprint dedup)"
+        verdict: PASS
+      - name: "born-at-l2-vocabulary-substrate"
+        binding: "`grep:escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES` `grep:escalation/src/escalation/models.py::HARNESS_SENTINEL_ROLE_PREFIXES` substrate"
+        verdict: PASS
+  - label: "β"
+    task_id: 9688
+    title: "Every other escalation-package filer, including the watcher's promotion to level 2, files through the entry point"
+    note: "Key fk-0d31f1114911. Deps: α; task 7300. Lead edges 9188 (S3 ε1) → β and 9187 (S10 β1) → β (OQ-6, lead); 9188 and 9200 (S3 ζ) amended to bind the filer (OQ-3, lead); S2 γ, δ and ε (the caller-identity leaf) → β (Leo's S2-3 (a)). Priority high."
+    capabilities:
+      - name: "server-direct-writes-gone"
+        binding: "anti-inversion (β) — code lines writing through queue.submit/submit_resolved in server.py: 5 at a85cb1ad78 (_file_markup_residue, _submit_or_dedupe's L2 branch, eval-lane containment, terminal auto-resolve, promote_to_l2's create); α removes three, β the rest"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^\\s*(return |[a-z_]+ = )?queue\\.submit(_resolved)?\\("
+          paths: ["escalation/src/escalation/server.py"]
+          expect: absent
+      - name: "promotion-through-the-door"
+        binding: "built here — promote_to_l2's create step files with FilingPolicy.promoted_l2(root_cause) (D3, OQ-7); no call at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FilingPolicy\\.promoted_l2\\("
+          paths: ["escalation/src/"]
+          expect: present
+      - name: "note-to-file-filer-moved"
+        binding: "anti-inversion (β) — note_to_file.py::file_note_to_file present at a85cb1ad78; becomes C2 step 6"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def file_note_to_file\\("
+          paths: ["escalation/src/"]
+          expect: absent
+      - name: "submit-cli-through-filer"
+        binding: "built here — escalation/src/escalation/submit.py files with EscalationFiler.file_blocking"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "file_blocking\\("
+          paths: ["escalation/src/escalation/submit.py"]
+          expect: present
+      - name: "storm-filer-substrate"
+        binding: "`grep:escalation/src/escalation/guard_storm_alarm.py::file_storm_once` substrate; its amend-on-open note is kept, its write goes through the filer"
+        verdict: PASS
+      - name: "s3-merge-tools-bind-the-filer"
+        binding: "lead edges 9188 → β and 9187 → β and the amendments of 9188/9200 and the S3 PRD's C7a (register_merge_tools takes the filer; ζ registers escalate_* over it) — a lead action, not code"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "A lead action, not code: the lead confirms 9188 and 9187 depend on β and that 9188's and 9200's descriptions and the S3 PRD's C7a bind EscalationFiler instead of filing_tools.submit_or_dedupe / _chokepoint_or_submit (OQ-3 and OQ-6, both ruled by the lead)."
+  - label: "γ"
+    task_id: 9713
+    title: "A typed outcome for task status writes, and one file-then-block helper for the deterministic runner"
+    note: "Key fk-0ee68c0948ab (helper + the runner's 8 arms). Deps: α; 9191 (S10 β2, end of the deterministic_runner.py chain). S2 θ2 (wave 3) depends on γ. Subsumes tasks 3887 and 8355 (cancelled into γ)."
+    capabilities:
+      - name: "status-write-module"
+        binding: "built here — orchestrator/src/orchestrator/status_write.py (C6)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/status_write.py"]
+          expect: present
+      - name: "runner-tails-through-file-and-block"
+        binding: "built here — DeterministicRunner's five _file_*_and_block tails call file_and_block"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "file_and_block\\("
+          paths: ["orchestrator/src/orchestrator/deterministic_runner.py"]
+          expect: present
+      - name: "rejection-type-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::SetTaskStatusRejected` `grep:orchestrator/src/orchestrator/scheduler.py::TerminalExitRejection` substrate (row_already_terminal, error_code)"
+        verdict: PASS
+  - label: "δ"
+    task_id: 9715
+    title: "One workflow filing helper for the task workflow's escalations, each emitting escalation_created"
+    note: "Keys fk-9c72e4399b4e, fk-0ee68c0948ab (the workflow's 4 arms). Deps: α, γ, λ2 (workflow.py: λ2 takes the end of the wave-2 order, δ follows); 9232 (S8 κ1, end of the wave-2 workflow.py chain) through λ2. Carries Leo's sentence: the eval cell factory passes no filer, and a test asserts it (boundary row 14b)."
+    capabilities:
+      - name: "workflow-filing-helper"
+        binding: "built here — TaskWorkflow._file_escalation (C7), with an agent_role parameter for the architect desync filing; no such method at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _file_escalation\\("
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+      - name: "event-type-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/event_store.py::EventType` substrate (escalation_created, read by evals/reviewer_trial/mining.py)"
+        verdict: PASS
+  - label: "ε1"
+    task_id: 9716
+    title: "The merge lane's escalation port takes a draft and a policy; the gate-measurement storm sink folds into it"
+    note: "Key fk-2e0a4419290b (port half). Deps: α; 9136 (S7 α1), 9154 (S7 ζ), 9188 (S3 ε1, end of worker.py), 9150 (S4 μ0, end of ports.py), 8528 (R55; parked at filing)."
+    capabilities:
+      - name: "port-file-soon"
+        binding: "built here — EscalationPort.file_soon (C4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def file_soon\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/ports.py"]
+          expect: present
+      - name: "worker-raw-submits-gone"
+        binding: "anti-inversion (ε1) — 5 escalation_queue.submit( lines in worker.py at a85cb1ad78; S6 δ/ζ/φ move two of them out first, ε1 converts the rest"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "escalation_queue\\.submit\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/worker.py"]
+          expect: absent
+      - name: "storm-sink-substrate"
+        binding: "substrate — producer:task-9136 (S7 α1 creates merge_lane/gate_measurement.py::StormEscalationSink, which ε1 deletes); upstream by edge"
+        verdict: PASS
+      - name: "port-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/ports.py::EscalationPort` `grep:orchestrator/src/orchestrator/merge_lane/ports.py::escalation_port` substrate"
+        verdict: PASS
+  - label: "ε2a"
+    task_id: 9722
+    title: "The merge lane's liveness, request-ledger, verify-base and skew-tripwire alarms file through the port"
+    note: "Key fk-2e0a4419290b (contributes). Deps: ε1; 9270 (S5 ο0), 9255 (S5 α), 8493, 8528."
+    capabilities:
+      - name: "satellite-raw-submits-gone"
+        binding: "anti-inversion (ε2a) — 5 escalation_queue.submit( lines across liveness.py (2), request_ledger.py, verify_base_detector.py and skew_tripwire.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "escalation_queue\\.submit\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/liveness.py", "orchestrator/src/orchestrator/merge_lane/request_ledger.py", "orchestrator/src/orchestrator/merge_lane/verify_base_detector.py", "orchestrator/src/orchestrator/merge_lane/skew_tripwire.py"]
+          expect: absent
+  - label: "ε2b"
+    task_id: 9723
+    title: "The merge lane's shadow, landing-evidence, member re-drive and intake-buffer alarms file through the port"
+    note: "Key fk-2e0a4419290b (closes). Deps: ε2a; 9150 (S4 μ0), 9201 (S6 μ), 9182 (S6 ζ), 8528. Task 8665 (amended) depends on ε2b."
+    capabilities:
+      - name: "lane-raw-submits-gone"
+        binding: "anti-inversion (ε2b) — 6 escalation_queue.submit( lines in shadow.py (3), landing_evidence.py (2) and intake_buffers.py at a85cb1ad78 (16 across merge_lane/; ε1 and ε2a remove the rest); scoped to ε2b's files so S6's new halt/main-health/lifecycle modules, which ε3 converts later, cannot hold it red"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "escalation_queue\\.submit\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/shadow.py", "orchestrator/src/orchestrator/merge_lane/landing_evidence.py", "orchestrator/src/orchestrator/merge_lane/intake_buffers.py"]
+          expect: absent
+      - name: "shadow-level-one-dedup-gone"
+        binding: "anti-inversion (ε2b) — 3 has_open_l1( dedup calls in shadow.py guarding level-2 filings at a85cb1ad78 (they never match an L2; D3)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "has_open_l1\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/shadow.py"]
+          expect: absent
+  - label: "ε3"
+    task_id: 9725
+    title: "The merge lane's halt-owner, auto-heal and lifecycle-refusal escalations file through the port"
+    note: "Keys fk-2e0a4419290b, fk-9c72e4399b4e (contribute). Deps: ε2b, ζ2 (harness.py); 9176 (S6 θ), 9171 (S6 δ), 9186 (S6 φ), 9193 (S3 ε2), 9201 (S6 μ), 9236 (S8 ω), 8528. Lead notes on 9176, 9171, 9186 name C10 without changing their work; ε3 applies it."
+    capabilities:
+      - name: "halt-state-takes-port"
+        binding: "built here — HaltState files through the widened port with FilingPolicy.none(level=1) (C10) in place of S6 C7's submit_halt_owner; anchored on FilingPolicy, which no S6 task can write before S1 α exists; halt.py has no match at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FilingPolicy\\."
+          paths: ["orchestrator/src/orchestrator/merge_lane/halt.py"]
+          expect: present
+      - name: "auto-heal-takes-port"
+        binding: "built here — MainHealthAutoHeal files with FilingPolicy.folded(<main-health DedupeConfig>) through the widened port (C10) in place of S6 C3's bound submit_or_dedupe; anchored on FilingPolicy, which no S6 task can write before S1 α exists; merge_lane/main_health.py does not exist at a85cb1ad78 (S6 δ creates it)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FilingPolicy\\."
+          paths: ["orchestrator/src/orchestrator/merge_lane/main_health.py"]
+          expect: present
+      - name: "lane-record-type-gone"
+        binding: "anti-inversion (ε3) — merge_lane/types.py::EscalationRecord (re-exported by merge_lane/__init__.py, used by ports.py, worker.py and, after S6 θ, halt.py) present at a85cb1ad78; EscalationDraft replaces it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class EscalationRecord\\b"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: absent
+      - name: "s6-lane-filers-substrate"
+        binding: "substrate — producer:task-9176 producer:task-9171 producer:task-9186 (S6 θ, δ, φ create the halt-owner, auto-heal and lifecycle-refusal filers ε3 moves onto the port); upstream by edge"
+        verdict: PASS
+  - label: "ζ1"
+    task_id: 9727
+    title: "Scheduler sentinel alarms built as drafts and policies; sentinel_l1.py deleted"
+    note: "Key fk-cd446ff3da74 (contributes). Deps: α; 9234 (S8 μ1, end of scheduler.py); task 7718. Subsumes task 6942 (cancelled into ζ1)."
+    capabilities:
+      - name: "sentinel-l1-helper-gone"
+        binding: "anti-inversion (ζ1) — orchestrator/src/orchestrator/sentinel_l1.py exists at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/sentinel_l1.py"]
+          expect: absent
+      - name: "scheduler-inline-sentinels-gone"
+        binding: "anti-inversion (ζ1) — Scheduler._FM_READ_STORM_SENTINEL (5 lines in scheduler.py at a85cb1ad78); the registry's Sentinel member replaces it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_FM_READ_STORM_SENTINEL\\b"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: absent
+  - label: "ζ2"
+    task_id: 9731
+    title: "One scheduler escalation port replacing seven escalation callbacks"
+    note: "Keys fk-cd446ff3da74 (closes), fk-0ee68c0948ab (2 arms). Deps: ζ1, γ; 9236 (S8 ω, end of harness.py; S8 ζ1a/ζ1b moved the callbacks). S17 θ and S17 δ2 (wave 3) depend on ζ2; S17's two scheduler filers are born at level 2 through C5 and land after ζ2."
+    capabilities:
+      - name: "scheduler-port-module"
+        binding: "built here — orchestrator/src/orchestrator/scheduler_escalations.py (C5)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/scheduler_escalations.py"]
+          expect: present
+      - name: "seven-hooks-gone"
+        binding: "anti-inversion (ζ2) — the SchedulerCallbacks.on_warm_base_promote_l2 field and its harness wiring (one of the seven) present at a85cb1ad78; anchored on the declaration/keyword so comment mentions cannot hold it red"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "on_warm_base_promote_l2\\s*[:=]"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "callbacks-owner-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::SchedulerCallbacks` substrate (S8 owns it; ζ2 adds one field, removes seven)"
+        verdict: PASS
+      - name: "s8-filer-modules-substrate"
+        binding: "substrate — producer:task-9226 producer:task-9227 (S8 ζ1a/ζ1b create dispatch_gate_filers.py / infra_filers.py holding the seven callbacks); upstream through 9236"
+        verdict: PASS
+  - label: "η1"
+    task_id: 9755
+    title: "Harness dispatch-gate, infrastructure and escalation-sweep filers through the entry point; born_at_l2.py deleted"
+    note: "Keys fk-7d1f3a0d12ca (contributes), fk-0ee68c0948ab (3 arms). Deps: ζ2 (same files); through it 9236. Task 8926 is done (its helper escalation/file_or_refresh.py is on main; η1 moves the dirty-tree caller onto RefreshOpen). Task 8826 is upstream through S8 ζ1b."
+    capabilities:
+      - name: "born-at-l2-helper-gone"
+        binding: "anti-inversion (η1) — orchestrator/src/orchestrator/born_at_l2.py exists at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/born_at_l2.py"]
+          expect: absent
+      - name: "born-at-l2-callers-gone"
+        binding: "anti-inversion (η1) — file_deduped_born_at_l2 called from lane_record_divergence.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "file_deduped_born_at_l2"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "s8-sweeps-module-substrate"
+        binding: "substrate — producer:task-9228 (S8 ζ2 creates escalation_record_sweeps.py); upstream through 9236"
+        verdict: PASS
+  - label: "η2"
+    task_id: 9759
+    title: "The filings that stay in harness.py, the drift detectors and the harness's remaining swallowed status writes"
+    note: "Keys fk-0ee68c0948ab (6 arms), fk-7d1f3a0d12ca (contributes). Deps: η1 and κ1 (they convert the two landed callers of escalation/file_or_refresh.py, task 8926's helper, which η2 deletes with escalation/tests/test_file_or_refresh.py), ε3 (harness.py; η2 is S1's last leaf on it); 9166 (S4 ρ, end of verify_runner.py and merge_lane/drift.py); 9218 (S8 β, the third caller) through ε3 → 9236."
+    capabilities:
+      - name: "harness-raw-submits-gone"
+        binding: "anti-inversion (η2) — 22 _escalation_queue.submit( lines in harness.py at a85cb1ad78 (23 at ba17934861; task 8926 moved the dirty-tree filer onto file_or_refresh); S8 moves most; ζ2, η1 and η3 convert the moved ones; η2 removes the rest"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_escalation_queue\\.submit\\("
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+      - name: "abandoned-member-sweep-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/merge_deferred_recovery.py::AbandonedMemberSweep` substrate (task 4737; why fk-1b573c2428c2 is fixed:2ef04c8241)"
+        verdict: PASS
+  - label: "η3"
+    task_id: 9763
+    title: "Harness filings in the modules the composition-root refactor creates: session-resume storm, stranded reconcile, deterministic recon, stranded verified-green"
+    note: "Keys fk-7d1f3a0d12ca (contributes), fk-0ee68c0948ab (1 arm). Deps: α, γ; 9220 (S8 γ), 9224 (S8 ε2b), 9225 (S8 ε3), 9213 (S9 θ), 9188 (S3 ε1, end of stranded_reconcile.py), 9236."
+    capabilities:
+      - name: "stranded-reconcile-builds-drafts"
+        binding: "built here — stranded_reconcile.py's two filings build EscalationDraft values; the module does not exist at a85cb1ad78 (S8 ε2a creates it)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "EscalationDraft\\("
+          paths: ["orchestrator/src/orchestrator/stranded_reconcile.py"]
+          expect: present
+      - name: "session-resume-storm-builds-drafts"
+        binding: "built here — session_resume_storm.py's storm L1 builds an EscalationDraft; the module does not exist at a85cb1ad78 (S8 γ creates it)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "EscalationDraft\\("
+          paths: ["orchestrator/src/orchestrator/session_resume_storm.py"]
+          expect: present
+      - name: "extracted-modules-substrate"
+        binding: "substrate — producer:task-9220 producer:task-9223 producer:task-9224 producer:task-9225 producer:task-9213 (S8 γ, ε2a, ε2b, ε3 and S9 θ create the four modules η3 converts); upstream by edge"
+        verdict: PASS
+  - label: "θ1a"
+    task_id: 9769
+    title: "Fused-memory's folded escalation filer gets an async twin; the on-loop emitters await it"
+    note: "Key fk-1bf4bfa8be04. Deps: α, β; task 4809; 9280 (S10 μ2, end of server/tools.py); task 5270; S19 β2 (wave 3). S15 ε4 (wave 3) depends on θ1a (server/tools.py). Declares escalators/folded_escalation.py (S19/OQ-4 (b)). Checks anchor on a glob that matches both the pre- and post-move path of folded_escalation."
+    capabilities:
+      - name: "async-folded-filer"
+        binding: "built here — afile_folded_escalation (C9); anchored on the def over fused-memory/src/*folded_escalation.py so S19 γ's move to escalators/folded_escalation.py (S19/OQ-4 (b)) cannot make it vacuous"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def afile_folded_escalation\\("
+          paths: ["fused-memory/src/*folded_escalation.py"]
+          expect: present
+      - name: "call-site-offload-prose-gone"
+        binding: "anti-inversion (θ1a) — the 'ASYNC ON PURPOSE' docstring in server/tools.py at a85cb1ad78 (S19 does not move server/tools.py)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ASYNC ON PURPOSE"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: absent
+      - name: "folded-filer-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/middleware/_folded_escalation.py::file_folded_escalation` substrate (its anchor-uniqueness test is kept; S19 γ moves the module to escalators/folded_escalation.py (S19/OQ-4 (b)))"
+        verdict: PASS
+  - label: "θ1b"
+    task_id: 9789
+    title: "The other eight fused-memory folded-escalation callers pass typed anchors"
+    note: "Key fk-1bf4bfa8be04 (contributes). Deps: θ1a; S19 γ (wave 3). 14 files: the two spies of converted callers (tests/server/test_write_triage.py, tests/test_memory_metadata_census.py) read the keyword θ1b replaces. θ2 (which depends on θ1b) removes C9's transitional anchor_task_id keyword. Checks anchor on globs that match both the pre- and post-move paths."
+    capabilities:
+      - name: "string-anchors-gone"
+        binding: "anti-inversion (θ1b) — anchor_task_id as a whole word at the 8 keyword call sites (one per caller module) at a85cb1ad78; θ1a keeps the keyword transitional and θ2 removes it after converting the twelfth caller. Word-bounded so memory_metadata_census.py::writer_anchor_task_id, a function name, cannot hold it red"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\banchor_task_id\\b"
+          paths: ["fused-memory/src/*link_heal_executor.py", "fused-memory/src/*candidate_key_escalation.py", "fused-memory/src/*referent_repair_storm_escalator.py", "fused-memory/src/*server/write_triage.py", "fused-memory/src/*classification_fallback_alarm.py", "fused-memory/src/*journal_growth_alarm.py", "fused-memory/src/*mem0_retry_backlog_alarm.py", "fused-memory/src/*memory_metadata_census.py"]
+          expect: absent
+  - label: "θ2"
+    task_id: 9792
+    title: "Fused-memory escalators that build their own queue file through the entry point; the ticket janitor's outage alarm folds"
+    note: "Keys fk-7d1f3a0d12ca, fk-333277fb4bd7 (contribute). Deps: α, θ1b; S19 γ (wave 3; it moves the dead-letter escalator to services/dead_letter_escalator.py, S19 D5). Subsumes tasks 6348 and 6689 (cancelled into θ2). Converts the ticket janitor's curation-backlog alarm (the twelfth C9 caller) and removes C9's transitional anchor_task_id keyword; 13 files (adds escalators/folded_escalation.py (S19/OQ-4 (b)) and tests/test_folded_escalation.py)."
+    capabilities:
+      - name: "transitional-anchor-keyword-gone"
+        binding: "anti-inversion (θ2) — anchor_task_id as a whole word in the C9 filer and the ticket janitor: 11 lines at a85cb1ad78, as at c9ab19766a (10 in middleware/_folded_escalation.py, 1 at the janitor's asyncio.to_thread(file_folded_escalation, …) call); θ2 converts the janitor's call, the last caller, and removes the keyword; globs match both the middleware/ and S19 γ's escalators/ layout (S19/OQ-4 (b))"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\banchor_task_id\\b"
+          paths: ["fused-memory/src/*folded_escalation.py", "fused-memory/src/*middleware/ticket_janitor.py"]
+          expect: absent
+      - name: "escalator-queue-constructions-gone"
+        binding: "anti-inversion (θ2) — 7 EscalationQueue( constructions in the six escalators at a85cb1ad78; anchored on globs (*_escalator.py, */ticket_janitor.py) that match both the middleware/ and S19 γ's escalators/ layout (S19/OQ-4 (b)), so the move cannot make it vacuous"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "EscalationQueue\\("
+          paths: ["fused-memory/src/*_escalator.py", "fused-memory/src/*/ticket_janitor.py"]
+          expect: absent
+  - label: "ι1"
+    task_id: 9797
+    title: "Recon escalation registry: one declaration per recon alarm category"
+    note: "Key fk-b7b0be25c6b4. Deps: α; 9254 (S10 λ, end of reconciliation/harness.py), 9251 (S10 κ2, orphaned_recon_escalation_sweep.py); task 5270; S19 β2 and S2 η (wave 3). Only S12 ε depends on ι1 (lead S12/OQ-7; S12 η2 and θ reach it through ε); S12 β1 and ι1 are unordered on recon harness.py (lead S12/OQ-7)."
+    capabilities:
+      - name: "recon-registry-module"
+        binding: "built here — fused-memory/src/fused_memory/reconciliation/recon_escalations.py (C8)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/reconciliation/recon_escalations.py"]
+          expect: present
+      - name: "hand-kept-fold-list-gone"
+        binding: "anti-inversion (ι1) — reconciliation/harness.py::_RECON_DEDUP_CONFIG present at a85cb1ad78 (definition, uses and prose pointers in three modules)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_RECON_DEDUP_CONFIG"
+          paths: ["fused-memory/src/"]
+          expect: absent
+  - label: "ι2"
+    task_id: 9806
+    title: "The other recon filers and the recon backfill script through the entry point; dedupe.file_or_fold_l1 deleted"
+    note: "Key fk-7d1f3a0d12ca (contributes). Deps: ι1, β; 9285 (S10 ο, end of stage1_stall_detector.py and targeted.py); S19 β2 (wave 3). Task 7070 is answered by α's typed subject; ι2 retires index_drift_detector.py's REFACTOR TRIGGER."
+    capabilities:
+      - name: "fingerprint-l1-helper-gone"
+        binding: "anti-inversion (ι2) — dedupe.py::file_or_fold_l1 present at a85cb1ad78 (5 callers; β migrates mismatch_streak.py, ι2 the four fused-memory ones)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def file_or_fold_l1\\("
+          paths: ["escalation/src/"]
+          expect: absent
+      - name: "backfill-resubmit-gone"
+        binding: "anti-inversion (ι2) — backfill_recon_escalations.py::apply_plan resubmits a mutated canonical with queue.submit(canonical) at a85cb1ad78; it moves onto a public queue mutator over S3 C4"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "queue\\.submit\\(canonical\\)"
+          paths: ["fused-memory/scripts/backfill_recon_escalations.py"]
+          expect: absent
+  - label: "κ1"
+    task_id: 9808
+    title: "Escalation router, L0 promotion, zero-progress requeue, startup steps and process supervision file through the entry point"
+    note: "Key fk-7d1f3a0d12ca (contributes). Deps: α (task 8926, the draft's edge, is done). S2 θ2 (wave 3) depends on κ1; η2 depends on κ1 (it deletes escalation/file_or_refresh.py, whose startup_steps.py caller κ1 converts). κ1 keeps router_owns' eval-lane exclusion (Leo's hermeticity rule)."
+    capabilities:
+      - name: "ladder-module-id-minting-gone"
+        binding: "anti-inversion (κ1) — make_id( calls in the five modules: 5 at a85cb1ad78 (6 at ba17934861; startup_steps.py's moved into file_or_refresh); the filer mints ids"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "make_id\\("
+          paths: ["orchestrator/src/orchestrator/escalation_router.py", "orchestrator/src/orchestrator/l0_promotion.py", "orchestrator/src/orchestrator/zero_progress_requeue.py", "orchestrator/src/orchestrator/startup_steps.py", "orchestrator/src/orchestrator/proc_supervision.py"]
+          expect: absent
+  - label: "κ2"
+    task_id: 9810
+    title: "Markup sink, flake-debt drain, offline-lane and merge-deferred recovery file through the entry point"
+    note: "Key fk-333277fb4bd7 (contributes). Deps: α, β; task 7128. S17 μ (wave 3) depends on κ2 (mcp/markup_sink.py)."
+    capabilities:
+      - name: "four-module-id-minting-gone"
+        binding: "anti-inversion (κ2) — make_id( calls in the four modules at a85cb1ad78 (6)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "make_id\\("
+          paths: ["orchestrator/src/orchestrator/mcp/markup_sink.py", "orchestrator/src/orchestrator/flake_debt_drain.py", "orchestrator/src/orchestrator/offline_lane_escalations.py", "orchestrator/src/orchestrator/merge_deferred_recovery.py"]
+          expect: absent
+      - name: "sink-eval-lane-copy-gone"
+        binding: "anti-inversion (κ2) — make_escalation_sink's own eval_lane_provenance call at a85cb1ad78 (C2 step 3 replaces it); anchored on the call, not the import or prose"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "eval_lane_reason = eval_lane_provenance\\("
+          paths: ["orchestrator/src/orchestrator/mcp/markup_sink.py"]
+          expect: absent
+  - label: "κ3"
+    task_id: 9811
+    title: "Exit contract, recovery emission, slot lease, review checkpoint, provenance conflict, flake recorder and lane lifecycle file through the entry point"
+    note: "Key fk-7d1f3a0d12ca (contributes). Deps: α; 9284 (S9 ν), 9224 (S8 ε2b), 9216 (S8 α), 9150 (S4 μ0), 9283 (S10 ξ), 9262 (S5 κ). The draft's κ3 → ζ1 rested only on a shared test file and is not wired (lead, 2026-11-12). S2 θ2 (wave 3) depends on κ3."
+    capabilities:
+      - name: "seven-module-id-minting-gone"
+        binding: "anti-inversion (κ3) — make_id( calls in six of the seven modules at a85cb1ad78 (slot_lease.py takes its id from its caller)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "make_id\\("
+          paths: ["orchestrator/src/orchestrator/exit_contract.py", "orchestrator/src/orchestrator/recovery_emission.py", "orchestrator/src/orchestrator/review_checkpoint.py", "orchestrator/src/orchestrator/provenance_conflict.py", "orchestrator/src/orchestrator/flake_recorder.py", "orchestrator/src/orchestrator/lane_lifecycle.py"]
+          expect: absent
+      - name: "slot-lease-builder-gone"
+        binding: "anti-inversion (κ3) — slot_lease.py returns a hand-built Escalation at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "return Escalation\\("
+          paths: ["orchestrator/src/orchestrator/slot_lease.py"]
+          expect: absent
+  - label: "κ4"
+    task_id: 9841
+    title: "The steward's level-1 re-escalation through the entry point"
+    note: "Key fk-7d1f3a0d12ca (contributes). Deps: α; 9190 (S9 ε), 9229 (S8 θ, end of steward.py). S2 θ2 (wave 3) depends on κ4. Boundary row 23 reproduces S9 ε's row 15c."
+    capabilities:
+      - name: "steward-constructions-gone"
+        binding: "anti-inversion (κ4) — 2 EscModel( constructions in steward.py at a85cb1ad78 (_auto_escalate_to_human's L1 and _pre_triage_suggestions' copy); EscModel.from_dict stays (attribute access)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "EscModel\\("
+          paths: ["orchestrator/src/orchestrator/steward.py"]
+          expect: absent
+      - name: "steward-give-up-awaits-filing"
+        binding: "built here — TaskSteward._auto_escalate_to_human becomes async and awaits the filing (D1, OQ-9); sync at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _auto_escalate_to_human\\("
+          paths: ["orchestrator/src/orchestrator/steward.py"]
+          expect: present
+  - label: "λ1"
+    task_id: 9845
+    title: "Eval cells write nothing to production stores: transcripts under the eval root, a factory that refuses production stores, and a zero-write boundary check"
+    note: "No finding key (Leo's S1-2 ruling, 2026-11-12/13: parts 1, 3 and 4 of the eval-hermeticity task, carried in this plan). Priority medium. Deps: none (depends on no other S1 task); it opens the plan's evals/runner.py chain (μ → λ1, λ2 → μ; lead 2026-11-13, same-file rule); the filed same-file neighbours 8499 and 7765 take no edge. Files: evals/profile.py, evals/runner.py, tests/test_eval_boundary_suite.py, tests/test_eval_profile.py, tests/test_eval_cell_hermeticity.py (new)."
+    capabilities:
+      - name: "eval-profile-declares-transcript-root"
+        binding: "built here — EVAL_PROFILE gains transcript_archive.root, resolved under evals/snapshots.py::eval_worktree_root, so the parity tripwire (B1) declares it; no match in profile.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "transcript_archive\\.root"
+          paths: ["orchestrator/src/orchestrator/evals/profile.py"]
+          expect: present
+      - name: "cell-factory-refuses-production-stores"
+        binding: "built here — _cell_workflow raises EvalHermeticityError for a workflow holding an escalation queue, steward factory, event store or cost store (C11, boundary row 26); no match at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class EvalHermeticityError\\b"
+          paths: ["orchestrator/src/orchestrator/evals/"]
+          expect: present
+      - name: "zero-write-boundary-row"
+        binding: "built here — row B11 of the eval↔production boundary suite (boundary row 27): one recorded cell leaves the production queue directory, runs.db, the transcript archive and the stub task store unchanged; the suite stops at B10 at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\bB11\\b"
+          paths: ["orchestrator/tests/test_eval_boundary_suite.py"]
+          expect: present
+      - name: "eval-construction-point-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/evals/profile.py::EVAL_PROFILE` `grep:orchestrator/src/orchestrator/evals/runner.py::_cell_workflow` `grep:orchestrator/src/orchestrator/evals/snapshots.py::eval_worktree_root` substrate"
+        verdict: PASS
+  - label: "λ2"
+    task_id: 9855
+    title: "Eval verify logs under the eval root, and the design invariant that an eval run writes no production state"
+    note: "No finding key (Leo's S1-2 ruling: parts 2 and 5). Priority medium. Deps: λ1; μ (evals/runner.py, same-file rule, lead 2026-11-13); 9232 (S8 κ1, end of the wave-2 workflow.py chain, where the ruling places part 2). S1 δ → λ2 and ω → λ2, so λ2 waits on no door leaf. Mints eval-writes-no-production-state (the six wave-3 minting tasks take INV-18 to INV-23 in landing order, S17 ν's one-decision-partition-per-area last as INV-23; the lead wires the invariant-file chain at decompose; checks anchor on the slug). Signal leaf for the hermeticity rule."
+    capabilities:
+      - name: "workflow-verify-log-root-seam"
+        binding: "built here — build_workflow(..., verify_log_root=None) and the TaskWorkflow archive root it sets; the root is hard-coded as project_root / 'data' / 'verify-logs' at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_log_root"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+      - name: "eval-invariant-minted"
+        binding: "built here — the slug in docs/legibility/design-invariants.md (four-site lockstep edit, CONTRIBUTING.md §6)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "eval-writes-no-production-state"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+  - label: "μ"
+    task_id: 9849
+    title: "Run corpus eval cells under the production sandbox, give their setup the grants it needs, and mark the new baseline"
+    note: "No finding key (Leo's residual R-7 = A, 2026-11-13). Priority medium. Deps: λ1 (evals/runner.py: the overlay's same-file rule chains this plan's three tasks on that file, lead 2026-11-13; λ1 waits on no live task); λ2 follows μ. The filed same-file neighbours 8499 and 6748 take no edge. Grants: production's agents/write_set.py::compute_write_set (the declared conditional file). The separate eval clone (option C) is not part of it. Signal leaf for the sandbox ruling."
+    capabilities:
+      - name: "corpus-sandbox-override-gone"
+        binding: "anti-inversion (μ) — build_eval_orch_config's 'sandbox': SandboxConfig(enabled=False) override, present at a85cb1ad78; a corpus cell inherits base_config.sandbox (same backend and grants as production)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SandboxConfig\\(enabled=False\\)"
+          paths: ["orchestrator/src/orchestrator/evals/runner.py"]
+          expect: absent
+      - name: "cell-records-sandbox-backend"
+        binding: "built here — EvalMetrics.sandbox_backend (None on every result recorded before μ), so pre- and post-change corpus results are told apart; no match in metrics.py at a85cb1ad78"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "sandbox_backend"
+          paths: ["orchestrator/src/orchestrator/evals/metrics.py"]
+          expect: present
+      - name: "sandbox-config-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/config.py::SandboxConfig` `grep:orchestrator/src/orchestrator/evals/shadow_invocation.py::build_shadow_orch_config` substrate (shadow cells already run sandboxed)"
+        verdict: PASS
+  - label: "ω"
+    task_id: 9856
+    title: "Integration gate: invariant escalation-filing-one-door, its guard, and the level-1 and dedupe helpers deleted"
+    note: "Keys fk-7d1f3a0d12ca, fk-333277fb4bd7 (close). Deps: every S1 door leaf; λ2 (the invariant files); 9210 (S3 μ, ARCHITECTURE.md); S12 ε (wave 3). No edge onto 9154 (lead S2/OQ-10 (b)); the lead wires the wave-3 invariant-file chain at decompose (S2 ι → ω; S17 ν → ω, ν last). Priority high. INV number: one of INV-18 to INV-22 by landing order (S17 ν takes INV-23); checks anchor on the slug. S2 γ3 (the fingerprint deletion) depends on ω."
+    capabilities:
+      - name: "one-door-guard"
+        binding: "built here — escalation/tests/test_filing_one_door.py (boundary rows 20, 21 and 22)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["escalation/tests/test_filing_one_door.py"]
+          expect: present
+      - name: "invariant-minted"
+        binding: "built here — the slug in docs/legibility/design-invariants.md (four-site lockstep edit, CONTRIBUTING.md §6)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "escalation-filing-one-door"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+      - name: "level-one-forwarder-gone"
+        binding: "anti-inversion (ω) — EscalationQueue.has_open_l1 present at a85cb1ad78 (41 non-test calls in 19 modules by AST, unchanged since ba17934861; converted by the leaves above)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def has_open_l1\\("
+          paths: ["escalation/src/"]
+          expect: absent
+      - name: "public-dedupe-filers-gone"
+        binding: "anti-inversion (ω) — dedupe.py::submit_or_dedupe and submit_or_dedupe_off_loop present at a85cb1ad78; the filer composes resolve_dedupe_parent + attach_to_parent itself"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def submit_or_dedupe"
+          paths: ["escalation/src/escalation/dedupe.py"]
+          expect: absent
+      - name: "consistency-test-substrate"
+        binding: "`grep:scripts/tests/test_design_invariants_consistency.py` substrate (PINNED_SITES)"
+        verdict: PASS

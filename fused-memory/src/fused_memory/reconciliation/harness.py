@@ -10,15 +10,16 @@ import os
 import socket
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
+from shared.cli_invoke import AllAccountsCappedException
 from shared.project_layout import escalation_queue_dir
 from shared.scheduler_state import SchedulerStateSnapshot
 from shared.storm_counter import StormCounter
@@ -43,7 +44,8 @@ from fused_memory.models.scope import (
     ProjectId,
     ProjectRoot,
     ProjectScope,
-    build_known_projects_map,
+    configured_known_projects_map,
+    configured_primary_root,
 )
 from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -51,7 +53,6 @@ from fused_memory.reconciliation.cli_stage_runner import (
     announce_recon_archive_root,
     gc_run_config_dir,
     recon_archive_root,
-    run_config_dir_path,
 )
 from fused_memory.reconciliation.dangling_citation import dangling_citation_identity
 from fused_memory.reconciliation.drained_event_restore import (
@@ -71,7 +72,7 @@ from fused_memory.reconciliation.finding_task_escalation import (
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
-from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.judge import Judge, NoVerdict, NoVerdictReason
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.overreach_flags import (
     acknowledge_overreach_flags,
@@ -115,7 +116,9 @@ from fused_memory.reconciliation.task_filter import (
     filter_task_tree,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
+from fused_memory.services.id_resolver import IdResolver
 from fused_memory.services.live_workflow_detector import (
+    TaskLiveness,
     corroboration_for_task,
     is_pure_gate_metadata,
     is_workflow_live_for_task,
@@ -187,7 +190,7 @@ one spelling: a drifted literal would silently stop folding."""
 #     queue with a different reader.  Unlike BacklogPolicy, this filer does not
 #     close its own records either.  Level 0 keeps them off the orchestrator's
 #     level-1-only has_open_l1 guard surface; an unattended one still reaches
-#     L1 on its own, promoted by Harness._reap_orphan_l0_escalations once it
+#     a consumer on its own (the orphan reaper and its info-L0 router) once it
 #     ages past orphan_l0_timeout_secs with no live workflow on the task.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
@@ -262,6 +265,11 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # escalates within a watchable window (≈ 10–180 minutes depending on cycle
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
+
+#: Detail key on a persistent-finding escalation listing the cited task ids
+#: whose liveness probe failed: the escalation filed because none was confirmed
+#: live, not because each was confirmed not live (task 5370).
+LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
 
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
@@ -817,6 +825,7 @@ class ReconciliationHarness:
         server_ready_event: asyncio.Event | None = None,
         escalation_listener: socket.socket | None = None,
         full_cycle_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
+        escalation_queue: EscalationQueue | None = None,
     ):
         self.memory = memory_service
         # systemd-held listening socket for the escalation port, so it stays
@@ -833,25 +842,17 @@ class ReconciliationHarness:
         # accepting connections.  None when no recon_report server is started.
         self._server_ready_event = server_ready_event
         self._recon_report_port: int = config.server.recon_report_port
-        _raw_root = config.taskmaster.project_root if config.taskmaster else ''
-        if _raw_root:
-            _raw_root = os.path.expanduser(_raw_root)
-        self._project_root = str(Path(_raw_root).resolve()) if _raw_root else ''
+        self._project_root = configured_primary_root(config.taskmaster)
         self.config = config.reconciliation
         self._full_cycle_deadline = full_cycle_deadline
         self._backlog_policy = backlog_policy
-        # Multi-project routing: build a {project_id → project_root} map from
-        # the configured project + DASHBOARD_KNOWN_PROJECT_ROOTS env var so
-        # Stage 2 can surface other projects to its LLM and authorise
-        # cross-project task filing.  Reuses the dashboard's existing env var
-        # to avoid two sources of truth — see plans/deep-squishing-lagoon.md
-        # for the trade-off (rename to a neutral name is a tracked followup).
-        # When a known_projects kwarg is supplied (server startup), the harness
-        # uses that snapshot instead of building its own — single source of
-        # truth across harness, ticket janitor, and path-scope guard (task 1164).
+        # Multi-project routing: Stage 2 surfaces the registered projects to
+        # its LLM and authorises cross-project task filing.  Server startup
+        # passes its known_projects snapshot (task 1164); otherwise derive it
+        # by the same rule, models/scope.py::configured_known_projects_map.
         self._known_projects: dict[str, str] = (
             dict(known_projects) if known_projects is not None
-            else build_known_projects_map(self._project_root)
+            else configured_known_projects_map(config.taskmaster)
         )
         # Task 2998 GAP A: seed the policy's project_root cache NOW, at
         # construction.  Its only other writer is BacklogPolicy.check(), which
@@ -921,14 +922,6 @@ class ReconciliationHarness:
         # rate-limited single-fire semantics.
         self._phantom_citation_drop_storm = StormCounter()
 
-        # Task σ / 2717: rolling-window per-event counter of unresumable/failed
-        # interrupted-run resume attempts (config-driven
-        # resume_failure_storm_threshold / _window_seconds).  Fed from
-        # _resume_interrupted_runs' failed+restore fallback arm so a persistent
-        # resume failure (prompt/tool drift, stale transcripts) surfaces ONE loud
-        # recon_resume_failure_storm escalation instead of silent churn.
-        self._resume_failure_storm = StormCounter()
-
         # Task 3049 lever 1: per-project count of CONSECUTIVE full cycles whose
         # inline remediation tail was deferred because the project was still in
         # backlog mode (see _maybe_remediate).  Reset to 0 the moment a
@@ -955,7 +948,7 @@ class ReconciliationHarness:
         )
 
         # Escalation support
-        self._escalation_queue: EscalationQueue | None = None
+        self._escalation_queue: EscalationQueue | None = escalation_queue
         self._escalation_task: asyncio.Task | None = None
         self._escalation_url: str | None = None
 
@@ -1165,6 +1158,11 @@ class ReconciliationHarness:
         """
         return self._project_root
 
+    @property
+    def known_projects(self) -> Mapping[str, str]:
+        """The ``{project_id: project_root}`` registry this harness routes by, read-only."""
+        return MappingProxyType(self._known_projects)
+
     def _known_project_scope_for(self, project_id: str) -> ProjectScope:
         """Return the canonical ProjectScope for *project_id* from the registry.
 
@@ -1290,10 +1288,12 @@ class ReconciliationHarness:
         Called from ``_make_stages`` once per cycle (task 2146 β — there is no
         long-lived ``self.stages`` list to push into from
         ``_start_escalation_server`` anymore; escalation startup only stores
-        ``self._escalation_url``/``self._escalation_queue`` for the next
-        ``_make_stages`` call to pick up). Defensive: only assigns when the
-        harness has a value, so calls before escalation startup leave stages
-        untouched.
+        ``self._escalation_url`` for the next ``_make_stages`` call to pick up,
+        and ``self._escalation_queue`` is either injected at construction or
+        built by escalation startup). Defensive: assigns each value only when
+        the harness has one, so a call before escalation startup leaves the
+        URL untouched, and the queue too unless one was injected at
+        construction.
 
         Single-pass over *stages* so single-pass iterables (generators, ``iter(...)``)
         work correctly — the prior two-pass form would silently skip the queue
@@ -2084,15 +2084,15 @@ class ReconciliationHarness:
         lock_holder: str | None,
         lock_age: float | None,
         *,
-        disposition: str = 'failed',
         error_type: str = 'StaleRunRecovery',
         error_message: str | None = None,
     ) -> dict | None:
-        """Recover a single orphaned run row to a terminal status.
+        """Recover a single orphaned run row to 'failed'.
 
-        Shared mechanical body for both recovery passes — the age-based
+        Shared mechanical body for the three recovery passes — the age-based
         ``_recover_stale_runs`` reaper and the startup ``_recover_predecessor_runs``
-        pass: error-stamp the run, complete it, restore the drained events it
+        and ``_recover_legacy_interrupted_runs`` passes: error-stamp the run,
+        complete it, GC its per-run config dir, restore the drained events it
         owned, release the lock when this run's own instance still owns it,
         and replay any deferred writes for the project. Returns the
         ``build_stale_run_diagnostics`` dict so the caller can drive its own
@@ -2108,11 +2108,6 @@ class ReconciliationHarness:
         ``restore_drained``'s ``include_unattributed``) are restored, so a
         concurrent live run's in-flight drained events on the same project
         are never clobbered back to 'buffered'.
-
-        ``disposition`` is the terminal journal status to complete the run
-        with; it defaults to (and, as of task 2711, is always) 'failed'. This
-        is the seam for task σ (session-resume): a future caller can pass a
-        resumable disposition instead before falling into this same body.
         """
         cutoff = self.config.stale_run_recovery_seconds
         diag = build_stale_run_diagnostics(run, lock_holder, lock_age, cutoff)
@@ -2126,7 +2121,7 @@ class ReconciliationHarness:
         recovered = await self.journal.complete_run_if_status(
             run.id,
             expected_status=run.status,
-            status=disposition,
+            status='failed',
             stage_reports=run.stage_reports,
         )
         if not recovered:
@@ -2143,16 +2138,6 @@ class ReconciliationHarness:
 
         # Task 2744: sweep the config dir a dead predecessor process may have left
         # behind for this run. Defensive — never mask the recovery outcome.
-        #
-        # TODO(task σ / session-resume): this GC is UNCONDITIONAL because
-        # ``disposition`` is always 'failed' today — a non-resumable terminal
-        # status — so the per-run config dir (which holds the CLI transcript a
-        # ``--resume`` would need) is always safe to delete here. When σ teaches
-        # this seam to complete a run with a *resumable* disposition (see the
-        # ``disposition`` docstring above), it MUST gate this GC on the
-        # disposition and skip it for resumable ones, or the transcript
-        # session-resume depends on is destroyed and resume has nothing to
-        # resume from.
         try:
             gc_run_config_dir(
                 self.journal.data_dir, run.id,
@@ -2220,7 +2205,7 @@ class ReconciliationHarness:
         instance_id — is left untouched for the existing age-based
         backstop to handle.
 
-        Recovery always completes the run with disposition='failed' and
+        Recovery always completes the run as 'failed' and
         never escalates: adopting your own dead predecessor's orphan at
         startup is expected operational-restart behaviour (mirrors the
         dead_owner_shielded suppression rationale in _recover_stale_runs),
@@ -2236,7 +2221,6 @@ class ReconciliationHarness:
 
             diag = await self._recover_one_run(
                 run, lock_holder, lock_age,
-                disposition='failed',
                 error_type='PredecessorRunRecovery',
                 error_message=(
                     'Run owned by dead predecessor instance, recovered at startup'
@@ -2255,244 +2239,61 @@ class ReconciliationHarness:
                 },
             )
 
-    async def _resume_interrupted_runs(self) -> None:
-        """One-shot startup pass: adopt and ``--resume`` runs a dead predecessor
-        left ``interrupted`` mid-stage (task σ / 2717).
+    async def _recover_legacy_interrupted_runs(self) -> None:
+        """One-shot startup pass: recover every 'interrupted' row to failed,
+        whatever its owner, lock or age.
 
-        Runs beside :meth:`_recover_predecessor_runs` and BEFORE the age-gated
-        :meth:`_recover_stale_runs` reaper. For each ``interrupted`` run owned by
-        an own-dead-predecessor (``instance_id`` not None and not this instance,
-        with the project lock still corroborating that owner — the same
-        ownership test the predecessor pass uses), the guard rails below decide
-        between two paths:
+        Nothing writes 'interrupted' since task 5514 retired resume; this
+        converts the rows a pre-5514 process left behind, through the same
+        :meth:`_recover_one_run` body the other recovery passes use.
 
-        * **Resume** — when every guard rail passes, adopt the project lock,
-          source the run's still-drained events read-only via
-          :meth:`EventBuffer.get_drained_events` (restoring them would
-          double-process on resume), and drive a resume-aware
-          :meth:`run_full_cycle` that skips already-completed stages and
-          ``--resume``s the ``stage_cursor`` stage. The adopted lock is released
-          after the resumed cycle — this pass cannot heartbeat it, so holding it
-          would wedge the normal project loop.
-        * **Fallback** — on ANY doubt (see :meth:`_resume_guard_reason`:
-          freshness expired, per-run attempt cap reached, this stage_cursor
-          already resumed once, or the session transcript is missing) route to
-          :meth:`_recover_one_run` with ``disposition='failed'``, which
-          error-stamps the run, restores its drained events, and GCs the config
-          dir — today's failed+restore path, verbatim.
+        Rows are recovered one at a time, in isolation. If one row's recovery
+        raises, the error is logged with that row's run id and the sweep moves
+        on, so one bad row cannot strand the hundreds behind it. If the raise
+        came before the row's write to 'failed' landed, the row stays
+        'interrupted' and the next startup's sweep retries it; nothing else
+        selects that status.
         """
-        my_iid = self.buffer.instance_id
-        for run in await self.journal.get_interrupted_runs():
-            if run.instance_id is None or run.instance_id == my_iid:
-                continue
-            lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
-            if lock_holder != run.instance_id:
-                continue
-
-            # ── Master switch (honoured on the RESUMING side too): when a deploy
-            # opts out of resume via resume_after_restart=False — typically
-            # because it changed recon prompts/tooling — a run the OLD
-            # (resume-enabled) process already marked `interrupted` must NOT be
-            # --resume'd into the NEW system prompt (a --resume finishes under the
-            # OLD system prompt by construction). Route it to the same
-            # failed+restore fallback the guard rails use so it is cleaned up
-            # (drained events restored, config dir GC'd) rather than left orphaned
-            # for the age-based reaper. This is a deliberate operator opt-out, NOT
-            # a resume failure, so it deliberately does NOT feed the
-            # _record_resume_failure storm counter.
-            if not self.config.resume_after_restart:
-                diag = await self._recover_one_run(
-                    run, lock_holder, lock_age,
-                    disposition='failed',
-                    error_type='InterruptedRunResumeDisabled',
-                    error_message=(
-                        'resume_after_restart disabled — interrupted run cleaned '
-                        'up via failed+restore instead of --resume (deploy opted '
-                        'out of resuming into a changed prompt/toolset)'
-                    ),
-                )
-                if diag is None:
-                    continue
-                logger.info(
-                    'reconciliation.interrupted_run_resume_disabled',
-                    extra={
-                        'run_id': run.id,
-                        'project_id': run.project_id,
-                        'instance_id': run.instance_id,
-                        'stage_cursor': run.stage_cursor,
-                    },
-                )
-                continue
-
-            # ── Guard rails: on ANY doubt, fall back to the failed+restore
-            # recovery path rather than --resume a stale/unsafe run.  Checked
-            # BEFORE adopting the lock so _recover_one_run's own ownership-scoped
-            # release (lock_holder == run.instance_id) cleans up the dead
-            # predecessor's lock exactly as the predecessor-recovery pass does.
-            unresumable_reason = self._resume_guard_reason(run)
-            if unresumable_reason is not None:
-                diag = await self._recover_one_run(
-                    run, lock_holder, lock_age,
-                    disposition='failed',
-                    error_type='InterruptedRunUnresumable',
-                    error_message=unresumable_reason,
-                )
-                if diag is None:
-                    continue
-                logger.info(
-                    'reconciliation.interrupted_run_unresumable',
-                    extra={
-                        'run_id': run.id,
-                        'project_id': run.project_id,
-                        'instance_id': run.instance_id,
-                        'stage_cursor': run.stage_cursor,
-                        'reason': unresumable_reason,
-                    },
-                )
-                # Rolling-window storm counter: a single unresumable run is
-                # expected operational noise (kept to the INFO log above), but
-                # repeated resume failures across runs — prompt/tool drift or
-                # systematically stale transcripts — fire ONE loud recon-scoped
-                # escalation per window (rate-limited single-fire, mirroring
-                # _record_dead_owner_suppression).
-                storm = self._record_resume_failure(run.project_id)
-                if storm is not None:
-                    window_min = storm['window_seconds'] / 60
-                    proj_label = ', '.join(storm['projects']) or run.project_id
-                    summary = (
-                        f"resume-failure storm: {storm['count']} unresumable "
-                        f"interrupted runs in {window_min:.0f} min "
-                        f"(projects: {proj_label}) — interrupted reconciliation "
-                        f"runs are not resuming (check recon prompt/tool drift or "
-                        f"stale transcripts)"
-                    )
-                    detail = (
-                        f'run_id={run.id} project={run.project_id} '
-                        f'reason={unresumable_reason}'
-                    )
-                    self._escalate(
-                        'recon_resume_failure_storm', run.id, summary, detail,
-                    )
-                continue
-
-            # Persist the incremented resume bookkeeping BEFORE adopting/resuming
-            # so the per-run cap and one-resume-per-stage rails survive a
-            # re-interrupt of this very resume.  Stored out-of-band in
-            # stage_reports['_resume'] (mirroring the '_error' entry) — no new
-            # runs-table column.
-            resume_meta = run.stage_reports.get('_resume')
-            prior_count = (
-                resume_meta.get('count', 0) if isinstance(resume_meta, dict) else 0
-            )
-            run.stage_reports['_resume'] = {
-                'count': prior_count + 1,
-                'last_stage': run.stage_cursor,
-            }
-            await self.journal.update_run_stage_reports(run.id, run.stage_reports)
-
-            # Adopt the project lock: release the dead predecessor's corroborated
-            # lock, then re-acquire as this instance so the resumed cycle owns the
-            # project and the reaper cannot clobber it mid-resume.
-            await self.buffer.mark_run_complete(
-                run.project_id, instance_id=run.instance_id,
-            )
-            acquired = await self.buffer.mark_run_active(run.project_id)
-            if not acquired:
-                # Lost the adopt race (not expected at single-instance startup);
-                # leave the run for the age-based backstop rather than resume
-                # without holding the lock.
-                logger.warning(
-                    'reconciliation.resume_adopt_lock_failed run_id=%s project=%s',
-                    run.id, run.project_id,
-                )
-                continue
-
+        runs = await self.journal.get_interrupted_runs()
+        stranded: list[str] = []
+        for run in runs:
             try:
-                events = await self.buffer.get_drained_events(run.project_id, run.id)
-                await self.run_full_cycle(
-                    run.project_id, 'resume_after_restart',
-                    resume_run=run, events=events,
+                await self._recover_legacy_interrupted_run(run)
+            except Exception as e:
+                stranded.append(run.id)
+                logger.warning(
+                    'Legacy interrupted run %s (project %s) failed to recover at '
+                    'startup: %r',
+                    run.id, run.project_id, e,
                 )
-                logger.info(
-                    'reconciliation.interrupted_run_resumed',
-                    extra={
-                        'run_id': run.id,
-                        'project_id': run.project_id,
-                        'instance_id': run.instance_id,
-                        'stage_cursor': run.stage_cursor,
-                    },
-                )
-            finally:
-                # Release the adopted lock so the normal project loop can
-                # re-acquire — a one-shot startup pass cannot heartbeat it.
-                await self.buffer.mark_run_complete(
-                    run.project_id, instance_id=self.buffer.instance_id,
-                )
-
-    def _resume_guard_reason(self, run: ReconciliationRun) -> str | None:
-        """Return a reason string if *run* is NOT safe to ``--resume``, else None.
-
-        The task σ guard rails, evaluated cheapest-first (all config-driven). On
-        ANY doubt this returns a non-None reason and the caller falls back to
-        :meth:`_recover_one_run` (failed+restore). None means every rail passed
-        and the run may be adopted and resumed.
-
-        Rails:
-        * **freshness** — ``now - run.completed_at`` (the interrupt instant
-          stamped by ``complete_run``) must be within
-          ``resume_freshness_window_seconds``.
-        * **per-run cap** — ``stage_reports['_resume'].count`` must be below
-          ``resume_max_attempts_per_run`` (bounds a resume→re-interrupt loop).
-        * **one-resume-per-stage** — ``stage_reports['_resume'].last_stage``
-          must differ from ``run.stage_cursor`` (never re-resume the same stage).
-        * **transcript-exists** — only when a session was captured
-          (``run.session_id`` non-null): its transcript must still be on disk in
-          the per-run config dir, whose path is derived rather than built as a
-          ``TaskConfigDir``, because a read-only probe must not create the dir
-          it probes for.  ``record_run_session``'s snapshot is
-          best-effort (can go stale after an internal cap retry), so a missing
-          transcript means there is nothing to ``--resume``.  A NULL session_id
-          is NOT a failure — no session was captured (the interrupt landed
-          between stages, or the stage's best-effort ``record_run_session``
-          write failed), so the run resumes with every remaining stage fresh
-          (no --resume), degrading cleanly.
-        """
-        # Freshness — measured from the interrupt instant (completed_at).
-        if run.completed_at is None:
-            return 'run has no completed_at (interrupt instant) — cannot verify freshness'
-        age_secs = (datetime.now(UTC) - run.completed_at).total_seconds()
-        if age_secs > self.config.resume_freshness_window_seconds:
-            return (
-                f'interrupt is {age_secs:.0f}s old (> '
-                f'resume_freshness_window_seconds={self.config.resume_freshness_window_seconds})'
+        if runs:
+            logger.log(
+                logging.WARNING if stranded else logging.INFO,
+                'reconciliation.legacy_interrupted_sweep_finished',
+                extra={'rows': len(runs), 'stranded_run_ids': stranded},
             )
 
-        # Per-run attempt cap + one-resume-per-stage (out-of-band _resume meta).
-        resume_meta = run.stage_reports.get('_resume')
-        resume_meta = resume_meta if isinstance(resume_meta, dict) else {}
-        count = resume_meta.get('count', 0)
-        if count >= self.config.resume_max_attempts_per_run:
-            return (
-                f'resume attempt cap reached (count={count} >= '
-                f'resume_max_attempts_per_run={self.config.resume_max_attempts_per_run})'
-            )
-        if resume_meta.get('last_stage') == run.stage_cursor:
-            return (
-                f'stage_cursor {run.stage_cursor!r} already resumed once '
-                '(one-resume-per-stage)'
-            )
-
-        # Transcript existence — only meaningful when a session was captured.
-        if run.session_id:
-            config_dir_path = run_config_dir_path(self.journal.data_dir, run.id)
-            transcript = read_transcript_records(config_dir_path, run.session_id)
-            if not transcript:
-                return (
-                    f'session {run.session_id} has no transcript on disk '
-                    f'({config_dir_path}) — unresumable'
-                )
-
-        return None
+    async def _recover_legacy_interrupted_run(self, run: ReconciliationRun) -> None:
+        lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
+        diag = await self._recover_one_run(
+            run, lock_holder, lock_age,
+            error_type='LegacyInterruptedRunRecovery',
+            error_message=(
+                'Legacy interrupted run (resume retired, task 5514) '
+                'recovered at startup'
+            ),
+        )
+        if diag is None:
+            return
+        logger.info(
+            'reconciliation.legacy_interrupted_run_recovered',
+            extra={
+                'run_id': run.id,
+                'project_id': run.project_id,
+                'instance_id': run.instance_id,
+                'disposition': diag['disposition'],
+            },
+        )
 
     # ── Dead-owner suppression storm counter ─────────────────────────
 
@@ -2688,40 +2489,6 @@ class ReconciliationHarness:
             now=now,
         )
 
-    # ── Resume-failure storm counter (task σ / 2717) ───────────────────
-
-    def _record_resume_failure(
-        self, project_id: str, *, now: datetime | None = None
-    ) -> dict | None:
-        """Record one unresumable/failed interrupted-run resume and check for a storm.
-
-        Applied to the failed+restore fallback arm of
-        :meth:`_resume_interrupted_runs`.  Thresholds are the config fields
-        ``resume_failure_storm_threshold`` /
-        ``resume_failure_storm_window_seconds`` (mirroring
-        :meth:`_record_dead_owner_suppression`, which likewise reads config)
-        rather than module constants, so an operator can retune the alarm.  Both
-        are read LIVE on every call rather than captured, so promoting either
-        into ``RELOADABLE_FIELDS`` would work without further edits.
-
-        The rolling-window mechanics live in
-        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
-        the knobs and the event.  Returns None below the threshold and None when
-        the alarm already fired within this window, otherwise a storm summary
-        dict with ``count``, ``window_seconds``, and ``projects`` (sorted
-        distinct project labels seen in the window).
-
-        The now= parameter follows the same time-injection convention as the
-        sibling storm counters, for deterministic unit tests.
-        """
-        return self._storm_summary(
-            self._resume_failure_storm,
-            threshold=self.config.resume_failure_storm_threshold,
-            window_seconds=self.config.resume_failure_storm_window_seconds,
-            project_id=project_id,
-            now=now,
-        )
-
     # ── Deferred write replay ─────────────────────────────────────────
 
     async def _replay_deferred_writes(self, project_id: ProjectId) -> None:
@@ -2786,16 +2553,27 @@ class ReconciliationHarness:
 
     # ── Escalation support ─────────────────────────────────────────────
 
+    def _configured_escalation_queue_dir(self) -> Path:
+        """``config.escalation_queue_dir``, made absolute against ``explore_codebase_root``."""
+        queue_dir = Path(self.config.escalation_queue_dir)
+        if not queue_dir.is_absolute():
+            queue_dir = Path(self.config.explore_codebase_root) / queue_dir
+        return queue_dir
+
     async def _start_escalation_server(self) -> None:
-        """Start the escalation MCP server as a background asyncio task."""
+        """Start the escalation MCP server as a background asyncio task.
+
+        A queue injected at construction takes precedence over
+        ``config.escalation_queue_dir`` and is the one the server serves, so
+        filing and serving share one store.
+        """
         if not HAS_ESCALATION:
             logger.info('Escalation package not installed — skipping escalation server')
             return
 
-        queue_dir = Path(self.config.escalation_queue_dir)
-        if not queue_dir.is_absolute():
-            queue_dir = Path(self.config.explore_codebase_root) / queue_dir
-        self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
+        if self._escalation_queue is None:
+            queue_dir = self._configured_escalation_queue_dir()
+            self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
 
         mcp_server = create_escalation_server(  # type: ignore[possibly-undefined]
             self._escalation_queue,
@@ -2805,6 +2583,11 @@ class ReconciliationHarness:
                 project_id=None,
                 project_root=None,
             ),
+            # This store serves every project, so create_server leaves the guard
+            # unscoped (resolver='no_project') until task 6910 scopes it per call.
+            prefix_resolver=lambda project_id, prefix: IdResolver.for_memory_service(
+                self.memory
+            ).resolve_prefix(project_id, prefix),
         )
         host = self.config.escalation_host
         port = self.config.escalation_port
@@ -2827,8 +2610,8 @@ class ReconciliationHarness:
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
         await _sleep(0.5)
 
-        # Store escalation URL and queue; _make_stages propagates them to each
-        # cycle's fresh stages via _propagate_escalation_queue (task 2146 β —
+        # Store the escalation URL; _make_stages propagates it (and the queue) to
+        # each cycle's fresh stages via _propagate_escalation_queue (task 2146 β —
         # there is no long-lived self.stages list to push into here anymore).
         escalation_url = f'http://{host}:{port}/mcp'
         self._escalation_url = escalation_url
@@ -2952,6 +2735,8 @@ class ReconciliationHarness:
         finding: dict,
         persistence: int,
         task_id: str | None = None,
+        *,
+        liveness_unknown: bool = False,
     ) -> str | None:
         """File a level-0 record for *finding* on its named task's ORCHESTRATOR queue.
 
@@ -2985,8 +2770,8 @@ class ReconciliationHarness:
         on this task", so an L1 here would turn a passive observation into a
         gate on dispatch.  See the `FINDING_TASK_ESCALATION_LEVEL` comment block in
         `finding_task_escalation.py` for the full guard-site population and for
-        why an unattended record still reaches L1 (via
-        `Harness._reap_orphan_l0_escalations`) without this filer asserting it.
+        why an unattended record still reaches a consumer (the orphan reaper and
+        its info-L0 router) without this filer asserting it.
 
         FAIL-SAFE: a queue hiccup is logged and swallowed — a reconciliation
         cycle is never aborted by a failed filing (mirroring
@@ -2996,6 +2781,10 @@ class ReconciliationHarness:
         A7b note: this WRITES but never RESOLVES, and the queue it writes is
         NOT the recon queue the A7b invariant governs — see the contract block
         at the top of this module.
+
+        *liveness_unknown* says the target is filed because its liveness probe
+        failed, not because it was confirmed not live (task 5370). It marks the
+        WARNING-level filed log line; the record's detail does not carry it.
         """
         # Mirrors _escalate's guard: on ImportError the module-level names are
         # left UNBOUND (not set to None as in targeted.py), so `HAS_ESCALATION`
@@ -3106,7 +2895,8 @@ class ReconciliationHarness:
                 task_id, project_id, run_id, e,
             )
             return None
-        logger.info(
+        logger.log(
+            logging.WARNING if liveness_unknown else logging.INFO,
             'reconciliation.finding_task_escalation_filed',
             extra={
                 'project_id': project_id,
@@ -3115,6 +2905,7 @@ class ReconciliationHarness:
                 'escalation_id': esc_id,
                 'finding_category': finding.get('category', ''),
                 'persistence': persistence,
+                'liveness_unknown': liveness_unknown,
             },
         )
         return esc_id
@@ -3193,14 +2984,13 @@ class ReconciliationHarness:
         except Exception as e:
             logger.warning(f'_recover_predecessor_runs at startup failed: {e}')
 
-        # One-shot: adopt and --resume any interrupted runs a dead predecessor
-        # left mid-stage (task σ / 2717), before the age-gated _recover_stale_runs
-        # reaper gets its first tick. Guarded like the predecessor pass above so a
-        # resume hiccup can't crash harness startup.
+        # One-shot: convert every legacy 'interrupted' row to failed (task 5514).
+        # Guarded like the predecessor pass above so a recovery hiccup can't
+        # crash harness startup.
         try:
-            await self._resume_interrupted_runs()
+            await self._recover_legacy_interrupted_runs()
         except Exception as e:
-            logger.warning(f'_resume_interrupted_runs at startup failed: {e}')
+            logger.warning(f'_recover_legacy_interrupted_runs at startup failed: {e}')
 
         # One-shot: re-fire the judge for any run whose verdict a restart dropped
         # in the cycle-end→verdict-commit window (task 2708). The durable
@@ -3621,10 +3411,15 @@ class ReconciliationHarness:
         try:
             assert self.judge is not None
             verdict = await self.judge.review_run(run_id)
-            if verdict:
-                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
+            if isinstance(verdict, NoVerdict):
+                logger.log(
+                    logging.INFO if verdict.reason is NoVerdictReason.PROJECT_HALTED
+                    else logging.WARNING,
+                    'Judge produced no verdict for run %s: reason=%s detail=%s',
+                    run_id, verdict.reason.value, verdict.detail,
+                )
             else:
-                logger.warning(f'Judge returned no verdict for run {run_id}')
+                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
         except asyncio.CancelledError:
             # Shutdown drain (or a cycle-aware restart) cancelled the judge
             # mid-review, before add_verdict's atomic marker-clear ran. The
@@ -3674,7 +3469,6 @@ class ReconciliationHarness:
         tier: TierConfig | None = None,
         events: list[ReconciliationEvent] | None = None,
         assembled_payload: AssembledPayload | None = None,
-        resume_run: ReconciliationRun | None = None,
         run_id: str | None = None,
     ) -> ReconciliationRun:
         """Execute the three-stage pipeline for a project.
@@ -3687,17 +3481,6 @@ class ReconciliationHarness:
             assembled_payload: Optional token-budgeted payload from ContextAssembler.
                     When provided, Stage 1 uses this instead of generic
                     time-windowed episode/memory fetches.
-            resume_run: Task σ adopt-and-resume seam.  When set, the cycle reuses
-                    this interrupted run wholesale instead of starting a fresh one:
-                    it keeps ``resume_run.id`` (no ``start_run``), does NOT drain
-                    (the caller MUST supply the run's already-drained ``events`` so
-                    a resumed cycle never double-processes them), skips any stage
-                    whose real ``StageReport`` is already in
-                    ``resume_run.stage_reports`` (its work landed before the
-                    interrupt), and ``--resume``s ONLY the stage matching
-                    ``resume_run.stage_cursor`` by threading
-                    ``resume_run.session_id`` into it.  The remaining stages run
-                    fresh, and the completion/judge/remediation tail is unchanged.
             run_id: caller-minted id for this run, so a caller whose deadline
                     timed out can still scope the restore of its events (task 6453).
         """
@@ -3705,53 +3488,29 @@ class ReconciliationHarness:
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
         scope = self._known_project_scope_for(project_id)
         project_root = scope.project_root
-        if resume_run is not None and run_id is not None:
-            raise ValueError(
-                'run_full_cycle(resume_run=..., run_id=...) are mutually exclusive: '
-                'a resumed run keeps resume_run.id'
-            )
 
         tier = tier or TierConfig()
         watermark = await self.journal.get_watermark(project_id)
 
-        if resume_run is not None:
-            # Task σ adopt-and-resume: reuse the interrupted run wholesale — no
-            # fresh run row, no re-drain. The startup pass supplies the run's
-            # already-drained events via `events`; re-draining or re-attributing
-            # them would double-process on resume, so both are skipped here.
-            if events is None:
-                raise ValueError(
-                    'run_full_cycle(resume_run=...) requires caller-supplied '
-                    "events (the interrupted run's already-drained events); "
-                    'draining fresh would lose the in-flight batch'
-                )
-            run = resume_run
-            run_id = run.id
-            # The row is 'interrupted' on disk; mark it running in-memory so the
-            # active-run tracker/logs reflect reality and the finally's GC gate
-            # (skip iff status == interrupted) permits the transcript sweep once
-            # this resumed cycle completes.
-            run.status = RunStatus.running
+        run_id = run_id if run_id is not None else str(uuid4())
+        if events is None:
+            events = await self.buffer.drain(project_id, run_id=run_id)
         else:
-            run_id = run_id if run_id is not None else str(uuid4())
-            if events is None:
-                events = await self.buffer.drain(project_id, run_id=run_id)
-            else:
-                await self.buffer.mark_drained_run_id(
-                    project_id, [e.id for e in events], run_id
-                )
-
-            run = ReconciliationRun(
-                id=run_id,
-                project_id=project_id,
-                run_type=RunType.full,
-                trigger_reason=trigger_reason,
-                started_at=datetime.now(UTC),
-                events_processed=len(events),
-                status=RunStatus.running,
-                instance_id=self.buffer.instance_id,
+            await self.buffer.mark_drained_run_id(
+                project_id, [e.id for e in events], run_id
             )
-            await self.journal.start_run(run)
+
+        run = ReconciliationRun(
+            id=run_id,
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason=trigger_reason,
+            started_at=datetime.now(UTC),
+            events_processed=len(events),
+            status=RunStatus.running,
+            instance_id=self.buffer.instance_id,
+        )
+        await self.journal.start_run(run)
 
         logger.info(
             'reconciliation.run_started',
@@ -3762,7 +3521,6 @@ class ReconciliationHarness:
                 'trigger_reason': trigger_reason,
                 'events_to_process': len(events),
                 'model': tier.model,
-                'resumed': resume_run is not None,
             },
         )
 
@@ -3845,18 +3603,6 @@ class ReconciliationHarness:
                 reports = []
                 for stage in stages:
                     stage_key = stage.stage_id.value
-
-                    # Task σ resume: a stage whose real StageReport is already
-                    # persisted on the resumed run completed BEFORE the interrupt
-                    # — skip its subprocess entirely, but thread its persisted
-                    # report into `reports` so later stages still receive it as
-                    # prior context (exactly as a freshly-run stage would).
-                    if resume_run is not None:
-                        prior = run.stage_reports.get(stage_key)
-                        if isinstance(prior, StageReport):
-                            reports.append(prior)
-                            continue
-
                     current_stage_name = stage_key
                     _active.stage(current_stage_name)
 
@@ -3880,8 +3626,7 @@ class ReconciliationHarness:
                     #     is structurally unreachable and ONLY the write-recovered
                     #     arms can fire. Anchoring the flush to the READER's
                     #     dispatch also keeps it correct if the stage list is ever
-                    #     reordered, and it naturally no-ops on a resumed run whose
-                    #     Stage 3 is skipped above.
+                    #     reordered.
                     # (3) WHY THIS IS SAFE: both methods are already never-raise
                     #     (each swallows BaseException), shield their writes, and
                     #     are idempotent on the ledger's 5-part identity
@@ -3891,9 +3636,9 @@ class ReconciliationHarness:
                     #
                     # The finally-block call STAYS: it remains the terminal
                     # backstop for paths this flush cannot reach (a stage that
-                    # raised before Stage 3, an interrupted/resumed run) and the
-                    # last chance after a flush attempt that did not CONFIRM (the
-                    # write-missing predicate excludes only a marker that is True).
+                    # raised before Stage 3) and the last chance after a flush
+                    # attempt that did not CONFIRM (the write-missing predicate
+                    # excludes only a marker that is True).
                     # _run_remediation_pass carries the identical flush; all four
                     # sites go through _flush_cycle_summaries, so the arms and
                     # their load-bearing Stage-1-before-Stage-2 order cannot
@@ -3935,28 +3680,9 @@ class ReconciliationHarness:
                     if isinstance(stage, IntegrityCheck):
                         stage.filtered_task_tree = filtered_task_tree
 
-                    # Task σ resume: --resume ONLY the stage the interrupt caught
-                    # mid-flight (stage_cursor), and only when a session was
-                    # actually captured for it. Pass the kwarg solely on that
-                    # path so every non-resume call site keeps today's signature.
-                    resume_session_id = (
-                        run.session_id
-                        if (
-                            resume_run is not None
-                            and stage_key == run.stage_cursor
-                            and run.session_id
-                        )
-                        else None
+                    report = await stage.run(
+                        events, watermark, reports, run_id, model=tier.model,
                     )
-                    if resume_session_id is not None:
-                        report = await stage.run(
-                            events, watermark, reports, run_id,
-                            model=tier.model, resume_session_id=resume_session_id,
-                        )
-                    else:
-                        report = await stage.run(
-                            events, watermark, reports, run_id, model=tier.model,
-                        )
                     reports.append(report)
                     run.stage_reports[stage_key] = report
 
@@ -4023,9 +3749,9 @@ class ReconciliationHarness:
                 # TERMINAL backstop. Task 4186 hoisted a copy of this call to
                 # the top of the Stage-3 iteration above (the pre-Stage-3
                 # flush); this stays as the last resort for the paths that flush
-                # cannot reach — a stage that raised before Stage 3, an
-                # interrupted/resumed run — and as the second attempt after a
-                # flush attempt that did not CONFIRM. A flush that DID confirm
+                # cannot reach — a stage that raised before Stage 3 — and as
+                # the second attempt after a flush attempt that did not
+                # CONFIRM. A flush that DID confirm
                 # makes it no-op via _cycle_summary_ledger_write_missing's
                 # write-recovered exclusion, so one recovery logs one WARNING.
                 # Stays before update_run_stage_reports so the persisted
@@ -4040,23 +3766,12 @@ class ReconciliationHarness:
     async def _record_cancelled_run(
         self, run: ReconciliationRun, project_id: str, current_stage_name: str | None,
     ) -> None:
-        """Journal a ``run_full_cycle`` cancelled before durable completion; the
-        caller re-raises, so asyncio cancellation semantics hold
-        (the cycle deadline cancels via CancelledError, which is not an
-        Exception, so without this the row would stay 'running').
-
-        Task σ: when resume_after_restart is enabled, a restart cancelling an
-        in-flight stage is a RESUMABLE interrupt, not a failure. The run is
-        marked `interrupted` and restore_drained is DELIBERATELY skipped — the
-        drained events must stay drained so the startup adopt-and-resume pass
-        can feed a resumed cycle's fresh later stages without double-processing.
-        The (session_id, stage_cursor) snapshot survives on the run row
-        (BaseStage.run skips clear_run_session on cancel), and run_full_cycle's
-        finally skips the config-dir GC for interrupted runs so the transcript
-        survives for --resume. When the knob is off the run is failed and its
-        events restored (a deploy that changed recon prompts/tooling opts out of
-        resume this way, since a --resume'd session finishes under the OLD
-        system prompt by construction).
+        """Journal a ``run_full_cycle`` cancelled before durable completion:
+        failed, with its drained events restored for a later cycle. The caller
+        re-raises, so asyncio cancellation semantics hold (the cycle deadline
+        cancels via CancelledError, which is not an Exception, so without this
+        the row would stay 'running'). A restart cancel and a deadline cancel
+        end alike: 'interrupted' was retired by task 5514.
 
         Every write is best-effort and shielded, so a second cancellation (e.g.
         server shutdown) cannot abort it and a write failure cannot replace the
@@ -4068,17 +3783,6 @@ class ReconciliationHarness:
         run completed.
         """
         run_id = run.id
-        if self.config.resume_after_restart:
-            run.status = RunStatus.interrupted
-            if await self._end_run_unless_completed(
-                run, project_id, current_stage_name,
-                lambda: self._journal_interrupted(run_id),
-            ):
-                logger.warning(
-                    f'Reconciliation run {run_id} INTERRUPTED (resumable) for '
-                    f'{project_id} (stage: {current_stage_name})'
-                )
-            return
         run.status = RunStatus.failed
         run.stage_reports['_error'] = {
             'error_type': 'CancelledError',
@@ -4150,13 +3854,6 @@ class ReconciliationHarness:
             what='is_run_completed', run_id=run_id,
             logger=logger, level=logging.ERROR,
         ) is True
-
-    async def _journal_interrupted(self, run_id: str) -> None:
-        await await_best_effort(
-            self.journal.complete_run(run_id, 'interrupted'),
-            what='complete_run(interrupted)', run_id=run_id,
-            logger=logger, level=logging.ERROR,
-        )
 
     async def _record_deferred_run(
         self,
@@ -4563,9 +4260,7 @@ class ReconciliationHarness:
         The GC runs even when a second cancellation lands mid-write, and that
         cancellation still propagates
         (``tests/test_harness.py::test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation``).
-        An interrupted run keeps its dir for the startup ``--resume`` pass
-        (task σ); its stage transcripts were already copied to the archive by
-        ``stages/base.py::BaseStage.run``. A GC failure is logged, never raised.
+        A GC failure is logged, never raised.
         """
         stage_reports_write = asyncio.ensure_future(
             self.journal.update_run_stage_reports(run.id, run.stage_reports)
@@ -4576,17 +4271,16 @@ class ReconciliationHarness:
         try:
             await asyncio.shield(stage_reports_write)
         finally:
-            if run.status != RunStatus.interrupted:
-                try:
-                    gc_run_config_dir(
-                        self.journal.data_dir, run.id,
-                        archive_root=recon_archive_root(self.config),
-                    )
-                except Exception as gc_err:  # noqa: BLE001
-                    logger.warning(
-                        'gc_run_config_dir failed for %s run %s: %r',
-                        run.run_type, run.id, gc_err,
-                    )
+            try:
+                gc_run_config_dir(
+                    self.journal.data_dir, run.id,
+                    archive_root=recon_archive_root(self.config),
+                )
+            except Exception as gc_err:  # noqa: BLE001
+                logger.warning(
+                    'gc_run_config_dir failed for %s run %s: %r',
+                    run.run_type, run.id, gc_err,
+                )
 
     def _log_stage_reports_write_failure(
         self, run_id: str, task: asyncio.Task,
@@ -4841,11 +4535,11 @@ class ReconciliationHarness:
         - **Degraded-synth arm** — the ``task_knowledge_sync`` entry is
           present but is NOT a ``StageReport``: the plain-dict shape
           ``run.stage_reports`` (typed ``dict[str, StageReport | dict]``) is
-          allowed to hold. This is production-reachable, not defensive
-          fiction — ``journal`` reconstructs ``StageReport(**v)`` only when
-          the stored value ``isinstance(v, dict) and 'stage' in v``, and
-          otherwise keeps the raw dict, so an adopted/resumed run can carry
-          one. It is the only remaining shape where Stage 2 demonstrably
+          allowed to hold. ``journal`` reconstructs ``StageReport(**v)`` only
+          when the stored value ``isinstance(v, dict) and 'stage' in v``, and
+          otherwise keeps the raw dict, so a run whose reports were read back
+          from the journal can carry one (the resume path task 5514 retired
+          was the production route that did). It is the only remaining shape where Stage 2 demonstrably
           produced a report yet no faithful re-attempt is possible, so it is
           the one place a synthesized row is honest rather than fabricated.
 
@@ -6098,26 +5792,35 @@ class ReconciliationHarness:
                 # its call only because its read-to-use gap is microseconds; this
                 # one's is not, so the read moves to the use.
                 #
-                # Both are constant for this project_root over the gate loop below,
-                # and both are wrapped fail-safe → None: a None simply means that
-                # corroborating signal cannot fire (corroboration_for_task tolerates
-                # None inputs and never raises on them), which leaves the verdict
-                # biased toward "not corroborated" — the direction that lets a
-                # stranded escalation through only when nothing at all vouches for
-                # the task. read_scheduler_state already returns
+                # Both are constant for this project_root over the gate loop below.
+                # A read that raises leaves its signal unable to fire, so a False
+                # corroboration computed without it is not a confirmed one:
+                # `_corroboration_inputs_failed` makes `_task_liveness` report such
+                # a negative as UNKNOWN. read_scheduler_state already returns
                 # SchedulerStateSnapshot.empty() for an absent/invalid file;
                 # orchestrator_started_at returns None for an absent or
                 # unparseable lock.
+                _corroboration_inputs_failed = False
                 try:
                     _sched_state: SchedulerStateSnapshot | None = read_scheduler_state(
                         Path(project_root)
                     )
                 except Exception:
+                    logger.warning(
+                        'read_scheduler_state failed for %s; negative liveness '
+                        'verdicts this pass are unknown', project_root, exc_info=True,
+                    )
                     _sched_state = None
+                    _corroboration_inputs_failed = True
                 try:
                     _orch_started: datetime | None = orchestrator_started_at(project_root)
                 except Exception:
+                    logger.warning(
+                        'orchestrator_started_at failed for %s; negative liveness '
+                        'verdicts this pass are unknown', project_root, exc_info=True,
+                    )
                     _orch_started = None
+                    _corroboration_inputs_failed = True
 
                 # Task 3778: hoist the whole-repo `git worktree list --porcelain`
                 # out of the cited-task fan-out below, the same way
@@ -6136,25 +5839,21 @@ class ReconciliationHarness:
                 # tasks). A known-empty repo arrives as {'worktree_index': {}}.
                 _index_kwargs: dict = await worktree_index_kwargs(project_root)
 
-                async def _task_is_live(tid: str) -> bool:
+                async def _task_liveness(tid: str) -> TaskLiveness:
                     """Is task *tid* covered by a live workflow right now?
 
-                    Extracted verbatim (task 4821) from the per-cited-task body
-                    of the live-workflow gate below so a SECOND consumer — the
-                    routed-filing gate on the escalate branch — asks the exact
-                    same question of the exact same inputs.  A re-implementation
-                    would be free to drift; a shared helper cannot.
+                    Shared (task 4821) by the cited-task gate and the
+                    routed-target gate below, so both ask the same question of
+                    the same pass-local, loop-constant inputs (`task_by_id`,
+                    `_tasks_snapshot_at`, `_sched_state`, `_orch_started`,
+                    `_index_kwargs`).
 
-                    Closes over the five pass-local, loop-constant inputs
-                    (`task_by_id`, `_tasks_snapshot_at`, `_sched_state`,
-                    `_orch_started`, `_index_kwargs`) plus `project_root`, so
-                    the caller supplies only the task id.
-
-                    Fail-safe direction is UNCHANGED from the inline version it
-                    replaces: a corroboration error leaves the gate inert
-                    (`corroborated=None`), and a detector error is treated as
-                    NOT live — biasing toward escalating rather than toward
-                    silencing a genuine stranded-work escalation.
+                    LIVE suppresses an escalation here, so a probe that could
+                    not run must never answer LIVE (task 5370). A corroboration
+                    error reaches the detector as corroborated=False, which
+                    demands genuine per-task evidence; a negative verdict that
+                    rests on a failed corroboration or failed inputs is UNKNOWN,
+                    and so is a detector error.
                     """
                     _task = task_by_id.get(tid)
                     _metadata = _task.get('metadata') if _task else None
@@ -6163,6 +5862,7 @@ class ReconciliationHarness:
                     # `task.get('status') == 'in-progress'` guard so all
                     # three consumers gate corroboration identically.
                     corroborated: bool | None = None
+                    corroboration_known = True
                     if _status == 'in-progress' and _task is not None:
                         try:
                             corroborated = corroboration_for_task(
@@ -6176,17 +5876,22 @@ class ReconciliationHarness:
                                 scheduler_state=_sched_state,
                                 orchestrator_started_at=_orch_started,
                             )
-                        except Exception as _corr_exc:
-                            logger.debug(
-                                'corroboration_for_task error for task %s; '
-                                'leaving the gate inert: %s',
-                                tid, _corr_exc,
+                            corroboration_known = (
+                                corroborated or not _corroboration_inputs_failed
                             )
+                        except Exception:
+                            logger.warning(
+                                'corroboration_for_task failed for task %s; '
+                                'requiring per-task evidence of liveness',
+                                tid, exc_info=True,
+                            )
+                            corroborated = False
+                            corroboration_known = False
                     try:
                         # Awaited (task 3778): the detector's three git
                         # probes are async now, so this gate no longer
                         # blocks the loop this pass runs on.
-                        return bool(await is_workflow_live_for_task(
+                        live = await is_workflow_live_for_task(
                             tid, project_root,
                             status=_status,
                             **_index_kwargs,
@@ -6207,23 +5912,26 @@ class ReconciliationHarness:
                             # exists to establish.
                             pure_gate=is_pure_gate_metadata(_metadata),
                             corroborated=corroborated,
-                        ))
-                    except Exception as _det_exc:
-                        logger.debug(
-                            'live_workflow_detector error for task %s; treating as not-live: %s',
-                            tid, _det_exc,
                         )
-                        return False
+                    except Exception:
+                        logger.warning(
+                            'live_workflow_detector failed for task %s; liveness unknown',
+                            tid, exc_info=True,
+                        )
+                        return TaskLiveness.UNKNOWN
+                    if live:
+                        return TaskLiveness.LIVE
+                    return TaskLiveness.NOT_LIVE if corroboration_known else TaskLiveness.UNKNOWN
 
                 # Task 5550: liveness is loop-constant per task id here, like
                 # `_sched_state` above, so each id's git probes run once per pass.
-                _live_by_task: dict[str, bool] = {}
+                _liveness_by_task: dict[str, TaskLiveness] = {}
 
-                async def _task_is_live_memoised(tid: str) -> bool:
-                    """`_task_is_live`, asked once per id per pass."""
-                    if tid not in _live_by_task:
-                        _live_by_task[tid] = await _task_is_live(tid)
-                    return _live_by_task[tid]
+                async def _task_liveness_memoised(tid: str) -> TaskLiveness:
+                    """`_task_liveness`, asked once per id per pass."""
+                    if tid not in _liveness_by_task:
+                        _liveness_by_task[tid] = await _task_liveness(tid)
+                    return _liveness_by_task[tid]
 
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
@@ -6233,8 +5941,9 @@ class ReconciliationHarness:
                         # orchestrator), suppress this cycle's escalation with an INFO log.
                         # The finding keeps recurring and will escalate after the workflow
                         # finishes — so genuine stranded cases (all signals False) still
-                        # escalate.  Guard detector errors as not-live (fail toward escalating
-                        # rather than toward silencing a genuine stranded-work escalation).
+                        # escalate.  Only a LIVE verdict suppresses: a probe that failed is
+                        # UNKNOWN, which escalates rather than silencing a genuine
+                        # stranded-work escalation.
                         # Task 2031: cited tasks in a never-dispatched status
                         # (deferred/done/cancelled, via task_by_id above) drop the
                         # project-wide orchestrator_live signal, so a deferred task stuck
@@ -6262,14 +5971,12 @@ class ReconciliationHarness:
                         # with no recent commit. Post-2963 the renderer downgrades
                         # that to indeterminate and drops the task, while this gate
                         # still read it as live and silenced the stranded-work
-                        # escalation indefinitely. The fail-safe direction here is
-                        # UNCHANGED: any assembly error, a non-in-progress status,
-                        # or an absent task_by_id entry all leave corroborated=None,
-                        # the detector's gate stays inert, and the escalation is
-                        # still suppressed — this is never a new silencing path.
-                        # Only an explicit corroborated=False (nothing at all
-                        # vouches for the task) now lets a stranded escalation
-                        # through.
+                        # escalation indefinitely. A non-in-progress status or an
+                        # absent task_by_id entry leaves corroborated=None and the
+                        # detector's gate inert. A corroboration that could not be
+                        # computed is passed as False, so it cannot suppress
+                        # (task 5370); the escalation then lists the task under
+                        # LIVENESS_UNKNOWN_DETAIL_KEY.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,
@@ -6283,10 +5990,14 @@ class ReconciliationHarness:
                             if isinstance(c, dict) and 'task_id' in c
                         ]
                         any_live = False
+                        liveness_unknown: set[str] = set()
                         for tid in cited_task_ids:
-                            if await _task_is_live_memoised(tid):
+                            liveness = await _task_liveness_memoised(tid)
+                            if liveness is TaskLiveness.LIVE:
                                 any_live = True
                                 break
+                            if liveness is TaskLiveness.UNKNOWN:
+                                liveness_unknown.add(tid)
                         if any_live:
                             logger.info(
                                 'reconciliation.integrity_escalation_suppressed_live_workflow',
@@ -6299,15 +6010,25 @@ class ReconciliationHarness:
                                 },
                             )
                         else:
+                            escalation_detail = {**finding, 'persistence': persistence}
+                            if liveness_unknown:
+                                escalation_detail[LIVENESS_UNKNOWN_DETAIL_KEY] = sorted(
+                                    liveness_unknown
+                                )
+                                logger.warning(
+                                    'reconciliation.integrity_escalation_liveness_unknown',
+                                    extra={
+                                        'project_id': project_id,
+                                        'run_id': run_id,
+                                        'task_ids': sorted(liveness_unknown),
+                                    },
+                                )
                             self._escalate(
                                 _RECON_INTEGRITY_ISSUE_CATEGORY,
                                 run_id,
                                 f'Persistently unresolved after remediation '
                                 f'({persistence} cycles): {finding.get("description", "?")}',
-                                detail=json.dumps(
-                                    {**finding, 'persistence': persistence},
-                                    default=str,
-                                ),
+                                detail=json.dumps(escalation_detail, default=str),
                                 finding=finding,
                                 resolved_fps=resolved_fps,
                             )
@@ -6345,7 +6066,7 @@ class ReconciliationHarness:
                             # named task has live work in flight.  Gate the
                             # resolved target explicitly, skipping the recheck
                             # when it is already a cited id (the loop above just
-                            # proved that one not-live, and a recheck would spend
+                            # proved that one not LIVE, and a recheck would spend
                             # git subprocess calls to re-derive the same answer).
                             #
                             # The `_escalate` gate above is deliberately NOT
@@ -6425,7 +6146,8 @@ class ReconciliationHarness:
                                 )
                             elif (
                                 routed_task_id not in cited_task_ids
-                                and await _task_is_live_memoised(routed_task_id)
+                                and await _task_liveness_memoised(routed_task_id)
+                                is TaskLiveness.LIVE
                             ):
                                 logger.info(
                                     'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',
@@ -6442,9 +6164,17 @@ class ReconciliationHarness:
                                 # per DISTINCT persistent finding per task, and
                                 # none filed behind an open routed L1 — see
                                 # `finding_task_escalation.py::routed_record_covers_finding`.
+                                # Memoised: the cited loop or the gate above
+                                # has already probed this id.
+                                routed_liveness = await _task_liveness_memoised(
+                                    routed_task_id
+                                )
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
                                     task_id=routed_task_id,
+                                    liveness_unknown=(
+                                        routed_liveness is TaskLiveness.UNKNOWN
+                                    ),
                                 )
                     else:
                         logger.info(
@@ -6467,8 +6197,6 @@ class ReconciliationHarness:
             )
 
         except asyncio.CancelledError as e:
-            # Always 'failed', never 'interrupted': _resume_interrupted_runs re-drives
-            # only run_full_cycle, and get_interrupted_runs does not filter by run_type.
             run.status = RunStatus.failed
             run.stage_reports['_error'] = _run_failure_record(
                 e, failed_stage=current_stage_name,

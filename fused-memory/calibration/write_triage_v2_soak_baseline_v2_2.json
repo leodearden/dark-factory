@@ -3,7 +3,7 @@
   "cell_rules": {
     "hidden_detail": "A restated write adds something a reader acting on its record would need (HOME, LOSS, no CONFLICT), and a sighting is only counted, never shown.",
     "hidden_conflict": "A restated write disputes its record (CONFLICT), and the dispute sits in a sighting a reader of the record never sees.",
-    "digest_conflict": "An amended write disputes its record (CONFLICT), and a reader of the record meets the dispute only as an untagged 240-character digest.",
+    "digest_conflict": "An amended write disputes its record (CONFLICT), and a reader of the record meets the dispute only as an untagged amendment, not as a correction.",
     "wrong_home": "An attached write is not about its record's claim (HOME=NO); a contest whose dispute is true is never a wrong home (ruling 5b).",
     "false_conflict": "A contested write does not dispute its record (CONFLICT=NO), so a reader is told a sound record is in doubt.",
     "duplicate_clutter": "A standalone write restates an earlier record and adds nothing a reader needs (HOME, no LOSS, no CONFLICT).",
@@ -132,17 +132,17 @@
     },
     "m1_as_amended": {
       "n": 91,
-      "hits": 29,
-      "rate": 0.3187,
+      "hits": 24,
+      "rate": 0.2637,
       "wilson95": [
-        0.232,
-        0.4201
+        0.1841,
+        0.3625
       ],
       "unclear": 1,
-      "population_rate": 0.3172,
+      "population_rate": 0.2621,
       "population_interval95": [
-        0.2225,
-        0.4157
+        0.1739,
+        0.3559
       ]
     },
     "m2": {

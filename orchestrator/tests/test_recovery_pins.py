@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 from escalation.models import Escalation
-from escalation.pins import classify_pins
+from escalation.pins import classify_pins, needs_human
 
 from orchestrator.recovery_pins import (
     MERGE_REMEDIABLE_ESC_CATEGORIES,
@@ -276,9 +276,19 @@ class TestRecordsPinBlockedRecovery:
         assert records_pin_blocked_recovery(_TID, None, live_claimant=False) is True
 
     @pytest.mark.parametrize(
+        ('level', 'severity'),
+        [(2, 'blocking'), (3, 'blocking'), (1, 'critical'), (0, 'urgent')],
+    )
+    def test_a_human_held_stranded_blocked_record_pins(self, level: int, severity: str) -> None:
+        """A re-dispatch meets the gate that stops on it; a direct merge would pass it (task 6145)."""
+        records = [_ref('stranded_blocked', level=level, severity=severity)]
+        assert records_pin_blocked_recovery(_TID, records, live_claimant=False) is True
+
+    @pytest.mark.parametrize(
         ('category', 'level', 'severity', 'expected'),
         [
             ('stranded_blocked', 1, 'blocking', False),
+            ('stranded_blocked', 2, 'blocking', True),
             ('task_failure', 1, 'blocking', True),
             ('stranded_blocked', 0, 'blocking', False),
             ('task_failure', 0, 'blocking', False),
@@ -293,7 +303,10 @@ class TestRecordsPinBlockedRecovery:
         records = [_ref(category, level=level, severity=severity)]
         composed = (
             records_pin_recovery(_TID, records, live_claimant=False)
-            and not only_merge_remediable(records)
+            and not (
+                only_merge_remediable(records)
+                and not any(needs_human(r) for r in records)
+            )
         )
         answer = records_pin_blocked_recovery(_TID, records, live_claimant=False)
         assert answer is composed
@@ -503,6 +516,7 @@ class TestTheTwoBlockedPredicatesDivergeOnExactlyTheEnumeratedRows:
             _ref('preexisting_main_break'),
             _ref('design_concern', esc_id='esc-3541-2'),
         ]),
+        ('human-held-remediable-l2', [_ref('stranded_blocked', level=2)]),
     )
 
     #: label -> (done_flip, recovery) for the ONLY rows where the two differ.
@@ -511,6 +525,8 @@ class TestTheTwoBlockedPredicatesDivergeOnExactlyTheEnumeratedRows:
         'dead-filer-l0': (True, False),
         # On main the ask is met, so only the done-flip relaxes (task 4645).
         'lone-preexisting-main-break': (False, True),
+        # Recovery re-dispatches into, or merges past, a human-held record; a done-flip on main does neither.
+        'human-held-remediable-l2': (False, True),
     }
 
     @pytest.mark.parametrize(

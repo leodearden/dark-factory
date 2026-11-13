@@ -557,7 +557,7 @@ and are not restated here.
     `_file_stop_instruction_and_block`,
     `_file_curator_adjudication_missing_and_block`,
     `_file_milestone_gate_and_block`,
-    `_file_milestone_check_failed_and_block`). Each wraps the status write in
+    `_file_predicate_escalation_and_block`). Each wraps the status write in
     `try`/`except` and *log-and-swallows* a failure (the escalation is already
     durable), so it can file the record and still not write `blocked`. These
     are also the `pending → blocked` edge §3.8 depends on — no workflow, and
@@ -636,8 +636,16 @@ and are not restated here.
     below, a dead-filer L0 does not suppress that re-file.
   - **Both blocked-arm predicates** carry the `MERGE_REMEDIABLE_ESC_CATEGORIES`
     relaxation, so a record set made up entirely of `stranded_blocked`
-    records does not veto the merge it asks for. They differ on exactly one
-    input: a dead-filer L0 holds the done-flip but not the recovery.
+    records does not veto the merge it asks for. The recovery predicate
+    applies it only while no record needs a human
+    (`escalation/src/escalation/pins.py::needs_human`): a re-dispatch would
+    meet the workflow gate that stops on that record, and the off-main
+    verified-green submit goes straight to the merge queue and would merge
+    past it, which repend-PRD D4 stop-the-line forbids (task 6145). They differ
+    on exactly three inputs: a dead-filer L0 holds the done-flip but not the
+    recovery; a lone `preexisting_main_break` record holds the recovery but
+    not the on-main done-flip; and a human-held `stranded_blocked` record
+    holds the recovery but not the done-flip.
   - **Owned-record question.** `Harness._reconcile_one_stranded`'s re-file
     dedup asks `records_would_duplicate_a_handoff`, which counts a dead-filer
     L0 even though it does not pin: the orphan-L0 reaper will promote it, so a
@@ -675,7 +683,7 @@ and are not restated here.
   blocked-arm upgrade clauses would move again on the next sweep —
   `orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery`
   is False, because it is pinned only by merge-remediable `stranded_blocked`
-  records or only by dead-filer L0s — would not be at rest in `blocked`, so it
+  records that no human holds, or only by dead-filer L0s — would not be at rest in `blocked`, so it
   is held at `LEAVE` instead. The write is observe-before-enforce, gated by
   `convert_to_blocked_enforce`
   (`orchestrator/src/orchestrator/config.py::OrchestratorConfig`). With it
@@ -716,6 +724,9 @@ This expresses auto-deploys, act-then-ask gates, pure human gates, and (via
 [docs/task-authoring.md](docs/task-authoring.md)'s "Deterministic tasks" and
 "Milestones" sections for the full field reference; that's task-author-facing
 configuration, not architecture, so it isn't repeated here.
+The runner's internal dispatch state machine (idempotency and quiescence,
+the `before_done` sub-paths, the pure gate's proof ladder) is documented in
+[docs/deterministic-runner.md](docs/deterministic-runner.md).
 
 ---
 
@@ -739,7 +750,7 @@ matter most for reasoning about safety:
 
 | Role | Stage | Purpose | Model / effort / budget / turns |
 |---|---|---|---|
-| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / max / $15 / 100 |
+| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / xhigh / $15 / 180 |
 | `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / max / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
 | `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / max / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |

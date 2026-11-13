@@ -91,21 +91,15 @@ from _verify_boundary_harness import (
     worktree_base_for,
     write_verify_config,
 )
+from _verify_host_drive import (
+    drive_runner_unavailable,
+    git_ops_mock_for_verify,
+    merge_request_for_verify,
+    probe_free_orch_config,
+)
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
-from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
-from test_merge_queue_multihost_wiring import (
-    _drive_runner_unavailable as _mq_drive_runner_unavailable,
-)
-from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
-    _make_config as _mq_make_config,
-)
-from test_merge_queue_multihost_wiring import (
-    _make_git_ops_mock as _mq_make_git_ops_mock,
-)
-from test_merge_queue_multihost_wiring import (
-    _make_merge_request as _mq_make_merge_request,
-)
+from test_cli import _setup_verify_repo
 
 import orchestrator.cli as cli_module
 from orchestrator.cli import main
@@ -114,7 +108,7 @@ from orchestrator.merge_lane.worker import (
     _run_post_merge_verify,
     _verify_worktree_contention_sentinel,
 )
-from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
+from orchestrator.verify_cancel import (
     WatchdogTrigger,
     lane_lock_path,
     pgid_file,
@@ -155,8 +149,8 @@ from orchestrator.verify_runner import (
 # this guard into a whole-tree scanner; a new module that drives the harness
 # must be added to it.  Self-parsing AST guards are an established idiom in
 # this suite (test_marker_registration_drift.py,
-# test_git_repo_isolation_guard.py, test_lock_release_single_writer_guard.py,
-# test_event_loop_antipattern_guard.py) and cost nothing at runtime -- pure
+# test_git_repo_isolation_guard.py, test_lock_release_single_writer_guard.py)
+# and cost nothing at runtime -- pure
 # parse, no subprocess, no timing.
 #
 # Both sweeps live here, beside the rows, because their sibling
@@ -1488,7 +1482,7 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
 
     consumer_dir = tmp_path / 'consumer'
     consumer_dir.mkdir()
-    _, records = asyncio.run(_mq_drive_runner_unavailable(consumer_dir, caplog, reason))
+    _, records = asyncio.run(drive_runner_unavailable(consumer_dir, caplog, reason))
     assert len(records) == 1, [record.message for record in records]
     assert 'exited 1' in records[0].message, records[0].message
     assert_watchdog_fire_trigger(
@@ -1657,9 +1651,9 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     eq = EscalationQueue(tmp_path / 'escalations')
 
     async def _drive_consumer():
-        config = _mq_make_config()
-        req = _mq_make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _mq_make_git_ops_mock()
+        config = probe_free_orch_config()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         return await _run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},

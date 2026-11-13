@@ -1,9 +1,11 @@
 """Tests for memory_eval_retrieval_probe.py — the E1 retrieval-health probe.
 
-The script is loaded via importlib so it can be tested without sys.path
+The registry contract and the pure metric math are imported from
+``fused_memory.eval.topic_registry`` and ``fused_memory.eval.retrieval_probe``.
+The derivation, report and runner bands still live in the script, which is
+loaded lazily via importlib (``_mod()``) so it can be tested without sys.path
 pollution — mirrors the pattern in test_calibrate_write_triage.py and
-test_audit_duplicate_memories.py. The loader is invoked lazily (``_mod()``)
-so the committed-fixture contract tests stay runnable independently.
+test_audit_duplicate_memories.py.
 
 **Lane discipline.** Every test in this file except the single seeded
 induced-regression test is free of network, Qdrant, OPENAI_API_KEY and any
@@ -19,16 +21,25 @@ booleans and on flips. ``k`` appears only as a metric parameterisation.
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import functools
 import json
+import os
+import sqlite3
 import types
 from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
 from shared.testing_streams import closed_pipe_stdout
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+from fused_memory.eval import retrieval_probe, topic_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
@@ -104,7 +115,7 @@ class TestLoadTopicRegistry:
         path = _write_registry(tmp_path, _registry_payload(
             _entry_payload('briefing-assembler-queries', project_id='reify'),
         ))
-        registry = _mod().load_topic_registry(path)
+        registry = topic_registry.load_topic_registry(path)
 
         assert len(registry.entries) == 1
         entry = registry.entries[0]
@@ -127,7 +138,7 @@ class TestLoadTopicRegistry:
         path = _write_registry(tmp_path, _registry_payload(
             _entry_payload('alpha-topic'), _entry_payload('beta-topic'),
         ))
-        registry = _mod().load_topic_registry(path)
+        registry = topic_registry.load_topic_registry(path)
 
         assert registry.topics == {'alpha-topic', 'beta-topic'}
         assert registry.by_topic['alpha-topic'].topic == 'alpha-topic'
@@ -138,7 +149,7 @@ class TestLoadTopicRegistry:
                 {'superseded_hash': 'c' * 16, 'successor_hash': 'd' * 16},
             ],
         )))
-        entry = _mod().load_topic_registry(path).entries[0]
+        entry = topic_registry.load_topic_registry(path).entries[0]
 
         assert len(entry.supersedes_pairs) == 1
         assert entry.supersedes_pairs[0].superseded_hash == 'c' * 16
@@ -152,8 +163,8 @@ class TestLoadTopicRegistry:
         del bad[missing]
         path = _write_registry(tmp_path, _registry_payload(bad))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'offending-slug' in str(exc.value)
         assert missing in str(exc.value)
 
@@ -162,8 +173,8 @@ class TestLoadTopicRegistry:
         del bad['topic']
         path = _write_registry(tmp_path, _registry_payload(bad))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'topic' in str(exc.value)
 
     def test_duplicate_topic_slug_names_the_topic(self, tmp_path):
@@ -171,8 +182,8 @@ class TestLoadTopicRegistry:
             _entry_payload('dup-slug'), _entry_payload('dup-slug'),
         ))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'dup-slug' in str(exc.value)
         assert 'duplicate' in str(exc.value).lower()
 
@@ -183,8 +194,8 @@ class TestLoadTopicRegistry:
             _entry_payload('fold-me'), _entry_payload('fold_me'),
         ))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'fold-me' in str(exc.value)
         assert 'fold_me' in str(exc.value)
         assert 'duplicate' in str(exc.value).lower()
@@ -194,8 +205,8 @@ class TestLoadTopicRegistry:
             _entry_payload('empty-phrasings', phrasings=[]),
         ))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'empty-phrasings' in str(exc.value)
 
     def test_no_held_out_phrasing_names_the_topic(self, tmp_path):
@@ -207,8 +218,8 @@ class TestLoadTopicRegistry:
             ],
         )))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'no-heldout' in str(exc.value)
         assert 'held_out' in str(exc.value)
 
@@ -217,8 +228,8 @@ class TestLoadTopicRegistry:
             'bad-canonical', canonical={'content_prefix': 'no hash here'},
         )))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'bad-canonical' in str(exc.value)
         assert 'content_hash' in str(exc.value)
 
@@ -227,14 +238,14 @@ class TestLoadTopicRegistry:
             _entry_payload('bad-provenance', derived_from='telepathy'),
         ))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'bad-provenance' in str(exc.value)
         assert 'telepathy' in str(exc.value)
 
     def test_missing_file_raises_registry_error(self, tmp_path):
-        with pytest.raises(_mod().RegistryError):
-            _mod().load_topic_registry(tmp_path / 'does-not-exist.json')
+        with pytest.raises(topic_registry.RegistryError):
+            topic_registry.load_topic_registry(tmp_path / 'does-not-exist.json')
 
     # -- forward-compat: additive-tolerant (3201 widens derivation later) --
 
@@ -242,7 +253,7 @@ class TestLoadTopicRegistry:
         path = _write_registry(tmp_path, _registry_payload(_entry_payload(
             'forward-compat', future_field_from_3201={'kind': 'gotcha'},
         )))
-        entry = _mod().load_topic_registry(path).entries[0]
+        entry = topic_registry.load_topic_registry(path).entries[0]
 
         assert entry.topic == 'forward-compat'
         assert entry.extra['future_field_from_3201'] == {'kind': 'gotcha'}
@@ -252,7 +263,7 @@ class TestLoadTopicRegistry:
         payload['derived_at'] = '2026-07-30T00:00:00Z'
         path = _write_registry(tmp_path, payload)
 
-        assert len(_mod().load_topic_registry(path).entries) == 1
+        assert len(topic_registry.load_topic_registry(path).entries) == 1
 
     # -- the version check runs BEFORE the entry shapes it does not understand --
 
@@ -270,8 +281,8 @@ class TestLoadTopicRegistry:
         payload['schema_version'] = 2
         path = _write_registry(tmp_path, payload)
 
-        with pytest.raises(_mod().RegistryError) as excinfo:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as excinfo:
+            topic_registry.load_topic_registry(path)
 
         message = str(excinfo.value)
         assert 'schema_version' in message
@@ -285,14 +296,14 @@ class TestLoadTopicRegistry:
         payload['_disclosures'] = {'census_topics_skipped_singleton': 303}
         path = _write_registry(tmp_path, payload)
 
-        registry = _mod().load_topic_registry(path)
+        registry = topic_registry.load_topic_registry(path)
 
         assert registry.disclosures == {'census_topics_skipped_singleton': 303}
 
     def test_an_absent_disclosures_block_is_legal(self, tmp_path):
         path = _write_registry(tmp_path, _registry_payload())
 
-        assert _mod().load_topic_registry(path).disclosures == {}
+        assert topic_registry.load_topic_registry(path).disclosures == {}
 
     @pytest.mark.parametrize('value', ['41', 41.5, None, True, ['41']])
     def test_a_non_integer_disclosure_is_a_named_failure_not_a_silent_drop(
@@ -311,8 +322,8 @@ class TestLoadTopicRegistry:
         payload['_disclosures'] = {'census_topics_skipped_singleton': value}
         path = _write_registry(tmp_path, payload)
 
-        with pytest.raises(_mod().RegistryError) as excinfo:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as excinfo:
+            topic_registry.load_topic_registry(path)
 
         assert 'census_topics_skipped_singleton' in str(excinfo.value)
 
@@ -321,8 +332,8 @@ class TestLoadTopicRegistry:
         payload['_disclosures'] = ['census_topics_skipped_singleton']
         path = _write_registry(tmp_path, payload)
 
-        with pytest.raises(_mod().RegistryError) as excinfo:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as excinfo:
+            topic_registry.load_topic_registry(path)
 
         assert '_disclosures' in str(excinfo.value)
 
@@ -351,7 +362,7 @@ topic's pooled rate is never a single coin flip."""
 
 @pytest.fixture(scope='module')
 def registry():
-    return _mod().load_topic_registry(REGISTRY_PATH)
+    return topic_registry.load_topic_registry(REGISTRY_PATH)
 
 
 def _guard_cluster_phrases() -> set[str]:
@@ -369,14 +380,14 @@ class TestCommittedRegistryFixture:
 
     def test_fixture_exists_and_parses(self, registry):
         assert REGISTRY_PATH.is_file()
-        assert registry.schema_version == _mod().REGISTRY_SCHEMA_VERSION
+        assert registry.schema_version == topic_registry.REGISTRY_SCHEMA_VERSION
         assert registry.entries
 
     def test_topic_slugs_are_unique_and_slug_shaped(self, registry):
         topics = [e.topic for e in registry.entries]
         assert len(topics) == len(set(topics))
         for topic in topics:
-            assert _mod()._SLUG_RE.match(topic), f'{topic!r} is not slug-shaped'
+            assert topic_registry.REGISTRY_SLUG_RE.match(topic), f'{topic!r} is not slug-shaped'
 
     def test_breadth_floor(self, registry):
         assert len(registry.entries) >= MIN_TOPICS
@@ -448,7 +459,7 @@ class TestCommittedRegistryFixture:
 
     def test_derived_from_is_in_the_closed_set(self, registry):
         for entry in registry.entries:
-            assert entry.derived_from in _mod().DERIVED_FROM_VALUES, entry.topic
+            assert entry.derived_from in topic_registry.DERIVED_FROM_VALUES, entry.topic
 
     def test_supersedes_pairs_reference_distinct_hashes(self, registry):
         for entry in registry.entries:
@@ -571,7 +582,7 @@ class TestDeriveFromCuratorGates:
     def test_canonical_hash_is_content_key_of_the_canonical_row(
         self, derived, calibration_rows,
     ):
-        content_key = _mod().content_key
+        content_key = retrieval_probe.content_key
         canonical_by_cluster = {
             r['cluster_id']: r for r in calibration_rows if r['label'] == 'canonical'
         }
@@ -581,7 +592,7 @@ class TestDeriveFromCuratorGates:
             assert candidate['canonical']['last_known_id'] == row['memory_id']
 
     def test_members_are_the_duplicate_rows(self, derived, calibration_rows):
-        content_key = _mod().content_key
+        content_key = retrieval_probe.content_key
         dups = {}
         for row in calibration_rows:
             if row['label'] == 'duplicate':
@@ -598,7 +609,7 @@ class TestDeriveFromCuratorGates:
         Folding them in would poison the contamination metric with entries that
         legitimately answer a different question.
         """
-        content_key = _mod().content_key
+        content_key = retrieval_probe.content_key
         excluded = {
             content_key(r['content']) for r in calibration_rows
             if r['label'] in ('distinct', 'pseudo_contradiction')
@@ -769,7 +780,7 @@ class TestDeriveFromCensus:
         d = result.disclosures
         assert kept_or_dropped(d) == kept_or_dropped(baseline) + len(multi_entry_rows)
         assert kept_or_dropped(d) - d['slug_collisions_dropped'] == len(result.candidates)
-        folded = {m.normalize_topic(c['topic']) for c in result.candidates}
+        folded = {topic_registry.normalize_topic(c['topic']) for c in result.candidates}
         assert len(folded) == len(result.candidates)
 
     @pytest.mark.parametrize(('payload', 'named_location'), [
@@ -858,7 +869,7 @@ class TestDeriveFromGuardClusters:
 
         [kept] = [
             c for c in result.candidates
-            if m.normalize_topic(c['topic']) == m.normalize_topic(slug)
+            if topic_registry.normalize_topic(c['topic']) == topic_registry.normalize_topic(slug)
         ]
         assert kept['derived_from'] == 'topic_guard_cluster'
         assert kept['topic'] == slug
@@ -939,14 +950,14 @@ class TestDerivationIsPure:
             )
             if not entry['canonical']['content_hash']:
                 hashless.add(entry['derived_from'])
-                entry['canonical']['content_hash'] = _mod().content_key(entry['topic'])
+                entry['canonical']['content_hash'] = retrieval_probe.content_key(entry['topic'])
 
         assert 'curator_gate' not in hashless
         assert hashless == {'census_topic', 'topic_guard_cluster'}
         path = tmp_path / 'derived.json'
         path.write_text(json.dumps(payload), encoding='utf-8')
 
-        registry = _mod().load_topic_registry(path)
+        registry = topic_registry.load_topic_registry(path)
         assert len(registry.entries) == len(payload['entries'])
 
 
@@ -977,17 +988,16 @@ class _R:
 
 def _entry(topic='t', content='the canonical text', last_known_id: str | None = 'ID-1', **kw):
     """Build a real RegistryEntry whose canonical hashes *content*."""
-    m = _mod()
-    return m.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=topic,
         project_id=kw.pop('project_id', 'dark_factory'),
         derived_from=kw.pop('derived_from', 'hand'),
-        canonical=m.Canonical(
-            content_hash=kw.pop('content_hash', m.content_key(content)),
+        canonical=topic_registry.Canonical(
+            content_hash=kw.pop('content_hash', retrieval_probe.content_key(content)),
             content_prefix=content[:80],
             last_known_id=last_known_id,
         ),
-        phrasings=kw.pop('phrasings', (m.Phrasing('q', False), m.Phrasing('h', True))),
+        phrasings=kw.pop('phrasings', (topic_registry.Phrasing('q', False), topic_registry.Phrasing('h', True))),
         **kw,
     )
 
@@ -1005,15 +1015,15 @@ class TestCanonicalHit:
         at_one = [_R(content=CANON, id='ID-1'), *_filler(9)]
         at_five = [*_filler(4), _R(content=CANON, id='ID-1'), *_filler(5, start=4)]
 
-        assert _mod().canonical_hit(at_one, entry, 5).hit
-        assert _mod().canonical_hit(at_one, entry, 5).rank == 1
-        assert _mod().canonical_hit(at_five, entry, 5).hit
-        assert _mod().canonical_hit(at_five, entry, 5).rank == 5
+        assert retrieval_probe.canonical_hit(at_one, entry.canonical, 5).hit
+        assert retrieval_probe.canonical_hit(at_one, entry.canonical, 5).rank == 1
+        assert retrieval_probe.canonical_hit(at_five, entry.canonical, 5).hit
+        assert retrieval_probe.canonical_hit(at_five, entry.canonical, 5).rank == 5
 
     def test_rank_k_plus_one_does_not_hit(self):
         entry = _entry(content=CANON)
         results = [*_filler(5), _R(content=CANON, id='ID-1')]
-        outcome = _mod().canonical_hit(results, entry, 5)
+        outcome = retrieval_probe.canonical_hit(results, entry.canonical, 5)
 
         assert not outcome.hit
         assert outcome.rank == 6, 'the true rank is still reported, for the report'
@@ -1023,13 +1033,13 @@ class TestCanonicalHit:
         entry = _entry(content=CANON)
         results = [*_filler(6), _R(content=CANON, id='ID-1'), *_filler(3, start=6)]
 
-        assert not _mod().canonical_hit(results, entry, 5).hit
-        assert _mod().canonical_hit(results, entry, 10).hit
+        assert not retrieval_probe.canonical_hit(results, entry.canonical, 5).hit
+        assert retrieval_probe.canonical_hit(results, entry.canonical, 10).hit
 
     def test_content_hash_matches_even_when_the_id_rotated(self):
         entry = _entry(content=CANON, last_known_id='OLD-UUID')
         results = [_R(content=CANON, id='BRAND-NEW-UUID')]
-        outcome = _mod().canonical_hit(results, entry, 5)
+        outcome = retrieval_probe.canonical_hit(results, entry.canonical, 5)
 
         assert outcome.hit
         assert outcome.matched_by == 'content_hash'
@@ -1037,7 +1047,7 @@ class TestCanonicalHit:
     def test_id_fallback_hits_and_flags_a_hash_repair(self):
         entry = _entry(content=CANON, last_known_id='ID-1')
         results = [_R(content='the canonical text, lightly reworded', id='ID-1')]
-        outcome = _mod().canonical_hit(results, entry, 5)
+        outcome = retrieval_probe.canonical_hit(results, entry.canonical, 5)
 
         assert outcome.hit
         assert outcome.matched_by == 'last_known_id'
@@ -1046,7 +1056,7 @@ class TestCanonicalHit:
     def test_content_hash_wins_when_both_could_match(self):
         entry = _entry(content=CANON, last_known_id='ID-1')
         results = [_R(content='something else', id='ID-1'), _R(content=CANON, id='OTHER')]
-        outcome = _mod().canonical_hit(results, entry, 5)
+        outcome = retrieval_probe.canonical_hit(results, entry.canonical, 5)
 
         assert outcome.matched_by == 'content_hash'
         assert outcome.rank == 2
@@ -1054,7 +1064,7 @@ class TestCanonicalHit:
 
     def test_matching_neither_is_recorded_as_unmatched(self):
         entry = _entry(content=CANON, last_known_id='ID-1')
-        outcome = _mod().canonical_hit(_filler(5), entry, 5)
+        outcome = retrieval_probe.canonical_hit(_filler(5), entry.canonical, 5)
 
         assert not outcome.hit
         assert outcome.matched_by is None
@@ -1065,12 +1075,12 @@ class TestCanonicalHit:
         entry = _entry(content=CANON)
         results = [_R(content='  the   canonical\n text  ', id='X')]
 
-        assert _mod().canonical_hit(results, entry, 5).matched_by == 'content_hash'
+        assert retrieval_probe.canonical_hit(results, entry.canonical, 5).matched_by == 'content_hash'
 
     def test_absent_last_known_id_never_matches_an_empty_result_id(self):
         """A registry entry with no id must not match a result with no id."""
         entry = _entry(content=CANON, last_known_id=None)
-        outcome = _mod().canonical_hit([_R(content='other', id='')], entry, 5)
+        outcome = retrieval_probe.canonical_hit([_R(content='other', id='')], entry.canonical, 5)
 
         assert not outcome.hit
         assert outcome.unmatched
@@ -1083,22 +1093,20 @@ class TestCanonicalHit:
         fallback, unmatched — because the threaded index short-circuits the
         hash arm and only the fallback still walks the list.
         """
-        m = _mod()
         entry = _entry(content=CANON, last_known_id='ID-1')
         results = [*_filler(2), _R(content=content, id='ID-1')]
 
         assert (
-            m.canonical_hit(results, entry, 5, ranks=m.rank_index(results))
-            == m.canonical_hit(results, entry, 5)
+            retrieval_probe.canonical_hit(results, entry.canonical, 5, ranks=retrieval_probe.rank_index(results))
+            == retrieval_probe.canonical_hit(results, entry.canonical, 5)
         )
 
 
 class TestObservationBuilder:
     def test_records_topic_phrasing_and_k(self):
-        m = _mod()
         entry = _entry(topic='my-topic', content=CANON)
-        obs = m.observe_phrasing(
-            [_R(content=CANON, id='ID-1')], entry, m.Phrasing('some query', False), 5,
+        obs = retrieval_probe.observe_phrasing(
+            [_R(content=CANON, id='ID-1')], entry, topic_registry.Phrasing('some query', False), 5,
         )
 
         assert obs.topic == 'my-topic'
@@ -1108,17 +1116,15 @@ class TestObservationBuilder:
         assert obs.matched_by == 'content_hash'
 
     def test_held_out_phrasings_are_tagged(self):
-        m = _mod()
         entry = _entry(content=CANON)
-        tuned = m.observe_phrasing([], entry, m.Phrasing('tuned', False), 5)
-        held = m.observe_phrasing([], entry, m.Phrasing('fresh', True), 5)
+        tuned = retrieval_probe.observe_phrasing([], entry, topic_registry.Phrasing('tuned', False), 5)
+        held = retrieval_probe.observe_phrasing([], entry, topic_registry.Phrasing('fresh', True), 5)
 
         assert not tuned.held_out
         assert held.held_out
 
     def test_observation_is_not_degraded_by_default(self):
-        m = _mod()
-        obs = m.observe_phrasing([], _entry(content=CANON), m.Phrasing('q', False), 5)
+        obs = retrieval_probe.observe_phrasing([], _entry(content=CANON), topic_registry.Phrasing('q', False), 5)
         assert not obs.degraded
 
 
@@ -1127,18 +1133,17 @@ class TestObservationBuilder:
 # ---------------------------------------------------------------------------
 
 def _pair_entry(topic='sup', old='old text', new='new text'):
-    m = _mod()
     base = _entry(topic=topic, content=new)
-    return m.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=base.topic,
         project_id=base.project_id,
         derived_from=base.derived_from,
         canonical=base.canonical,
         phrasings=base.phrasings,
         supersedes_pairs=(
-            m.SupersedesPair(
-                superseded_hash=m.content_key(old),
-                successor_hash=m.content_key(new),
+            topic_registry.SupersedesPair(
+                superseded_hash=retrieval_probe.content_key(old),
+                successor_hash=retrieval_probe.content_key(new),
             ),
         ),
     )
@@ -1148,12 +1153,12 @@ class TestSupersededInversions:
     def test_superseded_ranked_above_successor_is_one_inversion(self):
         entry = _pair_entry()
         results = [_R(content='old text', id='A'), _R(content='new text', id='B')]
-        inversions = _mod().superseded_inversions(results, entry)
+        inversions = retrieval_probe.superseded_inversions(results, entry)
 
         assert len(inversions) == 1
         record = inversions[0]
-        assert record.superseded_hash == _mod().content_key('old text')
-        assert record.successor_hash == _mod().content_key('new text')
+        assert record.superseded_hash == retrieval_probe.content_key('old text')
+        assert record.successor_hash == retrieval_probe.content_key('new text')
         assert record.superseded_rank == 1
         assert record.successor_rank == 2
         assert record.topic == 'sup'
@@ -1162,7 +1167,7 @@ class TestSupersededInversions:
         entry = _pair_entry()
         results = [_R(content='new text', id='B'), _R(content='old text', id='A')]
 
-        assert _mod().superseded_inversions(results, entry) == []
+        assert retrieval_probe.superseded_inversions(results, entry) == []
 
     @pytest.mark.parametrize('present', ['old text', 'new text'])
     def test_only_one_member_present_is_no_inversion(self, present):
@@ -1174,28 +1179,27 @@ class TestSupersededInversions:
         entry = _pair_entry()
         results = [*_filler(2), _R(content=present, id='X')]
 
-        assert _mod().superseded_inversions(results, entry) == []
+        assert retrieval_probe.superseded_inversions(results, entry) == []
 
     def test_neither_present_is_no_inversion(self):
-        assert _mod().superseded_inversions(_filler(3), _pair_entry()) == []
+        assert retrieval_probe.superseded_inversions(_filler(3), _pair_entry()) == []
 
     def test_several_pairs_are_counted_independently(self):
-        m = _mod()
         base = _entry(topic='multi', content='c1')
-        entry = m.RegistryEntry(
+        entry = topic_registry.RegistryEntry(
             topic=base.topic, project_id=base.project_id,
             derived_from=base.derived_from, canonical=base.canonical,
             phrasings=base.phrasings,
             supersedes_pairs=(
-                m.SupersedesPair(m.content_key('o1'), m.content_key('c1')),
-                m.SupersedesPair(m.content_key('o2'), m.content_key('c2')),
+                topic_registry.SupersedesPair(retrieval_probe.content_key('o1'), retrieval_probe.content_key('c1')),
+                topic_registry.SupersedesPair(retrieval_probe.content_key('o2'), retrieval_probe.content_key('c2')),
             ),
         )
         results = [
             _R(content='o1'), _R(content='o2'), _R(content='c1'), _R(content='c2'),
         ]
 
-        assert len(m.superseded_inversions(results, entry)) == 2
+        assert len(retrieval_probe.superseded_inversions(results, entry)) == 2
 
     def test_ties_resolve_by_returned_list_order_deterministically(self):
         """Equal relevance_score must not let the count flap between runs."""
@@ -1208,7 +1212,7 @@ class TestSupersededInversions:
             _R(content='new text', relevance_score=0.5),
             _R(content='old text', relevance_score=0.5),
         ]
-        run = _mod().superseded_inversions
+        run = retrieval_probe.superseded_inversions
 
         assert len(run(tied_old_first, entry)) == 1
         assert run(tied_old_first, entry) == run(tied_old_first, entry)
@@ -1221,7 +1225,7 @@ class TestSupersededInversions:
         count — if it did, a second pointer parser would have grown here.
         """
         entry = _pair_entry()
-        run = _mod().superseded_inversions
+        run = retrieval_probe.superseded_inversions
         clean = [_R(content='old text'), _R(content='new text')]
         poisoned = [
             _R(content='old text', metadata={'supersedes': {'nonsense': [1, 2, None]}}),
@@ -1232,7 +1236,7 @@ class TestSupersededInversions:
         assert len(run(poisoned, entry)) == 1
 
     def test_entry_without_pairs_yields_nothing(self):
-        assert _mod().superseded_inversions(_filler(3), _entry()) == []
+        assert retrieval_probe.superseded_inversions(_filler(3), _entry()) == []
 
     def test_a_threaded_rank_index_gives_the_same_answer(self):
         """The hash-once refactor must not be a behaviour change.
@@ -1241,13 +1245,12 @@ class TestSupersededInversions:
         consumer; a direct caller passes nothing. Both paths read the same
         list, so both must produce the same records.
         """
-        m = _mod()
         entry = _pair_entry()
         results = [_R(content='old text', id='A'), _R(content='new text', id='B')]
 
         assert (
-            m.superseded_inversions(results, entry, ranks=m.rank_index(results))
-            == m.superseded_inversions(results, entry)
+            retrieval_probe.superseded_inversions(results, entry, ranks=retrieval_probe.rank_index(results))
+            == retrieval_probe.superseded_inversions(results, entry)
         )
 
 
@@ -1260,83 +1263,74 @@ class TestComparablePairs:
     """
 
     def test_both_members_present_is_one_comparable_pair(self):
-        m = _mod()
         entry = _pair_entry()
         results = [_R(content='old text'), _R(content='new text')]
 
-        assert m.comparable_pairs(entry, m.rank_index(results)) == 1
+        assert retrieval_probe.comparable_pairs(entry, retrieval_probe.rank_index(results)) == 1
 
     @pytest.mark.parametrize('present', ['old text', 'new text'])
     def test_one_member_present_is_no_exposure(self, present):
-        m = _mod()
         results = [*_filler(2), _R(content=present)]
 
-        assert m.comparable_pairs(_pair_entry(), m.rank_index(results)) == 0
+        assert retrieval_probe.comparable_pairs(_pair_entry(), retrieval_probe.rank_index(results)) == 0
 
     def test_neither_member_present_is_no_exposure(self):
-        m = _mod()
 
-        assert m.comparable_pairs(_pair_entry(), m.rank_index(_filler(3))) == 0
+        assert retrieval_probe.comparable_pairs(_pair_entry(), retrieval_probe.rank_index(_filler(3))) == 0
 
     def test_it_counts_the_same_population_the_inversions_come_from(self):
         """The invariant that makes it a valid denominator: events <= exposure."""
-        m = _mod()
         base = _entry(topic='multi', content='c1')
-        entry = m.RegistryEntry(
+        entry = topic_registry.RegistryEntry(
             topic=base.topic, project_id=base.project_id,
             derived_from=base.derived_from, canonical=base.canonical,
             phrasings=base.phrasings,
             supersedes_pairs=(
-                m.SupersedesPair(m.content_key('o1'), m.content_key('c1')),
-                m.SupersedesPair(m.content_key('o2'), m.content_key('c2')),
-                m.SupersedesPair(m.content_key('o3'), m.content_key('c3')),
+                topic_registry.SupersedesPair(retrieval_probe.content_key('o1'), retrieval_probe.content_key('c1')),
+                topic_registry.SupersedesPair(retrieval_probe.content_key('o2'), retrieval_probe.content_key('c2')),
+                topic_registry.SupersedesPair(retrieval_probe.content_key('o3'), retrieval_probe.content_key('c3')),
             ),
         )
         results = [_R(content='o1'), _R(content='c1'), _R(content='o2'), _R(content='c2')]
-        ranks = m.rank_index(results)
+        ranks = retrieval_probe.rank_index(results)
 
-        assert m.comparable_pairs(entry, ranks) == 2, 'the o3/c3 pair never came back'
-        assert len(m.superseded_inversions(results, entry, ranks=ranks)) <= 2
+        assert retrieval_probe.comparable_pairs(entry, ranks) == 2, 'the o3/c3 pair never came back'
+        assert len(retrieval_probe.superseded_inversions(results, entry, ranks=ranks)) <= 2
 
     def test_an_entry_without_pairs_has_no_exposure(self):
-        m = _mod()
 
-        assert m.comparable_pairs(_entry(), m.rank_index(_filler(3))) == 0
+        assert retrieval_probe.comparable_pairs(_entry(), retrieval_probe.rank_index(_filler(3))) == 0
 
     def test_results_are_accepted_when_no_index_was_built(self):
         """The direct-caller shape, for a caller that has the list only."""
-        m = _mod()
         results = [_R(content='old text'), _R(content='new text')]
 
-        assert m.comparable_pairs(_pair_entry(), None, results) == 1
+        assert retrieval_probe.comparable_pairs(_pair_entry(), None, results) == 1
 
 
 class TestRankIndex:
     """`rank_index(results)` — one hash pass per search, read by three families."""
 
     def test_it_maps_each_content_hash_to_its_rank(self):
-        m = _mod()
-        ranks = m.rank_index([_R(content='first'), _R(content='second')])
+        ranks = retrieval_probe.rank_index([_R(content='first'), _R(content='second')])
 
-        assert ranks[m.content_key('first')] == 1
-        assert ranks[m.content_key('second')] == 2
+        assert ranks[retrieval_probe.content_key('first')] == 1
+        assert ranks[retrieval_probe.content_key('second')] == 2
 
     def test_a_repeated_entry_keeps_its_best_rank(self):
         """Taking the later position would report a duplication as a ranking
         problem."""
-        m = _mod()
-        ranks = m.rank_index([_R(content='dup'), *_filler(2), _R(content='dup')])
+        ranks = retrieval_probe.rank_index([_R(content='dup'), *_filler(2), _R(content='dup')])
 
-        assert ranks[m.content_key('dup')] == 1
+        assert ranks[retrieval_probe.content_key('dup')] == 1
 
     def test_it_normalises_whitespace_exactly_as_content_key_does(self):
-        m = _mod()
-        ranks = m.rank_index([_R(content='  the   canonical\n text  ')])
+        ranks = retrieval_probe.rank_index([_R(content='  the   canonical\n text  ')])
 
-        assert ranks[m.content_key('the canonical text')] == 1
+        assert ranks[retrieval_probe.content_key('the canonical text')] == 1
 
     def test_an_empty_list_indexes_nothing(self):
-        assert _mod().rank_index([]) == {}
+        assert retrieval_probe.rank_index([]) == {}
 
 
 class TestRanksAtDepth:
@@ -1350,33 +1344,30 @@ class TestRanksAtDepth:
     """
 
     def test_matches_rehashing_the_truncated_list_at_every_depth(self):
-        m = _mod()
         results = _filler(9)
-        ranks = m.rank_index(results)
+        ranks = retrieval_probe.rank_index(results)
 
         for k in (0, 1, 4, len(results), len(results) + 5):
-            assert m.ranks_at_depth(ranks, k) == m.rank_index(results[:k])
+            assert retrieval_probe.ranks_at_depth(ranks, k) == retrieval_probe.rank_index(results[:k])
 
     def test_a_repeated_hash_keeps_its_first_rank_across_the_cut(self):
         """Same content at rank 1 (<= k) and rank 7 (> k): the derived view
         must map it to its first rank, not drop it because a later
         occurrence of the same content fell outside the depth."""
-        m = _mod()
         results = [_R(content='dup', id='D1'), *_filler(5), _R(content='dup', id='D2')]
-        ranks = m.rank_index(results)
+        ranks = retrieval_probe.rank_index(results)
         k = 3
 
-        depth_view = m.ranks_at_depth(ranks, k)
+        depth_view = retrieval_probe.ranks_at_depth(ranks, k)
 
-        assert depth_view[m.content_key('dup')] == 1
-        assert depth_view == m.rank_index(results[:k])
+        assert depth_view[retrieval_probe.content_key('dup')] == 1
+        assert depth_view == retrieval_probe.rank_index(results[:k])
 
     def test_it_does_not_mutate_the_input_mapping(self):
-        m = _mod()
-        ranks = m.rank_index(_filler(5))
+        ranks = retrieval_probe.rank_index(_filler(5))
         before = dict(ranks)
 
-        m.ranks_at_depth(ranks, 2)
+        retrieval_probe.ranks_at_depth(ranks, 2)
 
         assert ranks == before
 
@@ -1385,26 +1376,26 @@ class TestContentKey:
     """`content_key(text)` — whitespace-normalized sha256[:16]."""
 
     def test_stable_across_surrounding_whitespace(self):
-        content_key = _mod().content_key
+        content_key = retrieval_probe.content_key
         assert content_key('  hello world  ') == content_key('hello world')
         assert content_key('hello world\n') == content_key('hello world')
 
     def test_stable_across_collapsed_internal_whitespace(self):
-        content_key = _mod().content_key
+        content_key = retrieval_probe.content_key
         assert content_key('hello   world') == content_key('hello world')
         assert content_key('hello\n\tworld') == content_key('hello world')
 
     def test_differs_for_different_text(self):
-        content_key = _mod().content_key
+        content_key = retrieval_probe.content_key
         assert content_key('hello world') != content_key('goodbye world')
 
     def test_shape_is_sixteen_hex_chars(self):
-        key = _mod().content_key('anything at all')
+        key = retrieval_probe.content_key('anything at all')
         assert len(key) == 16
         assert all(c in '0123456789abcdef' for c in key)
 
     def test_empty_and_whitespace_only_agree(self):
-        content_key = _mod().content_key
+        content_key = retrieval_probe.content_key
         assert content_key('') == content_key('   \n\t ')
 
 
@@ -1422,7 +1413,7 @@ class TestContentKey:
 # ---------------------------------------------------------------------------
 
 def _claim(query, *needles):
-    return _mod().ClaimQuery(query=query, needles=tuple(needles))
+    return topic_registry.ClaimQuery(query=query, needles=tuple(needles))
 
 
 CLAIM_TEXT = (
@@ -1440,7 +1431,7 @@ class TestClaimRecalled:
             _R(content='an unrelated preamble', id='X'),
             _R(content=CLAIM_TEXT, id='SOME-OTHER-ENTRY'),
         ]
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             results, _claim('how does the merge lane advance', 'strictly serial'), 5,
         )
 
@@ -1449,7 +1440,7 @@ class TestClaimRecalled:
         assert outcome.matched_rank == 2
 
     def test_needles_absent_from_every_entry_is_not_recalled(self):
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             _filler(5), _claim('how does the merge lane advance', 'strictly serial'), 5,
         )
 
@@ -1460,7 +1451,7 @@ class TestClaimRecalled:
     def test_matching_is_whitespace_normalized_like_content_key(self):
         """(c) Re-wrapping a stored line must not read as knowledge loss."""
         results = [_R(content='the merge   lane is\n\tstrictly    serial', id='X')]
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             results, _claim('merge lane', 'merge lane is strictly serial'), 5,
         )
 
@@ -1469,7 +1460,7 @@ class TestClaimRecalled:
     def test_matching_is_case_insensitive(self):
         """(c) Casing is presentation churn in prose — 'WRITE-SET' vs 'write-set'."""
         results = [_R(content='the plan files list is a WRITE-SET, not a read-set', id='X')]
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             results, _claim('what does the plan files list mean', 'write-set'), 5,
         )
 
@@ -1478,7 +1469,7 @@ class TestClaimRecalled:
     def test_all_needles_are_required(self):
         """(d) A partial match is not recall."""
         results = [_R(content=CLAIM_TEXT, id='X')]
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             results,
             _claim('merge lane', 'strictly serial', 'never rolls back a landed merge'),
             5,
@@ -1489,7 +1480,7 @@ class TestClaimRecalled:
     def test_missing_needles_name_what_did_not_come_back(self):
         """(d) The report must say WHAT was missing, not merely that something was."""
         results = [_R(content=CLAIM_TEXT, id='X')]
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             results,
             _claim('merge lane', 'strictly serial', 'never rolls back a landed merge'),
             5,
@@ -1509,7 +1500,7 @@ class TestClaimRecalled:
             _R(content='the merge lane is strictly serial', id='A'),
             _R(content='the queue never rolls back a landed merge', id='B'),
         ]
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             split,
             _claim('merge lane', 'strictly serial', 'never rolls back a landed merge'),
             5,
@@ -1523,7 +1514,7 @@ class TestClaimRecalled:
             _R(content='wholly unrelated filler', id='A'),
             _R(content='the merge lane is strictly serial', id='B'),
         ]
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             results,
             _claim('merge lane', 'strictly serial', 'never rolls back a landed merge'),
             5,
@@ -1534,7 +1525,7 @@ class TestClaimRecalled:
     def test_recall_is_confined_to_the_top_k_slice(self):
         """(e) Same parameterised k as canonical-in-top-k."""
         results = [*_filler(5), _R(content=CLAIM_TEXT, id='X')]
-        run = _mod().claim_recalled
+        run = retrieval_probe.claim_recalled
         claim = _claim('merge lane', 'strictly serial')
 
         assert not run(results, claim, 5).recalled
@@ -1547,20 +1538,20 @@ class TestClaimRecalled:
         recall for a malformed registry entry. It is disclosed as unscorable
         instead, so leaf alpha's denominator can exclude it visibly.
         """
-        outcome = _mod().claim_recalled(_filler(3), _claim('a claim with no needles'), 5)
+        outcome = retrieval_probe.claim_recalled(_filler(3), _claim('a claim with no needles'), 5)
 
         assert not outcome.scorable
         assert not outcome.recalled
 
     def test_a_needled_claim_is_scorable(self):
-        outcome = _mod().claim_recalled(
+        outcome = retrieval_probe.claim_recalled(
             [_R(content=CLAIM_TEXT, id='X')], _claim('merge lane', 'strictly serial'), 5,
         )
 
         assert outcome.scorable
 
     def test_empty_results_are_not_recalled(self):
-        outcome = _mod().claim_recalled([], _claim('merge lane', 'strictly serial'), 5)
+        outcome = retrieval_probe.claim_recalled([], _claim('merge lane', 'strictly serial'), 5)
 
         assert not outcome.recalled
         assert outcome.missing_needles == ('strictly serial',)
@@ -1583,8 +1574,7 @@ class TestClaimRecalled:
 
 def _mini_registry(*topics):
     """A TopicRegistry over bare topic slugs (only the slugs matter here)."""
-    m = _mod()
-    return m.TopicRegistry(
+    return topic_registry.TopicRegistry(
         schema_version=1,
         entries=tuple(_entry(topic=t, content=f'canonical for {t}') for t in topics),
     )
@@ -1599,9 +1589,8 @@ class TestClassifyContamination:
 
     def test_a_different_registry_topic_is_foreign_and_named(self):
         """(a) The record must name WHICH foreign topic bled in."""
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [_topiced('escalation-ladder', id='F1')],
             registry.by_topic['merge-lane'],
             registry,
@@ -1614,9 +1603,8 @@ class TestClassifyContamination:
         assert outcome.foreign_records[0].rank == 1
 
     def test_the_probed_topic_itself_is_not_foreign(self):
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [_topiced('merge-lane')], registry.by_topic['merge-lane'], registry, 5,
         )
 
@@ -1625,9 +1613,8 @@ class TestClassifyContamination:
 
     def test_a_result_with_no_topic_is_untopiced_not_foreign(self):
         """(c) Pre-3201 well-posedness: absence of a stamp is not contamination."""
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [_R(content='no topic key at all', id='U1')],
             registry.by_topic['merge-lane'],
             registry,
@@ -1639,9 +1626,8 @@ class TestClassifyContamination:
 
     def test_an_unregistered_topic_is_untopiced_not_foreign(self):
         """(c) 352 distinct topic values live; the registry knows ~32 of them."""
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [_topiced('some-topic-the-registry-has-never-heard-of', id='U1')],
             registry.by_topic['merge-lane'],
             registry,
@@ -1658,10 +1644,9 @@ class TestClassifyContamination:
         silently read zero the contamination share would look authoritative
         while being computed over a handful of stamped results.
         """
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
         results = [*_filler(4), _topiced('escalation-ladder', id='F1')]
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             results, registry.by_topic['merge-lane'], registry, 5,
         )
 
@@ -1671,12 +1656,11 @@ class TestClassifyContamination:
 
     def test_hyphen_and_underscore_spellings_are_the_same_topic(self):
         """(e) The guard slug and the live metadata value differ by - vs _."""
-        m = _mod()
         registry = _mini_registry(
             'architect-report-task-already-done-main-reachability', 'merge-lane',
         )
         probed = registry.by_topic['architect-report-task-already-done-main-reachability']
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [_topiced('architect_report_task_already_done_main_reachability')],
             probed,
             registry,
@@ -1688,11 +1672,10 @@ class TestClassifyContamination:
 
     def test_underscored_foreign_topic_is_still_foreign(self):
         """(e) The same fold must not make a genuinely foreign topic vanish."""
-        m = _mod()
         registry = _mini_registry(
             'architect-report-task-already-done-main-reachability', 'merge-lane',
         )
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [_topiced('architect_report_task_already_done_main_reachability')],
             registry.by_topic['merge-lane'],
             registry,
@@ -1703,13 +1686,12 @@ class TestClassifyContamination:
 
     def test_classification_is_confined_to_the_top_k_slice(self):
         """(f) Same parameterised k as every other metric here."""
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
         probed = registry.by_topic['merge-lane']
         results = [*_filler(5), _topiced('escalation-ladder', id='F1')]
 
-        at_five = m.classify_contamination(results, probed, registry, 5)
-        at_ten = m.classify_contamination(results, probed, registry, 10)
+        at_five = retrieval_probe.classify_contamination(results, probed, registry, 5)
+        at_ten = retrieval_probe.classify_contamination(results, probed, registry, 10)
 
         assert at_five.foreign_count == 0
         assert at_five.scored_total == 5
@@ -1723,16 +1705,15 @@ class TestClassifyContamination:
         3201's retro stamping widens exactly this set, and the same code then
         sees contamination it could not previously name.
         """
-        m = _mod()
         results = [_topiced('escalation-ladder', id='F1')]
 
         narrow = _mini_registry('merge-lane')
-        before = m.classify_contamination(
+        before = retrieval_probe.classify_contamination(
             results, narrow.by_topic['merge-lane'], narrow, 5,
         )
 
         wide = _mini_registry('merge-lane', 'escalation-ladder')
-        after = m.classify_contamination(results, wide.by_topic['merge-lane'], wide, 5)
+        after = retrieval_probe.classify_contamination(results, wide.by_topic['merge-lane'], wide, 5)
 
         assert before.foreign_count == 0
         assert before.untopiced_count == 1
@@ -1740,9 +1721,8 @@ class TestClassifyContamination:
         assert after.untopiced_count == 0
 
     def test_foreign_records_carry_the_probed_topic_for_the_report(self):
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [_topiced('escalation-ladder', id='F1')],
             registry.by_topic['merge-lane'],
             registry,
@@ -1752,9 +1732,8 @@ class TestClassifyContamination:
         assert outcome.foreign_records[0].topic == 'merge-lane'
 
     def test_an_empty_result_list_scores_nothing(self):
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [], registry.by_topic['merge-lane'], registry, 5,
         )
 
@@ -1765,9 +1744,8 @@ class TestClassifyContamination:
     def test_a_non_string_topic_value_is_untopiced_not_a_crash(self):
         """Live metadata is not schema-enforced; a list-valued topic must not
         take the run down, nor be silently read as the probed topic."""
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
-        outcome = m.classify_contamination(
+        outcome = retrieval_probe.classify_contamination(
             [_R(content='x', id='B1', metadata={'topic': ['merge-lane']})],
             registry.by_topic['merge-lane'],
             registry,
@@ -1778,10 +1756,9 @@ class TestClassifyContamination:
         assert outcome.foreign_count == 0
 
     def test_the_outcome_unpacks_as_the_documented_four_tuple(self):
-        m = _mod()
         registry = _mini_registry('merge-lane', 'escalation-ladder')
         foreign_records, foreign_count, untopiced_count, scored_total = (
-            m.classify_contamination(
+            retrieval_probe.classify_contamination(
                 [_topiced('escalation-ladder', id='F1'), *_filler(2)],
                 registry.by_topic['merge-lane'],
                 registry,
@@ -1808,8 +1785,7 @@ class TestClassifyContamination:
 # ---------------------------------------------------------------------------
 
 def _phrasing_obs(topic, phrasing='q', *, k=5, hit=True, held_out=False, degraded=False):
-    m = _mod()
-    return m.PhrasingObservation(
+    return retrieval_probe.PhrasingObservation(
         topic=topic,
         phrasing=phrasing,
         held_out=held_out,
@@ -1822,8 +1798,7 @@ def _phrasing_obs(topic, phrasing='q', *, k=5, hit=True, held_out=False, degrade
 
 
 def _claim_obs(topic, query='c', *, k=5, recalled=True, scorable=True, degraded=False):
-    m = _mod()
-    return m.ClaimObservation(
+    return retrieval_probe.ClaimObservation(
         topic=topic,
         query=query,
         k=k,
@@ -1835,8 +1810,7 @@ def _claim_obs(topic, query='c', *, k=5, recalled=True, scorable=True, degraded=
 
 
 def _contam_obs(topic, *, foreign=0, untopiced=0, scored=5, degraded=False):
-    m = _mod()
-    return m.ContaminationObservation(
+    return retrieval_probe.ContaminationObservation(
         topic=topic,
         phrasing='q',
         k=5,
@@ -1851,8 +1825,7 @@ def _contam_obs(topic, *, foreign=0, untopiced=0, scored=5, degraded=False):
 def _inversion_obs(
     topic, *, pairs=2, comparable=None, inversions=0, degraded=False, k=5, beyond_depth=0,
 ):
-    m = _mod()
-    return m.InversionObservation(
+    return retrieval_probe.InversionObservation(
         topic=topic,
         phrasing='q',
         k=k,
@@ -1864,7 +1837,7 @@ def _inversion_obs(
         # care about the diagnostic set it explicitly.
         pairs_beyond_scored_depth=beyond_depth,
         inversions=tuple(
-            m.InversionRecord(
+            retrieval_probe.InversionRecord(
                 topic=topic, phrasing='q',
                 superseded_hash='a' * 16, successor_hash='b' * 16,
                 superseded_rank=1, successor_rank=2,
@@ -1884,7 +1857,6 @@ def _observations(*, topics=('alpha-topic', 'beta-topic'), ks=(5, 10), miss_held
     Goodhart guard's failure mode, and the only way a topic in this fixture can
     fail its tripwire.
     """
-    m = _mod()
     phrasings = []
     for topic in topics:
         for k in ks:
@@ -1893,7 +1865,7 @@ def _observations(*, topics=('alpha-topic', 'beta-topic'), ks=(5, 10), miss_held
             phrasings.append(_phrasing_obs(
                 topic, 'held out', k=k, held_out=True, hit=topic not in miss_held_out,
             ))
-    return m.ProbeObservations(
+    return retrieval_probe.ProbeObservations(
         phrasings=phrasings,
         claims=[_claim_obs(t) for t in topics],
         contamination=[_contam_obs(t, foreign=1, untopiced=3, scored=5) for t in topics],
@@ -1903,7 +1875,7 @@ def _observations(*, topics=('alpha-topic', 'beta-topic'), ks=(5, 10), miss_held
 
 def _build(observations=None, *, counts=None, project_id='dark_factory', stamp='20260730T101500Z',
            ks=(5, 10)):
-    return _mod().build_series(
+    return retrieval_probe.build_series(
         observations if observations is not None else _observations(),
         counts if counts is not None else {'topics': 2, 'phrasings': 6},
         project_id,
@@ -1969,6 +1941,7 @@ class TestBuildSeries:
     def test_tripwire_items_are_one_per_topic_keyed_by_slug(self):
         """(d) The item_key shape alpha's grandfather set persists."""
         tripwire = {m.metric_id: m for m in _build().metrics}['topic-canonical-present']
+        assert tripwire.items is not None
         keys = {item.item_key for item in tripwire.items}
 
         assert keys == {'t-alpha-topic', 't-beta-topic'}
@@ -1982,6 +1955,7 @@ class TestBuildSeries:
         """
         series = _build(_observations(miss_held_out=('beta-topic',)))
         tripwire = {m.metric_id: m for m in series.metrics}['topic-canonical-present']
+        assert tripwire.items is not None
         passed = {item.item_key: item.passed for item in tripwire.items}
 
         assert passed['t-alpha-topic']
@@ -1990,8 +1964,7 @@ class TestBuildSeries:
 
     def test_tripwire_is_evaluated_at_k_five(self):
         """(d) Pinned at TRIPWIRE_K, matching alpha's committed exemplar."""
-        m = _mod()
-        observations = m.ProbeObservations(
+        observations = retrieval_probe.ProbeObservations(
             phrasings=[
                 # Hits at k=10 only: rank 7 for every phrasing.
                 _phrasing_obs('alpha-topic', 'p', k=5, hit=False),
@@ -2026,11 +1999,12 @@ class TestBuildSeries:
         for metric in _build().metrics:
             if metric.kind != 'proportion':
                 continue
+            assert metric.denominator is not None
             successes = metric.value * metric.denominator
             assert abs(successes - round(successes)) < 1e-9, metric.metric_id
 
     def test_the_count_metric_carries_its_exposure_as_n(self):
-        series = _build(_mod().ProbeObservations(
+        series = _build(retrieval_probe.ProbeObservations(
             phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
             inversions=[
                 _inversion_obs('alpha-topic', pairs=3, inversions=2),
@@ -2051,7 +2025,7 @@ class TestBuildSeries:
         the event count can rise while n stays pinned, and leaf alpha's
         Poisson tail test reads the improvement as a rate regression.
         """
-        series = _build(_mod().ProbeObservations(
+        series = _build(retrieval_probe.ProbeObservations(
             phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
             inversions=[
                 _inversion_obs('alpha-topic', pairs=50, comparable=3, inversions=1),
@@ -2072,7 +2046,7 @@ class TestBuildSeries:
         value=0 / n=0 — a fabricated 'no inversions here' datapoint entering
         leaf alpha's baseline window.
         """
-        series = _build(_mod().ProbeObservations(
+        series = _build(retrieval_probe.ProbeObservations(
             phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
             inversions=[
                 _inversion_obs('alpha-topic', pairs=0, inversions=0),
@@ -2084,7 +2058,7 @@ class TestBuildSeries:
 
     def test_no_comparable_pair_is_also_zero_exposure(self):
         """Registered pairs that never both came back measure nothing either."""
-        series = _build(_mod().ProbeObservations(
+        series = _build(retrieval_probe.ProbeObservations(
             phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
             inversions=[_inversion_obs('alpha-topic', pairs=12, comparable=0)],
         ))
@@ -2114,11 +2088,10 @@ class TestBuildSeries:
         assert 'degraded_queries' in str(excinfo.value)
 
     def test_the_collision_guard_covers_the_depth_keyed_disclosures_too(self):
-        m = _mod()
-        observations = m.ProbeObservations(phrasings=[
-            m.PhrasingObservation(
+        observations = retrieval_probe.ProbeObservations(phrasings=[
+            retrieval_probe.PhrasingObservation(
                 topic='a', phrasing='h', held_out=True, k=5, hit=True, rank=1,
-                matched_by=m.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
+                matched_by=retrieval_probe.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
             ),
         ])
 
@@ -2127,7 +2100,7 @@ class TestBuildSeries:
 
         assert 'observations_served_by_mem0_at_k5' in str(excinfo.value)
 
-        inversion_observations = m.ProbeObservations(inversions=[_inversion_obs('a', k=5)])
+        inversion_observations = retrieval_probe.ProbeObservations(inversions=[_inversion_obs('a', k=5)])
 
         with pytest.raises(ValueError) as excinfo:
             _build(inversion_observations, counts={'inversion_observations_at_k5': 99})
@@ -2154,8 +2127,7 @@ class TestBuildSeries:
 
     def test_degraded_observations_are_excluded_from_denominators(self):
         """A store outage must not be charged as a findability failure."""
-        m = _mod()
-        series = _build(m.ProbeObservations(
+        series = _build(retrieval_probe.ProbeObservations(
             phrasings=[
                 _phrasing_obs('alpha-topic', 'ok', hit=True),
                 _phrasing_obs('alpha-topic', 'h', hit=True, held_out=True),
@@ -2166,11 +2138,11 @@ class TestBuildSeries:
 
         assert by_id['canonical-in-top-5'].denominator == 2
         tripwire = by_id['topic-canonical-present']
-        assert [item.passed for item in tripwire.items] == [True]
+        assert [item.passed for item in tripwire.items or []] == [True]
 
     def test_a_metric_with_no_scored_trials_is_absent_not_zero(self):
         """An absent proportion is honest; a 0/0 one would be a fabricated trial."""
-        series = _build(_mod().ProbeObservations(
+        series = _build(retrieval_probe.ProbeObservations(
             phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
         ))
         ids = {metric.metric_id for metric in series.metrics}
@@ -2180,7 +2152,7 @@ class TestBuildSeries:
         assert 'canonical-in-top-5' in ids
 
     def test_unscorable_claims_are_disclosed_and_excluded(self):
-        series = _build(_mod().ProbeObservations(
+        series = _build(retrieval_probe.ProbeObservations(
             phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
             claims=[
                 _claim_obs('alpha-topic', 'scorable', recalled=True),
@@ -2233,7 +2205,7 @@ class TestBuildSeries:
         for observations in (
             _observations(),
             _observations(miss_held_out=('alpha-topic', 'beta-topic')),
-            _mod().ProbeObservations(phrasings=[_phrasing_obs('a', 'h', held_out=True)]),
+            retrieval_probe.ProbeObservations(phrasings=[_phrasing_obs('a', 'h', held_out=True)]),
         ):
             validate_metric_series(_build(observations))
 
@@ -2288,15 +2260,14 @@ def _healthy(results=()):
 
 def _probe_entry(topic='alpha-topic', content=CANON, **kw):
     """A registry entry with one tuned and one held-out phrasing plus a claim."""
-    m = _mod()
     base = _entry(topic=topic, content=content, **kw)
-    return m.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=base.topic,
         project_id=base.project_id,
         derived_from=base.derived_from,
         canonical=base.canonical,
-        phrasings=(m.Phrasing('tuned query', False), m.Phrasing('held out query', True)),
-        claim_queries=(m.ClaimQuery(query='claim query', needles=('canonical text',)),),
+        phrasings=(topic_registry.Phrasing('tuned query', False), topic_registry.Phrasing('held out query', True)),
+        claim_queries=(topic_registry.ClaimQuery(query='claim query', needles=('canonical text',)),),
     )
 
 
@@ -2317,8 +2288,8 @@ class TestDegradedSearchDisclosure:
     async def test_a_degraded_query_marks_every_observation_it_produced(self):
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         search = _search_returning({'tuned query': _degraded()})
 
         await m.probe_topic(search, entry, registry, (5,), observations)
@@ -2331,8 +2302,8 @@ class TestDegradedSearchDisclosure:
     async def test_degraded_queries_are_recorded_with_stores_and_diagnostics(self):
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         search = _search_returning({'tuned query': _degraded(
             stores=('mem0', 'graphiti'),
             diagnostics=[{'store': 'mem0', 'error_type': 'TimeoutError'}],
@@ -2352,15 +2323,15 @@ class TestDegradedSearchDisclosure:
         """(a) The exclusion, end to end through build_series."""
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         search = _search_returning(
             {'tuned query': _degraded()},
             default_factory=lambda: _healthy([_R(content=CANON, id='ID-1')]),
         )
 
         await m.probe_topic(search, entry, registry, (5,), observations)
-        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        series = retrieval_probe.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
         by_id = {metric.metric_id: metric for metric in series.metrics}
 
         assert by_id['canonical-in-top-5'].denominator == 1, 'only the healthy query'
@@ -2400,18 +2371,18 @@ class TestDegradedSearchDisclosure:
         """
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
 
         await m.probe_topic(
             search=_search_returning({}, default_factory=_degraded),
             entry=entry, registry=registry, ks=(5,), observations=observations,
         )
-        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        series = retrieval_probe.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
         ids = {metric.metric_id for metric in series.metrics}
 
         assert 'topic-canonical-present' not in ids, 'no item, so no tripwire'
-        assert m.not_measured_topics(observations) == ['alpha-topic']
+        assert retrieval_probe.not_measured_topics(observations) == ['alpha-topic']
 
     @pytest.mark.asyncio
     async def test_a_wholly_degraded_run_still_emits_a_valid_artifact(self, tmp_path):
@@ -2423,14 +2394,14 @@ class TestDegradedSearchDisclosure:
 
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
 
         await m.probe_topic(
             search=_search_returning({}, default_factory=_degraded),
             entry=entry, registry=registry, ks=(5,), observations=observations,
         )
-        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        series = retrieval_probe.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
         validate_metric_series(series)
         metrics_path, _ = m.emit_series(series, tmp_path)
 
@@ -2443,8 +2414,8 @@ class TestDegradedSearchDisclosure:
         """(a)+(c)+(d): the prose has to say what the numbers cannot."""
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
 
         await m.probe_topic(
             search=_search_returning({}, default_factory=lambda: _degraded(
@@ -2453,7 +2424,7 @@ class TestDegradedSearchDisclosure:
             )),
             entry=entry, registry=registry, ks=(5,), observations=observations,
         )
-        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        series = retrieval_probe.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
         report = m.render_probe_report(series, observations)
 
         assert 'qdrant' in report
@@ -2470,8 +2441,8 @@ class TestDegradedSearchDisclosure:
         """The band's happy path: phrasings, claims, contamination, inversions."""
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         search = _search_returning(
             {}, default_factory=lambda: _healthy([_R(content=CANON, id='ID-1')]),
         )
@@ -2490,15 +2461,15 @@ class TestDegradedSearchDisclosure:
     async def test_a_degraded_claim_query_is_excluded_too(self):
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         search = _search_returning(
             {'claim query': _degraded()},
             default_factory=lambda: _healthy([_R(content=CANON, id='ID-1')]),
         )
 
         await m.probe_topic(search, entry, registry, (5,), observations)
-        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        series = retrieval_probe.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
         ids = {metric.metric_id for metric in series.metrics}
 
         assert observations.claims[0].degraded
@@ -2510,14 +2481,14 @@ class TestDegradedSearchDisclosure:
         embedding spend and could return two different result lists."""
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
         seen: list[tuple[str, int]] = []
 
         async def search(query, limit):
             seen.append((query, limit))
             return _healthy([_R(content=CANON, id='ID-1')])
 
-        await m.probe_topic(search, entry, registry, (5, 10), m.ProbeObservations())
+        await m.probe_topic(search, entry, registry, (5, 10), retrieval_probe.ProbeObservations())
 
         assert [limit for _, limit in seen] == [10, 10, 10]
         assert len(seen) == 3, 'two phrasings + one claim query, once each'
@@ -2548,26 +2519,25 @@ class TestDegradedSearchDisclosure:
 
 def _report_observations():
     """Observations exercising every disclosure the report must carry."""
-    m = _mod()
-    return m.ProbeObservations(
+    return retrieval_probe.ProbeObservations(
         phrasings=[
             _phrasing_obs('alpha-topic', 'tuned', hit=True),
             _phrasing_obs('alpha-topic', 'held out', hit=False, held_out=True),
-            m.PhrasingObservation(
+            retrieval_probe.PhrasingObservation(
                 topic='beta-topic', phrasing='reworded', held_out=False, k=5,
                 hit=True, rank=2, matched_by='last_known_id',
             ),
-            m.PhrasingObservation(
+            retrieval_probe.PhrasingObservation(
                 topic='beta-topic', phrasing='held out', held_out=True, k=5,
                 hit=False, rank=None, matched_by=None,
             ),
         ],
         claims=[_claim_obs('alpha-topic', 'a claim', recalled=False)],
         contamination=[_contam_obs('alpha-topic', foreign=1, untopiced=3, scored=5)],
-        inversions=[m.InversionObservation(
+        inversions=[retrieval_probe.InversionObservation(
             topic='alpha-topic', phrasing='tuned', k=5,
             pairs_registered=1, pairs_comparable=1, pairs_beyond_scored_depth=0,
-            inversions=(m.InversionRecord(
+            inversions=(retrieval_probe.InversionRecord(
                 topic='alpha-topic', phrasing='tuned',
                 superseded_hash='dead' * 4, successor_hash='beef' * 4,
                 superseded_rank=1, successor_rank=4,
@@ -2714,22 +2684,22 @@ class TestProbeReport:
         is missing, so nothing downstream would ever say so.
         """
         m = _mod()
-        observations = m.ProbeObservations(
+        observations = retrieval_probe.ProbeObservations(
             phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
         )
         sections = _sections(_build(observations), observations)
 
         block = sections[m.SECTION_FAMILIES_NOT_MEASURED].text
-        assert m.METRIC_CLAIM_RECALL in block
-        assert m.METRIC_CONTAMINATION_SHARE in block
-        assert m.METRIC_SUPERSEDED_ABOVE_SUCCESSOR in block
-        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=5) not in block
+        assert retrieval_probe.METRIC_CLAIM_RECALL in block
+        assert retrieval_probe.METRIC_CONTAMINATION_SHARE in block
+        assert retrieval_probe.METRIC_SUPERSEDED_ABOVE_SUCCESSOR in block
+        assert retrieval_probe.METRIC_CANONICAL_IN_TOP_K.format(k=5) not in block
 
     def test_the_unmeasured_family_block_sits_under_the_table_it_qualifies(self):
         """A reader cannot see the gap by reading the rows — so it goes at
         the rows."""
         m = _mod()
-        observations = m.ProbeObservations(
+        observations = retrieval_probe.ProbeObservations(
             phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
         )
         keys = _section_keys(_build(observations), observations)
@@ -2768,7 +2738,7 @@ class TestProbeReport:
         )
 
         block = sections[m.SECTION_FAMILIES_NOT_MEASURED].text
-        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=10) in block
+        assert retrieval_probe.METRIC_CANONICAL_IN_TOP_K.format(k=10) in block
 
     def test_the_report_carries_the_matched_by_breakdown(self):
         """(d) step-7's dual matcher, made visible — with its COUNTS.
@@ -2803,7 +2773,7 @@ class TestProbeReport:
     def test_the_report_carries_the_registry_composition(self):
         """(d) step-5: what derivation covered, and what it left out."""
         m = _mod()
-        registry = m.TopicRegistry(
+        registry = topic_registry.TopicRegistry(
             schema_version=1,
             entries=(_entry(topic='alpha-topic'), _entry(topic='beta-topic')),
             disclosures={'census_topics_skipped_singleton': 41},
@@ -2837,7 +2807,7 @@ class TestProbeReport:
         """The step-17 section must survive the step-19 extension."""
         m = _mod()
         observations = _report_observations()
-        observations.degraded_queries.append(m.DegradedQuery(
+        observations.degraded_queries.append(retrieval_probe.DegradedQuery(
             topic='alpha-topic', query='tuned',
             failed_stores=('qdrant',),
             diagnostics=({'store': 'qdrant', 'error_type': 'ConnectionRefusedError'},),
@@ -2886,7 +2856,7 @@ class _ServiceDouble:
         self.search_kwargs: list[dict] = []
         """The remaining keyword arguments of each search, parallel to ``searches``."""
         self.count_calls: list[tuple[str, dict]] = []
-        self.initialized = False
+        self.opened_for_reads = False
         self.closed = False
 
     # -- the two read paths the probe is allowed to use --------------------
@@ -2902,13 +2872,19 @@ class _ServiceDouble:
         return self._counts.get(filters.get('category'), 0)
 
     # -- lifecycle ---------------------------------------------------------
-    async def initialize(self):
-        self.initialized = True
+    async def initialize_for_reads(self):
+        self.opened_for_reads = True
 
     async def close(self):
         self.closed = True
 
     # -- every write path is a tripwire ------------------------------------
+    async def initialize(self):
+        raise _ReadOnlyViolation(
+            'the probe took the full open, which starts the durable write queue '
+            'and runs Graphiti startup maintenance'
+        )
+
     async def add_memory(self, *a, **kw):
         raise _ReadOnlyViolation('the probe called add_memory')
 
@@ -2986,25 +2962,24 @@ def _scoped_entry(topic, *, project_id='dark_factory'):
     measurement), and these tests would be asserting the pinned metric set
     against a run that legitimately cannot produce all of it.
     """
-    m = _mod()
     content = f'the {topic} canonical text'
-    return m.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=topic,
         project_id=project_id,
         derived_from='hand',
-        canonical=m.Canonical(
-            content_hash=m.content_key(content),
+        canonical=topic_registry.Canonical(
+            content_hash=retrieval_probe.content_key(content),
             content_prefix=content,
             last_known_id=f'ID-{topic}',
         ),
         phrasings=(
-            m.Phrasing(f'{topic} tuned', False),
-            m.Phrasing(f'{topic} held out', True),
+            topic_registry.Phrasing(f'{topic} tuned', False),
+            topic_registry.Phrasing(f'{topic} held out', True),
         ),
-        claim_queries=(m.ClaimQuery(query=f'{topic} claim', needles=('canonical text',)),),
-        supersedes_pairs=(m.SupersedesPair(
-            superseded_hash=m.content_key(_superseded_text(topic)),
-            successor_hash=m.content_key(content),
+        claim_queries=(topic_registry.ClaimQuery(query=f'{topic} claim', needles=('canonical text',)),),
+        supersedes_pairs=(topic_registry.SupersedesPair(
+            superseded_hash=retrieval_probe.content_key(_superseded_text(topic)),
+            successor_hash=retrieval_probe.content_key(content),
         ),),
     )
 
@@ -3016,8 +2991,7 @@ def _superseded_text(topic: str) -> str:
 
 def _probe_registry(*, project_id='dark_factory'):
     """A two-topic registry whose canonicals are findable in the canned results."""
-    m = _mod()
-    return m.TopicRegistry(schema_version=1, entries=(
+    return topic_registry.TopicRegistry(schema_version=1, entries=(
         _scoped_entry('alpha-topic', project_id=project_id),
         _scoped_entry('beta-topic', project_id=project_id),
     ))
@@ -3073,7 +3047,7 @@ class TestReadOnlyGuarantee:
         ])
 
         assert code == 0
-        assert double.initialized and double.closed
+        assert double.opened_for_reads and double.closed
         artifact = tmp_path / 'out' / 'e1-retrieval-health' / 'metrics-20260730T090000Z.json'
         assert artifact.exists()
 
@@ -3084,8 +3058,9 @@ class TestReadOnlyGuarantee:
         import asyncio  # noqa: PLC0415
 
         for name in (
-            'add_memory', 'add_episode', 'add_system_record', 'delete_memory',
-            'delete_episode', 'update_edge', 'merge_entities', 'delete_entity',
+            'initialize', 'add_memory', 'add_episode', 'add_system_record',
+            'delete_memory', 'delete_episode', 'update_edge', 'merge_entities',
+            'delete_entity',
         ):
             with pytest.raises(_ReadOnlyViolation):
                 asyncio.run(getattr(double, name)())
@@ -3112,7 +3087,7 @@ class TestReadOnlyGuarantee:
         ))
 
         series = load_metric_series(outcome.metrics_path)
-        assert series.eval_id == m.EVAL_ID
+        assert series.eval_id == retrieval_probe.EVAL_ID
         assert outcome.report_path.exists()
         assert outcome.report_path.read_text(encoding='utf-8').strip()
 
@@ -3190,7 +3165,7 @@ class TestReadOnlyGuarantee:
 
     def test_the_search_is_scoped_to_each_entrys_project(self, tmp_path):
         m = _mod()
-        registry = m.TopicRegistry(schema_version=1, entries=(
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(
             _scoped_entry('alpha-topic', project_id='dark_factory'),
             _scoped_entry('beta-topic', project_id='reify'),
         ))
@@ -3218,7 +3193,7 @@ class TestReadOnlyGuarantee:
     ):
         """No silent caps: a narrowed run must say what it did not probe."""
         m = _mod()
-        registry = m.TopicRegistry(schema_version=1, entries=(
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(
             _scoped_entry('alpha-topic', project_id='dark_factory'),
             _scoped_entry('beta-topic', project_id='reify'),
         ))
@@ -3258,11 +3233,11 @@ class TestRegistrySearchScope:
         path = _write_registry(tmp_path, _registry_payload(_entry_payload(
             'scoped-topic', search_scope=BRIEFING_CONVENTIONS_SCOPE,
         )))
-        entry = _mod().load_topic_registry(path).entries[0]
+        entry = topic_registry.load_topic_registry(path).entries[0]
 
-        assert entry.search_scope.stores == ('mem0',)
-        assert entry.search_scope.categories == (
-            'preferences_and_norms', 'procedural_knowledge',
+        assert entry.search_scope == topic_registry.SearchScope(
+            stores=('mem0',),
+            categories=('preferences_and_norms', 'procedural_knowledge'),
         )
 
     def test_an_entry_without_a_scope_has_none_and_leaks_nothing_into_extra(
@@ -3272,7 +3247,7 @@ class TestRegistrySearchScope:
             _entry_payload('unscoped-topic'),
             _entry_payload('scoped-topic', search_scope=BRIEFING_CONVENTIONS_SCOPE),
         ))
-        by_topic = _mod().load_topic_registry(path).by_topic
+        by_topic = topic_registry.load_topic_registry(path).by_topic
 
         assert by_topic['unscoped-topic'].search_scope is None
         assert 'search_scope' not in by_topic['unscoped-topic'].extra
@@ -3297,8 +3272,8 @@ class TestRegistrySearchScope:
             'bad-scope', search_scope=scope,
         )))
 
-        with pytest.raises(_mod().RegistryError) as exc:
-            _mod().load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
         assert 'bad-scope' in str(exc.value)
         assert 'search_scope' in str(exc.value)
 
@@ -3311,13 +3286,13 @@ class TestRegistrySearchScope:
         m = _mod()
         scoped = replace(
             _scoped_entry('scoped-topic'),
-            search_scope=m.SearchScope(
+            search_scope=topic_registry.SearchScope(
                 stores=('mem0',),
                 categories=('preferences_and_norms', 'procedural_knowledge'),
             ),
         )
         unscoped = _scoped_entry('unscoped-topic')
-        registry = m.TopicRegistry(schema_version=1, entries=(scoped, unscoped))
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(scoped, unscoped))
         double = _ServiceDouble(by_query=_canned_hits(registry))
 
         asyncio.run(m.run_probe(
@@ -3409,7 +3384,7 @@ ALL_DEGRADED = 'all-degraded'
 
 def _split_obs(topic, phrasing, *, k=5, hit=False, rank=None, matched_by=None,
                stores=('mem0',), held_out=False, degraded=False):
-    return _mod().PhrasingObservation(
+    return retrieval_probe.PhrasingObservation(
         topic=topic, phrasing=phrasing, held_out=held_out, k=k, hit=hit,
         rank=rank, matched_by=matched_by, stores_served=stores, degraded=degraded,
     )
@@ -3418,7 +3393,6 @@ def _split_obs(topic, phrasing, *, k=5, hit=False, rank=None, matched_by=None,
 def _split_registry():
     from dataclasses import replace  # noqa: PLC0415
 
-    m = _mod()
     entries = []
     for topic in sorted((
         RANKED_LOW, RANKED_WELL, STAMPED_NOWHERE, SPELLED_OTHERWISE,
@@ -3426,13 +3400,12 @@ def _split_registry():
     )):
         entry = _scoped_entry(topic)
         if topic == BRIEFING_SURFACE:
-            entry = replace(entry, derived_from=m.QUERY_SURFACE_DERIVATION)
+            entry = replace(entry, derived_from=topic_registry.QUERY_SURFACE_DERIVATION)
         entries.append(entry)
-    return m.TopicRegistry(schema_version=1, entries=tuple(entries))
+    return topic_registry.TopicRegistry(schema_version=1, entries=tuple(entries))
 
 
 def _split_observations():
-    m = _mod()
     phrasings = [
         _split_obs(RANKED_LOW, f'{RANKED_LOW} tuned', rank=8, matched_by='content_hash'),
         _split_obs(RANKED_LOW, f'{RANKED_LOW} held out', held_out=True, stores=('graphiti',)),
@@ -3449,7 +3422,7 @@ def _split_observations():
         _split_obs(NEVER_CENSUSED, f'{NEVER_CENSUSED} tuned'),
         _split_obs(ALL_DEGRADED, f'{ALL_DEGRADED} tuned', degraded=True),
     ]
-    return m.ProbeObservations(phrasings=phrasings)
+    return retrieval_probe.ProbeObservations(phrasings=phrasings)
 
 
 def _split_census_payload():
@@ -3589,13 +3562,12 @@ class TestTripwireCensusSplit:
     def test_the_split_agrees_with_the_emitted_tripwire(self, tmp_path):
         """Same items, same verdicts: the split qualifies the tripwire, it does
         not re-derive it."""
-        m = _mod()
         split = self._split(tmp_path)
         series = _build(_split_observations(), ks=(5, 10))
 
         assert {
-            f'{m.TRIPWIRE_ITEM_PREFIX}{t.topic}': t.passed for t in split.topics
-        } == {item.item_key: item.passed for item in _tripwire(series).items}
+            f'{topic_registry.TRIPWIRE_ITEM_PREFIX}{t.topic}': t.passed for t in split.topics
+        } == {item.item_key: item.passed for item in _tripwire(series).items or []}
 
     def test_an_all_degraded_topic_is_in_no_class(self, tmp_path):
         split = self._split(tmp_path)
@@ -3884,22 +3856,22 @@ class TestCorpusCounting:
 
         expected = {c.value for c in (GRAPHITI_PRIMARY | MEM0_PRIMARY)}
 
-        assert set(_mod().corpus_categories()) == expected
+        assert set(topic_registry.corpus_categories()) == expected
 
     def test_one_count_call_per_category_keyed_by_category_only(self, tmp_path):
         double, _ = self._run_counts(tmp_path, {})
 
         assert [pid for pid, _ in double.count_calls] == (
-            ['dark_factory'] * len(_mod().corpus_categories())
+            ['dark_factory'] * len(topic_registry.corpus_categories())
         )
         assert all(set(f) == {'category'} for _, f in double.count_calls)
         assert (
             sorted(f['category'] for _, f in double.count_calls)
-            == sorted(_mod().corpus_categories())
+            == sorted(topic_registry.corpus_categories())
         )
 
     def test_the_counts_reach_the_corpus(self, tmp_path):
-        categories = _mod().corpus_categories()
+        categories = topic_registry.corpus_categories()
         counts = {c: i + 1 for i, c in enumerate(categories)}
         _, outcome = self._run_counts(tmp_path, counts)
 
@@ -4024,11 +3996,10 @@ class TestRegistryLoadFailureIsFatal:
         ``{"entries": []}``. Accepting it produces `"metrics": []` at exit 0 —
         the exact silent artifact RegistryError exists to prevent.
         """
-        m = _mod()
         path = _write_registry(tmp_path, _registry_payload(entries_override=[]))
 
-        with pytest.raises(m.RegistryError) as exc:
-            m.load_topic_registry(path)
+        with pytest.raises(topic_registry.RegistryError) as exc:
+            topic_registry.load_topic_registry(path)
 
         assert 'zero entries' in str(exc.value)
 
@@ -4068,7 +4039,7 @@ class TestRegistryLoadFailureIsFatal:
 
         m.main(['--registry', str(bad), '--out-root', str(tmp_path / 'out')])
 
-        assert not double.initialized
+        assert not double.opened_for_reads
 
 
 class TestEmptyProjectSelectionIsFatal:
@@ -4098,7 +4069,7 @@ class TestEmptyProjectSelectionIsFatal:
             asyncio.run(m.run_probe(
                 _ServiceDouble(), registry,
                 project_ids=('typo_project',),
-                ks=m.DEFAULT_KS,
+                ks=retrieval_probe.DEFAULT_KS,
                 out_root=tmp_path,
             ))
 
@@ -4113,13 +4084,13 @@ class TestEmptyProjectSelectionIsFatal:
         import asyncio  # noqa: PLC0415
 
         m = _mod()
-        empty = m.TopicRegistry(schema_version=1, entries=())
+        empty = topic_registry.TopicRegistry(schema_version=1, entries=())
 
         with pytest.raises(m.EmptySelectionError):
             asyncio.run(m.run_probe(
                 _ServiceDouble(), empty,
                 project_ids=('dark_factory',),
-                ks=m.DEFAULT_KS,
+                ks=retrieval_probe.DEFAULT_KS,
                 out_root=tmp_path,
             ))
 
@@ -4134,7 +4105,7 @@ class TestEmptyProjectSelectionIsFatal:
             asyncio.run(m.run_probe(
                 _ServiceDouble(), _probe_registry(),
                 project_ids=('typo_project',),
-                ks=m.DEFAULT_KS,
+                ks=retrieval_probe.DEFAULT_KS,
                 out_root=tmp_path,
             ))
 
@@ -4218,11 +4189,14 @@ class TestRunStampOverride:
 
 
 class _UnopenableStoreDouble(_ServiceDouble):
-    """A store whose open fails the way ``MemoryService.initialize`` measurably
-    does when it cannot create ``config.queue.data_dir``."""
+    """A store whose open raises *error*."""
 
-    async def initialize(self):
-        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+    def __init__(self, error: Exception):
+        super().__init__()
+        self._error = error
+
+    async def initialize_for_reads(self):
+        raise self._error
 
 
 def _error_lines(stderr: str) -> list[str]:
@@ -4252,9 +4226,23 @@ class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
             '--project-id', 'dark_factory',
         ]
 
-    def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, capsys):
+    @pytest.mark.parametrize(
+        ('error', 'detail'),
+        [
+            (
+                PermissionError(errno.EACCES, 'Permission denied', '/unreadable/planned_episodes.db'),
+                '/unreadable/planned_episodes.db',
+            ),
+            (
+                sqlite3.OperationalError('unable to open database file'),
+                'unable to open database file',
+            ),
+        ],
+        ids=['oserror', 'sqlite-error'],
+    )
+    def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, capsys, error, detail):
         m = _mod()
-        double = _UnopenableStoreDouble()
+        double = _UnopenableStoreDouble(error)
         _install_double(monkeypatch, double)
         out_root = tmp_path / 'out'
 
@@ -4264,7 +4252,7 @@ class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
         errors = _error_lines(capsys.readouterr().err)
         assert len(errors) == 1
         assert 'store' in errors[0]
-        assert '/unwritable/queue-data' in errors[0]
+        assert detail in errors[0]
         assert 'stdout' not in errors[0]
         assert double.closed
         assert not list(out_root.rglob('metrics-*.json'))
@@ -4341,7 +4329,7 @@ class TestAStdoutFailureAfterEmissionNamesTheArtifacts:
             code = run_cli(lambda: m.main(argv))
         monkeypatch.undo()
 
-        eval_dir = out_root / m.EVAL_ID
+        eval_dir = out_root / retrieval_probe.EVAL_ID
         metrics_path = eval_dir / f'metrics-{self.STAMP}.json'
         report_path = eval_dir / f'report-{self.STAMP}.txt'
         assert code == EXIT_STDOUT_FAILED
@@ -4382,11 +4370,6 @@ class TestAStdoutFailureAfterEmissionNamesTheArtifacts:
 #     never touches the live one.
 # ---------------------------------------------------------------------------
 
-import contextlib  # noqa: E402
-import os  # noqa: E402
-
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
-
 EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
 
 FLIP_TOPIC = 'e1-probe-flip-topic'
@@ -4422,25 +4405,24 @@ def _flip_registry(project_id: str, *, last_known_id: str | None = None):
     silent fall back to the id would mean search stopped returning content
     verbatim and every content-keyed metric had quietly gone blind.
     """
-    m = _mod()
 
     def entry(topic, canonical, *, known_id=None):
-        return m.RegistryEntry(
+        return topic_registry.RegistryEntry(
             topic=topic,
             project_id=project_id,
             derived_from='hand',
-            canonical=m.Canonical(
-                content_hash=m.content_key(canonical),
+            canonical=topic_registry.Canonical(
+                content_hash=retrieval_probe.content_key(canonical),
                 content_prefix=canonical[:80],
                 last_known_id=known_id,
             ),
             phrasings=(
-                m.Phrasing(f'what does the {topic} say', False),
-                m.Phrasing(f'summarise everything known about {topic}', True),
+                topic_registry.Phrasing(f'what does the {topic} say', False),
+                topic_registry.Phrasing(f'summarise everything known about {topic}', True),
             ),
         )
 
-    return m.TopicRegistry(schema_version=1, entries=(
+    return topic_registry.TopicRegistry(schema_version=1, entries=(
         entry(FLIP_TOPIC, FLIP_CANONICAL, known_id=last_known_id),
         entry(FOREIGN_TOPIC, FOREIGN_CANONICAL),
     ))
@@ -4448,9 +4430,8 @@ def _flip_registry(project_id: str, *, last_known_id: str | None = None):
 
 def _tripwire(series):
     """The topic-canonical-present metric off an emitted series."""
-    m = _mod()
     for metric in series.metrics:
-        if metric.metric_id == m.METRIC_TOPIC_CANONICAL_PRESENT:
+        if metric.metric_id == retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT:
             return metric
     raise AssertionError('the series carries no topic-canonical-present metric')
 
@@ -4503,23 +4484,13 @@ def clean_probe_collection(probe_config, probe_project_id):
 
 
 @contextlib.asynccontextmanager
-async def _seeded_memory_service(probe_config, probe_project_id):
-    """An initialized MemoryService over the ephemeral collection, closed on exit.
-
-    mem0's SQLite history writer is process-shared and xdist-contended (and
-    read-only in the sandbox), so it is stubbed here, for the same reason
-    test_recon_dedup_premise.py stubs it: it is not the question under test,
-    and its failure would mask the one that is. This is the one place these
-    tests reach mem0's private instance.
-    """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+async def _seeded_memory_service(probe_config):
+    """An initialized MemoryService over the ephemeral collection, closed on exit."""
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
     memory = MemoryService(probe_config)
     await memory.initialize()
     try:
-        instance = await memory.mem0._get_instance(Scope(project_id=probe_project_id))
-        instance.db.add_history = lambda *a, **kw: None
         yield memory
     finally:
         await memory.close()
@@ -4568,7 +4539,7 @@ class TestSeededInducedRegression:
         self, probe_config, probe_project_id, clean_probe_collection, tmp_path,
     ):
         m = _mod()
-        async with _seeded_memory_service(probe_config, probe_project_id) as memory:
+        async with _seeded_memory_service(probe_config) as memory:
             seeded = await memory.add_memory(
                 FLIP_CANONICAL, category='procedural_knowledge',
                 project_id=probe_project_id, agent_id='e1-probe-seed',
@@ -4605,7 +4576,7 @@ class TestSeededInducedRegression:
             # mean search stopped returning content verbatim, which would blind
             # every content-keyed metric while still reporting a pass.
             assert all(
-                obs.matched_by == m.MATCHED_BY_CONTENT_HASH
+                obs.matched_by == retrieval_probe.MATCHED_BY_CONTENT_HASH
                 for obs in before.observations.phrasings
                 if obs.topic == FLIP_TOPIC and obs.hit
             )
@@ -4666,13 +4637,12 @@ def _seeded_briefing_registry(project_id: str):
     """
     from dataclasses import replace  # noqa: PLC0415
 
-    m = _mod()
-    committed = m.load_topic_registry(REGISTRY_PATH).by_topic
-    return m.TopicRegistry(schema_version=1, entries=tuple(
+    committed = topic_registry.load_topic_registry(REGISTRY_PATH).by_topic
+    return topic_registry.TopicRegistry(schema_version=1, entries=tuple(
         replace(
             committed[topic],
             project_id=project_id,
-            canonical=m.Canonical(content_hash=m.content_key(text), content_prefix=text[:80]),
+            canonical=topic_registry.Canonical(content_hash=retrieval_probe.content_key(text), content_prefix=text[:80]),
             claim_queries=(),
         )
         for topic, (text, _) in sorted(BRIEFING_SEEDS.items())
@@ -4695,7 +4665,7 @@ class TestSeededBriefingTopicFlip:
     ):
         m = _mod()
         registry = _seeded_briefing_registry(probe_project_id)
-        async with _seeded_memory_service(probe_config, probe_project_id) as memory:
+        async with _seeded_memory_service(probe_config) as memory:
             seeded_ids = {}
             for topic, (text, category) in BRIEFING_SEEDS.items():
                 seeded = await memory.add_memory(
@@ -4761,35 +4731,32 @@ class TestStoresServedDisclosure:
     """Which store answered is a recorded fact, not something to infer."""
 
     def test_the_observation_records_the_stores_that_served_it(self):
-        m = _mod()
         entry = _entry(content=CANON)
         results = [_stored(CANON, 'mem0', 'ID-1'), _stored('other', 'graphiti', 'G1')]
 
-        obs = m.observe_phrasing(results, entry, m.Phrasing('q', False), 5)
+        obs = retrieval_probe.observe_phrasing(results, entry, topic_registry.Phrasing('q', False), 5)
 
         assert obs.stores_served == ('graphiti', 'mem0')
 
     def test_a_result_without_a_store_is_recorded_as_unknown(self):
         """A shape this probe does not recognise must not silently vanish."""
-        m = _mod()
         entry = _entry(content=CANON)
 
-        obs = m.observe_phrasing([_R(content=CANON, id='ID-1')], entry, m.Phrasing('q'), 5)
+        obs = retrieval_probe.observe_phrasing([_R(content=CANON, id='ID-1')], entry, topic_registry.Phrasing('q'), 5)
 
         assert obs.stores_served == ('unknown',)
 
     def test_only_the_top_k_slice_is_credited(self):
-        m = _mod()
         entry = _entry(content=CANON)
         results = [*[_stored('f', 'mem0', f'M{i}') for i in range(5)],
                    _stored('g', 'graphiti', 'G1')]
 
-        assert m.observe_phrasing(results, entry, m.Phrasing('q'), 5).stores_served == ('mem0',)
+        assert retrieval_probe.observe_phrasing(results, entry, topic_registry.Phrasing('q'), 5).stores_served == ('mem0',)
 
     def test_the_report_breaks_observations_down_by_serving_store(self):
         m = _mod()
         observations = _report_observations()
-        observations.phrasings.append(m.PhrasingObservation(
+        observations.phrasings.append(retrieval_probe.PhrasingObservation(
             topic='alpha-topic', phrasing='routed away', held_out=False, k=5,
             hit=False, rank=None, matched_by=None, stores_served=('graphiti',),
         ))
@@ -4804,12 +4771,12 @@ class TestStoresServedDisclosure:
         """An operator must not have to guess whether the canonical could
         have been returned at all."""
         m = _mod()
-        observations = m.ProbeObservations(phrasings=[
-            m.PhrasingObservation(
+        observations = retrieval_probe.ProbeObservations(phrasings=[
+            retrieval_probe.PhrasingObservation(
                 topic='routed-away-topic', phrasing='q', held_out=False, k=5,
                 hit=False, rank=None, matched_by=None, stores_served=('graphiti',),
             ),
-            m.PhrasingObservation(
+            retrieval_probe.PhrasingObservation(
                 topic='routed-away-topic', phrasing='h', held_out=True, k=5,
                 hit=False, rank=None, matched_by=None, stores_served=('graphiti',),
             ),
@@ -4825,13 +4792,12 @@ class TestStoresServedDisclosure:
 
     def test_the_serving_store_counts_ride_in_the_machine_readable_artifact(self):
         """Prose-only disclosure is invisible to every consumer that reads JSON."""
-        m = _mod()
-        observations = m.ProbeObservations(phrasings=[
-            m.PhrasingObservation(
+        observations = retrieval_probe.ProbeObservations(phrasings=[
+            retrieval_probe.PhrasingObservation(
                 topic='a', phrasing='q', held_out=False, k=5, hit=True, rank=1,
-                matched_by=m.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
+                matched_by=retrieval_probe.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
             ),
-            m.PhrasingObservation(
+            retrieval_probe.PhrasingObservation(
                 topic='a', phrasing='h', held_out=True, k=5, hit=False, rank=None,
                 matched_by=None, stores_served=('graphiti',),
             ),
@@ -4848,13 +4814,12 @@ class TestStoresServedDisclosure:
         comparing the two got a 2x mismatch with nothing in the artifact
         saying why, which is the uninterpretable-rate hazard the disclosure
         exists to prevent."""
-        m = _mod()
         # Two queries, each served by exactly one store, each scored at both
         # depths — the shape where the tally and the denominator SHOULD agree.
-        observations = m.ProbeObservations(phrasings=[
-            m.PhrasingObservation(
+        observations = retrieval_probe.ProbeObservations(phrasings=[
+            retrieval_probe.PhrasingObservation(
                 topic='a', phrasing=phrasing, held_out=held_out, k=k, hit=True,
-                rank=1, matched_by=m.MATCHED_BY_CONTENT_HASH,
+                rank=1, matched_by=retrieval_probe.MATCHED_BY_CONTENT_HASH,
                 stores_served=('mem0',),
             )
             for phrasing, held_out in (('tuned', False), ('held out', True))
@@ -4876,15 +4841,14 @@ class TestStoresServedDisclosure:
         """stores_served is computed over results[:k], so the SAME query can
         report different served sets at different depths. Under one key those
         two facts were indistinguishable."""
-        m = _mod()
-        observations = m.ProbeObservations(phrasings=[
-            m.PhrasingObservation(
+        observations = retrieval_probe.ProbeObservations(phrasings=[
+            retrieval_probe.PhrasingObservation(
                 topic='a', phrasing='h', held_out=True, k=5, hit=True, rank=1,
-                matched_by=m.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
+                matched_by=retrieval_probe.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
             ),
-            m.PhrasingObservation(
+            retrieval_probe.PhrasingObservation(
                 topic='a', phrasing='h', held_out=True, k=10, hit=True, rank=1,
-                matched_by=m.MATCHED_BY_CONTENT_HASH,
+                matched_by=retrieval_probe.MATCHED_BY_CONTENT_HASH,
                 stores_served=('graphiti', 'mem0'),
             ),
         ])
@@ -4895,13 +4859,12 @@ class TestStoresServedDisclosure:
 
     def test_a_degraded_query_is_counted_once_whatever_depth_it_is_scored_at(self):
         """A store outage is one event, not one per k."""
-        m = _mod()
-        observations = m.ProbeObservations(
+        observations = retrieval_probe.ProbeObservations(
             phrasings=[
                 _phrasing_obs('a', 'h', k=k, held_out=True, degraded=True)
                 for k in (5, 10)
             ],
-            degraded_queries=[m.DegradedQuery(
+            degraded_queries=[retrieval_probe.DegradedQuery(
                 topic='a', query='h', failed_stores=('mem0',),
             )],
         )
@@ -4925,7 +4888,7 @@ class TestStoresServedDisclosure:
         row — a trim diagnostic, not an exposure — but is walled off from
         the degraded observation the same way as the other two.
         """
-        observations = _mod().ProbeObservations(inversions=[
+        observations = retrieval_probe.ProbeObservations(inversions=[
             _inversion_obs('a', pairs=3, inversions=1, k=5, beyond_depth=2),
             _inversion_obs('b', pairs=2, k=5, beyond_depth=1),
             _inversion_obs('c', pairs=99, k=5, degraded=True, beyond_depth=99),
@@ -4941,7 +4904,7 @@ class TestStoresServedDisclosure:
         """Two coexisting depths must not be merged into one number — the
         same hazard the serving-store disclosure guards against, restated
         for the inversion family."""
-        observations = _mod().ProbeObservations(inversions=[
+        observations = retrieval_probe.ProbeObservations(inversions=[
             _inversion_obs('a', pairs=1, k=5, beyond_depth=1),
             _inversion_obs('a', pairs=1, k=10, beyond_depth=1),
         ])
@@ -4964,17 +4927,17 @@ class TestStoresServedDisclosure:
 
         m = _mod()
         base = _probe_entry()
-        entry = m.RegistryEntry(
+        entry = topic_registry.RegistryEntry(
             topic=base.topic, project_id=base.project_id,
             derived_from=base.derived_from, canonical=base.canonical,
-            phrasings=(m.Phrasing('tuned query', False), m.Phrasing('held out query', True)),
+            phrasings=(topic_registry.Phrasing('tuned query', False), topic_registry.Phrasing('held out query', True)),
             supersedes_pairs=(
-                m.SupersedesPair(m.content_key('came back'), m.content_key(CANON)),
-                m.SupersedesPair(m.content_key('never returned'), m.content_key('nor this')),
+                topic_registry.SupersedesPair(retrieval_probe.content_key('came back'), retrieval_probe.content_key(CANON)),
+                topic_registry.SupersedesPair(retrieval_probe.content_key('never returned'), retrieval_probe.content_key('nor this')),
             ),
         )
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         search = _search_returning(
             {},
             default_factory=lambda: _healthy([
@@ -4994,8 +4957,8 @@ class TestStoresServedDisclosure:
 
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         search = _search_returning({
             'tuned query': _healthy([_stored(CANON, 'mem0', 'ID-1')]),
             'held out query': _healthy([_stored('unrelated', 'graphiti', 'G1')]),
@@ -5052,34 +5015,29 @@ class TestNormaliseKs:
     """(a)-(c) The contract-pinned depth is folded in, the caller's order kept."""
 
     def test_a_k_that_omits_the_tripwire_depth_gains_it(self):
-        m = _mod()
 
-        assert m.TRIPWIRE_K in m.normalise_ks((7,))
+        assert retrieval_probe.TRIPWIRE_K in retrieval_probe.normalise_ks((7,))
 
     def test_the_callers_order_is_preserved_and_the_pin_appended(self):
         """Requested depths first: the operator asked for 7, and got 7 AND 5."""
-        m = _mod()
 
-        assert m.normalise_ks((7,)) == (7, m.TRIPWIRE_K)
-        assert m.normalise_ks((20, 7)) == (20, 7, m.TRIPWIRE_K)
+        assert retrieval_probe.normalise_ks((7,)) == (7, retrieval_probe.TRIPWIRE_K)
+        assert retrieval_probe.normalise_ks((20, 7)) == (20, 7, retrieval_probe.TRIPWIRE_K)
 
     def test_an_already_pinned_k_is_returned_unchanged(self):
         """The default path's metric vocabulary must not churn."""
-        m = _mod()
 
-        assert m.normalise_ks((5, 10)) == (5, 10)
-        assert m.normalise_ks(m.DEFAULT_KS) == m.DEFAULT_KS
+        assert retrieval_probe.normalise_ks((5, 10)) == (5, 10)
+        assert retrieval_probe.normalise_ks(retrieval_probe.DEFAULT_KS) == retrieval_probe.DEFAULT_KS
 
     def test_duplicates_collapse(self):
         """A doubled --k would otherwise emit the same metric_id twice."""
-        m = _mod()
 
-        assert m.normalise_ks((7, 7, 5)) == (7, 5)
+        assert retrieval_probe.normalise_ks((7, 7, 5)) == (7, 5)
 
     def test_an_empty_k_yields_the_pin_alone(self):
-        m = _mod()
 
-        assert m.normalise_ks(()) == (m.TRIPWIRE_K,)
+        assert retrieval_probe.normalise_ks(()) == (retrieval_probe.TRIPWIRE_K,)
 
 
 class TestNonDefaultKKeepsThePinnedMetrics:
@@ -5103,39 +5061,35 @@ class TestNonDefaultKKeepsThePinnedMetrics:
         ))
 
     def test_k_seven_still_emits_the_flagship_tripwire(self, tmp_path):
-        m = _mod()
         _, outcome = self._run(tmp_path, (7,))
 
         ids = [metric.metric_id for metric in outcome.series.metrics]
-        assert m.METRIC_TOPIC_CANONICAL_PRESENT in ids
+        assert retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT in ids
 
     def test_k_seven_still_emits_the_held_out_proportion(self, tmp_path):
         """The Goodhart guard cannot be switched off by a CLI flag."""
-        m = _mod()
         _, outcome = self._run(tmp_path, (7,))
 
         ids = [metric.metric_id for metric in outcome.series.metrics]
-        assert m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K) in ids
+        assert retrieval_probe.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=retrieval_probe.TRIPWIRE_K) in ids
 
     def test_the_requested_depth_is_still_measured(self, tmp_path):
         """Normalising ADDS the pin; it never drops what the operator asked for."""
-        m = _mod()
         _, outcome = self._run(tmp_path, (7,))
 
         ids = [metric.metric_id for metric in outcome.series.metrics]
-        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=7) in ids
-        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=m.TRIPWIRE_K) in ids
+        assert retrieval_probe.METRIC_CANONICAL_IN_TOP_K.format(k=7) in ids
+        assert retrieval_probe.METRIC_CANONICAL_IN_TOP_K.format(k=retrieval_probe.TRIPWIRE_K) in ids
 
     def test_the_pinned_metric_set_is_a_superset_on_every_run(self, tmp_path):
         """Whatever --k is passed, alpha's join keys are all still there."""
-        m = _mod()
         pinned = {
-            m.METRIC_TOPIC_CANONICAL_PRESENT,
-            m.METRIC_CANONICAL_IN_TOP_K.format(k=m.TRIPWIRE_K),
-            m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K),
-            m.METRIC_CLAIM_RECALL,
-            m.METRIC_CONTAMINATION_SHARE,
-            m.METRIC_SUPERSEDED_ABOVE_SUCCESSOR,
+            retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT,
+            retrieval_probe.METRIC_CANONICAL_IN_TOP_K.format(k=retrieval_probe.TRIPWIRE_K),
+            retrieval_probe.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=retrieval_probe.TRIPWIRE_K),
+            retrieval_probe.METRIC_CLAIM_RECALL,
+            retrieval_probe.METRIC_CONTAMINATION_SHARE,
+            retrieval_probe.METRIC_SUPERSEDED_ABOVE_SUCCESSOR,
         }
         for ks in ((7,), (3,), (20, 7), (5, 10)):
             _, outcome = self._run(tmp_path, ks)
@@ -5146,7 +5100,6 @@ class TestNonDefaultKKeepsThePinnedMetrics:
         """not_measured_topics() reads k=5 observations; with --k 7 there were
         none, so a fully-degraded topic was reported as [] — silence that reads
         exactly like a healthy run."""
-        m = _mod()
         registry = _probe_registry()
         healthy = _canned_hits(registry)
         for phrasing in registry.entries[1].phrasings:
@@ -5154,7 +5107,7 @@ class TestNonDefaultKKeepsThePinnedMetrics:
 
         _, outcome = self._run(tmp_path, (7,), double=_ServiceDouble(by_query=healthy))
 
-        assert m.not_measured_topics(outcome.observations) == ['beta-topic']
+        assert retrieval_probe.not_measured_topics(outcome.observations) == ['beta-topic']
 
     def test_the_operators_actual_path_through_the_cli(self, monkeypatch, tmp_path):
         """(e) --k 7 is a supported flag, so the fix has to hold through main()."""
@@ -5179,9 +5132,9 @@ class TestNonDefaultKKeepsThePinnedMetrics:
             tmp_path / 'out' / 'e1-retrieval-health' / 'metrics-20260731T101500Z.json',
         )
         ids = {metric.metric_id for metric in series.metrics}
-        assert m.METRIC_TOPIC_CANONICAL_PRESENT in ids
-        assert m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K) in ids
-        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=7) in ids
+        assert retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT in ids
+        assert retrieval_probe.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=retrieval_probe.TRIPWIRE_K) in ids
+        assert retrieval_probe.METRIC_CANONICAL_IN_TOP_K.format(k=7) in ids
 
     def test_the_added_depth_is_disclosed_rather_than_inferred(self, tmp_path):
         """Measuring a depth the operator did not ask for is a narrowing like
@@ -5202,8 +5155,8 @@ class TestNonDefaultKKeepsThePinnedMetrics:
             s for s in outcome.sections if s.key == m.SECTION_MEASUREMENT_DEPTH
         ).text
 
-        assert m.METRIC_TOPIC_CANONICAL_PRESENT in section
-        assert m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K) in section
+        assert retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT in section
+        assert retrieval_probe.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=retrieval_probe.TRIPWIRE_K) in section
 
     def test_the_default_run_discloses_no_added_depth(self, tmp_path):
         """Nothing was added, so there is nothing to disclose — a section that
@@ -5220,8 +5173,8 @@ class TestObservationDepthIsHonest:
     def _observe(self, ks):
         m = _mod()
         entry = _probe_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         search = _search_returning(
             {}, default_factory=lambda: _healthy(_filler(10)),
         )
@@ -5235,9 +5188,8 @@ class TestObservationDepthIsHonest:
         """probe_topic is public and called directly by this file's own tests;
         with ks=(3,) it searched at limit=3 but stamped k=5 on every claim and
         contamination observation — an artifact mislabelling its own depth."""
-        m = _mod()
         observations = self._observe((3,))
-        expected = min(m.TRIPWIRE_K, 3)
+        expected = min(retrieval_probe.TRIPWIRE_K, 3)
 
         assert {o.k for o in observations.contamination} == {expected}
         assert {o.k for o in observations.claims} == {expected}
@@ -5246,20 +5198,18 @@ class TestObservationDepthIsHonest:
     def test_a_deep_call_still_scores_at_the_pinned_depth(self):
         """min(), not max(): contamination and claim recall are DEFINED at the
         tripwire's depth, so a deeper fetch must not silently widen them."""
-        m = _mod()
         observations = self._observe((10,))
 
-        assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
-        assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
-        assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.contamination} == {retrieval_probe.TRIPWIRE_K}
+        assert {o.k for o in observations.claims} == {retrieval_probe.TRIPWIRE_K}
+        assert {o.k for o in observations.inversions} == {retrieval_probe.TRIPWIRE_K}
 
     def test_the_default_path_is_unchanged(self):
-        m = _mod()
-        observations = self._observe(m.DEFAULT_KS)
+        observations = self._observe(retrieval_probe.DEFAULT_KS)
 
-        assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
-        assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
-        assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.contamination} == {retrieval_probe.TRIPWIRE_K}
+        assert {o.k for o in observations.claims} == {retrieval_probe.TRIPWIRE_K}
+        assert {o.k for o in observations.inversions} == {retrieval_probe.TRIPWIRE_K}
 
 
 class TestInversionFamilyIsPinnedToScoredDepth:
@@ -5270,8 +5220,8 @@ class TestInversionFamilyIsPinnedToScoredDepth:
     def _observe(self, *, superseded_rank, successor_rank, ks=(10,), total=10):
         m = _mod()
         entry = _pair_entry()
-        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
-        observations = m.ProbeObservations()
+        registry = topic_registry.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = retrieval_probe.ProbeObservations()
         results = _filler(total)
         results[superseded_rank - 1] = _R(content='old text', id='OLD')
         results[successor_rank - 1] = _R(content='new text', id='NEW')

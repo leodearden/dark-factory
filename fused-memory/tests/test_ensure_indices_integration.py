@@ -43,18 +43,12 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 from _falkor_index_live import listed_index_specs, live_backends, scratch_graphs
-from _fm_helpers import await_index_operational, falkor_skipif
+from _fm_falkor_live import await_index_operational, falkor_skipif
 
 from fused_memory.backends.falkor_indices import expected_index_set, parse_index_statement
 
 pytestmark = [
     falkor_skipif(),
-    # Provisioning writes ~30 statements and each boundary test waits for every
-    # one of them to reach OPERATIONAL, so this module opts up from the suite
-    # default of 60s deliberately -- `timeout_method = "thread"` os._exit(1)s the
-    # whole xdist worker, so an under-budget timeout here would read as an
-    # infrastructure crash rather than a slow test.
-    pytest.mark.timeout(120),
     pytest.mark.integration,
 ]
 

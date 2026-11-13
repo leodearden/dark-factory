@@ -197,13 +197,16 @@ _DECLARED_FILES_STAT_WHY = (
     'read.'
 )
 
-#: Task 5099: the curator COMBINE audit line.
+#: Task 5099: the curator COMBINE audit line; task 8415 added its item fields.
 _COMBINE_AUDIT_APPEND_WHY = (
     'ACCEPTED, bounded by an LLM decision (one cause): '
     'TaskInterceptor._execute_combine reaches _append_combine_audit, an '
     'idempotent mkdir (6-11us, task 5099 timeit) plus one open(\'a\') '
-    'append of a single JSON line under 2 KB (descriptions truncated to '
-    '500 chars), with no fsync. It runs once per curator COMBINE decision, '
+    'append of a single JSON line, with no fsync. The line is about 2 KB '
+    '(descriptions and justification truncated to 500 chars) plus, since '
+    'task 8415, the items_before/items_after lists: one 16-hex item key '
+    'per follow-up item on the target, so roughly 40 bytes per item. It '
+    'runs once per curator COMBINE decision, '
     'each of which follows an LLM call of seconds, so the append is never '
     'on a hot or storm-coupled path. The one storm-coupled defect of this '
     'shape, the EventQueue dead-letter append that fires during a drop '
@@ -337,14 +340,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
         'TaskInterceptor._execute_combine',
-        '15bda1dd6b34',
+        '0a7e982628a1',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
     ),
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
         'TaskInterceptor._execute_combine',
-        'd7b1b643f3fe',
+        'ab64655040c9',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
     ),
@@ -429,13 +432,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._resume_interrupted_runs',
-        'bc3672ec502c',
-        'filed',
-        _ESCALATE_ARCHIVE_SCAN_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._record_failed_run',
         '652fc88d57ad',
         'filed',
@@ -510,7 +506,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
-        '58434c3060da',
+        'edd9a8720cf9',
         'filed',
         'ROOT CAUSE: _file_finding_task_escalation, the orchestrator-queue '
         'counterpart of _escalate that task 4821 added after this census '
@@ -528,7 +524,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
-        '920dc9ba5dbb',
+        'a4c939b65449',
         'filed',
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
@@ -700,12 +696,12 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
-        'f38dc5fc1e4c',
+        '06814d9a4e68',
         'accepted',
-        'ACCEPTED: run_server calls build_known_projects_map '
-        '(models/scope.py -- open() of each project manifest, then '
-        'yaml.safe_load; the sweep reports whichever the walk reaches '
-        'first) during process STARTUP, before the server binds '
+        'ACCEPTED: run_server calls configured_known_projects_map '
+        '(models/scope.py -- Path.resolve() of the primary root, then '
+        'open() and yaml.safe_load of each project manifest; the sweep '
+        'reports whichever the walk reaches first) during process STARTUP, before the server binds '
         'and begins serving traffic, so there is no concurrent work for it '
         'to stall and no request whose latency it can affect. This is what '
         'an accepted row must say -- what makes the cost acceptable, not '
@@ -720,7 +716,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ACCEPTED, startup only: run_server reaches '
         'build_topic_cluster_store -> TopicClusterStore.open(), a sync '
         'SQLite open matched by the method name open. It genuinely blocks, '
-        'but like the build_known_projects_map row beside it, it runs once '
+        'but like the configured_known_projects_map row beside it, it runs once '
         'during process STARTUP, before the server binds and begins '
         'serving traffic, so there is no concurrent work to stall. If it '
         'ever moves onto a request or reload path, the content_hash '
@@ -736,7 +732,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
-        'beb5b61c6b9a',
+        'f6a7ff40db1f',
         'filed',
         _STARTUP_PATH_RESOLVE_WHY,
     ),

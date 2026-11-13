@@ -21,14 +21,14 @@ import contextlib
 import pytest
 import pytest_asyncio
 from _falkor_index_live import live_backends
-from _fm_helpers import (
+from _fm_falkor_live import (
     FALKOR_HOST,
     FALKOR_PORT,
     await_index_operational,
     falkor_skipif,
-    poll_until,
     unique_graph_name,
 )
+from _fm_polling import poll_until
 from falkordb.asyncio import FalkorDB
 
 TEST_GRAPH: str = unique_graph_name('530_list_indices_integration')
@@ -112,7 +112,7 @@ class TestCallDbIndexesOverRoQuery:
         bulk data to widen the window, producing a slow and inherently flaky
         test that blows the module's 15s timeout budget.
 
-        Its durable job is different: ``_fm_helpers.await_index_operational``
+        Its durable job is different: ``_fm_falkor_live.await_index_operational``
         resolves the readiness column BY NAME (``status``) from
         ``result.header`` and matches its value EXACTLY against
         ``'OPERATIONAL'``. If a FalkorDB upgrade renames or reorders that
@@ -158,7 +158,7 @@ class TestCallDbIndexesOverRoQuery:
             assert all(len(col) == 2 for col in result.header), (
                 f'CALL db.indexes() header rows are no longer (type, name) '
                 f'2-tuples (header={result.header!r}); '
-                f'_fm_helpers.await_index_operational reads the column name as '
+                f'_fm_falkor_live.await_index_operational reads the column name as '
                 f'col[1] and can no longer be trusted.'
             )
 
@@ -167,7 +167,7 @@ class TestCallDbIndexesOverRoQuery:
             header_names = [col[1] for col in result.header]
             assert 'status' in header_names, (
                 f'CALL db.indexes() has no "status" column (header={header_names}). '
-                f'_fm_helpers.await_index_operational resolves readiness from this '
+                f'_fm_falkor_live.await_index_operational resolves readiness from this '
                 f'column by name; without it the barrier cannot be trusted.'
             )
             status_idx = header_names.index('status')
@@ -200,7 +200,7 @@ class TestCallDbIndexesOverRoQuery:
             assert observed >= {'OPERATIONAL'}, (
                 f'the index build settled but never reported the exact ready '
                 f'sentinel "OPERATIONAL" (statuses seen={sorted(observed)!r}). '
-                f'_fm_helpers.await_index_operational matches that string exactly '
+                f'_fm_falkor_live.await_index_operational matches that string exactly '
                 f'and fail-closed, so a renamed sentinel turns the barrier into a '
                 f'permanent timeout. Re-verify the barrier against this FalkorDB '
                 f'version and update its predicate.'

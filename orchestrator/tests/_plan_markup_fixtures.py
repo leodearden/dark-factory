@@ -122,4 +122,4 @@ def corrupt_plan(**overrides) -> dict:
 
 
 def on_disk(artifacts) -> dict:
-    return json.loads((artifacts.root / 'plan.json').read_text())
+    return json.loads(artifacts.artifact_path('plan.json').read_text())

@@ -25,7 +25,7 @@ import pytest
 import pytest_asyncio
 from _falkor_index_live import live_backends, scratch_graphs
 from _falkor_plans import explain, scan_operators, spy_on_queries
-from _fm_helpers import await_index_operational, falkor_skipif
+from _fm_falkor_live import await_index_operational, falkor_skipif
 from _query_recorder import IssuedQuery, recording_driver
 from _unused_embedder import UnusedEmbedder
 from falkordb.asyncio.graph import AsyncGraph

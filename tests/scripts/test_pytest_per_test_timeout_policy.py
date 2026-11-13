@@ -44,11 +44,14 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 from collections.abc import Iterator
 
 import pytest
 import verify_command_invariants as vci
+from pytest_config_discovery import discovered_pytest_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -348,85 +351,10 @@ def test_the_root_bound_probe_leaves_the_hosts_default_temp_root_untouched(
     )
 
 
-# ``'.'`` names the ROOT pyproject.toml, the convention
-# ``test_merge_gate_parallelism_config.py::_declared_addopts`` already
-# established: the root is a genuinely different file from any member's, and
-# naming it this way lets it read as one more entry in the sweep instead of a
-# special case bolted onto it.
-ROOT_CONFIG_NAME = '.'
-
-# A FLOOR, not an equality — 8 at authorship (the repo root plus all seven
-# workspace members) — so a member added later is swept with no edit here, while
-# a discovery that rots and finds fewer still fails loudly. Same idiom, and the
-# same reason, as ``test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES``.
-MIN_EXPECTED_PYTEST_CONFIGS = 8
-
 # The two keys every config must carry. `timeout` alone is not enough: without
 # `timeout_method` the enforcement mechanism is whatever pytest-timeout defaults
 # to rather than one this repo chose against a measured failure.
 REQUIRED_TIMEOUT_KEYS = ('timeout', 'timeout_method')
-
-
-def _pytest_ini_options(pyproject: pathlib.Path) -> dict | None:
-    """``[tool.pytest.ini_options]`` for *pyproject*, or ``None`` if it declares none.
-
-    Shape copied from ``test_pytest_workspace_collection.py::_pytest_ini_options``,
-    with ONE deliberate difference: that helper returns ``{}`` both for an absent
-    file and for a config that declares no pytest table, which is right for a
-    caller reading a single key out of it. This file DISCOVERS configs by the
-    presence of that table, so the two cases have to be distinguishable — an
-    empty-but-present table would otherwise be skipped by discovery rather than
-    reported as a config missing both keys, which is a vacuity hole exactly where
-    this file can least afford one.
-    """
-    if not pyproject.exists():
-        return None
-    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
-    pytest_table = data.get('tool', {}).get('pytest', {})
-    if 'ini_options' not in pytest_table:
-        return None
-    return pytest_table['ini_options']
-
-
-def discovered_pytest_configs() -> dict[str, dict]:
-    """Every pyproject.toml in this repo declaring ``[tool.pytest.ini_options]``.
-
-    DISCOVERED from ``[tool.uv.workspace].members`` rather than hardcoded, so a
-    new member joins the sweep with no edit here. That is the whole point: the
-    defect this file guards against is a config that nobody remembered to give a
-    cap, and a hand-written list is the same class of forgetting.
-
-    Both anti-vacuity guards live HERE rather than in each caller, because they
-    are properties of DISCOVERY and every sweep in this file depends on them.
-    """
-    root_pyproject = REPO_ROOT / 'pyproject.toml'
-    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
-    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
-
-    # A typo'd key here would make the loop below iterate nothing and turn every
-    # sweep in this file into a silent pass.
-    assert members, (
-        '[tool.uv.workspace].members is empty or missing in the root '
-        'pyproject.toml — this guard reads it to discover which subprojects to '
-        'check, so it would otherwise pass vacuously.'
-    )
-
-    configs: dict[str, dict] = {}
-    for name in [ROOT_CONFIG_NAME, *members]:
-        ini_options = _pytest_ini_options(REPO_ROOT / name / 'pyproject.toml')
-        if ini_options is not None:
-            configs[name] = ini_options
-
-    assert len(configs) >= MIN_EXPECTED_PYTEST_CONFIGS, (
-        f'only discovered {len(configs)} pytest configs '
-        f'({sorted(configs)}), expected at least '
-        f'{MIN_EXPECTED_PYTEST_CONFIGS} (task 5442). The sweep may be looking in '
-        f'the wrong place — it reads the root pyproject.toml plus one per '
-        f'[tool.uv.workspace].members entry, with {ROOT_CONFIG_NAME!r} naming the '
-        f'root. A config that stopped being discovered is a config nothing in '
-        f'this file checks any more.'
-    )
-    return configs
 
 
 def test_every_pytest_config_declares_a_per_test_timeout() -> None:

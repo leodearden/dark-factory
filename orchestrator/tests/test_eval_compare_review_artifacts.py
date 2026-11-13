@@ -93,7 +93,7 @@ class TestReadReviewerVerdictEnvelopes:
         assert set(result) == {'reviewer_comprehensive'}
 
     def test_skips_corrupt_envelope(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'verdicts' / 'reviewer_bad.json').write_text('{not valid json')
+        (artifacts.artifact_path('verdicts') / 'reviewer_bad.json').write_text('{not valid json')
 
         result = _read_reviewer_verdict_envelopes(artifacts)
 
@@ -115,7 +115,7 @@ class TestReadReviewerVerdictEnvelopes:
         # raises ValueError for it via _validate_verdict_role). It matches
         # the reviewer*.json glob, so it must be skipped-with-warning rather
         # than crashing the whole read.
-        (artifacts.root / 'verdicts' / 'reviewer.stray.json').write_text(
+        (artifacts.artifact_path('verdicts') / 'reviewer.stray.json').write_text(
             json.dumps(_envelope('reviewer.stray', {'reviewer': 'x', 'verdict': 'PASS',
                                                       'issues': [], 'summary': 's'})),
         )
@@ -196,7 +196,7 @@ class TestReadLegacyReviews:
             'summary': 'LEGACY-GOOD',
         }
         artifacts.write_review('reviewer_comprehensive', good)
-        (artifacts.root / 'reviews' / 'reviewer_bad.json').write_text('{not valid json')
+        (artifacts.artifact_path('reviews') / 'reviewer_bad.json').write_text('{not valid json')
 
         result = _read_legacy_reviews(artifacts)
 
@@ -284,7 +284,7 @@ class TestReadReviewArtifacts:
             'summary': 'LEGACY-GOOD',
         }
         ta.write_review('reviewer_comprehensive', good)
-        (ta.root / 'reviews' / 'reviewer_bad.json').write_text('{not valid json')
+        (ta.artifact_path('reviews') / 'reviewer_bad.json').write_text('{not valid json')
 
         result = _read_review_artifacts(str(worktree))
 

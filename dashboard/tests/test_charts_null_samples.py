@@ -84,7 +84,7 @@ import re
 from dataclasses import dataclass
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 
 @dataclass(frozen=True)
@@ -254,9 +254,10 @@ _CONTRACTS: dict[str, _Contract] = {
     'Sparkline': _Contract(builders=('sparkSmoothPaths',), banned=_SPARKLINE_BANNED),
     'StepSpark': _Contract(builders=('sparkStepPaths',), banned=_SPARKLINE_BANNED),
     # LineChart routes its gridline y through axisY too, so no sample-scaling
-    # arithmetic is left inline anywhere in the component.
+    # arithmetic is left inline anywhere in the component; its optional
+    # bound band (task 8461) is drawn by bandPaths.
     'LineChart': _Contract(
-        builders=('plottableMax', 'axisPaths', 'axisY'),
+        builders=('plottableMax', 'axisPaths', 'axisY', 'bandPaths'),
         banned=_LINE_CHART_BANNED,
     ),
     # StackedAreaChart gets its axis maximum back FROM the builder (a stack's

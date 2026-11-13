@@ -181,14 +181,15 @@ def by_design_reaper(metadata: Any) -> str | None:
 
     Read off the CITING record's metadata and never parsed from its content:
     the "CANONICAL (consolidates ...)" prose is LLM-authored. ``canonical`` is
-    tested with ``is True``, the vocabulary validator's own idiom, so a ``1``
-    or ``'true'`` never attributes. Status correction is checked first, so a
+    read through ``canonical_marker.py::is_canonical``, so a ``1`` or
+    ``'true'`` never attributes. Status correction is checked first, so a
     record carrying both signatures gets the more specific writer.
 
     One residual (PRD D11): a reaper-written edge whose target vanished for an
     unrelated reason is indistinguishable from a reaped one, and is treated as
     by-design because that target was going to be deleted anyway.
     """
+    from fused_memory.canonical_marker import is_canonical
     from fused_memory.reconciliation.harness import (  # noqa: PLC0415
         PROJECT_STATUS_CORRECTION_KIND,
     )
@@ -197,7 +198,7 @@ def by_design_reaper(metadata: Any) -> str | None:
         return None
     if metadata.get('kind') == PROJECT_STATUS_CORRECTION_KIND:
         return REAPER_STATUS_CORRECTION
-    if metadata.get('canonical') is True or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
+    if is_canonical(metadata) or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
         return REAPER_CONSOLIDATION
     return None
 
@@ -2102,7 +2103,9 @@ def write_report_text(path: str | Path, text: str) -> None:
 # The read-only run band
 #
 # D8's runner pattern minus every mutation: CONFIG_PATH from --config,
-# FusedMemoryConfig(), MemoryService(), initialize(), try/finally close().
+# FusedMemoryConfig(), MemoryService(), initialize_for_reads(), try/finally
+# close(); the full initialize() starts the durable write queue and runs
+# Graphiti startup maintenance, which repairs edges.
 #
 # There is no --apply band and no write call anywhere below. The guarantee is
 # asserted as BEHAVIOUR: the tests drive this band against a service double
@@ -2330,8 +2333,8 @@ async def _run(args: argparse.Namespace) -> int:
 
     config = _schema.FusedMemoryConfig()
     memory = _service.MemoryService(config)
-    await memory.initialize()
     try:
+        await memory.initialize_for_reads()
         outcome = await run_sweep(
             memory,
             project_ids=(args.project_id,),

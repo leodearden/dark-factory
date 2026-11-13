@@ -38,6 +38,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
@@ -73,6 +74,8 @@ from df_pytest_isolation import (  # noqa: E402
     wait_pid_gone,
     wait_proof_grace_secs,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # NOT `from df_pytest_isolation import _df_no_leaked_drain_processes`. Importing
 # a FIXTURE into a test module binds it as a module-scoped fixture that SHADOWS

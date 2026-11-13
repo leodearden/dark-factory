@@ -433,9 +433,14 @@ directly, not just interactive agents.
 - For a direct-to-main commit under contention, use `git commit --only <path>`
   (not a bare `git commit`) so you don't sweep up unrelated staged/dirty state
   from a concurrent process.
-- `pre-commit` runs pyright **only for packages with staged `.py` changes**
-  (`hooks/project-checks`, task 2551): a docs-only commit prints
-  `pyright skipped (no Python changes)` and is quick. When a commit does stage
+- `pre-commit` runs the merge gate's module checks **only for modules with
+  staged `.py` changes** (`hooks/project-checks` via
+  `scripts/hook_module_checks.py`, task 8531). A commit mapping to none prints
+  `merge-gate checks skipped (...)` and is quick. A docs-only commit runs the
+  `scripts/merge_screen.yaml` screen instead (about 10 s warm) when it stages
+  anything under `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md`
+  outside a workspace package, root-level docs such as this file included;
+  other docs-only commits skip the merge-gate checks. When a commit does stage
   Python, pass `timeout: 300000` (or higher) to `Bash`, or run detached via
   `setsid` and poll, rather than letting the default timeout kill it mid-hook.
 - `git commit --only` holds `.git/index.lock` for that **entire** hook run,
@@ -468,6 +473,26 @@ directly, not just interactive agents.
   (incident `13674d3c68`). A stash you push can be popped out from under you
   by an unrelated process, and a `stash pop` on a clean tree can apply another
   task's WIP into yours. Park WIP as commits on a branch instead.
+
+## Killing processes on this host
+
+- **Never** kill by a bare program or script name. `pkill -f PATTERN` and
+  `kill $(pgrep -f PATTERN)` match the full command line of **every** process
+  on this shared host: every project's merge verifies, the offline lane, and
+  production systemd timers. On 2026-11-02 a read-only `/team` investigation
+  subagent stopped its own `/tmp/s2/c.sh` loops by killing whatever
+  `pgrep -f 'c\.sh'` returned. `c\.sh` matches any "gc.sh", so that one
+  command SIGTERMed the offline lane's
+  `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` run and reify's
+  production `reify-warm-lane-gc.service` (task 8231).
+- Stop what you launched by the pid, process group or session id you captured
+  at launch: `setsid` plus a recorded session id, or the task id `Bash`'s
+  `run_in_background` returns. Failing that, anchor the pattern on your own
+  absolute path and preview it with `pgrep -af` before killing. A `pkill -f`
+  whose pattern appears in your own command line also kills the shell running
+  it ("Exit code 144").
+- The full rule's single home is
+  `orchestrator/src/orchestrator/agents/pkill_guidance.py::PKILL_SELF_MATCH_GUIDANCE`.
 
 ## Reference
 

@@ -11,6 +11,9 @@ from pathlib import Path
 import orchestrator_projects
 import pytest
 from orchestrator_projects import ProjectTarget, UnitScan, resolve_targets, scan_units
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CONFIG_NAME = 'dark-factory-orchestrator.yaml'
 

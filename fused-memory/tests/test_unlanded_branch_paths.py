@@ -11,7 +11,7 @@ import dataclasses
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from _merged_branch_repo import (
     INCIDENT_GUARD,
     commit_file,

@@ -44,7 +44,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from shared.transcript_archive import archive_task_transcripts
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The encoded-project dir the fake transcripts are laid down under.
 ENC = '-home-leo-projX'

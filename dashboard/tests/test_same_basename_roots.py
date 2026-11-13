@@ -20,8 +20,9 @@ from dashboard.data.active_tasks import (
 )
 from dashboard.data.datum import Datum, DatumState
 from dashboard.data.escalation_corpus import QueueKind, corpus_queues
+from dashboard.data.merge_queue import MergeAttempts
 from dashboard.data.root_invariants import RootInvariants, ScanStatus
-from dashboard.data.scheduler import collect_scheduler_state
+from dashboard.data.scheduler import clear_scheduler_state, collect_scheduler_state
 from dashboard.data.task_snapshot import (
     FRESHNESS_BOUND_SECONDS,
     SnapshotFailure,
@@ -211,6 +212,7 @@ class TestSchedulerCollector:
     @staticmethod
     async def _collect(client, roots, substrate, active, snapshots=None):
         config = DashboardConfig(project_root=roots[0], known_project_roots=list(roots[1:]))
+        clear_scheduler_state()
         with patch('dashboard.data.scheduler.mcp_tool_call', new=substrate), patch(
             'dashboard.data.scheduler.collect_tasks_with_counts',
             new=AsyncMock(return_value=(active, snapshots or {})),
@@ -366,9 +368,11 @@ _TEAM_LABELS = ProjectLabels.of_roots([_TEAM_A, _TEAM_B])
 def _measured_merge_queue(depth: int) -> dict:
     """One project's merge-queue aggregate, with the fields the route always resolves."""
     return {
-        'depth_timeseries': {'labels': [0], 'values': [depth]},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
+        'depth_timeseries': Datum(
+            {'labels': [0], 'values': [depth], 'bucket_minutes': 15}, _NOW, DatumState.FRESH, None, 30,
+        ),
+        'attempts': Datum(MergeAttempts(), _NOW, DatumState.FRESH, None, 30),
+        'train_throughput': Datum({}, _NOW, DatumState.FRESH, None, 30),
         'recent': [],
         'active': [],
         'in_queue': Datum(0, _NOW, DatumState.FRESH, None, 30),
@@ -418,7 +422,7 @@ class TestReduxShapers:
         )['MERGE_QUEUE']
 
         assert {
-            label: (block['depth']['values'], block['halt']['halted'])
+            label: (block['depth']['value']['values'], block['halt']['halted'])
             for label, block in mq.items()
         } == {'team-a/app': ([3], True), 'team-b/app': ([5], False)}
 

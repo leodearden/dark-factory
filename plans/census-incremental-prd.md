@@ -59,7 +59,7 @@ All new fields are optional, written only by the census, and validated by `codeb
     - `evidence_source`: always `agent-transcripts`, plus `present-tree` when the verifier confirmed the finding at `as_of_sha`.
     - `sub_area`: null.
     - `verdict` and `disposition`: per C4 and contract §7.
-  - `filed_tickets`: a list of `{ticket: str|null, project_root, run_id, finding_key, task_id: int|null, resolution: created|combined|refused|failed|existing|null, step: key|semantic|curator}`.
+  - `filed_tickets`: a list of `{ticket: str|null, project_root, run_id, finding_key, task_id: int|null, resolution: created|combined|refused|failed|cancelled|existing|null, step: key|semantic|curator}`.
   - `fixed_at_sha`, `accepted_by` (task id).
   - `status` gains `accepted` in `codebook.py::STATUSES`.
   - The v1 free-form `filed_tasks` (16 legacy entries, strings or lists) is left untouched. `filed_tickets` is the structured back-link.

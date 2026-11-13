@@ -71,6 +71,36 @@ class TestStatefulServer:
             assert _post_one_alarm(server) == PAYLOAD
 
 
+IDENTITY_HEADERS = {'X-Escalation-Identity': 'interactive:coordinator'}
+
+
+class TestCallerHeaders:
+    def test_caller_headers_ride_every_post_beside_the_session_echo(self):
+        with StubMcpServer(stateful=True, payload=PAYLOAD) as server:
+            with SyncMcpSession(server.url, client_name='t', headers=IDENTITY_HEADERS) as session:
+                session.call_tool('escalate_info', ARGUMENTS)
+            posts = _posts(server.requests)
+            minted = server.minted_session_ids
+
+        assert [r.body['method'] for r in posts] == [
+            'initialize', 'notifications/initialized', 'tools/call',
+        ]
+        assert all(r.headers.get('x-escalation-identity') == 'interactive:coordinator' for r in posts)
+        assert all(r.headers.get('mcp-session-id') == minted[0] for r in posts[1:])
+
+    def test_a_session_without_caller_headers_sends_none(self):
+        with StubMcpServer(stateful=True, payload=PAYLOAD) as server:
+            _post_one_alarm(server)
+            requests = server.requests
+
+        assert all('x-escalation-identity' not in r.headers for r in requests)
+
+    @pytest.mark.parametrize('name', ['Accept', 'content-type', 'Mcp-Session-Id', 'MCP-SESSION-ID'])
+    def test_a_caller_header_may_not_override_a_protocol_header(self, name: str):
+        with pytest.raises(ValueError, match=name):
+            SyncMcpSession('http://127.0.0.1:1', client_name='t', headers={name: 'x'})
+
+
 class TestStatelessServer:
     def test_no_session_id_is_sent_and_nothing_is_released(self):
         with StubMcpServer(stateful=False, payload=PAYLOAD) as server:

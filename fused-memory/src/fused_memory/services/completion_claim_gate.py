@@ -34,8 +34,9 @@ constantly stops being read.
 
 A claim must also be ASSERTED (task 6677). A marker inside a quotation,
 governed by a modal, inside a conditional/interrogative, present-tense
-temporal or imperative scope, or in attributive position is not a claim. See
-tests/test_completion_claim_mood.py and
+temporal or imperative scope, or in attributive position is not a claim. Nor is
+a bare participle after a temporal cue ('until merged') a claim about an earlier
+ref (task 7811). See tests/test_completion_claim_mood.py and
 docs/completion-claim-mood-filter-2026-10/measurement.md.
 
 Verification is split from detection behind INJECTED probes (mirroring
@@ -359,11 +360,10 @@ _NON_VERIDICAL_CUE_RE: re.Pattern[str] = re.compile(
     r'(?<![-\w])(?:if|whether|unless|in\s+case)(?![-\w])',
     re.IGNORECASE,
 )
-_TEMPORAL_CUE_RE: re.Pattern[str] = re.compile(
+_TEMPORAL_CUE: str = (
     r'(?<![-\w])(?:when(?:ever)?|once|after|before|until|till|as\s+soon\s+as|the\s+day)'
-    r'(?![-\w])',
-    re.IGNORECASE,
 )
+_TEMPORAL_CUE_RE: re.Pattern[str] = re.compile(_TEMPORAL_CUE + r'(?![-\w])', re.IGNORECASE)
 _PRESENT_AUXILIARY_RE: re.Pattern[str] = re.compile(
     r'\b(?:has|have|is|are)\b', re.IGNORECASE,
 )
@@ -382,6 +382,8 @@ _IMPERATIVE_HEAD_RE: re.Pattern[str] = re.compile(
 # present tense in a temporal clause is future reference ('once #N has
 # landed') while simple past is narrative and presupposes the event ('after
 # task 5 landed'). Each row is (cue, tense gate); None means always blank.
+# A verbless temporal clause ('holds once merged') has no tense to read; binding
+# handles it instead (_FORWARD_ONLY_LEAD_RE).
 # Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
 _MOOD_SCOPES: tuple[tuple[re.Pattern[str], re.Pattern[str] | None], ...] = (
     (_NON_VERIDICAL_CUE_RE, None),
@@ -675,10 +677,22 @@ _BINDING_BARRIER_RE: re.Pattern[str] = re.compile(
 # fit, so they do not bind forward.
 _TASK_COMPLEMENT_LEAD_RE: re.Pattern[str] = re.compile(r'\s+(?:as\s+)?', re.IGNORECASE)
 
-# A determiner (plus at most one adverb) directly before a marker makes it an
-# attributive participle modifying the noun after it ('the shipped examples').
-_ATTRIBUTIVE_LEAD_RE: re.Pattern[str] = re.compile(
-    r'\b(?:the|a|an|its|their|our|your|his|her|my)\s+(?:(?:\w+ly|already|just|now)\s+)?$',
+# An auxiliary right before 'once' makes it the adverb 'formerly' ('was once merged'),
+# so that 'once' is not a temporal lead. Every other cue after an auxiliary still is
+# ('is until merged'). Python lookbehind is fixed-width, hence one per width.
+_NOT_ADVERBIAL_ONCE: str = (
+    r'(?:(?!once\b)|(?<!\bis\s)(?<!\b(?:was|are|has|had)\s)(?<!\b(?:were|have|been)\s))'
+)
+
+# A marker with no subject of its own binds forward only. After a determiner it is
+# attributive ('the shipped examples'); after a temporal cue it heads a verbless clause
+# ('holds once merged') with no auxiliary for the _MOOD_SCOPES tense gate to read.
+# Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes (temporal
+# cue) and ::TestAttributiveMarkersBindForwardOnly (determiner).
+_FORWARD_ONLY_LEAD_RE: re.Pattern[str] = re.compile(
+    r'(?:\b(?:the|a|an|its|their|our|your|his|her|my)|'
+    + _NOT_ADVERBIAL_ONCE + _TEMPORAL_CUE + r')'
+    r'\s+(?:(?:\w+ly|already|just|now)\s+)?$',
     re.IGNORECASE,
 )
 
@@ -694,12 +708,13 @@ def _bind_marker(
     existence ('task N was merged as commit X' is a claim about X): the first
     ref after the marker, when :func:`_binds_forward` admits the gap. Otherwise
     BACKWARD: the nearest ref before the marker, with no barrier between them.
-    An attributive marker ('the merged commit X') binds forward only.
+    A marker led by a determiner or a temporal cue (:data:`_FORWARD_ONLY_LEAD_RE`)
+    binds forward only.
     """
     following = next((m for m in mentions if m.start >= marker.end), None)
     if following is not None and _binds_forward(clause, marker, following):
         return following
-    if _ATTRIBUTIVE_LEAD_RE.search(clause, 0, marker.start):
+    if _FORWARD_ONLY_LEAD_RE.search(clause, 0, marker.start):
         return None
     preceding = next((m for m in reversed(mentions) if m.end <= marker.start), None)
     if preceding is not None and not _BINDING_BARRIER_RE.search(

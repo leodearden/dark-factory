@@ -13,7 +13,10 @@ After=network.target fused-memory.service orchestrator-stream-touch.socket
 Wants=fused-memory.service
 Wants=orchestrator-stream-touch.socket
 # Restart-rate guard — MUST live under [Unit] (silently ignored under [Service]).
-StartLimitIntervalSec=600
+# With RestartSec=10 RestartSteps=4 RestartMaxDelaySec=60 the backoff is
+# 10/15.7/24.5/38.3/60 s, so ten starts fit inside 1800s for a crash up to ~120s
+# into startup (600s caught only a crash within ~15s of a fresh start).
+StartLimitIntervalSec=1800
 StartLimitBurst=10
 
 [Service]

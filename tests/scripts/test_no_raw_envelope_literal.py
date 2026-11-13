@@ -31,6 +31,9 @@ from raw_envelope_literal_guard import (
 )
 from shared.python_env import without_python_env_selection
 from shared.toolcall_markup import ENVELOPE_LITERALS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 

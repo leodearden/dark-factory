@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 
-from _task_db_scan import TaskDbUnreadable, connect_ro, discover_project_roots, tasks_db_path
+from _task_db_scan import discover_project_roots, tasks_db_path
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 from orchestrator.session_registry import (
@@ -42,10 +42,13 @@ from orchestrator.session_registry import (
 )
 from shared.project_id import fold_project_token
 from shared.project_layout import ESCALATION_QUEUE_RELPATH
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
+RECON_QUEUE_RELPATH = Path('data', 'reconciliation', 'escalations')
+RECON_QUEUE_TAG = 'recon'
 QUEUE_TAGS: Mapping[Path, str] = MappingProxyType({
     Path(ESCALATION_QUEUE_RELPATH): '',
-    Path('data', 'reconciliation', 'escalations'): 'recon',
+    RECON_QUEUE_RELPATH: RECON_QUEUE_TAG,
 })
 QUEUE_SUBDIRS: tuple[Path, ...] = tuple(QUEUE_TAGS)
 
@@ -54,7 +57,10 @@ TASK_CITATION_RE = re.compile(r'\btask (\d+)\b', re.IGNORECASE)
 
 _SCAN_CONTEXT = 'sitting.inventory'
 _SCAN_PARSE_ERRORS: tuple[type[BaseException], ...] = (json.JSONDecodeError, KeyError, TypeError, ValueError)
-_KEY_ARITY = {'esc': 3, 'decision': 2}
+ESCALATION_KIND = 'esc'
+AUDIT_KIND = 'audit'
+QUESTION_KINDS = frozenset({ESCALATION_KIND, 'decision'})
+_KEY_ARITY = {ESCALATION_KIND: 3, 'decision': 2, AUDIT_KIND: 2}
 
 ItemKey = tuple[str, ...]
 
@@ -104,6 +110,18 @@ class OpenItem:
     def kind(self) -> str:
         return self.key[0]
 
+    @property
+    def store_task_id(self) -> str | None:
+        """``task_id`` when it names a task in ``project``'s store (all digits), else None.
+
+        None for a sentinel, for no task, and for an escalation on a reconciliation
+        queue: that queue carries other projects' gates, so its ``task_id`` is not
+        a task of ``project``, the queue's own project.
+        """
+        if self.kind == ESCALATION_KIND and queue_tag(self.queue_dir) == RECON_QUEUE_TAG:
+            return None
+        return self.task_id if self.task_id and self.task_id.isdigit() else None
+
 
 @dataclass(frozen=True)
 class PendingRecords:
@@ -135,11 +153,16 @@ class Glossary:
 
 
 def escalation_key(queue_dir: str, escalation_id: str) -> ItemKey:
-    return ('esc', queue_dir, escalation_id)
+    return (ESCALATION_KIND, queue_dir, escalation_id)
 
 
 def decision_key(decision_id: str) -> ItemKey:
     return ('decision', decision_id)
+
+
+def audit_key(decision_id: str) -> ItemKey:
+    """An executor close drawn for audit, keyed by the DecisionRecord that closed it."""
+    return (AUDIT_KIND, decision_id)
 
 
 def key_str(key: ItemKey) -> str:
@@ -235,7 +258,7 @@ def collect_open_items(
     items: dict[ItemKey, OpenItem] = {}
     for queue_dir in dict.fromkeys(normalize_escalations_dir(q) for q in queue_dirs):
         queue_index, records = _scan_queue(queue_dir)
-        index[queue_dir] = MappingProxyType(queue_index)
+        index[queue_dir] = queue_index
         pending[queue_dir] = records
         shortfalls += records.unreadable
         for esc in (esc for escs in records.by_task.values() for esc in escs if esc.level == 2):
@@ -360,13 +383,17 @@ def read_escalation(path: Path) -> tuple[Escalation | None, Shortfall | None]:
     return esc, None
 
 
-def _scan_queue(queue_dir: str) -> tuple[dict[str, Path], PendingRecords]:
+def index_queue(queue_dir: str) -> Mapping[str, Path]:
+    """Every root and archive record of *queue_dir*, id to path, the root copy winning; nothing is read."""
+    return MappingProxyType({path.stem: path for path in iter_all_escalation_paths(Path(queue_dir))})
+
+
+def _scan_queue(queue_dir: str) -> tuple[Mapping[str, Path], PendingRecords]:
     root = Path(queue_dir)
-    index: dict[str, Path] = {}
+    index = index_queue(queue_dir)
     by_task: dict[str, list[Escalation]] = defaultdict(list)
     unreadable: list[Shortfall] = []
-    for path in iter_all_escalation_paths(root):
-        index[path.stem] = path
+    for path in index.values():
         if path.parent != root:
             continue
         esc, problem = read_escalation(path)

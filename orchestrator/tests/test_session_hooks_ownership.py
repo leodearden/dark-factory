@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from _process_identity_variants import IdentityVariant, own_identity
 from _process_tree_fakes import claude_process_tree
 from _session_hook_fixtures import (
     assert_hook_env_isolated,
@@ -16,6 +18,7 @@ from _session_hook_fixtures import (
     stdin_json,
     write_bound_parent,
 )
+from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -1057,3 +1060,392 @@ def test_hand_launched_record_keeps_the_durable_session_leader_pid(tmp_path: Pat
 
     slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path, process_tree=tree)
     assert sr.read_record(slug, root=tmp_path).launcher_pid == 515151
+
+
+# ---------------------------------------------------------------------------
+# Task 8125: hooks stamp and judge process identities
+# ---------------------------------------------------------------------------
+
+_IDENTITY_CWD = '/home/leo/src/dark-factory'
+
+# A pid virtually guaranteed dead on any host (the suite-wide idiom; see
+# test_session_registry.py's own _DEAD_PID -- deliberately not imported).
+_DEAD_PID = 2**31 - 1
+
+
+@pytest.mark.parametrize('owner_resolved', [True, False], ids=['owner-resolved', 'owner-unresolved'])
+def test_the_bind_stamps_the_owner_identity_with_the_owner_pid(
+    tmp_path: Path, owner_resolved: bool
+) -> None:
+    owner_pid = os.getpid() if owner_resolved else None
+    hook_input = {'session_id': 'sess-stamp', 'cwd': _IDENTITY_CWD}
+    slug = sh.hook_session_slug(
+        hook_input, env={}, root=tmp_path, process_tree=claude_process_tree(None)
+    )
+
+    sh.run_session_start(
+        hook_input, env={}, root=tmp_path, process_tree=claude_process_tree(owner_pid)
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_owner_pid == owner_pid
+    assert record.claude_owner_identity == (own_identity() if owner_resolved else None)
+
+
+def test_a_new_record_stamps_the_launcher_identity(tmp_path: Path) -> None:
+    tree = dataclasses.replace(claude_process_tree(424242), session_leader_pid=os.getpid)
+    hook_input = {'session_id': 'sess-launcher', 'cwd': _IDENTITY_CWD}
+
+    sh.run_session_start(hook_input, env={}, root=tmp_path, process_tree=tree)
+
+    slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path, process_tree=tree)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.launcher_pid == os.getpid()
+    assert record.launcher_identity == own_identity()
+
+
+_RECLAIM_EVENT = {'session_id': 'sess-reclaim', 'cwd': _IDENTITY_CWD}
+
+
+def _write_owned_by_this_process(tmp_path: Path, recorded: ProcessIdentity) -> str:
+    """Seed the record ``_RECLAIM_EVENT`` keys on, owned by this test process as *recorded* names it."""
+    slug = sh.hook_session_slug(
+        _RECLAIM_EVENT, env={}, root=tmp_path, process_tree=claude_process_tree(None)
+    )
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.IDLE,
+            cwd=_IDENTITY_CWD,
+            claude_session_id=_RECLAIM_EVENT['session_id'],
+            claude_owner_pid=os.getpid(),
+            claude_owner_identity=recorded,
+        ),
+        root=tmp_path,
+    )
+    return slug
+
+
+@pytest.mark.parametrize('variant', list(IdentityVariant))
+def test_the_reclaim_judges_the_recorded_owner_by_its_identity(
+    tmp_path: Path, variant: IdentityVariant
+) -> None:
+    recorded = own_identity(variant)
+    slug = _write_owned_by_this_process(tmp_path, recorded)
+
+    sh.run_stop(_RECLAIM_EVENT, {}, root=tmp_path, process_tree=claude_process_tree(_DEAD_PID))
+
+    record = sr.read_record(slug, root=tmp_path)
+    if variant.judged_dead:
+        assert record.claude_owner_pid == _DEAD_PID
+    else:
+        assert record.claude_owner_pid == os.getpid()
+        assert record.claude_owner_identity == recorded
+
+
+@pytest.mark.parametrize('variant', list(IdentityVariant))
+def test_an_owner_recorded_with_this_events_pid_is_re_stamped_iff_its_identity_is_judged_dead(
+    tmp_path: Path, variant: IdentityVariant
+) -> None:
+    recorded = own_identity(variant)
+    slug = _write_owned_by_this_process(tmp_path, recorded)
+
+    sh.run_stop(_RECLAIM_EVENT, {}, root=tmp_path, process_tree=claude_process_tree(os.getpid()))
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_owner_pid == os.getpid()
+    assert record.claude_owner_identity == (own_identity() if variant.judged_dead else recorded)
+
+
+# ---------------------------------------------------------------------------
+# Task 8124: T3CODE_THREAD_ID binding
+# ---------------------------------------------------------------------------
+
+_THREAD = '9b2d4f6a-8124-4c3e-9a5b-7d1f3e5a7c90'
+_T3_ENV = {'T3CODE_THREAD_ID': _THREAD}
+_T3_SPAWN_SLUG = 'unblock-df-8124-4242'
+_T3_CLAUDE_PID = 424242
+
+
+def _t3_spawn_record(
+    tmp_path: Path,
+    *,
+    session_id: str | None = None,
+    owner_pid: int | None = None,
+    owner_identity: ProcessIdentity | None = None,
+) -> str:
+    """A running t3 spawn record of ``_THREAD`` (result_file set), indexed by its thread pointer."""
+    record_dir = sr.record_path_for_slug(_T3_SPAWN_SLUG, root=tmp_path).parent
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=_T3_SPAWN_SLUG,
+            status=sr.Status.RUNNING,
+            title='unblock:df#8124',
+            role='unblock',
+            project='df',
+            task_id='8124',
+            cwd=_IDENTITY_CWD,
+            launcher_pid=4242,
+            result_file=str(record_dir / 'result.md'),
+            display=sr.Display(
+                kind=sr.DisplayKind.T3.value, wm_title='unblock:df#8124', t3_thread_id=_THREAD
+            ),
+            claude_session_id=session_id,
+            claude_launch_session_id=session_id,
+            claude_owner_pid=owner_pid,
+            claude_owner_identity=owner_identity,
+        ),
+        root=tmp_path,
+    )
+    assert sr.write_t3_thread_pointer(_THREAD, _T3_SPAWN_SLUG, root=tmp_path)
+    return _T3_SPAWN_SLUG
+
+
+def _hand_slug(hook_input: dict[str, str], tmp_path: Path) -> str:
+    """The hand-launched slug *hook_input*'s session_id keys on."""
+    return sh.hook_session_slug(
+        hook_input, env={}, root=tmp_path, process_tree=claude_process_tree(None)
+    )
+
+
+def _record_slugs(tmp_path: Path) -> list[str]:
+    return sorted(path.name for path in sr.sessions_dir(tmp_path).iterdir())
+
+
+def test_a_thread_pointer_adopts_and_binds_an_unbound_spawn_record(tmp_path: Path) -> None:
+    slug = _t3_spawn_record(tmp_path)
+    hook_input = {'session_id': 'sess-t3', 'cwd': _IDENTITY_CWD}
+
+    sh.run_session_start(
+        hook_input, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id == 'sess-t3'
+    assert record.claude_owner_pid == _T3_CLAUDE_PID
+    assert sr.resolve_session_slug_for_claude_session_id('sess-t3', root=tmp_path) == slug
+    assert sr.resolve_session_slug_for_pid(_T3_CLAUDE_PID, root=tmp_path) == slug
+    assert _record_slugs(tmp_path) == [slug]
+    assert record.display is not None
+    assert (record.display.kind, record.display.t3_thread_id) == (sr.DisplayKind.T3, _THREAD)
+
+
+@pytest.mark.parametrize(
+    ('recorded_session_id', 'event_pid', 'source', 'adopted', 'bound_after'),
+    [
+        pytest.param(None, _T3_CLAUDE_PID, 'startup', False, None, id='unbound-another-live-owner-forks'),
+        pytest.param(None, None, 'startup', True, None, id='unbound-unresolvable-pid-adopts-unbound'),
+        pytest.param('sess-owner', os.getpid(), 'clear', True, 'sess-event', id='owner-re-mint-rebinds'),
+    ],
+)
+def test_the_thread_lane_decides_adopt_or_fork_by_the_claude_pids(
+    tmp_path: Path,
+    recorded_session_id: str | None,
+    event_pid: int | None,
+    source: str,
+    adopted: bool,
+    bound_after: str | None,
+) -> None:
+    slug = _t3_spawn_record(
+        tmp_path,
+        session_id=recorded_session_id,
+        owner_pid=os.getpid(),
+        owner_identity=own_identity(),
+    )
+    event = {'session_id': 'sess-event', 'cwd': _IDENTITY_CWD, 'source': source}
+
+    sh.run_session_start(
+        event, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(event_pid)
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id == bound_after
+    assert record.claude_launch_session_id == recorded_session_id
+    assert (_record_slugs(tmp_path) == [slug]) is adopted
+    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
+
+
+def test_a_resume_reaching_its_bound_record_by_the_thread_pointer_reclaims_a_dead_owner(
+    tmp_path: Path,
+) -> None:
+    """Without the reclaim, the next nested claude would find a dead owner and take the record over."""
+    slug = _t3_spawn_record(tmp_path, session_id='sess-owner', owner_pid=_DEAD_PID)
+    resumed = {'session_id': 'sess-owner', 'cwd': _IDENTITY_CWD, 'source': 'resume'}
+    nested = {'session_id': 'sess-nested', 'cwd': _IDENTITY_CWD, 'source': 'startup'}
+
+    sh.run_session_start(
+        resumed, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(os.getpid())
+    )
+    sh.run_session_start(
+        nested, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert (record.claude_session_id, record.claude_owner_pid) == ('sess-owner', os.getpid())
+    assert record.claude_owner_identity == own_identity()
+    assert sr.resolve_session_slug_for_claude_session_id('sess-owner', root=tmp_path) == slug
+    assert _hand_slug(nested, tmp_path) in _record_slugs(tmp_path)
+
+
+@pytest.mark.parametrize(
+    'thread_id',
+    [_THREAD, f'mcp:{_THREAD}', 'mcp:launch:' + 'a1b2c3d4' * 8],
+    ids=['ui-uuid', 'mcp-uuid', 'mcp-launch'],
+)
+def test_an_unheld_thread_is_claimed_by_the_hand_launched_record(
+    tmp_path: Path, thread_id: str
+) -> None:
+    hook_input = {'session_id': 'sess-hand', 'cwd': _IDENTITY_CWD}
+    leaked_terminal = {'TMUX': '/tmp/tmux-1000/default,1,0', 'TMUX_PANE': '%3'}
+
+    sh.run_session_start(
+        hook_input,
+        {'T3CODE_THREAD_ID': thread_id, **leaked_terminal},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_CLAUDE_PID),
+    )
+
+    slug = _hand_slug(hook_input, tmp_path)
+    record = sr.read_record(slug, root=tmp_path)
+    assert sr.is_t3_record(record)
+    assert record.display is not None and record.display.t3_thread_id == thread_id
+    assert sr.resolve_session_slug_for_t3_thread(thread_id, root=tmp_path) == slug
+
+
+def test_a_thread_id_that_cannot_name_a_pointer_is_never_claimed(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-hand', 'cwd': _IDENTITY_CWD}
+
+    sh.run_session_start(
+        hook_input,
+        {'T3CODE_THREAD_ID': '../escape'},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_CLAUDE_PID),
+    )
+
+    record = sr.read_record(_hand_slug(hook_input, tmp_path), root=tmp_path)
+    assert not sr.is_t3_record(record)
+    assert not sr.t3_thread_pointers_dir(tmp_path).exists()
+
+
+def test_a_nested_claude_in_a_bound_thread_forks_without_claiming_it(tmp_path: Path) -> None:
+    slug = _t3_spawn_record(
+        tmp_path, session_id='sess-owner', owner_pid=os.getpid(), owner_identity=own_identity()
+    )
+    nested = {'session_id': 'sess-nested', 'cwd': _IDENTITY_CWD}
+
+    sh.run_session_start(
+        nested, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
+    )
+
+    spawn = sr.read_record(slug, root=tmp_path)
+    assert (spawn.claude_session_id, spawn.claude_owner_pid) == ('sess-owner', os.getpid())
+    nested_slug = _hand_slug(nested, tmp_path)
+    assert _record_slugs(tmp_path) == sorted([slug, nested_slug])
+    assert not sr.is_t3_record(sr.read_record(nested_slug, root=tmp_path))
+    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
+
+
+def _dead_owner(kind: str) -> tuple[int, ProcessIdentity | None]:
+    if kind == 'dead-pid':
+        return _DEAD_PID, None
+    return os.getpid(), own_identity(IdentityVariant.REUSED_PID)
+
+
+_DEAD_OWNER_KINDS = ['dead-pid', 'reused-pid']
+
+
+@pytest.mark.parametrize('dead_owner', _DEAD_OWNER_KINDS)
+def test_a_fresh_session_start_after_the_owner_died_rebinds_the_thread_record(
+    tmp_path: Path, dead_owner: str
+) -> None:
+    owner_pid, owner_identity = _dead_owner(dead_owner)
+    slug = _t3_spawn_record(
+        tmp_path, session_id='sess-owner', owner_pid=owner_pid, owner_identity=owner_identity
+    )
+    resumed = {'session_id': 'sess-resumed', 'cwd': _IDENTITY_CWD, 'source': 'startup'}
+
+    sh.run_session_start(
+        resumed, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id == 'sess-resumed'
+    assert record.claude_launch_session_id == 'sess-owner'
+    assert record.claude_owner_pid == _T3_CLAUDE_PID
+    assert sr.resolve_session_slug_for_claude_session_id('sess-resumed', root=tmp_path) == slug
+    assert _record_slugs(tmp_path) == [slug]
+
+
+@pytest.mark.parametrize('dead_owner', _DEAD_OWNER_KINDS)
+def test_only_session_start_rebinds_a_thread_record_whose_owner_died(
+    tmp_path: Path, dead_owner: str
+) -> None:
+    owner_pid, owner_identity = _dead_owner(dead_owner)
+    slug = _t3_spawn_record(
+        tmp_path, session_id='sess-owner', owner_pid=owner_pid, owner_identity=owner_identity
+    )
+    resumed = {'session_id': 'sess-resumed', 'cwd': _IDENTITY_CWD}
+
+    sh.run_notification(
+        resumed, _T3_ENV, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID)
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert (record.claude_session_id, record.claude_owner_pid) == ('sess-owner', owner_pid)
+    assert record.status == sr.Status.RUNNING
+    assert _hand_slug(resumed, tmp_path) in _record_slugs(tmp_path)
+    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
+
+
+@pytest.mark.parametrize('owned', [True, False], ids=['owned-spawn', 'nested-in-a-spawn'])
+def test_an_event_keyed_by_a_spawn_session_id_never_touches_the_thread_pointer(
+    tmp_path: Path, owned: bool
+) -> None:
+    tmux_slug = 'worker-df-8124-77'
+    if owned:
+        sr.write_record(
+            sr.SessionRecord(session_slug=tmux_slug, status=sr.Status.LAUNCHING, launcher_pid=77),
+            root=tmp_path,
+        )
+    else:
+        write_bound_parent(tmux_slug, tmp_path, 77)
+    hook_input = {'session_id': 'sess-tmux', 'cwd': _IDENTITY_CWD}
+    env = {**owner_ppid_env(tmux_slug, 4300), **_T3_ENV}
+
+    sh.run_session_start(
+        hook_input, env, root=tmp_path, process_tree=claude_process_tree(_T3_CLAUDE_PID, 4300)
+    )
+
+    written = tmux_slug if owned else _hand_slug(hook_input, tmp_path)
+    assert sr.read_record(written, root=tmp_path).claude_session_id == 'sess-tmux'
+    assert not sr.is_t3_record(sr.read_record(written, root=tmp_path))
+    assert not sr.t3_thread_pointers_dir(tmp_path).exists()
+
+
+def test_a_hand_t3_record_regains_its_lost_thread_pointer_on_its_next_event(
+    tmp_path: Path,
+) -> None:
+    hook_input = {'session_id': 'sess-hand', 'cwd': _IDENTITY_CWD}
+    tree = claude_process_tree(_T3_CLAUDE_PID)
+    sh.run_session_start(hook_input, _T3_ENV, root=tmp_path, process_tree=tree)
+    sr.t3_thread_pointer_path(_THREAD, tmp_path).unlink()
+
+    sh.run_stop(hook_input, _T3_ENV, root=tmp_path, process_tree=tree)
+
+    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == _hand_slug(
+        hook_input, tmp_path
+    )
+
+
+def test_a_hook_event_never_moves_a_thread_pointer_another_live_record_holds(
+    tmp_path: Path,
+) -> None:
+    hand_input = {'session_id': 'sess-hand', 'cwd': _IDENTITY_CWD}
+    tree = claude_process_tree(_T3_CLAUDE_PID)
+    sh.run_session_start(hand_input, _T3_ENV, root=tmp_path, process_tree=tree)
+    spawn_slug = _t3_spawn_record(tmp_path)
+
+    sh.run_notification(hand_input, _T3_ENV, root=tmp_path, process_tree=tree)
+
+    assert sr.is_t3_record(sr.read_record(_hand_slug(hand_input, tmp_path), root=tmp_path))
+    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == spawn_slug

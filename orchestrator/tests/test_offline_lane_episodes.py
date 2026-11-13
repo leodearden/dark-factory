@@ -23,19 +23,28 @@ from _lane_episode_fakes import (
     HEAD1,
     HEAD2,
     HEAD3,
+    T0,
     A,
     B,
     C,
     Lane,
+    _episode,
     _episodes_path,
+    _record,
 )
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.task_submit import SubmitFailed, SubmittedTask, SubmittedTicket
 
-from orchestrator.offline_lane_episode_state import unconfirmable_node
-from orchestrator.offline_lane_episodes import TickResult
+from orchestrator.offline_lane_episode_state import (
+    EPISODE_RETENTION,
+    EpisodeStore,
+    unconfirmable_node,
+)
+from orchestrator.offline_lane_episodes import TICK_FAILURES_BEFORE_ESCALATION, TickResult
 from orchestrator.offline_lane_escalations import (
     STUCK_FILING_CATEGORY,
+    TICK_FAILURE_CATEGORY,
     UNLANDED_RED_CATEGORY,
     escalation_state,
 )
@@ -49,15 +58,28 @@ from orchestrator.offline_lane_records import (
 
 
 class FailingOnceQueue(EscalationQueue):
-    def __init__(self, queue_dir: Path) -> None:
+    """A real queue whose calls named in ``fail_once`` each raise once, the next time they are made."""
+
+    def __init__(self, queue_dir: Path, *fail_once: str) -> None:
         super().__init__(queue_dir)
-        self.failures_left = 1
+        self.fail_once = set(fail_once)
+
+    def _maybe_fail(self, call: str) -> None:
+        if call in self.fail_once:
+            self.fail_once.discard(call)
+            raise OSError(f'queue {call} failed: queue directory unwritable')
 
     def submit(self, escalation):
-        if self.failures_left:
-            self.failures_left -= 1
-            raise OSError('queue directory unwritable')
+        self._maybe_fail('submit')
         return super().submit(escalation)
+
+    def amend(self, escalation_id, **framing):
+        self._maybe_fail('amend')
+        return super().amend(escalation_id, **framing)
+
+    def resolve(self, escalation_id, resolution, *args, **kwargs):
+        self._maybe_fail('resolve')
+        return super().resolve(escalation_id, resolution, *args, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -579,7 +601,7 @@ async def test_with_no_escalation_queue_nothing_is_raised_and_nothing_raises(tmp
 
 @pytest.mark.asyncio
 async def test_a_failed_unlanded_escalation_write_is_retried_at_the_next_qualifying_pass(tmp_path):
-    lane = Lane(tmp_path, queue=FailingOnceQueue(tmp_path / 'queue'))
+    lane = Lane(tmp_path, queue=FailingOnceQueue(tmp_path / 'queue', 'submit'))
     await _filed(lane)
     raised: list[tuple[str, ...]] = []
 
@@ -1107,3 +1129,189 @@ async def test_r14_an_unlistable_run_record_directory_seeds_nothing_and_the_pass
         r.levelno == logging.ERROR and 'run records unreadable, no history seeded' in r.getMessage()
         for r in caplog.records
     )
+
+
+# --- R15: a command whose tick raises is logged and skipped, the other commands go on --------
+
+BROKEN = 'broken'
+
+
+def _plant_broken(lane: Lane) -> None:
+    """A stored record whose due filing has no counted pass, so every tick of it raises in the filing's
+    evidence check; planted before any other command's pass, so it comes first in the store's commands."""
+    broken = _episode(A, counted_passes=(), filing_due=True, filing_due_since=T0, reproduce='pytest -m integration tests')
+    EpisodeStore(lane.tmp_path, clock=lane.clock).save(replace(_record(broken), command=BROKEN))
+    lane.restarted()
+
+
+@pytest.mark.asyncio
+async def test_one_command_whose_record_makes_its_tick_raise_leaves_the_other_commands_ticked(tmp_path, caplog):
+    lane = Lane(tmp_path)
+    _plant_broken(lane)
+    await lane.red()
+    lane.clock.advance(minutes=30)
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        tick = await lane.tick()
+
+    assert tick.commands_due == (COMMAND,)
+    assert any(
+        r.levelno == logging.ERROR and all(text in r.getMessage() for text in (BROKEN, 'ValueError', 'counted pass'))
+        for r in caplog.records
+    )
+    assert lane.stored(BROKEN).episodes[A].filing_due is True
+
+
+@pytest.mark.asyncio
+async def test_a_command_failing_every_tick_keeps_one_level_one_record_resolved_at_its_first_clean_tick(tmp_path):
+    lane = Lane(tmp_path)
+    assert lane.queue is not None
+    _plant_broken(lane)
+    for _ in range(TICK_FAILURES_BEFORE_ESCALATION - 1):
+        await lane.tick()
+    assert lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN) == []
+
+    await lane.tick()
+    (record,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    assert record.level == 1
+    assert BROKEN in record.summary and 'ValueError' in record.summary
+    assert 'a lane fix task needs at least one test, each with a counted pass' in record.detail
+
+    await lane.tick()
+    assert [e.id for e in lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)] == [record.id]
+
+    lane.client.set_status('850', 'pending', **_engine_filed(command=BROKEN))
+    await lane.tick()
+
+    assert escalation_state(lane.queue, record.id) == 'resolved'
+    assert lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN) == []
+    assert lane.stored(BROKEN).episodes[A].covering_task_id == '850'
+
+
+@pytest.mark.asyncio
+async def test_with_no_escalation_queue_a_failing_command_is_only_logged(tmp_path, caplog):
+    lane = Lane(tmp_path, queue=None)
+    _plant_broken(lane)
+
+    for in_a_row in range(1, TICK_FAILURES_BEFORE_ESCALATION + 2):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+            await lane.tick()
+        assert any(
+            r.levelno == logging.ERROR and f'{BROKEN}: tick failed ({in_a_row} in a row)' in r.getMessage()
+            for r in caplog.records
+        )
+
+
+async def _ticked_to_its_tick_failure_record(lane: Lane) -> Escalation:
+    """The broken command's one pending tick-failure record, after a run of failed ticks long enough to file it."""
+    for _ in range(TICK_FAILURES_BEFORE_ESCALATION):
+        await lane.tick()
+    (record,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    return record
+
+
+def _broken_ticks_clean(lane: Lane, clean: bool) -> None:
+    """With R13's lookup failing, the broken command's filing is not attempted, so its tick runs clean."""
+    lane.client.lookup_error = RuntimeError('task store unreachable') if clean else None
+
+
+def _logged(caplog: pytest.LogCaptureFixture, text: str) -> bool:
+    return any(r.levelno == logging.ERROR and BROKEN in r.getMessage() and text in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_record_resolved_while_the_command_still_fails_is_filed_afresh_at_its_next_failed_tick(tmp_path):
+    lane = Lane(tmp_path)
+    assert lane.queue is not None
+    _plant_broken(lane)
+    first = await _ticked_to_its_tick_failure_record(lane)
+
+    lane.queue.resolve(first.id, 'operator: looked at it', resolved_by='operator')
+    await lane.tick()
+
+    (second,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    assert second.id != first.id
+    _broken_ticks_clean(lane, True)
+    await lane.tick()
+    assert escalation_state(lane.queue, second.id) == 'resolved'
+
+
+@pytest.mark.asyncio
+async def test_a_failed_filing_or_amend_of_the_tick_failure_record_is_logged_and_retried_at_the_next_failed_tick(
+    tmp_path, caplog,
+):
+    queue = FailingOnceQueue(tmp_path / 'queue', 'submit')
+    lane = Lane(tmp_path, queue=queue)
+    _plant_broken(lane)
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        for _ in range(TICK_FAILURES_BEFORE_ESCALATION):
+            await lane.tick()
+    assert lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN) == []
+    assert _logged(caplog, 'tick-failure escalation not maintained')
+
+    await lane.tick()
+    (record,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    caplog.clear()
+    queue.fail_once.add('amend')
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        await lane.tick()
+    assert _logged(caplog, 'tick-failure escalation not maintained')
+
+    await lane.tick()
+    assert [e.id for e in lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)] == [record.id]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_resolve_of_the_tick_failure_record_is_retried_at_the_next_clean_tick(tmp_path, caplog):
+    queue = FailingOnceQueue(tmp_path / 'queue')
+    lane = Lane(tmp_path, queue=queue)
+    _plant_broken(lane)
+    record = await _ticked_to_its_tick_failure_record(lane)
+
+    queue.fail_once.add('resolve')
+    _broken_ticks_clean(lane, True)
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_episodes'):
+        await lane.tick()
+    assert escalation_state(queue, record.id) == 'pending'
+    assert _logged(caplog, f'tick-failure record {record.id} not resolved')
+
+    await lane.tick()
+    assert escalation_state(queue, record.id) == 'resolved'
+
+
+@pytest.mark.asyncio
+async def test_a_failure_run_after_a_failed_resolve_amends_the_record_the_resolve_left_pending(tmp_path):
+    queue = FailingOnceQueue(tmp_path / 'queue')
+    lane = Lane(tmp_path, queue=queue)
+    _plant_broken(lane)
+    record = await _ticked_to_its_tick_failure_record(lane)
+    queue.fail_once.add('resolve')
+    _broken_ticks_clean(lane, True)
+    await lane.tick()
+
+    lane.clock.advance(minutes=1)
+    _broken_ticks_clean(lane, False)
+    for _ in range(TICK_FAILURES_BEFORE_ESCALATION):
+        await lane.tick()
+
+    (amended,) = lane.pending(TICK_FAILURE_CATEGORY, command=BROKEN)
+    assert amended.id == record.id
+    assert lane.clock().isoformat() in amended.amendments[-1]['detail']
+    _broken_ticks_clean(lane, True)
+    await lane.tick()
+    assert escalation_state(queue, record.id) == 'resolved'
+
+
+@pytest.mark.asyncio
+async def test_a_failing_command_whose_record_expires_from_the_store_has_its_tick_failure_record_resolved(tmp_path):
+    lane = Lane(tmp_path)
+    assert lane.queue is not None
+    _plant_broken(lane)
+    record = await _ticked_to_its_tick_failure_record(lane)
+
+    lane.clock.advance(seconds=EPISODE_RETENTION.total_seconds() + 60)
+    await lane.tick()
+
+    assert BROKEN not in EpisodeStore(lane.tmp_path, clock=lane.clock).commands()
+    assert escalation_state(lane.queue, record.id) == 'resolved'

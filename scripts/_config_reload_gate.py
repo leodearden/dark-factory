@@ -9,15 +9,12 @@ its own knob's disposition in it. Everything between the landing and that
 check lives here once: importing the transport, calling reload_config through
 it, confirming the reload committed a re-read of the caller's own config file,
 and the operator-facing diagnostic for each way that can fail. The landing
-module shares this module's transport loader, its remedy and `die`.
+module shares this module's transport loader and its remedy.
 
-Two entry points, one fetch:
-
-* `fetch_reload_report` raises `ReloadNotConfirmed` on any failure. Its
-  `.failure` is a `ReloadFailure` whose value is the wire tag a caller may
-  print in its own verdict, and its `.detail` is the operator prose.
-* `reload_or_exit` is that same fetch without the re-read check, exiting
-  through `die` with the detail.
+`fetch_reload_report` is the one entry point. It raises `ReloadNotConfirmed`
+on any failure: its `.failure` is a `ReloadFailure` whose value is the wire
+tag a caller may print in its own verdict, and its `.detail` is the operator
+prose.
 
 The calling script's side of the contract:
 
@@ -38,7 +35,10 @@ import os
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import NoReturn
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shared.mcp_session import McpCallError
 
 RELOAD_REPLY_TIMEOUT_SECS = 30.0
 
@@ -53,6 +53,7 @@ class ReloadFailure(str, Enum):  # noqa: UP042 - see docstring
     TRANSPORT_NOT_IMPORTABLE = "transport_not_importable"
     NO_RELOAD_REPORT = "no_reload_report"
     REPLY_TIMED_OUT = "reload_reply_timed_out"
+    RELOAD_RAISED = "reload_raised"
     RELOAD_ERROR = "reload_error"
     RELOAD_NOT_COMMITTED = "reload_not_committed"
     DIFFERENT_CONFIG_FILE = "different_config_file"
@@ -66,12 +67,6 @@ class ReloadNotConfirmed(Exception):
         super().__init__(detail)
         self.failure = failure
         self.detail = detail
-
-
-def die(prog: str, message: str) -> NoReturn:
-    """Fail the deploy gate: `<prog>: <message>` on stderr, exit 1."""
-    print(f"{prog}: {message}", file=sys.stderr)
-    sys.exit(1)
 
 
 def load_transport():
@@ -104,7 +99,7 @@ def transport_not_importable_remedy(exc: ImportError) -> str:
 
 
 def fetch_reload_report(
-    port: str, *, committed_as: str, config_path: str | None,
+    port: str, *, committed_as: str, config_path: str,
     timeout: float = RELOAD_REPLY_TIMEOUT_SECS,
 ) -> dict:
     """reload_config's report from the orchestrator whose escalation MCP
@@ -117,8 +112,7 @@ def fetch_reload_report(
     nothing about that file unless its reload committed and re-read exactly
     that file: any disposition it carries -- a key absent from `applied`, or
     present with the caller's value -- is equally produced by a rolled-back
-    reload or by a reload of another orchestrator. None skips that check, for
-    a caller that asks only for the report.
+    reload or by a reload of another orchestrator.
     """
     report = _call_reload_config(port, committed_as=committed_as, timeout=timeout)
     # reload_config's OWN error field -- a config that failed to parse --
@@ -127,14 +121,13 @@ def fetch_reload_report(
         raise ReloadNotConfirmed(
             ReloadFailure.RELOAD_ERROR, f"reload_config error: {report['error']}",
         )
-    if config_path is not None:
-        _confirm_reread_of(config_path, report)
+    _confirm_reread_of(config_path, report)
     return report
 
 
 def _call_reload_config(port: str, *, committed_as: str, timeout: float) -> dict:
     """reload_config's unwrapped result, or ReloadNotConfirmed naming why the
-    transport could not deliver it."""
+    call returned none."""
     try:
         mcp_session, httpx = load_transport()
     except ImportError as exc:
@@ -151,21 +144,45 @@ def _call_reload_config(port: str, *, committed_as: str, timeout: float) -> dict
     except mcp_session.McpCallError as exc:
         # Only a READ timeout follows a completely sent request. A connect,
         # write or pool timeout leaves the server no complete request to run,
-        # so those are a reload that never reached the tool. Either way the
-        # live config is UNKNOWN, and a deploy gate must not pass on an unknown.
-        if isinstance(exc.__cause__, httpx.ReadTimeout):
-            raise ReloadNotConfirmed(
-                ReloadFailure.REPLY_TIMED_OUT,
-                f"no reply from {base_url} within {timeout}s to a request already sent; the transport "
-                f"cannot tell whether that was the session handshake or reload_config itself, so "
-                f"the tool may have run and applied the change, and the live config is unknown "
-                f"(committed as {committed_as}; re-run to converge, or the value lands at the next restart)",
-            ) from exc
-        raise ReloadNotConfirmed(
-            ReloadFailure.NO_RELOAD_REPORT,
-            f"reload_config never reached the tool at {base_url}: {exc.kind}: {exc} "
-            f"(committed as {committed_as}; the value lands at the next restart)",
+        # so those are a reload that never reached the tool.
+        raise _not_confirmed_by(
+            exc,
+            tool_raised=exc.kind is mcp_session.McpFailureKind.TOOL_ERROR,
+            read_timed_out=isinstance(exc.__cause__, httpx.ReadTimeout),
+            base_url=base_url, timeout=timeout, committed_as=committed_as,
         ) from exc
+
+
+def _not_confirmed_by(
+    exc: McpCallError, *, tool_raised: bool, read_timed_out: bool,
+    base_url: str, timeout: float, committed_as: str,
+) -> ReloadNotConfirmed:
+    """The refusal for a reload_config call that raised *exc*: the tool ran
+    and failed (*tool_raised*), its reply did not arrive in time after a full
+    send (*read_timed_out*), or else the request never reached the tool.
+
+    Whenever the tool may have run, the live config is UNKNOWN, and a deploy
+    gate must not pass on that."""
+    if tool_raised:
+        return ReloadNotConfirmed(
+            ReloadFailure.RELOAD_RAISED,
+            f"reload_config ran and failed at {base_url}: {exc} (it may have applied the change "
+            f"before failing, so the live config is unknown; committed as {committed_as}; "
+            f"re-run to converge, or the value lands at the next restart)",
+        )
+    if read_timed_out:
+        return ReloadNotConfirmed(
+            ReloadFailure.REPLY_TIMED_OUT,
+            f"no reply from {base_url} within {timeout}s to a request already sent; the transport "
+            f"cannot tell whether that was the session handshake or reload_config itself, so "
+            f"the tool may have run and applied the change, and the live config is unknown "
+            f"(committed as {committed_as}; re-run to converge, or the value lands at the next restart)",
+        )
+    return ReloadNotConfirmed(
+        ReloadFailure.NO_RELOAD_REPORT,
+        f"reload_config never reached the tool at {base_url}: {exc.kind}: {exc} "
+        f"(committed as {committed_as}; the value lands at the next restart)",
+    )
 
 
 def _confirm_reread_of(config_path: str, report: dict) -> None:
@@ -191,12 +208,3 @@ def _confirm_reread_of(config_path: str, report: dict) -> None:
             ReloadFailure.DIFFERENT_CONFIG_FILE,
             f"reload re-read a different file: config_path={reported!r} expected={expected!r}",
         )
-
-
-def reload_or_exit(port: str, *, prog: str, committed_as: str) -> dict:
-    """`fetch_reload_report` without the re-read check, exiting through `die`
-    with the refusal's detail."""
-    try:
-        return fetch_reload_report(port, committed_as=committed_as, config_path=None)
-    except ReloadNotConfirmed as exc:
-        die(prog, exc.detail)

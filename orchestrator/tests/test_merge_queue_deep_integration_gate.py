@@ -824,7 +824,7 @@ def _ladder_after(
 
     Both are taken through the SHIPPED functions
     (:func:`orchestrator.workflow._compute_merge_outcome_signature`,
-    :func:`orchestrator.workflow._evaluate_merge_thrash`) rather than
+    :func:`orchestrator.workflow.evaluate_merge_thrash`) rather than
     transcribed.  A transcription would let a signature-format change or a
     counter-arithmetic change pass this gate silently, which for a row whose
     entire content is "the shipped ladder does not move" would be the one
@@ -859,7 +859,7 @@ def _ladder_after(
             signature would show up as either an increment or a reset.
         requests: the scene's request registry, scanned for a blocked outcome
             rendered for any item the rounds do not already account for.
-        threshold: what ``_evaluate_merge_thrash`` escalates at.  Affects only
+        threshold: what ``evaluate_merge_thrash`` escalates at.  Affects only
             the verdict's ``escalate`` flag, which this helper drops — the
             counter arithmetic is threshold-independent — but is threaded so
             the control test can state the number it is asserting against.
@@ -869,7 +869,7 @@ def _ladder_after(
         :func:`_assert_two_way_quiescent` as ``ladder={'before': ..., 'after':
         ...}`` to make the unmoved claim part of the round-by-round oracle.
     """
-    from orchestrator.workflow import _evaluate_merge_thrash
+    from orchestrator.workflow import evaluate_merge_thrash
 
     current = RetryLedger() if ledger is None else ledger
 
@@ -891,7 +891,7 @@ def _ladder_after(
         if outcome is None or getattr(outcome, 'status', None) != 'blocked':
             continue
         signature = _blocked_signature(outcome)
-        current = _evaluate_merge_thrash(
+        current = evaluate_merge_thrash(
             current, current.last_merge_outcome_signature, signature, threshold,
         ).ledger
     return current
@@ -1005,9 +1005,9 @@ def _assert_two_way_quiescent(
         green over a genuinely leaking one.
       * *main_sha* must be a REAL sha, never falsy and never the literal
         ``'unknown'``.  ``two_layer_invariants`` gates its base-chain
-        (``check_frozen_prefix_invariant``) and verify-base sub-checks on
-        exactly that condition, leaving only the two graph-consistency checks
-        running for the sentinel.
+        (``check_frozen_prefix_invariant``, INV-3) sub-check on exactly that
+        condition, leaving only the two graph-consistency checks running for
+        the sentinel.
 
     WORKER SIDE
       (a) every request in *requests* has resolved (done or cancelled) — no
@@ -1060,9 +1060,9 @@ def _assert_two_way_quiescent(
     )
     assert main_sha and main_sha != 'unknown', (
         f'_assert_two_way_quiescent requires a REAL main_sha, got '
-        f'{main_sha!r}: two_layer_invariants silently skips its base-chain and '
-        f'verify-base sub-checks for a falsy or \'unknown\' sha, so surface '
-        f'(e) would pass vacuously'
+        f'{main_sha!r}: two_layer_invariants silently skips its base-chain '
+        f'(INV-3) sub-check for a falsy or \'unknown\' sha, so surface (e) '
+        f'would pass vacuously'
     )
 
     # ── (a) every tracked request resolved ──────────────────────────────────
@@ -1162,8 +1162,8 @@ def _assert_two_way_quiescent(
 #     both `return []` immediately when `not self._running` (stop() over-
 #     releases both semaphores by depth+1 as a shutdown safety valve, which
 #     would otherwise read as a spurious violation);
-#   * `two_layer_invariants(main_sha)` SKIPS its base-chain and verify-base
-#     sub-checks for a falsy or 'unknown' main_sha (the snapshot() sentinel).
+#   * `two_layer_invariants(main_sha)` SKIPS its base-chain (INV-3) sub-check
+#     for a falsy or 'unknown' main_sha (the snapshot() sentinel).
 #
 # — so the oracle must REJECT those inputs rather than consume them.  This
 # class pins all three as POSITIVE CONTROLS, and pins a forced permit leak as
@@ -1242,8 +1242,8 @@ class TestTwoWayOracleContract:
         """VACUITY TRAP (ii): ``two_layer_invariants`` skips sub-checks for 'unknown'.
 
         ``snapshot()`` passes the literal ``'unknown'`` when ``get_main_sha()``
-        is unavailable, and the base-chain + verify-base sub-checks are gated
-        off for it (and for a falsy sha) so startup does not report spurious
+        is unavailable, and the base-chain (INV-3) sub-check is gated off for
+        it (and for a falsy sha) so startup does not report spurious
         violations.  A gate that handed the oracle that sentinel would be
         asserting only the two graph-consistency checks and calling it §5.3.
 
@@ -1315,7 +1315,7 @@ class TestTwoWayOracleContract:
         """CAS/LEDGER half (b): row 8's claim is about workflow.py's LADDER.
 
         The `after` ledger is produced by the REAL
-        ``workflow._evaluate_merge_thrash`` over a real ``RetryLedger`` rather
+        ``workflow.evaluate_merge_thrash`` over a real ``RetryLedger`` rather
         than by hand, so a change to the ladder's counter arithmetic moves this
         control rather than leaving it stale.  ``before is after`` is the
         UNMOVED shape row 8 asserts; a single genuine blocked signature folded
@@ -1325,7 +1325,7 @@ class TestTwoWayOracleContract:
 
         from orchestrator.workflow import (
             _compute_merge_outcome_signature,
-            _evaluate_merge_thrash,
+            evaluate_merge_thrash,
         )
 
         worker = _make_worker(_make_git_ops(git_repo))
@@ -1333,7 +1333,7 @@ class TestTwoWayOracleContract:
 
         before = RetryLedger()
         signature = _compute_merge_outcome_signature('merge_conflict', 'shared.txt', '')
-        moved = _evaluate_merge_thrash(before, None, signature, 2).ledger
+        moved = evaluate_merge_thrash(before, None, signature, 2).ledger
         assert moved.consecutive_merge_thrash == 1, (
             f'the ladder control is inert: folding one genuine blocked '
             f'signature must move the counter off 0, got '
@@ -1555,10 +1555,10 @@ class _GateScene:
 
         ``enqueue_merge_request`` is what registers ``_on_finalized``, and
         ``merge_finalized`` has no other emit site — so a scene that stuffed
-        ``_lane_buffers`` directly would make every landing assertion blind to
+        the lane buffers directly would make every landing assertion blind to
         the payload this gate exists to read.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         for tid in task_ids:
             self.reqs[tid] = _make_req(tid, tid, self.config, self.repo)
@@ -1618,7 +1618,7 @@ class _GateScene:
         )
         # The head leaves the buffers the way the merger takes it — it must not
         # still be queued when `chain_snapshot` runs, or it would chain itself.
-        popped = req if req is not None else worker._pop_next_pickable()
+        popped = req if req is not None else worker._intake.pop_next_pickable()
         assert popped is not None and popped.task_id == head_tid, (
             f'expected {head_tid} to be the pickable head, got '
             f'{None if popped is None else popped.task_id}'
@@ -1730,7 +1730,7 @@ class _GateScene:
         head_mc = await _merge_commit_off_main(
             self.repo, f'task/{head_tid}', f'head-{head_tid}',
         )
-        popped = worker._pop_next_pickable()
+        popped = worker._intake.pop_next_pickable()
         assert popped is not None and popped.task_id == head_tid, (
             f'expected {head_tid} to be the pickable head, got '
             f'{None if popped is None else popped.task_id}'
@@ -1815,7 +1815,7 @@ class _GateScene:
             self.repo, f'task/{spec_tid}', self.head_mc,
             f'{tag}-r{self._round_no}',
         )
-        popped = worker._pop_next_pickable()
+        popped = worker._intake.pop_next_pickable()
         assert popped is not None and popped.task_id == spec_tid, (
             f'expected {spec_tid} to be the pickable spec item, got '
             f'{None if popped is None else popped.task_id}'
@@ -2778,7 +2778,7 @@ class TestRow3HalvingIsolatesTheBadItem:
         pending: MergeRequest | None = None
         for _ in range(max_rounds):
             if pending is None:
-                nxt = worker._pop_next_pickable()
+                nxt = worker._intake.pop_next_pickable()
                 if nxt is None:
                     break
             else:
@@ -2801,7 +2801,7 @@ class TestRow3HalvingIsolatesTheBadItem:
             # drained perfectly.  Probe once more before failing — a pop that
             # returns None consumes nothing, and on the failing branch the
             # consumed item does not matter.
-            leftover = pending if pending is not None else worker._pop_next_pickable()
+            leftover = pending if pending is not None else worker._intake.pop_next_pickable()
             if leftover is not None:
                 pytest.fail(
                     f'the queue never drained in {max_rounds} rounds (task '
@@ -3115,7 +3115,7 @@ class TestRow3HalvingIsolatesTheBadItem:
 #   unmoved.
 #
 #   LEDGER SIDE (original here): the pair of rounds' real observable outputs
-#   are folded through the SHIPPED ladder — ``workflow._evaluate_merge_thrash``
+#   are folded through the SHIPPED ladder — ``workflow.evaluate_merge_thrash``
 #   over a real ``shared.task_metadata.RetryLedger``, keyed by the SHIPPED
 #   ``workflow._compute_merge_outcome_signature`` — and the ladder comes back
 #   byte-identical.  Deriving the signature THROUGH the production function
@@ -3157,7 +3157,7 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         The head is re-dispatched by OBJECT on round 2 rather than re-popped:
         a red tip REQUEUES its dispatching request onto ``_queue`` (deliberately
         NOT back into a lane buffer — draining it would make the head a member
-        of its own next chain), so ``_pop_next_pickable`` would hand back a
+        of its own next chain), so ``pop_next_pickable`` would hand back a
         FOLLOWER and the second round would be a different scenario entirely.
         """
         scene = await _make_gate_scene(
@@ -3286,7 +3286,7 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         """LEDGER SIDE — the conclusion, folded through the REAL ladder.
 
         The pair's own observable outputs are handed to
-        ``workflow._evaluate_merge_thrash``.  It has nothing to eat, because the
+        ``workflow.evaluate_merge_thrash``.  It has nothing to eat, because the
         ladder is fed ONLY from a rendered blocked ``MergeOutcome`` (workflow.py
         stashes ``result.reason`` into ``_last_merge_block_reason`` and gates
         the whole thrash check on it being non-None), and a deep red tip
@@ -3770,7 +3770,7 @@ class TestRow7KillSwitchByteIdentity:
         # every enqueued request holds THIS object by reference.
         scene.config.verify_cross_check_remote_green = False
         for tag in ('r1', 'r2', 'r3'):
-            nxt = scene.worker._pop_next_pickable()
+            nxt = scene.worker._intake.pop_next_pickable()
             assert nxt is not None, (
                 f'the queue ran dry before round {tag}: a 3-round claim needs '
                 f'three real rounds, not a short run that passes vacuously'
@@ -4755,7 +4755,7 @@ class TestRow4ConflictTruncatesSilently:
         )
 
         # ── ...and then takes the ORDINARY sequential path and lands ────────
-        nxt = worker._pop_next_pickable()
+        nxt = worker._intake.pop_next_pickable()
         assert nxt is two, (
             f'item 2 must be the next pickable, at its original lane index; '
             f'got {None if nxt is None else nxt.task_id!r}'
@@ -5014,7 +5014,7 @@ class TestDeepGateCapstone:
         # it for the same determinism reason it was pinned at the top.
         scene.config.verify_cross_check_remote_green = False
 
-        nxt = worker._pop_next_pickable()
+        nxt = worker._intake.pop_next_pickable()
         assert nxt is scene.reqs['110']
         r6 = await scene.round_(tag='reload+truncate', head_tid='110', req=nxt)
         assert r6['chain'] is not None and 1 + len(r6['chain'].links) == 12, (

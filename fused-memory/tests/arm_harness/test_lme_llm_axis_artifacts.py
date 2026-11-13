@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.arm_spec import LlmArmSpec, load_arm_spec
 from fused_memory.arm_harness.incumbent_cost import (
@@ -33,6 +34,8 @@ from fused_memory.arm_harness.screening import (
     ScreeningOutcome,
     load_screening_verdict,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[3]
 LLM_AXIS_RELATIVE = 'plans/local-memory-models-eval-llm'

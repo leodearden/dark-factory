@@ -10,7 +10,7 @@ import dataclasses
 import logging
 import os
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,7 +30,9 @@ from fused_memory.services.overreach_guard import (
 )
 from fused_memory.services.overreach_shadow import (
     SIDECAR_FILENAME,
+    HandedFlag,
     JudgedEpisode,
+    OverreachFlag,
     OverreachFlagPage,
     OverreachShadow,
     OverreachShadowStore,
@@ -226,6 +228,98 @@ class TestPendingFlags:
             await opened.close()
         assert [f.edge_uuid for f in every.flags] == ['whole', 'late']
         assert [f.judged_at for f in every.flags] == [whole, fraction]
+
+
+H1, H2 = T0 + timedelta(hours=1), T0 + timedelta(hours=3)
+
+
+async def _seed_handoffs(data_dir: Path) -> OverreachShadowStore:
+    """Graph g: a1/a2 overreach and a3 holding handed at H1, b1 handed at H2, b2 never handed; x1 on another graph at H1."""
+    clock = _Clock(T0, T0 + timedelta(minutes=1), T0 + timedelta(minutes=1), T0 + timedelta(minutes=2),
+                   H1, H1, H2)
+    opened = await OverreachShadowStore.open(data_dir, clock=clock)
+    await opened.record(episode=judged_episode('ep-a'), judgements=[
+        judged_edge('a2', 'overreach'), judged_edge('a1', 'overreach'), judged_edge('a3', 'holding'),
+    ])
+    await opened.record(episode=judged_episode('ep-b'), judgements=[judged_edge('b1', 'overreach')])
+    await opened.record(episode=judged_episode('ep-c'), judgements=[judged_edge('b2', 'overreach')])
+    await opened.record(episode=judged_episode('ep-x', graph='other'), judgements=[judged_edge('x1', 'overreach')])
+    await opened.record_handoffs('g', ['a2', 'a1', 'a3'])
+    await opened.record_handoffs('other', ['x1'])
+    await opened.record_handoffs('g', ['b1'])
+    return opened
+
+
+class TestHandedOverreachFlags:
+    @pytest.mark.asyncio
+    async def test_only_this_graphs_handed_overreach_flags_in_the_window(self, tmp_path: Path) -> None:
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            handed = await opened.handed_overreach_flags('g', handed_from=H1, handed_until=H2)
+        finally:
+            await opened.close()
+        assert [h.flag.edge_uuid for h in handed] == ['a1', 'a2']
+
+    @pytest.mark.asyncio
+    async def test_a_handed_flag_carries_the_flag_and_its_handoff_instant(self, tmp_path: Path) -> None:
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            handed = await opened.handed_overreach_flags('g', handed_from=H1, handed_until=H2)
+        finally:
+            await opened.close()
+        assert isinstance(handed, tuple) and all(isinstance(h, HandedFlag) for h in handed)
+        assert handed[0].flag == OverreachFlag(
+            episode_uuid='ep-a', edge_uuid='a1', fact='fact of a1', rationale='span for a1',
+            judged_at=T0, prompt_version=PROMPT_VERSION,
+        )
+        assert handed[0].handed_at == H1 and handed[0].handed_at.tzinfo is not None
+
+    @pytest.mark.asyncio
+    async def test_the_window_end_is_exclusive_and_its_start_inclusive(self, tmp_path: Path) -> None:
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            through_h2 = await opened.handed_overreach_flags(
+                'g', handed_from=H1, handed_until=H2 + timedelta(microseconds=1),
+            )
+            after_h1 = await opened.handed_overreach_flags(
+                'g', handed_from=H1 + timedelta(microseconds=1), handed_until=H2 + timedelta(hours=1),
+            )
+        finally:
+            await opened.close()
+        assert [h.flag.edge_uuid for h in through_h2] == ['a1', 'a2', 'b1']
+        assert [h.flag.edge_uuid for h in after_h1] == ['b1']
+
+    @pytest.mark.asyncio
+    async def test_bounds_in_another_offset_compare_as_instants(self, tmp_path: Path) -> None:
+        plus_two = timezone(timedelta(hours=2))
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            handed = await opened.handed_overreach_flags(
+                'g', handed_from=H1.astimezone(plus_two), handed_until=H2.astimezone(plus_two),
+            )
+        finally:
+            await opened.close()
+        assert [h.flag.edge_uuid for h in handed] == ['a1', 'a2']
+
+    @pytest.mark.asyncio
+    async def test_another_graphs_handed_flag_is_its_own(self, tmp_path: Path) -> None:
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            handed = await opened.handed_overreach_flags('other', handed_from=T0, handed_until=H2)
+        finally:
+            await opened.close()
+        assert [(h.flag.episode_uuid, h.flag.edge_uuid) for h in handed] == [('ep-x', 'x1')]
+
+    @pytest.mark.asyncio
+    async def test_it_reads_through_the_read_only_view(self, tmp_path: Path) -> None:
+        writer = await _seed_handoffs(tmp_path / 'handed')
+        await writer.close()
+        reader = await OverreachShadowStore.open_read_only(tmp_path / 'handed' / SIDECAR_FILENAME)
+        try:
+            handed = await reader.handed_overreach_flags('g', handed_from=T0, handed_until=H2 + timedelta(hours=1))
+        finally:
+            await reader.close()
+        assert [h.flag.edge_uuid for h in handed] == ['a1', 'a2', 'b1']
 
 
 class TestStoreLifecycle:

@@ -18,12 +18,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 from _task_db_scan import (
-    TaskDbProblem,
-    TaskDbUnreadable,
-    connect_ro,
     decode_metadata,
     runs_db_path,
 )
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 
 EXIT_OK = 0
 EXIT_NO_EVENTS = 1

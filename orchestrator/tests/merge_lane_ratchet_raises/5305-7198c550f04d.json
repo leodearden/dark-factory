@@ -1,0 +1,12 @@
+{
+  "task_id": "5305",
+  "reason": "Move, not growth (PRD plans/merge-lane-quality-prd.md task theta): _WipHaltMixin leaves worker.py for the composed merge_lane/halt.py::HaltState, and the worker keeps its public halt API as one-statement delegators. worker.py lines 22197 -> 22005 (-192), prose_lines 12530 -> 12430 (-100), cognitive 2194 -> 2157 (-37); halt.py adds 204 lines, 71 prose_lines, cognitive 32. Net total:lines 57128 -> 57140 (+12), which is the new module's docstring, imports and logger plus the delegator seam. Every other total holds or falls: total:prose_lines 31601 -> 31572, total:cognitive 4841 -> 4836 (dead _wait_until_any_lane_runnable and the getattr _signal_resume shim deleted), total:private_reads 6557 -> 6547 (tests moved to is_operator_halted / halt_owner_esc_id), total:patch_targets 55 -> 55. No new_function_over_ceiling: every HaltState method scores <= 6.",
+  "measures": [
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57128,
+      "current": 57140
+    }
+  ]
+}

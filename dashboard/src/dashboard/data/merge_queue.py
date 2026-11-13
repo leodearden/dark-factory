@@ -29,7 +29,7 @@ import aiosqlite
 import httpx
 
 from dashboard.data.chart_utils import ChartData
-from dashboard.data.datum import Datum, DatumState, unknown_datum
+from dashboard.data.datum import Datum, DatumState, map_datum, unknown_datum
 from dashboard.data.db import with_db
 from dashboard.data.mcp_fanout import describe_exc
 from dashboard.data.memory import enclosing_deadline, mcp_tool_call
@@ -74,6 +74,11 @@ A window read is stamped at the route's ``render_at``, the same instant the
 live probe is stamped, so it must outlast the same fan-out — hence the same
 number, held once.
 """
+
+
+def _no_runs_db() -> Datum[Any]:
+    """The reading of every runs.db leg for a project with no runs.db open."""
+    return unknown_datum('no runs.db is open for this project', RUNS_DB_READ_FRESHNESS_BOUND_SECONDS)
 
 # ---------------------------------------------------------------------------
 # Adaptive bucket ladder: (max_hours | None, bucket_minutes)
@@ -134,11 +139,6 @@ class DepthSeries(ChartData):
     bucket_minutes: int
 
 
-def _empty_depth(hours: int) -> DepthSeries:
-    """Return the empty depth series of an *hours* window, still naming its width."""
-    return {'labels': [], 'values': [], 'bucket_minutes': _bucket_minutes_for_window(hours)}
-
-
 def _align_bucket(t: datetime, bucket_min: int) -> datetime:
     """Floor *t* to the nearest bucket boundary using epoch-based arithmetic.
 
@@ -175,11 +175,11 @@ async def queue_depth_timeseries(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> DepthSeries:
+) -> Datum[DepthSeries]:
     """Approximate merge queue throughput as adaptive-width bucket counts.
 
-    Returns a DepthSeries with ISO bucket-start labels, integer counts and
-    the ``bucket_minutes`` they were counted at.
+    The series carries ISO bucket-start labels, integer counts and the
+    ``bucket_minutes`` they were counted at.
     Bucket width is chosen adaptively via ``_bucket_minutes_for_window`` so
     the point count stays manageable for all window sizes:
 
@@ -192,16 +192,23 @@ async def queue_depth_timeseries(
     inclusive.  The current bucket is always included.
 
     Args:
-        db: aiosqlite connection, or None (returns the window's empty series).
+        db: aiosqlite connection, or None (no runs.db is open for the project).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for bucket alignment.  When None (the default),
             ``datetime.now(UTC)`` is used.  Pass an explicit value in tests to
             get deterministic bucket counts and eliminate boundary flakiness.
-    """
-    if db is None:
-        return _empty_depth(hours)
 
-    async def _query(conn: aiosqlite.Connection) -> DepthSeries:
+    Returns:
+        One ``Datum[DepthSeries]``, FRESH at *now* when the window was read —
+        a readable empty window is a series of measured zeros. With no
+        runs.db, or when the read fails, the Datum is UNKNOWN with a reason
+        saying which: an unread series counted nothing, at no width.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if db is None:
+        return _no_runs_db()
+
+    async def _query(conn: aiosqlite.Connection) -> Datum[DepthSeries]:
         effective_now = resolve_now(now)
         cutoff = effective_now - timedelta(hours=hours)
 
@@ -246,9 +253,13 @@ async def queue_depth_timeseries(
 
         labels = [b.isoformat() for b in buckets]
         values: list[int | float] = [counts[lbl] for lbl in labels]
-        return {'labels': labels, 'values': values, 'bucket_minutes': bucket_min}
+        series: DepthSeries = {'labels': labels, 'values': values, 'bucket_minutes': bucket_min}
+        return Datum(series, effective_now, DatumState.FRESH, None, bound)
 
-    return await with_db(db, _query, _empty_depth(hours))
+    return await with_db(
+        db, _query,
+        unknown_datum('the merge_attempt depth series could not be read from runs.db', bound),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +274,8 @@ class MergeAttempts:
     row set, so the chart's total always equals ``with_duration +
     without_duration`` — a headline can never count a subset of what the
     donut beside it counts (PRD dashboard-one-datum-one-path, sketch #9).
+    It is served as ONE Datum for the same reason: the donut and the latency
+    can never disagree on whether the window was read.
 
     Attributes:
         outcomes: Every attempt counted by outcome; an unrecorded outcome
@@ -287,12 +300,16 @@ class MergeAttempts:
         }
 
     def latency(self) -> dict:
-        """Centiles and mean over the timed attempts, and the timed/untimed split."""
+        """Centiles and mean over the timed attempts, and the timed/untimed split.
+
+        An untimed window has no centiles: they are None, never a 0 computed
+        over zero samples.
+        """
         with_duration = len(self.durations)
         without_duration = sum(self.outcomes.values()) - with_duration
         if not self.durations:
             return {
-                'p50': 0, 'p95': 0, 'p99': 0, 'mean_ms': 0.0,
+                'p50': None, 'p95': None, 'p99': None, 'mean_ms': None,
                 'with_duration': 0, 'without_duration': without_duration,
             }
         return {
@@ -310,19 +327,25 @@ async def merge_attempts(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> MergeAttempts:
+) -> Datum[MergeAttempts]:
     """Read every merge_attempt in the window with ONE query.
 
     Args:
-        db: aiosqlite connection, or None (returns an empty record).
+        db: aiosqlite connection, or None (no runs.db is open for the project).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
             is used. Pass an explicit value to share a timestamp with sibling calls.
-    """
-    if db is None:
-        return MergeAttempts()
 
-    async def _query(conn: aiosqlite.Connection) -> MergeAttempts:
+    Returns:
+        One ``Datum[MergeAttempts]``, FRESH at *now* when the window was read —
+        a readable empty window is an empty record. With no runs.db, or when
+        the read fails, the Datum is UNKNOWN with a reason saying which.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if db is None:
+        return _no_runs_db()
+
+    async def _query(conn: aiosqlite.Connection) -> Datum[MergeAttempts]:
         rows = await conn.execute_fetchall(
             "SELECT json_extract(data, '$.outcome') AS outcome, duration_ms "
             "FROM events "
@@ -334,9 +357,13 @@ async def merge_attempts(
             float(row['duration_ms']) for row in rows
             if row['duration_ms'] is not None and row['duration_ms'] > 0
         )
-        return MergeAttempts(outcomes=dict(outcomes), durations=tuple(durations))
+        record = MergeAttempts(outcomes=dict(outcomes), durations=tuple(durations))
+        return Datum(record, resolve_now(now), DatumState.FRESH, None, bound)
 
-    return await with_db(db, _query, MergeAttempts())
+    return await with_db(
+        db, _query,
+        unknown_datum('the merge_attempt events could not be read from runs.db', bound),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +414,7 @@ async def recent_merges(
         raise ValueError(f'recent_merges limit must be at least 1, got {limit}')
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
     if db is None:
-        return {'rows': [], 'total': unknown_datum('no runs.db is open for this project', bound)}
+        return {'rows': [], 'total': _no_runs_db()}
 
     async def _query(conn: aiosqlite.Connection) -> RecentMerges:
         rows = list(await conn.execute_fetchall(
@@ -502,7 +529,7 @@ async def speculative_stats(
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
     if db is None:
-        return unknown_datum('no runs.db is open for this project', bound)
+        return _no_runs_db()
 
     async def _query(conn: aiosqlite.Connection) -> Datum[dict]:
         since = _cutoff_iso(hours, now=now)
@@ -540,20 +567,19 @@ async def speculative_stats(
 # 5b. Train throughput stats
 # ---------------------------------------------------------------------------
 
-# All-zeros default dict for train_throughput_stats (returned when db is None
-# or when an exception occurs inside the query).
-_TRAIN_THROUGHPUT_DEFAULT: dict = {
-    'trains_landed': 0,
-    'tasks_landed_via_trains': 0,
-    'train_verifies_per_landed_task': 0.0,
-    'baseline_solo_landed': 0,
-    'baseline_verifies_per_landed_task': 0.0,
-    'verifies_per_landed_task_delta': 0.0,
-    'train_cas_retry_rate': 0.0,
-    'baseline_cas_retry_rate': 0.0,
-    'cas_retry_rate_delta': 0.0,
-    'improved': False,
-}
+class TrainThroughput(TypedDict):
+    """One window's train amortisation; :func:`train_throughput_stats` defines each key."""
+
+    trains_landed: int
+    tasks_landed_via_trains: int
+    train_verifies_per_landed_task: float
+    baseline_solo_landed: int
+    baseline_verifies_per_landed_task: float
+    verifies_per_landed_task_delta: float
+    train_cas_retry_rate: float
+    baseline_cas_retry_rate: float
+    cas_retry_rate_delta: float
+    improved: bool
 
 
 async def train_throughput_stats(
@@ -561,7 +587,7 @@ async def train_throughput_stats(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> dict:
+) -> Datum[TrainThroughput]:
     """Throughput amortisation metrics derived from the events table.
 
     Reads train_merged + merge_attempt rows in the look-back window and computes:
@@ -577,17 +603,21 @@ async def train_throughput_stats(
     - cas_retry_rate_delta: baseline − train
     - improved: True when verifies_per_landed_task_delta > 0
 
-    Returns the all-zeros default when db is None or on exception.
-
     Args:
-        db: aiosqlite connection, or None (returns all-zeros dict).
+        db: aiosqlite connection, or None (no runs.db is open for the project).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp. When None, uses datetime.now(UTC).
-    """
-    if db is None:
-        return dict(_TRAIN_THROUGHPUT_DEFAULT)
 
-    async def _query(conn: aiosqlite.Connection) -> dict:
+    Returns:
+        One ``Datum[TrainThroughput]``, FRESH at *now* when the window was read
+        — a readable empty window is measured zeros. With no runs.db, or when
+        the read fails, the Datum is UNKNOWN with a reason saying which.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if db is None:
+        return _no_runs_db()
+
+    async def _query(conn: aiosqlite.Connection) -> Datum[TrainThroughput]:
         since = _cutoff_iso(hours, now=now)
         # --- train_merged rows ---
         train_merged_rows = list(await conn.execute_fetchall(
@@ -681,7 +711,7 @@ async def train_throughput_stats(
             and verifies_per_landed_task_delta > 0
         )
 
-        return {
+        stats: TrainThroughput = {
             'trains_landed': trains_landed,
             'tasks_landed_via_trains': tasks_landed_via_trains,
             'train_verifies_per_landed_task': train_verifies_per_landed_task,
@@ -693,8 +723,12 @@ async def train_throughput_stats(
             'cas_retry_rate_delta': cas_retry_rate_delta,
             'improved': improved,
         }
+        return Datum(stats, resolve_now(now), DatumState.FRESH, None, bound)
 
-    return await with_db(db, _query, dict(_TRAIN_THROUGHPUT_DEFAULT))
+    return await with_db(
+        db, _query,
+        unknown_datum('the train_merged and merge_attempt events could not be read from runs.db', bound),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -741,10 +775,7 @@ def enrich_merges_with_titles(
         elif (found := lookup.get(TaskRef(project_root, task_id))) is None:
             title = _unknown_title(f'task {task_id} was not looked up')
         else:
-            title = Datum(
-                None if found.value is None else str(found.value.get('title') or ''),
-                found.as_of, found.state, found.reason, found.freshness_bound_seconds,
-            )
+            title = map_datum(found, lambda task: str(task.get('title') or ''))
         titled.append({**row, 'title': title})
     return titled
 
@@ -754,6 +785,13 @@ def _unknown_title(reason: str) -> Datum[str]:
 
 
 _Leg = TypeVar('_Leg')
+
+
+def _unread_leg(pid: str, what: str) -> Callable[[str], Datum[Any]]:
+    """The reading of *pid*'s *what* leg once it raised, built from the failure's cause."""
+    return lambda cause: unknown_datum(
+        f'{pid} {what} could not be read: {cause}', RUNS_DB_READ_FRESHNESS_BOUND_SECONDS,
+    )
 
 
 def _leg_or_unread(result: _Leg | BaseException, unread: Callable[[str], _Leg], label: str) -> _Leg:
@@ -776,18 +814,17 @@ async def build_per_project_merge_queue(
 ) -> dict[str, dict]:
     """Build per-project merge queue stats by querying each project's DB independently.
 
-    For each ``(pid, db)`` pair, gathers the per-DB stats concurrently. Pairs
-    with ``db=None`` produce empty/default stats (the per-DB functions handle
-    None gracefully by returning declared defaults). All per-project gathers
-    also run concurrently across projects via a single top-level
-    :func:`asyncio.gather`.
+    For each ``(pid, db)`` pair, gathers the per-DB stats concurrently. All
+    per-project gathers also run concurrently across projects via a single
+    top-level :func:`asyncio.gather`.
 
     ``recent`` is the newest :data:`RECENT_MERGES_CAP` merge_attempt rows in
     the same ``hours`` window every other leg uses, and ``recent_total`` is
     how many that window holds (see :func:`recent_merges`).
 
-    ``speculative`` and ``recent_total`` are Datums: a leg that raises, or a
-    project whose whole build fails, serves them UNKNOWN with a reason rather
+    ``depth_timeseries``, ``attempts``, ``recent_total``, ``speculative`` and
+    ``train_throughput`` are Datums: a ``db=None`` pair, a leg that raises, or
+    a project whose whole build fails serves them UNKNOWN with a reason rather
     than zeros that read as measured.
 
     Args:
@@ -797,10 +834,12 @@ async def build_per_project_merge_queue(
         now: Shared reference timestamp captured once per request.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, recent_total, speculative, train_events, train_throughput}}``,
-        where ``depth_timeseries`` is a :class:`DepthSeries` carrying its
-        ``bucket_minutes``, ``speculative`` a ``Datum[dict]`` and
-        ``recent_total`` a ``Datum[int]``.
+        Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput}}``,
+        where ``depth_timeseries`` is a ``Datum[DepthSeries]`` whose series
+        carries its ``bucket_minutes``, ``attempts`` a ``Datum[MergeAttempts]``
+        (the shaper projects its outcome chart and latency), ``recent_total``
+        a ``Datum[int]``, ``speculative`` a ``Datum[dict]`` and
+        ``train_throughput`` a ``Datum[TrainThroughput]``.
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
@@ -815,29 +854,22 @@ async def build_per_project_merge_queue(
                 train_throughput_stats(db, hours=hours, now=now),
                 return_exceptions=True,
             )
-            depth = safe_gather_result(depth_r, _empty_depth(hours), f'{pid}/depth')
-            attempts = safe_gather_result(attempts_r, MergeAttempts(), f'{pid}/attempts')
+            depth = _leg_or_unread(depth_r, _unread_leg(pid, 'merge depth'), f'{pid}/depth')
+            attempts = _leg_or_unread(attempts_r, _unread_leg(pid, 'merge attempts'), f'{pid}/attempts')
+            unread_total = _unread_leg(pid, 'recent merges')
             recent = _leg_or_unread(
                 recent_r,
-                lambda cause: {
-                    'rows': [],
-                    'total': unknown_datum(f'{pid} recent merges could not be read: {cause}', bound),
-                },
+                lambda cause: {'rows': [], 'total': unread_total(cause)},
                 f'{pid}/recent',
             )
-            spec = _leg_or_unread(
-                spec_r,
-                lambda cause: unknown_datum(
-                    f'{pid} speculative-merge stats could not be read: {cause}', bound,
-                ),
-                f'{pid}/speculative',
-            )
+            spec = _leg_or_unread(spec_r, _unread_leg(pid, 'speculative-merge stats'), f'{pid}/speculative')
             train_events_list = safe_gather_result(train_r, [], f'{pid}/train_events')
-            train_throughput = safe_gather_result(throughput_r, dict(_TRAIN_THROUGHPUT_DEFAULT), f'{pid}/train_throughput')
+            train_throughput = _leg_or_unread(
+                throughput_r, _unread_leg(pid, 'train throughput'), f'{pid}/train_throughput',
+            )
             return pid, {
                 'depth_timeseries': depth,
-                'outcomes': attempts.outcome_chart(),
-                'latency': attempts.latency(),
+                'attempts': attempts,
                 'recent': recent['rows'],
                 'recent_total': recent['total'],
                 'speculative': spec,
@@ -854,14 +886,13 @@ async def build_per_project_merge_queue(
                 f'the merge history of {pid} could not be read: {describe_exc(exc)}', bound,
             )
             return pid, {
-                'depth_timeseries': _empty_depth(hours),
-                'outcomes': MergeAttempts().outcome_chart(),
-                'latency': MergeAttempts().latency(),
+                'depth_timeseries': unread,
+                'attempts': unread,
                 'recent': [],
                 'recent_total': unread,
                 'speculative': unread,
                 'train_events': [],
-                'train_throughput': dict(_TRAIN_THROUGHPUT_DEFAULT),
+                'train_throughput': unread,
             }
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])

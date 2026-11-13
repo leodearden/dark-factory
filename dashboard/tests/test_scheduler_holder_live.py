@@ -18,12 +18,23 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from dashboard.config import DashboardConfig
 from dashboard.data.scheduler import (
     _merge_module_lists,
     _module_contention_counts,
+    clear_scheduler_state,
     collect_scheduler_state,
 )
+
+
+@pytest.fixture(autouse=True)
+def _forget_scheduler_state():
+    """Each test reads its own scheduler state rather than one an earlier test cached."""
+    clear_scheduler_state()
+    yield
+    clear_scheduler_state()
 
 LABEL = 'proj'
 

@@ -51,6 +51,7 @@ from legibility.detectors import (  # noqa: E402  # debt: task 6760
 from legibility.inventory import (  # noqa: E402
     UNREADABLE_FILE_ERRORS,
     as_unreadable_file_error,
+    encode_cwd,
 )
 
 logger = logging.getLogger('legibility.digest')
@@ -695,35 +696,18 @@ def _derive_date(records: list[dict[str, Any]]) -> str:
     return timestamp.split('T', 1)[0]
 
 
-def _encode_cwd(cwd: str) -> str:
-    """Mirror Claude Code's own ``~/.claude/projects/<enc>`` encoding.
-
-    '/', '.' AND '_' all map to '-', and case is preserved — same rule as
-    orchestrator.session_registry.encode_cwd, the canonical implementation,
-    which carries the authoritative statement of the rule and the record of
-    the 738 real (encoded-dir, decoded-cwd) pairs it was validated against.
-    Reused here as the fallback when the real transcript path isn't
-    available to read the ground-truth encoded dir name off disk.
-
-    Agreement with the canonical is not left to goodwill: it is asserted
-    row-for-row against real on-disk dir names by
-    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``
-    (task 3272, which found this copy and three others all missing '_').
-    """
-    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
-
-
 def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:
     """Prefer the real transcript file's parent dir name (ground truth);
-    fall back to mirror-encoding the derived *cwd* when no *path* is given
-    or *cwd* itself could not be derived."""
+    fall back to ``inventory.encode_cwd`` of the derived *cwd* when no *path*
+    is given or its parent dir name is empty, or to 'unknown' when *cwd*
+    itself could not be derived."""
     if path is not None:
         parent_name = Path(path).parent.name
         if parent_name:
             return parent_name
     if cwd == 'unknown':
         return 'unknown'
-    return _encode_cwd(cwd)
+    return encode_cwd(cwd)
 
 
 SECTION_HEADINGS: dict[str, str] = {
@@ -944,6 +928,14 @@ without having been capped. ``truncated_items`` is therefore tracked from
 what :func:`_cap_item` actually did (see :func:`_build_sections`), never
 re-derived by scanning the rendered body."""
 
+DEFAULT_MAX_BYTES = 15360
+"""The PRD §7.2 per-digest soft cap, in UTF-8 bytes.
+
+SOFT because :func:`_truncate_sections` stops trimming once every section is
+empty: a soft cap cannot shrink the frontmatter itself, so a digest whose
+frontmatter alone exceeds *max_bytes* (a pathological ``cwd``/``session``
+value, or a very small injected cap) renders LARGER than the cap."""
+
 MAX_ITEM_BYTES = 2048
 """Hard ceiling on a single rendered item's UTF-8 byte length, regardless
 of how large *max_bytes* is."""
@@ -1042,7 +1034,7 @@ def _cap_item(line: str, cap: int) -> str:
 def _build_sections(
     records: list[dict[str, Any]],
     *,
-    item_max_bytes: int = _item_byte_cap(15360),
+    item_max_bytes: int,
     hits: Sequence[RecordHits] | None = None,
 ) -> tuple[dict[str, list[str]], set[tuple[str, int]]]:
     """Run every detector once and render its hits to markdown bullet
@@ -1225,7 +1217,7 @@ def render_digest(
     *,
     agent_class: str,
     path: Any = None,
-    max_bytes: int = 15360,
+    max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> str:
     """Render the full markdown digest: frontmatter + one section per
     non-empty signal class (PRD Sec 7.2), soft-capped at *max_bytes*.
@@ -1274,7 +1266,8 @@ def render_digest(
 
 
 def build_digest(
-    path: Any, *, agent_class_override: str | None = None, max_bytes: int = 15360,
+    path: Any, *, agent_class_override: str | None = None,
+    max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> str:
     """Orchestrate the full pipeline for a single transcript file: parse,
     classify, render. This is the headline entry point (PRD Sec 8.1
@@ -1315,7 +1308,7 @@ def main(argv: Sequence[str]) -> int:
         help='Render this agent_class instead of classifying the transcript',
     )
     parser.add_argument(
-        '--max-bytes', type=int, default=15360,
+        '--max-bytes', type=int, default=DEFAULT_MAX_BYTES,
         help='Soft byte cap for the rendered digest (default: %(default)s)',
     )
     parser.add_argument(

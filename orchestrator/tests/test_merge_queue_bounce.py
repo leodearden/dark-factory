@@ -17,9 +17,9 @@ Covers:
 Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
 file's drive mechanism. Every test here used to reach into the worker: it
 seeded ``_inflight`` with a hand-built ``InflightEntry`` carrying a fake
-merge commit, pushed requests straight into ``_lane_buffers``, assigned a
-``_suffix_conflict_graph``, then called the private
-``_bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
+merge commit, pushed requests straight into the lane buffers, assigned a
+``suffix_conflict_graph``, then called the private
+``bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
 test going as far as replacing three private methods with stubs purely to
 pin the ORDER they are called in. That froze the lane's internals rather
 than its behaviour: none of it would have noticed the bounce being wired
@@ -53,7 +53,7 @@ from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, hangs_until, lane_state
+from _merge_lane_fakes import FakeVerifier, hangs_until, lane_scene_config, lane_state
 from _orch_helpers import wait_responsive
 from shared.task_metadata import RetryLedger
 
@@ -61,17 +61,16 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.types import MergeBounceRegistry, QueuedBranch
 from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
     ItemLifecycleState,
-    MergeBounceRegistry,
     MergeOutcome,
     MergeRequest,
 )
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
-from orchestrator.workflow import _evaluate_merge_thrash
+from orchestrator.workflow import evaluate_merge_thrash
 
 _STOP_TIMEOUT = 30.0
 
@@ -120,7 +119,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Helpers: a running lane over a real repo ─────────────────────────────────
@@ -274,6 +273,7 @@ def _make_tracker(
     lane_buffers: dict[str, collections.deque],
     frozen_tip: str,
     retired: list[tuple[str, bool]] | None = None,
+    reserved: frozenset[str] = frozenset(),
 ) -> SuffixConflictTracker:
     """A tracker over the TEST's lane buffers and a fixed frozen-prefix tip.
 
@@ -295,6 +295,7 @@ def _make_tracker(
         frozen_requests=lambda: (),
         frozen_prefix_tip=lambda _main_sha: frozen_tip,
         retire_item=_record,
+        is_reserved=lambda rid: rid in reserved,
     )
 
 
@@ -373,7 +374,7 @@ def _fold_through_thrash_ladder(
     ledger = RetryLedger()
     escalations: list[bool] = []
     for outcome in outcomes:
-        verdict = _evaluate_merge_thrash(
+        verdict = evaluate_merge_thrash(
             ledger, ledger.last_merge_outcome_signature, _signature(outcome), threshold,
         )
         ledger = verdict.ledger
@@ -680,6 +681,41 @@ class TestBounceBookkeeping:
             f'{[r.message for r in caplog.records]}'
         )
 
+    async def test_a_reserved_request_records_no_bounce(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deep chain's reserved link (task 7720) is skipped before any bounce
+        is recorded: no rebase of its worktree, no escalation, no count. The
+        unreserved peer is bounced as usual."""
+        held = _make_req('591', '591', config, git_repo)
+        held.worktree = git_repo / 'held-wt'
+        peer = _make_req('592', '592', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([held, peer])}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe3333',
+            retired=retired, reserved=frozenset({held.request_id}),
+        )
+        tracker.graph = SuffixConflictGraph(
+            nodes=(held.request_id, peer.request_id),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({held.request_id, peer.request_id}),
+        )
+        tracker.signature = ((held.request_id, peer.request_id), 'abc123')
+        rebase_spy = AsyncMock(return_value=True)
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', rebase_spy)
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert [call.args[0] for call in rebase_spy.await_args_list] == [peer.worktree]
+        assert list(buffers['normal']) == [held, peer]
+        assert not held.result.done()
+        assert retired == []
+        assert tracker.bounce_registry.count('591') == 0
+        assert tracker.bounce_registry.count('592') == 1
+
     async def test_escalation_clears_the_bounce_count(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
@@ -875,7 +911,7 @@ class TestBounceEscalationsNeverFeedTheThrashLadder:
     ``consecutive_merge_thrash`` reaches its threshold of 2 -- a false L1 for
     what is a fresh collision each time.
 
-    Every outcome here is folded through the SHIPPED ``_evaluate_merge_thrash``
+    Every outcome here is folded through the SHIPPED ``evaluate_merge_thrash``
     at the SHIPPED ``max_consecutive_merge_thrash``; the control proves that
     fold escalates on genuinely identical input.
     """

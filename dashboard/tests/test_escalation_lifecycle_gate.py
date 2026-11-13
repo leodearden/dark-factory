@@ -617,7 +617,7 @@ class TestEndpointOverLiveArchive:
         _assert_origin_matches(entry['origin']['sources'], arch)
 
     def test_row9_malformed_regime_markers_never_500s(self, client, tmp_path, monkeypatch) -> None:
-        import dashboard.data.escalation_analytics as escalation_analytics_module
+        from dashboard.data import quality_markers
 
         _live_archive_sync(tmp_path)
         client.app.state.config = _make_config(tmp_path)
@@ -634,9 +634,7 @@ class TestEndpointOverLiveArchive:
         # never 500: regime_markers empties and parse_failures strictly increases.
         bad_markers = tmp_path / 'bad-regime-markers.yaml'
         bad_markers.write_text('date: [unclosed')
-        monkeypatch.setattr(
-            escalation_analytics_module, '_DEFAULT_REGIME_MARKERS_PATH', bad_markers,
-        )
+        monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', bad_markers)
         _clear_escalation_caches()
         resp2 = client.get('/api/v2/dashboard/escalation-analytics')
 

@@ -74,153 +74,6 @@ def _catalogued() -> dict:
     }
 
 
-def _cluster(title: str, session: str = "sess-new") -> dict:
-    return {
-        "title": title,
-        "summary": title,
-        "cause": "a cause",
-        "area": None,
-        "origin_phase": "implement",
-        "manifested_phase": "verify",
-        "evidence": [],
-        "sightings": [{"session": session, "origin_phase": "implement", "manifested_phase": "verify"}],
-    }
-
-
-def _screen(*clusters: dict) -> prescreen.Screen:
-    return prescreen.screen(list(clusters), prescreen.Catalogue.of(_catalogued()))
-
-
-# ---------------------------------------------------------------------------
-# normalised_title
-# ---------------------------------------------------------------------------
-
-def test_normalised_titles_ignore_case_and_whitespace():
-    assert prescreen.normalised_title("  Rejected\tSHAPE \n") == prescreen.normalised_title("rejected shape")
-
-
-def test_normalised_titles_keep_different_words_apart():
-    assert prescreen.normalised_title("Rejected shape") != prescreen.normalised_title("Rejected shapes")
-
-
-# ---------------------------------------------------------------------------
-# screen(): the title rule, surfacing, and the session rule
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "title, matched",
-    [
-        ("Pending shape", ("cand-20260701-1",)),
-        ("promoted  SHAPE", ("cand-20260701-2", "entry-cand-20260701-2")),
-        ("Rejected Shape", ("cand-20260701-3",)),
-        ("entry only shape", ("entry-only",)),
-    ],
-    ids=["pending", "promoted", "rejected", "entry-only"],
-)
-def test_a_catalogued_title_is_screened_by_the_title_rule(title, matched):
-    cluster = _cluster(title)
-
-    screen = _screen(cluster)
-
-    assert screen.to_verify == ()
-    assert screen.surfaced == ()
-    assert screen.screened == (
-        prescreen.Screened(rule=prescreen.Rule.TITLE, title=title, session="sess-new", matched=matched),
-    )
-
-
-def test_a_novel_title_from_an_unseen_session_stays_to_verify_in_order():
-    first, second = _cluster("Brand new shape"), _cluster("Another new shape", session="sess-other")
-
-    screen = _screen(first, second)
-
-    assert len(screen.to_verify) == 2
-    assert screen.to_verify[0] is first
-    assert screen.to_verify[1] is second
-    assert screen.screened == ()
-    assert screen.surfaced == ()
-    assert screen.uncatalogued == screen.to_verify
-    assert all(got is want for got, want in zip(screen.uncatalogued, screen.to_verify, strict=True))
-
-
-@pytest.mark.parametrize(
-    "title, fixed_entry_id",
-    [("FIXED shape", "entry-fixed"), ("Fixed via candidate", "entry-cand-20260701-4")],
-    ids=["fixed-entry", "candidate-promoted-to-a-fixed-entry"],
-)
-def test_a_title_matching_a_fixed_entry_is_surfaced_and_verified(title, fixed_entry_id):
-    cluster = _cluster(title)
-
-    screen = _screen(cluster)
-
-    assert screen.to_verify == (cluster,)
-    assert screen.screened == ()
-    assert screen.surfaced == (
-        prescreen.Surfaced(rule=prescreen.Rule.TITLE, title=title, fixed_entry_ids=(fixed_entry_id,)),
-    )
-    assert screen.uncatalogued == ()
-
-
-def test_only_clusters_no_catalogued_record_matches_are_uncatalogued():
-    novel = _cluster("Brand new shape")
-    surfaced = _cluster("FIXED shape", session="sess-other")
-
-    screen = _screen(novel, surfaced)
-
-    assert screen.to_verify == (novel, surfaced)
-    assert screen.uncatalogued == (novel,)
-    assert screen.uncatalogued[0] is novel
-
-
-def test_a_title_matching_a_retired_entry_is_surfaced_as_fixed():
-    cb = _catalogued()
-    cb["entries"].append(_entry("entry-retired", "Retired shape", "sess-retired", status="retired"))
-    cluster = _cluster("retired shape")
-
-    screen = prescreen.screen([cluster], prescreen.Catalogue.of(cb))
-
-    assert screen.to_verify == (cluster,)
-    assert [item.fixed_entry_ids for item in screen.surfaced] == [("entry-retired",)]
-
-
-def test_a_novel_title_from_an_already_sighted_session_is_screened_by_the_session_rule():
-    cluster = _cluster("Brand new shape", session="sess-pending")
-
-    screen = _screen(cluster)
-
-    assert screen.to_verify == ()
-    assert screen.screened == (
-        prescreen.Screened(
-            rule=prescreen.Rule.SESSION, title="Brand new shape", session="sess-pending",
-            matched=("cand-20260701-1",),
-        ),
-    )
-
-
-def test_the_session_rule_names_every_record_carrying_the_session():
-    screen = _screen(_cluster("Brand new shape", session="sess-promoted"))
-
-    assert screen.screened[0].rule is prescreen.Rule.SESSION
-    assert set(screen.screened[0].matched) == {"cand-20260701-2", "entry-cand-20260701-2"}
-
-
-def test_the_title_rule_wins_when_the_session_rule_also_applies():
-    screen = _screen(_cluster("Rejected shape", session="sess-pending"))
-
-    assert [screened.rule for screened in screen.screened] == [prescreen.Rule.TITLE]
-
-
-def test_the_attached_by_methods_are_rule_values():
-    assert prescreen.Rule.TITLE.value == "title"
-    assert prescreen.Rule.SESSION.value == "session"
-    assert prescreen.Rule.KEY.value == "key"
-    assert prescreen.Rule.CROSS_INSTRUMENT.value == "cross_instrument"
-
-
-# ---------------------------------------------------------------------------
-# routed_records(): title-screened payloads attach through the merger's routing
-# ---------------------------------------------------------------------------
-
 _TITLE_ATTACH = {"method": "title", "run_id": _RUN}
 
 
@@ -246,9 +99,165 @@ def _record(*titles: str, session: str = "sess-new") -> dict:
     }
 
 
-def _routed(*records: dict) -> list[dict]:
-    return prescreen.routed_records(list(records), prescreen.Catalogue.of(_catalogued()), run_id=_RUN)
+def _screen(*records: dict, cb: dict | None = None) -> prescreen.Screen:
+    return prescreen.screen(list(records), prescreen.Catalogue.of(cb or _catalogued()), run_id=_RUN)
 
+
+def _ref(record: int, candidate: int = 0) -> codebook.PayloadRef:
+    return codebook.PayloadRef(record=record, candidate=candidate)
+
+
+def _at(screen: prescreen.Screen, ref: codebook.PayloadRef) -> dict:
+    return screen.records[ref.record]["candidates"][ref.candidate]
+
+
+# ---------------------------------------------------------------------------
+# normalised_title
+# ---------------------------------------------------------------------------
+
+def test_normalised_titles_ignore_case_and_whitespace():
+    assert prescreen.normalised_title("  Rejected\tSHAPE \n") == prescreen.normalised_title("rejected shape")
+
+
+def test_normalised_titles_keep_different_words_apart():
+    assert prescreen.normalised_title("Rejected shape") != prescreen.normalised_title("Rejected shapes")
+
+
+# ---------------------------------------------------------------------------
+# screen(): the title rule, surfacing, and the session rule, per payload
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "title, matched",
+    [
+        ("Pending shape", ("cand-20260701-1",)),
+        ("promoted  SHAPE", ("cand-20260701-2", "entry-cand-20260701-2")),
+        ("Rejected Shape", ("cand-20260701-3",)),
+        ("entry only shape", ("entry-only",)),
+    ],
+    ids=["pending", "promoted", "rejected", "entry-only"],
+)
+def test_a_catalogued_title_is_screened_by_the_title_rule(title, matched):
+    screen = _screen(_record(title))
+
+    assert screen.to_verify == screen.uncatalogued == ()
+    assert screen.surfaced == ()
+    assert screen.screened == (
+        prescreen.Screened(rule=prescreen.Rule.TITLE, title=title, session="sess-new", matched=matched),
+    )
+
+
+def test_a_novel_title_from_an_unseen_session_stays_to_verify_in_order():
+    screen = _screen(_record("Brand new shape"), _record("Another new shape", session="sess-other"))
+
+    assert screen.to_verify == (_ref(0), _ref(1))
+    assert screen.uncatalogued == screen.to_verify
+    assert [_at(screen, ref)["title"] for ref in screen.to_verify] == ["Brand new shape", "Another new shape"]
+    assert screen.screened == ()
+    assert screen.surfaced == ()
+
+
+@pytest.mark.parametrize(
+    "title, fixed_entry_id",
+    [("FIXED shape", "entry-fixed"), ("Fixed via candidate", "entry-cand-20260701-4")],
+    ids=["fixed-entry", "candidate-promoted-to-a-fixed-entry"],
+)
+def test_a_title_matching_a_fixed_entry_is_surfaced_and_verified(title, fixed_entry_id):
+    screen = _screen(_record(title))
+
+    assert screen.to_verify == (_ref(0),)
+    assert screen.uncatalogued == ()
+    assert screen.screened == ()
+    assert screen.surfaced == (
+        prescreen.Surfaced(rule=prescreen.Rule.TITLE, title=title, fixed_entry_ids=(fixed_entry_id,)),
+    )
+
+
+def test_only_payloads_no_catalogued_record_matches_are_uncatalogued():
+    screen = _screen(_record("Brand new shape"), _record("FIXED shape", session="sess-other"))
+
+    assert screen.to_verify == (_ref(0), _ref(1))
+    assert screen.uncatalogued == (_ref(0),)
+
+
+def test_a_title_matching_a_retired_entry_is_surfaced_as_fixed():
+    cb = _catalogued()
+    cb["entries"].append(_entry("entry-retired", "Retired shape", "sess-retired", status="retired"))
+
+    screen = _screen(_record("retired shape"), cb=cb)
+
+    assert screen.to_verify == (_ref(0),)
+    assert [item.fixed_entry_ids for item in screen.surfaced] == [("entry-retired",)]
+
+
+def test_a_novel_title_from_an_already_sighted_session_is_screened_by_the_session_rule():
+    screen = _screen(_record("Brand new shape", session="sess-pending"))
+
+    assert screen.to_verify == ()
+    assert screen.screened == (
+        prescreen.Screened(
+            rule=prescreen.Rule.SESSION, title="Brand new shape", session="sess-pending",
+            matched=("cand-20260701-1",),
+        ),
+    )
+
+
+def test_the_session_rule_names_every_record_carrying_the_session():
+    screen = _screen(_record("Brand new shape", session="sess-promoted"))
+
+    assert screen.screened[0].rule is prescreen.Rule.SESSION
+    assert set(screen.screened[0].matched) == {"cand-20260701-2", "entry-cand-20260701-2"}
+
+
+def test_the_title_rule_wins_when_the_session_rule_also_applies():
+    screen = _screen(_record("Rejected shape", session="sess-pending"))
+
+    assert [screened.rule for screened in screen.screened] == [prescreen.Rule.TITLE]
+
+
+def test_the_attached_by_methods_are_rule_values():
+    assert prescreen.Rule.TITLE.value == "title"
+    assert prescreen.Rule.SESSION.value == "session"
+    assert prescreen.Rule.KEY.value == "key"
+    assert prescreen.Rule.CROSS_INSTRUMENT.value == "cross_instrument"
+
+
+def test_a_ref_indexes_the_routed_batch():
+    screen = _screen(_record("rejected  SHAPE", "ENTRY only shape", "Brand new shape"))
+
+    assert screen.to_verify == (_ref(0, 1),)
+    assert _at(screen, _ref(0, 1)) == _payload("Brand new shape")
+    assert [payload["title"] for payload in screen.records[0]["candidates"]] == ["Rejected shape", "Brand new shape"]
+
+
+def test_two_payloads_of_one_novel_title_are_two_refs():
+    screen = _screen(_record("Brand new shape"), _record("Brand new shape", session="sess-other"))
+
+    assert screen.to_verify == screen.uncatalogued == (_ref(0), _ref(1))
+
+
+def test_two_payloads_of_one_catalogued_title_are_two_screened_rows():
+    screen = _screen(_record("Rejected shape"), _record("rejected shape", session="sess-other"))
+
+    assert [(item.rule, item.title, item.session) for item in screen.screened] == [
+        (prescreen.Rule.TITLE, "Rejected shape", "sess-new"),
+        (prescreen.Rule.TITLE, "rejected shape", "sess-other"),
+    ]
+
+
+def test_a_titleless_payload_is_neither_screened_nor_verified_but_still_merges():
+    record = _record("")
+
+    screen = _screen(record)
+
+    assert screen.to_verify == screen.uncatalogued == ()
+    assert screen.screened == screen.surfaced == ()
+    assert list(screen.records) == [record]
+
+
+# ---------------------------------------------------------------------------
+# screen().records: title-screened payloads attach through the merger's routing
+# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
     "mined, routing_title",
@@ -259,14 +268,14 @@ def _routed(*records: dict) -> list[dict]:
     ],
 )
 def test_a_title_screened_payload_takes_the_candidates_exact_title_and_an_attach(mined, routing_title):
-    (record,) = _routed(_record(mined))
+    (record,) = _screen(_record(mined)).records
 
     assert record["candidates"] == [{**_payload(mined), "title": routing_title, "attached_by": _TITLE_ATTACH}]
     assert record["matches"] == []
 
 
 def test_a_payload_matching_only_an_entry_becomes_a_match_on_it():
-    (record,) = _routed(_record("ENTRY only shape"))
+    (record,) = _screen(_record("ENTRY only shape")).records
 
     assert record["candidates"] == []
     assert record["matches"] == [
@@ -285,20 +294,20 @@ def test_surfaced_session_screened_and_novel_payloads_are_untouched():
     session_screened = _record("Brand new shape", session="sess-pending")
     novel = _record("Another new shape")
 
-    assert _routed(surfaced, session_screened, novel) == [surfaced, session_screened, novel]
+    assert list(_screen(surfaced, session_screened, novel).records) == [surfaced, session_screened, novel]
 
 
-def test_routing_never_mutates_its_input_records():
+def test_screening_never_mutates_its_input_records():
     records = [_record("rejected  SHAPE", "ENTRY only shape", "Brand new shape")]
     before = copy.deepcopy(records)
 
-    prescreen.routed_records(records, prescreen.Catalogue.of(_catalogued()), run_id=_RUN)
+    prescreen.screen(records, prescreen.Catalogue.of(_catalogued()), run_id=_RUN)
 
     assert records == before
 
 
 def _merged(*records: dict) -> dict:
-    merge = codebook.apply_coding_records(_catalogued(), _routed(*records), invariant_slugs=_NO_SLUGS)
+    merge = codebook.apply_coding_records(_catalogued(), _screen(*records).records, invariant_slugs=_NO_SLUGS)
     assert codebook.validate(merge.codebook) == []
     return merge.codebook
 
@@ -730,11 +739,11 @@ def _full_report(tmp_path: Path) -> prescreen.ScreenReport:
     _, key_attach = _attach(_keyed_codebook())
     return prescreen.ScreenReport(
         screen=_screen(
-            _cluster("Rejected shape"),
-            _cluster("ENTRY only shape"),
-            _cluster("Brand new shape", session="sess-pending"),
-            _cluster("Fixed shape"),
-            _cluster("Novel shape"),
+            _record("Rejected shape"),
+            _record("ENTRY only shape"),
+            _record("Brand new shape", session="sess-pending"),
+            _record("Fixed shape"),
+            _record("Novel shape"),
         ),
         surfaced_by_key=(
             prescreen.Surfaced(rule=prescreen.Rule.KEY, title="D title", fixed_entry_ids=("entry-cand-20260901-1",)),
@@ -747,7 +756,7 @@ def _full_report(tmp_path: Path) -> prescreen.ScreenReport:
 
 def _empty_report() -> prescreen.ScreenReport:
     return prescreen.ScreenReport(
-        screen=prescreen.Screen((), (), ()),
+        screen=prescreen.Screen(records=(), to_verify=(), uncatalogued=(), screened=(), surfaced=()),
         surfaced_by_key=(),
         attached=(),
         re_observed=(),

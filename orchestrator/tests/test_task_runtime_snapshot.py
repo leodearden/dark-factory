@@ -238,7 +238,7 @@ class TestB4HonestZero:
         lifecycle = git_ops._lane_lifecycle
         lifecycle.note_assigned('_lane-7', task_id='44')
         _make_task_artifacts(worktree_base, '_lane-7', '44')
-        empty_log = TaskArtifacts.meta_root_for(worktree_base, '_lane-7') / 'iterations.jsonl'
+        empty_log = TaskArtifacts.task_root_for(worktree_base, '44') / 'iterations.jsonl'
         empty_log.write_text('')
 
         by_task, offline = _tool_runtime_tasks(git_ops, tmp_path)

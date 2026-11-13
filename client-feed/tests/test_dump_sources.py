@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import yaml
 from _git_repo import make_repo
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.cli import main
 
@@ -66,13 +66,10 @@ def config(tmp_path: Path, root: Path) -> Path:
         metadata={'prd_path': 'plans/x-prd.md', 'dry_run_proposals': 'SECRET'},
     )
     tasks.add(10, title='Land it', updated_at='2026-10-02T10:00:00.000Z')
+    EscalationQueueDir.create(root).write('esc-9-1', task_id='9', level=2)
     runs = RunsDb.create(root)
     paused_at = datetime.now(UTC) - timedelta(hours=3)
     earlier = paused_at - timedelta(hours=1)
-    runs.emit(
-        'escalation_created', at=earlier, task_id='9',
-        data={'escalation_id': 'esc-9-1', 'level': 2, 'summary': 'SECRET-SUMMARY'},
-    )
     runs.emit('phase_enter', at=earlier, task_id='9', phase='execute')
     runs.emit(
         'merge_finalized', at=earlier, task_id='10', phase='merge',
@@ -103,6 +100,10 @@ def test_the_dump_carries_every_source_and_no_secret(
     assert document['factory']['idle_seconds'] >= 10800
     tasks = {row['task_id']: row for row in document['tasks']['rows']}
     assert tasks[9]['waiting_on'] == 'leo'
+    assert document['escalations'] == {
+        'by_task': {'9': [{'escalation_id': 'esc-9-1', 'level': 2}]},
+        'skipped': [],
+    }
     assert tasks[9]['title'] == 'Unblock [path]'
     assert document['prds']['found'] == [
         {'prd_path': 'plans/x-prd.md', 'title': 'X plan [path]', 'excerpt': 'The goal paragraph.'}
@@ -132,7 +133,21 @@ def test_the_cursor_skips_events_already_read(
 
     _, second, _ = dump(capsys, '--config', str(config), '--after-id', str(cursor))
 
-    assert [event['event_id'] for event in json.loads(second)['events']['events']] == [3]
+    assert [event['event_id'] for event in json.loads(second)['events']['events']] == [2]
+
+
+def test_a_malformed_escalation_record_is_named_and_the_rest_still_dump(
+    root: Path, config: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    EscalationQueueDir.create(root).write_raw('esc-9-2.json', '{"summary": "SECRET')
+
+    code, out, _ = dump(capsys, '--config', str(config))
+
+    escalations = json.loads(out)['escalations']
+    assert code == 0
+    assert 'SECRET' not in out
+    assert escalations['skipped'] == [{'name': 'esc-9-2.json', 'reason': 'malformed_record'}]
+    assert escalations['by_task'] == {'9': [{'escalation_id': 'esc-9-1', 'level': 2}]}
 
 
 def test_a_refused_policy_exits_1_with_nothing_on_stdout(
@@ -151,9 +166,23 @@ def test_a_missing_store_exits_1_naming_it(
     tmp_path: Path, root: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     TasksDb.create(root)
+    EscalationQueueDir.create(root)
 
     code, out, err = dump(capsys, '--config', str(write_policy(tmp_path, root)))
 
     assert (code, out) == (1, '')
     assert 'events' in err
     assert 'data/orchestrator/runs.db' in err
+
+
+def test_a_missing_escalation_queue_exits_1_naming_it(
+    tmp_path: Path, root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    TasksDb.create(root)
+    RunsDb.create(root)
+
+    code, out, err = dump(capsys, '--config', str(write_policy(tmp_path, root)))
+
+    assert (code, out) == (1, '')
+    assert 'events' in err
+    assert 'data/escalations' in err

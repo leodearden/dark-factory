@@ -16,8 +16,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import curator_returning
-from _fm_helpers import poll_until
+from _curator_helpers import answer_each_with, curator_returning, serve_existing_task
+from _fm_polling import poll_until
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.middleware.curator_types import CuratorDecision, RewrittenTask
@@ -33,6 +34,8 @@ from fused_memory.middleware.task_creation_journal import (
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 RUN = 'f9e49aef-0000-4000-8000-000000000001'
 OTHER_RUN = '90d762d0-0000-4000-8000-000000000002'
@@ -515,9 +518,8 @@ class TestCuratorWorkerJournal:
 
     @pytest.mark.asyncio
     async def test_combine_writes_task_combined_for_the_target(
-        self, build_interceptor, write_journal, taskmaster, monkeypatch, tmp_path,
+        self, build_interceptor, write_journal, taskmaster,
     ):
-        monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
         taskmaster.get_task = AsyncMock(return_value={
             'id': '42', 'title': 'Existing Task', 'status': 'pending', 'metadata': {},
         })
@@ -649,7 +651,7 @@ class TestOrphanRaceJournal:
             return decision
 
         curator = curator_returning()
-        curator.curate = AsyncMock(side_effect=gated_curate)
+        answer_each_with(curator, gated_curate)
         interceptor = build_interceptor(curator)
 
         ticket = await _submit(interceptor)
@@ -678,7 +680,7 @@ class TestIdempotencyHitJournal:
     async def test_idempotency_hit_writes_task_combined(
         self, build_interceptor, write_journal, taskmaster,
     ):
-        taskmaster.get_tasks = AsyncMock(return_value={'tasks': [self._EXISTING]})
+        serve_existing_task(taskmaster, self._EXISTING)
         interceptor = build_interceptor(curator_returning())
 
         resolved = await _resolve(interceptor, await _submit(interceptor, metadata=self._METADATA))

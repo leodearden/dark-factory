@@ -37,7 +37,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from shared.task_claimant import compose_claimant_run_id, is_stranded
 from shared.task_statuses import TaskStatus
 

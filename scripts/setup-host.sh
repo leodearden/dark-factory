@@ -12,9 +12,10 @@ ok()    { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 
-# Classify what a parity checker just told us. Defined HERE, once, immediately
-# below the log shims and above every parity call site — the five sites share
-# one shell scope, and every sliced block is executed by the test harness under
+# Classify what a tagged checker just told us: the five parity checkers and the
+# network exposure check. Defined HERE, once, immediately below the log shims
+# and above every call site — the sites share one shell scope, and every sliced
+# block is executed by the test harness under
 # a preamble that provides this helper (tests/scripts/setup_host_sections.py
 # slices it live out of this file, so there is no second copy to drift).
 #
@@ -33,13 +34,14 @@ fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 #
 # CLASSIFICATION ONLY. Each call site keeps its own wording, severity and side
 # effects, because those legitimately differ — `absent` is `info` at the
-# orchestrator, dashboard pre-install and lms sites but `warn` at the
-# fused-memory and dashboard post-install ones; the orchestrator gate may
-# `fail` and sets _orch_install_blocked, while the lms gate is forbidden from
-# ever calling `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+# orchestrator, dashboard pre-install and lms sites, `warn` at the
+# fused-memory and dashboard post-install ones and `fail` at the network
+# exposure one; the orchestrator gate may `fail` and sets
+# _orch_install_blocked, while the lms gate is forbidden from ever calling
+# `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
 # A helper that also emitted messages would have to collapse those distinctions
-# or take five message parameters — either way re-creating the coupling the
-# extraction removes.
+# or take a message and a severity per verdict from every site — either way
+# re-creating the coupling the extraction removes.
 #
 # The tag is matched with bash's own `[[ ]]`, never `printf | grep -q`. grep
 # exits the instant it matches and the tag is on line 1, so once the report
@@ -62,9 +64,10 @@ _parity_verdict() {
   fi
 }
 
-# Does FalkorDB answer? ONE probe, two callers — the section-2 wait loop and the
-# section-12 health check ask exactly the same question, and a copy at each site
-# is how the two drift apart.
+# Does FalkorDB answer? ONE probe, every caller — the section-2 wait loops and the
+# section-11 health check ask exactly the same question, and a copy at each site
+# is how they drift apart. The optional argument names the compose service
+# (default `falkordb`; the scratch server is `falkordb-scratch`).
 #
 # The verdict is read from the captured REPLY, not from a pipeline's exit
 # status. `... ping | grep -q PONG` answers with the PRODUCER's status, which is
@@ -86,8 +89,8 @@ _parity_verdict() {
 # `local` confines the reply to the call, so neither caller can ever read a
 # verdict the other left behind in the shared shell scope.
 falkordb_pings() {
-  local out
-  out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  local service="${1:-falkordb}" out
+  out="$(docker compose -f "$COMPOSE_FILE" exec -T "$service" redis-cli ping 2>/dev/null)" || true
   [[ "$out" == *PONG* ]]
 }
 
@@ -179,6 +182,22 @@ for i in $(seq 1 30); do
   [ "$i" -eq 30 ] && fail "Qdrant did not become healthy in 30s"
   sleep 1
 done
+
+# The scratch FalkorDB that tests, the offline lane and evals write to
+# (OPERATIONS.md "The scratch FalkorDB"). Production does not depend on it, so
+# every failure here is a warning.
+if docker compose -f "$COMPOSE_FILE" up -d --no-deps falkordb-scratch; then
+  for i in $(seq 1 30); do
+    if falkordb_pings falkordb-scratch; then
+      ok "Scratch FalkorDB healthy"
+      break
+    fi
+    [ "$i" -eq 30 ] && warn "Scratch FalkorDB did not become healthy in 30s"
+    sleep 1
+  done
+else
+  warn "Scratch FalkorDB did not start; start it with: docker compose -f $COMPOSE_FILE up -d --no-deps falkordb-scratch"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Python workspace — uv sync --all-packages
@@ -1487,6 +1506,35 @@ else
     warn "  Inspect:  systemctl --user cat lms-arm@<arm>.service"
     warn "  Remove:   scripts/remove-lms-arm-worktree-dropin.sh (checks its"
     warn "            safety preconditions first)"
+    ;;
+  esac
+fi
+
+# Every factory port must refuse off-loopback connects and accept on 127.0.0.1
+# (contract: plans/mcp-network-exposure-prd.md §3). The status is believed only
+# with the [network_exposure] tag; the check never exits 2 under it, so `absent`
+# is a failure here.
+_net_exposure_script="$REPO_ROOT/scripts/check_network_exposure.py"
+if [ ! -f "$_net_exposure_script" ]; then
+  fail "Network exposure check missing: $_net_exposure_script"
+  fail "  Not treating that as 'nothing exposed' — it is 'nothing checked'."
+else
+  _net_exposure_out="$(python3 "$_net_exposure_script" 2>&1)" \
+       && _net_exposure_exit=0 || _net_exposure_exit=$?
+  printf '%s\n' "$_net_exposure_out"
+  _net_exposure_verdict="$(_parity_verdict "$_net_exposure_out" \
+       "$_net_exposure_exit" '[network_exposure]')"
+  case "$_net_exposure_verdict" in
+  unreported)
+    fail "Network exposure check produced no [network_exposure] report"
+    fail "  (status $_net_exposure_exit) — it did not run, so nothing was checked."
+    ;;
+  parity)
+    ok "Network exposure: every factory port refuses off-loopback connects and accepts on 127.0.0.1"
+    ;;
+  absent | finding | *)
+    fail "Network exposure: a factory port is reachable off loopback, unreachable on it, or unverified —"
+    fail "  see the [network_exposure] report above."
     ;;
   esac
 fi

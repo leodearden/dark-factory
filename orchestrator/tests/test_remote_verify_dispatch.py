@@ -35,11 +35,13 @@ from orchestrator.verify import (
 from orchestrator.verify_runner import (
     REMOTE_VERIFY_PROCESS_PATTERN,
     ConcurrentDispatchError,
+    HostAllocator,
     MergeVerifySpec,
     RemoteRunner,
     RunnerUnavailable,
     RunnerUnavailableKind,
     UnscopedTypecheckSpec,
+    remote_verify_process_pattern,
     result_from_json,
     result_to_json,
 )
@@ -396,11 +398,11 @@ class TestRunTaskVerifyTransport:
         parsed = gate_argv(ssh_argv[-1])
         assert parsed == [
             'verify-task', '--sha', _TIP,
+            '--request-id', 'fixed-id',
             '--spec', task_spec_to_json(spec),
             '--config', '/etc/orch.yaml',
-            '--request-id', 'fixed-id',
         ]
-        assert task_spec_from_json(parsed[4]) == spec
+        assert task_spec_from_json(parsed[6]) == spec
         assert transport.deleted_refs() == ['refs/merge-verify/fixed-id']
 
     @pytest.mark.asyncio
@@ -706,46 +708,192 @@ def _sleeper(*argv: str) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', *argv])
 
 
+def _verify_sleeper(subcommand: str, request_id: str) -> subprocess.Popen:
+    """A process whose command line has a dispatch's shape, its spec past 4096 bytes."""
+    return _sleeper(
+        'orchestrator', subcommand, '--sha', 's', '--request-id', request_id,
+        '--spec', 'x' * 9000,
+    )
+
+
+def _stop(*children: subprocess.Popen) -> None:
+    for child in children:
+        child.kill()
+        child.wait()
+
+
+def _pgrep(pattern: str) -> list[str]:
+    return subprocess.run(
+        ['pgrep', '-f', pattern], capture_output=True, text=True, check=False,
+    ).stdout.split()
+
+
+async def _cancelled_runner(transport: _FakeTransport, request_id: str) -> RemoteRunner:
+    """A runner whose dispatch of *request_id* was cancelled after its verify ssh
+    started; the dispatch has unwound (raised) before this returns."""
+    transport.hold_ssh, transport.ssh_rc = True, 137
+    runner = _remote_runner(transport, id_factory=_ids(request_id))
+    dispatch = asyncio.create_task(runner.run_merge_verify('abc123', _merge_spec()))
+    await transport.ssh_entered.wait()
+    cancel = asyncio.create_task(runner.cancel_verify())
+    await asyncio.sleep(0)
+    transport.ssh_release.set()
+    await cancel
+    with pytest.raises(RunnerUnavailable):
+        await dispatch
+    assert dispatch.done() and runner.dispatch_in_flight is False
+    transport.hold_ssh = False
+    transport.calls.clear()
+    return runner
+
+
 class TestRemoteVerifyProcessPattern:
-    def test_pgrep_finds_both_subcommands_and_nothing_else(self):
+    def test_pgrep_finds_one_requests_verify_of_either_subcommand_and_nothing_else(self):
         if shutil.which('pgrep') is None:
             pytest.skip('pgrep is not installed')
-        request_id = f'--request-id={uuid.uuid4().hex}'
-        task = _sleeper('orchestrator', 'verify-task', request_id)
-        merge = _sleeper('orchestrator', 'verify-merge', request_id)
-        other = _sleeper('orchestrator', 'verify-other', request_id)
+        request_id, other_id = uuid.uuid4().hex, uuid.uuid4().hex
+        task = _verify_sleeper('verify-task', request_id)
+        merge = _verify_sleeper('verify-merge', request_id)
+        at_the_end = _sleeper('orchestrator', 'verify-merge', '--request-id', request_id)
+        others = [
+            _verify_sleeper('verify-task', other_id),
+            _verify_sleeper('verify-task', f'{request_id}0'),
+            _verify_sleeper('verify-other', request_id),
+            _sleeper('orchestrator', 'cancel-verify', '--request-id', request_id),
+        ]
         try:
-            listed = subprocess.run(
-                ['pgrep', '-f', REMOTE_VERIFY_PROCESS_PATTERN],
-                capture_output=True, text=True, check=False,
-            ).stdout.split()
+            listed = _pgrep(remote_verify_process_pattern(request_id))
 
-            assert str(task.pid) in listed
-            assert str(merge.pid) in listed
-            assert str(other.pid) not in listed
+            assert {str(task.pid), str(merge.pid), str(at_the_end.pid)} <= set(listed)
+            assert not {str(child.pid) for child in others} & set(listed)
         finally:
-            for child in (task, merge, other):
-                child.kill()
-                child.wait()
+            _stop(task, merge, at_the_end, *others)
+
+    def test_the_pattern_keeps_the_subcommand_alternation(self):
+        assert remote_verify_process_pattern('r1') == (
+            f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id r1( |$)'
+        )
 
     @pytest.mark.asyncio
-    async def test_probe_issues_one_ssh_running_the_pattern(self):
-        transport = _FakeTransport(ssh_rc=1)
+    async def test_a_runner_that_cancelled_nothing_is_clean_without_any_call(self):
+        transport = _FakeTransport(ssh_rc=0)
 
-        await _remote_runner(transport).probe_clean()
+        assert await _remote_runner(transport).probe_clean() is True
+        assert transport.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_probe_greps_only_the_cancelled_request(self):
+        transport = _FakeTransport(ssh_stdout=result_to_json(_green()))
+        runner = await _cancelled_runner(transport, 'req-7')
+        transport.ssh_rc = 1
+
+        assert await runner.probe_clean() is True
 
         [ssh_argv] = transport.ssh_calls()
         assert (ssh_argv[0], ssh_argv[-2]) == ('ssh', 'laptop.local')
-        assert shlex.split(ssh_argv[-1]) == ['pgrep', '-f', REMOTE_VERIFY_PROCESS_PATTERN]
+        assert shlex.split(ssh_argv[-1]) == ['pgrep', '-f', remote_verify_process_pattern('req-7')]
         assert len(transport.calls) == 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('ssh_rc', 'clean'), [(1, True), (0, False), (2, False)])
-    async def test_probe_is_clean_only_when_pgrep_finds_nothing(self, ssh_rc: int, clean: bool):
-        assert await _remote_runner(_FakeTransport(ssh_rc=ssh_rc)).probe_clean() is clean
+    async def test_the_probe_is_clean_only_when_pgrep_finds_nothing(self, ssh_rc: int, clean: bool):
+        transport = _FakeTransport(ssh_stdout=result_to_json(_green()))
+        runner = await _cancelled_runner(transport, 'req-7')
+        transport.ssh_rc = ssh_rc
+
+        assert await runner.probe_clean() is clean
 
     @pytest.mark.asyncio
-    async def test_probe_transport_failure_is_not_clean(self):
-        transport = _FakeTransport(ssh_error=OSError('no ssh'))
+    async def test_a_probe_transport_failure_is_not_clean(self):
+        transport = _FakeTransport(ssh_stdout=result_to_json(_green()))
+        runner = await _cancelled_runner(transport, 'req-7')
+        transport.ssh_error = OSError('no ssh')
 
-        assert await _remote_runner(transport).probe_clean() is False
+        assert await runner.probe_clean() is False
+
+
+class _LocalHostRun:
+    """A RemoteRunner ``run`` whose host is this machine: the probe's remote
+    command runs through ``bash -c``, a cancel-verify answers rc 1, and the
+    verify ssh is held until released, then dies as a cancelled verify does."""
+
+    def __init__(self) -> None:
+        self.verify_entered = asyncio.Event()
+        self.verify_release = asyncio.Event()
+
+    async def run(self, argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+        if argv[0] == 'git':
+            return 0, '', ''
+        remote_cmd = argv[-1]
+        if remote_cmd.startswith('pgrep '):
+            proc = await asyncio.create_subprocess_exec(
+                'bash', '-c', remote_cmd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return await proc.wait(), '', ''
+        if 'cancel-verify' in remote_cmd:
+            return 1, '', 'cancel-verify failed'
+        self.verify_entered.set()
+        await self.verify_release.wait()
+        return 137, '', 'Killed'
+
+
+@pytest.mark.asyncio
+class TestParkedMergeSlotProbesItsOwnRequest:
+    """Row 46: a PARKED merge slot clears while a sibling verify runs on the host."""
+
+    async def _park_and_probe(self, request_id: str) -> tuple[HostAllocator, asyncio.Task]:
+        host = _LocalHostRun()
+        runner = gated_remote_runner(
+            name='laptop', ssh_host='laptop.local', git_remote='origin', cwd='/repo',
+            run=host.run, id_factory=_ids(request_id),
+        )
+        allocator = HostAllocator([runner])
+        lease = allocator.acquire_remote()
+        assert lease is not None
+        dispatch = asyncio.create_task(lease.runner.run_merge_verify('abc123', _merge_spec()))
+        await host.verify_entered.wait()
+
+        async def _no_sleep(_secs: float) -> None:
+            return None
+
+        cleared = await allocator.cancel_and_release(lease, sleep=_no_sleep, max_attempts=2)
+        assert cleared is False
+        host.verify_release.set()
+        return allocator, dispatch
+
+    @staticmethod
+    async def _unwind(dispatch: asyncio.Task) -> None:
+        with pytest.raises(RunnerUnavailable):
+            await dispatch
+
+    async def test_a_parked_slot_clears_while_other_requests_still_run(self):
+        if shutil.which('pgrep') is None:
+            pytest.skip('pgrep is not installed')
+        request_id = uuid.uuid4().hex
+        _stop(_verify_sleeper('verify-merge', request_id))
+        siblings = [
+            _verify_sleeper('verify-task', uuid.uuid4().hex),
+            _verify_sleeper('verify-merge', uuid.uuid4().hex),
+        ]
+        try:
+            allocator, dispatch = await self._park_and_probe(request_id)
+            await self._unwind(dispatch)
+
+            assert allocator.is_parked('laptop') is False
+            assert allocator.is_busy('laptop') is False
+        finally:
+            _stop(*siblings)
+
+    async def test_a_parked_slot_stays_parked_while_its_own_request_runs(self):
+        if shutil.which('pgrep') is None:
+            pytest.skip('pgrep is not installed')
+        request_id = uuid.uuid4().hex
+        own = _verify_sleeper('verify-merge', request_id)
+        try:
+            allocator, dispatch = await self._park_and_probe(request_id)
+            await self._unwind(dispatch)
+
+            assert allocator.is_parked('laptop') is True
+        finally:
+            _stop(own)

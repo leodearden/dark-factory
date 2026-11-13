@@ -78,7 +78,7 @@ def glm_subscription_config(token: str = 'zai-test-token') -> EvalConfig:
 
 def minimax_metered_config(token: str = 'minimax-test-token') -> EvalConfig:
     return EvalConfig(
-        'minimax-m3-endpoint', 'claude', MINIMAX_MODEL, 'high',
+        'minimax-m3.1-flash-endpoint', 'claude', MINIMAX_MODEL, 'high',
         env_overrides={'ANTHROPIC_BASE_URL': MINIMAX_BASE_URL, 'ANTHROPIC_AUTH_TOKEN': token},
     )
 
@@ -93,6 +93,7 @@ def completed(
     cost_usd: float = 0.25,
     cost_credits: float = 0.0,
     plan: dict | None = None,
+    served_model: str | None = None,
     **metrics: Any,
 ) -> CellRunOutcome:
     fields = {'tests_pass': True, 'lint_clean': True, 'typecheck_clean': True, 'plan_steps': 2}
@@ -104,6 +105,7 @@ def completed(
         cost_usd=cost_usd,
         cost_credits=cost_credits,
         plan=plan,
+        served_model=served_model,
     )
 
 

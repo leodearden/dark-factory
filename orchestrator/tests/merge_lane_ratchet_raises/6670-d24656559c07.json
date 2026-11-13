@@ -1,0 +1,12 @@
+{
+  "task_id": "6670",
+  "reason": "census visibility, not new coupling (task 6670 reviewer suggestion 3): test_harness_host_pool.py now imports orchestrator.merge_lane.liveness.MergeLivenessConfigError and asserts the refusal by type instead of by class-name string, so the ratchet sweep measures this file for the first time. Its 36 Harness private reads (_host_pool, _merge_worker, _start_merge_worker, _stop_merge_worker, _run_slot, ...; the file's original cases plus the two bench-sink cases of reviewer suggestion 1) and its one liveness patch target join the census. The import itself adds no read",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6388,
+      "current": 6424
+    }
+  ]
+}

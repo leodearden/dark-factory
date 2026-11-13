@@ -18,9 +18,10 @@ from shared.scheduler_state import PinQueueEntry, SchedulerStateSnapshot
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.overrides import OverrideStore
 from orchestrator.pin_reservation import PinOrder
-from orchestrator.scheduler import ModuleLockTable, Scheduler
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # Reuse the _RecordingEventStore test double from test_scheduler.py

@@ -18,8 +18,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import curator_returning
-from _fm_helpers import _init_git_repo, submit_and_resolve
+from _curator_helpers import answer_each_with, curator_returning
+from _fm_git_repos import _init_git_repo
+from _fm_helpers import submit_and_resolve
 from shared.task_text_fingerprint import task_text_fingerprint
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -90,8 +91,7 @@ BuildStack = Callable[..., Awaitable[Stack]]
 
 
 @pytest_asyncio.fixture
-async def build_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[BuildStack]:
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
+async def build_stack(tmp_path: Path) -> AsyncIterator[BuildStack]:
     closers: list[Callable[[], Awaitable[object]]] = []
 
     async def _build(*, curator: Any = None, event_queue: Any = None) -> Stack:
@@ -319,7 +319,7 @@ async def combine_a_duplicate_into_a_new_stack(
     curator = curator_returning()
     stack = await build_stack(curator=curator, event_queue=event_queue)
     target_id = await stack.seed(stamped=stamped)
-    curator.curate.side_effect = [combine_into(target_id)]
+    answer_each_with(curator, AsyncMock(return_value=combine_into(target_id)))
     result = await submit_and_resolve(
         stack.interceptor, stack.root,
         title='Duplicate of the planned task', description='candidate description',

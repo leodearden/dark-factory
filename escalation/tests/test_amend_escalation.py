@@ -20,17 +20,17 @@ from typing import Any
 
 import pytest
 from _pending_tool_fixtures import _file
+from _tool_calls import call_tool
 
+from escalation.amendments import (
+    MAX_AMENDMENT_DETAIL_CHARS,
+    MAX_AMENDMENT_LINE_CHARS,
+    MAX_AMENDMENT_OPTIONS,
+    MAX_AMENDMENTS,
+)
 from escalation.dedupe import DedupeConfig
 from escalation.models import Amendment, Escalation
-from escalation.queue import (
-    _MAX_AMENDMENT_DETAIL_CHARS,
-    _MAX_AMENDMENT_LINE_CHARS,
-    _MAX_AMENDMENT_OPTIONS,
-    _MAX_AMENDMENTS,
-    AmendResult,
-    EscalationQueue,
-)
+from escalation.queue import AmendResult, EscalationQueue
 from escalation.server import (
     _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
     _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
@@ -259,7 +259,7 @@ class TestQueueAmend:
 
     def test_entry_cap_sheds_the_oldest_on_this_path(self, tmp_path):
         queue = EscalationQueue(tmp_path / 'esc')
-        seeded = [_amendment(i) for i in range(_MAX_AMENDMENTS)]
+        seeded = [_amendment(i) for i in range(MAX_AMENDMENTS)]
         l2 = _framed_l2(queue, amendments=seeded)
         others_before = _others(_json_files(queue), l2.id)
 
@@ -269,7 +269,7 @@ class TestQueueAmend:
         assert result['recorded'] is True
         assert result['dropped'] == 1
         stored = _on_disk(queue, l2.id)
-        assert len(stored.amendments) == _MAX_AMENDMENTS
+        assert len(stored.amendments) == MAX_AMENDMENTS
         assert stored.amendments_truncated == 1
         assert stored.amendments[0] == seeded[1], 'the OLDEST entry is the one shed'
         assert stored.amendments[-1]['summary'] == 'one past the cap'
@@ -283,35 +283,28 @@ class TestQueueAmend:
 
         result = queue.amend(
             l2.id,
-            root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
-            summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
-            detail='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
-            options=[f'option {i}' for i in range(_MAX_AMENDMENT_OPTIONS + 2)],
+            root_cause='R' * (MAX_AMENDMENT_LINE_CHARS + over),
+            summary='S' * (MAX_AMENDMENT_LINE_CHARS + over),
+            detail='D' * (MAX_AMENDMENT_DETAIL_CHARS + over),
+            options=[f'option {i}' for i in range(MAX_AMENDMENT_OPTIONS + 2)],
             agent_role='interactive',
         )
 
         assert result['status'] == 'amended'
         stored = _on_disk(queue, l2.id)
         [entry] = stored.amendments
-        assert entry['root_cause'].count('R') == _MAX_AMENDMENT_LINE_CHARS
-        assert entry['summary'].count('S') == _MAX_AMENDMENT_LINE_CHARS
-        assert entry['detail'].count('D') == _MAX_AMENDMENT_DETAIL_CHARS
+        assert entry['root_cause'].count('R') == MAX_AMENDMENT_LINE_CHARS
+        assert entry['summary'].count('S') == MAX_AMENDMENT_LINE_CHARS
+        assert entry['detail'].count('D') == MAX_AMENDMENT_DETAIL_CHARS
         assert entry['detail'].endswith(' ...]'), 'elision is marked in-band'
         assert str(over) in entry['detail']
-        assert len(entry['options']) == _MAX_AMENDMENT_OPTIONS
+        assert len(entry['options']) == MAX_AMENDMENT_OPTIONS
         assert stored.amendments_chars_elided > 3 * over
         assert _others(_json_files(queue), l2.id) == others_before
 
 
 async def _amend(server, **kw: Any) -> dict[str, Any]:
-    """``amend_escalation`` is an ASYNC tool: it awaits the storm reporter."""
-    tool = await server.get_tool('amend_escalation')
-    return await tool.fn(**kw)
-
-
-async def _sync_tool(server, name: str, **kw: Any) -> dict[str, Any]:
-    tool = await server.get_tool(name)
-    return tool.fn(**kw)
+    return await call_tool(server, 'amend_escalation', **kw)
 
 
 class _AmendThreadProbeQueue(EscalationQueue):
@@ -337,11 +330,11 @@ class TestAmendEscalationTool:
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = _framed_l2(queue)
         server = create_server(queue, startup_sweep=False)
-        triaged = await _sync_tool(
+        triaged = await call_tool(
             server, 'stamp_triage', escalation_id=l2.id, triage_note='probe',
         )
         assert 'error' not in triaged
-        before = await _sync_tool(server, 'get_escalation', escalation_id=l2.id)
+        before = await call_tool(server, 'get_escalation', escalation_id=l2.id)
 
         response = await _amend(
             server, escalation_id=l2.id,
@@ -352,7 +345,7 @@ class TestAmendEscalationTool:
 
         assert response['amendment_recorded'] is True
         assert 'no_op_reason' not in response
-        after = await _sync_tool(server, 'get_escalation', escalation_id=l2.id)
+        after = await call_tool(server, 'get_escalation', escalation_id=l2.id)
         assert {k: v for k, v in response.items() if k != 'amendment_recorded'} == after, (
             'the success response is the full amended record'
         )
@@ -476,7 +469,7 @@ class TestAmendTruncationStorm:
 
     async def test_amend_truncations_file_one_info_escalation(self, tmp_path):
         queue = EscalationQueue(tmp_path / 'esc')
-        l2 = _framed_l2(queue, amendments=[_amendment(i) for i in range(_MAX_AMENDMENTS)])
+        l2 = _framed_l2(queue, amendments=[_amendment(i) for i in range(MAX_AMENDMENTS)])
         server = create_server(
             queue, startup_sweep=False,
             dedupe_config=DedupeConfig(infra_dedupe_enabled=False),

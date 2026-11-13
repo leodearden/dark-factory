@@ -61,7 +61,9 @@ from dashboard.data.census import (
 from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum, validate_datum
 from dashboard.data.deferral_summary import read_liveness, session_holders
 from dashboard.data.mcp_fanout import TTLCache
+from dashboard.data.prd_attribution import LINEAGE_METADATA_KEYS
 from dashboard.data.tasks import (
+    SHAPED_ROW_FIELDS,
     fetch_statuses,
     fetch_task_page,
     fetch_tasks,
@@ -123,10 +125,10 @@ demonstrably failed; a per-call budget below the honest service time turns
 that claim into a lie on every cold render.
 
 WHY THE SERVER COST SCALES WITH TREE SIZE even though the row read is
-status-narrowed: there is no field projection at any layer and the backend
-query is ``SELECT *`` feeding a fixed 14-key row — see ``fetch_tasks``'
-docstring, and task 4390, the open follow-up to add projection. Until that
-lands, narrowing the STATUSES does not narrow the WORK.
+status-narrowed: the row read projects to :data:`ROW_READ_FIELDS`, which cuts
+the wire bytes and both JSON decodes, but the backend still reads whole rows
+and projects after ``_row_to_task``. Narrowing the STATUSES or the FIELDS does
+not narrow the backend WORK.
 
 WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
 ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
@@ -169,11 +171,25 @@ ROW_READ_STATUSES: frozenset[TaskStatus] = ACTIVE
 """The statuses the unit's rows half asks for, applied server-side as
 ``WHERE status IN (...)``."""
 
+ROW_READ_FIELDS: tuple[str, ...] = (
+    *SHAPED_ROW_FIELDS,
+    *(f'metadata.{key}' for key in (
+        'files', 'train', 'external_deps', 'deferral', 'infra_hold',
+        'task_kind', 'always_escalates', 'milestone', 'milestone_deps_satisfied_at',
+        'pending_since', 'pending_since_backfilled', 'source',
+        *LINEAGE_METADATA_KEYS,
+    )),
+)
+"""The wire fields every dashboard row read asks ``get_tasks`` for:
+:data:`~dashboard.data.tasks.SHAPED_ROW_FIELDS`, plus the metadata keys the
+readers of those rows touch. ``tests/test_row_read_projection.py`` fails when a reader reads a key
+this omits."""
+
 
 class SnapshotFailure(enum.StrEnum):
     """WHY a unit is not wholly measured — structured, never parsed from prose.
 
-    The three project lists ``/api/v2/dashboard/tasks`` emits encode facts the
+    The project lists ``/api/v2/dashboard/tasks`` emits encode facts the
     codebase insists must not be merged: offline means a read DEMONSTRABLY
     failed, degraded means a budget expired and the state is simply unknown.
     ``Datum.reason`` is by contract the producer's VERBATIM failure text, so
@@ -183,7 +199,8 @@ class SnapshotFailure(enum.StrEnum):
     The kind reported on a unit is the ROWS half's, because that is the half
     that decides whether a PROJECT is offline. The map's own fate is carried
     by the census ``Datum``'s state: rows fresh beside a non-fresh census is
-    exactly the count-unknown case, and needs no third enum member.
+    the count-unknown or count-stale case, told apart by that ``Datum``'s own
+    state, and needs no third enum member.
     """
 
     NONE = 'none'
@@ -538,6 +555,7 @@ async def _read_unit(
             fetch_tasks(
                 client, config, project_root,
                 statuses=sorted(ROW_READ_STATUSES),
+                fields=ROW_READ_FIELDS,
                 timeout=PER_CALL_TIMEOUT,
             ),
             label='active rows',
@@ -638,7 +656,7 @@ def withhold_rows(snapshot: TaskSnapshot) -> TaskSnapshot:
 class SnapshotHealth(enum.StrEnum):
     """How a consumer must present one root, from its unit alone.
 
-    The four members are the four banners ``/api/v2/dashboard/tasks`` can put
+    The five members are the five banners ``/api/v2/dashboard/tasks`` can put
     a project under, and the codebase insists they stay distinct:
 
     * ``OK`` — both halves measured.
@@ -646,15 +664,23 @@ class SnapshotHealth(enum.StrEnum):
     * ``DEGRADED`` — a budget expired first, so this root's state is simply
       UNKNOWN. Nothing was proven unreachable. Merging this into ``OFFLINE``
       tells an operator to restart a healthy service.
-    * ``COUNT_UNKNOWN`` — the rows are current but the census is not. Without
-      a name of its own such a root renders as healthy with a confident
-      "0 done", which is the invisible failure the envelope exists to remove.
+    * ``COUNT_UNKNOWN`` — the row read did not fail but the census has NO
+      value to show. Without a name of its own such a root renders as healthy
+      with a confident "0 done", which is the invisible failure the envelope
+      exists to remove.
+    * ``COUNT_STALE`` — the row read did not fail and the census carries its
+      last measured value at its own ``as_of``, which every census surface
+      renders with an age badge. Announcing it as unknown would contradict
+      those surfaces. Says nothing about the rows' freshness: a unit
+      :func:`as_served` aged past :data:`FRESHNESS_BOUND_SECONDS` lands here
+      with BOTH halves stale, each carrying its own age.
     """
 
     OK = 'ok'
     OFFLINE = 'offline'
     DEGRADED = 'degraded'
     COUNT_UNKNOWN = 'count_unknown'
+    COUNT_STALE = 'count_stale'
 
 
 def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
@@ -673,9 +699,11 @@ def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
         return SnapshotHealth.OFFLINE
     if snapshot.failure is SnapshotFailure.BUDGET:
         return SnapshotHealth.DEGRADED
-    if snapshot.census.state is not DatumState.FRESH:
-        return SnapshotHealth.COUNT_UNKNOWN
-    return SnapshotHealth.OK
+    if snapshot.census.state is DatumState.FRESH:
+        return SnapshotHealth.OK
+    if snapshot.census.state is DatumState.STALE:
+        return SnapshotHealth.COUNT_STALE
+    return SnapshotHealth.COUNT_UNKNOWN
 
 
 def as_served(snapshot: TaskSnapshot, served_at: datetime) -> TaskSnapshot:
@@ -839,6 +867,7 @@ async def acquire_terminal_window(
             # A COMPUTED offset, not a LIMIT: the slice is over ascending ids,
             # so reaching the high-id end is arithmetic rather than an option.
             offset=max(0, terminal_total - window),
+            fields=ROW_READ_FIELDS,
             timeout=PER_CALL_TIMEOUT,
         ),
         label='terminal window',

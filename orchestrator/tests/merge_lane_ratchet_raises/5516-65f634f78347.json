@@ -1,0 +1,12 @@
+{
+  "task_id": "5516",
+  "reason": "Net-additive tests: the two new task-5516 test files (test_restart_recut_dispatch.py, test_restart_recut_e2e.py) wire a Harness to a real EscalationQueue through the same seams every harness-escalation test uses, since Harness exposes no public one: h._escalation_queue = queue, queue.set_resolve_callback(h._on_escalation_resolved), and draining harness._background_tasks after resolve_issue so the restart teardown has run. 4 private reads per file, total 6608 -> 6616. Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6608,
+      "current": 6616
+    }
+  ]
+}

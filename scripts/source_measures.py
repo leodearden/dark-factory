@@ -20,7 +20,7 @@ import subprocess
 import tokenize
 import tomllib
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from io import StringIO
 from pathlib import Path
 from types import MappingProxyType
@@ -327,12 +327,12 @@ def reexport_names_in_tree(tree: ast.Module) -> list[str]:
 # instrument from becoming a suite-truncating landmine. 7.0.1's cost grows
 # roughly cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so
 # the whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The
-# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s, and
+# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT), and
 # exceeding it does not merely fail the test: pytest-timeout's thread method
 # os._exit()s the xdist worker and --max-worker-restart=0 then truncates the
 # ENTIRE orchestrator suite, reporting against an innocent test (the esc-3980-1
-# / esc-3787-1 mode documented at orchestrator/tests/_orch_helpers.py::
-# WHOLE_TREE_SCAN_TEST_TIMEOUT).
+# / esc-3787-1 mode documented at
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
 #
 # The tuples are the source of truth; the human-readable specifier is derived
 # from them, so the message and the check can never disagree. The same string
@@ -887,6 +887,13 @@ def tracked_python_files(root: Path) -> tuple[str, ...]:
     return tracked_files(root, '*.py')
 
 
+def blob_sha(path: Path) -> str:
+    """Git's blob id of *path*'s content on disk, equal to its index entry when committed and unmodified."""
+    if not path.is_file():
+        raise MetricsError(f'{path}: no such file, so it has no blob id')
+    return _git_output(path.parent, 'hash-object', '--', path.name).strip()
+
+
 # ---------------------------------------------------------------------------
 # The workspace domain: each member's tracked .py files, classified.
 
@@ -896,19 +903,40 @@ class FileKind(enum.StrEnum):
     TESTS = 'tests'
 
 
+def _dotted_below(root: str, path: str) -> str:
+    """The dotted name of ``.py`` *path* below *root*; a package's ``__init__.py``
+    is named by its package."""
+    dotted = path[len(root) + 1:].removesuffix('.py').replace('/', '.')
+    return dotted.removesuffix('.__init__')
+
+
 @dataclasses.dataclass(frozen=True)
 class MemberRoots:
     """Where one member's source and test files live, repo-relative.
 
     One rule for real and pseudo members alike: a path under ``tests_root`` is a
     test file, else a path under ``src_root`` is a source file named by its
-    dotted path below that root, else it is not the member's.
+    dotted path below that root, and also by its dotted path below each extra
+    import root that contains it, else it is not the member's.
     """
 
     name: str
     pseudo: bool
     src_root: str | None
     tests_root: str
+    extra_import_roots: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        outside = [
+            root
+            for root in self.extra_import_roots
+            if self.src_root is None or not root.startswith(self.src_root + '/')
+        ]
+        if outside:
+            raise ValueError(
+                f'member {self.name!r}: extra import root(s) {outside!r} must lie '
+                f'strictly below its src_root {self.src_root!r}'
+            )
 
     @classmethod
     def declared(cls, name: str) -> MemberRoots:
@@ -926,19 +954,28 @@ class MemberRoots:
             return FileKind.SRC
         return None
 
+    def _is_source_module(self, path: str) -> bool:
+        return path.endswith('.py') and self.kind_of(path) is FileKind.SRC
+
     def import_name(self, path: str) -> str | None:
         """The dotted import name of source file *path*; None for anything else.
 
         A package's ``__init__.py`` is named by its package.
         """
-        if (
-            self.src_root is None
-            or not path.endswith('.py')
-            or self.kind_of(path) is not FileKind.SRC
-        ):
+        if self.src_root is None or not self._is_source_module(path):
             return None
-        dotted = path[len(self.src_root) + 1:].removesuffix('.py').replace('/', '.')
-        return dotted.removesuffix('.__init__')
+        return _dotted_below(self.src_root, path)
+
+    def extra_import_names(self, path: str) -> tuple[str, ...]:
+        """The dotted names of source file *path* below each extra import root
+        holding it, in ``extra_import_roots`` order; () for anything else."""
+        if not self._is_source_module(path):
+            return ()
+        return tuple(
+            _dotted_below(root, path)
+            for root in self.extra_import_roots
+            if path.startswith(root + '/') and path != f'{root}/__init__.py'
+        )
 
 
 def src_module_name(path: str) -> str | None:
@@ -953,6 +990,14 @@ class DomainFile:
     blob: str
     kind: FileKind
     import_name: str | None
+    extra_import_names: tuple[str, ...]
+
+    @property
+    def import_names(self) -> tuple[str, ...]:
+        """Every name the file imports as: ``import_name``, then the extra names."""
+        if self.import_name is None:
+            return self.extra_import_names
+        return (self.import_name, *self.extra_import_names)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -962,8 +1007,38 @@ class DomainMember:
     files: tuple[DomainFile, ...]
 
 
+def unique_import_paths(
+    domain: Iterable[DomainMember], names_of: Callable[[DomainFile], Iterable[str]]
+) -> dict[str, str]:
+    """Each name *names_of* gives a file of *domain*, to the path of the one file it names.
+
+    An import of a name two files share is ambiguous, so MetricsError names each
+    such name and its sorted paths.
+    """
+    holders: dict[str, set[str]] = {}
+    for member in domain:
+        for domain_file in member.files:
+            for name in names_of(domain_file):
+                holders.setdefault(name, set()).add(domain_file.path)
+    shared = {name: sorted(paths) for name, paths in sorted(holders.items()) if len(paths) > 1}
+    if shared:
+        raise MetricsError(
+            'import name(s) shared by two or more source files, so an import of one is '
+            'ambiguous: ' + '; '.join(f'{name!r} names {paths!r}' for name, paths in shared.items())
+        )
+    return {name: path for name, (path,) in holders.items()}
+
+
 _SCRIPTS_PSEUDO_MEMBER = MemberRoots(
-    name='scripts', pseudo=True, src_root='scripts', tests_root='scripts/tests'
+    name='scripts',
+    pseudo=True,
+    src_root='scripts',
+    tests_root='scripts/tests',
+    # scripts/tests/conftest.py puts these on sys.path, mirrored by the root
+    # pyproject.toml [tool.pyright].extraPaths. Pinned equal to the first by
+    # scripts/tests/test_source_measures_import_roots.py and to the second by
+    # tests/scripts/test_source_measures.py::TestExtraImportNames.
+    extra_import_roots=('scripts/legibility', 'scripts/local-model-serving'),
 )
 _TESTS_PSEUDO_MEMBER = MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests')
 
@@ -1119,7 +1194,13 @@ def _domain_member(
     member: MemberRoots, entries: tuple[tuple[str, str], ...]
 ) -> DomainMember:
     files = tuple(
-        DomainFile(path=path, blob=blob, kind=kind, import_name=member.import_name(path))
+        DomainFile(
+            path=path,
+            blob=blob,
+            kind=kind,
+            import_name=member.import_name(path),
+            extra_import_names=member.extra_import_names(path),
+        )
         for path, blob in sorted(entries)
         if (kind := member.kind_of(path)) is not None
     )

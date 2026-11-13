@@ -4,9 +4,22 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from shared.cancel_dispositions import (
+    ChildRelation,
+    ChildRow,
+    DispositionSource,
+    RepointDisposition,
+    children_to_json,
+    parse_children,
+    qualified_task_ref,
+    rows_to_json,
+    stamp_entry,
+)
+from shared.task_statuses import TaskStatus
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
@@ -21,6 +34,7 @@ from escalation.models import (
     IndexHealthState,
     LateResolution,
     ParkStopTripFacts,
+    ReviewDueState,
     TrainState,
     max_severity,
     normalised_severity,
@@ -547,6 +561,68 @@ class TestEscalationDeliveredCheckOwnerField:
         assert restored.delivered_check_owner is None
 
 
+
+class TestReviewDueField:
+    """Escalation carries the human gate's review_due payload (PRD
+    completion-driven-triggers C4). Same additive zero-migration contract as
+    `index_health`."""
+
+    _FINAL: ReviewDueState = {
+        'skill': 'review',
+        'project_id': 'dark_factory',
+        'project_root': '/home/leo/src/dark-factory',
+        'run_id': 'review-dark_factory-20261004',
+        'human_gate_task_id': '42',
+        'completion_gate_task_id': '41',
+        'verdict': {'verdict': 'pass', 'share': 0.75, 'by_priority': {'high': [3, 1, 0]}},
+        'fired_at': '2026-10-05T00:00:00+00:00',
+        'launched_from': 'esc-42-1',
+    }
+    _INTERIM: ReviewDueState = {
+        **_FINAL,
+        'completion_gate_task_id': None,
+        'verdict': None,
+    }
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-42-1',
+            'task_id': '42',
+            'agent_role': 'orchestrator-deterministic',
+            'severity': 'critical',
+            'category': 'review_due',
+            'summary': 'Run /review on dark_factory (review-dark_factory-20261004 landed)',
+            'level': 2,
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_default_is_none_and_surfaces_in_to_dict(self):
+        esc = self._make_base_esc()
+        assert esc.review_due is None
+        d = esc.to_dict()
+        assert 'review_due' in d
+        assert d['review_due'] is None
+
+    @pytest.mark.parametrize('payload', [_FINAL, _INTERIM], ids=['final', 'interim'])
+    def test_round_trip_via_to_dict_from_dict(self, payload):
+        esc = self._make_base_esc(review_due=payload)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.review_due == payload
+
+    @pytest.mark.parametrize('payload', [_FINAL, _INTERIM], ids=['final', 'interim'])
+    def test_round_trip_via_to_json_from_json(self, payload):
+        esc = self._make_base_esc(review_due=payload)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.review_due == payload
+        assert restored.to_json() == esc.to_json()
+
+    def test_legacy_json_without_the_key_deserialises_to_none(self):
+        payload = self._make_base_esc().to_dict()
+        del payload['review_due']
+        restored = Escalation.from_json(json.dumps(payload))
+        assert restored.review_due is None
+
 _EWA_RATE_TRIP: EwaRateTripFacts = {
     'ewa': 73.59,
     'threshold': 24.6,
@@ -623,6 +699,110 @@ class TestEscalationTripFactsFields:
 
         assert restored.ewa_rate_trip is None
         assert restored.park_stop_trip is None
+
+
+_CANCEL_PARENT = 5869
+_CANCEL_PROJECT = 'dark_factory'
+
+
+def _cancel_child_row() -> ChildRow:
+    return ChildRow(
+        id=6905,
+        project_id=_CANCEL_PROJECT,
+        title='repoint me',
+        status=TaskStatus.PENDING,
+        relation=ChildRelation.DEPENDENT,
+        declared_files_total=2,
+        declared_files_missing_from_main=('a.py',),
+        declared_files_missing_from_main_total=1,
+        depends_on_superseder=False,
+        named_superseder=False,
+        has_live_children=False,
+        existing_disposition=stamp_entry(
+            RepointDisposition(onto=(8032,)),
+            parent=qualified_task_ref(_CANCEL_PROJECT, _CANCEL_PARENT),
+            stamped_at=datetime(2026, 11, 3, 12, 0, tzinfo=UTC),
+            stamped_by='claude-x',
+            source=DispositionSource.CANCELLER,
+        ),
+    )
+
+
+def _parse_cancel_children(raw: object):
+    return parse_children(raw, parent_id=_CANCEL_PARENT, parent_project_id=_CANCEL_PROJECT)
+
+
+class TestEscalationCancelChildrenFields:
+    """A cancel-with-children residue or abandon record carries the contract as plain JSON.
+
+    plans/cancel-with-children-prd.md §4.11-§4.12: the rows and the map cross this record's
+    JSON boundary through shared.cancel_dispositions' one serializer each, and re-validate.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-5869-1',
+            'task_id': str(_CANCEL_PARENT),
+            'agent_role': 'reconciliation',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'cancelled parent left live children',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_all_three_default_to_none_and_serialise_as_none(self):
+        esc = self._make_base_esc()
+
+        assert (esc.cancel_children, esc.children, esc.superseded_by) == (None, None, None)
+        d = esc.to_dict()
+        assert (d['cancel_children'], d['children'], d['superseded_by']) == (None, None, None)
+
+    def test_cancel_children_rows_round_trip_and_revalidate(self):
+        row = _cancel_child_row()
+        esc = self._make_base_esc(cancel_children=rows_to_json([row]))
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.cancel_children == rows_to_json([row])
+        assert restored.cancel_children is not None
+        assert ChildRow.model_validate(restored.cancel_children[0]) == row
+
+    def test_children_map_round_trips_and_reparses(self):
+        parsed = _parse_cancel_children(
+            {
+                '6905': {'action': 'repoint', 'onto': [8032]},
+                'reify:44': {'action': 'repoint', 'onto': [8033]},
+            }
+        )
+        esc = self._make_base_esc(children=children_to_json(parsed))
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.children is not None
+        assert _parse_cancel_children(restored.children) == parsed
+
+    def test_superseded_by_round_trips_as_ints(self):
+        esc = self._make_base_esc(superseded_by=[8032, 8033])
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.superseded_by == [8032, 8033]
+        assert restored.superseded_by is not None
+        assert all(type(task_id) is int for task_id in restored.superseded_by)
+
+    def test_legacy_json_without_the_three_keys_reads_none(self):
+        legacy = self._make_base_esc().to_dict()
+        for key in ('cancel_children', 'children', 'superseded_by'):
+            del legacy[key]
+
+        restored = Escalation.from_json(json.dumps(legacy))
+
+        assert (restored.cancel_children, restored.children, restored.superseded_by) == (
+            None,
+            None,
+            None,
+        )
 
 
 class TestEscalationResolutionAction:

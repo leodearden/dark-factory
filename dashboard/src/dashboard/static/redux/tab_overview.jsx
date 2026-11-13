@@ -57,7 +57,7 @@ function formatLoadValue(type, v) {
  * unit's `--timeout-keep-alive` must stay strictly ABOVE the slowest such
  * poller, or the server closes this socket in the gap between polls and exposes
  * the server-closes-while-client-writes race. The value is parsed from this
- * declaration by tests/scripts/test_dashboard_service_template.py
+ * declaration by tests/scripts/dashboard_client_pollers.py
  * (CLIENT_POLLERS), so RAISING IT REQUIRES raising --timeout-keep-alive in BOTH
  * scripts/dashboard.service.template and
  * dashboard/dark-factory-dashboard.service.

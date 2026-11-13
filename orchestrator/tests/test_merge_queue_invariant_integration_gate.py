@@ -46,11 +46,12 @@ NAME (grep/search), never trust a PRD line offset.
       the surviving InflightEntry passthrough_outcome ValueError [ε=1890].
   8.  CAS-retry rebased landing completes without a phantom
       POST_MERGE_EQUIVALENCE_FAILED (1928 regression pin) [ε=1890 I3].
-  10. A main tip that advances under an in-flight verify surfaces a
-      verify-base violation that is a member of two_layer_invariants()
-      [ξ=1999 I5], and clears once the item drains.
+  10. A main tip that advances under an in-flight verify is NOT a violation:
+      two_layer_invariants() and snapshot()['verify_base_divergences'] both
+      stay [] (task 5302 retired the ξ=1999 I5 false positive), and the item
+      drains.
   11. snapshot() keys are additive-only across the whole module-split batch
-      (13 keys total, resource_audit being the newest).
+      (14 keys total, verify_base_divergences being the newest, task 5302).
   12. InFlightMergeRegistry.acquire/attach fan-out mirror + the
       coalesce_or_enqueue_merge_request dispatched/in_flight/alias contract
       are unchanged by the split.
@@ -119,6 +120,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane, WaiterRecord
+from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
     DecidedItem,
@@ -127,7 +129,6 @@ from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
-    coalesce_or_enqueue_merge_request,
     item_merge_wt,
 )
 from orchestrator.verify_runner import RunnerUnavailable
@@ -316,9 +317,9 @@ def _assert_quiescent(
           request out of LANE_BUFFERED without ever reaching _retire_item's
           TERMINAL hop shows up here as a leaked entry.
       (e) lane.two_layer_invariants(main_sha) == [] — *main_sha* MUST be a
-          REAL sha, never 'unknown': the base-chain and verify-base
-          sub-checks are silently skipped for the 'unknown' sentinel, which
-          would make this assertion pass vacuously rather than meaningfully.
+          REAL sha, never 'unknown': the base-chain (INV-3) sub-check is
+          silently skipped for the 'unknown' sentinel, which would make this
+          assertion pass vacuously rather than meaningfully.
 
     Task 5030 dropped a sixth surface: the request-liveness ledger's own
     emptiness, which was asserted as ``_request_ledger.sweep_resolved()``
@@ -842,17 +843,20 @@ class TestScenario8CasRetryTipCarry:
         advance_calls: list[str] = []
 
         async def _fake_advance(sha: str, worktree: Path, **kwargs: Any) -> AdvanceOutcome:
-            # Call 1 forces the replace-only rebuild; call 2 lands. The
-            # fabricated advanced_sha is deliberate: it is not a real git
+            # Call 1 forces the replace-only rebuild, here of the rebased
+            # head the gate dispatches (task 8525); call 2 lands. The rebased
+            # commit is main itself: a real commit the dispatch can build a
+            # worktree on, already based on main, so it is not re-merged. The
+            # fabricated landed sha is deliberate: it is not a real git
             # object, so the equivalence gate's own tip resolution fails open
             # and cannot mask a dropped merged_branch_tip.
             advance_calls.append(sha)
             if len(advance_calls) == 1:
                 return AdvanceOutcome(
                     'rebased_pending_reverify',
-                    advanced_sha='f' * 40,
-                    rebased_from=base_sha,
-                    rebased_onto='e' * 40,
+                    advanced_sha=base_sha,
+                    rebased_from='e' * 40,
+                    rebased_onto=base_sha,
                 )
             return AdvanceOutcome('advanced', advanced_sha='a' * 40)
 
@@ -876,23 +880,23 @@ class TestScenario8CasRetryTipCarry:
             _assert_quiescent(lane, main_sha, [req])
 
 
-# ── Row 10 — verify-base / frozen-tip mismatch ───────────────────────────────
+# ── Row 10 — main advancing under an in-flight verify ────────────────────────
 
 
 @pytest.mark.asyncio
 class TestScenario10VerifyBaseMismatch:
-    """Row 10: a verify-base/frozen-tip mismatch surfaces a violation string
-    that is a structural member of ``two_layer_invariants()`` [ξ=1999 I5],
-    promoted from the ε=1890 log-only WARN.
+    """Row 10: main moving under an in-flight verify is NOT a violation (task 5302).
 
-    The mismatch is produced the way a real one is: a foreign lander moves
-    main while an item is mid-verify against the older tip. Asserts
-    STRUCTURAL containment (the same violation strings appear in
-    ``two_layer_invariants()`` and ``snapshot()['two_layer_invariants']``),
-    never violation wording.
+    This scene is the measured false-positive mechanism behind the 2026-08-12
+    and 2026-08-28 recurrences (PRD §5.3), which this row used to pin as a
+    violation: a foreign lander moves main while an item is mid-verify on the
+    older tip, and the snapshot then re-judged a dispatch-time rule against
+    post-dispatch main.  The item was dispatched on the right tip, so neither
+    ``two_layer_invariants()`` nor the dispatch-time detector's
+    ``snapshot()['verify_base_divergences']`` reports anything.
     """
 
-    async def test_main_advancing_under_verify_surfaces_and_clears(
+    async def test_main_advancing_under_verify_is_not_a_violation(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
         verify_gate = asyncio.Event()
@@ -921,23 +925,16 @@ class TestScenario10VerifyBaseMismatch:
             assert main_after != main_before
 
             violations = lane.two_layer_invariants(main_after)
-            assert violations, (
-                f'expected the stale verify base to be flagged against main '
-                f'{main_after!r}, got: {violations}'
-            )
-            assert any(req.request_id in v for v in violations), (
-                f'expected a violation naming {req.request_id!r}, got: {violations}'
+            assert violations == [], (
+                f'main moving under an in-flight verify is not a violation, got: {violations}'
             )
 
             # snapshot() reads the same surface against the main SHA cached by
-            # the lane's own recompute — refresh it and the violations must
-            # match verbatim.
+            # the lane's own recompute — refresh it so it judges main_after.
             await lane.recompute_suffix_conflict_graph()
-            snap_violations = lane.snapshot()['two_layer_invariants']
-            assert all(v in snap_violations for v in violations), (
-                f"expected snapshot()['two_layer_invariants'] to surface the same "
-                f'violation(s), got: {snap_violations}'
-            )
+            snap = lane.snapshot()
+            assert snap['two_layer_invariants'] == []
+            assert snap['verify_base_divergences'] == []
 
             # Draining the item clears the surface: quiescence is measured
             # against the main the pipeline actually ends on.
@@ -964,8 +961,8 @@ class TestScenario1112Preservation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
         """Row 11: the 12 pre-existing snapshot() keys are all still present,
-        plus the newest additive key 'resource_audit' (13 total); per-entry
-        keys are unchanged.
+        plus the additive keys 'resource_audit' and 'verify_base_divergences'
+        (task 5302); per-entry keys are unchanged.
         """
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = MergeLane(git_ops, queue, verifier=FakeVerifier())
@@ -977,7 +974,7 @@ class TestScenario1112Preservation:
             'suffix_conflict_graph', 'metrics', 'frozen_prefix',
             'two_layer_invariants', 'speculation',
         }
-        expected_keys = pre_existing_keys | {'resource_audit'}
+        expected_keys = pre_existing_keys | {'resource_audit', 'verify_base_divergences'}
         missing = expected_keys - snap.keys()
         # Additive-only contract: every expected key must be present
         # (expected_keys <= snap.keys()), but a future genuinely-additive key
@@ -993,6 +990,7 @@ class TestScenario1112Preservation:
             'speculation_accounting': [],
             'worktree_ledger': [],
         }
+        assert snap['verify_base_divergences'] == []
 
         # Per-entry keys stable: submit one request on the lane's own queue
         # (the lane is not running, so it stays queued) and check its shape.

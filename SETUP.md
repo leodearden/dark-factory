@@ -23,12 +23,11 @@ see `OPERATIONS.md` once you're up and running.
 - **`OPENAI_API_KEY` IS required.** fused-memory uses it for Graphiti/Mem0
   embeddings (`gpt-4o-mini` + `text-embedding-3-small`) — nothing else in the
   stack needs it.
-- **Multi-account OAuth pool is entirely optional.** A single logged-in Claude
-  Code CLI session is sufficient to run everything in this doc. The pool
-  (`config/usage-accounts.yaml` + `CLAUDE_OAUTH_TOKEN_*` env vars) exists to
-  spread load across several Claude Max accounts and fail over on rate-limit
-  — skip it unless you're running a large concurrent fleet. Detail in
-  §4 below.
+- **Multi-account OAuth pool is the default.** The pool
+  (`config/usage-accounts.yaml` + `CLAUDE_OAUTH_TOKEN_*` env vars) spreads
+  load across several Claude Max accounts and fails over on rate-limit. A
+  single-user setup without it must opt out explicitly. Detail in §4 below
+  and in `OPERATIONS.md`.
 
 ## 2. Clone with submodules
 
@@ -160,19 +159,18 @@ them in sync, or symlink one to the other.
   `orchestrator/src/orchestrator/defaults.yaml`'s equivalent hardcode
   `${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml`
   as their fallback — without the env var on a different path, they'll try
-  to read a file that isn't there (harmless — the pool just falls back to
-  no accounts / plain CLI auth — but worth setting to avoid a confusing
-  startup warning).
+  to read a file that isn't there, which leaves the pool empty (see "Optional:
+  multi-account OAuth pool" below for the single-user routes).
 - **Side-tooling keys** (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
   `PERPLEXITY_API_KEY`, `HF_DOWNLOAD_TOKEN`, `RUNPOD_API_KEY`) appear
   commented out in `.env.example` for optional eval harnesses and auxiliary
   scripts only — **not** needed for the core factory (agents authenticate
   via the Claude Code CLI's own OAuth, never `ANTHROPIC_API_KEY`).
 
-### Optional: multi-account OAuth pool
+### Multi-account OAuth pool
 
-Only relevant if you want several Claude Max accounts sharing load with
-automatic failover on a rate limit. `config/usage-accounts.yaml` lists
+`usage_cap` is enabled in the shipped configs, so the factory expects a pool
+(or an explicit single-user opt-out, below). `config/usage-accounts.yaml` lists
 accounts by name and the **env var name** holding each one's OAuth token
 (never the token itself):
 
@@ -186,10 +184,10 @@ accounts:
 
 For each account, generate a long-lived OAuth token (`claude setup-token`)
 and put it in `.env` as `CLAUDE_OAUTH_TOKEN_A=...`, `CLAUDE_OAUTH_TOKEN_B=...`,
-etc. Absent this file (or an absent env var for a listed account), the pool
-degrades gracefully to plain Claude Code CLI default auth — this is the
-normal, supported single-account setup. Don't configure this unless you
-know you need it; see `OPERATIONS.md` for the failover/capacity model.
+etc. Absent this file (or an absent env var for every listed account), the
+pool is empty and every invocation raises. For a single-user setup, use one of
+the two supported routes described in `OPERATIONS.md` ("Multi-account failover
+(`usage_cap.*`)"); see it too for the failover/capacity model.
 
 ## 5. Start backing stores
 
@@ -211,6 +209,10 @@ docker compose up -d falkordb qdrant
   - After setup, the fused-memory unit brings FalkorDB up through
     `scripts/falkordb_aof_gate.py`, which recreates the container only onto a
     current AOF (`OPERATIONS.md` "FalkorDB settings and the recreate gate").
+  - Integration tests, the offline lane and evals write to a second,
+    disposable FalkorDB, `falkordb-scratch` on `127.0.0.1:6380`, which
+    `setup-host.sh` starts, Docker keeps running, and nothing else starts
+    (`OPERATIONS.md` "The scratch FalkorDB").
 - **Qdrant** (vector store for Mem0) on `6333` (HTTP) / `6334` (gRPC).
 
 A third compose service, `fused-mcp`, builds and runs fused-memory itself
@@ -251,12 +253,14 @@ it ran; otherwise re-run the two commands above now that you've written it.)
 - Health check:
 
 ```bash
-curl -sf http://localhost:8002/health && echo healthy
+curl -sf http://127.0.0.1:8002/health && echo healthy
 journalctl --user -u fused-memory -f   # tail logs
 ```
 
 The MCP endpoint itself is `http://127.0.0.1:8002/mcp` (wired into Claude
-Code sessions via each project's `.mcp.json`).
+Code sessions via each project's `.mcp.json`). fused-memory listens on
+loopback only by design, so a connect on the machine's LAN or tailnet
+address is refused; see `OPERATIONS.md` §"Network exposure check".
 
 ## 7. Dashboard + watchdog units
 
@@ -508,9 +512,10 @@ requirement for a working install — skip this section unless you need it.
   remote checkout has checked out, and git refuses to accept a push to a
   checked-out branch by default. The `RemoteRunner(main_branch=...)`
   argument is always populated from `git.main_branch` in production —
-  `merge_lane/drift.py::_build_remote_runners` is the sole production site that
-  constructs a `RemoteRunner`, and it always passes
-  `main_branch=config.git.main_branch` — so this push, and therefore the
+  `verify_hosts.py::_remote_runner` is the sole production site that
+  constructs a `RemoteRunner` (merge verifies reach it through
+  `build_remote_runners`, task verifies through `remote_runner_factory`), and
+  it always passes `main_branch=config.git.main_branch` — so this push, and therefore the
   `updateInstead` requirement, is not optional. `RemoteRunner`'s
   `if self._main_branch:` skip exists only for direct construction with
   `main_branch=None` (tests), which a config-driven dispatch never does.
@@ -899,6 +904,31 @@ verify host, and day-2 operational notes for a live laptop runner, see
 generic wiring and precedence, not environment fingerprints or ongoing
 operational notes, which already live there. For the full config
 hot-reload tier reference, see `OPERATIONS.md`.
+
+### Remote task verifies on the same host
+
+A `verify_runners` host can also run implement-phase task verifies, once the
+dispatching project moves `verify_task_host_policy` off its default `local`
+(task 6670; keys and rollback in `OPERATIONS.md` §"Remote task verifies").
+It is the same host in the same pool: one bench covers both lanes, and the
+merge snapshot's host row names a task holding the host as `task_held_by`.
+Before a project flips its policy:
+
+- **The host's orchestrator must provide `orchestrator verify-task`**, the
+  task-role sibling of `verify-merge` (it verifies on a fresh ephemeral
+  worktree). Under the shim contract above it runs from the gate checkout of
+  the dispatcher's own deployed commit, so it is present whenever the
+  dispatcher has it; a wrapper that ignores `ORCH_GATE_BIN` runs the shared
+  laptop checkout instead, which must then carry the subcommand too.
+- **It needs the dispatching orchestrator's deployed sha, as merge verifies
+  do.** A process that cannot resolve its deployed commit offers no remote
+  host to task verifies, and every one runs locally.
+- **Task-verify scopes share the project's systemd drop-in.** The scope name
+  is `df-verify-<tag>-<uuid>.scope`, and `verify.py::_scope_tag_for` derives
+  `<tag>` from the project root, not the verify role. So a
+  `df-verify-<tag>-.scope.d/` memory drop-in written for the project's merge
+  verifies caps its task-verify scopes as well. Size it for both lanes
+  running at once.
 
 ---
 

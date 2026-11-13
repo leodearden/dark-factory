@@ -1,5 +1,5 @@
 """Migration guard: every live-index test module must route through the shared
-``_fm_helpers.await_index_operational`` barrier — and may not re-fork it.
+``_fm_falkor_live.await_index_operational`` barrier — and may not re-fork it.
 
 Task 3377. FalkorDB builds indices **asynchronously**, so a test that queries
 an index immediately after creating it can silently succeed for a query the
@@ -57,7 +57,7 @@ of quietly passing zero modules.
 
 AST (not string grep) for the assertions themselves so a docstring or comment
 that merely *describes* the barrier — e.g. "see
-_fm_helpers.await_index_operational" — cannot satisfy the check; only real
+_fm_falkor_live.await_index_operational" — cannot satisfy the check; only real
 ImportFrom / Call / FunctionDef nodes count. The parse and node-search
 machinery is shared with the sibling guards via ``_ast_guard``
 (``parse_python_module`` / ``calls_named`` / ``imported_names_from``), so the
@@ -78,11 +78,14 @@ import re
 
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 TESTS_ROOT = pathlib.Path(__file__).parent
 SELF = pathlib.Path(__file__).resolve()
 
-HELPERS_MODULE = '_fm_helpers'
+HELPERS_MODULE = '_fm_falkor_live'
 BARRIER = 'await_index_operational'
 # The pre-extraction private spelling (task 3334) must not come back either.
 LOCAL_FORKS = {BARRIER, f'_{BARRIER}'}

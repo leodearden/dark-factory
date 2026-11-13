@@ -4,7 +4,7 @@ These lists are PLAIN DATA, deliberately: they are the pinned corpora for
 ``PLURAL_ENUM_SNAPSHOT_RE`` and ``_enumeration_is_prepositional_complement``,
 and they have two consumers that must never drift apart.
 
-1. ``test_stale_status_snapshot_edge_sweep.py`` parametrizes its guard tests
+1. ``test_status_snapshot_extraction.py`` parametrizes its guard tests
    off them — the shapes' original home, and still the authority on what the
    SHIPPED guard must do.
 2. ``tests/test_measure_plural_enum_guard_recall.py`` re-validates task 3949's
@@ -15,7 +15,7 @@ and they have two consumers that must never drift apart.
 WHY A DATA MODULE RATHER THAN A COPY, OR MARKER INTROSPECTION. A hardcoded
 second copy satisfies the re-validation requirement on the day it is written
 and silently stops covering the full set the moment someone adds a shape --
-the same silent-loss failure mode the sweep suite's own
+the same silent-loss failure mode the extraction suite's own
 ``test_every_guarded_preposition_is_exercised_against_a_plural_head`` exists to
 prevent for ``_ENUM_PREP_WORDS``. Reading the shapes off the other suite's
 ``pytest.mark.parametrize`` markers by test-FUNCTION NAME (the mechanism this

@@ -39,6 +39,7 @@ from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     MetadataNotAnObjectError,
     MetadataTooDeepError,
+    NoFieldsToUpdateError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
@@ -1670,6 +1671,60 @@ async def test_stamp_audit_metadata_persists_and_preserves_sibling_keys(backend,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'fields',
+    [
+        pytest.param({}, id='empty'),
+        pytest.param({'pending_since': '2000-01-01T00:00:00.000Z'}, id='only-pending_since'),
+        pytest.param(
+            {'pending_since': 'x', 'pending_since_backfilled': True},
+            id='only-machine-authored-keys',
+        ),
+    ],
+)
+async def test_stamp_audit_metadata_with_nothing_to_write_raises_and_writes_nothing(
+    backend, project_root, fields,
+):
+    """Task 4867: a stamp whose SANITISED fields are empty is the same false
+    success as a fieldless update_task (it rewrote the unchanged blob, bumped
+    ``updated_at`` and reported 'Stamped audit metadata'), so it raises the
+    same class, naming this operation."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'files': ['src/a.py']}),
+    )
+    before = await backend.get_task('1', project_root=project_root)
+    await asyncio.sleep(0.01)
+
+    with pytest.raises(NoFieldsToUpdateError) as exc:
+        await backend.stamp_audit_metadata('1', project_root, fields)
+
+    assert exc.value.operation == 'stamp_audit_metadata'
+    assert exc.value.task_id == '1'
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'stamp_audit_metadata' in str(exc.value)
+    assert await backend.get_task('1', project_root=project_root) == before
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_machine_authored_keys_do_not_block_a_real_field(
+    backend, project_root,
+):
+    """Only the sanitised remainder counts: a writable key beside a stripped
+    one still stamps, and the stripped one is not persisted."""
+    await backend.add_task(project_root=project_root, title='x')
+
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': 'merged', 'commit': 'abc'}, 'pending_since': 'forged'},
+    )
+
+    metadata = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert metadata['done_provenance'] == {'kind': 'merged', 'commit': 'abc'}
+    assert metadata.get('pending_since') != 'forged'
+
+
+@pytest.mark.asyncio
 async def test_stamp_audit_metadata_second_stamp_merges_without_dropping_earlier(backend, project_root):
     """A second stamp (e.g. reopen_* fields) merges in without erasing the
     done_provenance a prior stamp wrote."""
@@ -2666,6 +2721,19 @@ async def test_add_and_remove_dependency_round_trip(backend, project_root):
 
 
 @pytest.mark.asyncio
+async def test_get_task_returns_only_its_own_dependencies_ascending(backend, project_root):
+    for title in ('a', 'b', 'c', 'd'):
+        await backend.add_task(project_root=project_root, title=title)
+    await backend.add_dependency('3', '2', project_root=project_root)
+    await backend.add_dependency('3', '1', project_root=project_root)
+    await backend.add_dependency('4', '3', project_root=project_root)
+
+    assert (await backend.get_task('3', project_root))['dependencies'] == [1, 2]
+    assert (await backend.get_task('4', project_root))['dependencies'] == [3]
+    assert (await backend.get_task('1', project_root))['dependencies'] == []
+
+
+@pytest.mark.asyncio
 async def test_add_dependency_self_loop_raises(backend, project_root):
     await backend.add_task(project_root=project_root, title='a')
     with pytest.raises(TaskmasterError):
@@ -3064,7 +3132,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after migration; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
     )
@@ -3082,7 +3150,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 5."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 6."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -3109,13 +3177,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 5
+    assert user_version == 6
     assert 'parent_id' not in tasks_cols
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_6(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -3141,7 +3209,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 5, f'Fresh DB should have user_version=5; got {user_version}'
+    assert user_version == 6, f'Fresh DB should have user_version=6; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
     )
@@ -3239,7 +3307,7 @@ async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
     )
-    assert user_version == 5, f'Expected user_version=5 after v1->v5 migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after v1->v6 migration; got {user_version}'
 
 
 def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
@@ -3508,7 +3576,7 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     # residual audit over the same rows is trivially clean too, so the chain
     # runs on past v4 (index built) to the v4->v5 pending_since back-fill
     # rather than stopping at v3.
-    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after migration; got {user_version}'
 
     # Exactly one audit record, at INFO (not WARNING), naming duplicate_groups=0.
     audit_records = [r for r in caplog.records if 'duplicate_groups=' in r.message]
@@ -3872,7 +3940,7 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
     assert after[11] is None
 
     # (e) the chain lands at the new top.
-    assert user_version == 5, f'Expected user_version=5; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6; got {user_version}'
 
     # (f) exactly one line, reporting the COUNT -- the migration reporting N is
     # part of the user-observable signal (PRD boundary row 3).
@@ -3924,7 +3992,7 @@ async def test_v4_to_v5_backfill_is_a_no_op_on_reopen(tmp_path, caplog):
     after_second, user_version = _read_backfill_state(db_path)
     assert after_second == after_first, 'a second open must touch no row'
     assert [r.getMessage() for r in caplog.records if 'v4->v5' in r.getMessage()] == []
-    assert user_version == 5
+    assert user_version == 6
 
 
 @pytest.mark.asyncio
@@ -4056,8 +4124,8 @@ async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     assert 'tag' in index_sql and 'candidate_key' in index_sql, index_sql
     # (d) the version advances past 4 on a clean build -- the v3->v4 step
     # stamps 4 and the chain then runs the v4->v5 back-fill to the top.
-    assert user_version == 5, (
-        f'Expected user_version=5 after clean v3->v4 migration + chain; got {user_version}'
+    assert user_version == 6, (
+        f'Expected user_version=6 after clean v3->v4 migration + chain; got {user_version}'
     )
 
 
@@ -4304,8 +4372,8 @@ async def test_v3_to_v4_self_heal_cancels_non_canonical_and_builds_index(
     assert 'ux_tasks_candidate_key' in indexes, (
         f'Expected the index to be built once the residual is self-healed; got {indexes}'
     )
-    assert user_version == 5, (
-        f'Expected user_version=5 after a fully self-healed residual; got {user_version}'
+    assert user_version == 6, (
+        f'Expected user_version=6 after a fully self-healed residual; got {user_version}'
     )
 
     # (e) nothing ambiguous here — the escalation callback must NOT fire.
@@ -5480,7 +5548,7 @@ async def test_get_statuses_raw_filters_by_ids(backend, project_root):
 
 
 @pytest.mark.asyncio
-async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, monkeypatch):
+async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root):
     """get_tasks(statuses=...) pushes the filter into SQL and returns only matching tasks.
 
     Four sub-assertions (mirroring test_get_statuses_raw_filters_by_ids):
@@ -5496,27 +5564,10 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     await backend.add_task(project_root=project_root, title='T-inprog', status='in-progress')  # id=3
     await backend.add_task(project_root=project_root, title='T-cancelled', status='cancelled')  # id=4
 
-    # --- Set up spy on conn.execute ---
-    # get_tasks reads via the cached read connection (_get_read_connection,
-    # task 2651), not the write connection (_get_write_access) — spy on the
-    # former so this still captures the SQL get_tasks actually issues.
-    conn = await backend._get_read_connection(project_root)
+    # get_tasks reads on the cached read connection; record every statement it runs.
+    conn = (await backend._get_read_access(project_root)).connection
     recorded_sql: list[str] = []
-    _orig_execute = conn.execute
-
-    # NOT `async def`: aiosqlite's Connection.execute is a plain method that
-    # returns a Result wrapper supporting both `await conn.execute(...)` and
-    # `async with conn.execute(...) as cursor:` (see aiosqlite.core's
-    # `@contextmanager` helper). An `async def` spy would instead return a
-    # bare coroutine — awaitable, but not usable as an async context
-    # manager — breaking any caller that does `async with conn.execute(...)`
-    # (e.g. _fetch_dependencies, task 2651). Passing the Result straight
-    # through preserves both calling conventions.
-    def _spy_execute(sql: str, *args, **kwargs):
-        recorded_sql.append(sql)
-        return _orig_execute(sql, *args, **kwargs)
-
-    monkeypatch.setattr(conn, 'execute', _spy_execute)
+    await conn.set_trace_callback(recorded_sql.append)
 
     # (a) Filtered: statuses=['pending', 'in-progress']
     recorded_sql.clear()
@@ -5750,76 +5801,6 @@ async def test_get_statuses_hot_path_fresh_despite_pinned_write_connection(
 
 
 @pytest.mark.asyncio
-async def test_get_statuses_hot_path_fresh_on_reused_warm_connection(
-    backend, project_root,
-):
-    """The cached read connection :meth:`_get_read_connection` hands back
-    must stay fresh across REUSE, not just at the moment it is first opened.
-
-    ``test_get_statuses_hot_path_fresh_despite_pinned_write_connection``
-    (above) only calls ``get_statuses`` AFTER the out-of-band commit, so it
-    always opens the cached read connection for the first time post-commit
-    — a freshly-opened connection trivially observes the latest committed
-    row, so that test would still pass even if the cache were silently
-    reopening a new connection on every call (defeating the whole point of
-    caching one per project) or otherwise mishandling reuse. This test
-    instead warms the connection with a pre-commit read, then asserts BOTH
-    that a later call through that same cached slot reflects the
-    out-of-band commit AND that the connection object backing that slot is
-    still the identical one captured at warm-up (genuine reuse, not a quiet
-    reopen) — the actual "cached across calls but never pinned" contract
-    the docstring promises.
-    """
-    from shared.async_sqlite_base import apply_wal_pragmas, connect_daemon
-
-    await backend.add_task(project_root=project_root, title='T1')  # id=1
-    await backend.set_task_status('1', 'done', project_root)
-
-    # Warm the cached read connection with a pre-commit read.
-    warm = await backend.get_statuses(project_root)
-    assert warm['1'] == 'done', (
-        f"Expected the warm-up read to see 'done', got: {warm}"
-    )
-    warm_conn = backend._read_connections.get(project_root)
-    assert warm_conn is not None, (
-        'Expected get_statuses to have cached a read connection for project_root'
-    )
-
-    # Commit a status change out-of-band via a separate autocommit
-    # connection — simulating a second process writing to the same DB file
-    # while the cached read connection sits idle in between calls.
-    db_path = tasks_db(project_root)
-    writer = await connect_daemon(str(db_path), isolation_level=None)
-    try:
-        await apply_wal_pragmas(writer, busy_timeout_ms=5000)
-        await writer.execute("UPDATE tasks SET status='cancelled' WHERE id=1")
-        await writer.commit()
-    finally:
-        await writer.close()
-
-    # Reading again (bulk and scoped) must observe the post-commit state,
-    # despite having already read this same row once before the commit.
-    bulk = await backend.get_statuses(project_root)
-    assert bulk['1'] == 'cancelled', (
-        f"Expected the reused warm connection to see fresh 'cancelled', got: {bulk}"
-    )
-
-    scoped = await backend.get_statuses(project_root, ids=['1'])
-    assert scoped['1'] == 'cancelled', (
-        f"Expected the reused warm connection (scoped) to see fresh 'cancelled', got: {scoped}"
-    )
-
-    # ...and the cache must still hold the SAME connection object used for
-    # the warm-up read (genuine reuse across both later calls, not a quiet
-    # reopen) — checked AFTER the reuse, not just before it, since nothing
-    # would have triggered a reopen yet at that earlier point.
-    assert backend._read_connections.get(project_root) is warm_conn, (
-        'Expected _get_read_connection to have reused the cached connection '
-        'across both calls above, not opened a new one'
-    )
-
-
-@pytest.mark.asyncio
 async def test_get_statuses_and_get_task_agree_under_pinned_write_connection(
     backend, project_root,
 ):
@@ -5831,7 +5812,7 @@ async def test_get_statuses_and_get_task_agree_under_pinned_write_connection(
     unpinnable cached read connection (see
     ``test_get_statuses_hot_path_fresh_despite_pinned_write_connection``,
     above) and are therefore fresh here. As of task 2651 step-2, get_task
-    reads via that same cached read connection (:meth:`_get_read_connection`)
+    reads via that same cached read connection (:meth:`_get_read_access`)
     instead of the pinnable cached WRITE connection it used before — see
     ``get_statuses_raw``'s "Snapshot consistency" note — so with the write
     connection pinned to a stale pre-commit snapshot and 'cancelled'
@@ -5869,7 +5850,7 @@ async def test_get_tasks_tree_fresh_despite_pinned_write_connection(
     ``_get_tasks_internal``), which task 2651 step-2's ``get_task`` reroute
     does NOT itself touch. As of task 2651 step-4, ``_get_tasks_internal``
     is separately rerouted to the same cached unpinnable read connection
-    (:meth:`_get_read_connection`) that ``get_task`` and ``get_statuses``
+    (:meth:`_get_read_access`) that ``get_task`` and ``get_statuses``
     use — that reroute is exactly why the tree read stays fresh here even
     with the write connection pinned to a stale pre-commit snapshot.
     """
@@ -5886,197 +5867,120 @@ async def test_get_tasks_tree_fresh_despite_pinned_write_connection(
     await conn.rollback()
 
 
-# ── cached read-connection pin hardening (task 2694) ────────────────────
+# ── cached read connection freshness ────────────────────────────────────
 
 
-async def _pin_cached_read_connection_then_commit_out_of_band(backend, project_root) -> Any:
-    """Seed two 'done' tasks, warm the cached READ connection, then pin ITS
-    WAL snapshot via an open read transaction before committing a status
-    change to id=1 out-of-band via a separate autocommit connection.
+async def _read_task_1_status(backend, project_root):
+    return (await backend.get_task('1', project_root))['status']
 
-    Retargets ``_pin_write_connection_then_commit_out_of_band`` (above) at
-    the cached READ connection (``backend._read_connections[project_root]``,
-    returned by :meth:`SqliteTaskBackend._get_read_connection`) instead of
-    the cached WRITE connection: same BEGIN + materialized-SELECT pin
-    technique and out-of-band commit, but this reproduces the task 2694
-    residual gap — the exact scenario ``_get_read_connection``'s docstring
-    Guardrail note warns about (a leaked / partially-stepped cursor, or an
-    abandoned mid-iteration read, left open on the cached READ connection
-    itself) — rather than the task 2388/2455 pinned-WRITE-connection class
-    that tasks 2455/2651 already closed.
 
-    Returns the pinned read connection for callers that want to inspect it
-    (e.g. assert ``in_transaction`` before/after a guarded read). Callers do
-    NOT need to roll it back themselves afterward — clearing the pin as a
-    side effect of the next guarded read is exactly the behavior under
-    test.
+async def _read_tree_task_1_status(backend, project_root):
+    by_id = {t['id']: t for t in (await backend.get_tasks(project_root))['tasks']}
+    return by_id['1']['status']
+
+
+async def _read_bulk_and_scoped_task_1_status(backend, project_root):
+    bulk = await backend.get_statuses(project_root)
+    scoped = await backend.get_statuses(project_root, ids=['1'])
+    return bulk['1'], scoped['1']
+
+
+async def _read_dependency_edges(backend, project_root):
+    return await backend.get_dependency_edges(project_root)
+
+
+async def _read_tag_set(backend, project_root):
+    return set(await backend.list_tags(project_root))
+
+
+async def _read_x_probe_task_ids(backend, project_root):
+    result = await backend.find_tasks_by_metadata(project_root, 'x_probe')
+    return [row['task_id'] for row in result['results']]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('out_of_band_sql', 'read', 'stale', 'fresh'),
+    [
+        pytest.param(
+            "UPDATE tasks SET status='cancelled' WHERE id=1",
+            _read_task_1_status, 'done', 'cancelled', id='get_task',
+        ),
+        pytest.param(
+            "UPDATE tasks SET status='cancelled' WHERE id=1",
+            _read_tree_task_1_status, 'done', 'cancelled', id='get_tasks',
+        ),
+        pytest.param(
+            "UPDATE tasks SET status='cancelled' WHERE id=1",
+            _read_bulk_and_scoped_task_1_status,
+            ('done', 'done'), ('cancelled', 'cancelled'), id='get_statuses',
+        ),
+        pytest.param(
+            "INSERT INTO dependencies(tag, task_id, depends_on) VALUES ('master', 2, 1)",
+            _read_dependency_edges, {}, {2: [1]}, id='get_dependency_edges',
+        ),
+        pytest.param(
+            "UPDATE tasks SET tag='other' WHERE id=2",
+            _read_tag_set, {'master'}, {'master', 'other'}, id='list_tags',
+        ),
+        pytest.param(
+            """UPDATE tasks SET metadata='{"x_probe": 1}' WHERE id=1""",
+            _read_x_probe_task_ids, [], [1], id='find_tasks_by_metadata',
+        ),
+    ],
+)
+async def test_warm_cached_reader_sees_out_of_band_commit(
+    backend, project_root, tmp_path, monkeypatch, out_of_band_sql, read, stale, fresh,
+):
+    """A warm cached reader observes a commit another process made, on the SAME connection.
+
+    The zero ``connect_daemon`` count after the commit is what makes the
+    freshness meaningful: a cache that quietly reopened its connection would
+    see the commit trivially.  The same reader on a cold project must then
+    count one connect, or the spy is not on the bring-up path at all.
     """
-    from shared.async_sqlite_base import apply_wal_pragmas, connect_daemon
+    from shared.async_sqlite_base import apply_wal_pragmas
 
-    # Seed two tasks and mark both 'done'.
+    from fused_memory.backends import sqlite_task_backend as _sb
+
+    cold_root = str(tmp_path / 'cold-proj')
+    await backend.add_task(project_root=cold_root, title='C1')  # warms only the write side
     await backend.add_task(project_root=project_root, title='T1')  # id=1
     await backend.add_task(project_root=project_root, title='T2')  # id=2
     await backend.set_task_status('1', 'done', project_root)
     await backend.set_task_status('2', 'done', project_root)
 
-    # Warm the cached read connection so backend._read_connections[project_root] exists.
-    await backend.get_statuses(project_root)
-    read_conn = backend._read_connections[project_root]
+    assert await read(backend, project_root) == stale
 
-    # Pin the cached READ connection's WAL read-snapshot by leaving a read
-    # transaction open on it (materialize the snapshot via fetchall()).
-    await read_conn.execute('BEGIN')
-    cur = await read_conn.execute('SELECT id, status FROM tasks')
-    await cur.fetchall()
-    assert read_conn.in_transaction, (
-        'Expected BEGIN + a materialized SELECT to pin the cached read '
-        'connection to an open transaction'
-    )
-
-    # Simulate a separate process committing a status change out-of-band,
-    # via a fresh autocommit connection to the same DB file on disk.
-    db_path = tasks_db(project_root)
-    writer = await connect_daemon(str(db_path), isolation_level=None)
+    writer = await _sb.connect_daemon(str(tasks_db(project_root)), isolation_level=None)
     try:
         await apply_wal_pragmas(writer, busy_timeout_ms=5000)
-        await writer.execute("UPDATE tasks SET status='cancelled' WHERE id=1")
+        await writer.execute(out_of_band_sql)
         await writer.commit()
     finally:
         await writer.close()
 
-    return read_conn
+    real_connect_daemon = _sb.connect_daemon
+    connects = 0
 
+    async def _counting_connect_daemon(*args, **kwargs):
+        nonlocal connects
+        connects += 1
+        return await real_connect_daemon(*args, **kwargs)
 
-@pytest.mark.asyncio
-async def test_get_task_fresh_and_read_conn_unpinned_when_cached_read_connection_pinned(
-    backend, project_root,
-):
-    """get_task must return the fresh committed status — and clear the pin
-    behind it — even when the cached READ connection itself has a read
-    transaction left open on it (task 2694; residual gap after task 2651
-    moved get_task off the pinnable WRITE connection but did not harden the
-    READ connection against being pinned itself).
+    monkeypatch.setattr(_sb, 'connect_daemon', _counting_connect_daemon)
 
-    Direct reproduction of the task 2679 incident: a leaked/partially-
-    stepped cursor (simulated here via an explicit BEGIN + materialized
-    SELECT, per ``_get_read_connection``'s Guardrail note) pins the cached
-    read connection to a stale WAL snapshot; get_task must not silently
-    keep serving that stale snapshot. The freshness guard rolls back any
-    lingering transaction before serving a read, so get_task both returns
-    the fresh status AND leaves the connection's ``in_transaction`` flag
-    False afterward — the pin is cleared, not just papered over for this
-    one call.
-    """
-    await _pin_cached_read_connection_then_commit_out_of_band(backend, project_root)
+    assert await read(backend, project_root) == fresh
+    assert connects == 0, f'Expected the reread to reuse the warm connection, opened {connects}'
 
-    task = await backend.get_task('1', project_root)
-
-    assert task['status'] == 'cancelled', (
-        f"get_task must see the fresh committed status despite the pinned "
-        f"cached read connection, got {task['status']!r}"
-    )
-    assert backend._read_connections[project_root].in_transaction is False, (
-        'Expected the freshness guard to have rolled back the lingering '
-        'transaction on the cached read connection'
-    )
-
-
-@pytest.mark.asyncio
-async def test_cached_read_conn_reads_serialize_on_read_lock(backend, project_root):
-    """Cached-read-connection reads must serialize through a per-project
-    read lock (task 2694), so the freshness guard's rollback can never run
-    between a concurrent peer reader's execute and fetch and tear its
-    in-flight cursor — the shared read connection genuinely serves
-    concurrent readers (see ``_get_read_connection``'s "Serialization
-    trade-off" note), so an unserialized rollback would be a correctness
-    bug, not just a performance one.
-
-    Holds ``backend._read_lock(project_root)`` open manually (standing in
-    for an in-flight guarded read) and asserts a concurrent ``get_task``
-    call blocks until the lock is released, then completes with the fresh
-    status once it is.
-    """
-    await backend.add_task(project_root=project_root, title='T1')  # id=1
-    await backend.set_task_status('1', 'done', project_root)
-
-    lock = backend._read_lock(project_root)
-    await lock.acquire()
-    try:
-        pending = asyncio.create_task(backend.get_task('1', project_root))
-        await asyncio.sleep(0.05)
-        assert not pending.done(), (
-            'Expected get_task to block on the read lock while it is held'
-        )
-    finally:
-        lock.release()
-
-    result = await pending
-    assert result['status'] == 'done'
-
-
-@pytest.mark.asyncio
-async def test_get_tasks_tree_fresh_when_cached_read_connection_pinned(
-    backend, project_root,
-):
-    """get_tasks (the full-tree read) must reflect the latest committed
-    status even when the cached READ connection itself has a read
-    transaction pinned open (task 2694).
-
-    Companion to
-    ``test_get_task_fresh_and_read_conn_unpinned_when_cached_read_connection_pinned``,
-    covering the full-tree read surface (``get_tasks``/
-    ``_get_tasks_internal``): as of task 2694 step-4, ``_get_tasks_internal``
-    reads through ``_fresh_read_conn``, which rolls back any lingering pin
-    before serving the tasks-row SELECT and the ``_fetch_dependencies``
-    call, so the returned tree reflects the fresh committed status rather
-    than the stale pinned snapshot.
-    """
-    await _pin_cached_read_connection_then_commit_out_of_band(backend, project_root)
-
-    result = await backend.get_tasks(project_root)
-    by_id = {t['id']: t for t in result['tasks']}
-
-    assert by_id['1']['status'] == 'cancelled', (
-        f"get_tasks tree must reflect the fresh committed status despite "
-        f"the pinned cached read connection, got {by_id['1']['status']!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_get_statuses_fresh_when_cached_read_connection_pinned(
-    backend, project_root,
-):
-    """get_statuses (bulk and scoped) must reflect the latest committed
-    status even when the cached READ connection itself has a read
-    transaction pinned open (task 2694).
-
-    Companion to
-    ``test_get_task_fresh_and_read_conn_unpinned_when_cached_read_connection_pinned``,
-    covering the ``get_statuses``/``get_statuses_raw`` surface: as of task
-    2694 step-4, ``get_statuses_raw`` reads through ``_fresh_read_conn``
-    (via ``_statuses_from_conn``), which rolls back any lingering pin
-    before serving the read, so both the bulk and scoped queries see the
-    fresh committed status rather than the stale pinned snapshot.
-    """
-    await _pin_cached_read_connection_then_commit_out_of_band(backend, project_root)
-
-    bulk = await backend.get_statuses(project_root)
-    assert bulk['1'] == 'cancelled', (
-        f"Expected the bulk get_statuses to see fresh 'cancelled' despite "
-        f"the pinned cached read connection, got: {bulk}"
-    )
-
-    scoped = await backend.get_statuses(project_root, ids=['1'])
-    assert scoped['1'] == 'cancelled', (
-        f"Expected the scoped get_statuses to see fresh 'cancelled' despite "
-        f"the pinned cached read connection, got: {scoped}"
-    )
+    await read(backend, cold_root)
+    assert connects == 1, f'Expected one read-connection bring-up on a cold project, counted {connects}'
 
 
 @pytest.mark.asyncio
 async def test_close_drains_cached_read_connections(backend, project_root):
     """close() must drain the cached read connections opened by
-    :meth:`~SqliteTaskBackend._get_read_connection` (task 2455), not just
+    :meth:`~SqliteTaskBackend._get_read_access` (task 2455), not just
     the write connections in ``self._write_accesses`` — otherwise the
     autocommit read connection is leaked open (a stray file handle / WAL
     reader) past shutdown.
@@ -6085,36 +5989,53 @@ async def test_close_drains_cached_read_connections(backend, project_root):
     # Lazily opens a cached read connection for project_root.
     await backend.get_statuses(project_root)
 
-    assert project_root in backend._read_connections, (
+    assert project_root in backend._read_accesses, (
         'Expected a cached read connection to have been opened for project_root'
     )
-    read_conn = backend._read_connections[project_root]
+    access = backend._read_accesses[project_root]
 
     await backend.close()
 
-    assert backend._read_connections == {}, (
-        f'Expected _read_connections to be drained/cleared by close(), got: {backend._read_connections}'
+    assert backend._read_accesses == {}, (
+        f'Expected _read_accesses to be drained/cleared by close(), got: {backend._read_accesses}'
     )
     # A closed aiosqlite connection raises ValueError on further operations.
     with pytest.raises(ValueError):
-        await read_conn.execute('SELECT 1')
+        await access.connection.execute('SELECT 1')
 
 
 @pytest.mark.asyncio
-async def test_get_read_connection_does_not_leak_when_closed_during_bring_up(
+async def test_close_runs_no_wal_checkpoint_on_the_read_connection(backend, project_root):
+    """The read connection never writes, so close() owes it no WAL checkpoint.
+
+    A TRUNCATE checkpoint there busy-waits behind any other process's open
+    snapshot, spending the shared shutdown budget on a no-op.
+    """
+    await backend.add_task(project_root=project_root, title='T1')
+    conn = (await backend._get_read_access(project_root)).connection
+    recorded_sql: list[str] = []
+    await conn.set_trace_callback(recorded_sql.append)
+
+    await backend.close()
+
+    assert [sql for sql in recorded_sql if 'wal_checkpoint' in sql.lower()] == []
+
+
+@pytest.mark.asyncio
+async def test_get_read_access_does_not_leak_when_closed_during_bring_up(
     backend, project_root, monkeypatch,
 ):
-    """_get_read_connection must not strand a live connection in
-    ``self._read_connections`` if ``close()`` runs concurrently between its
+    """_get_read_access must not strand a live connection in
+    ``self._read_accesses`` if ``close()`` runs concurrently between its
     initial ``self._closed`` check and its ``_connect_locks_lock``
     acquisition.
 
     Regression test for a narrow resource-leak race flagged in task 2455
     review: the re-check-after-acquiring-the-lock only tested
-    ``self._read_connections.get(project_root)``, not ``self._closed`` — so
+    ``self._read_accesses.get(project_root)``, not ``self._closed`` — so
     a ``close()`` that ran (and drained the then-empty map) during the
     ``await self._get_write_access(...)`` bring-up call, before
-    ``_get_read_connection`` reached the lock, would let it go on to open
+    ``_get_read_access`` reached the lock, would let it go on to open
     and cache a brand-new connection that ``close()`` would never revisit —
     a leaked file handle / WAL reader past shutdown.
     """
@@ -6126,7 +6047,7 @@ async def test_get_read_connection_does_not_leak_when_closed_during_bring_up(
         access = await real_get_write_access(self, root)
         # Simulate close() winning the race here: it runs to completion
         # (setting self._closed and draining the — at this point still
-        # empty — _read_connections map) before _get_read_connection
+        # empty — _read_accesses map) before _get_read_access
         # reaches its lock acquisition below.
         await self.close()
         return access
@@ -6134,29 +6055,29 @@ async def test_get_read_connection_does_not_leak_when_closed_during_bring_up(
     monkeypatch.setattr(SqliteTaskBackend, '_get_write_access', _get_write_access_then_close)
 
     with pytest.raises(RuntimeError, match='closed'):
-        await backend._get_read_connection(project_root)
+        await backend._get_read_access(project_root)
 
-    assert backend._read_connections == {}, (
-        'Expected no connection to be stranded in _read_connections after a '
-        f'close() race, got: {backend._read_connections}'
+    assert backend._read_accesses == {}, (
+        'Expected no connection to be stranded in _read_accesses after a '
+        f'close() race, got: {backend._read_accesses}'
     )
 
 
 @pytest.mark.asyncio
-async def test_get_read_connection_does_not_leak_when_closed_during_open(
+async def test_get_read_access_does_not_leak_when_closed_during_open(
     backend, project_root, monkeypatch,
 ):
-    """_get_read_connection must not strand a live connection in
-    ``self._read_connections`` if ``close()`` runs to completion *during*
+    """_get_read_access must not strand a live connection in
+    ``self._read_accesses`` if ``close()`` runs to completion *during*
     the ``connect_daemon``/``apply_wal_pragmas`` open sequence — i.e. after
     the pre-open ``self._closed`` re-check (inside the per-project lock)
     but before the new connection is cached.
 
     Regression test for a second, narrower resource-leak race flagged in
     task 2455 review (distinct from
-    ``test_get_read_connection_does_not_leak_when_closed_during_bring_up``,
+    ``test_get_read_access_does_not_leak_when_closed_during_bring_up``,
     which covers the earlier window before the lock is acquired): a
-    ``close()`` that wins the race here drains an ``_read_connections`` map
+    ``close()`` that wins the race here drains an ``_read_accesses`` map
     that doesn't contain this in-flight connection yet (it isn't cached
     until after the open completes), so without a post-open re-check the
     connection would be cached anyway — stranded past shutdown, since
@@ -6172,8 +6093,8 @@ async def test_get_read_connection_does_not_leak_when_closed_during_open(
         conn = await real_connect_daemon(*args, **kwargs)
         # Simulate close() winning the race here: it runs to completion
         # (setting self._closed and draining the — at this point still
-        # empty — _read_connections map, since this conn isn't cached
-        # yet) while _get_read_connection is still inside its
+        # empty — _read_accesses map, since this conn isn't cached
+        # yet) while _get_read_access is still inside its
         # connect_daemon/apply_wal_pragmas open sequence.
         await backend.close()
         return conn
@@ -6181,11 +6102,11 @@ async def test_get_read_connection_does_not_leak_when_closed_during_open(
     monkeypatch.setattr(_sb, 'connect_daemon', _connect_daemon_then_close)
 
     with pytest.raises(RuntimeError, match='closed'):
-        await backend._get_read_connection(project_root)
+        await backend._get_read_access(project_root)
 
-    assert backend._read_connections == {}, (
-        'Expected no connection to be stranded in _read_connections after a '
-        f'close() race during open, got: {backend._read_connections}'
+    assert backend._read_accesses == {}, (
+        'Expected no connection to be stranded in _read_accesses after a '
+        f'close() race during open, got: {backend._read_accesses}'
     )
 
 
@@ -6198,14 +6119,14 @@ async def test_get_statuses_concurrent_cold_open_opens_single_read_connection(
     connection — not one per caller.
 
     Regression test for the "another caller raced us to open" branch inside
-    :meth:`_get_read_connection` (task 2455 review): both coroutines pass
-    the initial ``project_root in self._read_connections`` fast-path check
+    :meth:`_get_read_access` (task 2455 review): both coroutines pass
+    the initial ``project_root in self._read_accesses`` fast-path check
     (miss — cold read cache) and both reach the per-project lock via
     ``asyncio.gather``, but only the winner should actually call
     ``connect_daemon``; the loser must hit the in-lock re-check
-    (``conn = self._read_connections.get(project_root); if conn is not
-    None: return conn``) and get back the winner's connection instead of
-    opening a second one. A bare ``len(backend._read_connections) == 1``
+    (``access = self._read_accesses.get(project_root); if access is not
+    None: return access``) and get back the winner's connection instead of
+    opening a second one. A bare ``len(backend._read_accesses) == 1``
     check can't distinguish "opened once" from "opened twice, second one
     silently overwritten/leaked" — both leave exactly one entry in the
     dict — so this counts actual ``connect_daemon`` invocations via a spy
@@ -6213,14 +6134,14 @@ async def test_get_statuses_concurrent_cold_open_opens_single_read_connection(
 
     The WRITE connection is warmed first (via ``add_task``) so the only
     cold cache in play when the race starts is the READ connection —
-    isolating this test to :meth:`_get_read_connection`'s own lock, rather
+    isolating this test to :meth:`_get_read_access`'s own lock, rather
     than :meth:`_get_write_access`'s (already covered by the
     close()-during-bring-up/open regression tests above).
     """
     from fused_memory.backends import sqlite_task_backend as _sb
 
     await backend.add_task(project_root=project_root, title='T1')  # id=1, pending
-    assert project_root not in backend._read_connections, (
+    assert project_root not in backend._read_accesses, (
         'Expected the read-connection cache to still be cold before the race'
     )
 
@@ -6246,9 +6167,9 @@ async def test_get_statuses_concurrent_cold_open_opens_single_read_connection(
         "(the second caller should reuse the winner's cached connection via "
         f'the in-lock re-check), got {call_count}'
     )
-    assert list(backend._read_connections) == [project_root], (
+    assert list(backend._read_accesses) == [project_root], (
         f'Expected a single cached read connection for project_root, got: '
-        f'{backend._read_connections}'
+        f'{backend._read_accesses}'
     )
 
 
@@ -6266,10 +6187,10 @@ async def test_get_statuses_raw_propagates_when_read_connection_open_raises(
     best-effort census caller, but get_statuses/get_statuses_raw feed the
     scheduler dispatch gate and ``get_external_statuses``, which must see a
     failure surface as an error rather than silently misreading ``{}`` as
-    "no tasks" (see get_statuses_raw's and _get_read_connection's
-    docstrings). Pins that _get_read_connection's error surface survived
+    "no tasks" (see get_statuses_raw's and _get_read_access's
+    docstrings). Pins that _get_read_access's error surface survived
     task 2455's move of get_statuses_raw onto it — a future refactor of
-    _get_read_connection that accidentally swallowed a
+    _get_read_access that accidentally swallowed a
     connect_daemon/apply_wal_pragmas failure into ``{}`` would be caught
     here.
     """
@@ -6279,7 +6200,7 @@ async def test_get_statuses_raw_propagates_when_read_connection_open_raises(
     # connection already exist — isolates the simulated failure to the
     # READ connection's own (still cold) open sequence.
     await backend.add_task(project_root=project_root, title='T1')
-    assert project_root not in backend._read_connections, (
+    assert project_root not in backend._read_accesses, (
         'Expected the read-connection cache to still be cold'
     )
 
@@ -7842,6 +7763,149 @@ async def test_update_task_invalid_metadata_mode_always_raises(
             metadata_mode='bogus',
         )
     assert exc2.value.code == 'TASKMASTER_TOOL_ERROR'
+
+
+# ── fieldless update_task is refused (task 4867) ──
+
+
+async def _updated_at(backend, project_root, task_id='1') -> str:
+    task = await backend.get_task(task_id, project_root=project_root)
+    return task['updatedAt']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'ignored_arguments',
+    [
+        pytest.param({}, id='nothing-at-all'),
+        pytest.param({'append': True}, id='append-only'),
+        pytest.param({'append': False}, id='append-false-only'),
+        pytest.param({'metadata_mode': 'merge'}, id='metadata_mode-only'),
+        pytest.param({'tag': 'master'}, id='tag-only'),
+        pytest.param(
+            {'append': True, 'metadata_mode': 'additive', 'tag': 'master'},
+            id='every-non-mutating-parameter',
+        ),
+    ],
+)
+async def test_update_task_with_no_mutating_field_raises_and_writes_nothing(
+    backend, project_root, ignored_arguments,
+):
+    """A call whose only arguments are non-mutating must fail loudly.
+
+    Two L2 escalations (esc-3147-7, esc-3671-7) came from a caller's
+    misnamed ``metadata`` argument being dropped: the call wrote nothing and
+    still returned ``updated: True`` after bumping ``updated_at``.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    before = await backend.get_task('1', project_root=project_root)
+    await asyncio.sleep(0.01)
+
+    with pytest.raises(NoFieldsToUpdateError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, **ignored_arguments,
+        )
+
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert exc.value.operation == 'update_task'
+    assert exc.value.task_id == '1'
+    assert set(exc.value.accepted_fields) == {
+        'prompt', 'metadata', 'title', 'description', 'details', 'priority',
+        'dependencies',
+    }
+    for name in exc.value.accepted_fields:
+        assert name in str(exc.value), (
+            f'the message must name every field the caller could have '
+            f'supplied; {name!r} missing from {str(exc.value)!r}'
+        )
+    after = await backend.get_task('1', project_root=project_root)
+    assert after == before, 'a refused fieldless call must not touch the row'
+
+
+@pytest.mark.asyncio
+async def test_update_task_fieldless_refusal_precedes_the_existence_lookup(
+    backend, project_root,
+):
+    """The refusal is a floor, judged before the row is read."""
+    with pytest.raises(NoFieldsToUpdateError):
+        await backend.update_task('9999', project_root=project_root)
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_floor_outranks_the_fieldless_refusal(
+    backend, project_root,
+):
+    """``status`` is not a mutating field here, but it names the real mistake."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    with pytest.raises(StatusWriteAuthorityError):
+        await backend.update_task('1', project_root=project_root, status='done')
+
+
+@pytest.mark.asyncio
+async def test_update_task_bad_metadata_mode_outranks_the_fieldless_refusal(
+    backend, project_root,
+):
+    """A supplied-but-wrong argument is reported before an absent one."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, metadata_mode='bogus',
+        )
+
+    assert not isinstance(exc.value, NoFieldsToUpdateError)
+    assert 'bogus' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_update_task_empty_dependencies_list_is_a_real_write(
+    backend, project_root,
+):
+    """``dependencies=[]`` clears the list; it is not a fieldless call."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_task(project_root=project_root, title='b')
+    await backend.update_task('2', project_root=project_root, dependencies=['1'])
+    assert (await backend.get_task('2', project_root=project_root))['dependencies']
+
+    await backend.update_task('2', project_root=project_root, dependencies=[])
+
+    assert (await backend.get_task('2', project_root=project_root))['dependencies'] == []
+
+
+@pytest.mark.asyncio
+async def test_update_task_empty_metadata_object_is_a_real_write(
+    backend, project_root,
+):
+    """``metadata='{}'`` is a write (the orchestrator harness can produce it)."""
+    await backend.add_task(project_root=project_root, title='t')
+    before = await _updated_at(backend, project_root)
+    await asyncio.sleep(0.01)
+
+    result = await backend.update_task('1', project_root=project_root, metadata='{}')
+
+    assert result['updated'] is True
+    assert await _updated_at(backend, project_root) != before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field',
+    [
+        {'prompt': 'p'}, {'metadata': '{"k": "v"}'}, {'title': 'new'},
+        {'description': 'd'}, {'details': 'x'}, {'priority': 'high'},
+        {'dependencies': []},
+    ],
+    ids=lambda field: next(iter(field)),
+)
+async def test_update_task_each_mutating_field_alone_is_accepted(
+    backend, project_root, field,
+):
+    await backend.add_task(project_root=project_root, title='t')
+
+    result = await backend.update_task('1', project_root=project_root, **field)
+
+    assert result['updated'] is True
 
 
 # ── write-boundary validation (task 2162, update_task post-merge I3) ──

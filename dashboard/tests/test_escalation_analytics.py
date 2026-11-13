@@ -117,27 +117,47 @@ def _aggregate(
 # step-1: load_regime_markers
 # ---------------------------------------------------------------------------
 
+COMMITTED_REGIME_MARKERS = [
+    {'date': '2026-07-15', 'label': 'Starvation threshold raised to 72h', 'tasks': [2631]},
+    {'date': '2026-07-15', 'label': 'Auto-watcher benign closes', 'tasks': [2630]},
+    {'date': '2026-07-15', 'label': 'Verify-scope flip', 'tasks': [2593]},
+]
+
 
 class TestLoadRegimeMarkers:
     """load_regime_markers(path) -> (markers, parse_failures_delta). Never raises."""
 
     def test_default_path_parses_committed_seed_file(self):
-        """The committed dashboard/regime-markers.yaml parses to exactly 3 markers."""
+        """The committed file's regime entries, unchanged; its quality artefact is not one of them."""
         markers, parse_failures_delta = load_regime_markers()
 
         assert parse_failures_delta == 0
-        assert len(markers) == 3
-        for m in markers:
-            assert set(m) == {'date', 'label', 'tasks'}
-            # Must be JSON-serializable: yaml.safe_load parses unquoted
-            # YYYY-MM-DD as a datetime.date, which is NOT JSON-serializable —
-            # the loader must normalize it to a str.
-            assert isinstance(m['date'], str)
-            assert isinstance(m['label'], str)
-            assert isinstance(m['tasks'], list)
+        assert markers == COMMITTED_REGIME_MARKERS
 
-        all_tasks = sorted(t for m in markers for t in m['tasks'])
-        assert all_tasks == [2593, 2630, 2631]
+    def test_only_regime_entries_are_escalation_regime_markers(self, tmp_path):
+        mixed = tmp_path / 'mixed.yaml'
+        mixed.write_text(
+            '- {date: 2026-07-15, label: a regime, tasks: [1]}\n'
+            '- {date: 2026-10-16, until: 2026-10-16, kind: artefact, label: an artefact}\n'
+            '- {date: 2026-11-01, kind: effort, label: an effort change}\n'
+        )
+
+        assert load_regime_markers(mixed) == ([{'date': '2026-07-15', 'label': 'a regime', 'tasks': [1]}], 0)
+
+    def test_a_rejected_entry_is_counted_in_the_delta(self, tmp_path):
+        partly_bad = tmp_path / 'partly-bad.yaml'
+        partly_bad.write_text('- {date: 2026-07-15, label: kept}\n- not a mapping\n')
+
+        assert load_regime_markers(partly_bad) == ([{'date': '2026-07-15', 'label': 'kept', 'tasks': []}], 1)
+
+    def test_the_payload_serves_the_committed_regime_markers(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+
+        result = _analytics([('dark_factory', esc_dir, _make_runs_db(tmp_path, []))], now=now)
+
+        assert result['regime_markers'] == COMMITTED_REGIME_MARKERS
 
     def test_malformed_yaml_returns_empty_and_one_failure(self, tmp_path):
         """Unparseable YAML syntax -> ([], 1), never raises."""

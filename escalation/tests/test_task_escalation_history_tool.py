@@ -17,10 +17,7 @@ the delegation, the ``level_filter`` echo, and the no-``status`` safety pin
 fast path — that is the exact false-absence trap this PRD exists to
 remove).
 
-Uses the sync-tool FastMCP unit-test pattern established by
-``test_task_runtime_state_tool.py``: ``tool = await server.get_tool(name);
-tool.fn(**kwargs)`` — no ``await`` on ``.fn()`` itself, since the tool body
-is a sync ``def``.
+Drives the tool through ``_tool_calls.py::call_tool``.
 """
 
 from __future__ import annotations
@@ -29,6 +26,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _pending_tool_fixtures import _get_pending
+from _tool_calls import call_tool
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -36,19 +35,7 @@ from escalation.server import create_server
 
 
 async def _history(server: Any, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the get_task_escalation_history MCP tool directly (sync tool)."""
-    tool = await server.get_tool('get_task_escalation_history')
-    return tool.fn(**kwargs)
-
-
-async def _get_pending(server: Any, **kwargs: Any) -> list[dict[str, Any]]:
-    """Invoke get_pending_escalations directly, for the B6 contrast.
-
-    Async as of task 3543 (it awaits a batched scheduler status read for the
-    pins_recovery annotation), unlike its sync siblings above.
-    """
-    tool = await server.get_tool('get_pending_escalations')
-    return await tool.fn(**kwargs)
+    return await call_tool(server, 'get_task_escalation_history', **kwargs)
 
 
 @pytest.mark.asyncio

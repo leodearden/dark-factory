@@ -15,10 +15,13 @@ import pytest
 from _curator_helpers import agent_result, empty_corpus, escalator_double, make_config
 from shared.config_dir import CONFIG_DIR_PREFIX, reset_sweep_once_state, sweep_stale_pid_dirs
 from shared.usage_gate import UsageGate
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
 from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CURATOR_MODULE = 'fused_memory.middleware.task_curator'
 _SWEEP = f'{_CURATOR_MODULE}.sweep_stale_pid_dirs'

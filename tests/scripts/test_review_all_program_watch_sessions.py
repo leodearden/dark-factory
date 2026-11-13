@@ -11,6 +11,7 @@ import dataclasses
 import json
 import os
 import shutil
+import socket
 import subprocess
 import types
 from collections.abc import Iterator
@@ -26,6 +27,7 @@ from review_all_program_fixture import (
     load_session_registry,
     running_fake_store,
 )
+from shared.process_identity import ProcessIdentity, capture
 
 SCRIPT = 'watch_sessions.py'
 SPAWNED_AFTER = '2026-10-19T09:00:00Z'
@@ -623,11 +625,24 @@ def test_a_hand_back_is_final_iff_its_outcome_is_terminal_and_its_record_exited(
     assert _applied(s2) is (terminal and status == 'exited')
 
 
-def _sibling_record(env: ProgramEnv, *, exit_requested_at: str | None, owner_pid: int) -> None:
+def _sibling_record(
+    env: ProgramEnv,
+    *,
+    exit_requested_at: str | None,
+    owner_pid: int,
+    owner_identity: ProcessIdentity | None = None,
+) -> None:
     put_written_record(
         env, result_md('done'), status='idle', spawn_mode='sibling',
         exit_requested_at=exit_requested_at, claude_owner_pid=owner_pid,
+        claude_owner_identity=None if owner_identity is None else dataclasses.asdict(owner_identity),
     )
+
+
+def _own_identity() -> ProcessIdentity:
+    identity = capture(os.getpid())
+    assert identity is not None
+    return identity
 
 
 def test_a_sibling_whose_self_exit_owner_is_dead_is_final(s2: ProgramEnv) -> None:
@@ -648,6 +663,55 @@ def test_a_sibling_whose_self_exit_owner_is_alive_is_finished_not_exited(s2: Pro
     assert proc.returncode == 0, _output(proc)
     assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: finished, not exited')
     assert not _applied(s2)
+
+
+def test_a_dead_local_pid_does_not_end_an_owner_on_another_host(s2: ProgramEnv) -> None:
+    reaped = _reaped_pid()
+    elsewhere = ProcessIdentity(reaped, 1, 'boot-x', 'other-host.invalid')
+    _sibling_record(
+        s2, exit_requested_at=EXIT_REQUESTED_AT, owner_pid=reaped, owner_identity=elsewhere,
+    )
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: finished, not exited')
+    assert not _applied(s2)
+
+
+def test_a_live_pid_whose_start_ticks_differ_is_a_dead_owner_and_final(s2: ProgramEnv) -> None:
+    live = _own_identity()
+    reused = dataclasses.replace(live, start_ticks=live.start_ticks + 1)
+    _sibling_record(
+        s2, exit_requested_at=EXIT_REQUESTED_AT, owner_pid=os.getpid(), owner_identity=reused,
+    )
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: final')
+    assert _applied(s2)
+
+
+def test_the_standing_line_names_the_launchers_host(s2: ProgramEnv) -> None:
+    put_written_record(
+        s2, result_md('done'), status='idle',
+        launcher_pid=os.getpid(), launcher_identity=dataclasses.asdict(_own_identity()),
+    )
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert f'host={socket.gethostname()}' in standing_line(proc, S2_TITLE)
+
+
+def test_the_standing_line_of_a_record_without_an_identity_is_unqualified(s2: ProgramEnv) -> None:
+    put_written_record(s2, result_md('done'), status='idle')
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert 'host=unqualified' in standing_line(proc, S2_TITLE)
 
 
 def test_a_dead_owner_without_a_self_exit_attempt_is_not_final(s2: ProgramEnv) -> None:

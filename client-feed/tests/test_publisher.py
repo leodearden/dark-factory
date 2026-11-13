@@ -5,6 +5,7 @@ import os
 import shutil
 import threading
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,7 +14,7 @@ import pytest
 from _archive_files import junit_xml, passed, red, write_junit, write_plan, write_summary
 from _git_repo import Repo, make_repo, path_with_git_answering, path_with_git_killed_on
 from _in_dir import write_engagement
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 from shared.project_layout import runs_db, tasks_db
 
 from client_feed.contract import (
@@ -84,11 +85,12 @@ def prd_markdown(title: str) -> str:
 
 @dataclass(frozen=True)
 class Project:
-    """A fixture root as the publisher meets it: main, task branches, the two stores, a verify archive."""
+    """A fixture root as the publisher meets it: main, task branches, the two stores, the escalation queue, a verify archive."""
 
     repo: Repo
     tasks: TasksDb
     runs: RunsDb
+    queue: EscalationQueueDir
     policy: Policy
     merge: str
     last_stream_id: int
@@ -163,13 +165,17 @@ def project(tmp_path: Path) -> Project:
     landed = runs.emit(
         'merge_finalized', at=at(20), task_id=7, phase='merge', data={'state': 'done', 'merge_sha': merge}
     )
-    runs.emit('escalation_created', at=at(25), task_id=9, data={'escalation_id': 'esc-9-1', 'level': 2})
     runs.emit('scheduler_paused', at=at(30))
+    queue = EscalationQueueDir.create(repo.root)
+    queue.write('esc-9-1', task_id='9', level=2)
     out_dir = tmp_path / 'out'
     out_dir.mkdir()
     policy = policy_over(repo.root, out_dir, tmp_path / 'in')
     write_engagement(policy.in_dir, project_id=PROJECT)
-    return Project(repo=repo, tasks=tasks, runs=runs, policy=policy, merge=merge, last_stream_id=landed)
+    return Project(
+        repo=repo, tasks=tasks, runs=runs, queue=queue, policy=policy, merge=merge,
+        last_stream_id=landed,
+    )
 
 
 def feed(project: Project) -> tuple[FeedLine, ...]:
@@ -359,16 +365,23 @@ def test_an_unreadable_runs_db_is_named_events_and_every_other_source_still_publ
     assert_valid(project)
 
 
-def test_a_restored_runs_db_publishes_the_held_stream_and_rewaits_the_escalated_task(
+def upserted_task(lines: tuple[FeedLine, ...], task_id: int) -> TaskUpserted:
+    (task,) = (line for line in lines if isinstance(line, TaskUpserted) and line.task_id == task_id)
+    return task
+
+
+def test_an_unreadable_runs_db_holds_the_stream_but_not_who_the_escalated_task_waits_on(
     project: Project,
 ) -> None:
     good = runs_db(project.root).read_bytes()
     runs_db(project.root).write_bytes(NOT_A_DATABASE)
     out = project.open()
-    run_pass(project.policy, out, now=NOW)
+
+    blind = run_pass(project.policy, out, now=NOW)
+
     held = feed(project)
-    (task_9,) = (line for line in held if isinstance(line, TaskUpserted) and line.task_id == 9)
-    assert task_9.waiting_on is WaitingOn.FACTORY
+    assert [degradation.source for degradation in blind.degraded] == [Source.EVENTS]
+    assert upserted_task(held, 9).waiting_on is WaitingOn.LEO
     assert_valid(project)
     runs_db(project.root).write_bytes(good)
 
@@ -377,26 +390,73 @@ def test_a_restored_runs_db_publishes_the_held_stream_and_rewaits_the_escalated_
     recovered = feed(project)[len(held) :]
     assert report.degraded == ()
     assert {'task_phase', 'verify_run', 'merge_landed'} <= types_of(recovered)
-    upserts = [line for line in recovered if isinstance(line, TaskUpserted)]
-    assert [(task.task_id, task.waiting_on) for task in upserts] == [(9, WaitingOn.LEO)]
     assert stored_cursor(project).events_id == project.last_stream_id
     assert_valid(project)
 
 
-def test_a_rescan_while_runs_db_is_unreadable_holds_the_escalated_tasks_waiting_on(
+def test_a_missing_escalation_queue_is_named_events_and_its_return_rewaits_the_escalated_task(
     project: Project,
+) -> None:
+    shutil.rmtree(project.queue.path)
+    out = project.open()
+
+    blind = run_pass(project.policy, out, now=NOW)
+
+    first = feed(project)
+    (degradation,) = blind.degraded
+    assert degradation.source is Source.EVENTS
+    assert 'data/escalations' in degradation.reason
+    assert upserted_task(first, 9).waiting_on is WaitingOn.FACTORY
+    assert_valid(project)
+    EscalationQueueDir.create(project.root).write('esc-9-1', task_id='9', level=2)
+
+    report = run_pass(project.policy, out, now=NOW, rescan_tasks=False)
+
+    upserts = [line for line in feed(project)[len(first) :] if isinstance(line, TaskUpserted)]
+    assert report.degraded == ()
+    assert [(task.task_id, task.waiting_on) for task in upserts] == [(9, WaitingOn.LEO)]
+    assert_valid(project)
+
+
+def _queue_replaced_by_a_file(queue: Path) -> None:
+    shutil.rmtree(queue)
+    queue.write_text('not a directory')
+
+
+@pytest.mark.parametrize(
+    'break_queue', [shutil.rmtree, _queue_replaced_by_a_file], ids=['removed', 'replaced-by-a-file']
+)
+def test_a_rescan_while_the_escalation_queue_is_unreadable_holds_the_escalated_tasks_waiting_on(
+    project: Project, break_queue: Callable[[Path], object]
 ) -> None:
     out = project.open()
     run_pass(project.policy, out, now=NOW)
     assert out.state.tasks[9].waiting_on is WaitingOn.LEO
     first = feed(project)
-    runs_db(project.root).write_bytes(NOT_A_DATABASE)
+    break_queue(project.queue.path)
 
     report = run_pass(project.policy, out, now=NOW, rescan_tasks=True)
 
     assert [degradation.source for degradation in report.degraded] == [Source.EVENTS]
     assert 'task_upserted' not in types_of(feed(project)[len(first) :])
     assert out.state.tasks[9].waiting_on is WaitingOn.LEO
+    assert_valid(project)
+
+
+def test_a_malformed_escalation_record_is_counted_and_the_escalated_task_still_waits_on_leo(
+    project: Project,
+) -> None:
+    project.queue.write_raw('esc-9-2.json', '{not json')
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert report.degraded == (
+        Degradation(
+            source=Source.EVENTS,
+            reason='skipped 1 records in data/escalations: malformed_record=1',
+        ),
+    )
+    assert upserted_task(feed(project), 9).waiting_on is WaitingOn.LEO
     assert_valid(project)
 
 

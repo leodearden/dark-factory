@@ -11,6 +11,7 @@ import copy
 import dataclasses
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,10 @@ import pytest
 import quality_metrics_snapshot as snapshot
 import source_measures
 from git_listing import git
+from quality_snapshot_identity import below_run_id_and_cost
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 
@@ -55,7 +60,7 @@ _BASE: dict[str, str] = {
 
 _BASE_DOMAIN = frozenset(path for path in _BASE if not path.startswith('hooks/'))
 
-_IDENTITY = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
+_COMMITTER = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
 
 
 def _write(root: Path, files: dict[str, str]) -> None:
@@ -72,7 +77,7 @@ def _repo(tmp_path: Path, files: dict[str, str]) -> Path:
     git(root, 'init', '-q')
     _write(root, {'pyproject.toml': _PYPROJECT, **files})
     git(root, 'add', '-A')
-    git(root, *_IDENTITY, 'commit', '--no-verify', '-q', '-m', 'base')
+    git(root, *_COMMITTER, 'commit', '--no-verify', '-q', '-m', 'base')
     return root
 
 
@@ -90,7 +95,7 @@ def _commit(
     for source, destination in moves:
         git(root, 'mv', source, destination)
     git(root, 'add', '-A')
-    git(root, *_IDENTITY, 'commit', '--no-verify', '--allow-empty', '-q', '-m', message)
+    git(root, *_COMMITTER, 'commit', '--no-verify', '--allow-empty', '-q', '-m', message)
 
 
 def _run(root: Path, out: Path, *extra: str) -> int:
@@ -102,6 +107,27 @@ def _measured(tmp_path: Path, files: dict[str, str]) -> dict[str, Any]:
     out = tmp_path / 'out' / 'snapshot.json'
     assert _run(root, out) == 0
     return json.loads(out.read_text(encoding='utf-8'))
+
+
+def _run_in_a_process(root: Path, out: Path, run_id: str, *, hash_seed: str) -> None:
+    """Measure *root* through the real entry point, in a process of its own with *hash_seed*."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith('GIT_') or key == 'GIT_CEILING_DIRECTORIES'
+    }
+    env['PYTHONHASHSEED'] = hash_seed
+    proc = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / 'scripts' / 'quality_metrics_snapshot.py'),
+            '--run-id', run_id, '--out', str(out), '--root', str(root),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +177,7 @@ class TestTheHeader:
         out = tmp_path / 'out' / 'snapshot.json'
         assert _run(root, out) == 0
         measured = json.loads(out.read_text(encoding='utf-8'))
-        assert measured['schema_version'] == 2
+        assert measured['schema_version'] == 3
         assert measured['instrument'] == 'quality-metrics-snapshot'
         assert measured['run_id'] == 'run-1'
         assert measured['as_of_sha'] == git(root, 'rev-parse', 'HEAD').strip()
@@ -162,11 +188,25 @@ class TestTheHeader:
         assert evidence['complete'] is True
         wall_clock = measured['cost']['wall_clock_s']
         assert isinstance(wall_clock, float) and wall_clock >= 0
+        assert list(measured['params']) == [
+            'complexipy_version', 'python_version', 'instrument',
+            'h14_soft_ceiling_lines', 'h14_alarm_lines',
+        ]
         assert measured['params'] == {
             'complexipy_version': source_measures.complexipy_version(),
+            'python_version': platform.python_version(),
+            'instrument': {
+                'quality_metrics_snapshot': _blob_on_disk('scripts/quality_metrics_snapshot.py'),
+                'source_measures': _blob_on_disk('scripts/source_measures.py'),
+            },
             'h14_soft_ceiling_lines': 1500,
             'h14_alarm_lines': 2000,
         }
+
+
+def _blob_on_disk(relpath: str) -> str:
+    """The running instrument file's blob id: hash-object, so an uncommitted edit still agrees."""
+    return git(REPO_ROOT, 'hash-object', '--', relpath).strip()
 
 
 class TestFileRecords:
@@ -278,20 +318,8 @@ class TestTheCommandLine:
         assert printed[-1] == 'no previous snapshot given; since = none'
 
     def test_the_real_entry_point_measures_and_writes(self, tmp_path: Path) -> None:
-        root = _repo(tmp_path, _BASE)
         out = tmp_path / 'out' / 'snapshot.json'
-        env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-        proc = subprocess.run(
-            [
-                sys.executable, str(REPO_ROOT / 'scripts' / 'quality_metrics_snapshot.py'),
-                '--run-id', 'r', '--out', str(out), '--root', str(root),
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
-        assert proc.returncode == 0, proc.stderr
+        _run_in_a_process(_repo(tmp_path, _BASE), out, 'r', hash_seed='0')
         assert out.is_file()
 
     @pytest.mark.parametrize(
@@ -301,6 +329,7 @@ class TestTheCommandLine:
             pytest.param(['--out', 'x.json'], id='out-without-run-id'),
             pytest.param(['--current', 'a.json'], id='current-without-diff'),
             pytest.param(['--summary', 'a.json', '--run-id', 'r'], id='summary-with-run-id'),
+            pytest.param(['--params', '--run-id', 'r'], id='params-with-run-id'),
             pytest.param([], id='no-mode'),
         ],
     )
@@ -308,6 +337,18 @@ class TestTheCommandLine:
         with pytest.raises(SystemExit) as raised:
             snapshot.main(argv)
         assert raised.value.code == 2
+
+
+class TestTheParamsMode:
+    def test_it_prints_the_params_a_measurement_records_as_one_json_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        recorded = _measured(tmp_path, _BASE)['params']
+        capsys.readouterr()
+        assert snapshot.main(['--params']) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert len(printed) == 1
+        assert json.loads(printed[0]) == recorded
 
 
 # ---------------------------------------------------------------------------
@@ -1026,9 +1067,17 @@ class TestImportGraphChanges:
         ]
 
 
+def _as_schema_2(taken: dict[str, Any]) -> dict[str, Any]:
+    """What a pre-8463 measurement of the same tree recorded: no python_version or instrument params."""
+    old = copy.deepcopy(taken)
+    old['schema_version'] = 2
+    del old['params']['python_version'], old['params']['instrument']
+    return old
+
+
 def _as_schema_1(taken: dict[str, Any]) -> dict[str, Any]:
     """What a pre-6612 measurement of the same tree recorded, e.g. plans/quality-metrics/review-all-dark_factory-20261008.json."""
-    old = copy.deepcopy(taken)
+    old = _as_schema_2(taken)
     old['schema_version'] = 1
     graph = old['import_graph']
     del graph['hidden_cycles'], graph['typing_cycles']
@@ -1107,14 +1156,197 @@ class TestASchema1SnapshotIsStillRead:
 
     def test_an_unread_version_is_refused_naming_the_read_ones(self, taken: dict[str, Any]) -> None:
         with pytest.raises(source_measures.MetricsError) as raised:
-            snapshot.validate_snapshot({**taken, 'schema_version': 3}, origin='v3')
-        assert 'schema_version is 3' in str(raised.value)
-        assert 'one of [1, 2]' in str(raised.value)
+            snapshot.validate_snapshot({**taken, 'schema_version': 4}, origin='v4')
+        assert 'schema_version is 4' in str(raised.value)
+        assert 'one of [1, 2, 3]' in str(raised.value)
 
     def test_the_instrument_is_checked_before_the_version(self) -> None:
         with pytest.raises(source_measures.MetricsError) as raised:
             snapshot.validate_snapshot({'schema_version': 7, 'instrument': 'other'}, origin='foreign')
         assert 'instrument' in str(raised.value)
+
+
+class TestASchema2SnapshotIsStillRead:
+    @pytest.fixture
+    def taken(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    def test_it_is_valid(self, taken: dict[str, Any]) -> None:
+        old = _as_schema_2(taken)
+        assert snapshot.validate_snapshot(old, origin='v2') == old
+
+    @pytest.mark.parametrize(
+        ('version', 'dropped'),
+        [
+            pytest.param(2, 'instrument', id='schema-2-carrying-python_version'),
+            pytest.param(2, 'python_version', id='schema-2-carrying-instrument'),
+            pytest.param(3, 'instrument', id='schema-3-lacking-instrument'),
+        ],
+    )
+    def test_params_of_another_schema_are_refused(
+        self, taken: dict[str, Any], version: int, dropped: str
+    ) -> None:
+        edited = copy.deepcopy(taken)
+        edited['schema_version'] = version
+        del edited['params'][dropped]
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.validate_snapshot(edited, origin='edited')
+        assert 'params keys' in str(raised.value)
+
+
+class TestMeasurementIdentity:
+    @pytest.fixture
+    def taken(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    def test_it_is_the_recorded_sha_and_params_as_canonical_json(self, taken: dict[str, Any]) -> None:
+        identity = snapshot.measurement_identity(taken)
+        params_json = json.dumps(taken['params'], sort_keys=True)
+        assert identity == snapshot.MeasurementIdentity(taken['as_of_sha'], params_json)
+        assert identity == snapshot.MeasurementIdentity.of(taken['as_of_sha'], taken['params'])
+        assert str(identity) == f"{taken['as_of_sha']} {params_json}"
+
+    def test_it_is_a_hashable_value_its_snapshot_cannot_change(self, taken: dict[str, Any]) -> None:
+        identity = snapshot.measurement_identity(taken)
+        assert {identity: 'measured'}[snapshot.measurement_identity(copy.deepcopy(taken))] == 'measured'
+        before = str(identity)
+        taken['params']['complexipy_version'] = '0.0.0'
+        assert str(identity) == before
+        assert snapshot.measurement_identity(taken) != identity
+
+    def test_two_runs_at_one_identity_are_byte_identical_below_run_id_and_cost(
+        self, tmp_path: Path
+    ) -> None:
+        # Decision 17: identity is (as_of_sha, params), not the checkout path nor the str-hash
+        # seed. Seeds 1 and 5 iterate this fixture's import-edge set in different orders.
+        root = _repo(tmp_path, _SUMMARY_FILES)
+        pinned = tmp_path / 'pinned'
+        git(root, 'worktree', 'add', '--detach', str(pinned), 'HEAD')
+        first, second = tmp_path / 'a.json', tmp_path / 'b.json'
+        _run_in_a_process(root, first, 'run-a', hash_seed='1')
+        _run_in_a_process(pinned, second, 'run-b', hash_seed='5')
+        a, b = snapshot.load_snapshot(first), snapshot.load_snapshot(second)
+        assert snapshot.measurement_identity(a) == snapshot.measurement_identity(b)
+        assert below_run_id_and_cost(first) == below_run_id_and_cost(second)
+        assert a['run_id'] != b['run_id']
+
+    @pytest.mark.parametrize('as_older', [_as_schema_2, _as_schema_1], ids=['schema-2', 'schema-1'])
+    def test_an_older_schema_has_no_identity(
+        self, taken: dict[str, Any], as_older: Callable[[dict[str, Any]], dict[str, Any]]
+    ) -> None:
+        old = as_older(taken)
+        assert not snapshot.identity_known(old)
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.measurement_identity(old)
+        assert 'records no instrument, python_version' in str(raised.value)
+
+    @pytest.mark.parametrize(
+        'pair',
+        [
+            pytest.param(lambda t: (t, copy.deepcopy(t)), id='one-identity'),
+            pytest.param(lambda t: (t, _with_complexipy(t, '0.0.0')), id='params-changed'),
+            pytest.param(lambda t: (t, _as_schema_2(t)), id='schema-3-and-2'),
+            pytest.param(lambda t: (_as_schema_2(t), _as_schema_2(t)), id='both-schema-2'),
+        ],
+    )
+    def test_a_shared_identity_is_exactly_a_diff_without_params_differ(
+        self,
+        taken: dict[str, Any],
+        pair: Callable[[dict[str, Any]], tuple[dict[str, Any], dict[str, Any]]],
+    ) -> None:
+        current, previous = pair(taken)
+        shared = (
+            snapshot.identity_known(current)
+            and snapshot.identity_known(previous)
+            and snapshot.measurement_identity(current) == snapshot.measurement_identity(previous)
+        )
+        differs = snapshot.diff_lines(current, previous)[0].startswith('params differ: ')
+        assert shared is not differs
+
+
+def _with_complexipy(taken: dict[str, Any], version: str) -> dict[str, Any]:
+    edited = copy.deepcopy(taken)
+    edited['params']['complexipy_version'] = version
+    return edited
+
+
+_NOT_ATTRIBUTABLE = (
+    '  not attributable to code: a delta below may come from the params change, not from the code'
+)
+
+
+class TestParamsDiffer:
+    """A params key unknown on either side, or differing, opens the diff; unknown never equals unknown."""
+
+    @pytest.fixture
+    def taken(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    @staticmethod
+    def _new_params(taken: dict[str, Any]) -> tuple[str, str]:
+        params = taken['params']
+        return json.dumps(params['instrument'], sort_keys=True), json.dumps(params['python_version'])
+
+    def test_a_schema_2_previous_reads_instrument_unknown(self, taken: dict[str, Any]) -> None:
+        instrument, python = self._new_params(taken)
+        diff = snapshot.diff_lines(taken, _as_schema_2(taken))
+        assert diff[0] == (
+            f'params differ: instrument unknown -> {instrument}; python_version unknown -> {python}'
+        )
+        assert diff[1] == _NOT_ATTRIBUTABLE
+        assert diff[2].startswith('current: ')
+
+    def test_a_schema_1_previous_reads_the_same(self, taken: dict[str, Any]) -> None:
+        assert (
+            snapshot.diff_lines(taken, _as_schema_1(taken))[:2]
+            == snapshot.diff_lines(taken, _as_schema_2(taken))[:2]
+        )
+
+    def test_the_reverse_direction(self, taken: dict[str, Any]) -> None:
+        instrument, python = self._new_params(taken)
+        assert snapshot.diff_lines(_as_schema_2(taken), taken)[0] == (
+            f'params differ: instrument {instrument} -> unknown; python_version {python} -> unknown'
+        )
+
+    def test_unknown_never_equals_unknown(self, taken: dict[str, Any]) -> None:
+        old = _as_schema_2(taken)
+        assert snapshot.diff_lines(old, old)[0] == (
+            'params differ: instrument unknown -> unknown; python_version unknown -> unknown'
+        )
+
+    def test_only_differing_keys_are_listed(self, taken: dict[str, Any]) -> None:
+        older = copy.deepcopy(taken)
+        older['params']['complexipy_version'] = '0.0.0'
+        real = json.dumps(taken['params']['complexipy_version'])
+        assert snapshot.diff_lines(taken, older)[0] == (
+            f'params differ: complexipy_version "0.0.0" -> {real}'
+        )
+
+    def test_equal_params_open_with_the_headers(self, taken: dict[str, Any]) -> None:
+        assert snapshot.diff_lines(taken, taken)[0].startswith('current: ')
+
+    def test_the_command_line_diff_opens_with_it_and_exits_0(
+        self, taken: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        current, previous = tmp_path / 'current.json', tmp_path / 'previous.json'
+        current.write_text(snapshot.render_snapshot(taken), encoding='utf-8')
+        previous.write_text(snapshot.render_snapshot(_as_schema_2(taken)), encoding='utf-8')
+        capsys.readouterr()
+        assert snapshot.main(['--current', str(current), '--diff', str(previous)]) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert printed[:2] == snapshot.diff_lines(taken, _as_schema_2(taken))[:2]
+        assert printed[0].startswith('params differ: instrument unknown -> ')
+
+    def test_the_committed_10_08_snapshot_reads_instrument_unknown(
+        self, taken: dict[str, Any]
+    ) -> None:
+        # The PRD's sketch row 17, on the actual file its signal diffs.
+        previous = snapshot.load_snapshot(
+            REPO_ROOT / 'plans' / 'quality-metrics' / 'review-all-dark_factory-20261008.json'
+        )
+        diff = snapshot.diff_lines(taken, previous)
+        assert diff[0].startswith('params differ: instrument unknown -> ')
+        assert diff[1] == _NOT_ATTRIBUTABLE
 
 
 _COUPLING_BEFORE = 'from pkg import mod\n\ndef test_it():\n    assert mod._y\n'
@@ -1561,7 +1793,7 @@ class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
         assert _run(root, measured) == 0
         previous = tmp_path / 'previous.json'
         previous.write_text(
-            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 3}),
+            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 4}),
             encoding='utf-8',
         )
         capsys.readouterr()

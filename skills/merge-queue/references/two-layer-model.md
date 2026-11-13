@@ -14,7 +14,7 @@ The merge queue is divided into two structurally distinct layers:
 
 | Layer | Role | Contents | Mutable? | Disk usage |
 |-------|------|----------|----------|------------|
-| **Layer 1: Speculative merge graph (suffix)** | Deep conflict-graph over all queued items not yet verifying | `_lane_buffers` (unfrozen suffix) | Fully reorderable | Disk-free — conflict graph is in-memory git-objects only; no `_merge-*` worktrees created |
+| **Layer 1: Speculative merge graph (suffix)** | Deep conflict-graph over all queued items not yet verifying | the lane buffers in `MergeIntake` (unfrozen suffix) | Fully reorderable | Disk-free — conflict graph is in-memory git-objects only; no `_merge-*` worktrees created |
 | **Layer 2: Frozen verify frontier (prefix)** | Shallow, immutable set of items currently in verify or already landed | `_inflight` (frozen prefix) | Immutable — no reorder, no re-base | Each item holds a real `_merge-*` worktree for the in-flight verify |
 
 The **frozen prefix** = {verifying} ∪ {landed}.  The **unfrozen suffix** = everything else in the lane.
@@ -23,19 +23,19 @@ The **frozen prefix** = {verifying} ∪ {landed}.  The **unfrozen suffix** = eve
 
 ## 2. Key design invariants (§5.3)
 
-All four invariants must hold simultaneously.  `two_layer_invariants(main_sha)` → `[]` when healthy; a non-empty list describes specific violations.
+Three invariants and one detector.  I1, I3 and I4 are invariants and must hold simultaneously.  `two_layer_invariants(main_sha)` → `[]` when healthy; it reports the frozen-prefix half as INV-3 chain-intact (no frozen entry built on a recorded dead commit, `plans/merge-verdict-integrity-prd.md` §1), successor chain links and frozen∩suffix disjointness, plus the conflict-graph consistency checks.  I2 is a detector, judged once at dispatch, with its own surface (task 5302).
 
 ### I1. Frozen prefix immutable
 
 An item in the frozen prefix (verifying or landed) is **never reordered or re-based** out from under an in-flight verify.  Its `_inflight` position and `base_sha` are set at dispatch time and do not change.
 
-### I2. Verify base equals frozen-prefix tip
+### I2 (detector). Verify base equals frozen-prefix tip at dispatch
 
-Every real-verify dispatch uses **exactly the tip of the frozen prefix** as its base SHA (`frozen_prefix_tip(main_sha)`).  Dispatching against any other base is a violation (logged at WARNING by `_warn_if_base_not_frozen_tip`).
+Every real-verify dispatch should use **exactly the tip of the frozen prefix** as its base SHA (`frozen_prefix_tip(main_sha)`).  The rule is judged once, at dispatch, by `SpeculativeMergeWorker._verify_base_divergence_at_dispatch` against that dispatch's freshly fetched main; the policy, with the recovery re-merge carve-out, is `merge_lane/verify_base_detector.py::detect_verify_base_divergence`.  A hit is logged at WARNING, stamped on the in-flight entry as a `VerifyBaseDivergence`, surfaced in `snapshot()['verify_base_divergences']`, and filed as an L1 `merge_verify_base_divergence` unless one is already open.  It never refuses the dispatch (esc-3206-3): INV-3 voids a dead-base verdict at adoption.  It is not re-judged later, because main legitimately moves under an in-flight verify; re-judging it at snapshot time was the false positive behind the 2026-08-12 and 2026-08-28 recurrences (PRD §5.3).  The detector and `two_layer_invariants` are not disjoint.  At depth ≥ 1 (the frozen prefix already holds a real merge) the same divergent dispatch also reads in `two_layer_invariants` as a successor chain-link break ('frozen-prefix base-chain broken at <request_id>'), for as long as its predecessor stays frozen.  At depth 0 only the detector reports it: the head has no predecessor and is judged by INV-3 alone, so an off-tip base that is not a recorded dead commit raises no field string (`merge_lane/worker.py::SpeculativeMergeWorker::_chain_breaks`).
 
 ### I3. Reorder touches only the unfrozen suffix
 
-`recompute_suffix_conflict_graph()` updates only `_lane_buffers`; `_inflight` order and `base_sha` are unchanged.  Reordering is always disk-free (no `_merge-*` worktree side effects).
+`recompute_suffix_conflict_graph()` reads only the lane buffers; `_inflight` order and `base_sha` are unchanged.  Reordering is always disk-free (no `_merge-*` worktree side effects).
 
 ### I4. Liveness / no-starvation
 
@@ -45,7 +45,7 @@ An item in a conflict clique eventually becomes head of its clique and is picked
 
 ## 3. Graph-time bounce (`needs_rebase`, η=1892)
 
-When `recompute_suffix_conflict_graph()` detects a textual conflict between two suffix items, it **bounces the younger item** (`_bounce_conflicting_suffix_items`) — at conflict-graph time, **disk-free**, before any verify slot is consumed or `_merge-*` worktree is created.
+When `recompute_suffix_conflict_graph()` detects a textual conflict between two suffix items, it **bounces the younger item** (`MergeIntake.bounce_conflicting_suffix_items`) — at conflict-graph time, **disk-free**, before any verify slot is consumed or `_merge-*` worktree is created.
 
 **Mechanical-rebase-first protocol:**
 
@@ -101,7 +101,8 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `suffix_conflict_graph` | dict | In-memory conflict-graph edges for unfrozen suffix items (δ=1889) |
 | `frozen_prefix` | dict | `{request_ids, tip_merge_commit, verify_depth}` — current frozen-prefix state (ε=1890) |
 | `metrics` | dict | `{retries_per_landing, drift_at_detection: {count, last, mean, max}, landings_total}` (ι=1894) |
-| `two_layer_invariants` | list\[str\] | `[]` when all §5.3 invariants hold; violation strings otherwise (λ=1895) |
+| `two_layer_invariants` | list\[str\] | `[]` when the §5.3 invariants hold; otherwise INV-3 dead-link, successor chain-link, disjointness or graph-consistency violation strings (λ=1895; INV-3 head arm since task 5302) |
+| `verify_base_divergences` | list\[dict\] | `[]` normally; one `{request_id, task_id, base_sha, expected_tip, verify_depth, observed_at}` record per in-flight verify dispatched off the frozen-prefix tip, judged once at dispatch (I2 detector, task 5302) |
 | `hosts` | list\[dict\] | Per-verify-host state: `{name, is_local, slot_state: free\|busy\|parked\|null, quarantined, quarantine_class: ru\|divergence\|null, unavailable_since, unavailable_secs, streak, reason}` (task 3275) |
 
 `hosts` is what makes an under-full `verifying N/M hosts` line diagnosable — it
@@ -134,7 +135,16 @@ the number of verifies in flight — read `inflight_total` for that.
 `inflight_by_host` is the authoritative lossless `{host: [task_id, ...]}` view
 (finalize head first, then `_inflight` order); `by_host` is the
 retained-for-compatibility lossy `{host: task_id}` map, which keeps only the last
-occupant when two entries share a host.
+occupant when two entries share a host. All four are **lease** occupancy, and a
+lease is never evidence that its host is reachable: a finished verify holds its
+lease until finalize, and a lease can sit on a host benched since it was taken.
+Whether a verify really runs on a host is `leases[].activity` (`dispatching`,
+`verifying`, `no_live_dispatch`, `finished`) with `leases[].host_quarantined`, and
+`verifying_by_host`, which counts the live leases on unquarantined hosts and is
+the `N` of the heartbeat's `verifying N/M hosts` line (task 5290).
+`no_live_dispatch` is a remote lease whose verify task runs on THIS host with no
+ssh dispatch live: either before the dispatch claims (the main-mirror push, which
+can hang on an ssh connect) or after it returned (a cross-check or gate re-verify).
 
 ---
 
@@ -157,17 +167,19 @@ occupant when two entries share a host.
 |--------|----------|-------------|
 | `NEEDS_REBASE_REASON_PREFIX` | merge_lane/worker.py | Prefix of the `needs_rebase` bounce reason string |
 | `MERGE_BOUNCE_CAP` | merge_lane/worker.py | Max bounce count before thrash-backstop triggers (= 3) |
-| `_aging_key(req)` | merge_lane/worker.py | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
+| `_aging_key(req)` | merge_lane/intake_buffers.py | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
 | `merge_first_enqueued_at` | merge_lane/types.py | Write-once field: epoch of first submission to the merge queue |
 | `SuffixConflictGraph` | suffix_graph.py | In-memory conflict graph over the unfrozen suffix |
 | `NoLandingsCircuitBreaker` | merge_lane/worker.py | No-landings circuit-breaker decision object (θ=1893) |
-| `_pop_next_pickable()` | merge_lane/worker.py | Select next item using clique-scoped aging (ζ=1891) |
+| `MergeIntake.pop_next_pickable()` | merge_lane/intake_buffers.py | Select next item using clique-scoped aging (ζ=1891) |
 | `frozen_prefix()` | merge_lane/worker.py | Return ordered `request_id`s in the frozen prefix |
 | `frozen_prefix_tip()` | merge_lane/worker.py | Return the base SHA for next verify dispatch |
-| `check_frozen_prefix_invariant()` | merge_lane/worker.py | §5.3 I1+I2 violations (base-chain integrity) |
-| `two_layer_invariants()` | merge_lane/worker.py | All §5.3 violations (I1–I4 + graph consistency) |
-| `recompute_suffix_conflict_graph()` | merge_lane/worker.py | Worker delegator → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph, triggers bounce |
-| `_bounce_conflicting_suffix_items()` | merge_lane/worker.py | Worker delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
+| `check_frozen_prefix_invariant()` | merge_lane/worker.py | Frozen-prefix violations: INV-3 dead links (via `_chain_dead_link`), successor chain links, frozen∩suffix disjointness |
+| `two_layer_invariants()` | merge_lane/worker.py | The §5.3 invariant violations: `check_frozen_prefix_invariant()` + graph consistency.  Not the I2 detector |
+| `verify_base_divergences()` | merge_lane/worker.py | The I2 detector's records stamped on the frozen prefix, in frozen order (task 5302) |
+| `detect_verify_base_divergence()` | merge_lane/verify_base_detector.py | Pure I2 policy: the `VerifyBaseDivergence` a dispatch commits, or None (task 5302) |
+| `recompute_suffix_conflict_graph()` | merge_lane/worker.py | Worker delegator → `MergeIntake.recompute_suffix_conflict_graph()` → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph |
+| `MergeIntake.bounce_conflicting_suffix_items()` | merge_lane/intake_buffers.py | Delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
 | `classify_and_merge()` | merge_lane/worker.py | Shared pre-merge guard + merge + drop-guard pipeline (branch-presence → already-merged → merge → conflict/non-conflict-failure → drop-guard), returning `MergedOk \| Decided`; `SpeculativeMergeWorker._merger_loop` and `SpeculativeMergeWorker._remerge` both delegate to it instead of each running its own duplicated inline copy (MQ-refactor task κ, task 1995) |
 | `patch_content_contained()` | merge_lane/landing_evidence.py | Patch-id containment check: True iff every commit in `head` is already present in `upstream` (moved out of the worker, task 5036) |
@@ -348,11 +360,10 @@ test or config patches later.
 | `PersistentWorktreeConfigError` | merge_lane/liveness.py | Raised by `enforce_persistent_worktree_serial_lane` when per-host in-flight count would exceed 1 |
 | `_safety_valve_due()` | merge_lane/liveness.py | Periodic cold-verify safety-valve gate (every Nth verifying attempt, PRD §10 invariant 6) |
 | `_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX` | merge_lane/liveness.py | Per-host dedup sentinel prefix for unreachability alarms (task 1795) |
-| `_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX` | merge_lane/liveness.py | Per-host sentinel prefix for recovery info escalations, distinct from the unreachable prefix |
 | `_MERGE_WORKER_LOOP_DIED_SENTINEL` | merge_lane/liveness.py | Sentinel task_id base for the merge-worker supervisor loop-death escalation |
 | `_verify_host_unreachable_sentinel()` | merge_lane/liveness.py | Per-host dedup sentinel task_id for unreachability alarms |
 | `_alarm_verify_host_unreachable()` | merge_lane/liveness.py | Dedup'd L1 escalation when a remote verify host is persistently unreachable |
-| `_clear_verify_host_unreachable()` | merge_lane/liveness.py | Resolve any open unreachability alarm and emit a recovery event on reprobe success |
+| `_clear_verify_host_unreachable()` | merge_lane/liveness.py | Resolve every pending record on the host's sentinel on named `RecoveryEvidence`, then emit `verify_host_recovered` |
 | `_acquire_warm_verify_worktree()` | merge_lane/liveness.py | Swap the ephemeral merge worktree for the persistent warm worktree (or the `_spec-` warm lane) |
 | `enforce_persistent_worktree_serial_lane()` | merge_lane/liveness.py | Fail-closed startup guard: per-host in-flight verify count must not exceed 1 |
 | `TOUCH_MISS_TOLERANCE` | merge_lane/liveness.py | Consecutive heartbeat ticks a live worker's `_merge-*` worktrees may miss before mtime ages into the reaper window (= 20); moved out of the worker, task 5036 |
@@ -376,29 +387,26 @@ reference, so it is fully unit-testable without a `SpeculativeMergeWorker`. A bo
 removes the request from the lane buffer it was found in and retires it from the worker's
 lifecycle registry through the required `retire_item` (wired to
 `SpeculativeMergeWorker._retire_item`) before resolving it `blocked`, so it never lingers in the
-census as queued. `SpeculativeMergeWorker` owns exactly one
-instance (`self._suffix_tracker`, constructed immediately after `self._lane_buffers` in
-`__init__`) and delegates to it via 4 get/set `@property` descriptors that preserve the worker's
-original attribute names (`_suffix_conflict_graph`, `_suffix_conflict_signature`,
-`_last_known_main_sha`, `_bounce_registry`) plus two thin async methods
-(`recompute_suffix_conflict_graph()`, `_bounce_conflicting_suffix_items()`) that just `await` the
-tracker — so `_acquire_next_request()`, `snapshot()`, `_pop_next_pickable()`,
-`two_layer_invariants()`, and the existing conflict-graph/bounce test suites all keep working with
-zero churn.
+census as queued. Since task 5305 the one instance is owned by `MergeIntake`
+(`merge_lane/intake_buffers.py`, §7.8), beside the lane buffers it reads. The intake exposes the
+tracker's state as read-only properties (`suffix_conflict_graph`, `suffix_conflict_signature`,
+`last_known_main_sha`, `bounce_registry`), plus `note_main_sha()` and the two thin async methods
+`recompute_suffix_conflict_graph()` and `bounce_conflicting_suffix_items()`.
 
-**Reach-back convention:** the two tracker methods resolve the three worker-resident constants
-they read (`MERGE_LANES`, `MERGE_BOUNCE_CAP`, `NEEDS_REBASE_REASON_PREFIX`, all in
-`merge_lane/worker.py`) through a function-local deferred `from orchestrator.merge_lane.worker
-import <name>` import rather than a top-level import, keeping `suffix_graph.py` free of
-any top-level import of the worker (which would be a cycle, since the worker imports this module).
+**Reach-back convention:** `MERGE_LANES` is a module-top import from `merge_lane/intake.py`, which
+loads neither the worker nor `suffix_graph.py`. The two tracker methods resolve the two
+worker-resident constants they read, `MERGE_BOUNCE_CAP` and `NEEDS_REBASE_REASON_PREFIX` (both in
+`merge_lane/worker.py`), through a function-local deferred import (`_worker_constants()`). This keeps
+`suffix_graph.py` free of any top-level import of the worker, which would be a cycle, since the
+worker imports this module.
 
 | Symbol | Location | Description |
 |--------|----------|--------------|
 | `SuffixConflictGraph` | suffix_graph.py | Immutable conflict graph over the unfrozen suffix (moved verbatim from the monolith, now `merge_lane/worker.py`) |
 | `EMPTY_SUFFIX_CONFLICT_GRAPH` | suffix_graph.py | Sentinel empty `SuffixConflictGraph` for the default/zero-suffix case (moved verbatim) |
 | `SuffixConflictTracker` | suffix_graph.py | Owns `graph` / `signature` / `last_known_main_sha` / `bounce_registry`; constructed with `git_ops`/`lane_buffers`/`frozen_requests`/`frozen_prefix_tip`/`retire_item` callables |
-| `SuffixConflictTracker.recompute()` | suffix_graph.py | Recompute and store the conflict graph over the unfrozen suffix (debounced, fail-open); `SpeculativeMergeWorker.recompute_suffix_conflict_graph()` delegates here |
-| `SuffixConflictTracker.bounce_conflicting_suffix_items()` | suffix_graph.py | Graph-time disk-free bounce of the younger conflicting item (cap/escalation/TOCTOU); an escalation retires the item via `retire_item`; `SpeculativeMergeWorker._bounce_conflicting_suffix_items()` delegates here |
+| `SuffixConflictTracker.recompute()` | suffix_graph.py | Recompute and store the conflict graph over the unfrozen suffix (debounced, fail-open); `MergeIntake.recompute_suffix_conflict_graph()` delegates here |
+| `SuffixConflictTracker.bounce_conflicting_suffix_items()` | suffix_graph.py | Graph-time disk-free bounce of the younger conflicting item (cap/escalation/TOCTOU); an escalation retires the item via `retire_item`; `MergeIntake.bounce_conflicting_suffix_items()` delegates here |
 
 ### 7.7 MergeWorker retirement — one merge worker, in production and in the tests (MQ-refactor task ν, merge-lane-quality δ)
 
@@ -419,8 +427,50 @@ production or anywhere under `orchestrator/tests`.
 The shared pipeline pieces the serial worker used were never worker-specific, and remain:
 `classify_and_merge()` (§7, task κ/1995), `_do_train_merge()` with its `_TrainMergeHost`
 Protocol (the narrow statement of what the train pipeline touches), `_run_post_merge_verify()`,
-`_finalize_advanced_merge()`, `_map_advance_failure()`, `_emit_merge_queued()`,
-`_HALT_ADVANCE_RESULTS` and `_WipHaltMixin`.
+`_finalize_advanced_merge()`, `_map_advance_failure()`, `_emit_merge_queued()` (now in
+`merge_lane/intake.py`), `_HALT_ADVANCE_RESULTS` and the lane halt state, now `HaltState` in
+`merge_lane/halt.py`, which the worker composes (task 5305).
+
+
+### 7.8 merge_lane/intake.py, intake_buffers.py and tip_relation.py — the request door and the merger's buffers (merge-lane-quality θ and ι, task 5305)
+
+Task 5305 moved three concerns out of `merge_lane/worker.py`, and none of the three modules
+imports the worker:
+
+- `intake.py` is the caller-side request door. It holds the request entry points and the
+  decomposed coalesce gate.
+- `intake_buffers.py` holds `MergeIntake`, the merger-side sole writer of the lane buffers, the
+  redispatch park and the suffix-conflict tracker. The worker composes one, hands it re-reading
+  ports, and asks it for every buffer and park change. It is a separate module from `intake.py`
+  so both stay under the 1500-line new-file ceiling (esc-5305-1).
+- `tip_relation.py` holds the C3 tip-relation decisions that coalesce consults.
+
+`train_selection.py` holds train-member selection by changed line ranges. It moved down from
+`workflow.py`, so the worker no longer imports the workflow.
+
+`halt.py::HaltState` owns the lane and operator halt state, and the worker keeps its public halt
+API as one-statement delegators.
+
+| Symbol | Location | Description |
+|--------|----------|--------------|
+| `enqueue_merge_request()` / `register_and_enqueue_merge_request()` | merge_lane/intake.py | Enqueue a request and emit `merge_queued`; the workflow-path variant first registers the branch in the in-flight registry |
+| `coalesce_or_enqueue_merge_request()` | merge_lane/intake.py | De-dup gate for the `merge_request` MCP chokepoint, decomposed into named steps (registry fast path, C3 submit gate, disk scan, enqueue); façade-exported |
+| `MERGE_LANES` / `normalize_lane()` | merge_lane/intake.py | Lane pick order (high → normal) and lane-name normalization |
+| `_emit_merge_queued()` / `emit_merge_coalesced()` | merge_lane/intake.py | `merge_queued` / `merge_coalesced` event emitters |
+| `select_train_members()` / `line_ranges_stackable()` | merge_lane/train_selection.py | Select a mutually-stackable train subset, capped at `max_members` (moved from `workflow.py`) |
+| `MergeIntake` | merge_lane/intake_buffers.py | Sole writer of the lane buffers, the redispatch park and the `SuffixConflictTracker` |
+| `IntakeLifecycle` | merge_lane/intake_buffers.py | Frozen port of the five lifecycle-registry operations the intake drives |
+| `MergeIntake.buffer_owned_request()` | merge_lane/intake_buffers.py | Register at QUEUED, advance to LANE_BUFFERED, buffer and journal a fresh request; coalesces a re-entrant drain |
+| `MergeIntake.drain_into_lanes()` | merge_lane/intake_buffers.py | Non-blocking queue drain; returns whether it consumed the shutdown sentinel |
+| `MergeIntake.pop_next_pickable()` / `_aging_key()` | merge_lane/intake_buffers.py | The one pick from the lane buffers: lane priority, then the clique-minimal item by aging key |
+| `MergeIntake.take_buffered()` / `restore_buffered()` | merge_lane/intake_buffers.py | δ chain-link walk: take a buffered link by task id, put it back at its exact slot |
+| `MergeIntake.request_redispatch()` / `next_redispatch()` | merge_lane/intake_buffers.py | Park an item for re-dispatch (back, or front with `front=True`) and pop the next one |
+| `MERGE_WORKER_SHUTDOWN_REASON` | merge_lane/intake_buffers.py | Shutdown reason whose `blocked` outcome keeps a request in the durable journal |
+| `HaltState` | merge_lane/halt.py | Lane halts, their owners and the operator halt |
+| `TipRelation` / `classify_tip_relation()` / `resolve_divergent()` | merge_lane/tip_relation.py | Topological relation of two branch tips (SAME / SUPERSET / SUBSET / DIVERGENT); a DIVERGENT pair is resolved by patch-id content comparison |
+| `AttachAction` / `decide_attach_action()` / `resolve_attach_action()` | merge_lane/tip_relation.py | What a new submission for an already in-flight branch does (COALESCE / RESNAPSHOT / ATTACH_AND_CHAIN / ATTACH_CONTAINMENT) |
+| `C3SubmitAction` / `decide_c3_submit_action()` | merge_lane/tip_relation.py | The SHA-sensitive `merge_request` submit-gate action (COALESCE / REPLACE / REJECT; PRD §4 C3) |
+| `select_recovery_winner()` | merge_lane/tip_relation.py | Pick the descendant-most snapshot tip for recovery dedup |
 
 ---
 
@@ -438,6 +488,7 @@ Protocol (the narrow statement of what the train pipeline touches), `_run_post_m
 | λ | 1895 | Integration gate + `two_layer_invariants()` — §5.3 invariant health surface |
 | μ | 1896 | This documentation task (SKILL.md + design-doc companion) |
 | ν | 1897 | Follow-on task (post-integration cleanup / companion) |
+| — | 5302 | Frozen-prefix liveness (a vacated finalize head is not frozen); the I2 verify-base rule split out of `two_layer_invariants()` into the dispatch-time detector (`verify_base_divergences()`, L1 `merge_verify_base_divergence`) |
 
 ---
 

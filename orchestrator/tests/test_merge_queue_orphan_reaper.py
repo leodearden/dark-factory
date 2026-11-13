@@ -34,6 +34,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _merge_lane_fakes import FakeClock
+from _packaged_defaults import load_packaged_defaults
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
@@ -953,9 +954,7 @@ def _shipped_cold_command_timeout_secs() -> float:
     shipped budget is caught by the derivation assertion below instead of
     silently invalidating it.
     """
-    from orchestrator.config import _load_defaults
-
-    value = _load_defaults().get('merge_verify_cold_command_timeout_secs')
+    value = load_packaged_defaults().get('merge_verify_cold_command_timeout_secs')
     assert value is not None, (
         'defaults.yaml no longer ships merge_verify_cold_command_timeout_secs — '
         'the destructive floor below is DERIVED from it, so this test must be '

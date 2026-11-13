@@ -5,6 +5,7 @@ Verifies the following cleanup:
   - fused_memory.services.__init__ no longer exports QueueService
   - orchestrator.protocols module deleted
   - fused_memory.reconciliation.stages.integrity_check shim deleted
+  - fused_memory.server.storm_counter shim deleted (task 6547)
   - fused_memory.backends.__init__ no longer re-exports GraphitiBackend / Mem0Backend
 
 Each test group is expected to FAIL before the corresponding deletion and PASS after.
@@ -13,6 +14,11 @@ Each test group is expected to FAIL before the corresponding deletion and PASS a
 import importlib
 import importlib.util
 from pathlib import Path
+
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Root of the repository (two levels up from fused-memory/tests/)
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -76,6 +82,18 @@ class TestIntegrityCheckShimRemoved:
         assert spec is None, (
             "fused_memory.reconciliation.stages.integrity_check still exists — "
             "delete the shim file"
+        )
+
+
+class TestStormCounterShimRemoved:
+    """Assert the server/storm_counter.py re-export shim has been deleted (task 6547)."""
+
+    def test_storm_counter_shim_not_importable(self):
+        """fused_memory.server.storm_counter should not exist."""
+        spec = importlib.util.find_spec("fused_memory.server.storm_counter")
+        assert spec is None, (
+            "fused_memory.server.storm_counter still exists — StormCounter's "
+            "single home is shared/src/shared/storm_counter.py; delete the shim file"
         )
 
 

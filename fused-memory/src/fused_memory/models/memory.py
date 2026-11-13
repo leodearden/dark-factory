@@ -99,6 +99,14 @@ class AddEpisodeResponse(BaseModel):
     message: str = ''
 
 
+class Mem0WriteState(StrEnum):
+    """Whether an add_memory write's Mem0 leg landed, is queued for retry, or did not land."""
+
+    LANDED = 'landed'
+    PENDING_RETRY = 'pending_retry'
+    NOT_LANDED = 'not_landed'
+
+
 class AddMemoryResponse(BaseModel):
     """Response from add_memory."""
 
@@ -112,6 +120,15 @@ class AddMemoryResponse(BaseModel):
     # Set when category was not supplied and the classifier returned a default
     # rather than a classification.
     classification_fallback: ClassificationFallback | None = None
+
+    @property
+    def mem0_write_state(self) -> Mem0WriteState:
+        """The one reading of whether this write's Mem0 leg landed; every consumer of memory_ids routes through it."""
+        if self.memory_ids:
+            return Mem0WriteState.LANDED
+        if SourceStore.mem0 in self.stores_pending_retry:
+            return Mem0WriteState.PENDING_RETRY
+        return Mem0WriteState.NOT_LANDED
 
 
 class ReadRouteResult(BaseModel):

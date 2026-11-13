@@ -38,7 +38,7 @@ def mark_holder(plan: dict) -> None:
 
 
 def _read_raw(artifacts: TaskArtifacts) -> dict:
-    return json.loads((artifacts.root / 'plan.json').read_text())
+    return json.loads(artifacts.artifact_path('plan.json').read_text())
 
 
 def race_writer_against_held_mutex(

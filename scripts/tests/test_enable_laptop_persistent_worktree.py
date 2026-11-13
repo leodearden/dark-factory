@@ -20,6 +20,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / "deploy" / "enable_laptop_persistent_worktree.sh"
 KEY = "persistent_merge_worktree"

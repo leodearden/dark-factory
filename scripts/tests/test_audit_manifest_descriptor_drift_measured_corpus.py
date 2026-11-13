@@ -49,6 +49,9 @@ from shared.delivered_check_polarity import (
     build_grep_argv,
     interpret_grep_rc,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # THE 21 MEASURED UNBOUND LABELS (task 4907).

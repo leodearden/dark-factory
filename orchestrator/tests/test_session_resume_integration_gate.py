@@ -95,6 +95,11 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler.get_task = AsyncMock(return_value={})
     # None status → transient/None → fall through to restore (never terminal-release).
     h.scheduler.get_status = AsyncMock(return_value=None)
+    # These tests model a task still in-progress at crash time, which the
+    # sidecar reaper must keep (plans/session-resume-eligibility-seam-prd.md D7's second conjunct).
+    h.scheduler.get_statuses = AsyncMock(
+        side_effect=lambda ids=None: ({i: 'in-progress' for i in (ids or [])}, None),
+    )
     h.scheduler._dispatched = set()
     # is_deterministic is a sync @staticmethod predicate at the top of _run_slot.
     h.scheduler.is_deterministic = MagicMock(return_value=False)
@@ -268,11 +273,12 @@ def _setup_warm_lane_session(
 ) -> Path:
     """Lay down an on-disk warm lane (or cold worktree) mid-invocation.
 
-    Writes ``<dir>/.task/plan.json`` (stamped w/ the real task_id + partial
-    progress, when ``with_plan``), a v1/v2 ``agent_session.json`` sidecar (when
-    ``with_sidecar``), and — when ``with_transcript`` — the corroborating
-    transcript under ``<dir>/.task/claude-config-<sid>/...``. Returns the
-    lane/worktree dir.
+    Writes what a dispatch of *task_id* into the dir leaves: the lane root's
+    ``metadata.json`` naming the task, and ``plan.json`` in the task root
+    (stamped w/ the real task_id + partial progress, when ``with_plan``). Also
+    a v1/v2 ``<dir>/.task/agent_session.json`` sidecar (when ``with_sidecar``),
+    and — when ``with_transcript`` — the corroborating transcript under
+    ``<dir>/.task/claude-config-<sid>/...``. Returns the lane/worktree dir.
 
     ``with_sidecar=False`` models the POST-COMPLETION on-disk state (B10): the
     plan survives but α's ``_invoke`` ``finally`` already cleared the sidecar,
@@ -300,8 +306,12 @@ def _setup_warm_lane_session(
         wt = base / task_id
     task_dir = wt / '.task'
     task_dir.mkdir(parents=True, exist_ok=True)
+    dispatch = TaskArtifacts.for_task(wt, task_id)
+    dispatch.lane_root.mkdir(parents=True, exist_ok=True)
+    dispatch.artifact_path('metadata.json').write_text(json.dumps({'task_id': task_id}))
     if with_plan:
-        (task_dir / 'plan.json').write_text(
+        dispatch.task_root.mkdir(parents=True, exist_ok=True)
+        dispatch.artifact_path('plan.json').write_text(
             json.dumps(_make_plan(steps_done, steps_total, task_id))
         )
     if with_sidecar:
@@ -2109,12 +2119,12 @@ async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
     harness: Harness, tmp_path: Path, caplog,
 ):
     """B11 — a PRE-DEPLOY v1 sidecar (no ``task_id`` / ``schema_version``) on a
-    plan-bearing lane is still adopted (keyed via plan.json's task_id), and the
+    plan-bearing lane is still adopted (keyed via the lane metadata's task id), and the
     resumed invocation REWRITES it as v2 while preserving the prior session_id.
 
     Two-way (consumer + producer):
       CONSUMER (β): the v1 sidecar carries no ``task_id`` of its own, so β keys
-        the adoption off plan.json's task_id — the stored recovered dict is the
+        the adoption off the lane metadata's task id — the stored recovered dict is the
         RAW v1 payload (session_id preserved, still NO ``task_id`` key).
       PRODUCER (α): feeding that adopted v1 dict back in as ``resume_session_id``
         drives a REAL ``_invoke`` that resumes the SAME session_id (not a fresh
@@ -2125,7 +2135,7 @@ async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
     """
     task_id, session_id = '51', 'uuid-b11-v1compat'
 
-    # ── CONSUMER (β): v1 sidecar adopted, keyed via plan.json's task_id ──
+    # ── CONSUMER (β): v1 sidecar adopted, keyed via the lane metadata's task id ──
     _setup_warm_lane_session(
         harness, task_id, session_id, role='implementer', sidecar_version=1,
     )

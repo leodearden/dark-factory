@@ -814,9 +814,9 @@ stamp_fleet_deploy_clock() {
     tmp_file="$(mktemp "$clock_dir/.last_redeploy_orchestrator.XXXXXX")"
     # printf cannot escape JSON, so an env value carrying a quote, a
     # backslash or a newline could otherwise emit a syntactically broken
-    # clock file -- and _read_clock_epoch fails OPEN on a corrupt body, which
-    # would disarm the very min-interval cap this stamp exists to arm. A
-    # uuid4().hex passes through untouched.
+    # clock file -- and scripts/_watchdog_state.py::read_clock_epoch fails
+    # OPEN on a corrupt body, which would disarm the very min-interval cap
+    # this stamp exists to arm. A uuid4().hex passes through untouched.
     raw_token="${DF_PYTEST_SESSION_TOKEN:-}"
     session_token="$(printf '%s' "$raw_token" | tr -cd '[:alnum:]_-')"
     # Sanitising must never MANUFACTURE the empty token. Empty is not a

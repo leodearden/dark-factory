@@ -16,13 +16,14 @@ from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
-from _git_fixtures import seed_repo
+from _git_fixtures import _git, seed_repo
 from _orch_helpers import (
     NonIsolatedGitRepoError,
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult
+from shared.merge_subject import format_merge_subject
 
 from orchestrator import git_ops as git_ops_module
 from orchestrator.artifacts import TaskArtifacts
@@ -35,6 +36,7 @@ from orchestrator.git_ops import (
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     CommitEffectProbe,
     GitOps,
+    GitQueryFailed,
     MergeParkContentionError,
     MergeParkError,
     MergeParkLockContentionError,
@@ -45,7 +47,6 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _assert_no_conflict_markers,
     _git_stderr_is_unresolved_ref,
-    _merge_subject,
     _run,
 )
 from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
@@ -903,14 +904,6 @@ class TestWorktreeLifecycle:
             'unresolved conflicts'
         )
 
-    async def test_diff_from_main(self, git_ops: GitOps):
-        worktree_info = await git_ops.create_worktree('feature-4')
-        (worktree_info.path / 'change.py').write_text('x = 1\n')
-        await git_ops.commit(worktree_info.path, 'Add change')
-        diff = await git_ops.get_diff_from_main(worktree_info.path)
-        assert 'change.py' in diff
-        assert 'x = 1' in diff
-
     async def test_diff_from_base(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-4b')
         (worktree_info.path / 'base_change.py').write_text('y = 2\n')
@@ -920,12 +913,7 @@ class TestWorktreeLifecycle:
         assert 'y = 2' in diff
 
     async def test_diff_from_base_stable_when_main_advances(self, git_ops: GitOps):
-        """get_diff_from_base returns branch changes even after main advances.
-
-        This is the key test for the fix: when main advances during task execution,
-        get_diff_from_base must still return the branch's changes by using the
-        pinned base_commit instead of the moving main ref.
-        """
+        """get_diff_from_base diffs from the base it is given, whatever main does since."""
         # Create worktree and capture base_commit
         worktree_info = await git_ops.create_worktree('feature-adv')
         base_commit = worktree_info.base_commit
@@ -943,9 +931,6 @@ class TestWorktreeLifecycle:
         diff = await git_ops.get_diff_from_base(worktree_info.path, base_commit)
         assert 'branch_change.py' in diff
         assert 'z = 3' in diff
-
-        # Contrast: get_diff_from_main might return empty/different (main absorbed branch)
-        # This demonstrates that base_commit is needed for stable diffs
 
     async def test_cleanup_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-5')
@@ -4323,7 +4308,7 @@ class TestMergeMarkerIndex:
     async def test_index_and_direct_scan_agree(self, git_ops: GitOps):
         """Indexed lookup == direct scan, for both a hit and a miss."""
         repo = git_ops.project_root
-        marker = _merge_subject('task/agree', git_ops.config.main_branch)
+        marker = format_merge_subject('task/agree', git_ops.config.main_branch)
         sha = await _seed_on_main(repo, {'agree.txt': 'x\n'}, marker)
 
         assert await git_ops.find_merge_marker('task/agree') == sha
@@ -4336,7 +4321,7 @@ class TestMergeMarkerIndex:
         """A hand-written ``Merge task/x: ...`` subject is not a marker.
 
         dark-factory's main carries 46 such commits against 2,972 canonical
-        ones.  They do not match ``_merge_subject``'s ``into <main>`` shape and
+        ones.  They do not match ``format_merge_subject``'s ``into <main>`` shape and
         are invisible to the grep, so the index must not surface them either.
         """
         repo = git_ops.project_root
@@ -4359,7 +4344,7 @@ class TestMergeMarkerIndex:
         # Builds an index at a main sha that has no such marker.
         assert await git_ops.find_merge_marker('task/later') is None
 
-        marker = _merge_subject('task/later', git_ops.config.main_branch)
+        marker = format_merge_subject('task/later', git_ops.config.main_branch)
         sha = await _seed_on_main(repo, {'later.txt': 'x\n'}, marker)
 
         assert await git_ops.find_merge_marker('task/later') == sha
@@ -4391,7 +4376,7 @@ class TestMergeMarkerIndex:
     ):
         """A failed index build degrades to the direct scan, not to a wrong answer."""
         repo = git_ops.project_root
-        marker = _merge_subject('task/fallback', git_ops.config.main_branch)
+        marker = format_merge_subject('task/fallback', git_ops.config.main_branch)
         sha = await _seed_on_main(repo, {'fb.txt': 'x\n'}, marker)
 
         async def _no_index(self: GitOps) -> dict[str, str] | None:
@@ -4415,7 +4400,7 @@ class TestMergeMarkerIndex:
             'orchestrator.git_ops._MERGE_MARKER_INDEX_RECHECK_SECS', 0.0,
         )
         repo = git_ops.project_root
-        marker = _merge_subject('task/flaky', git_ops.config.main_branch)
+        marker = format_merge_subject('task/flaky', git_ops.config.main_branch)
         sha = await _seed_on_main(repo, {'flaky.txt': 'x\n'}, marker)
 
         real = GitOps._build_merge_marker_index
@@ -4435,17 +4420,6 @@ class TestMergeMarkerIndex:
         # Second call: build succeeds and is cached — no failure was pinned.
         assert await git_ops.find_merge_marker('task/flaky') == sha
         assert git_ops._merge_marker_index is not None
-
-    async def test_pattern_is_derived_from_merge_subject(self, git_ops: GitOps):
-        """The index's regex tracks _merge_subject rather than a hard-coded format."""
-        from orchestrator.git_ops import _merge_marker_pattern
-
-        pattern = _merge_marker_pattern(git_ops.config.main_branch)
-        subject = _merge_subject('task/derived', git_ops.config.main_branch)
-        match = pattern.search(subject)
-
-        assert match is not None
-        assert match.group(1) == 'task/derived'
 
 
 async def _quote_marker_in_body(repo: Path, marker: str) -> None:
@@ -4503,7 +4477,7 @@ async def _wrapped_first_paragraph(repo: Path, task_id: str, marker: str) -> str
 @pytest.mark.asyncio
 class TestMergeMarkerIsExactSubject:
     """A marker is a commit whose git subject (``%s``) equals
-    ``_merge_subject(branch, main_branch)``; the body and the parent count are
+    ``format_merge_subject(branch, main_branch)``; the body and the parent count are
     never consulted (task 5765).
     """
 
@@ -4531,7 +4505,7 @@ class TestMergeMarkerIsExactSubject:
         repo = git_ops.project_root
         task_id = '5765'
         branch = f'task/{task_id}'
-        marker = _merge_subject(branch, git_ops.config.main_branch)
+        marker = format_merge_subject(branch, git_ops.config.main_branch)
 
         expected = await build(repo, task_id, marker)
 
@@ -6723,9 +6697,9 @@ class TestFindTaskCitationCommit:
 @pytest.mark.asyncio
 class TestMergeSubjectContract:
     """End-to-end contract: the merge subject written to main by merge_to_main
-    equals _merge_subject output, and find_merge_marker locates that commit.
+    equals format_merge_subject output, and find_merge_marker locates that commit.
 
-    If either the writer or reader drifts from _merge_subject (e.g. an inline
+    If either the writer or reader drifts from format_merge_subject (e.g. an inline
     f-string replaces the helper call with a different format), at least one of
     the two roundtrip assertions will fail.
     """
@@ -6733,7 +6707,7 @@ class TestMergeSubjectContract:
     async def test_merge_subject_roundtrip(
         self, git_ops: GitOps
     ) -> None:
-        """Assert the on-main subject equals _merge_subject output and that
+        """Assert the on-main subject equals format_merge_subject output and that
         find_merge_marker returns the same SHA.
         """
         tid = 'contract-1'
@@ -6760,34 +6734,11 @@ class TestMergeSubjectContract:
             ['git', 'log', '--format=%s', '-n', '1', result.merge_commit],
             cwd=git_ops.project_root,
         )
-        assert subject == _merge_subject(full_branch, git_ops.config.main_branch)
+        assert subject == format_merge_subject(full_branch, git_ops.config.main_branch)
 
         # find_merge_marker must locate the same commit
         marker_sha = await git_ops.find_merge_marker(full_branch)
         assert marker_sha == result.merge_commit
-
-
-class TestMergeSubject:
-    """Unit tests for the _merge_subject helper.
-
-    Locks the canonical format: 'Merge {branch} into {main_branch}'.
-    This helper is the single source of truth consumed by merge_to_main,
-    advance_main (retry path), and find_merge_marker.
-    """
-
-    @pytest.mark.parametrize(
-        'branch, main_branch, expected',
-        [
-            ('task/1', 'main', 'Merge task/1 into main'),
-            ('task/123', 'main', 'Merge task/123 into main'),
-            ('task/v1.0', 'develop', 'Merge task/v1.0 into develop'),
-        ],
-    )
-    def test_canonical_format(
-        self, branch: str, main_branch: str, expected: str
-    ) -> None:
-        """_merge_subject returns 'Merge {branch} into {main_branch}'."""
-        assert _merge_subject(branch, main_branch) == expected
 
 
 @pytest.mark.asyncio
@@ -7796,7 +7747,7 @@ class TestFindInflightMergeWorktree:
     """Tests for GitOps.find_inflight_merge_worktree(branch).
 
     Uses real _merge-* worktrees created by merge_to_main, verified via HEAD
-    subject matching against _merge_subject.
+    subject matching against format_merge_subject.
     """
 
     async def _make_branch_with_commit(
@@ -9083,55 +9034,81 @@ class TestParseDiffLineRanges:
 
 @pytest.mark.asyncio
 class TestGetChangedLineRanges:
-    """Unit tests for GitOps.get_changed_line_ranges."""
+    """PRD merge-pre-verify-screen §7 S1.3 ref: real git, not a mocked ``_run``."""
 
-    async def test_invokes_correct_git_command(self, git_config, git_repo):
-        """Verify that git diff is called with main...ref --unified=0 --no-color."""
-        ops = GitOps(git_config, git_repo)
-        ref = 'task/123'
+    @staticmethod
+    def _commit_on(repo: Path, branch: str, name: str, text: str = 'changed\n') -> None:
+        _git(repo, 'checkout', '-q', '-b', branch, 'main')
+        (repo / name).write_text(text)
+        _git(repo, 'add', name)
+        _git(repo, 'commit', '-q', '-m', f'add {name}')
+        _git(repo, 'checkout', '-q', 'main')
 
-        captured_cmds: list[list[str]] = []
-
-        async def mock_run(cmd, cwd=None):
-            captured_cmds.append(cmd)
-            return (0, CANNED_DIFF_TWO_FILES, '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            await ops.get_changed_line_ranges(ref)
-
-        assert len(captured_cmds) == 1
-        cmd = captured_cmds[0]
-        assert 'git' in cmd
-        assert 'diff' in cmd
-        assert f'{git_config.main_branch}...{ref}' in cmd
-        assert '--unified=0' in cmd
-        assert '--no-color' in cmd
-
-    async def test_returns_parsed_ranges(self, git_config, git_repo):
-        """Verify the returned dict matches parse_diff_line_ranges output."""
-        from orchestrator.git_ops import parse_diff_line_ranges
-        ops = GitOps(git_config, git_repo)
-        ref = 'task/456'
-
-        async def mock_run(cmd, cwd=None):
-            return (0, CANNED_DIFF_TWO_FILES, '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await ops.get_changed_line_ranges(ref)
-
-        expected = parse_diff_line_ranges(CANNED_DIFF_TWO_FILES)
-        assert result == expected
-
-    async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
+    async def test_returns_exact_old_side_ranges_whatever_the_colour_config(
+        self, git_config, git_repo,
+    ):
+        lines = [f'line {n}\n' for n in range(1, 11)]
+        (git_repo / 'lines.txt').write_text(''.join(lines))
+        _git(git_repo, 'add', 'lines.txt')
+        _git(git_repo, 'commit', '-q', '-m', 'add lines.txt')
+        lines[4] = 'line 5 changed\n'
+        self._commit_on(git_repo, 'task/31', 'lines.txt', ''.join(lines))
+        _git(git_repo, 'config', 'color.ui', 'always')
         ops = GitOps(git_config, git_repo)
 
-        async def mock_run(cmd, cwd=None):
-            return (0, '', '')
+        result = await ops.get_changed_line_ranges('31')
 
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await ops.get_changed_line_ranges('task/789')
+        assert result == {'lines.txt': [(5, 5)]}
 
-        assert result == {}
+    async def test_branch_with_no_commits_returns_empty_dict(self, git_config, git_repo):
+        _git(git_repo, 'branch', 'task/789', 'main')
+        ops = GitOps(git_config, git_repo)
+
+        assert await ops.get_changed_line_ranges('789') == {}
+
+    async def test_bare_id_diffs_the_task_branch_not_a_same_named_ref(self, git_config, git_repo):
+        self._commit_on(git_repo, 'task/5563', 'task_file.txt')
+        self._commit_on(git_repo, '5563', 'unrelated_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('5563')
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_bare_id_never_resolves_as_an_abbreviated_commit_sha(
+        self, git_config, git_repo,
+    ):
+        self._commit_on(git_repo, 'scratch', 'unrelated_file.txt')
+        abbrev = subprocess.run(
+            ['git', 'rev-parse', '--short=7', 'scratch'],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _git(git_repo, 'branch', '-q', '-D', 'scratch')
+        self._commit_on(git_repo, f'task/{abbrev}', 'task_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges(abbrev)
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_prefixed_ref_still_works(self, git_config, git_repo):
+        self._commit_on(git_repo, 'task/77', 'task_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('task/77')
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_missing_ref_raises_naming_ref_rc_and_stderr(self, git_config, git_repo):
+        ops = GitOps(git_config, git_repo)
+
+        with pytest.raises(GitQueryFailed) as excinfo:
+            await ops.get_changed_line_ranges('9999')
+
+        message = str(excinfo.value)
+        assert 'main...task/9999' in message
+        assert 'exited 128' in message
+        assert 'task/9999' in message.partition('exited 128')[2]
 
 
 # ---------------------------------------------------------------------------
@@ -12420,8 +12397,8 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
 @pytest.mark.asyncio
 class TestReuseWarmLaneBranchAware:
-    """_reuse_warm_lane called on a DETACHED lane must rebind refs/heads/task/R
-    to the lane HEAD after commit()+rebase_onto_main.
+    """_reuse_warm_lane called on a DETACHED lane must leave the lane attached
+    on task/R, with refs/heads/task/R equal to the rebased lane HEAD.
 
     RED today: _reuse_warm_lane runs commit+rebase on the detached HEAD but
     never rebinds refs/heads/task/R — the ref stays at the pre-detach tip
@@ -13233,7 +13210,7 @@ class TestWarmLaneRefIsDegenerate:
 
 
 # ---------------------------------------------------------------------------
-# Task 2442 step-3/4 — GitOps._run_thin_warm_lane unit tests (§9.5 η)
+# Task 2442 step-3/4 — GitOps.thin_warm_lane unit tests (§9.5 η)
 # ---------------------------------------------------------------------------
 
 
@@ -13274,8 +13251,8 @@ def _read_thin_warm_lane_call_log(repo: Path) -> list[str]:
 
 
 @pytest.mark.asyncio
-class TestRunThinWarmLane:
-    """Unit tests for GitOps._run_thin_warm_lane (task 2442 step-4).
+class TestThinWarmLane:
+    """Unit tests for GitOps.thin_warm_lane (task 2442 step-4).
 
     Fail-soft, never-raise wrapper around reify δ's
     scripts/thin-warm-lane.sh (§9.5 η): an absent script, a benign
@@ -13295,7 +13272,7 @@ class TestRunThinWarmLane:
         mock_run = AsyncMock(return_value=(0, '', ''))
 
         with patch('orchestrator.git_ops._run', mock_run):
-            rc = await git_ops._run_thin_warm_lane(lane)
+            rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 127
         mock_run.assert_not_called()
@@ -13310,7 +13287,7 @@ class TestRunThinWarmLane:
         lane = git_repo / '_lane-0'
         lane.mkdir()
 
-        rc = await git_ops._run_thin_warm_lane(lane)
+        rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 0
         [line] = _read_thin_warm_lane_call_log(git_repo)
@@ -13331,7 +13308,7 @@ class TestRunThinWarmLane:
         lane.mkdir()
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            rc = await git_ops._run_thin_warm_lane(lane)
+            rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 75
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -13351,12 +13328,12 @@ class TestRunThinWarmLane:
         lane.mkdir()
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            rc = await git_ops._run_thin_warm_lane(lane)
+            rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 1
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('_run_thin_warm_lane' in r.getMessage() for r in warnings), (
-            f'Expected a WARNING naming _run_thin_warm_lane, got '
+        assert any('thin_warm_lane' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming thin_warm_lane, got '
             f'{[r.getMessage() for r in warnings]}'
         )
 
@@ -13374,12 +13351,12 @@ class TestRunThinWarmLane:
             caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
             patch('orchestrator.git_ops._run', side_effect=RuntimeError('boom')),
         ):
-            rc = await git_ops._run_thin_warm_lane(lane)
+            rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 127, 'an exception from _run must fail-soft to 127, never raise'
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('_run_thin_warm_lane' in r.getMessage() for r in warnings), (
-            f'Expected a WARNING naming _run_thin_warm_lane, got '
+        assert any('thin_warm_lane' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming thin_warm_lane, got '
             f'{[r.getMessage() for r in warnings]}'
         )
 
@@ -13402,7 +13379,7 @@ class TestRunThinWarmLane:
         assert git_ops.pool_in_use()
         assert not git_ops.pool_storage_present()
 
-        rc = await git_ops._run_thin_warm_lane(lane)
+        rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 127
         assert _read_thin_warm_lane_call_log(git_repo) == [], (
@@ -13411,7 +13388,7 @@ class TestRunThinWarmLane:
 
 
 # ---------------------------------------------------------------------------
-# Task 2442 amend — real flock contention for _run_thin_warm_lane's rc=75 path
+# Task 2442 amend — real flock contention for thin_warm_lane's rc=75 path
 # (review: git_ops.py:2323 — the rc=75 benign-skip path was previously only
 # exercised via a forced stub exit code, never an actual flock conflict on
 # <lane_dir>.lock, the mechanism a concurrent re-acquire actually relies on)
@@ -13422,7 +13399,7 @@ def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
     """Write a thin-warm-lane.sh stub that mirrors the REAL T3 flock gate.
 
     Unlike ``_write_thin_warm_lane_stub`` above (a configurable-exit stub
-    used to unit-test each branch of ``_run_thin_warm_lane`` in isolation
+    used to unit-test each branch of ``thin_warm_lane`` in isolation
     without caring *why* a given rc was produced), this stub reproduces the
     shape of reify's actual ``scripts/thin-warm-lane.sh`` T3 block: it opens
     ``<lane_dir>.lock`` (a sibling lock file, trailing slash stripped —
@@ -13430,7 +13407,7 @@ def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
     ``flock -n``, exiting 75 if — and only if — it genuinely cannot.
     Otherwise it exits 0. This lets a test hold a real OS-level flock on
     that same lock file from the test process and observe
-    ``_run_thin_warm_lane`` correctly propagate the rc=75 that real
+    ``thin_warm_lane`` correctly propagate the rc=75 that real
     contention produces, rather than one a stub was merely told to return.
     """
     script = scripts_dir / 'thin-warm-lane.sh'
@@ -13453,15 +13430,15 @@ def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
-class TestRunThinWarmLaneFlockContention:
+class TestThinWarmLaneFlockContention:
     """rc=75 exercised against a REAL held flock, not a scripted exit code.
 
     Amendment requested by the task 2442 code review (git_ops.py:2323):
-    ``TestRunThinWarmLane.test_exit_75_returns_75_and_no_warning`` only
-    proves ``_run_thin_warm_lane`` *interprets* rc=75 correctly once told to
+    ``TestThinWarmLane.test_exit_75_returns_75_and_no_warning`` only
+    proves ``thin_warm_lane`` *interprets* rc=75 correctly once told to
     return it — it says nothing about whether genuine contention on
     ``<lane_dir>.lock`` (the T3 mechanism a concurrent re-acquire actually
-    relies on — see the "Flock contract" note on ``_run_thin_warm_lane``'s
+    relies on — see the "Flock contract" note on ``thin_warm_lane``'s
     docstring and reify PRD §9.3 invariant T3 / §9.5 inv.10) is observed
     correctly end-to-end. These tests hold a genuine OS-level flock from the
     test process itself, against a stub that performs the real ``flock -n``
@@ -13485,7 +13462,7 @@ class TestRunThinWarmLaneFlockContention:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
             with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-                rc = await git_ops._run_thin_warm_lane(lane)
+                rc = await git_ops.thin_warm_lane(lane)
 
             assert rc == 75, (
                 'a genuinely held flock on <lane_dir>.lock must surface as '
@@ -13518,7 +13495,7 @@ class TestRunThinWarmLaneFlockContention:
         lane = git_repo / '_lane-1'
         lane.mkdir()
 
-        rc = await git_ops._run_thin_warm_lane(lane)
+        rc = await git_ops.thin_warm_lane(lane)
 
         assert rc == 0, (
             'with no concurrent holder, the flock-real stub must acquire '
@@ -13540,7 +13517,7 @@ class TestRunThinWarmLaneFlockContention:
 class TestSeedWarmLaneTakesLaneLock:
     """Pins the lane-lock coupling gap CLOSED (task 2599).
 
-    ``_run_thin_warm_lane``'s rc=75 benign-skip protection (see its
+    ``thin_warm_lane``'s rc=75 benign-skip protection (see its
     "Lane-lock coupling gap" docstring note) only actually serializes a
     concurrent re-acquire against release-thin if the re-acquire side ALSO
     takes ``<lane_dir>.lock``. Previously ``_seed_warm_lane`` (the
@@ -13554,7 +13531,7 @@ class TestSeedWarmLaneTakesLaneLock:
     non-blocking ``flock -n`` a real counterparty. This test proves that
     concretely — a real, externally-held ``<lane_dir>.lock`` now BLOCKS
     ``_seed_warm_lane``'s progress until released, rather than being
-    ignored — so ``_run_thin_warm_lane``'s "Flock contract" note is now
+    ignored — so ``thin_warm_lane``'s "Flock contract" note is now
     backed by genuine DF-side enforcement on both sides of the race. If
     this test ever starts failing, ``_seed_warm_lane``'s locking model
     changed and the coupling-gap docstring note on both methods must be
@@ -13575,8 +13552,8 @@ class TestSeedWarmLaneTakesLaneLock:
         script.chmod(0o755)
 
         # Simulate a concurrent release-thin holding <lane_dir>.lock for the
-        # duration of its rm -rf — the exact lock _run_thin_warm_lane's real
-        # script contends on (see TestRunThinWarmLaneFlockContention above).
+        # duration of its rm -rf — the exact lock thin_warm_lane's real
+        # script contends on (see TestThinWarmLaneFlockContention above).
         lock_path = Path(f'{lane}.lock')
         lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -13800,7 +13777,7 @@ class TestSeedWarmLaneLockTimeout:
 
 # ---------------------------------------------------------------------------
 # Task 2599 (step-3) — end-to-end guard: _seed_warm_lane's new <lane_dir>.lock
-# and _run_thin_warm_lane's real script both agree on the SAME inode, so a
+# and thin_warm_lane's real script both agree on the SAME inode, so a
 # genuine concurrent seed really does make a racing thin exit 75 (benign
 # skip) — not just each side's lock behavior proven in isolation above.
 # ---------------------------------------------------------------------------
@@ -13809,16 +13786,16 @@ class TestSeedWarmLaneLockTimeout:
 @pytest.mark.asyncio
 class TestSeedAndThinMutualExclusion:
     """End-to-end: a live ``_seed_warm_lane`` holding ``<lane_dir>.lock``
-    makes a concurrent ``_run_thin_warm_lane``'s real ``flock -n`` gate exit
+    makes a concurrent ``thin_warm_lane``'s real ``flock -n`` gate exit
     75.
 
     ``TestSeedWarmLaneTakesLaneLock`` proves ``_seed_warm_lane`` blocks
-    against an externally-held lock; ``TestRunThinWarmLaneFlockContention``
-    proves ``_run_thin_warm_lane``'s real script surfaces rc=75 against an
+    against an externally-held lock; ``TestThinWarmLaneFlockContention``
+    proves ``thin_warm_lane``'s real script surfaces rc=75 against an
     externally-held lock. Neither, alone, proves the two sides actually
     contend with EACH OTHER on the same file. This test drives both real
     code paths at once — a genuine ``_seed_warm_lane`` in flight, and a
-    genuine ``_run_thin_warm_lane`` racing it — closing that last gap.
+    genuine ``thin_warm_lane`` racing it — closing that last gap.
     """
 
     async def test_seed_holding_lane_lock_makes_concurrent_thin_skip(
@@ -13841,7 +13818,7 @@ class TestSeedAndThinMutualExclusion:
         )
         seed_script.chmod(0o755)
 
-        # Real-T3 thin stub — the SAME stub TestRunThinWarmLaneFlockContention
+        # Real-T3 thin stub — the SAME stub TestThinWarmLaneFlockContention
         # uses — so this exercises the genuine flock -n gate, not a scripted rc.
         thin_scripts_dir = git_repo / 'scripts'
         thin_scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -13865,10 +13842,10 @@ class TestSeedAndThinMutualExclusion:
 
             # seed_started existing proves _seed_warm_lane has acquired the
             # outer flock -x <lane_dir>.lock and is now blocking on release.
-            thin_rc = await git_ops._run_thin_warm_lane(lane)
+            thin_rc = await git_ops.thin_warm_lane(lane)
 
             assert thin_rc == 75, (
-                'a concurrent _run_thin_warm_lane must exit 75 (benign skip) '
+                'a concurrent thin_warm_lane must exit 75 (benign skip) '
                 'while _seed_warm_lane genuinely holds <lane_dir>.lock — the '
                 'two sides must contend on the SAME lock file'
             )

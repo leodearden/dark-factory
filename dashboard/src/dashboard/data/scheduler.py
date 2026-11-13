@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -85,8 +86,11 @@ from shared.scheduler_state import (
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
+from dashboard.data.datum import Datum, DatumState, unknown_datum
+from dashboard.data.lock_contention import holder_of, lock_wanters
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
+from dashboard.data.served_read import ServedRead
 from dashboard.data.task_snapshot import SnapshotHealth, classify
 from dashboard.data.utils import resolve_now
 
@@ -160,8 +164,95 @@ _scheduler_cache: TTLCache[tuple[tuple, str]] = TTLCache(
 )
 
 
+SCHEDULER_STATE_TTL_SECONDS: float = 5.0
+"""Age below which a root's scheduler state is served without a new read: the collection's own TTL."""
+
+SCHEDULER_STATE_FRESHNESS_BOUND_SECONDS = 30
+"""The scheduler-state Datum's freshness bound, six TTLs."""
+
+SCHEDULER_STATE_READ_TIMEOUT = 45.0
+"""Whole-read bound on one root's ``get_scheduler_state``, across every URL.
+
+Above the Scheduler tab's handler deadline (``TASKS_BUDGET.total``, 20 s) and
+the browser's 30 s fetch abort, so the bound never cuts short an answer the tab
+could have delivered: its offline classification is the one it had before the
+read was bounded. It still ends a hung read, so the cache's single flight is
+freed.
+"""
+
+SCHEDULER_STATE_REQUEST_WAIT_SECONDS = 4.0
+"""Longest a ``/prds`` request waits on an in-flight scheduler-state read before
+it is served the last good state (or unknown); the read still lands for the next poll."""
+
+_scheduler_state: ServedRead[str, SchedulerStateSnapshot] = ServedRead(
+    ttl_seconds=lambda: SCHEDULER_STATE_TTL_SECONDS,
+    freshness_bound_seconds=SCHEDULER_STATE_FRESHNESS_BOUND_SECONDS,
+)
+
+
+async def acquire_scheduler_state(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    root: str | os.PathLike[str],
+    *,
+    now: datetime,
+    wait_seconds: float | None = None,
+) -> Datum[SchedulerStateSnapshot]:
+    """*root*'s scheduler state, read through the first URL that answers.
+
+    The one access path to the scheduler state for the Scheduler tab and the
+    PRD view's contention line. The Datum is measured at the *now* of the
+    request whose read it is; the snapshot keeps the file's own
+    ``snapshot_at``. A reply that is not a snapshot is a ``lower_bound``
+    empty snapshot; every URL failing is unknown, or the last good snapshot
+    ``stale``.
+    """
+    labels = config.project_labels
+    bound = SCHEDULER_STATE_FRESHNESS_BOUND_SECONDS
+
+    async def call(url: str) -> Datum[SchedulerStateSnapshot]:
+        reply = await mcp_tool_call(client, url, 'get_scheduler_state', {'project_root': str(root)})
+        try:
+            return Datum(SchedulerStateSnapshot.from_json(reply), now, DatumState.FRESH, None, bound)
+        except MalformedSnapshotError as exc:
+            logger.warning(
+                'get_scheduler_state[%s] reply is not a scheduler snapshot; '
+                'showing the project as online but empty: %s',
+                labels.of(root), exc,
+            )
+            return Datum(
+                SchedulerStateSnapshot.empty(), now, DatumState.LOWER_BOUND,
+                f'get_scheduler_state reply did not parse as a scheduler snapshot: {exc}', bound,
+            )
+
+    def every_url_failed(errors: list[str]) -> Datum[SchedulerStateSnapshot]:
+        return unknown_datum(f'get_scheduler_state failed on every URL: {"; ".join(errors)}', bound)
+
+    async def read() -> Datum[SchedulerStateSnapshot]:
+        try:
+            return await asyncio.wait_for(
+                first_success(
+                    config.fused_memory_urls, call,
+                    log_label=fanout_label('get_scheduler_state', root, labels),
+                    offline_result=every_url_failed,
+                ),
+                SCHEDULER_STATE_READ_TIMEOUT,
+            )
+        except TimeoutError:
+            return unknown_datum(
+                f'get_scheduler_state exceeded its {SCHEDULER_STATE_READ_TIMEOUT}s budget', bound,
+            )
+
+    return await _scheduler_state.serve(str(root), read, now=now, wait_seconds=wait_seconds)
+
+
+def clear_scheduler_state() -> None:
+    """Forget every root's scheduler state (test/admin hook)."""
+    _scheduler_state.clear()
+
+
 def _scheduler_cache_clear() -> None:
-    """Clear the scheduler snapshot TTL cache and reset its refresh lock.
+    """Clear the scheduler snapshot TTL cache, its refresh lock, and the scheduler state.
 
     Test/admin hook.  Delegates to ``TTLCache.clear()``, which resets both
     the stored entry and the per-key ``asyncio.Lock`` — preventing "got
@@ -170,6 +261,7 @@ def _scheduler_cache_clear() -> None:
     test functions.
     """
     _scheduler_cache.clear()
+    clear_scheduler_state()
 
 
 async def get_scheduler_snapshot(
@@ -233,7 +325,9 @@ def _module_contention_counts(
 
     For each module path that appears in any task's ``lock_set`` **or** in
     ``park_stacks`` keys, count how many live tasks include it and attach park
-    ownership data.
+    ownership data.  Counting and holder resolution are
+    ``dashboard/src/dashboard/data/lock_contention.py``'s, the rule the PRD
+    view's contention line shares.
 
     The holder for a module is resolved via the shared hierarchical prefix rule
     (``modules_conflict``), not dict-equality, so a holder key that is a
@@ -284,10 +378,7 @@ def _module_contention_counts(
           parked_owner_live bool       True iff parked_by is in live_task_ids
           park_stack       list[dict]  stack entries each enriched with ``live``
     """
-    counts: dict[str, int] = {}
-    for row in rows:
-        for path in row.get('lock_set') or []:
-            counts[path] = counts.get(path, 0) + 1
+    counts = lock_wanters(row.get('lock_set') or [] for row in rows)
 
     # All paths to produce entries for: contended paths ∪ park_stacks keys.
     # A fully-stranded module (dead park, no live waiters) has no entry in
@@ -314,16 +405,7 @@ def _module_contention_counts(
     result: list[dict] = []
     for path in all_paths:
         count = counts.get(path, 0)
-        # Resolve the holder via the shared hierarchical prefix rule rather than
-        # dict-equality.  Both *path* (a normalized module key) and the
-        # current_holders keys are normalized to lock_depth, so the common case
-        # is an exact match — but a holder key with fewer than lock_depth
-        # components (a sub-depth parent) still conflicts with this child
-        # module, and modules_conflict catches it where `.get(path)` would miss.
-        holder = next(
-            (tid for mod, tid in current_holders.items() if modules_conflict(mod, path)),
-            None,
-        )
+        holder = holder_of(path, current_holders)
         holder_live = (
             (holder in live_task_ids)
             if (holder is not None and live_task_ids is not None)
@@ -435,7 +517,7 @@ def _stranded_park_rows(
     Args:
         park_stacks:   ``{module_key: [entry, ...]}`` from the scheduler
                        snapshot; entry fields are owned by
-                       ``orchestrator/src/orchestrator/scheduler.py::ModuleLockTable.snapshot_park_stacks``.
+                       ``orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.snapshot_park_stacks``.
         live_task_ids: Set of task_ids present in the active-tasks snapshot
                        (``{r['task_id'] for r in rows}``).  Owners in this
                        set are live and are skipped.
@@ -723,18 +805,13 @@ async def collect_scheduler_state(
     async def _one_project(root) -> tuple[SchedulerStateSnapshot | None, list[dict], list[dict]]:
         """Fetch snapshot + skip events + recovery events for one project root.
 
-        Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
-        are tried sequentially and the first success wins; on a transport
-        error or soft failure the failing URL's cached MCP session is
-        invalidated and the next URL is tried.
-
-        Simplicity trade-off: if the snapshot call succeeds on url1 but either
-        events call raises, the whole TRIPLE is re-issued against url2 rather
-        than retrying only the failing leg — all three calls live inside one
-        ``_call(url)`` coroutine, so a failure anywhere in it re-runs all three
-        on the next URL.  This amplifies load slightly on the surviving URL but
-        keeps the retry logic single-axis; the calls are idempotent and small,
-        so the re-fetch is cheap.
+        The snapshot is :func:`acquire_scheduler_state`'s datum, which fails
+        over across URLs on its own. The two events calls share one
+        ``mcp_fanout.first_success`` of their own: URLs are tried sequentially
+        and the first URL answering both wins; on a transport error or soft
+        failure the failing URL's cached MCP session is invalidated and the
+        next URL is tried. A snapshot from url1 can therefore be paired with
+        events from url2; both replicas read the same root's files.
 
         The two events calls are deliberately SEPARATE requests rather than one
         widened ``event_types`` list — see ``_RECOVERY_EVENTS_LIMIT``: sharing
@@ -749,7 +826,8 @@ async def collect_scheduler_state(
         transport failure).  Returns ``(None, [], [])`` when every URL fails;
         the ``None`` sentinel lets the caller distinguish *offline* from
         *online-but-empty* so a legitimately quiescent project is never
-        misclassified as offline.
+        misclassified as offline. A ``stale`` snapshot is a failed latest read
+        (its TTL sits far inside its bound), so it is offline too.
         """
         label = labels.of(root)
 
@@ -789,22 +867,11 @@ async def collect_scheduler_state(
                 )
             return events
 
-        async def _call(url: str) -> tuple[SchedulerStateSnapshot, list[dict], list[dict]]:
-            reply = await mcp_tool_call(
-                client,
-                url,
-                'get_scheduler_state',
-                {'project_root': str(root)},
-            )
-            try:
-                snapshot = SchedulerStateSnapshot.from_json(reply)
-            except MalformedSnapshotError as exc:
-                logger.warning(
-                    'get_scheduler_state[%s] reply is not a scheduler snapshot; '
-                    'showing the project as online but empty: %s',
-                    label, exc,
-                )
-                snapshot = SchedulerStateSnapshot.empty()
+        state = await acquire_scheduler_state(client, config, root, now=effective_now)
+        if state.value is None or state.state is DatumState.STALE:
+            return None, [], []
+
+        async def _call(url: str) -> tuple[list[dict], list[dict]]:
             skip_events = await _fetch_events(
                 url, _SKIP_EVENT_TYPES, _SCHEDULER_EVENTS_LIMIT, 'skip',
             )
@@ -812,15 +879,18 @@ async def collect_scheduler_state(
                 url, list(_RECOVERY_EVENT_TYPES), _RECOVERY_EVENTS_LIMIT,
                 'recovery',
             )
-            return snapshot, skip_events, recovery_events
+            return skip_events, recovery_events
 
-        snapshot, skip_events, recovery_events = await first_success(
+        events = await first_success(
             config.fused_memory_urls,
             _call,
-            log_label=fanout_label('get_scheduler_state', root, labels),
-            offline_result=lambda errs: (None, [], []),
+            log_label=fanout_label('get_scheduler_events', root, labels),
+            offline_result=lambda errs: None,
         )
-        return snapshot, skip_events, recovery_events
+        if events is None:
+            return None, [], []
+        skip_events, recovery_events = events
+        return state.value, skip_events, recovery_events
 
     # Fan out to all project roots concurrently (mirrors metrics.py pattern)
     per_project_results = await asyncio.gather(

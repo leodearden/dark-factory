@@ -22,12 +22,12 @@ the merge-lane ratchet sweep measures per module.  Folding them in would pull
 that import, and the ratchet key that carries it, into a module every test
 family imports.
 
-Lane tests that STUFF the buffers (``worker._lane_buffers[...].extend``) to
-build a scene still touch the private attribute, and so does a check that
-needs the request OBJECTS back (identity, or a list to re-stuff), which
-``snapshot()`` cannot return.  Any other placement read off the buffers makes
-this module's claim a second way: this module is the destination, not a
-completed migration.
+Lane tests that STUFF the buffers (``worker._intake.replace_lane(...)``) to
+build a scene still reach past ``snapshot()``, and so does a check that needs
+the request OBJECTS back (identity, or a list to re-stuff), which
+``snapshot()`` cannot return.  Any other placement read off the intake's lane
+buffers makes this module's claim a second way: this module is the
+destination, not a completed migration.
 """
 from __future__ import annotations
 

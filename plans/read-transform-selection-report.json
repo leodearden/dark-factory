@@ -190,8 +190,8 @@
       "path": "fused-memory/tests/fixtures/write_triage_calibration.jsonl"
     },
     {
-      "blob": "a02b4ae406147db0f3130661cfbbec0a47764e78",
-      "commit": "8b9a66a262180e4652b571d6c4d76a2df01b273d",
+      "blob": "4858f7312831283f2f3d16e936b918bbeea848b2",
+      "commit": "70b708c8393642cf25bfa78ef6969159cb1d1604",
       "path": "fused-memory/tests/fixtures/memory_eval_topic_registry.json"
     },
     {
@@ -216,7 +216,7 @@
     },
     {
       "blob": "6912b2d9a249076823cd22e572c93450821171e2",
-      "commit": "87f362f7f9fd111c7ce6bcaf13bcaa1debfc6e96",
+      "commit": "c470af946526df188ef1872be3c29c9039312c4e",
       "path": "fused-memory/tests/fixtures/e2_fetch_cache.json"
     }
   ],

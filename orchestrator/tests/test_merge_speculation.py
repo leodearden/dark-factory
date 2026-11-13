@@ -70,6 +70,7 @@ from _orch_helpers import (  # noqa: F401
     pydantic_spec,
     wait_responsive,
 )
+from _poll_responsive import poll_responsive
 from _verify_result_doubles import (
     FAIL_OPEN_LOGGERS,
     fail_open_records,
@@ -619,9 +620,9 @@ def _make_spec_req(tmp_path: Path, *, spec_knob: bool, persistent: bool = False)
     """Build a minimal MergeRequest stub for spec-routing tests."""
     req = MagicMock()
     req.task_id = 'task-spec-1'
-    req.config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
+    req.config = lane_scene_config(
+        tmp_path,
+        GitConfig(
             persistent_merge_worktree=persistent,
             merge_spec_warm_lane_pool=spec_knob,
         ),
@@ -1524,12 +1525,11 @@ class TestLateArrivalAttaches:
 
             # Poll until B's merge_to_main call appears in the spy (indicates the
             # Merger has dequeued B and merged it — either speculatively or not).
-            deadline = asyncio.get_running_loop().time() + 10.0
-            while (
-                not any(c['branch'] == 'task/late1-b' for c in _merge_calls)
-                and asyncio.get_running_loop().time() < deadline
-            ):
-                await asyncio.sleep(0.05)
+            await poll_responsive(
+                lambda: any(c['branch'] == 'task/late1-b' for c in _merge_calls),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='late1-b: merge_to_main called',
+            )
 
             # ── Assertions while A is still in-flight ─────────────────────────
             b_spy = [c for c in _merge_calls if c['branch'] == 'task/late1-b']
@@ -1577,7 +1577,7 @@ class TestLateArrivalAttaches:
             # DONE-WHEN 2 (mechanism): assert the late-arrival ATTACH code path
             # fired — not just the outcome.  The ATTACH branch emits a DEBUG log
             # 'late arrival attaches to in-flight predecessor …'.  If a future
-            # edit introduces an await inside _pop_next_pickable/_drain_queue so B
+            # edit introduces an await inside pop_next_pickable/_drain_queue so B
             # is prefetched normally by the look-ahead, the outcome assertions above
             # remain green but this log assertion will fail, revealing the test has
             # stopped guarding the late-arrival path.
@@ -1820,7 +1820,7 @@ class TestLateArrivalFailCascade:
 
     GREEN after step-2: B is a speculative descendant of A; the existing
     cascade in _verifier_loop (7608-7721) finds B in _inflight, cancels its
-    verify, re-merges against actual main, re-dispatches with _redispatch,
+    verify, re-merges against actual main, re-dispatches through the redispatch park,
     and emits speculative_discard reason=previous_failed via _dispatch_item.
     """
 
@@ -1976,7 +1976,7 @@ class TestLateArrivalFailCascade:
         #    speculatively against A's commit — only present after step-2).
         #
         #    NOTE: speculative_discard is emitted in _dispatch_item only when a
-        #    speculative item is re-dispatched from _redispatch with _n_failed=True
+        #    speculative item is re-dispatched from the redispatch park with _n_failed=True
         #    (single-host path). In the two-host cascade path, the remerged item
         #    has speculative=False (_remerge sets speculative=False), so
         #    speculative_discard is NOT emitted at re-dispatch.  The meaningful

@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import logging
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _invocation_ledger import invocation_rows
 
 from fused_memory.config.schema import PathScopeAdjudicatorConfig
 
@@ -591,6 +592,99 @@ class TestAdjudicateMcpScoping:
         call_kwargs = mock_invoke.await_args.kwargs
         assert call_kwargs.get('mcp_config') == {'mcpServers': {}}
         assert call_kwargs.get('strict_mcp_config') is True
+
+
+@pytest.mark.asyncio
+class TestAdjudicatorInvocationLedger:
+    """Every adjudicator CLI call carries the curator ledger keys, so it lands one row in the CostStore invocations ledger."""
+
+    async def test_passes_ledger_keys(self, tmp_path):
+        from shared.cost_store import CostStore
+
+        from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
+
+        gate = MagicMock()
+        gate.run_id = 'fm-run-1'
+        store_sentinel = CostStore(tmp_path / 'unused.db')
+        adj = PathScopeAdjudicator(
+            PathScopeAdjudicatorConfig(), usage_gate=gate, cost_store=store_sentinel,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=_OK)) as mock_invoke:
+            await _do_adjudicate(adj, project_id='proj-a')
+
+        assert mock_invoke.await_args is not None
+        kwargs = mock_invoke.await_args.kwargs
+        assert kwargs['cost_store'] is store_sentinel
+        assert kwargs['role'] == 'path_scope_adjudicator'
+        assert kwargs['run_id'] == 'fm-run-1'
+        assert kwargs['project_id'] == 'proj-a'
+        assert kwargs['usage_gate'] is gate
+
+    async def test_default_construction_passes_no_store_and_empty_run_id(self, tmp_path):
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=_OK)) as mock_invoke:
+            await _do_adjudicate(adj)
+
+        assert mock_invoke.await_args is not None
+        kwargs = mock_invoke.await_args.kwargs
+        assert kwargs['cost_store'] is None
+        assert kwargs['run_id'] == ''
+        assert kwargs['role'] == 'path_scope_adjudicator'
+
+    async def test_one_adjudicate_call_lands_one_invocations_row(self, tmp_path):
+        from shared.cli_invoke import AgentResult
+        from shared.cost_store import CostStore
+
+        from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
+
+        db_path = tmp_path / 'curator_events.db'
+        config = PathScopeAdjudicatorConfig()
+        served = AgentResult(
+            success=True, output='',
+            structured_output={'verdict': 'allow', 'reason': 'incidental'},
+            duration_ms=1234, cost_usd=0.01,
+        )
+        async with CostStore(db_path) as store:
+            adj = PathScopeAdjudicator(config, usage_gate=None, cost_store=store)
+            with patch('shared.cli_invoke.invoke_claude_agent',
+                       new=AsyncMock(return_value=served)):
+                verdict = await _do_adjudicate(adj, project_id='proj-x')
+
+        assert verdict.should_allow_creation is True
+        rows = await invocation_rows(db_path)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['role'] == 'path_scope_adjudicator'
+        assert row['project_id'] == 'proj-x'
+        assert row['model'] == config.model
+        assert row['duration_ms'] == 1234
+        assert row['capped'] == 0
+
+    async def test_failed_call_still_lands_a_row(self, tmp_path):
+        from shared.cli_invoke import AgentResult
+        from shared.cost_store import CostStore
+
+        from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
+
+        db_path = tmp_path / 'curator_events.db'
+        hung = AgentResult(
+            success=False, output='', structured_output=None,
+            timed_out=True, duration_ms=60_000,
+        )
+        async with CostStore(db_path) as store:
+            adj = PathScopeAdjudicator(
+                PathScopeAdjudicatorConfig(), usage_gate=None, cost_store=store,
+            )
+            with patch('shared.cli_invoke.invoke_claude_agent',
+                       new=AsyncMock(return_value=hung)):
+                verdict = await _do_adjudicate(adj)
+
+        assert verdict.failed is True
+        assert verdict.should_allow_creation is False
+        rows = await invocation_rows(db_path)
+        assert len(rows) == 1
+        assert rows[0]['duration_ms'] == 60_000
+        assert rows[0]['role'] == 'path_scope_adjudicator'
 
 
 # ===========================================================================

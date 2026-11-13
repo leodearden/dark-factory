@@ -44,6 +44,18 @@ def archive_dir_for_date(queue_dir: Path, resolved_at_iso: str) -> Path:
     return Path(queue_dir) / ARCHIVE_SUBDIR / date_str
 
 
+def _prune_subdir(child: Path) -> bool:
+    """Remove *child*; False iff a concurrent prune already removed it."""
+    try:
+        shutil.rmtree(child)
+    except FileNotFoundError:
+        if child.exists():
+            raise
+        logger.debug('Archive subdir %s already pruned (removed concurrently); skipping', child)
+        return False
+    return True
+
+
 def prune_archive(
     queue_dir: Path,
     retention_days: int,
@@ -55,13 +67,20 @@ def prune_archive(
     ``YYYY-MM-DD``.  Loose files, non-matching directories, and other
     entries are left untouched.
 
+    Takes no lock: another prune (a second startup sweep's pass 3, or a
+    manual ``python -m escalation.archive``) may remove the same subdir
+    between the scan and the rmtree.  Such a subdir is treated as already
+    pruned: it is not counted and is logged at DEBUG; a
+    ``FileNotFoundError`` while the subdir still exists is re-raised.
+
     Args:
         queue_dir: Root queue directory (parent of ``archive/``).
         retention_days: Subdirs older than this many days are removed.
         now: Reference time for cutoff calculation (defaults to ``datetime.now(UTC)``).
 
     Returns:
-        Number of subdirectories removed.
+        Number of subdirectories this call removed; one a concurrent prune
+        removed first is not counted.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -80,8 +99,9 @@ def prune_archive(
             parsed = datetime.strptime(child.name, DATE_FORMAT).replace(tzinfo=UTC)
         except ValueError:
             continue
-        if parsed < cutoff:
-            shutil.rmtree(child)
+        if parsed >= cutoff:
+            continue
+        if _prune_subdir(child):
             removed += 1
             logger.info('Pruned archive subdir: %s', child)
 

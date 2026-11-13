@@ -18,6 +18,13 @@ runs:
   * The Recent-merges caption ("showing N of M in <window>") is
     ``window_chip.js::recentMergesCaption``, covered by
     dashboard/tests/js/window_chip.test.mjs.
+  * The "Merges (window)" tile and its spark, the per-project "attempts" and
+    "p50" pips, the depth, outcomes and latency panels and the worst-project
+    p95 tile read the served ``depth`` and ``attempts`` Datums through
+    ``merge_queue.js`` (``projectDepth``, ``projectAttempts``,
+    ``attemptCount``, ``attemptsOver``, ``attemptsHistory``,
+    ``worstP95Over``), covered by dashboard/tests/js/merge_queue.test.mjs and,
+    in the mounted MergeTab, by dashboard/tests/js/jsx_render.test.mjs.
   * The depth panel's bucket-width caption is
     ``merge_queue.js::depthBucketCaption``, covered by
     dashboard/tests/js/merge_queue.test.mjs and, in the mounted MergeTab, by
@@ -40,7 +47,7 @@ from __future__ import annotations
 import pathlib
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 _REDUX_DIR = pathlib.Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 

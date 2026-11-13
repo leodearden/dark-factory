@@ -1,4 +1,4 @@
-"""Tests for dashboard.data.retention — the snapshot tables' retention policy."""
+"""Tests for dashboard.data.retention — the snapshot tables' retention policy, and what it never touches."""
 
 from __future__ import annotations
 
@@ -8,7 +8,19 @@ from pathlib import Path
 
 import aiosqlite
 import pytest
+from shared.quality_series.landings import GitCrossCheck, Landing, LandingSource, LinesBase
+from shared.quality_series.rows import Cost, LandingRow, Outcomes, SourceEpochs
 
+from dashboard.data.burndown import BURNDOWN_SCHEMA, downsample
+from dashboard.data.metrics import METRICS_SCHEMA, downsample_metrics
+from dashboard.data.quality_store import (
+    QUALITY_SCHEMA,
+    QualitySample,
+    insert_sample,
+    read_landing_rows,
+    read_samples,
+    upsert_landing_rows,
+)
 from dashboard.data.retention import (
     MAX_RETENTION,
     RAW_RETENTION,
@@ -169,3 +181,46 @@ async def test_a_table_name_that_is_not_an_identifier_is_refused(tmp_path):
     async with aiosqlite.connect(str(db_path)) as conn:
         with pytest.raises(ValueError, match=r"'t; DROP TABLE t'"):
             await apply_retention(conn, 't; DROP TABLE t', now=NOW)
+
+
+async def test_quality_tables_survive_every_retention_pass(tmp_path):
+    """quality.db is outside the retention policy: neither caller of apply_retention touches it.
+
+    PRD decision 14 (plans/quality-dashboard-prd.md). The samples sit in old hours that
+    hold two each, one hour past MAX_RETENTION and one inside the compaction window, so
+    either an expiry or a compaction pass over a quality table would change what reads back.
+    """
+    expired_hour = (NOW - timedelta(days=200)).replace(minute=0, second=0, microsecond=0)
+    landing = Landing(
+        project_id='p', merge_sha='sha', task_id='101', landed_at=expired_hour, ordinal=0,
+        source=LandingSource.MERGE_FINALIZED, unit_id='sha', unit_size=1, late_claim=False,
+        git_first_parent=True, prev_landed_at=None, lines_base=LinesBase.UNMEASURABLE,
+        base_sha=None,
+    )
+    row = LandingRow(
+        landing=landing,
+        outcomes=Outcomes(None, None, None, None, None, None, None, None, None),
+        cost=Cost(None, (), None, None, None, False, None, None, None, None, None, None, None),
+        modules=(),
+        rule_vintage=SourceEpochs(None, None, None, None, None, None),
+    )
+    samples = [
+        QualitySample.value(
+            'p', hour + timedelta(minutes=minute), cursor_sha='sha', landings_sampled=1,
+            landings_deferred=0, git_check=GitCrossCheck(0, 1, 0),
+        )
+        for hour in (expired_hour, OLD_HOUR)
+        for minute in (10, 50)
+    ]
+    async with aiosqlite.connect(str(tmp_path / 'combined.db')) as conn:
+        await conn.executescript(BURNDOWN_SCHEMA + METRICS_SCHEMA + QUALITY_SCHEMA)
+        await upsert_landing_rows(conn, [row], sampled_at=expired_hour)
+        for sample in samples:
+            await insert_sample(conn, sample)
+        await conn.commit()
+
+        await downsample(conn, now=NOW)
+        await downsample_metrics(conn, now=NOW)
+
+        assert await read_landing_rows(conn, 'p') == [row]
+        assert await read_samples(conn, 'p') == samples

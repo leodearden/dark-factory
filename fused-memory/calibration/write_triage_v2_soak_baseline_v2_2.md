@@ -10,7 +10,7 @@ Bootstrap: 10000 resamples, seed 7157.
 | metric | n | hits | rate | Wilson 95% | population rate | population 95% | unclear |
 |---|---|---|---|---|---|---|---|
 | M1 | 91 | 28 | 0.3077 | [0.2223, 0.4087] | 0.3084 | [0.2149, 0.4054] | 1 |
-| M1 as amended | 91 | 29 | 0.3187 | [0.232, 0.4201] | 0.3172 | [0.2225, 0.4157] | 1 |
+| M1 as amended | 91 | 24 | 0.2637 | [0.1841, 0.3625] | 0.2621 | [0.1739, 0.3559] | 1 |
 | M2 amended | 100 | 31 | 0.31 | [0.2278, 0.4063] | 0.31 | [0.22, 0.4] | 0 |
 | M2 contested | 472 | 322 | 0.6822 | [0.6389, 0.7226] | 0.6822 | [0.6385, 0.7246] | 1 |
 | M2 restated | 99 | 29 | 0.2929 | [0.2124, 0.389] | 0.2929 | [0.202, 0.3878] | 1 |
@@ -38,7 +38,7 @@ Bootstrap: 10000 resamples, seed 7157.
 |---|---|---|---|---|
 | hidden_detail | 7 | 0 | 1 | A restated write adds something a reader acting on its record would need (HOME, LOSS, no CONFLICT), and a sighting is only counted, never shown. |
 | hidden_conflict | 25 | 0 | 3 | A restated write disputes its record (CONFLICT), and the dispute sits in a sighting a reader of the record never sees. |
-| digest_conflict | 14 | 0 | 2 | An amended write disputes its record (CONFLICT), and a reader of the record meets the dispute only as an untagged 240-character digest. |
+| digest_conflict | 14 | 0 | 2 | An amended write disputes its record (CONFLICT), and a reader of the record meets the dispute only as an untagged amendment, not as a correction. |
 | wrong_home | 234 | 0 | 1 | An attached write is not about its record's claim (HOME=NO); a contest whose dispute is true is never a wrong home (ruling 5b). |
 | false_conflict | 140 | 0 | 2 | A contested write does not dispute its record (CONFLICT=NO), so a reader is told a sound record is in doubt. |
 | duplicate_clutter | 0 | 51 | 0.5 | A standalone write restates an earlier record and adds nothing a reader needs (HOME, no LOSS, no CONFLICT). |

@@ -16,6 +16,9 @@ from pathlib import Path
 
 import check_method_param_wiring as cmpw
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # scripts/tests -> scripts -> repo root. Same idiom as
 # shared/tests/capability_manifest_corpus.py; correct inside a worktree too.

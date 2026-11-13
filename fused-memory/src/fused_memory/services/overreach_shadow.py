@@ -129,6 +129,14 @@ class OverreachFlag:
 
 
 @dataclass(frozen=True)
+class HandedFlag:
+    """A flag recon has disposed of, and when: shown to Stage 1, or dropped as already gone or retired."""
+
+    flag: OverreachFlag
+    handed_at: datetime
+
+
+@dataclass(frozen=True)
 class OverreachFlagPage:
     """One cycle's slice of *graph*'s flags not yet handed over.
 
@@ -173,6 +181,15 @@ LEFT JOIN flag_handoffs h ON h.graph = j.graph AND h.edge_uuid = j.edge_uuid
 WHERE j.graph = ? AND j.label = ? AND h.edge_uuid IS NULL
 ORDER BY j.judged_at, j.edge_uuid
 LIMIT ?
+"""
+
+_HANDED_FLAGS_SQL = """
+SELECT j.episode_uuid, j.edge_uuid, j.fact, j.rationale, j.judged_at, e.prompt_version, h.handed_at
+FROM edge_judgements j
+JOIN judged_episodes e ON e.graph = j.graph AND e.episode_uuid = j.episode_uuid
+JOIN flag_handoffs h ON h.graph = j.graph AND h.edge_uuid = j.edge_uuid
+WHERE j.graph = ? AND j.label = ? AND h.handed_at >= ? AND h.handed_at < ?
+ORDER BY j.edge_uuid
 """
 
 _JUDGEMENTS_SQL = """
@@ -299,6 +316,25 @@ class OverreachShadowStore:
         )
         total = rows[0][-1] if rows else 0
         return OverreachFlagPage(graph=graph, flags=flags, omitted=total - len(flags))
+
+    async def handed_overreach_flags(
+        self, graph: str, *, handed_from: datetime, handed_until: datetime,
+    ) -> tuple[HandedFlag, ...]:
+        """*graph*'s overreach flags first handed over in ``[handed_from, handed_until)``, by edge uuid."""
+        rows = await self._require_access().read_all(
+            _HANDED_FLAGS_SQL,
+            (graph, OVERREACH, _to_stored_instant(handed_from), _to_stored_instant(handed_until)),
+        )
+        return tuple(
+            HandedFlag(
+                flag=OverreachFlag(
+                    episode_uuid=episode_uuid, edge_uuid=edge_uuid, fact=fact, rationale=rationale,
+                    judged_at=_from_stored_instant(judged_at), prompt_version=prompt_version,
+                ),
+                handed_at=_from_stored_instant(handed_at),
+            )
+            for episode_uuid, edge_uuid, fact, rationale, judged_at, prompt_version, handed_at in rows
+        )
 
     async def record_handoffs(self, graph: str, edge_uuids: Sequence[str]) -> None:
         """Take *edge_uuids* out of *graph*'s pending flags; the first handoff of an edge is kept."""

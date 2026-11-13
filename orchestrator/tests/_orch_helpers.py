@@ -194,103 +194,6 @@ def wire_live_status_from_get_task(scheduler_mock: MagicMock) -> None:
 # add a second copy -- import this one.
 PYPROJECT_DEFAULT_TIMEOUT = 420
 
-# task 4215: per-test ceiling for the family of guard tests that sweep the
-# WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
-# cannot be sized by the ordinary 60s default.  This comment is the SINGLE
-# home of that rationale: the ~20 modules that carry the mark point HERE
-# instead of repeating it, so switching `timeout_method`, retuning the
-# ceiling, or revising the measurements is one edit rather than twenty.
-#
-# WHAT THE FAMILY IS (task 4600): the consumers of the one shared tree pass
-# (`_tree_scan.py::TreePass`, served by conftest.py's session `tree_pass`
-# fixture), plus the one permanent private sweeper and
-# test_merge_lane_ratchet.py, both named with their reasons in
-# test_whole_tree_scan_timeout_guard.py.  For a consumer, the per-item cost
-# this ceiling must clear is no longer a sweep of its own but the SHARED PASS:
-# one streaming read of the union of every requested analysis's file set,
-# each file parsed at most once and walked only by the analyses whose
-# `_tree_scan.py::ParsedModule.may_name` prefilter cannot rule it out,
-# billed to whichever consumer item requests `tree_pass` first on its
-# worker, while every later consumer item projects facts already held.  Any
-# consumer may be the item billed, which is why each one carries this mark
-# however cheap its own tests are.
-#
-# It is the pyproject's own sanctioned escape hatch -- "Slow tests opt out
-# with `@pytest.mark.timeout(N)`", the comment on
-# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- applied
-# at MODULE level, which is the only form that is a sound LOWER bound on every
-# collected item (a per-test decorator leaves any test added later at the
-# default).  A tighter decorator still WINS where one is present, so the
-# module mark narrows nothing.  Coverage of the family is ENFORCED, not
-# sprinkled: test_whole_tree_scan_timeout_guard.py recomputes the census
-# (private sweepers and shared-pass consumers) from source on every run and
-# fails a member that lacks the mark OR pins it below this ceiling.
-#
-# MECHANISM -- what a breach here costs:
-#   * until task 6354, `[tool.pytest.ini_options].timeout_method = "thread"`
-#     meant pytest-timeout answered a breach by `os._exit()`ing the whole xdist
-#     worker ("node down: Not properly terminated"), NOT by failing the
-#     offending test, and `--max-worker-restart=0` (in
-#     `[tool.pytest.ini_options].addopts`, task 1907) then declined to replace
-#     that worker, degrading the run to a TRUNCATED whole-suite session whose
-#     surviving failure named some innocent guard that merely shared the dead
-#     worker.  One slow tree-scan cost a whole verify run AND misattributed the
-#     blame; the measured history below is from that era;
-#   * since task 6354 the method is `signal`: a breach is one false red on the
-#     scanner itself, and the worker lives on.  The ceiling still prevents that
-#     false red.  A breach inside a C or Rust call (complexipy's analysis)
-#     surfaces only once that call returns.
-#
-# MEASURED history of the family:
-#   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
-#     (test_merge_queue_reachback_patch_guard), 6.70s
-#     (test_event_loop_antipattern_guard), 6.46s
-#     (the serial-worker import guard, deleted with its fixture by task 5034);
-#   * the SAME serial-worker guard measured 17.85 / 21.32 / 30.75s per
-#     call at loadavg 120-176 under `-n auto` -- ~4.8x load inflation;
-#   * xdist worker deaths were then observed at loadavg 250-423, one further
-#     inflation step past the 60s default THEN IN FORCE (esc-3980-1 on branch
-#     task/3980, esc-3787-1 on branch task/3787).
-#   THREE members crashed that way -- test_event_loop_antipattern_guard.py,
-#   test_merge_queue_reachback_patch_guard.py and the serial-worker import
-#   guard -- which is what makes this a
-#   FAMILY defect rather than three accidents, and why the rest are marked
-#   preemptively: a marked-but-fast test costs nothing, while an
-#   unmarked-and-slow one cost a whole session then, and costs a false red now.
-# The current anchor is
-# test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE, which
-# floors the family at test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
-# Derivation: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-#
-# WAS `5 * PYPROJECT_DEFAULT_TIMEOUT` until 2026-09-12, when that ini default
-# was raised 60 -> 300 to stop CPU starvation on a loaded host false-redding a
-# shifting victim (shared/pyproject.toml carries the rationale).  The multiple
-# existed to TRACK the hazard: when the default was 60 it was the binding
-# constraint on this family, so deriving from it kept the ceiling clear of it
-# automatically.  The default has now overtaken the family's own measured
-# requirement, and carrying the multiple forward would have set this to 1500s
-# -- a 5x widening of the ceiling for the ~13 marked modules that no
-# measurement asks for, and one that would silently let a genuinely hung tree
-# scan burn 25 minutes.  So the two knobs are now what they always were
-# SEMANTICALLY -- orthogonal, one sized by host contention and one by the cost
-# of an AST sweep -- and this one is floored at the figure its own measurements
-# justify.  test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS
-# encodes that independence; it has since been re-anchored, but its role is
-# unchanged.
-#
-# It must clear BOTH the floor and PYPROJECT_DEFAULT_TIMEOUT (pinned by
-# test_whole_tree_scan_timeout_guard.py); which of the two binds is value
-# history, recorded in plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-#
-# Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT: that one bounds a
-# different hazard, sized by merge-barrier waits, and an AST sweep performs
-# zero merge waits, so borrowing it would let a future merge-timing retune
-# silently move this ceiling.  Never-narrow: it must also
-# never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
-# a FLOOR would start narrowing its module below the global default (pinned by
-# test_whole_tree_scan_timeout_guard.py).
-WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
-
 # Headroom a per-test ceiling must keep over its family's measured-under-load
 # worst case.  8x rather than 2x: the breaches these ceilings exist to prevent
 # (xdist worker deaths, in the thread era before task 6354) were observed at
@@ -622,8 +525,8 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # different module and its own comment says outright "do not read 1260 as a
 # claim about what this class costs", so borrowing it would let a Row 7
 # re-measurement silently move this module's ceiling -- the identical hazard
-# WHOLE_TREE_SCAN_TEST_TIMEOUT cites when it declines to borrow
-# HEAVY_BARRIER_TEST_TIMEOUT.  The two
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT
+# cites when it declines to borrow HEAVY_BARRIER_TEST_TIMEOUT.  The two
 # scenes are sized by different arithmetic anyway: Row 7 is 234 spawns with
 # zero bounded waits, this is 169 spawns plus a 180s bounded-wait path.
 #
@@ -631,8 +534,9 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # TestDeepLandingSceneBudget:
 #   * `>= VERIFY_CLI_PER_TEST_TIMEOUT` (300) -- 1080 is far above it, so the
 #     marker loosens under the budget verify's CLI passes and cannot invert;
-#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (420) -- the never-narrow rule this file
-#     states a few constants above, at WHOLE_TREE_SCAN_TEST_TIMEOUT: a mark
+#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (420) -- the never-narrow rule
+#     shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT
+#     states: a mark
 #     meant as a FLOOR must never fall below the ambient ini default, or it
 #     starts narrowing its own module.  Until 2026-09-17 these first two were
 #     the SAME number and one check covered both; task 5442 raised the ini

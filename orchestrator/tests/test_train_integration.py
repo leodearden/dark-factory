@@ -9,7 +9,7 @@ Scope:
   B1+B7 — a real 2-member, different-crate train lands via exactly ONE union verify;
            verifies-per-landed-task = 0.5 < the single-merge baseline 1.0
   B2     — a lower-member compile break is CAUGHT by the union verify → blocked
-  B3+B4  — real _select_train_members co-selects non-overlapping ranges, rejects overlapping
+  B3+B4  — real select_train_members co-selects non-overlapping ranges, rejects overlapping
   B8     — a lone merge-ready task merges solo without forming a train
 
 B5 (conflict-eject) and B6 (bounded attribution) are already locked by their owning
@@ -209,6 +209,7 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
     """
     return OrchestratorConfig(
         project_root=repo,
+        escalate_preexisting_main_break=True,
         test_command="cargo test --workspace --quiet",
         lint_command="true",
         type_check_command="true",
@@ -516,7 +517,7 @@ class TestTrainIntegrationB2:
 
 @pytest.mark.asyncio
 class TestTrainIntegrationB3B4:
-    """B3+B4 selection contract: real _select_train_members over real git line ranges.
+    """B3+B4 selection contract: real select_train_members over real git line ranges.
 
     B3: two candidates edit the SAME file in NON-overlapping line ranges →
         co-selected (returns 2-member list).
@@ -537,7 +538,7 @@ class TestTrainIntegrationB3B4:
         parse_diff_line_ranges maps pure insertions to point ranges at their
         old-side anchor: (3,3) vs (21,21) → non-overlapping → co-selected.
         """
-        from orchestrator.workflow import _select_train_members
+        from orchestrator.merge_lane.train_selection import select_train_members
 
         repo = await seed_workspace_repo(tmp_path)
         config = make_train_config(repo, tmp_path / "target_b3")
@@ -579,7 +580,7 @@ class TestTrainIntegrationB3B4:
             "b3_candidate": ranges_candidate,
         }
 
-        result = _select_train_members(
+        result = select_train_members(
             "b3_anchor",
             ["b3_candidate"],
             ranges_by_id,
@@ -600,9 +601,9 @@ class TestTrainIntegrationB3B4:
 
         Both anchor and candidate modify line 3 of crate_a/src/lib.rs
         (the ``value`` field) → both get range (3,3) on the old side →
-        overlapping → _select_train_members returns [].
+        overlapping → select_train_members returns [].
         """
-        from orchestrator.workflow import _select_train_members
+        from orchestrator.merge_lane.train_selection import select_train_members
 
         repo = await seed_workspace_repo(tmp_path)
         config = make_train_config(repo, tmp_path / "target_b4")
@@ -646,7 +647,7 @@ class TestTrainIntegrationB3B4:
             "b4_candidate": ranges_candidate,
         }
 
-        result = _select_train_members(
+        result = select_train_members(
             "b4_anchor",
             ["b4_candidate"],
             ranges_by_id,

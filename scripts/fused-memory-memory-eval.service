@@ -1,0 +1,14 @@
+[Unit]
+Description=Scheduled memory-eval runner: produce, evaluate, publish verdicts, file eval_regression (task 3211)
+Documentation=file:///home/leo/src/dark-factory/fused-memory/scripts/memory_eval_runner.py
+Documentation=file:///home/leo/src/dark-factory/OPERATIONS.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/leo/src/dark-factory
+# The fleet's one PATH spelling, copied from fused-memory-flag-marker-sweep.service,
+# which records why a Persistent=true boot catch-up needs it.
+Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=/home/leo/src/dark-factory/scripts/fused-memory-memory-eval.sh
+StandardOutput=journal
+StandardError=journal

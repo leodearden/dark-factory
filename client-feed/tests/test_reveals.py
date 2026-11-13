@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from _git_repo import Repo, make_repo, path_with_git_killed_on
 from _in_dir import request_reveals, write_engagement
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.contract import (
     ENGAGEMENT_FILENAME,
@@ -85,6 +85,7 @@ def make_project(
     repo.commit('c1', when=at(0))
     TasksDb.create(repo.root)
     RunsDb.create(repo.root)
+    EscalationQueueDir.create(repo.root)
     out_dir = tmp_path / 'out'
     out_dir.mkdir()
     policy = Policy.model_validate(

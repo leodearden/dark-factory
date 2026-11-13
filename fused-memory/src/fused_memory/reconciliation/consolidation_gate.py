@@ -1087,7 +1087,7 @@ def build_consolidation_gate_task(
     deterministic task that neither runs an action nor escalates, and invariant
     3b rejects ``always_escalates`` on a normal task, so it is the only legal
     shape for a pure human gate.  It is also exactly what
-    ``TaskInterceptor._inject_deterministic_pure_gate`` produces, so the
+    ``shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`` produces, so the
     declared submission and the post-coercion task agree either way.  No
     ``before_done`` is referenced: that coercion unconditionally pops one, and
     ``docs/task-authoring.md`` records that ``before_done.kind='predicate'``

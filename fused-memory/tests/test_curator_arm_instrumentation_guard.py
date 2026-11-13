@@ -3,9 +3,14 @@
 All four guard one hazard: a curation that no judgement stands behind, yet
 which no signal distinguishes from a healthy one.
 
-1. Every exception arm around ``TaskCurator.curate()``'s LLM call either
-   routes through ``report_failure`` or returns ``CuratorDecision.deferred``.
-   A defer creates nothing, so it cannot pass for a healthy create.
+1. ``TaskCurator`` issues its LLM call from one method, ``_dispatch_llm``, in
+   one ``try``, and every exception arm of that ``try`` hands the exception to
+   the one failure mapper, ``_failure_decision``. Every return of the mapper
+   is a ``CuratorDecision.deferred`` (a defer creates nothing, so it cannot
+   pass for a healthy create) or a ``_degraded_create`` (which counts it), and
+   the mapper reports to the escalator through ``_escalate_failure``, which
+   calls ``report_failure``. Neither method constructs a ``CuratorDecision``
+   directly.
 2. No ``TaskCurator`` method builds an ``action='create'`` decision except the
    ``_degraded_create`` funnel, which is what advances the degraded streak.
 3. Every ``CuratorDecision(action='create', ...)`` in the module states its
@@ -14,17 +19,17 @@ which no signal distinguishes from a healthy one.
    of ``action='defer'`` in the vocabulary, the curator and the interceptor, so
    every defer carries a ``DeferReason``.
 
-The behavioural halves live in test_task_curator.py. Those pin the paths that
-exist today; these assert over the shapes themselves, so the requirements land
-on an arm or branch added tomorrow without anyone remembering to extend a list.
-Asserted over the PARSED module, so prose that merely mentions a name cannot
-satisfy a check.
+The behavioural halves live in test_task_curator.py and
+test_curation_pipeline.py. Those pin the paths that exist today; these assert
+over the shapes themselves, so the requirements land on an arm or branch added
+tomorrow without anyone remembering to extend a list. Asserted over the PARSED
+module, so prose that merely mentions a name cannot satisfy a check.
 
-Deliberately NOT asserted: which exception types the arms catch, their order,
-what each passes to ``report_failure``, or which way a branch is classified.
-Those are design choices; the invariants are only that no arm is silent, no
-create is uncounted, no fail-open leaves its classification to a default, and
-no defer is built without its reason.
+Deliberately NOT asserted: which exception types the mapper distinguishes,
+their order, what it passes to ``report_failure``, or which way a branch is
+classified. Those are design choices; the invariants are only that no failure
+escapes the mapper undecided, no create is uncounted, no fail-open leaves its
+classification to a default, and no defer is built without its reason.
 """
 
 from __future__ import annotations
@@ -32,7 +37,11 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import pytest
 from _ast_guard import calls_named, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 TASK_CURATOR = SRC_ROOT / 'middleware' / 'task_curator.py'
@@ -40,12 +49,10 @@ CURATOR_TYPES = SRC_ROOT / 'middleware' / 'curator_types.py'
 TASK_INTERCEPTOR = SRC_ROOT / 'middleware' / 'task_interceptor.py'
 
 CURATOR_CLASS = 'TaskCurator'
-CURATE_METHOD = 'curate'
-
-# The batch path calls the same invoker, but from
-# ``_call_llm_batch_with_fallback`` rather than ``curate()``, so the one
-# ``try`` in ``curate()`` that calls it is still the single-candidate call.
 LLM_CALL = '_invoke_curator'
+DISPATCH = '_dispatch_llm'
+MAPPER = '_failure_decision'
+ESCALATE = '_escalate_failure'
 REPORT_CALL = 'report_failure'
 DEFER_FUNNEL = 'deferred'
 
@@ -54,39 +61,28 @@ DEFER_FUNNEL = 'deferred'
 DECISION_TYPE = 'CuratorDecision'
 DEGRADED_FUNNEL = '_degraded_create'
 
-# The arms as of task 4503: the pool-unavailable errors (which defer),
-# CuratorFailureError, and the catch-all. A handler list shorter than this
-# means an arm was deleted rather than instrumented, which would satisfy the
-# silence check vacuously.
-EXPECTED_ARMS = 3
 
-
-def _curate_def() -> ast.AsyncFunctionDef:
-    tree = parse_python_module(TASK_CURATOR)
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.ClassDef) and node.name == CURATOR_CLASS):
-            continue
-        for child in node.body:
-            if isinstance(child, ast.AsyncFunctionDef) and child.name == CURATE_METHOD:
-                return child
+def _curator_method(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    for method in _curator_methods():
+        if method.name == name:
+            return method
     raise AssertionError(
-        f'{TASK_CURATOR.name}: no async def {CURATE_METHOD}() inside '
-        f'class {CURATOR_CLASS} — this guard has lost its subject and is '
-        f'asserting nothing; re-point it rather than deleting it.'
+        f'{TASK_CURATOR.name}: no def {name}() inside class {CURATOR_CLASS} — '
+        f'this guard has lost its subject and is asserting nothing; re-point it '
+        f'rather than deleting it.'
     )
 
 
 def _llm_try() -> ast.Try:
-    """The one ``try`` in ``curate()`` whose body issues the LLM call."""
-    curate = _curate_def()
+    """The one ``try`` in ``_dispatch_llm`` whose body issues the LLM call."""
     matches = [
         node
-        for node in ast.walk(curate)
+        for node in ast.walk(_curator_method(DISPATCH))
         if isinstance(node, ast.Try)
         and any(calls_named(stmt, LLM_CALL) for stmt in node.body)
     ]
     assert len(matches) == 1, (
-        f'expected exactly one try: block in {CURATOR_CLASS}.{CURATE_METHOD} '
+        f'expected exactly one try: block in {CURATOR_CLASS}.{DISPATCH} '
         f'whose body calls {LLM_CALL}(), found {len(matches)} '
         f'(lines {[node.lineno for node in matches]})'
     )
@@ -99,50 +95,89 @@ def _handler_label(handler: ast.ExceptHandler) -> str:
     return f'except {ast.unparse(handler.type)}'
 
 
-def test_llm_call_is_wrapped_in_the_expected_arms():
-    handlers = _llm_try().handlers
-    assert len(handlers) >= EXPECTED_ARMS, (
-        f'{CURATOR_CLASS}.{CURATE_METHOD} guards {LLM_CALL}() with '
-        f'{len(handlers)} exception arm(s), expected at least {EXPECTED_ARMS}: '
-        + ', '.join(
-            f'{_handler_label(handler)} at line {handler.lineno}'
-            for handler in handlers
-        )
+def test_only_the_dispatch_calls_the_llm():
+    callers = sorted(
+        method.name for method in _curator_methods() if calls_named(method, LLM_CALL)
     )
+    assert callers == [DISPATCH], (
+        f'{CURATOR_CLASS} calls {LLM_CALL}() from {callers}, expected only '
+        f'{DISPATCH}(). A second call site is a second set of exception arms '
+        f'for this guard to miss; route the call through {DISPATCH}().'
+    )
+    _llm_try()
 
 
-def test_every_llm_exception_arm_reports_failure_or_defers():
-    silent = [
-        handler
-        for handler in _llm_try().handlers
-        if not calls_named(handler, REPORT_CALL)
-        and not calls_named(handler, DEFER_FUNNEL)
-    ]
-    assert not silent, (
-        f'{CURATOR_CLASS}.{CURATE_METHOD} has exception arm(s) around '
-        f'{LLM_CALL}() that neither call {REPORT_CALL}() nor return '
-        f'{DECISION_TYPE}.{DEFER_FUNNEL}(): '
+def test_every_llm_exception_arm_hands_the_failure_to_the_mapper():
+    handlers = _llm_try().handlers
+    assert handlers, (
+        f'{CURATOR_CLASS}.{DISPATCH} calls {LLM_CALL}() inside a try with no '
+        f'exception arm — re-point this guard.'
+    )
+    unmapped = [handler for handler in handlers if not calls_named(handler, MAPPER)]
+    assert not unmapped, (
+        f'{CURATOR_CLASS}.{DISPATCH} has exception arm(s) around {LLM_CALL}() '
+        f'that never call {MAPPER}(): '
         + ', '.join(
             f'{_handler_label(handler)} at line {handler.lineno}'
-            for handler in silent
+            for handler in unmapped
         )
         + '. A curator failure that reaches a silent arm still returns '
         "action='create', which is indistinguishable downstream from a healthy "
-        'create — the shape of the 2026-08-13 outage. Route it through the '
-        f'escalator ({REPORT_CALL}) as the sibling arms do, or defer it.'
+        'create — the shape of the 2026-08-13 outage. Decide it in the one '
+        f'mapper, {MAPPER}().'
     )
 
 
-def test_curate_constructs_no_decision_directly():
+def _returned_call_name(node: ast.Return) -> str | None:
+    value = node.value
+    if isinstance(value, ast.Await):
+        value = value.value
+    if not isinstance(value, ast.Call):
+        return None
+    func = value.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def test_every_mapper_return_is_a_defer_or_a_counted_create():
+    mapper = _curator_method(MAPPER)
+    returns = [node for node in ast.walk(mapper) if isinstance(node, ast.Return)]
+    assert returns, f'{CURATOR_CLASS}.{MAPPER} returns nothing — re-point this guard.'
+    stray = [
+        node for node in returns
+        if _returned_call_name(node) not in (DEFER_FUNNEL, DEGRADED_FUNNEL)
+    ]
+    assert not stray, (
+        f'{CURATOR_CLASS}.{MAPPER} returns something other than '
+        f'{DECISION_TYPE}.{DEFER_FUNNEL}(...) or {DEGRADED_FUNNEL}(...) at '
+        f'line(s) {sorted(node.lineno for node in stray)}. A failure must '
+        'either defer, which creates nothing, or create through the funnel '
+        'that counts it on the degraded streak.'
+    )
+    assert calls_named(mapper, ESCALATE) and calls_named(_curator_method(ESCALATE), REPORT_CALL), (
+        f'{CURATOR_CLASS}.{MAPPER} never reaches {REPORT_CALL}() through '
+        f'{ESCALATE}(): an LLM failure would be decided without the escalator '
+        'hearing of it.'
+    )
+
+
+def test_dispatch_and_mapper_construct_no_decision_directly():
     """Degraded decisions leave through one funnel, so the streak alarm needs
     no enumerated list of degraded reasons to stay hole-free."""
-    direct = calls_named(_curate_def(), DECISION_TYPE)
+    direct = [
+        (name, call.lineno)
+        for name in (DISPATCH, MAPPER)
+        for call in calls_named(_curator_method(name), DECISION_TYPE)
+    ]
     assert not direct, (
-        f'{CURATOR_CLASS}.{CURATE_METHOD} constructs {DECISION_TYPE} directly at '
-        f'line(s) {sorted(call.lineno for call in direct)}. Every degraded '
-        f'decision must be built by {DEGRADED_FUNNEL}() instead, which is what '
-        f'increments the degraded streak — a decision constructed here bypasses '
-        f'the counter and is invisible to the alarm.'
+        f'{CURATOR_CLASS} constructs {DECISION_TYPE} directly in '
+        + ', '.join(f'{name}() at line {line}' for name, line in direct)
+        + f'. Every degraded decision must be built by {DEGRADED_FUNNEL}() '
+        'instead, which is what increments the degraded streak — a decision '
+        'constructed here bypasses the counter and is invisible to the alarm.'
     )
 
 
@@ -166,9 +201,9 @@ def _is_create_construction(call: ast.Call) -> bool:
 
 
 def test_no_curator_method_but_the_funnel_builds_a_create():
-    """The whole class, not just curate(): a create the curator builds for
+    """The whole class, not just the dispatch: a create the curator builds for
     itself — rather than parsing from a model response — is by definition a
-    fail-open, so it must be counted, on the batch path as on the single one."""
+    fail-open, so it must be counted, at every batch size."""
     methods = _curator_methods()
     assert any(m.name == DEGRADED_FUNNEL for m in methods), (
         f'{CURATOR_CLASS} has no {DEGRADED_FUNNEL}() — re-point this guard.'

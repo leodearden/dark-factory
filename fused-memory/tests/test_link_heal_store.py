@@ -13,7 +13,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from _fm_helpers import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
+from _fm_qdrant_live import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
 
 from fused_memory.maintenance.link_heal_store import (
     CensusFailed,

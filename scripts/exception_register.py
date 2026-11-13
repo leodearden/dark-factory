@@ -1307,6 +1307,13 @@ def measure(root: Path, *, sweep_state: Path, now: datetime.datetime) -> Registe
     )
 
 
+def report_exit_code(register: Register) -> int:
+    """``--report``'s exit code: 2 for an untrusted sweep stamp, else 1 for any violation, else 0."""
+    if _sweep_failure(register.sweep) is not None:
+        return 2
+    return 1 if register.violations else 0
+
+
 #: The register document's own schema version.
 REGISTER_SCHEMA_VERSION = 1
 
@@ -1521,8 +1528,7 @@ def _run(args: argparse.Namespace) -> int:
     failure = _sweep_failure(register.sweep)
     if failure is not None:
         print(f'{_PROG}: {failure}', file=sys.stderr)
-        return 2
-    return 1 if register.violations else 0
+    return report_exit_code(register)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

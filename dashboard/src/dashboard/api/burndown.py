@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import app_clock
 from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
@@ -50,7 +50,7 @@ async def api_burndown(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     dbs = await _burndown_dbs(config, pool)
     window = _parse_window(request.query_params, vocabulary=_BURNDOWN_WINDOWS)
-    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    now = app_clock(request.app)()
 
     try:
         projects = await aggregate_burndown_projects(dbs, days=window.days, now=now)

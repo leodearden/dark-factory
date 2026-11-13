@@ -204,6 +204,33 @@ Phase 3 — observability + rollout:
   CAS advance; each landed item gets its normal finalize path + events;
   first CAS failure aborts the walk (remaining items stay queued). Tip fail
   ⇒ chain discarded, zero queue mutation, head path unaffected.
+- Dispatch contract (task 7720). Before it, the merger took a chain's
+  followers during the tip verify, and production walks logged "landed 0 of
+  N chained link(s)".
+  - **Reservation**: the chain's candidates are reserved from the snapshot
+    to the round's end (`merge_lane/chain_reservation.py`). A reserved
+    request stays buffered but is invisible to the pick, the coalescer and
+    the suffix bounce, so only the walk takes it.
+  - **Time limit**: a confirmed reservation lasts
+    `merge_deep.chain_reservation_timeout_secs` (default 7200, green tier,
+    read at confirm). On expiry the links go back to the ordinary pipeline
+    with a WARNING. The tip verify runs on, and the walk lands only what is
+    still buffered.
+  - **Dead tip**: when the links do not all land (tip fail or raise, abort,
+    expiry, a partial walk, a passed tip torn down before its finalize (the
+    head-failure cascade, or behind a gate-dispatched rebased head)), the tip
+    is recorded dead
+    (`DeadBaseSite.CHAIN_RELEASED`), so INV-3 re-merges or voids anything
+    stacked on it.
+  - **Successor base**: what successors of a chained entry stack on is its
+    chain tip (`remerge_base.py::entry_successor_base`). The next item is
+    merged onto the tip and needs only its own look-ahead permit.
+  - **Look-ahead hold**: when cap>0, the merger waits, before its look-ahead
+    pop, for the dispatch of the speculative item it just queued
+    (`merge_lane/lookahead_hold.py`). The dispatch publishes the successor
+    base above, so the pop cannot take a follower first. With no free host
+    the merger waits and the followers stay buffered. Requests arriving
+    while it waits are buffered too, so the dispatch can chain them.
 - Kill switch: cap=0 ⇒ no chain code executes on any dispatch path
   (byte-identity, asserted by test).
 - Telemetry: `merge_verify.chain_items >= 1` on every merge verify;

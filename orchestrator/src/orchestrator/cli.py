@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 import click
 from dotenv import load_dotenv
 from shared.project_layout import runs_db, tasks_db
+from shared.spawn_temp_files import sweep_orphaned_spawn_temp_files
 
-from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
+from orchestrator.config import ConfigRequiredError, GitConfig, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.shadow_types import ShadowShape
@@ -274,8 +275,18 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
             err=True,
         )
         sys.exit(1)
-    harness = Harness(config, deployed_sha=deployed_sha)
     logger = logging.getLogger(__name__)
+    # Process start, before this process spawns any agent; the sweep is host-wide, so it
+    # also reclaims fused-memory's and scripts' orphans. See
+    # shared/src/shared/spawn_temp_files.py::sweep_orphaned_spawn_temp_files.
+    try:
+        sweep_orphaned_spawn_temp_files()
+    except Exception:
+        logger.warning(
+            'Startup sweep of orphaned agent-spawn temp files failed (non-fatal, startup continues)',
+            exc_info=True,
+        )
+    harness = Harness(config, deployed_sha=deployed_sha)
 
     async def _main():
         # Route SIGTERM/SIGINT through asyncio so CancelledError flows into
@@ -398,6 +409,46 @@ def flake_ledger_cmd(config_path: Path | None):
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
     click.echo(render_report(build_report(ledger_db_path(Path(config.project_root)))))
+
+
+@main.group('verify-cache')
+def verify_cache_group():
+    """The verify-result cache (plans/verify-result-cache-prd.md)."""
+
+
+@verify_cache_group.command('status')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
+def verify_cache_status_cmd(config_path: Path | None):
+    """Print each role's cache mode, the registry's greens by tier, and the kill switch.
+
+    READ ONLY: it will NOT create a registry for a project that has none.
+    """
+    from datetime import UTC, datetime
+
+    from orchestrator.verify_cache.registry import (
+        Registry,
+        RegistryError,
+        RegistrySummary,
+        registry_db_path,
+    )
+    from orchestrator.verify_cache.status import render_status
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    summary: RegistrySummary | RegistryError
+    try:
+        summary = asyncio.run(Registry(registry_db_path(Path(config.project_root))).summary())
+    except RegistryError as e:
+        summary = e
+    for line in render_status(config.verify_cache, summary, datetime.now(UTC)):
+        click.echo(line)
 
 
 @main.command('probe-models')
@@ -1511,6 +1562,7 @@ async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
 
     tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
 
+    git = GitConfig()
     candidates = []
     for project, root in (('dark_factory', df_root), ('reify', reify_root)):
         if not root.exists():
@@ -1519,6 +1571,7 @@ async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
             continue
         found = await discover_completed_tasks(
             root, since=since, project=project, project_root=str(root),
+            branch_prefix=git.branch_prefix, main_branch=git.main_branch,
         )
         found = enrich_candidates_from_task_db(found, tasks_db(root))
         click.echo(f'discovered {len(found)} completed-task merge(s) in {project}')
@@ -1577,10 +1630,10 @@ def _run_single_eval(
     """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.eval_gate import campaign_usage_gate
+    from orchestrator.evals.measurement import format_invocation_errors
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import (
+    from orchestrator.evals.plan_quality_report import (
         build_plan_quality_report,
-        format_invocation_errors,
         format_plan_quality_table,
     )
     from orchestrator.evals.runner import run_architect_eval, run_eval
@@ -1755,11 +1808,13 @@ def _emit_composite_report(results, price_table) -> None:
     architect rows emits the composite table alone, so the existing
     ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
-    from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import (
+    from orchestrator.evals.composite_report import (
         build_composite_report,
-        build_plan_quality_report,
         format_composite_table,
+    )
+    from orchestrator.evals.metrics import RoleUnderTest
+    from orchestrator.evals.plan_quality_report import (
+        build_plan_quality_report,
         format_plan_quality_table,
     )
 

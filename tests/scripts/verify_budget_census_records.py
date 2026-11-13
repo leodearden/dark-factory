@@ -9,12 +9,16 @@ leaf: it imports no guard and nothing from ``module_budget_family``.
 Re-measure by repeating a record's ``census_command`` and replacing the whole
 record. Consumers:
 
-  * ``tests/scripts/test_module_verify_budgets.py::RULED_BUDGET_CENSUS``
+  * ``tests/scripts/test_module_verify_budgets.py::test_module_carries_its_own_measured_verify_budget``,
+    which reads ``RULED_BUDGET_CENSUS``
   * ``tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS``
-  * ``scripts/verify_budget_census.py::FEEDS_CONSTANT``, which points here
+  * ``scripts/verify_budget_census.py::gate_floor_rule``, which reads
+    ``RULED_BUDGET_CENSUS`` to decide which modules the D17 floor applies to
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import NamedTuple
 
 
@@ -108,3 +112,11 @@ ORCHESTRATOR_BUDGET_CENSUS = BudgetCensus(
     ),
     measured_at='2026-09-14',
 )
+
+
+# The one home of WHICH modules ruling D17 holds to their census floor instead
+# of min_budget. Read by the budget gate's ruled-exception branch and by the
+# census report, which must agree on it.
+RULED_BUDGET_CENSUS: Mapping[str, BudgetCensus] = MappingProxyType({
+    'orchestrator': ORCHESTRATOR_BUDGET_CENSUS,
+})

@@ -756,7 +756,7 @@ class TestInterIterationRebaseRederivesStepStatus:
 def _append_agent_line(artifacts: TaskArtifacts, entry: dict) -> None:
     """Append *entry* the way an agent's shell heredoc does, bypassing
     ``TaskArtifacts.append_iteration_log``."""
-    with open(artifacts.root / 'iterations.jsonl', 'a') as log:
+    with open(artifacts.artifact_path('iterations.jsonl'), 'a') as log:
         log.write(json.dumps(entry) + '\n')
 
 

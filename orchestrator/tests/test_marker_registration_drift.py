@@ -68,7 +68,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from _orch_helpers import ORCH_PYPROJECT, WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _orch_helpers import ORCH_PYPROJECT
 from _tree_scan import (
     ORCHESTRATOR_TESTS,
     TESTS_DIR,
@@ -79,8 +79,9 @@ from _tree_scan import (
     python_files,
 )
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),

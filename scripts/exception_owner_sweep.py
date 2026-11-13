@@ -51,6 +51,7 @@ try:
     import exception_register
     from _task_db_scan import UNREADABLE_STORE_ERRORS, tasks_db_path
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+    from inline_suppressions import BASELINE_PATH
     from shared.governed_exceptions import (
         MalformedDisposition,
         TaskRef,
@@ -685,10 +686,15 @@ MAX_OUTPUTS_PER_RUN = 10
 """INV-4's storm bound: filings and escalations per run, plus one overflow roll-up."""
 
 
-def _tighten_body(slack: int) -> _Body:
+def _tighten_body(slack: int, measured_at: datetime.datetime) -> _Body:
+    """The store's (title, files) candidate_key index covers done rows, so the measurement time
+    keeps each recurrence distinct from its closed predecessor (precedent:
+    ``fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title``).
+    """
     remedy = f'Run `{TIGHTEN_COMMAND}` and commit the tightened baseline.'
+    as_of = measured_at.isoformat(timespec='seconds')
     return _Body(
-        summary=f'INV-12: tighten the inline-suppression baseline ({slack} slack)',
+        summary=f'INV-12: tighten the inline-suppression baseline ({slack} slack as of {as_of})',
         detail='\n'.join(
             [
                 f'The inline-suppression baseline allows {slack} more unowned sites than the tree holds.',
@@ -698,6 +704,7 @@ def _tighten_body(slack: int) -> _Body:
         ),
         remedy=remedy,
         observation=f'baseline slack_total {slack}',
+        files=(BASELINE_PATH,),
     )
 
 
@@ -925,7 +932,7 @@ def _act_on(scan: Scan, outputs: _Outputs) -> None:
             step = outputs.raise_finding(key, _dead_owner_body(citation, verdict))
         outputs.reports.append(Report(citation.scope, citation.owner, verdict, step))
     if scan.register.slack_total > 0:
-        outputs.tighten = outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total))
+        outputs.tighten = outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total, scan.measured_at))
     outputs.roll_up()
     _reconcile_notes(outputs.reports, outputs.ports, outputs.now)
 

@@ -1,0 +1,24 @@
+{
+  "task_id": "8524",
+  "reason": "step-4: PermitLedger.try_acquire (non-blocking take, D1 ground 2) and RemergeClaim/claim_remerge_base in remerge_base.py; net-additive permit seam for re-anchored re-merges",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/remerge_base.py",
+      "baseline": 28,
+      "current": 32
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/speculation_controller.py",
+      "baseline": 21,
+      "current": 22
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5100,
+      "current": 5105
+    }
+  ]
+}

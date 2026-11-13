@@ -253,7 +253,7 @@ def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
     spells one. Reading such a project as capless would drop it out of the
     parity alarm entirely.
 
-    Resolution mirrors ``dashboard.config._discover_root_escalation_url`` and
+    Resolution mirrors ``dashboard.config.discover_root_escalation_url`` and
     reuses its filename constants so the two cannot fork: the canonical
     ``dark-factory-orchestrator.yaml`` is authoritative once it exists on
     disk (a live config must not be masked by a stale legacy file — including

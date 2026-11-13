@@ -8,6 +8,11 @@ colliding with sibling subprojects' helpers.
 
 An opt-in fixture defined here applies only to the modules that import it
 by name (see `lease_dir_fixture`).
+
+Five siblings follow the same convention, each owning one seam: `_fm_polling`
+(wait barriers), `_fm_qdrant_live` and `_fm_falkor_live` (live-backend
+scaffolding), `_fm_git_repos` (real-git builders) and `_fm_httpx_leaks`
+(leaked httpx client reaping).
 """
 
 import asyncio
@@ -16,7 +21,6 @@ import functools
 import importlib.util
 import inspect
 import json
-import os
 import pathlib
 import re
 import sqlite3
@@ -24,10 +28,7 @@ import subprocess
 import sys
 import threading
 import types
-import uuid
-import warnings
-import weakref
-from collections.abc import Callable
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -44,6 +45,7 @@ from fused_memory.backends.graphiti_client import (
     PagedRead,
     ReadCompleteness,
 )
+from fused_memory.services.durable_queue import DurableWriteQueue
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -654,250 +656,30 @@ MCP_SAFE_RESPONSE_CHARS = 62_000
 
 
 # ---------------------------------------------------------------------------
-# Shared Qdrant test scaffolding (task 2277)
+# Topic-guard note fixtures (task 3054)
 # ---------------------------------------------------------------------------
-#
-# De-duplicates the _qdrant_available()/QDRANT_URL/skip-marker trio that was
-# previously copy-pasted verbatim in test_recon_dedup_premise.py and
-# test_mem0_qdrant_integration.py (flagged by esc-2221-26).
+# One note drives both the pure-matcher assertions in test_config_schema.py
+# and the whole-tool assertions in server/test_add_memory_near_duplicate_gate.py,
+# so an edit to it moves both suites and neither silently tests a stale note.
 # ---------------------------------------------------------------------------
 
-QDRANT_URL = 'http://localhost:6333'
+STRADDLING_WRITE_FIXTURE = (
+    'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
+    'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
+    'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
+    'was scrubbed. The architect then sees no plan and may wrongly call '
+    'report_task_already_done instead of replanning.'
+)
 
-
-def _qdrant_available() -> bool:
-    """Probe whether a Qdrant instance is reachable at QDRANT_URL.
-
-    Imports QdrantClient lazily (rather than at module scope) so that
-    importing this module — which conftest.py does every test session —
-    never pulls in qdrant_client, and so tests can deterministically patch
-    ``qdrant_client.QdrantClient``.
-    """
-    from qdrant_client import QdrantClient
-
-    try:
-        client = QdrantClient(url=QDRANT_URL, timeout=2)
-    except Exception:
-        return False
-
-    try:
-        client.get_collections()
-        return True
-    except Exception:
-        return False
-    finally:
-        with contextlib.suppress(Exception):
-            client.close()
-
-
-def qdrant_skipif(reason: str = 'Qdrant not reachable'):
-    """Return a ``pytest.mark.skipif`` marker gated on `_qdrant_available()`.
-
-    A factory rather than a module-level marker constant: _fm_helpers is
-    imported by conftest.py on every test session, so evaluating the probe at
-    import time would run it even for test sessions that never touch Qdrant.
-    Calling this from a module's ``pytestmark`` instead defers the probe to
-    that module's own collection time — identical timing to each file's
-    previous local copy.
-    """
-    return pytest.mark.skipif(not _qdrant_available(), reason=reason)
-
-
-def ensure_fresh_collection(
-    client: Any,
-    collection_name: str,
-    *,
-    size: int,
-    distance: Any = None,
-) -> None:
-    """Idempotently (re)create *collection_name* as an empty size-*size* collection.
-
-    Replaces the fragile ``delete_collection(suppressed) + create_collection``
-    pair each integration fixture rolled by hand. Under ``-n auto`` xdist load,
-    a prior run's teardown can be swallowed (or a concurrent worker can win the
-    create race), leaving a stale collection behind that ``collection_exists()``
-    may still report absent — so a naive create then 409-conflicts and fails the
-    next run. This helper self-heals that case: if the create raises a 409
-    ``UnexpectedResponse`` it deletes the stale collection and creates once more.
-    Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
-    loud, no retry.
-
-    Imports ``VectorParams``/``Distance``/``UnexpectedResponse`` lazily inside
-    the body, mirroring ``_qdrant_available``'s convention (see its docstring):
-    conftest.py imports this module every test session, so a module-scope
-    qdrant import would pull qdrant_client into every session and break tests
-    that monkeypatch ``qdrant_client.QdrantClient``.
-
-    Args:
-        client: A ``qdrant_client.QdrantClient`` (or test double) exposing
-            ``collection_exists`` / ``delete_collection`` / ``create_collection``.
-        collection_name: The collection to (re)create.
-        size: Vector dimensionality for the new collection.
-        distance: Optional ``qdrant_client.models.Distance``; defaults to
-            ``Distance.COSINE`` when None.
-    """
-    from qdrant_client.http.exceptions import UnexpectedResponse
-    from qdrant_client.models import Distance, VectorParams
-
-    vectors_config = VectorParams(size=size, distance=distance or Distance.COSINE)
-
-    if client.collection_exists(collection_name):
-        client.delete_collection(collection_name)
-    try:
-        client.create_collection(
-            collection_name=collection_name, vectors_config=vectors_config,
-        )
-    except UnexpectedResponse as exc:
-        if getattr(exc, 'status_code', None) != 409:
-            raise
-        # Stale collection survived a swallowed teardown / lost create race:
-        # delete it and create once more rather than propagating the conflict.
-        client.delete_collection(collection_name)
-        client.create_collection(
-            collection_name=collection_name, vectors_config=vectors_config,
-        )
+MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
+    'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
+    'commit is an ancestor of a branch tip before cherry-picking.'
+)
 
 
 # ---------------------------------------------------------------------------
-# Shared FalkorDB test scaffolding (task 3502)
+# Shared xdist worker-id resolver
 # ---------------------------------------------------------------------------
-#
-# Connection constants, reachability probe and skip-marker factory for tests
-# that drive a live FalkorDB. Placed directly after the Qdrant section above so
-# the two reachability-probe pairs (constants → probe → skipif factory) read as
-# one convention. tests/test_falkor_probe_routing_guard.py enforces that no
-# test module forks this scaffolding back into itself.
-# ---------------------------------------------------------------------------
-
-def _falkor_host_from_env() -> str:
-    """Derive the FalkorDB host from FALKOR_HOST, defaulting to localhost.
-
-    A named function rather than an expression inlined at the constant's
-    assignment, so the derivation is reachable at call time and can be tested
-    under a monkeypatched environment without ``importlib.reload``.
-    """
-    return os.environ.get('FALKOR_HOST', 'localhost')
-
-
-def _falkor_port_from_env() -> int:
-    """Derive the FalkorDB port from FALKOR_PORT, defaulting to 6379.
-
-    The ``int()`` is load-bearing, not cosmetic: ``os.environ`` yields str, and
-    ``FalkorDB(port='6379')`` fails or misbehaves on a str port.
-
-    Unset *or empty* takes the default. Empty is what a CI template like
-    ``FALKOR_PORT: ${FALKOR_PORT}`` produces when the variable is not set, and
-    it is the same shape ``known_project_roots_from_env`` (models/scope.py)
-    already treats as unset.
-
-    A non-empty, non-numeric value is an operator error and raises
-    ``RuntimeError`` naming the offending value.
-
-    That raise fires at *import* of this module, and conftest.py imports it on
-    every session — so a malformed FALKOR_PORT aborts the whole run, including
-    the unit lane, which never touches FalkorDB. This is intentional, and is
-    faithful to the behaviour it replaces: each of the six migrated modules
-    already did a bare ``int(os.environ.get('FALKOR_PORT', 6379))`` at its own
-    import, so a malformed value was always fatal. What changes is (a) the
-    message — actionable text naming the offending value, rather than a
-    ``ValueError`` traceback into a shared helper — and (b) the blast radius,
-    which widens from the six FalkorDB modules to every fused-memory module.
-    Deferring the raise into ``_falkor_available()`` would narrow (b), at the
-    cost of letting a typo'd port read as "FalkorDB not reachable" and silently
-    skip the live lane rather than reporting the typo. Failing loudly is the
-    better trade.
-    """
-    raw = os.environ.get('FALKOR_PORT', '').strip()
-    if not raw:
-        return 6379
-    try:
-        return int(raw)
-    except ValueError:
-        raise RuntimeError(
-            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
-            f'default (6379), or set it to the port your FalkorDB listens on.'
-        ) from None
-
-
-# Evaluated once at import; consumers import the constants, not the helpers.
-FALKOR_HOST: str = _falkor_host_from_env()
-FALKOR_PORT: int = _falkor_port_from_env()
-
-
-def _falkor_available() -> bool:
-    """Probe whether a FalkorDB instance is reachable at FALKOR_HOST:FALKOR_PORT.
-
-    Returns False rather than raising for any failure — construct, query or
-    close — and is bounded by ``socket_connect_timeout=2``, so an unreachable
-    host costs ~2s at most.
-
-    Uses the falkordb-native sync client rather than ``redis``: redis is not a
-    declared dependency of fused-memory, only a transitive of
-    graphiti-core[falkordb], so a redis-based probe would break silently if
-    falkordb ever switched transport.
-
-    Imports FalkorDB lazily so (a) conftest.py's session-wide import of this
-    module does not drag falkordb into sessions that never touch it, and (b)
-    the name resolves at call time, which is what lets tests patch
-    ``falkordb.FalkorDB`` deterministically. Same convention as
-    ``_qdrant_available`` above.
-
-    Deliberately NOT cached: each consuming module pays its own probe at its
-    own collection time. Memoising would break the call-time tracking
-    ``falkor_skipif`` relies on, and test_integration_marker_real_service.py
-    budgets for the per-module cost explicitly.
-    """
-    from falkordb import FalkorDB
-
-    try:
-        client = FalkorDB(
-            host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2
-        )
-        try:
-            client.select_graph('_probe').query('RETURN 1')
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
-        return True
-    except Exception:
-        return False
-
-
-def falkor_skipif(reason: str = 'FalkorDB not reachable'):
-    """Return a ``pytest.mark.skipif`` marker gated on `_falkor_available()`.
-
-    A factory rather than a module-level marker constant: conftest.py imports
-    this module on every session, so evaluating the probe at import time would
-    cost a bounded ~2s connection attempt even for sessions that never touch
-    FalkorDB. Called from a consuming module's ``pytestmark``, or as a
-    class/function decorator, the probe instead fires at that module's own
-    collection time.
-
-    Resolves ``_falkor_available`` through the module global at call time
-    rather than capturing it, so the marker tracks whatever the probe
-    currently reports.
-    """
-    return pytest.mark.skipif(not _falkor_available(), reason=reason)
-
-
-def unique_graph_name(slug: str) -> str:
-    """Return a fresh per-run FalkorDB graph name, ``_test_<slug>_<8 hex>``.
-
-    A fresh name is minted on every call so that concurrent test runs —
-    pytest-xdist ``-n auto``, or a CI matrix pointed at one shared FalkorDB —
-    never select the same graph and wipe each other's fixtures.
-
-    The caller still owns the rest of the lifecycle: the best-effort delete of
-    a stale graph left by a prior run, and the teardown ``graph.delete()`` /
-    ``client.aclose()`` pair.
-
-    Args:
-        slug: Should embed the owning task id, by convention (e.g.
-            ``2207_merge_entities``), so a graph orphaned by a killed run is
-            traceable back to the test module that created it.
-    """
-    return f'_test_{slug}_{uuid.uuid4().hex[:8]}'
-
 
 def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.Session) -> str:
     """Return this worker's id ('gw0', 'gw1', …) or 'master' — without the xdist PLUGIN.
@@ -943,349 +725,32 @@ def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.S
 
 
 # ---------------------------------------------------------------------------
-# Shared poll_until() helper (task 2377)
-# ---------------------------------------------------------------------------
-#
-# Generalizes the local poll-then-assert precedents in test_durable_queue.py
-# (_poll_until_dead and the inline deadline loop) into a single shared
-# helper. Converts fixed "sleep(N) then assert background work is done"
-# sites — fragile under host CPU oversubscription, since the hardcoded
-# window may elapse before the background drainer/worker/watchdog is even
-# scheduled — into a bounded poll on the same post-condition. A genuinely
-# stuck background task still surfaces as a clear AssertionError once the
-# (generous) deadline passes.
+# Shared durable-queue retry-budget factory (task 4847)
 # ---------------------------------------------------------------------------
 
-async def poll_until(
-    predicate: Callable[[], Any],
-    *,
-    timeout: float = 10.0,
-    interval: float = 0.02,
-    message: str | None = None,
-) -> Any:
-    """Poll *predicate* until it is truthy, returning its truthy result verbatim.
+def make_retry_budget_queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
+    """A DurableWriteQueue with plain budget 5, extended transient budget 12,
+    sub-second backoff, and no ``transient_error_names=`` override, so the
+    shipped DEFAULT_TRANSIENT_ERROR_NAMES decides which budget applies.
 
-    *predicate* may be a plain sync callable or an async/coroutine function —
-    either way it is called with no arguments on each iteration; if the
-    result is awaitable (``inspect.isawaitable``), it is awaited before the
-    truthiness check. This lets callers poll on state that itself requires an
-    await (e.g. ``lambda: queue.get_stats()``).
-
-    Checks *before* sleeping, so an already-true predicate returns on the
-    first call with no sleep at all. Uses the asyncio event-loop monotonic
-    clock (mirrors the ``_poll_until_dead`` precedent in
-    test_durable_queue.py) rather than wall-clock/perf_counter, to avoid the
-    same class of timing fragility this helper exists to remove.
-
-    Args:
-        predicate: Zero-arg sync or async callable evaluated each iteration.
-        timeout: Seconds to keep polling before giving up. Defaults to 10s —
-            generous enough to absorb host CPU oversubscription while still
-            catching a genuinely-stuck post-condition.
-        interval: Seconds to sleep between polls. Defaults to 0.02s.
-        message: Custom AssertionError message on timeout. When None, a
-            default message naming *timeout* is used.
-
-    Returns:
-        The predicate's truthy result, returned verbatim (not coerced to
-        ``True``) so callers can chain on it (e.g. a stats dict).
-
-    Raises:
-        AssertionError: *predicate* never became truthy within *timeout*
-            seconds — signals a genuinely-stuck background task, the same
-            failure class the fixed-sleep asserts this helper replaces used
-            to (accidentally) surface.
+    The single definition that keeps task 3585's and task 3586's attempt
+    counts comparable. *overrides* replace any constructor keyword.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while True:
-        result = predicate()
-        if inspect.isawaitable(result):
-            result = await result
-        if result:
-            return result
-        if loop.time() >= deadline:
-            raise AssertionError(message or f'poll_until: condition not met within {timeout}s')
-        await asyncio.sleep(interval)
-
-
-# ---------------------------------------------------------------------------
-# Shared poll_until_stable() settle barrier (task 3697)
-# ---------------------------------------------------------------------------
-#
-# The companion to poll_until above, and deliberately placed beside it so the
-# two read as a matched PAIR of barrier primitives rather than two unrelated
-# utilities. poll_until is a LIVENESS barrier; this is a SETTLE barrier. Picking
-# the wrong one is the defect this exists to prevent -- see the docstring's
-# decision rule. Public (no leading underscore) for the reason this module
-# already documents for poll_until / ensure_fresh_collection: it is imported
-# cross-module.
-# ---------------------------------------------------------------------------
-
-#: Cap on the observed-value trail carried in the never-settled AssertionError.
-#: A pathological sampler must not be able to produce a multi-megabyte message.
-_STABLE_TRAIL_LIMIT = 10
-
-
-async def poll_until_stable(
-    sample: Callable[[], Any],
-    *,
-    settle: float = 0.2,
-    timeout: float = 10.0,
-    interval: float = 0.02,
-    message: str | None = None,
-) -> Any:
-    """Poll *sample* until its truthy value STOPS CHANGING, then return it verbatim.
-
-    Choosing between this and :func:`poll_until` — the whole point of having
-    both:
-
-    * ``poll_until`` is a **liveness** barrier. Correct when the assertion that
-      follows is "X happened".
-    * ``poll_until_stable`` is a **settle** barrier. **Required** when the
-      assertion that follows is an exact count or an "exactly once" claim,
-      because a liveness poll returns at the *first* occurrence and therefore
-      structurally cannot observe a duplicate that arrives after it.
-
-    The motivating call site is
-    ``test_ticket_worker.py::test_worker_created_path_emits_journal_event``,
-    whose ``assert len(task_created_events) == 1`` was gated on
-    ``poll_until(lambda: any(...))`` — so the assertion ran the instant the
-    first event landed. The duplicate that assertion exists to catch is
-    concrete, not hypothetical: ``task_created`` is emitted from two distinct
-    code paths (``task_interceptor.py`` lines 3786-3795 and 4164-4173), each
-    persisting the terminal ticket row *before* emitting — so no ticket-row
-    predicate closes the emission window either, and only a settle window does.
-
-    **The flake asymmetry**, which is what makes adding a settle window safe: a
-    too-short *settle* can only cause a false PASS (a missed duplicate), never
-    a false FAIL, because a stable value stays stable no matter how starved the
-    host is. The only false-FAIL surface is the outer *timeout*, which keeps
-    ``poll_until``'s already-proven 10s default. Raising *settle* is therefore
-    always safe, and is the correct response to a suspected missed duplicate.
-
-    *sample* may be a plain sync callable or an async/coroutine function —
-    either way it is called with no arguments each iteration and, if the result
-    is awaitable (``inspect.isawaitable``), awaited before use. A falsy result
-    means "not ready yet": polling continues and the settle window does not
-    start. Change detection uses ``!=``, and the deadline uses the asyncio
-    event-loop monotonic clock (same rationale as ``poll_until``), bounding
-    total time *including* settle restarts so a forever-changing value cannot
-    spin past *timeout*.
-
-    Args:
-        sample: Zero-arg sync or async callable evaluated each iteration.
-        settle: Seconds the value must be observed unchanged before it is
-            returned. Any change restarts this window. Defaults to 0.2s.
-        timeout: Total seconds to keep polling before giving up. Defaults to
-            10s, matching ``poll_until``.
-        interval: Seconds to sleep between polls. Defaults to 0.02s.
-        message: Custom AssertionError message used when the value never
-            became truthy at all.
-
-    Returns:
-        The settled truthy value, returned verbatim (not coerced to ``True``),
-        matching ``poll_until``.
-
-    Raises:
-        AssertionError: with two deliberately DISTINGUISHABLE messages, because
-            "it never happened" and "it kept changing" demand different
-            debugging and must not collapse into one string —
-
-            * never became truthy → the caller's *message* (or a default
-              naming *timeout*), matching ``poll_until``'s failure text so the
-              common case reads identically;
-            * became truthy but never settled → a message saying so and
-              naming the observed values (capped at the last
-              ``_STABLE_TRAIL_LIMIT`` distinct ones).
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    candidate: Any = None
-    have_candidate = False
-    stable_since = 0.0
-    trail: list[Any] = []
-    while True:
-        result = sample()
-        if inspect.isawaitable(result):
-            result = await result
-        if result:
-            now = loop.time()
-            if not have_candidate or result != candidate:
-                candidate = result
-                have_candidate = True
-                stable_since = now
-                trail.append(result)
-                del trail[:-_STABLE_TRAIL_LIMIT]
-            elif now - stable_since >= settle:
-                return candidate
-        else:
-            # Not ready yet — a falsy sample does not start the settle window.
-            have_candidate = False
-        if loop.time() >= deadline:
-            if trail:
-                raise AssertionError(
-                    f'poll_until_stable: value never settled for {settle}s within '
-                    f'{timeout}s; observed (last {len(trail)}): {trail!r}'
-                )
-            raise AssertionError(
-                message or f'poll_until_stable: condition not met within {timeout}s'
-            )
-        await asyncio.sleep(interval)
-
-
-# ---------------------------------------------------------------------------
-# Shared retry_until_observed() observation barrier (task 4972)
-# ---------------------------------------------------------------------------
-#
-# The THIRD member of the barrier family above, placed beside its two siblings
-# for the same reason poll_until_stable was placed beside poll_until: picking
-# the wrong one is the defect this exists to prevent -- see the docstring's
-# decision rule. Public (no leading underscore) for the reason this module
-# already documents for poll_until / poll_until_stable: it is imported
-# cross-module.
-# ---------------------------------------------------------------------------
-
-async def retry_until_observed(
-    observe: Callable[[], Any],
-    *,
-    reopen: Callable[[], Any] | None = None,
-    attempts: int = 4,
-    delay: float = 0.0,
-    message: str | None = None,
-) -> Any:
-    """Observe a RACY TRANSIENT, RE-OPENING it between attempts, and return what was seen.
-
-    Choosing between this and its two siblings — the whole point of having
-    three:
-
-    * :func:`poll_until` is a **liveness** barrier. Correct when the assertion
-      that follows is "X happened".
-    * :func:`poll_until_stable` is a **settle** barrier. Required when the
-      assertion that follows is an exact count or an "exactly once" claim.
-    * ``retry_until_observed`` is an **observation** barrier. **Required** when
-      the condition is a racy TRANSIENT that may close before any client read
-      can see it — the case both siblings structurally cannot handle, because
-      each only ever looks at ONE opening of the window.
-
-    The discriminator, stated plainly: reach for this only when a miss means
-    the window never opened *for this attempt*, so no interval and no deadline
-    on a single attempt can help — there is nothing left to observe. The only
-    lever that acts on an absent window is to open a new one, which is what
-    *reopen* does.
-
-    The motivating call site is
-    ``tests/test_drop_vector_indices_integration.py::TestDropRebuildWindow``,
-    which observes the rebuild window FalkorDB opens when ``DROP VECTOR INDEX``
-    leaves a merged index's other fields behind. Measured under the offline
-    lane's own scheduling (``nice -n 19 ionice -c3``, serial): the window was
-    observable on 28 of 30 first attempts. On a miss it was not merely hard to
-    catch — the first post-DROP read, taken 6.8 ms after ``DROP`` returned,
-    already showed ONE Entity row, already ``OPERATIONAL``, and it stayed that
-    way for the whole deadline. FalkorDB had completed the rebuild inside the
-    ``DROP`` round-trip; the window never opened at all.
-
-    *observe* and *reopen* may each be a plain sync callable or an
-    async/coroutine function — either way called with no arguments and, if the
-    result is awaitable (``inspect.isawaitable``), awaited before use, matching
-    ``poll_until``'s contract exactly so all three primitives accept the same
-    callable shapes. A falsy *observe* result means "the window was not
-    observed on this attempt". Only a FALSY result counts as a miss —
-    an exception from either callable propagates untouched, so a caller
-    reading a live system can still tell "the shape changed" apart from
-    "the window closed too fast" (the motivating call site's second durable
-    job depends on exactly that).
-
-    WHAT MAKES AN ATTEMPT AN ATTEMPT. Nothing here re-observes faster than
-    the caller lets it, so each attempt must be able to see a window that
-    was not open at the instant the previous one gave up. Satisfy that in
-    one of two ways: make *observe* itself a TIME-BOUNDED awaiting attempt
-    (typically a bounded :func:`poll_until`, which is what the motivating
-    call site does), or pass a non-zero *delay*. A synchronous *observe*
-    with ``reopen=None`` and ``delay=0.0`` would otherwise spend its whole
-    budget inside a single event-loop tick — a barrier that gated nothing
-    while wearing a plausible exhaustion message. The miss path always
-    awaits ``asyncio.sleep(delay)`` even at the 0.0 default, so the loop at
-    minimum YIELDS between attempts rather than starving the event loop.
-
-    Args:
-        observe: Zero-arg sync or async callable making ONE bounded attempt to
-            observe the transient. Returns a truthy observation, or falsy for a
-            miss. Typically itself a bounded ``poll_until``.
-        reopen: Zero-arg sync or async callable that re-opens the transient,
-            called only BETWEEN attempts — never before the first (the caller
-            has already opened the window) and never after the last (nobody
-            would read it). ``None`` means the transient re-arms itself, and
-            is a supported no-op: the attempt budget and the exhaustion raise
-            are unchanged.
-        attempts: Maximum number of observation attempts. Must be >= 1;
-            ``attempts=1`` degenerates to a single un-retried observation.
-        delay: Seconds slept BETWEEN attempts — after *reopen*, before the
-            next observation, so the wait is spent on a window that exists
-            rather than one not yet opened. The sibling primitives spell
-            their cadence knob ``interval``; this one is deliberately named
-            differently because it is not a poll cadence but the gap between
-            two INDEPENDENT openings. Awaited even at the 0.0 default (see
-            above) and, like *reopen*, never after the final miss.
-        message: Caller diagnostic appended to the exhaustion AssertionError.
-
-    Returns:
-        The observation, returned verbatim (not coerced to ``True``), matching
-        ``poll_until`` / ``poll_until_stable``.
-
-    Raises:
-        AssertionError: The transient was not observed in any of *attempts*
-            independent openings — the message names the attempt count and
-            carries the caller's *message*. This helper RAISES rather than
-            returning ``None`` because exhausting the budget is the one signal
-            it must never swallow: it is the evidence that the transient is
-            genuinely GONE rather than merely hard to catch. At the motivating
-            call site that distinction IS the test's primary durable job — a
-            FalkorDB that stopped rebuilding the merged index in place would
-            make every post-drop barrier task 4748 added dead weight, and a
-            silent ``None`` would let that pass as an ordinary miss.
-        ValueError: *attempts* was less than 1 — raised before *observe* is
-            called even once, so a mis-configured budget can never masquerade
-            as the exhaustion AssertionError above.
-    """
-    # Fail CLOSED on a mis-configured budget, before observing anything: with a
-    # bare loop, attempts=0 would make zero observations and then raise the
-    # ordinary exhaustion AssertionError below -- a barrier that gated nothing
-    # while wearing a plausible-looking failure message. Same argument
-    # await_index_operational makes for treating an empty result_set as NOT
-    # ready. ValueError (not AssertionError) so a caller catching a genuine
-    # missed observation cannot swallow a mis-configuration with it.
-    if attempts < 1:
-        raise ValueError(f'retry_until_observed: attempts must be >= 1, got {attempts!r}')
-    for attempt in range(1, attempts + 1):
-        result = observe()
-        if inspect.isawaitable(result):
-            result = await result
-        if result:
-            return result
-        # Re-open, then wait, ONLY between attempts:
-        #   * not before attempt 1 -- the caller has already opened the window
-        #     once, and re-opening first would silently discard that opening
-        #     and double the cost of the common (observed-first-try) case;
-        #   * not after the final miss -- re-arming a window nobody will look
-        #     at is pure waste, and would leave the caller's subject in a
-        #     different state than it expects on the failure path; sleeping
-        #     there is pure latency on the failure path for the same reason.
-        if attempt < attempts:
-            if reopen is not None:
-                reopened = reopen()
-                if inspect.isawaitable(reopened):
-                    await reopened
-            # Unconditional, even at delay=0.0: asyncio.sleep(0) costs one
-            # event-loop tick and hands control back, which is the minimum
-            # that makes a reopen=None caller (a transient re-armed by an
-            # external producer) able to make progress at all. Placed AFTER
-            # reopen so the wait is spent on an already-open window.
-            await asyncio.sleep(delay)
-    detail = f' {message}' if message else ''
-    raise AssertionError(
-        f'retry_until_observed: condition not observed in {attempts} attempt(s).{detail}'
+    # Annotated: without it pyright joins the heterogeneous literal values into
+    # a single narrow type and rejects the ** unpacking below.
+    kwargs: dict[str, Any] = dict(
+        data_dir=tmp_path / 'queue',
+        execute_write=execute,
+        workers_per_group=1,
+        semaphore_limit=5,
+        max_attempts=5,
+        retry_base_seconds=0.01,
+        retry_max_delay_seconds=0.05,
+        write_timeout_seconds=2.0,
+        transient_max_attempts=12,
     )
+    kwargs.update(overrides)
+    return DurableWriteQueue(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1373,234 +838,8 @@ class LoopFreedomProbe:
 
 
 # ---------------------------------------------------------------------------
-# Shared FalkorDB index-readiness barrier (task 3377; extracted from task 3334)
+# Claimant-less tasks.db builder
 # ---------------------------------------------------------------------------
-#
-# Extracted from test_falkor_fulltext_integration.py so every live-index test
-# module routes through ONE implementation instead of re-forking it. Public
-# (no leading underscore) because it is now imported cross-module, matching
-# poll_until / ensure_fresh_collection / collection_vector_size.
-# tests/test_falkor_index_barrier_guard.py enforces that routing.
-#
-# IndexHeaderError is public for the same reason: it is the blessed name a
-# caller catches to tell "FalkorDB changed shape" apart from "the index never
-# became ready". Keeping it module-private would document a distinction across
-# the module boundary that no caller could actually reach.
-# ---------------------------------------------------------------------------
-
-class IndexHeaderError(AssertionError):
-    """``CALL db.indexes()`` did not expose a ``status`` column.
-
-    A distinct type from the timeout AssertionError because the two failure
-    modes mean different things and call for different operator actions: a
-    timeout is a slow or wedged index build, whereas a missing ``status``
-    column means FalkorDB changed its result shape and the barrier cannot be
-    trusted at all. Collapsing the second into a generic timeout message would
-    hide a silent no-op behind a plausible-looking timeout.
-
-    Subclasses ``AssertionError`` so a caller that only cares that the barrier
-    failed can still catch the broad type, while a caller that needs to act on
-    the difference has a name to catch. Callers asserting on the *timeout* path
-    specifically should match its message (``'not OPERATIONAL'``) rather than
-    the bare type, which this subclass also satisfies.
-    """
-
-
-async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
-    """Block until every index on ``graph`` reports ``OPERATIONAL``.
-
-    FalkorDB builds indices **asynchronously**. Querying before the index is
-    ready silently returns success for a query the engine would otherwise
-    reject. Measured while characterising task 3334: a known-unparseable
-    fulltext query issued immediately after
-    ``CALL db.idx.fulltext.createNodeIndex(...)`` across six fresh graphs gave
-    FAIL, OK, OK, FAIL, FAIL, FAIL — **2 of 6 runs falsely reported success**.
-    Range indices are built asynchronously too (measured on a 200k-node graph:
-    ``'[Indexing] 628/200000: UNDER CONSTRUCTION'``, never operational within
-    40 polls), so this barrier is not fulltext-specific.
-
-    The ``status`` column is resolved **by name** from ``result.header`` rather
-    than hardcoded to its current position (7 of 9), so a FalkorDB column
-    reorder fails loudly here instead of silently reading the wrong column and
-    turning the barrier into a no-op.
-
-    Readiness is an **exact** match on ``'OPERATIONAL'`` for every row, never a
-    substring test for ``'UNDER CONSTRUCTION'``: the live not-ready value
-    carries a varying progress prefix (``'[Indexing] N/M: UNDER
-    CONSTRUCTION'``), so matching the not-ready side would have to anticipate
-    every status string FalkorDB might ever emit and would treat an
-    unrecognised future status as ready. Testing the ready side is fail-closed
-    — anything unfamiliar blocks and eventually raises. An empty
-    ``result_set`` counts as NOT ready, since ``all()`` over an empty sequence
-    is vacuously true and would otherwise return success having gated nothing.
-
-    Polling is delegated to :func:`poll_until` (event-loop monotonic clock,
-    check-before-sleep, raise-on-timeout) rather than hand-rolling a second
-    deadline loop in the module that hosts it. An already-operational index
-    therefore costs exactly one ``CALL db.indexes()`` round-trip.
-
-    Raises on timeout — deliberately. A never-operational index must be a loud
-    failure; skipping or passing would reintroduce exactly the false-green this
-    barrier exists to remove.
-
-    Measured against FalkorDB module v41800 (4.18.0), whose live header is
-    ``['label', 'properties', 'types', 'options', 'language', 'stopwords',
-    'entitytype', 'status', 'info']``.
-
-    Args:
-        graph: An async FalkorDB graph exposing ``await graph.query(...)``.
-        timeout_s: Seconds to wait for every index to become operational.
-            Callers with a module-wide ``pytest.mark.timeout`` must keep this
-            budget inside it.
-
-    Raises:
-        IndexHeaderError: ``CALL db.indexes()`` exposed no ``status`` column —
-            raised on the first poll, never retried until the deadline.
-        AssertionError: Not every index became ``OPERATIONAL`` within
-            *timeout_s*; the message carries the last-seen status strings.
-    """
-    last_statuses: list[str] = []
-
-    async def _all_operational() -> bool:
-        nonlocal last_statuses
-        result = await graph.query('CALL db.indexes()')
-        header_names = [col[1] for col in result.header]
-        if 'status' not in header_names:
-            raise IndexHeaderError(
-                'CALL db.indexes() has no "status" column; FalkorDB changed its '
-                f'result shape (header={header_names}). The index-readiness '
-                'barrier cannot be trusted until this is re-verified.'
-            )
-        status_idx = header_names.index('status')
-        last_statuses = [row[status_idx] for row in result.result_set]
-        return bool(last_statuses) and all(s == 'OPERATIONAL' for s in last_statuses)
-
-    try:
-        await poll_until(_all_operational, timeout=timeout_s, interval=0.05)
-    except IndexHeaderError:
-        # Shape failure — propagate untouched so it is never reported as (or
-        # masked by) a timeout.
-        raise
-    except AssertionError as exc:
-        raise AssertionError(
-            f'index not OPERATIONAL within {timeout_s}s '
-            f'(last statuses={last_statuses!r})'
-        ) from exc
-
-
-async def collection_vector_size(
-    client: Any,
-    collection: str,
-    *,
-    timeout: float = 15.0,
-    interval: float = 0.05,
-) -> int:
-    """Read *collection*'s vector dimension, tolerating the transient-404 read race.
-
-    Under ``-n auto`` xdist load a collection created moments earlier can
-    transiently 404 (or the HTTP layer can raise ``ResponseHandlingException``)
-    before it is durably readable, so a single naive ``get_collection`` flakes.
-    This wraps the read in the shared :func:`poll_until` engine so the
-    transient window becomes a bounded retry: a 404 ``UnexpectedResponse`` or a
-    ``ResponseHandlingException`` maps to "keep polling", while any other
-    ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised immediately —
-    fail loud, no retry. A collection that never becomes readable surfaces as
-    the usual :func:`poll_until` ``AssertionError`` at the deadline.
-
-    Imports the qdrant symbols lazily inside the body, mirroring
-    :func:`_qdrant_available` / :func:`ensure_fresh_collection` (see their
-    docstrings) so importing this module never pulls in qdrant_client.
-
-    Args:
-        client: A ``qdrant_client.QdrantClient`` (or test double) exposing
-            ``get_collection``.
-        collection: The collection to read.
-        timeout: Seconds to keep retrying the transient-404 window before
-            raising. Defaults to 15s — generous enough to absorb host CPU
-            oversubscription while still catching a genuinely-missing collection.
-        interval: Seconds to sleep between probes. Defaults to 0.05s.
-
-    Returns:
-        The collection's single-vector dimensionality.
-
-    Raises:
-        AssertionError: the collection never became readable within *timeout*.
-        qdrant_client.http.exceptions.UnexpectedResponse: a non-404 server
-            error on the read (surfaced immediately, not retried).
-    """
-    from qdrant_client.http.exceptions import (
-        ResponseHandlingException,
-        UnexpectedResponse,
-    )
-    from qdrant_client.models import VectorParams
-
-    def _probe():
-        try:
-            return client.get_collection(collection)
-        except UnexpectedResponse as exc:
-            if getattr(exc, 'status_code', None) == 404:
-                return None  # transient: not yet durably visible — keep polling
-            raise  # genuine server error — fail loud, no retry
-        except ResponseHandlingException:
-            return None  # transient HTTP-layer hiccup — keep polling
-
-    info = await poll_until(
-        _probe,
-        timeout=timeout,
-        interval=interval,
-        message=f'collection {collection!r} not readable within {timeout}s',
-    )
-    vectors = info.config.params.vectors
-    assert isinstance(vectors, VectorParams), (
-        f'collection {collection!r} vectors config is not a single VectorParams: {vectors!r}'
-    )
-    return vectors.size
-
-
-# ---------------------------------------------------------------------------
-# Shared quota/rate-limit error builder (task 2448)
-# ---------------------------------------------------------------------------
-#
-# De-duplicates the openai.RateLimitError builder that was previously
-# copy-pasted verbatim in test_memory_service.py and
-# tests/server/test_get_entity_tool.py (flagged by reviewer_comprehensive
-# amendment pass on task 2448) — a single copy avoids the two drifting apart
-# if the openai RateLimitError constructor signature ever changes.
-# ---------------------------------------------------------------------------
-
-
-def _init_git_repo(path) -> str:
-    """Create a minimal git repo at path with one commit; return full SHA.
-
-    Shared by test_task_interceptor.py and test_status_authority_gate.py: a
-    ``done_provenance={'kind': 'merged', 'commit': ...}`` write needs a real
-    ``main`` branch for the interceptor's ``_verify_commit_on_main`` ancestor
-    backstop (``git merge-base --is-ancestor <sha> main``) to resolve against.
-    """
-    import subprocess
-
-    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'],
-        check=True,
-    )
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.name', 'T'],
-        check=True,
-    )
-    (path / 'seed.txt').write_text('seed\n')
-    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'],
-        check=True,
-    )
-    return subprocess.run(
-        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
 
 def make_db_without_claimant_columns(db_path: pathlib.Path, *, status: str = 'pending') -> None:
     """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
@@ -1654,6 +893,18 @@ def make_db_without_claimant_columns(db_path: pathlib.Path, *, status: str = 'pe
     conn.execute("PRAGMA user_version = 2")
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Shared quota/rate-limit error builder (task 2448)
+# ---------------------------------------------------------------------------
+#
+# De-duplicates the openai.RateLimitError builder that was previously
+# copy-pasted verbatim in test_memory_service.py and
+# tests/server/test_get_entity_tool.py (flagged by reviewer_comprehensive
+# amendment pass on task 2448) — a single copy avoids the two drifting apart
+# if the openai RateLimitError constructor signature ever changes.
+# ---------------------------------------------------------------------------
 
 
 def _make_rate_limit_error(
@@ -1729,235 +980,6 @@ async def reap_leaked_ticket_workers() -> int:
         if task.done():
             reaped += 1
     return reaped
-
-
-# ---------------------------------------------------------------------------
-# Leaked async httpx client reaping (task 4412)
-#
-# Sibling of reap_leaked_ticket_workers above, and of
-# orchestrator/tests/_orch_helpers.py::reap_leaked_aiosqlite_connections
-# (task 2413): a per-test teardown drain for a resource whose owner never
-# closes it, written here rather than at the ~40 call sites across 7 test
-# modules that leak one.
-# ---------------------------------------------------------------------------
-
-#: Every httpx.AsyncClient constructed since track_async_httpx_clients() ran.
-#: A WeakSet so tracking never keeps a client alive past its natural lifetime —
-#: the reaper only ever sees clients something else is still holding.
-_TRACKED_ASYNC_HTTPX_CLIENTS: weakref.WeakSet = weakref.WeakSet()
-
-#: Per-client bound on the drain's aclose(). The reaper runs in EVERY test's
-#: teardown, so an aclose() that never returns must cost that test a bounded
-#: pause rather than hang it until pytest-timeout kills the whole xdist worker
-#: (see the timeout notes in fused-memory/pyproject.toml). A module-level knob
-#: rather than a literal so the bound itself is testable in ~50ms — see
-#: test_async_httpx_leak_isolation.test_reap_is_bounded_when_aclose_hangs.
-ASYNC_HTTPX_ACLOSE_TIMEOUT = 10.0
-
-
-#: Stamped on the installed wrapper so a second install is a no-op. Named on
-#: the FUNCTION rather than kept in a module global because the thing being
-#: guarded is the state of ``httpx.AsyncClient.__init__`` itself: a test that
-#: restores a pristine ``__init__`` (see
-#: test_async_httpx_leak_isolation.test_track_async_httpx_clients_is_idempotent)
-#: must be able to re-install, which a module-level "already ran" flag would
-#: wrongly refuse.
-_TRACK_SENTINEL = '_df_tracks_async_httpx_clients'
-
-
-def track_async_httpx_clients() -> bool:
-    """Record every ``httpx.AsyncClient`` built from now on, for later reaping.
-
-    Wraps ``httpx.AsyncClient.__init__`` — ONE patch point that catches every
-    library shipping the leaky wrapper, present and future. Measured in this
-    worktree: ``openai._base_client.AsyncHttpxClientWrapper`` and
-    ``anthropic._base_client.AsyncHttpxClientWrapper`` both have MRO
-    ``(Wrapper -> _DefaultAsyncHttpxClient -> httpx.AsyncClient)`` and chain to
-    ``httpx.AsyncClient.__init__``, so patching only the base tracked all of
-    ``AsyncOpenAI``, ``AsyncAnthropic``, a ``graphiti_core`` ``OpenAIClient``
-    and a bare ``httpx.AsyncClient``. That needs no per-library import list to
-    keep in sync and cannot break on import order.
-
-    Instances are recorded AFTER the original ``__init__`` returns, so a
-    constructor that raises leaves nothing half-built in the WeakSet.
-
-    Idempotent, and that is load-bearing rather than hygiene: ``conftest``'s
-    ``pytest_configure`` installs the hook at session start and each test in
-    ``test_async_httpx_leak_isolation.py`` calls it again, so an unguarded
-    re-wrap would nest one extra frame around the saved original per call for
-    the rest of the session.
-
-    Returns:
-        True if this call installed the hook, False if it was already present.
-    """
-    original = httpx.AsyncClient.__init__
-    if getattr(original, _TRACK_SENTINEL, False):
-        return False
-
-    @functools.wraps(original)
-    def __init__(self, *args, **kwargs):
-        original(self, *args, **kwargs)
-        _TRACKED_ASYNC_HTTPX_CLIENTS.add(self)
-
-    # functools.wraps copies __dict__ from the wrapped function, so stamp the
-    # sentinel AFTER it — otherwise re-installing over an already-stamped
-    # original would carry the flag straight onto the new wrapper anyway.
-    setattr(__init__, _TRACK_SENTINEL, True)
-    httpx.AsyncClient.__init__ = __init__
-    return True
-
-
-def _leaked_async_httpx_clients() -> list:
-    """Return the tracked clients that are unclosed AND resurrect-capable.
-
-    "Resurrect-capable" means ``type(c)`` defines ``__del__`` — the finaliser
-    that reschedules ``aclose()`` onto a running loop and so produces the
-    flake. Measured: True for both libraries' ``AsyncHttpxClientWrapper``,
-    False for a bare ``httpx.AsyncClient`` (``'__del__' not in
-    httpx.AsyncClient.__dict__``). Deriving the predicate from the MECHANISM
-    rather than allow-listing ``openai``/``anthropic`` by name means any
-    future dependency shipping the same finaliser is covered without a code
-    change, and — just as important — that a bare async httpx client owned by
-    an unrelated fixture is left strictly alone. Closing everything tracked
-    would give the reaper a much larger blast radius than a flake fix earns.
-
-    Also the cheap predicate ``conftest``'s SYNC autouse fixture checks before
-    deciding whether to spin up an event loop at all, so the ~14100-of-14147
-    tests that leak nothing pay only a WeakSet scan.
-
-    NO NOTION OF OWNERSHIP OR AGE, deliberately: every tracked, open,
-    resurrect-capable client is selected, whoever built it and whenever. A
-    client built by a fixture scoped WIDER than ``function`` would therefore
-    be closed at the first test's teardown, out from under its owner. See the
-    CONSTRAINT block above the two autouse arms in ``conftest.py`` for why
-    scoping the reap to the current test was considered and rejected (it opens
-    the inverse hole), and for the warning that makes the trap discoverable if
-    anyone ever walks into it.
-    """
-    return [
-        client
-        for client in list(_TRACKED_ASYNC_HTTPX_CLIENTS)
-        if not client.is_closed and hasattr(type(client), '__del__')
-    ]
-
-
-async def reap_leaked_async_httpx_clients() -> int:
-    """Close any tracked ``httpx.AsyncClient`` that its owner never closed.
-
-    Task 4412 — fix for the fused-memory caplog flake CLASS where an unclosed
-    ``openai``/``anthropic`` client emits an ERROR record onto the root
-    ``asyncio`` logger from inside an unrelated later test's caplog window.
-
-    ROOT CAUSE: ``openai._base_client.AsyncHttpxClientWrapper`` and its
-    ``anthropic`` twin define::
-
-        def __del__(self) -> None:
-            if self.is_closed:
-                return
-            try:
-                asyncio.get_running_loop().create_task(self.aclose())
-            except Exception:
-                pass
-
-    An ``AsyncOpenAI``/``AsyncAnthropic`` that is never closed is GC-finalised
-    at a nondeterministic point; if a loop happens to be running, ``__del__``
-    RESURRECTS the object as ``create_task(self.aclose())``. That Task's
-    coroutine is httpx's inherited ``AsyncClient.aclose`` — the
-    ``coro=<AsyncClient.aclose() ...>`` in the symptom. Its ``aclose()`` then
-    hits a connection pool bound to an already-closed loop and raises
-    ``RuntimeError('Event loop is closed')``; nobody retrieves it, so
-    ``Task.__del__`` logs ``Task exception was never retrieved`` at ERROR and
-    it is blamed on whichever test's caplog is open at the time.
-
-    MEASURED (this worktree, full default-lane suite, 14147 passed): 40
-    wrapper instances constructed, ALL 40 GC-finalised, ZERO closed — i.e. 40
-    chances per suite run for ``__del__`` to resurrect. They come from
-    ``graphiti_core``'s ``OpenAIClient`` / ``OpenAIGenericClient`` /
-    ``OpenAIEmbedder`` / ``OpenAIRerankerClient``, each of which mints its own
-    ``AsyncOpenAI`` in ``__init__`` and exposes no ``close()`` — so the tests
-    that trigger them have no call-site fix available.
-
-    FIX: close every tracked client at each test's teardown boundary.
-    ``__del__``'s own ``if self.is_closed: return`` then short-circuits, so the
-    resurrect path is unreachable and the ERROR record can never be emitted.
-
-    Best-effort and bounded, and a cheap no-op for the (vast majority of)
-    tests that leak nothing. Only ``asyncio.TimeoutError`` and ``RuntimeError``
-    are suppressed: a client whose pool belongs to an already-closed loop
-    raises ``RuntimeError`` on ``aclose()`` and must not fail an innocent test.
-    A genuine bug inside the reaper itself — or a ``CancelledError`` targeting
-    the reaper's own task — is deliberately left to propagate rather than
-    masked by a blanket ``except Exception``
-    (loud-over-silent-degradation). Both halves of that robustness contract
-    are pinned behaviourally rather than left as prose:
-    ``test_reap_survives_a_client_whose_aclose_raises`` (the suppressed
-    ``RuntimeError``, and that a client which failed to close is NOT counted)
-    and ``test_reap_is_bounded_when_aclose_hangs`` (the
-    ``ASYNC_HTTPX_ACLOSE_TIMEOUT`` bound, exercised at 50ms).
-
-    MAINTENANCE NOTE: this relies on third-party internals that are not part
-    of any public API — the ``AsyncHttpxClientWrapper.__del__`` finaliser in
-    ``openai``/``anthropic``, and those wrappers chaining to
-    ``httpx.AsyncClient.__init__`` so a single base-class hook sees them.
-    Verified against httpx 0.28.1 / openai 2.31.0 / anthropic 0.92.0. If a
-    future release drops the finaliser or stops chaining, this helper degrades
-    to a no-op (returns 0) rather than raising — the reaping is then lost. That
-    loss is NOT silent: ``test_async_httpx_leak_isolation.py``'s
-    ``test_a_reaped_client_del_schedules_no_aclose_task`` asserts an UNCLOSED
-    client's ``__del__`` schedules exactly 1 ``AsyncClient.aclose()`` task, so
-    a dropped finaliser fails that test loudly (mirrors
-    ``reap_leaked_aiosqlite_connections``'s MAINTENANCE NOTE and its
-    ``PytestUnhandledThreadExceptionWarning`` backstop, task 4075). Re-verify
-    this helper against both libraries' ``_base_client.py`` whenever the
-    pinned versions change.
-
-    Returns:
-        The number of clients this call actually closed (``is_closed``
-        confirmed post-drain) — a client that fails to close within the
-        bounded timeout is not counted.
-    """
-    reaped = 0
-    for client in _leaked_async_httpx_clients():
-        with contextlib.suppress(asyncio.TimeoutError, RuntimeError):
-            await asyncio.wait_for(
-                client.aclose(), timeout=ASYNC_HTTPX_ACLOSE_TIMEOUT,
-            )
-        if client.is_closed:
-            reaped += 1
-    return reaped
-
-
-def _warn_if_drain_closed_a_foreign_client(preexisting: weakref.WeakSet) -> None:
-    """Warn if the drain closed a client that pre-dated the current test.
-
-    *preexisting* is the snapshot ``conftest``'s SYNC autouse arm takes at
-    SETUP: the clients that were already tracked, open and resurrect-capable
-    before the test started.
-    Any of them found closed at teardown was closed by this test or by the
-    drain — either way, something owns a client that outlives a single test,
-    which the drain cannot support (see the CONSTRAINT block above the two
-    autouse arms in ``conftest.py``, and ``_leaked_async_httpx_clients``
-    above for why the selection predicate has no notion of ownership).
-
-    A warning rather than a failure: the drain closing a foreign client is a
-    design violation by the FIXTURE, not by the test that happens to be
-    finishing, and failing that test would reproduce the very
-    blame-the-innocent-test pattern being removed. The warning is greppable in
-    CI output and names the fix.
-    """
-    closed = [client for client in preexisting if client.is_closed]
-    if not closed:
-        return
-    warnings.warn(
-        f'async-httpx drain closed {len(closed)} openai/anthropic client(s) '
-        f'that existed BEFORE this test started. The drain has no notion of '
-        f'ownership: it closes every tracked, open, resurrect-capable client '
-        f'at every test teardown. If a fixture scoped wider than `function` '
-        f'(or a module-level cache) owns one, it has just been closed out from '
-        f'under its owner and will fail later with "Cannot send a request, as '
-        f'the client has been closed". Move it to function scope (task 4412).',
-        stacklevel=2,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2088,6 +1110,47 @@ def _lease_dir_env() -> str:
     return load_script_module(_CLEANUP_TEST_COLLECTIONS_SCRIPT).LEASE_DIR_ENV
 
 
+def isolated_lease_dir(monkeypatch, directory: pathlib.Path) -> pathlib.Path:
+    """Point the reaper's lease directory at *directory*, through *monkeypatch*.
+
+    The one mechanism behind `lease_dir_fixture` and
+    `lease_isolated_monkeypatch`.  *directory* is not created, for the reason
+    `lease_dir_fixture` gives.
+    """
+    monkeypatch.setenv(_lease_dir_env(), str(directory))
+    return directory
+
+
+@contextlib.contextmanager
+def lease_isolated_monkeypatch(
+    reaper: types.ModuleType, lease_directory: pathlib.Path,
+) -> Iterator[tuple[pytest.MonkeyPatch, list[pathlib.Path]]]:
+    """A `pytest.MonkeyPatch.context()` for a recording made at module scope.
+
+    A module-scoped fixture is set up BEFORE the autouse `lease_dir` fixture,
+    so a recorder that opened a bare context would lease the machine-global
+    directory the live cron reads.  This one yields its monkeypatch with the
+    lease directory already isolated to *lease_directory*, together with a
+    list that gains the directory every `reaper.hold_lease` inside the
+    context resolved, so a recording can carry where its leases really went
+    rather than only that it asked.
+
+    *reaper* is the module the code under test resolves, passed in for the
+    reason `_lease_dir_env` keeps no module reference of its own.
+    """
+    held_in: list[pathlib.Path] = []
+    hold_lease = reaper.hold_lease
+
+    def _observed_hold_lease(*args, directory=None, **kwargs):
+        held_in.append(reaper.lease_dir() if directory is None else pathlib.Path(directory))
+        return hold_lease(*args, directory=directory, **kwargs)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        isolated_lease_dir(monkeypatch, lease_directory)
+        monkeypatch.setattr(reaper, 'hold_lease', _observed_hold_lease)
+        yield monkeypatch, held_in
+
+
 @pytest.fixture(autouse=True, name='lease_dir')
 def lease_dir_fixture(tmp_path, monkeypatch):
     """Point ``DF_EPHEMERAL_COLLECTION_LEASE_DIR`` at a per-test directory.
@@ -2117,9 +1180,7 @@ def lease_dir_fixture(tmp_path, monkeypatch):
     shadowed by every ``def test_x(self, lease_dir)`` parameter, which ruff
     reports as F811 once per test.
     """
-    directory = tmp_path / 'ephemeral-collection-leases'
-    monkeypatch.setenv(_lease_dir_env(), str(directory))
-    return directory
+    return isolated_lease_dir(monkeypatch, tmp_path / 'ephemeral-collection-leases')
 
 
 def as_async_run_git(side_effect):

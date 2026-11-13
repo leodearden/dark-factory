@@ -1,0 +1,566 @@
+{
+  "confusion_by_cell": {
+    "dark_factory": {
+      "decision_anchor": {
+        "fn": 6,
+        "fp": 1,
+        "tn": 42,
+        "tp": 3
+      },
+      "other_decisions": {
+        "fn": 6,
+        "fp": 3,
+        "tn": 35,
+        "tp": 1
+      },
+      "ruling_lexeme": {
+        "fn": 7,
+        "fp": 3,
+        "tn": 43,
+        "tp": 0
+      }
+    },
+    "reify": {
+      "decision_anchor": {
+        "fn": 4,
+        "fp": 0,
+        "tn": 48,
+        "tp": 1
+      },
+      "other_decisions": {
+        "fn": 0,
+        "fp": 2,
+        "tn": 29,
+        "tp": 0
+      },
+      "ruling_lexeme": {
+        "fn": 6,
+        "fp": 4,
+        "tn": 42,
+        "tp": 0
+      }
+    }
+  },
+  "coverage": {
+    "judged": 286,
+    "offered": 286
+  },
+  "disagreements": [
+    {
+      "edge_uuid": "db54f7b1-6fe8-473b-b529-43473f772712",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "If the task is in another status, set it in-progress and then merge-deferred; only in-progress -> merge-deferred is a legal edge.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) The record never says 4926 is blocked by 4953: 4926 is the live check of the status edge (\"verified live on task 4926 (blocked -> in-progress -> merge-deferred\"), and \"the task-4953 class\" names the stranding defect."
+    },
+    {
+      "edge_uuid": "601ac478-3bcb-40e0-b548-2c8964d78ffe",
+      "episode_uuid": "28435636-b2e7-4a1e-b49c-c4e0a9e9c309",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "Dark Factory is a closed loop with in-flight tasks pinned at max_concurrent_tasks (~24 of 24, ~630 dispatch candidates waiting) and the single task-verify slot ~99% utilised, so by Little's law mean task residence is invariant under every ordering policy.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(iv) Drops the conditions the argument rests on (\"in-flight tasks pinned at max_concurrent_tasks\" and \"the single task-verify slot ~99% utilised\"), so the conditional Little's-law ground becomes an unconditional law."
+    },
+    {
+      "edge_uuid": "fdb00a89-dc3e-4493-ac3d-53942074da4c",
+      "episode_uuid": "7300f93c-d1dc-4efb-a772-e3d3a5dea794",
+      "graph": "dark_factory",
+      "judge": "overreach",
+      "judge_rationale": "The episode does not state that the WATCHER closes orphaned recon escalations specifically related to the reconciliation_stale_human_operator; it only mentions the reconciliation_stale_gate_backlog and the reconciliation_stale_human_operator as subjects of pending records.",
+      "outcome": "fp",
+      "stratum": "ruling_lexeme",
+      "verdict": "holding",
+      "verdict_rationale": "The ruling covers \"reconciliation_stale_human_operator records\" too."
+    },
+    {
+      "edge_uuid": "369d185d-68f5-4966-ab6a-147bf5cbb1d1",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "Merge_request for a reify branch mis-routes and returns unknown_branch because reify's server is on port 8100.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(iv) Drops \"a dark-factory session's\" \u2014 the record says merge_request mis-routes only from a session wired to 8102; stated bare, every reify-branch merge_request mis-routes."
+    },
+    {
+      "edge_uuid": "9472fb6b-07a7-4eb2-bc8b-6e8e88668422",
+      "episode_uuid": "fe7912cd-538b-4746-b8e9-e7e2af942480",
+      "graph": "dark_factory",
+      "judge": "overreach",
+      "judge_rationale": "The record states that task 6042 is responsible for moving the legibility trickle and census onto the orchestrator's shared session runner, not the account pool.",
+      "outcome": "fp",
+      "stratum": "ruling_lexeme",
+      "verdict": "misbound",
+      "verdict_rationale": "The fact (moving onto the orchestrator's account pool) is faithful, but it hangs on account_pool.py, whose \"parallel rotation is retired, not kept\" \u2014 the opposite entity."
+    },
+    {
+      "edge_uuid": "1e569c37-63c2-4b44-af93-2bbddf41fdeb",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "graph": "dark_factory",
+      "judge": "overreach",
+      "judge_rationale": "The episode does not state that the resumed session's nature results in genuine exhaustion; it discusses the artifact driving exhaustion.",
+      "outcome": "fp",
+      "stratum": "ruling_lexeme",
+      "verdict": "context",
+      "verdict_rationale": "Faithful ground: \"the ever-growing resumed session, which drives both the artifact and every genuine exhaustion\"."
+    },
+    {
+      "edge_uuid": "38c57b49-6667-4d24-b881-3cc2674af4c5",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "The episode states that the artifact drives both the metering issue and every genuine exhaustion.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Inverts the causal claim: the record says the ever-growing resumed session \"drives both the artifact and every genuine exhaustion\", not that the artifact drives them."
+    },
+    {
+      "edge_uuid": "5d9b218e-93a2-4bb7-879b-ed7f1ca816bf",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "The episode states that the steward handles each L0 in a fresh session with rebuilt briefing and prior-resolution digest behind steward_session_mode.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(iv) Drops the provisional qualifier the record quotes \u2014 \"'for now', with a parallel-shadow eval of both modes\" and a ruling gate 5822 \u2014 stating fresh-per-L0 as settled."
+    },
+    {
+      "edge_uuid": "edd356ae-e46e-47d3-8208-e62c411dd112",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "the prompt's own Session Startup Protocol already orders the agent to read .task/plan.json and iterations.jsonl.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) The protocol orders reading .task/plan.json, of which the Progress counter is the frozen copy being removed; the record never says the protocol orders reading the counter."
+    },
+    {
+      "edge_uuid": "e9b9eeba-044a-466d-8386-0a4a3120e09e",
+      "episode_uuid": "b5b7b62e-702b-45dd-9b69-fc20cc8e9acf",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "B asked Stage 1 to search filed human-gate tasks for coverage of a cluster's mem0 UUIDs before asserting no task covers it (task-3756 precedent).",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(iii) Detaches struck sub-finding B's ask (\"B asked Stage 1 to search filed human-gate tasks ...\") from B, so a rejected proposal reads as an instruction Stage 1 was given."
+    },
+    {
+      "edge_uuid": "4b5366d9-7eea-4edc-a707-420e4fcb9c0a",
+      "episode_uuid": "8da20213-f1b7-4545-912f-35253242f621",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "Both halves are load-bearing: the new predicate alone, evaluated at the OLD site, would still never open, because `prefetched` (deep queue) or `pending_spec_base` (dry queue) is set on every iteration that follows a successful merge.",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(iv) The record says `prefetched` (deep queue) OR `pending_spec_base` (dry queue) is set, depending on queue state; the edge drops the disjunction and says both are."
+    },
+    {
+      "edge_uuid": "8865dff2-1517-427d-b245-0ce50ff63568",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "The closure class 'scope-not-delivered' is mentioned as a successor of task 5374 in the systemic rulings.",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) The record routes the closure class to a task (\"'scope-not-delivered' closure class -> successor of 5374\"); it does not say the class IS a successor of 5374."
+    },
+    {
+      "edge_uuid": "934bc7e2-7b6f-443c-b685-872233df6b32",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "Task 5547 involves the audit_duplicate_memories.py script as stated in the rationale regarding the audit script.",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) audit_duplicate_memories.py appears only as HOLD rationale (\"t_high_by_category is consumed only by audit_duplicate_memories.py\"); nothing links it to 5547."
+    },
+    {
+      "edge_uuid": "deb6d606-5409-4da1-8def-774e2bdedc26",
+      "episode_uuid": "8070eac8-c9c0-4fd2-b596-4354387304cd",
+      "graph": "dark_factory",
+      "judge": "overreach",
+      "judge_rationale": "The episode does not state that the architect is responsible for task 5601; it only mentions that 'plan.json belongs to the architect.' This implies a responsibility that is not explicitly stated.",
+      "outcome": "fp",
+      "stratum": "decision_anchor",
+      "verdict": "context",
+      "verdict_rationale": "Faithful ground: \"plan.json belongs to the architect\"; the architect is the one that \"re-planned\" 5601."
+    },
+    {
+      "edge_uuid": "33871bd9-f5eb-4fb6-a9d9-01e795a7273f",
+      "episode_uuid": "ed2b4105-82cb-4349-8940-36be6205d9ef",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "The episode mentions that a 20-branch backlog creates a long unattended tail.",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Misplaces the cost: the long unattended tail is the cost of the one-at-a-time WORKAROUND (\"roughly 30-60 min per landing, so a 20-branch backlog is a long unattended tail\"), not of the deep queue."
+    },
+    {
+      "edge_uuid": "797e5496-ea76-491d-963c-53a8af4985ad",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "...chose teaching the fused-memory shim to consume the shared FORWARD_REPAIR...",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Garbles a rejection ground into a choice: the DF 3936 lost-write hole is why REJECT_WITH_REPAIR was rejected; the hole was not \"chosen to teach the fused-memory shim\"."
+    },
+    {
+      "edge_uuid": "e6d61b94-c04a-4215-b269-b2bd73728d44",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "...Leo decided to build a deterministic uuid-prefix resolution as a two-arm mechanism instead of a per-project resolver.",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Contradicts the record: the decision is a \"TWO-ARM mechanism OVER one per-project resolver\", not one \"instead of a per-project resolver\"."
+    },
+    {
+      "edge_uuid": "68a8c3a3-b0cf-4d7c-82b3-3c5301e291f9",
+      "episode_uuid": "d358e669-c892-4f1c-a905-db7252586bf0",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "The episode states: 'Pinning also commits the repo to a manual-bump cadence for this dependency, which is a standing-cost tradeoff that is the user's call.'",
+      "outcome": "fn",
+      "stratum": "other_decisions",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Attributes the session's own rationale to Leo; the record says pinning \"commits the repo to a manual-bump cadence ... that is the user's call\" \u2014 Leo said nothing."
+    },
+    {
+      "edge_uuid": "d61273fc-200c-44d8-b128-ad5a19344699",
+      "episode_uuid": "d358e669-c892-4f1c-a905-db7252586bf0",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "The episode states: 'Leo noted that .mcp.json is a checked-in repo file affecting every agent and session.'",
+      "outcome": "fn",
+      "stratum": "other_decisions",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Attributes the session's reasoning (\"`.mcp.json` is a checked-in repo file affecting every agent and every session\") to Leo."
+    },
+    {
+      "edge_uuid": "4402f2ff-6850-4484-86f9-73cba8581a34",
+      "episode_uuid": "2364e73d-f985-4445-baa0-a5e551e85cd9",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "The episode mentions Leo's ruling in task 3147, establishing that certain unsatisfiable prompt rules do not produce a scope violation from an agent obeying its own prompt.",
+      "outcome": "fn",
+      "stratum": "other_decisions",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Inverts the precedent: task 3147 is where \"an unsatisfiable prompt rule produced a self-reported scope_violation from an agent obeying its own prompt\"."
+    },
+    {
+      "edge_uuid": "ba1602e5-a185-45b3-9de3-0293b6a7b60e",
+      "episode_uuid": "2364e73d-f985-4445-baa0-a5e551e85cd9",
+      "graph": "dark_factory",
+      "judge": "overreach",
+      "judge_rationale": "The episode does not state that the cancellation of task 2916 is due to structural issues in dark_factory's declaration not being a threading problem; it only discusses the structural issues without linking them directly to the cancellation.",
+      "outcome": "fp",
+      "stratum": "other_decisions",
+      "verdict": "context",
+      "verdict_rationale": "Ground for the cancellation, in substance: \"there is NO directory set that expresses the declared file scope. This is not a threading problem a bigger change would solve.\""
+    },
+    {
+      "edge_uuid": "d95353a8-dccc-4f02-924c-a357fbefe88f",
+      "episode_uuid": "2364e73d-f985-4445-baa0-a5e551e85cd9",
+      "graph": "dark_factory",
+      "judge": "bookkeeping",
+      "judge_rationale": "The episode states that task 2916 was cancelled as won't fix by Leo on 2026-09-21.",
+      "outcome": "fn",
+      "stratum": "other_decisions",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Adds an actor the record does not name: it says only that 2916 \"was CANCELLED won't-fix on 2026-09-21\", not by Leo."
+    },
+    {
+      "edge_uuid": "1efec709-0efa-4d7d-97bb-44bd271f57b2",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "(3) task 5088 \u2014 a reviewer's blocking finding correctly deleted a prescribed pause-tolerant pin that could only assert on the PROSE of a YAML comment.",
+      "outcome": "fn",
+      "stratum": "other_decisions",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Instance (3) was \"a reviewer's blocking finding\" deleting a pin that was brittle and \"satisfiable by a stale copy-pasted comment\", not an architect finding it unsatisfiable."
+    },
+    {
+      "edge_uuid": "90ca27c9-f255-4b4f-8848-8169c6f6a68d",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "graph": "dark_factory",
+      "judge": "holding",
+      "judge_rationale": "(2) task 4864 \u2014 the frozen acceptance criterion needs a citation to land in a marker payload that task 4712's invariant forbids from holding one.",
+      "outcome": "fn",
+      "stratum": "other_decisions",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Garbles the conflict: 4712's invariant forbids the MARKER PAYLOAD from holding a citation, not task 4864 from holding a marker payload."
+    },
+    {
+      "edge_uuid": "0376eb4b-bbb0-4db7-8a22-e1c563a24cee",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "graph": "dark_factory",
+      "judge": "overreach",
+      "judge_rationale": "The fact implies a consequence (ImportError) that is not explicitly stated as a decision in the record.",
+      "outcome": "fp",
+      "stratum": "other_decisions",
+      "verdict": "context",
+      "verdict_rationale": "Faithful ground: \"If \u03b51's declaration ... landed first, 5578's merged tree would fail collection with an ImportError\"."
+    },
+    {
+      "edge_uuid": "675f85a6-01b3-4a75-aa9b-2d524a1872a8",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "graph": "dark_factory",
+      "judge": "overreach",
+      "judge_rationale": "The fact suggests a dependency that is not explicitly stated in the record.",
+      "outcome": "fp",
+      "stratum": "other_decisions",
+      "verdict": "context",
+      "verdict_rationale": "Loosely faithful link: \"Either the list is already gone when \u03b51 runs, or 5578 is its live owner in fact\"."
+    },
+    {
+      "edge_uuid": "20f5f364-5b7c-4f99-ad9c-0a62373b832f",
+      "episode_uuid": "5d4d1375-b191-4ba7-8709-31ef47f0b053",
+      "graph": "reify",
+      "judge": "overreach",
+      "judge_rationale": "The fact generalizes the ruling beyond its stated scope by implying that the premise drifted regarding the number of PINNED lanes without specifying the exact changes that led to the narrowing.",
+      "outcome": "fp",
+      "stratum": "ruling_lexeme",
+      "verdict": "holding",
+      "verdict_rationale": "The disposition: \"LEO'S RULING ON THE WARM-LANE RECLAIM WAS NARROWED ON EXECUTION BECAUSE ITS PREMISE HAD DRIFTED\" (PINNED was 24 not 14)."
+    },
+    {
+      "edge_uuid": "9cdacc4b-1739-4b47-a52b-5945a93a17b7",
+      "episode_uuid": "5d4d1375-b191-4ba7-8709-31ef47f0b053",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "The fact states that the live-consumer flock gate preserves lanes independently of the GC, which is supported by the episode.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) The record says \"the GC's own live-consumer flock gate\" protects lanes independently of the PAUSE; the gate is part of the GC, not independent of it."
+    },
+    {
+      "edge_uuid": "9e4c3d4e-3558-4834-ba1e-72089809a24b",
+      "episode_uuid": "7009536a-1651-4d27-9334-caac7a28354d",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "The esc-4458-87 inversion was not one implementer's misjudgement \u2014 it was the predictable outcome of a design.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) The inversion was \"the predictable outcome of a design where solver-free is the free, silent default\" \u2014 the OLD design the PRD replaces, not the PRD's design."
+    },
+    {
+      "edge_uuid": "13cbf59f-2ca5-48de-aa73-2a98b1c1e919",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "graph": "reify",
+      "judge": "overreach",
+      "judge_rationale": "The ruling states that '_' may NOT be combined with '|' in a match pattern, but does not specify combinations with 'C' specifically.",
+      "outcome": "fp",
+      "stratum": "ruling_lexeme",
+      "verdict": "holding",
+      "verdict_rationale": "An instance within the ruling's scope: \"`_` may NOT be combined with `|` in a match pattern\", here with variant C."
+    },
+    {
+      "edge_uuid": "35c4fe12-a1d5-4ae8-960c-d127a9709faf",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "The pattern '_' is not a variant of the enum 'Kind'.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(iii) Lifts a current diagnostic the ruling rejects (\"match-arm pattern '_' is not a variant of enum 'Kind'\" \u2014 \"symptom, not reason\") into a standalone fact, dropping that qualification."
+    },
+    {
+      "edge_uuid": "6c9fa3c0-c5ee-409a-9f26-2011a6d64c7f",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "graph": "reify",
+      "judge": "overreach",
+      "judge_rationale": "The ruling states that '_' may NOT be combined with '|' in a match pattern, but does not specify combinations with 'B' specifically.",
+      "outcome": "fp",
+      "stratum": "ruling_lexeme",
+      "verdict": "holding",
+      "verdict_rationale": "An instance within the ruling's scope: `_` may not be an or-slot alternative, here alongside variant B."
+    },
+    {
+      "edge_uuid": "8c90dcf4-a80e-4755-a4d9-de9bfaac00dd",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "graph": "reify",
+      "judge": "overreach",
+      "judge_rationale": "The ruling states that '_' may NOT be combined with '|' in a match pattern, but does not specify combinations with 'A' specifically.",
+      "outcome": "fp",
+      "stratum": "ruling_lexeme",
+      "verdict": "holding",
+      "verdict_rationale": "An instance within the ruling's scope: \"A | _\" is refused."
+    },
+    {
+      "edge_uuid": "adc24856-4686-45cc-bc25-ada6a09fa7d5",
+      "episode_uuid": "4648ebdd-253c-4fa2-a063-d8420f716924",
+      "graph": "reify",
+      "judge": "context",
+      "judge_rationale": "Priority raised low->medium (Leo, same day) because the stale blocker made it cheap and low-priority tasks in a deep queue effectively never dispatch.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Invents a cause: the record says the stale blocker made the priority raise \"cheap\" and, separately, that low-priority tasks in a deep queue never dispatch."
+    },
+    {
+      "edge_uuid": "7b788752-01ac-498e-b73a-fab1d95671d4",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "The structural fix (key the root_cause by originating pin instead of one generic bucket) is dark_factory task 5542.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(i) Generalises \"the structural fix\" for this re-minting veto-streak cluster (\"key the root_cause by originating pin\") into \"the structural fix for L2\"."
+    },
+    {
+      "edge_uuid": "c7d1ccf6-0a20-42e8-9d3c-3e9167d2cad8",
+      "episode_uuid": "88cdb3d1-e834-4519-a9b2-7fab9e192873",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "The ACTIVE patch is derived at analysis time by the joint from the linearization configuration.",
+      "outcome": "fn",
+      "stratum": "ruling_lexeme",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Reverses the adopted mechanism: the record projects \"the mating port's footprint posed at the configured position\" ONTO THE DOMAIN, not the patch onto the footprint."
+    },
+    {
+      "edge_uuid": "68179b53-2be6-4889-a082-2604b4fb04fc",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "h = (12*I_tube)^(1/4), same E and I so same bending k, density retuned to carry the true tube mass for modal.",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) h = (12*I_tube)^(1/4) is the height of the equivalent square BOX that stands in for the tube, not of the CFRP tube."
+    },
+    {
+      "edge_uuid": "93dca29f-4cfb-4223-b586-74666eb1de88",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "delta_cant(L/2, F/2) = delta_SS(L, F) exactly, so k_SS = 2*k_cant and the tube pair = 4*k_cant.",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(ii) Mislabels the quantities: k_SS is the simply-supported full-span stiffness and k_cant the half-span cantilever (\"k_SS = 2*k_cant\"), not \"k_SS of the half-span cantilever\"."
+    },
+    {
+      "edge_uuid": "9c3baa6f-35c1-44ab-aefa-a31632ec0e3e",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "X gantry rails changed from solid steel BearingRod to a new BearingTube CFRP leaf (60mm OD, 5mm wall, 1.11kg vs 17.8kg) - Leo's call, and it matches the project spec's assembly-C line ('CFRP tube X rail').",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(iv) Drops \"X gantry rails\": only the X rails changed to BearingTube, and the record adds \"Y rails stay steel\"."
+    },
+    {
+      "edge_uuid": "e2a10517-4787-4070-892e-3c18fc23a1ce",
+      "episode_uuid": "e08f8fcc-5d06-461b-acae-5f4af911253a",
+      "graph": "reify",
+      "judge": "holding",
+      "judge_rationale": "#6097 (pending) retypes ModalOptions.sigma to shift_frequency",
+      "outcome": "fn",
+      "stratum": "decision_anchor",
+      "verdict": "overreach",
+      "verdict_rationale": "(iii) Drops \"#6097 (pending)\": the retype is a pending task's planned change, stated here as already done."
+    },
+    {
+      "edge_uuid": "a6bf6fca-1401-45ff-ae61-1ed19cfe670c",
+      "episode_uuid": "6411166e-e95a-44da-8350-7f13f855d136",
+      "graph": "reify",
+      "judge": "overreach",
+      "judge_rationale": "The episode does not state that Task 7441 'may adopt SetNonDestructive(true) if necessary'; it only mentions verifying whether it affects cached operands.",
+      "outcome": "fp",
+      "stratum": "other_decisions",
+      "verdict": "holding",
+      "verdict_rationale": "Filed as decided: \"7441 \u2014 verify whether OCCT's default destructive mode ... and adopt SetNonDestructive(true) if so\"."
+    },
+    {
+      "edge_uuid": "741e1e0d-0447-43f2-9e71-19071a32e378",
+      "episode_uuid": "b0549cec-f02a-49aa-9a32-a2b3a5ba435c",
+      "graph": "reify",
+      "judge": "overreach",
+      "judge_rationale": "The kernel has no input for BucklingOptions mode/sigma/auto_dense and none is planned, which was rejected as a category error.",
+      "outcome": "fp",
+      "stratum": "other_decisions",
+      "verdict": "context",
+      "verdict_rationale": "The escalation's rejected reason restated with its rejection (\"which was rejected as a category error\")."
+    }
+  ],
+  "failures": [],
+  "judge_models": [
+    "gpt-4o-mini"
+  ],
+  "mode": "offline",
+  "precision": {
+    "ci": [
+      0.1074,
+      0.5249
+    ],
+    "effective_n": 14.4,
+    "rate": 0.2672
+  },
+  "prompt_versions": [
+    "overreach-judge-v1-ee6466c52d67"
+  ],
+  "recall": {
+    "ci": [
+      0.0583,
+      0.3231
+    ],
+    "effective_n": 27.0,
+    "rate": 0.1467
+  },
+  "trigger": {
+    "checks": {
+      "precision": false,
+      "precision_lower_bound": false,
+      "recall": false
+    },
+    "mode": "offline",
+    "passes": false
+  },
+  "unjudged": [],
+  "unweighted": {
+    "precision": {
+      "ci": [
+        0.125,
+        0.5087
+      ],
+      "k": 5,
+      "n": 18,
+      "rate": 0.2778
+    },
+    "recall": {
+      "ci": [
+        0.0645,
+        0.3013
+      ],
+      "k": 5,
+      "n": 34,
+      "rate": 0.1471
+    }
+  }
+}

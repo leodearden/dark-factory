@@ -24,15 +24,17 @@ separate message vocabularies and separate ``# noqa`` codes.  Every statement in
       Hot for every scanned file: the transitional per-file debt baseline was
       retired once its 95 grandfathered sites were migrated (task 4354).
 
-  Rule C — ``wall-clock-deadline`` (task 4246)
+  Rule C — ``wall-clock-deadline`` (tasks 4246, 7800)
       NOT a mock-spec rule.  Position-blind over any ``ast.Call``: a load-bearing
       synchronisation point (a ``MergeRequest.result`` future or a zero-argument
       ``.wait()`` barrier) awaited through a bare ``asyncio.wait_for`` instead of
       ``wait_responsive``, or carrying a raw numeric literal bound (``timeout=``,
-      ``max_wall_s=`` or wait_for's positional timeout).  Remedies are wait-specific
-      (``wait_responsive(...)`` with a ``label=``, bound derived from
-      ``MERGE_RESULT_TIMEOUT``).  Carries its own shrink-only per-file debt BUDGET
-      (``_WALL_CLOCK_DEADLINE_DEBT``).
+      ``max_wall_s=`` or wait_for's positional timeout).  Also any async ``while``
+      poll that gives up against a wall-clock read, and any ``asyncio.timeout``
+      block bounding a poll or a load-bearing await.  Remedies are wait-specific
+      (``wait_responsive(...)`` or ``poll_responsive(...)`` with a ``label=``,
+      bound derived from ``MERGE_RESULT_TIMEOUT``).  Carries its own shrink-only
+      per-file debt BUDGET (``_WALL_CLOCK_DEADLINE_DEBT``).
 
 WIDEN-NOT-SIBLING RULING (task 4016): Rule B was added here rather than as a sibling
 script.  A sibling would have cost nine wiring edits (seven package ``orchestrator.yaml``
@@ -47,8 +49,9 @@ call sites and break every in-flight branch, for a cosmetic gain.
 
 Task 4246 added Rule C under that same ruling, unchanged: the nine wiring edits, the
 extra ``python3`` process and the second fleet-lint-coverage entry a sibling script
-would have cost are all still there, and Rule C is per-``ast.Call`` exactly like
-Rule B, so it folds into the SAME ``ast.walk`` for very nearly free rather than
+would have cost are all still there, and Rule C is per-NODE like Rule B (it
+dispatches on ``ast.Call``, ``ast.While`` and ``ast.AsyncWith``; task 7800 added the
+latter two), so it folds into the SAME ``ast.walk`` for very nearly free rather than
 paying for a second pass (a second full walk was measured at ~43% of total checker
 runtime, 20.8s -> 30.7s over the seven scanned dirs).  Note what this ruling does NOT
 say: it is not "put every future check here".  It applies because Rule C is another
@@ -155,10 +158,50 @@ TWO violations:
   1. the target is awaited through a bare ``asyncio.wait_for(...)`` rather than
      ``wait_responsive(...)``, so its deadline is charged in WALL CLOCK; and
   2. the call carries a RAW numeric literal bound — a ``timeout=`` or
-     ``max_wall_s=`` keyword on EITHER call shape, or ``asyncio.wait_for``'s
-     positional timeout.  ``wait_responsive`` takes both keywords too, so a
-     migrated site can have moved the accounting while keeping a hand-written
-     number.  Several literal bounds on one call are still ONE violation.
+     ``max_wall_s=`` keyword on ANY wait call shape, or ``asyncio.wait_for``'s
+     positional timeout.  ``wait_responsive`` and ``poll_responsive`` take both
+     keywords too, so a migrated site can have moved the accounting while keeping a
+     hand-written number.  Only this kind applies to them, and every
+     ``poll_responsive`` predicate is load-bearing: it IS the poll's
+     synchronisation point.  Several literal bounds on one call are still ONE
+     violation.
+
+The same defect is also written as a POLL, so a further leg covers it:
+
+  3. CLOCK-DEADLINE POLL (task 7800): an async ``while`` loop that gives up against a
+     wall-clock read — a ``Compare`` in its test or its own body with a DIRECT
+     operand that is a zero-argument ``.time()``, ``.monotonic()`` or
+     ``.perf_counter()`` call, on any receiver, or a remaining time
+     (``deadline - loop.time() > 0``), which is always measured against a deadline.
+     One violation, at the ``while``.
+     Its bound is arithmetic in another statement, so it has no raw-literal kind.
+     A read held in a variable (``remaining = deadline - loop.time()``, then
+     ``if remaining <= 0``) is not seen yet: ticket tkt_0RWM0CNQ4KSK1K2Y3TPDEAR3M1.
+     Two structural discriminators keep it to polls.  ANOTHER-EXIT admits an
+     elapsed-time operand (``loop.time() - t0 < timeout``) only when the loop can
+     also end some other way: a test conjunct that reads no clock, or a ``break`` or
+     ``return`` outside every clock-reading ``if``.  So a fake worker's
+     ``while loop.time() - t0 < duration`` tick loop, which runs FOR a duration
+     rather than waiting for an event, stays silent, while the one-line elapsed
+     rewrite of a flagged poll does not.  AWAIT-REQUIRED excludes a sync
+     ``time.sleep`` loop, which a loop-responsive budget cannot help.  The search
+     does not descend into a nested ``while`` or scope, so a comparison belongs to
+     the loop that owns it.  A ``for`` loop is not a leg of its own: its comparison
+     belongs to the enclosing ``while``, so a top-level ``for`` clock poll is silent
+     (none in the scanned tree, measured 2026-11-02).
+  4. TIMEOUT BLOCK (task 7800): an ``async with asyncio.timeout(...)`` or
+     ``asyncio.timeout_at(...)`` block whose own scope awaits a load-bearing target
+     or runs an awaiting ``while`` poll.  It is ``asyncio.wait_for``'s deadline
+     spelled as a context, so it counts the same way: the routing kind, plus the
+     raw-literal kind when ``timeout``'s ``delay`` is a written number
+     (``timeout_at`` takes an absolute time, so routing only).  LOAD-BEARING-OR-POLL
+     is its discriminator because it mirrors the call leg's Name exclusion: a block
+     around ``await task`` or ``await asyncio.gather(...)`` is as silent as
+     ``asyncio.wait_for(task, ...)``, so neither spelling is stricter than the other,
+     and ``asyncio.wait_for(ev.wait(), 5)`` cannot escape by becoming a block.
+
+When deadline spellings nest — a block in a block, a clock poll in a block, a block
+in a clock poll — the INNERMOST owns the waits inside it, so one wait is counted once.
 
 Suppressed by ``# noqa: wall-clock-deadline — <reason>`` on the preceding non-blank
 line, or by the file's ``_WALL_CLOCK_DEADLINE_DEBT`` budget.
@@ -189,8 +232,10 @@ points, so flagging them is correct; ``# noqa: wall-clock-deadline — <reason>`
 escape for a ``Process.wait()``.
 
 Remedy reachability: ``wait_responsive`` and ``MERGE_RESULT_TIMEOUT`` are defined in
-``orchestrator/tests/_orch_helpers.py`` and importable only under orchestrator/tests,
-so every Rule C message says that elsewhere the per-site ``# noqa`` is the remedy.
+``orchestrator/tests/_orch_helpers.py``, and ``poll_responsive`` in
+``orchestrator/tests/_poll_responsive.py``; all three are importable only under
+orchestrator/tests, so every Rule C message says that elsewhere the per-site
+``# noqa`` is the remedy.
 Scoping the rule to orchestrator/tests instead would reintroduce exactly the
 a-list-decides-coverage failure mode the paragraph above rejects.
 
@@ -208,10 +253,13 @@ Scope paths are NOT carried in the message (the file-local guard printed
 Preferred alternatives named in the rejection message:
   • ``wait_responsive(aw, *, timeout=MERGE_RESULT_TIMEOUT, label, ...)``
     (orchestrator/tests/_orch_helpers.py::wait_responsive)
+  • ``poll_responsive(predicate, *, timeout=MERGE_RESULT_TIMEOUT, label, ...)`` for a
+    poll (orchestrator/tests/_poll_responsive.py::poll_responsive)
   • a bound derived from ``MERGE_RESULT_TIMEOUT``, never a written number
 
 Origin: task 2376 (the sweep whose threshold left the gap), task 3980 (migrated the
-sites and added a file-local guard), task 4246 (this shared, repo-wide guard).
+sites and added a file-local guard), task 4246 (this shared, repo-wide guard), task
+7800 (the poll leg).
 
 ---------------------------------------------------------------------------
 
@@ -219,9 +267,12 @@ This script is intentionally stdlib-only (ast, collections.abc, pathlib, sys, ty
 plus its stdlib-only sibling _lint_cli.py) so
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
 Adding a third-party dependency here would break that fast path.  This is why
-``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
-describes: ``import orchestrator.verify`` would need pydantic and break every caller.
-The hardcoded copy's drift guards live in the test, which CAN import it:
+``_DATACLASS_SHAPES`` never imports the dataclasses it describes: ``import
+orchestrator.verify`` would need pydantic and break every caller.  Instead it reads
+each one's fields from its defining module with ``dataclass_field_names``: the same
+class definition orchestrator/src/orchestrator/remote_gate.py::wire_fingerprint
+hashes via ``wire_classes()``, so one wire-shape change reaches both (task 7268).
+The reader's agreement with ``dataclasses.fields`` is guarded in
 fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry.
 """
 
@@ -229,9 +280,11 @@ from __future__ import annotations
 
 import ast
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path, PurePosixPath
-from typing import NamedTuple
+from typing import NamedTuple, TypeGuard
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -245,6 +298,47 @@ finally:
 # Exact matches plus suffix rules — generic names are excluded by design.
 _CONFIG_EXACT: frozenset[str] = frozenset({'config', 'cfg'})
 _CONFIG_SUFFIXES: tuple[str, ...] = ('_config', '_cfg')
+
+_DATACLASS_PSEUDO_FIELD_MARKERS: frozenset[str] = frozenset({'ClassVar', 'InitVar', 'KW_ONLY'})
+
+
+def _is_dataclass_pseudo_field(annotation: ast.expr) -> bool:
+    """Return True if *annotation* marks a pseudo-field: ``ClassVar``, ``InitVar`` or ``KW_ONLY``."""
+    marker = annotation.value if isinstance(annotation, ast.Subscript) else annotation
+    if isinstance(marker, ast.Name):
+        return marker.id in _DATACLASS_PSEUDO_FIELD_MARKERS
+    if isinstance(marker, ast.Attribute):
+        return marker.attr in _DATACLASS_PSEUDO_FIELD_MARKERS
+    return False
+
+
+def dataclass_field_names(path: Path, class_name: str) -> frozenset[str]:
+    """Mirror ``dataclasses.fields()`` for a base-less dataclass, without importing it."""
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    matches = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f'expected exactly one top-level class {class_name!r} in {path}, '
+            f'found {len(matches)}'
+        )
+    (cls,) = matches
+    if cls.bases:
+        bases = ', '.join(ast.unparse(base) for base in cls.bases)
+        raise ValueError(
+            f'class {class_name!r} in {path} has base classes ({bases}); '
+            'inherited fields are invisible to a stdlib AST read'
+        )
+    return frozenset(
+        stmt.target.id
+        for stmt in cls.body
+        if isinstance(stmt, ast.AnnAssign)
+        and stmt.simple
+        and isinstance(stmt.target, ast.Name)
+        and not _is_dataclass_pseudo_field(stmt.annotation)
+    )
 
 
 class _DataclassShape(NamedTuple):
@@ -261,12 +355,14 @@ class _DataclassShape(NamedTuple):
     VerifyResult does not have, so a subset rule would have missed precisely the
     defect this rule exists to catch.
 
-    ``factory`` names the helper the message offers as the remedy, and
-    ``factory_home`` the repo-relative path of the module that defines it.
+    ``home`` is the repo-relative path of the module that defines the dataclass,
+    which Rule B reads its ``fields`` from.  ``factory`` names the helper the message
+    offers as the remedy, and ``factory_home`` the repo-relative path of the module
+    that defines it.
     """
 
     name: str
-    module: str
+    home: str
     fields: frozenset[str]
     anchors: frozenset[str]
     min_field_matches: int
@@ -274,48 +370,32 @@ class _DataclassShape(NamedTuple):
     factory_home: str
 
 
-# Registered shapes.  The field lists are LITERALS, not imports: this script is
-# stdlib-only by hard contract (see module docstring) so hooks/project-checks and
-# all seven package lint_commands can run it under bare ``python3`` with no venv
-# resolution.  ``import orchestrator.verify`` would need pydantic and break every caller.
-#
-# VerifyResult's field list is a stdlib-only copy of
-# orchestrator/src/orchestrator/verify.py::VerifyResult, kept EXHAUSTIVE: a field
-# missing here does not count toward the overlap floor, so a double built from it
-# slips through.  Its drift guards are in
-# fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry,
-# which compare this literal against ``dataclasses.fields(VerifyResult)`` at runtime,
-# one test per drift direction, and parse ``factory_home`` for ``factory``.
+def _registered_shape(
+    *,
+    name: str,
+    home: str,
+    anchors: frozenset[str],
+    min_field_matches: int,
+    factory: str,
+    factory_home: str,
+) -> _DataclassShape:
+    return _DataclassShape(
+        name=name,
+        home=home,
+        fields=dataclass_field_names(_REPO_ROOT / home, name),
+        anchors=anchors,
+        min_field_matches=min_field_matches,
+        factory=factory,
+        factory_home=factory_home,
+    )
+
+
+# Registered shapes: each one's fields are read from its ``home`` module (see the
+# module docstring's last paragraph for why it is never imported).
 _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
-    _DataclassShape(
+    _registered_shape(
         name='VerifyResult',
-        module='orchestrator.verify',
-        fields=frozenset({
-            'passed',
-            'test_output',
-            'lint_output',
-            'type_output',
-            'summary',
-            'timed_out',
-            'cause_hint',
-            'category',
-            'worktree_log_paths',
-            'archive_log_paths',
-            'contention',
-            'plan',
-            'failing_test_ids',
-            'failing_test_ids_by_module',
-            'skipped_test_ids',
-            'failing_leg_categories',
-            'run_all_failed_members',
-            'trivial',
-            'duration_secs',
-            'flake_suppression',
-            'admission_legs',
-            'units',
-            'cache_mode',
-            'test_leg_failed',
-        }),
+        home='orchestrator/src/orchestrator/verify.py',
         anchors=frozenset({'passed'}),
         min_field_matches=2,
         factory='fake_verify_result',
@@ -414,7 +494,7 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
             f' of {shape.name}, which a bare MagicMock accepts silently.'
         )
     return (
-        f'unspecced MagicMock shaped like {shape.module}.{shape.name}'
+        f'unspecced MagicMock shaped like {shape.home}::{shape.name}'
         f' (matched {shape.name} fields: {", ".join(sorted(kwargs & shape.fields))}).'
         ' Reading an absent attribute on it auto-vivifies a truthy child Mock instead'
         f' of raising AttributeError.{drift_clause}'
@@ -607,9 +687,12 @@ def _dataclass_double_violation(
 # after WIDENING DETECTION — the barrier leg became a structural zero-argument
 # ``.wait()`` on any receiver, the raw-literal leg learned ``max_wall_s=`` and
 # wait_for's positional timeout, and directory discovery gained ``_*.py`` helper
-# modules — and recorded 650 violations across 47 files in four packages.  That is
-# the one sanctioned rise: every added violation was already in the tree, newly
-# SEEN, not new debt.  The non-orchestrator entries can shrink only by a per-site
+# modules — and recorded 650 violations across 47 files in four packages.  Task 7800
+# re-measured once more after Rule C learned asyncio.timeout/timeout_at blocks and
+# clock-deadline polls, and recorded 311 violations across 91 files in five packages
+# (220 across 39 before it).  Those are the two sanctioned rises: each time every
+# added violation was already in the tree, newly SEEN, not new debt.  The
+# non-orchestrator entries can shrink only by a per-site suppression pragma,
 # ``# noqa: wall-clock-deadline`` until follow-up ticket
 # tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes ``wait_responsive`` importable outside
 # orchestrator/tests.
@@ -636,7 +719,8 @@ def _dataclass_double_violation(
 # another package's suite (task 6202).
 #
 # DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files are
-# migrated onto wait_responsive(...) with bounds derived from MERGE_RESULT_TIMEOUT.
+# migrated onto wait_responsive(...) or poll_responsive(...) with bounds derived from
+# MERGE_RESULT_TIMEOUT.
 # A NEW file with a load-bearing wall-clock wait must FAIL the gate — that is the
 # entire reason the baseline is opt-OUT rather than opt-in.  An opt-in list would
 # exempt precisely the brand-new file this rule exists to catch, and would make
@@ -644,7 +728,8 @@ def _dataclass_double_violation(
 # 3980's amendment pass deleted a five-class frozenset to escape.
 #
 # orchestrator/tests/test_merge_speculation.py is deliberately NOT here.  It measures
-# ZERO because task 3980 already migrated it, and even a budgeted entry of zero would
+# ZERO because task 3980 already migrated it (and task 7800 its one clock-deadline
+# poll), and even a budgeted entry of zero would
 # be a blanket suppression letting a regression land there silently — which is what
 # 3980 spent a task removing, and what makes it safe for task 4246 to delete that
 # module's file-local copy of this guard.
@@ -653,24 +738,60 @@ def _dataclass_double_violation(
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 64,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 65,
     'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
     'orchestrator/tests/test_offline_lane.py': 10,
     'orchestrator/tests/test_live_merge_worker.py': 6,
+    'orchestrator/tests/test_merge_queue.py': 6,
+    'orchestrator/tests/test_verify_admission_integration_gate.py': 5,
     'orchestrator/tests/test_background_service.py': 4,
+    'orchestrator/tests/test_harness_lifecycle_registry.py': 4,
     'orchestrator/tests/test_merge_queue_deep_dispatch.py': 4,
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 4,
+    'orchestrator/tests/_task_verify_integration_rig.py': 3,
+    'orchestrator/tests/test_git_ops.py': 3,
+    'orchestrator/tests/test_invoke.py': 3,
+    'orchestrator/tests/test_merge_queue_bounce.py': 3,
     'orchestrator/tests/test_merge_queue_deep_landing.py': 3,
-    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 3,
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 3,
+    'orchestrator/tests/test_merge_queue_supervisor.py': 3,
+    'orchestrator/tests/test_workflow_cancellation.py': 3,
     'orchestrator/tests/test_harness.py': 2,
-    'orchestrator/tests/test_invoke.py': 2,
+    'orchestrator/tests/test_merge_queue_coalesce.py': 2,
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py': 2,
-    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 2,
+    'orchestrator/tests/test_merge_queue_rebased_landing_dead_base.py': 2,
     'orchestrator/tests/test_merge_skew_tripwire.py': 2,
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py': 2,
     'orchestrator/tests/test_offline_lane_infra_integration.py': 2,
     'orchestrator/tests/test_offline_lane_integration.py': 2,
-    'orchestrator/tests/test_workflow_cancellation.py': 2,
+    'orchestrator/tests/test_verify_cancel_unwind.py': 2,
+    'orchestrator/tests/test_verify_ruff_config_boundary.py': 2,
+    'orchestrator/tests/test_before_done_script.py': 1,
+    'orchestrator/tests/test_cancel_scope_bounded_cleanup.py': 1,
+    'orchestrator/tests/test_cascade_unblock.py': 1,
+    'orchestrator/tests/test_coalesce_integration_gate.py': 1,
+    'orchestrator/tests/test_done_phase_wedge.py': 1,
+    'orchestrator/tests/test_harness_force_release_wedged_slot.py': 1,
+    'orchestrator/tests/test_harness_offline_lane.py': 1,
+    'orchestrator/tests/test_harness_resume_scheduler.py': 1,
+    'orchestrator/tests/test_lane_lock_leak_guard.py': 1,
+    'orchestrator/tests/test_merge_lane_parked_custody.py': 1,
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 1,
+    'orchestrator/tests/test_merge_queue_orphan_reaper.py': 1,
+    'orchestrator/tests/test_merge_queue_restart_hook.py': 1,
+    'orchestrator/tests/test_offline_lane_records.py': 1,
+    'orchestrator/tests/test_remote_gate.py': 1,
+    'orchestrator/tests/test_task_verify_host_race.py': 1,
     'orchestrator/tests/test_verify.py': 1,
+    'orchestrator/tests/test_verify_admission_cancel_release.py': 1,
+    'orchestrator/tests/test_verify_admission_executor_bypass.py': 1,
+    'orchestrator/tests/test_verify_admission_gate.py': 1,
+    'orchestrator/tests/test_verify_admission_order_integration.py': 1,
+    'orchestrator/tests/test_verify_admission_watch.py': 1,
+    'orchestrator/tests/test_verify_hosts.py': 1,
+    'orchestrator/tests/test_verify_plan_latch.py': 1,
+    'orchestrator/tests/test_verify_run_cmd_reap.py': 1,
+    'orchestrator/tests/test_workflow_halt_owner.py': 1,
     # dashboard/tests
     'dashboard/tests/test_db.py': 26,
     'dashboard/tests/test_mcp_fanout.py': 18,
@@ -678,23 +799,40 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'dashboard/tests/test_metrics_curator.py': 4,
     'dashboard/tests/_dashboard_helpers.py': 3,
     'dashboard/tests/test_api_curator.py': 2,
+    'dashboard/tests/test_memory_exchange_isolation.py': 2,
     'dashboard/tests/test_merge_queue_data.py': 2,
+    'dashboard/tests/test_quality_sampler.py': 2,
+    'dashboard/tests/test_quality_marker_sampler.py': 2,
+    'dashboard/tests/test_escalation_corpus.py': 1,
     # fused-memory/tests
+    'fused-memory/tests/test_harness.py': 7,
     'fused-memory/tests/test_drain_signal_handler.py': 4,
-    'fused-memory/tests/test_harness.py': 4,
     'fused-memory/tests/test_memory_service.py': 4,
     'fused-memory/tests/test_operator_signal_handler.py': 4,
     'fused-memory/tests/test_periodic_rebuild_summaries.py': 4,
     'fused-memory/tests/test_task_interceptor.py': 4,
+    'fused-memory/tests/_fm_polling.py': 2,
     'fused-memory/tests/server/test_grouped_read.py': 2,
     'fused-memory/tests/test_dependency_direction_check.py': 2,
     'fused-memory/tests/test_e2e_durable_queue.py': 2,
     'fused-memory/tests/test_journaling_integration.py': 2,
     'fused-memory/tests/test_recon_claim_verification_wiring.py': 2,
+    'fused-memory/tests/test_mem0_collection_provisioning.py': 2,
+    'fused-memory/tests/test_event_loop_lag.py': 1,
+    'fused-memory/tests/test_event_queue.py': 1,
+    'fused-memory/tests/test_main_curator_usage_gate.py': 1,
     # shared/tests
+    'shared/tests/test_cli_invoke.py': 2,
     'shared/tests/test_uuid_prefix_guard.py': 2,
     'shared/tests/test_async_sqlite_base.py': 1,
-    'shared/tests/test_cli_invoke.py': 1,
+    'shared/tests/test_auth_failed.py': 1,
+    'shared/tests/test_auth_reprobe_opt_out.py': 1,
+    'shared/tests/test_cli_invoke_transcript_offloop.py': 1,
+    'shared/tests/test_failover_integration.py': 1,
+    'shared/tests/test_git_async.py': 1,
+    'shared/tests/test_usage_gate_park_visibility.py': 1,
+    # escalation/tests
+    'escalation/tests/test_prefix_resolver_client.py': 2,
 }
 
 
@@ -713,8 +851,9 @@ def _wall_clock_overrun_msg(entry: _DebtEntry, found: int) -> str:
         ' The reported sites are simply the LAST in source order: the anchor is'
         ' positional and is NOT a claim that these exact sites are the new ones.'
         ' Fix by migrating a load-bearing wait in this file onto wait_responsive(...)'
-        ' with a descriptive label=, or by deriving its bound from'
-        ' MERGE_RESULT_TIMEOUT instead of writing a number, or by adding'
+        f' ({_WAIT_RESPONSIVE_REF}), or a poll onto poll_responsive(predicate, ...)'
+        f' ({_POLL_RESPONSIVE_REF}), with a descriptive label=, or by deriving its'
+        ' bound from MERGE_RESULT_TIMEOUT instead of writing a number, or by adding'
         ' # noqa: wall-clock-deadline — <reason> above a deliberate one.'
         + _WALL_CLOCK_REMEDY_REACH
         + ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
@@ -791,26 +930,62 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
         return f'{ast.unparse(node)} (.wait() barrier)'
     return None
 
-# Rule C's two offence kinds.  They are INDEPENDENT — one call can trip both
-# (a bare asyncio.wait_for that also writes a number) or exactly one (a migrated
-# wait_responsive that kept its literal; a bare wait_for whose bound is derived).
-_WALL_CLOCK_BARE_WAIT_FOR = 'bare-wait_for'
-_WALL_CLOCK_RAW_LITERAL = 'raw-literal'
 
-# Shared by both kinds: WHY a wall-clock deadline on a load-bearing sync point is a
-# defect rather than a style preference.  Task 3980's three measured failures were
-# all genuine deadline expiries on tests that had already passed.
+def _polled_predicate_target(node: ast.expr) -> str:
+    """Describe *node* as a polled predicate: a poll's predicate IS its synchronisation point."""
+    return f'{ast.unparse(node)} (polled predicate)'
+
+
+class _ResponsiveHelper(NamedTuple):
+    """A responsive wait helper: a Rule C call shape, and a remedy its messages cite.
+
+    ``home`` is the repo-relative path of the module that defines it, and
+    ``describe`` how it describes its first argument as a load-bearing target.
+    """
+
+    home: str
+    describe: Callable[[ast.expr], str | None]
+
+
+# The responsive wait helpers by the name a call site spells.  A stdlib-only literal
+# copy of where they live, which this checker cannot import — the same precedent as
+# ``_DATACLASS_SHAPES``, guarded from both sides.  Each ``home`` is parsed for its helper by
+# fused-memory/tests/test_wall_clock_poll_deadlines.py::TestResponsiveHelperRegistry,
+# and the name set must equal the one the wait-budget audit derives from the helpers
+# themselves (orchestrator/tests/test_wait_budget_audit.py::TestRuleCRecognisesTheBilledHelpers).
+# A responsive helper is itself the remedy, so only its raw-literal kind ever applies.
+RESPONSIVE_WAIT_HELPERS: dict[str, _ResponsiveHelper] = {
+    'wait_responsive': _ResponsiveHelper(
+        home='orchestrator/tests/_orch_helpers.py', describe=_load_bearing_wait_target
+    ),
+    'poll_responsive': _ResponsiveHelper(
+        home='orchestrator/tests/_poll_responsive.py', describe=_polled_predicate_target
+    ),
+}
+
+
+def _helper_ref(name: str) -> str:
+    """Cite responsive helper *name* as ``<home>::<name>``."""
+    return f'{RESPONSIVE_WAIT_HELPERS[name].home}::{name}'
+
+
+_WAIT_RESPONSIVE_REF = _helper_ref('wait_responsive')
+_POLL_RESPONSIVE_REF = _helper_ref('poll_responsive')
+
+# Shared by every offence kind: WHY a wall-clock deadline on a load-bearing sync
+# point is a defect rather than a style preference.  Task 3980's three measured
+# failures were all genuine deadline expiries on tests that had already passed.
 _WALL_CLOCK_CONSEQUENCE = (
     ' A deadline expiry on a load-bearing synchronisation point fails a test whose'
     ' awaited event did happen, only because the loop was descheduled.'
 )
 
-# Shared by both kinds and the debt overrun: every Rule C remedy names
-# wait_responsive or MERGE_RESULT_TIMEOUT, and both live in
-# orchestrator/tests/_orch_helpers.py while the rule scans every package.
+# Shared by every offence kind and the debt overrun: every Rule C remedy names
+# wait_responsive, poll_responsive or MERGE_RESULT_TIMEOUT, and all three live under
+# orchestrator/tests while the rule scans every package.
 _WALL_CLOCK_REMEDY_REACH = (
-    ' wait_responsive and MERGE_RESULT_TIMEOUT are importable only under'
-    ' orchestrator/tests, so in another package the # noqa escape is the remedy.'
+    ' wait_responsive, poll_responsive and MERGE_RESULT_TIMEOUT are importable only'
+    ' under orchestrator/tests, so in another package the # noqa escape is the remedy.'
 )
 
 _WALL_CLOCK_SUPPRESS = (
@@ -819,32 +994,72 @@ _WALL_CLOCK_SUPPRESS = (
 )
 
 
-def _wall_clock_violation_msg(kind: str, target: str, *, parameter: str | None = None) -> str:
-    """Build Rule C's rejection message for one offence *kind* on *target*.
+class _DeadlineRouting(NamedTuple):
+    """One SPELLING of a wall-clock deadline, and the remedy that re-routes it.
 
-    *parameter* names the bound that carries the raw literal (``timeout`` or
-    ``max_wall_s``); it is consulted only for the raw-literal kind.
+    Rule C's routing offence is the same defect however the deadline is spelled;
+    only the clause naming the spelling and the helper that replaces it differ.
+    """
+
+    spelled: str
+    remedy: str
+
+
+_BARE_WAIT_FOR = _DeadlineRouting(
+    spelled='is routed through a bare asyncio.wait_for',
+    remedy=(
+        ' Route it through wait_responsive(...) with a descriptive label='
+        f' ({_WAIT_RESPONSIVE_REF}), which charges its'
+        ' budget in loop-responsive time and still reports a genuine hang red.'
+    ),
+)
+
+_CLOCK_DEADLINE = _DeadlineRouting(
+    spelled='gives up against a wall-clock read',
+    remedy=(
+        ' Replace the loop with poll_responsive(predicate, ...) with a descriptive'
+        f' label= ({_POLL_RESPONSIVE_REF}), which'
+        ' polls under a loop-responsive budget and still reports a genuine hang red.'
+    ),
+)
+
+_TIMEOUT_BLOCK = _DeadlineRouting(
+    spelled='is bounded by an asyncio.timeout(...) block',
+    remedy=(
+        ' Route a load-bearing await through wait_responsive(...) and a poll through'
+        ' poll_responsive(predicate, ...)'
+        f' ({_POLL_RESPONSIVE_REF}), each with a'
+        ' descriptive label=.'
+    ),
+)
+
+
+def _wall_clock_routing_msg(routing: _DeadlineRouting, target: str) -> str:
+    """Build Rule C's routing message: *target*'s deadline, spelled as *routing*, is wall clock.
 
     Deliberately shares NO vocabulary with ``_VIOLATION_MSG`` or
     ``_dataclass_violation_msg``: Rule A's remedies read pydantic ``model_fields``
     and Rule B's spec a stdlib dataclass — neither has anything to say about a
     wall-clock deadline on a future, so offering either here would send the reader
-    down a dead end.  The two KINDS also keep separate remedies from each other for
-    the same reason: routing through ``wait_responsive`` and deriving the bound from
-    ``MERGE_RESULT_TIMEOUT`` are independent fixes, and a site can need one, the
-    other, or both.
+    down a dead end.
     """
-    if kind == _WALL_CLOCK_BARE_WAIT_FOR:
-        return (
-            f'load-bearing wait on {target} is routed through a bare asyncio.wait_for,'
-            ' so its deadline is charged in WALL CLOCK.'
-            + _WALL_CLOCK_CONSEQUENCE
-            + ' Route it through wait_responsive(...) with a descriptive label='
-            ' (orchestrator/tests/_orch_helpers.py::wait_responsive), which charges its'
-            ' budget in loop-responsive time and still reports a genuine hang red.'
-            + _WALL_CLOCK_REMEDY_REACH
-            + _WALL_CLOCK_SUPPRESS
-        )
+    return (
+        f'load-bearing wait on {target} {routing.spelled},'
+        ' so its deadline is charged in WALL CLOCK.'
+        + _WALL_CLOCK_CONSEQUENCE
+        + routing.remedy
+        + _WALL_CLOCK_REMEDY_REACH
+        + _WALL_CLOCK_SUPPRESS
+    )
+
+
+def _wall_clock_raw_literal_msg(target: str, parameter: str) -> str:
+    """Build Rule C's raw-literal message: *target*'s *parameter* bound is a written number.
+
+    Kept apart from the routing message because the two are independent fixes:
+    re-routing the wait and deriving its bound from ``MERGE_RESULT_TIMEOUT``, and a
+    site can need one, the other, or both.
+    """
     return (
         f'load-bearing wait on {target} carries a RAW wall-clock literal as its'
         f' {parameter} bound.'
@@ -857,8 +1072,8 @@ def _wall_clock_violation_msg(kind: str, target: str, *, parameter: str | None =
     )
 
 
-# The keywords that carry a wall-clock bound on a wait call: ``timeout`` on both call
-# shapes, and ``max_wall_s``, wait_responsive's wall-clock cap
+# The keywords that carry a wall-clock bound on a wait call: ``timeout`` on every call
+# shape, and ``max_wall_s``, the responsive helpers' wall-clock cap
 # (orchestrator/tests/_orch_helpers.py::wait_responsive).
 _WALL_CLOCK_BOUND_KEYWORDS: tuple[str, ...] = ('timeout', 'max_wall_s')
 
@@ -879,9 +1094,9 @@ def _is_numeric_literal(node: ast.expr) -> bool:
 def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | None:
     """Return the name of the first wall-clock bound on *call* written as a number.
 
-    Checks the ``_WALL_CLOCK_BOUND_KEYWORDS`` keywords on either call shape, and
+    Checks the ``_WALL_CLOCK_BOUND_KEYWORDS`` keywords on any wait call shape, and
     ``asyncio.wait_for``'s positional timeout (``args[1]``) only when
-    *is_bare_wait_for*: wait_responsive's ``timeout`` is keyword-only, so a
+    *is_bare_wait_for*: a responsive helper's ``timeout`` is keyword-only, so a
     positional second argument there is a TypeError, not a lintable site.
     """
     for kw in call.keywords:
@@ -892,10 +1107,54 @@ def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | 
     return None
 
 
+def _asyncio_function_name(call: ast.Call) -> str | None:
+    """Return *attr* if *call* is ``asyncio.<attr>(...)``, spelled through the ``asyncio`` name.
+
+    ``gate.wait_for(...)`` and ``self.timeout(...)`` are not, so they return None.
+    """
+    func = call.func
+    if (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == 'asyncio'
+    ):
+        return func.attr
+    return None
+
+
 def _wall_clock_deadline_violations(
-    call: ast.Call, lines: list[str], filename: str
+    node: ast.AST, lines: list[str], filename: str
 ) -> list[Violation]:
-    """Rule C, evaluated for ONE ``ast.Call``: return 0, 1 or 2 Violations.
+    """Rule C, evaluated for ONE node of any type: return 0, 1 or 2 Violations.
+
+    Dispatches on the node type, one leg per spelling of a wall-clock deadline:
+    an ``ast.Call`` to the wait-call leg (``_wait_call_violations``), an
+    ``ast.While`` to the clock-deadline poll leg (``_clock_deadline_poll_violations``)
+    and an ``ast.AsyncWith`` to the timeout-block leg (``_timeout_block_violations``).
+    A sync ``with`` is not inspected: ``asyncio.timeout`` is async-only.  Every other
+    node yields nothing.
+
+    Per-NODE rather than per-tree so ``find_violations`` can evaluate all three rules
+    in a SINGLE ``ast.walk``; a second full walk was measured at ~43% of total checker
+    runtime (20.8s -> 30.7s over the seven scanned dirs), paid on every merge-queue
+    verify across all nine call sites.  Position-blind by construction: the caller
+    hands this every node, so there is no class list and no scope filter — see the
+    Rule C section of the module docstring for why a list, or a threshold, is not a
+    sound key.
+
+    Must never raise: a crash would fail every caller's lint over an unrelated edit.
+    """
+    if isinstance(node, ast.Call):
+        return _wait_call_violations(node, lines, filename)
+    if isinstance(node, ast.While):
+        return _clock_deadline_poll_violations(node, lines, filename)
+    if isinstance(node, ast.AsyncWith):
+        return _timeout_block_violations(node, lines, filename)
+    return []
+
+
+def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> list[Violation]:
+    """Rule C's wait-call leg, for ONE ``ast.Call``: return 0, 1 or 2 Violations.
 
     Returns a LIST, not an Optional, because the two offence kinds are independent
     and a single call can trip both — ``asyncio.wait_for(req.result, timeout=25.0)``
@@ -906,44 +1165,30 @@ def _wall_clock_deadline_violations(
     Gating order is cheapest-first, and deliberately so:
       1. the call has at least one positional argument (no ``args[0]`` to inspect
          otherwise — and a bare ``asyncio.wait_for()`` must be skipped, not crash);
-      2. the func is ``asyncio.wait_for`` or ``wait_responsive``;
-      3. ``_load_bearing_wait_target`` recognises ``args[0]``.
-    Only then is the exemption line-walk run (see ``_wall_clock_deadline_violations``'s
-    call to ``is_exempted``), so the upward walk keeps Rule B's cost profile rather
-    than running on every ``ast.Call`` in the tree.
-
-    Position-blind by construction: the caller hands this every ``ast.Call``, so a
-    wait in a ``return``, an argument, a comprehension body or at module level is
-    covered identically.  There is no class list and no scope filter — see the Rule C
-    section of the module docstring for why a list, or a threshold, is not a sound key.
-
-    Per-NODE rather than per-tree so ``find_violations`` can evaluate all three rules
-    in a SINGLE ``ast.walk``; a second full walk was measured at ~43% of total checker
-    runtime (20.8s -> 30.7s over the seven scanned dirs), paid on every merge-queue
-    verify across all nine call sites.
+      2. the func is ``asyncio.wait_for`` or a ``RESPONSIVE_WAIT_HELPERS`` helper;
+      3. that shape's describer recognises ``args[0]`` (``_load_bearing_wait_target``,
+         except a ``poll_responsive`` predicate, which is always load-bearing).
+    Only then is the exemption line-walk run, so the upward walk keeps Rule B's cost
+    profile rather than running on every ``ast.Call`` in the tree.
 
     Violations carry ``call.col_offset``, so a node tripping several rules yields
     deterministically-ordered entries under ``find_violations``' final sort.  Both
     kinds from one call share a position; Python's stable sort keeps them in the
     fixed order they are appended here.
-
-    Must never raise: a crash would fail every caller's lint over an unrelated edit.
     """
     if not call.args:
         return []
 
     func = call.func
-    is_bare_wait_for = (
-        isinstance(func, ast.Attribute)
-        and func.attr == 'wait_for'
-        and isinstance(func.value, ast.Name)
-        and func.value.id == 'asyncio'
-    )
-    is_responsive = isinstance(func, ast.Name) and func.id == 'wait_responsive'
-    if not (is_bare_wait_for or is_responsive):
+    is_bare_wait_for = _asyncio_function_name(call) == 'wait_for'
+    if is_bare_wait_for:
+        describe = _load_bearing_wait_target
+    elif isinstance(func, ast.Name) and func.id in RESPONSIVE_WAIT_HELPERS:
+        describe = RESPONSIVE_WAIT_HELPERS[func.id].describe
+    else:
         return []
 
-    target = _load_bearing_wait_target(call.args[0])
+    target = describe(call.args[0])
     if target is None:
         return []
 
@@ -956,18 +1201,16 @@ def _wall_clock_deadline_violations(
 
     messages: list[str] = []
     if is_bare_wait_for:
-        messages.append(_wall_clock_violation_msg(_WALL_CLOCK_BARE_WAIT_FOR, target))
+        messages.append(_wall_clock_routing_msg(_BARE_WAIT_FOR, target))
 
-    # A raw numeric literal is an offence on EITHER call shape: wait_responsive
-    # also takes ``timeout`` and ``max_wall_s`` keywords, so a migrated site can
+    # A raw numeric literal is an offence on ANY wait call shape: the responsive
+    # helpers also take ``timeout`` and ``max_wall_s`` keywords, so a migrated site can
     # have moved the accounting into loop-responsive time while keeping a
     # hand-written number.  At most ONE raw-literal violation per call, however
     # many bounds carry a number: it is one offence with one remedy.
     parameter = _raw_wall_clock_literal(call, is_bare_wait_for=is_bare_wait_for)
     if parameter is not None:
-        messages.append(
-            _wall_clock_violation_msg(_WALL_CLOCK_RAW_LITERAL, target, parameter=parameter)
-        )
+        messages.append(_wall_clock_raw_literal_msg(target, parameter))
 
     return [
         Violation(
@@ -980,8 +1223,329 @@ def _wall_clock_deadline_violations(
     ]
 
 
+# The nodes that open a new scope: an await, or a comparison, inside one belongs to
+# that scope's own code, not to the loop or block that merely contains its definition.
+_SCOPE_NODES: tuple[type[ast.AST], ...] = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.Lambda,
+    ast.ClassDef,
+)
+
+# The loops: a ``break`` inside one ends that loop, not an enclosing one.
+_LOOP_NODES: tuple[type[ast.AST], ...] = (ast.While, ast.For, ast.AsyncFor)
+
+
+def _opens_scope(node: ast.AST) -> bool:
+    """Return True if *node* opens a new scope (``_SCOPE_NODES``)."""
+    return isinstance(node, _SCOPE_NODES)
+
+
+def _walk_own_scope(
+    nodes: Iterable[ast.AST], *, prune: Callable[[ast.AST], bool] = _opens_scope
+) -> Iterator[ast.AST]:
+    """Yield *nodes* and their descendants in source order, skipping every node *prune* accepts.
+
+    A pruned node is skipped whole: neither it nor any of its descendants is yielded.
+    """
+    pending = list(reversed(list(nodes)))
+    while pending:
+        node = pending.pop()
+        if prune(node):
+            continue
+        yield node
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _awaits(
+    stmts: Iterable[ast.AST], *, prune: Callable[[ast.AST], bool] = _opens_scope
+) -> bool:
+    """Return True if *stmts* await anything outside every node *prune* accepts."""
+    return any(isinstance(node, ast.Await) for node in _walk_own_scope(stmts, prune=prune))
+
+
+# The zero-argument methods that read a wall clock: ``loop.time()``, ``time.time()``,
+# ``time.monotonic()``, ``time.perf_counter()``.  Matched by attribute name only.
+_WALL_CLOCK_READS: frozenset[str] = frozenset({'time', 'monotonic', 'perf_counter'})
+
+
+def _is_wall_clock_read(node: ast.AST) -> TypeGuard[ast.Call]:
+    """Return True if *node* is a zero-argument call of a ``_WALL_CLOCK_READS`` method.
+
+    The receiver is never consulted, like the barrier leg's ``.wait()``: no name
+    list decides what is a clock.
+    """
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _WALL_CLOCK_READS
+        and not node.args
+        and not node.keywords
+    )
+
+
+def _reads_clock(node: ast.AST) -> bool:
+    """Return True if a wall-clock read appears anywhere in *node*."""
+    return any(_is_wall_clock_read(inner) for inner in ast.walk(node))
+
+
+def _elapsed_clock_read(node: ast.expr) -> ast.Call | None:
+    """Return the clock read in *node* if it is an elapsed time, ``<clock read> - <start>``."""
+    if (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Sub)
+        and _is_wall_clock_read(node.left)
+    ):
+        return node.left
+    return None
+
+
+def _give_up_clock_read(node: ast.expr) -> ast.Call | None:
+    """Return the clock read in *node* if it is one measured against a deadline.
+
+    That is the read itself, or a remaining time, ``<deadline> - <clock read>``.
+    """
+    if _is_wall_clock_read(node):
+        return node
+    if (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Sub)
+        and _is_wall_clock_read(node.right)
+    ):
+        return node.right
+    return None
+
+
+def _ends_other_than_by_its_clock(loop: ast.While) -> bool:
+    """Return True if *loop* has an exit that no clock governs.
+
+    That is a conjunct of its test that reads no clock and is not a constant, or a
+    ``break`` or ``return`` in its own code outside the body of every ``if`` whose test
+    reads a clock.  A nested loop is not searched: its ``break`` ends that loop.  A loop
+    with neither runs FOR a duration — a fake worker's tick loop — rather than polling.
+    """
+    test = loop.test
+    conjuncts = (
+        test.values
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And)
+        else [test]
+    )
+    if any(not isinstance(c, ast.Constant) and not _reads_clock(c) for c in conjuncts):
+        return True
+    own_body = list(
+        _walk_own_scope(
+            loop.body, prune=lambda node: isinstance(node, (*_SCOPE_NODES, *_LOOP_NODES))
+        )
+    )
+    clock_governed = {
+        id(node)
+        for clock_check in own_body
+        if isinstance(clock_check, ast.If) and _reads_clock(clock_check.test)
+        for node in _walk_own_scope(clock_check.body)
+    }
+    return any(
+        isinstance(node, (ast.Break, ast.Return)) and id(node) not in clock_governed
+        for node in own_body
+    )
+
+
+def _clock_deadline_read(loop: ast.While) -> ast.Call | None:
+    """Return the wall-clock read *loop* compares against to give up, else None.
+
+    That is a DIRECT operand of a ``Compare`` in the loop's test or own body that is a
+    wall-clock read or a remaining time (``_give_up_clock_read``).  Failing one, it is
+    the read inside an elapsed-time operand (``_elapsed_clock_read``), but only for a
+    loop that ``_ends_other_than_by_its_clock``.  A nested ``while`` or scope is not
+    searched: its comparison is its own.  A nested ``for`` IS searched: a ``for`` loop
+    is not a leg of its own, so its comparison belongs to the enclosing ``while``.
+    """
+    own_code = _walk_own_scope(
+        [loop.test, *loop.body],
+        prune=lambda node: isinstance(node, (*_SCOPE_NODES, ast.While)),
+    )
+    elapsed_reads: list[ast.Call] = []
+    for node in own_code:
+        if not isinstance(node, ast.Compare):
+            continue
+        for operand in (node.left, *node.comparators):
+            give_up = _give_up_clock_read(operand)
+            if give_up is not None:
+                return give_up
+            elapsed = _elapsed_clock_read(operand)
+            if elapsed is not None:
+                elapsed_reads.append(elapsed)
+    if elapsed_reads and _ends_other_than_by_its_clock(loop):
+        return elapsed_reads[0]
+    return None
+
+
+class _DeadlineContext(NamedTuple):
+    """An ``asyncio.<attr>(...)`` deadline context's one argument.
+
+    ``keyword`` is that argument's keyword spelling, and ``is_duration`` whether it
+    is a duration, so a written number there is a raw literal, rather than an
+    absolute time.
+    """
+
+    keyword: str
+    is_duration: bool
+
+
+_DEADLINE_CONTEXTS: dict[str, _DeadlineContext] = {
+    'timeout': _DeadlineContext(keyword='delay', is_duration=True),
+    'timeout_at': _DeadlineContext(keyword='when', is_duration=False),
+}
+
+
+def _deadline_context(item: ast.withitem) -> tuple[ast.expr, _DeadlineContext] | None:
+    """Return *item*'s deadline argument and context if it is an asyncio deadline.
+
+    None unless the item is an ``asyncio.<attr>(...)`` call with *attr* in
+    ``_DEADLINE_CONTEXTS`` whose argument, positional or by that context's own
+    keyword, is present and not the literal None: a missing or None deadline bounds
+    nothing, and another context's keyword is a TypeError, not a deadline.
+    """
+    call = item.context_expr
+    if not isinstance(call, ast.Call):
+        return None
+    name = _asyncio_function_name(call)
+    if name not in _DEADLINE_CONTEXTS:
+        return None
+    context = _DEADLINE_CONTEXTS[name]
+    keyword_bounds = [kw.value for kw in call.keywords if kw.arg == context.keyword]
+    bounds = keyword_bounds or call.args[:1]
+    if not bounds:
+        return None
+    bound = bounds[0]
+    if isinstance(bound, ast.Constant) and bound.value is None:
+        return None
+    return bound, context
+
+
+def _block_deadline(block: ast.AsyncWith) -> tuple[ast.expr, _DeadlineContext] | None:
+    """Return the first asyncio deadline among *block*'s items (``_deadline_context``)."""
+    return next(
+        (found for item in block.items if (found := _deadline_context(item)) is not None),
+        None,
+    )
+
+
+def _owns_its_waits(node: ast.AST) -> bool:
+    """Return True if *node* opens a scope or is a deadline spelling that reports its waits.
+
+    Either owns the waits inside it.  A scope's code is its own, and a nested
+    ``asyncio`` deadline block or clock-deadline ``while`` that Rule C flags is the
+    innermost deadline on what it contains, so its waits are attributed to it alone
+    and one wait is counted once.  A nested spelling that flags nothing — a
+    per-attempt ``asyncio.timeout`` around a non-load-bearing await — owns nothing,
+    so the enclosing deadline still sees the waits inside it.
+    """
+    if isinstance(node, ast.AsyncWith):
+        return _block_deadline(node) is not None and _timeout_block_target(node) is not None
+    if isinstance(node, ast.While):
+        return _clock_deadline_read(node) is not None and _awaits(
+            node.body, prune=_owns_its_waits
+        )
+    return _opens_scope(node)
+
+
+def _clock_deadline_poll_violations(
+    loop: ast.While, lines: list[str], filename: str
+) -> list[Violation]:
+    """Rule C's clock-deadline poll leg, for ONE ``ast.While``: return 0 or 1 Violations.
+
+    Flags a loop that gives up against a wall-clock read and awaits outside every
+    nested deadline spelling, which owns its own waits (``_owns_its_waits``).  Only the
+    routing kind applies: the loop's bound is arithmetic in another statement, so
+    there is no literal on the inspected node to report.
+    """
+    read = _clock_deadline_read(loop)
+    if read is None or not _awaits(loop.body, prune=_owns_its_waits):
+        return []
+    if is_exempted(lines, loop.lineno, _RULE_C_CODE):
+        return []
+    target = f'poll loop `while {ast.unparse(loop.test)}` ({ast.unparse(read)} deadline)'
+    return [
+        Violation(
+            filename=filename,
+            lineno=loop.lineno,
+            col_offset=loop.col_offset,
+            message=_wall_clock_routing_msg(_CLOCK_DEADLINE, target),
+        )
+    ]
+
+
+def _timeout_block_target(block: ast.AsyncWith) -> str | None:
+    """Describe what *block*'s deadline bounds, if it is a load-bearing wait, else None.
+
+    A load-bearing await in the block's own code wins; otherwise an awaiting
+    ``while`` loop in it, which is a poll.  Anything else — ``await task``,
+    ``await asyncio.gather(...)``, a plain call — is not load-bearing.  A nested
+    deadline spelling is not searched: it owns the waits inside it (``_owns_its_waits``).
+    """
+    own_code = list(_walk_own_scope(block.body, prune=_owns_its_waits))
+    for node in own_code:
+        if isinstance(node, ast.Await):
+            target = _load_bearing_wait_target(node.value)
+            if target is not None:
+                return target
+    for node in own_code:
+        if isinstance(node, ast.While) and _awaits(node.body, prune=_owns_its_waits):
+            return f'poll loop `while {ast.unparse(node.test)}`'
+    return None
+
+
+def _timeout_block_violations(
+    block: ast.AsyncWith, lines: list[str], filename: str
+) -> list[Violation]:
+    """Rule C's timeout-block leg, for ONE ``ast.AsyncWith``: return 0, 1 or 2 Violations.
+
+    The first asyncio deadline context among the block's items decides.  The routing
+    kind applies whenever the block bounds a load-bearing wait; the raw-literal kind
+    as well when that context's argument is a duration written as a number, exactly
+    as for ``asyncio.wait_for(x, 25.0)``.
+    """
+    deadline = _block_deadline(block)
+    if deadline is None:
+        return []
+    bound, context = deadline
+    target = _timeout_block_target(block)
+    if target is None:
+        return []
+    if is_exempted(lines, block.lineno, _RULE_C_CODE):
+        return []
+
+    messages = [_wall_clock_routing_msg(_TIMEOUT_BLOCK, target)]
+    if context.is_duration and _is_numeric_literal(bound):
+        messages.append(_wall_clock_raw_literal_msg(target, context.keyword))
+    return [
+        Violation(
+            filename=filename,
+            lineno=block.lineno,
+            col_offset=block.col_offset,
+            message=message,
+        )
+        for message in messages
+    ]
+
+
 def find_violations(source: str, filename: str) -> list[Violation]:
-    """Parse *source* and return every violation of ALL THREE rules.
+    """Parse *source* and return ``find_violations_in_tree`` over it.
+
+    SyntaxError in *source* → returns an empty list.
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+    return find_violations_in_tree(tree, source, filename)
+
+
+def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> list[Violation]:
+    """Return every violation of ALL THREE rules in *tree*, the parse of *source*.
+
+    The seam for a caller that already holds the parse and runs other predicates
+    over the same tree, so that tree is parsed once.
 
     Rule A — ``bare-magicmock``: each ``<config_name> = MagicMock()`` that has at
     least one ast.Name target whose id matches the config-name set, calls MagicMock
@@ -997,7 +1561,10 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     ``MergeRequest.result`` future or a zero-argument ``.wait()`` barrier) routed through a
     bare ``asyncio.wait_for``, and/or carrying a raw numeric literal bound
     (``timeout=``, ``max_wall_s=`` or wait_for's positional timeout).  One call can
-    produce TWO violations — the kinds are independent.
+    produce TWO violations — the kinds are independent.  Also each async ``while``
+    poll that gives up against a wall-clock read (one violation, at the ``while``),
+    and each ``asyncio.timeout``/``timeout_at`` block bounding such a poll or a
+    load-bearing await (routing, plus raw-literal on a written ``delay``).
 
     Rule C additionally honours its own SHRINK-ONLY per-file debt budget
     (``_WALL_CLOCK_DEADLINE_DEBT``), compared with the collected COUNT after the
@@ -1005,16 +1572,9 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     it and one file-level slack violation below it.  Rules A and B have no baseline
     and apply in full to every file.
 
-    SyntaxError in *source* → returns an empty list.
-
     Returned violations are sorted ascending by (lineno, col_offset) for
     deterministic source-order output (ast.walk yields BFS order, not source order).
     """
-    try:
-        tree = ast.parse(source, filename=filename)
-    except SyntaxError:
-        return []
-
     lines = source.splitlines()
     violations: list[Violation] = []
 
@@ -1028,10 +1588,16 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     # same tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
     # scanned tests/ dirs) — a cost paid on every merge-queue verify across all nine
     # call sites.  Rule A's walk already visits every node and simply skips non-Assign
-    # ones, so folding Rule B's and Rule C's per-Call handling in here makes them nearly
+    # ones, so folding Rule B's and Rule C's per-node handling in here makes them nearly
     # free.  Output is unchanged: the final sort by (lineno, col_offset) still
     # normalises ordering.
     for node in ast.walk(tree):
+        # ---- Rule C: wall-clock-deadline, every node, dispatched on its type ----
+        # Runs FIRST and unconditionally: its legs read ast.Call, ast.While AND
+        # ast.AsyncWith nodes, so neither Rule B's `continue` nor Rule A's type filter
+        # below may skip it.
+        wall_clock.extend(_wall_clock_deadline_violations(node, lines, filename))
+
         # ---- Rule B: bare-dataclass-double, position-blind over every ast.Call ----
         # An ast.Call is never an ast.Assign/ast.AnnAssign, so this branch and Rule A's
         # below are mutually exclusive and the `continue` cannot skip Rule A work.
@@ -1039,10 +1605,6 @@ def find_violations(source: str, filename: str) -> list[Violation]:
             double = _dataclass_double_violation(node, lines, filename)
             if double is not None:
                 violations.append(double)
-            # Rule C shares this branch rather than adding its own `continue`:
-            # a second early exit here would shadow Rule B for any node Rule C
-            # matched first.  Both run, then the single existing continue fires.
-            wall_clock.extend(_wall_clock_deadline_violations(node, lines, filename))
             continue
 
         # ---- Rule A: bare-magicmock, ast.Assign/ast.AnnAssign only ----

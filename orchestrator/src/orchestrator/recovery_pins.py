@@ -65,7 +65,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from escalation.pins import PinRecord, classify_pins
+from escalation.pins import PinRecord, classify_pins, needs_human
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -200,6 +200,15 @@ def records_pin_blocked_recovery(
     to judge — ``only_merge_remediable(())`` would be vacuously True and
     silently relax a strand nobody can see.
 
+    A record that needs a human (:func:`escalation.pins.needs_human`) is never
+    relaxed (task 6145).  A re-dispatch meets the workflow gate that stops on
+    that record, so relaxing it loops block -> re-pend; a direct merge (the
+    harness's EXISTS_OFF_MAIN verified-green submit) never meets that gate and
+    would merge past the record, which repend-PRD D4 stop-the-line forbids.
+    ``orchestrator/tests/test_merge_gate_implies_sweep_pin.py`` pins the
+    property, and ``orchestrator/tests/test_stranded_verified_green_human_held.py``
+    the direct-merge consumer.
+
     NOT the predicate for a done-flip — see
     :func:`records_pin_blocked_done_flip`, its deliberately-more-conservative
     twin.
@@ -211,7 +220,11 @@ def records_pin_blocked_recovery(
         records,
         live_claimant=live_claimant,
         live_claimant_id=live_claimant_id,
-    ) and not only_merge_remediable(records)
+    ) and not _relaxed_for_recovery(records)
+
+
+def _relaxed_for_recovery(records: Sequence[PinRecord]) -> bool:
+    return only_merge_remediable(records) and not any(needs_human(r) for r in records)
 
 
 def records_pin_blocked_done_flip(
@@ -227,12 +240,16 @@ def records_pin_blocked_done_flip(
     Same ``records is None`` ordering and the same rationale for it, but built
     on ``vetoes_done_flip`` rather than ``pins`` and relaxing over the wider
     :data:`ON_MAIN_REMEDIABLE_ESC_CATEGORIES`.  The two therefore differ on
-    EXACTLY TWO input classes, one in each direction:
+    EXACTLY THREE input classes:
 
     * a dead-filer L0 — the done-flip is MORE conservative (below);
     * a ``preexisting_main_break``-only pin — the done-flip is LESS
       conservative, because this predicate is consumed only where the branch is
-      ON MAIN and that escalation's ask is already met (task 4645).
+      ON MAIN and that escalation's ask is already met (task 4645);
+    * a human-held merge-remediable record — the recovery predicate is MORE
+      conservative, because a re-dispatch meets the gate that stops on it and
+      a direct merge would pass it (task 6145); the done-flip, reached only on
+      main, merges nothing and keeps relaxing it.
 
     The dead-L0 asymmetry is PRD D3 ("Done-flip vetoes stay maximally conservative:
     any non-info open record still vetoes MARK_DONE") and spec

@@ -50,9 +50,11 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,13 @@ logger = logging.getLogger(__name__)
 # one-way (verify_runner -> config); config.py imports nothing from
 # verify_runner.py, so there is no cycle.
 VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
+
+# --- Task-verify host policy (remote task leg, task 6670) ---
+#
+# Same single-home rule as VerifyHostPolicy: task_verify_dispatch.py imports
+# this name as its HostPolicy, so the config field and the dispatcher's
+# eligibility match share one vocabulary.
+VerifyTaskHostPolicy = Literal['local', 'remote_modules', 'remote_all']
 
 
 # --- Priority-tier constants (value/h scheduler) ---
@@ -103,6 +112,10 @@ AGE_HALF_SECS: float = 259200.0
 CONTINUITY_CREDIT: float = 120.0
 CONTINUITY_PROBE_TTL_SECS: float = 300.0
 CONTINUITY_CREDIT_MAX_AGE_SECS: float = 604800.0
+
+# Default of DeterministicConfig.predicate_recheck_stall_cap
+# (plans/completion-driven-triggers-prd.md C1).
+PREDICATE_RECHECK_STALL_CAP: int = 30
 
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
 # below, keyed by a length-capped repr(value) (safe for unhashable/non-str
@@ -388,7 +401,7 @@ class TimeoutsConfig(BaseModel):
 
 
 class BackendsConfig(BaseModel):
-    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini', 'pi'."""
+    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini', 'pi', 'zcode', 'mimo'."""
 
     architect: str = Field(default='claude')
     implementer: str = Field(default='claude')
@@ -625,6 +638,26 @@ class FairnessConfig(BaseModel):
                 )
             )
         return int(self.skip_threshold)
+
+
+class DeterministicConfig(BaseModel):
+    """Deterministic-task runner knobs (plans/completion-driven-triggers-prd.md C1).
+
+    ``predicate_recheck_stall_cap`` is how many consecutive exit-75 "not yet"
+    verdicts a re-arming predicate may return before ``DeterministicRunner``
+    files ``milestone_check_stalled``. ``Harness._run_deterministic_slot``
+    reads it whenever a slot builds its runner, so every leaf is green-tier.
+    Calibrate it from ``predicate_recheck_stalled`` events.
+    """
+
+    predicate_recheck_stall_cap: int = Field(
+        default=PREDICATE_RECHECK_STALL_CAP,
+        ge=1,
+        description=(
+            'Consecutive exit-75 "not yet" verdicts a re-arming predicate may return '
+            'before the runner files milestone_check_stalled (PRD C1).'
+        ),
+    )
 
 
 class ScoringConfig(BaseModel):
@@ -1385,6 +1418,28 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class VerifyCacheConfig(BaseModel):
+    """How far the verify-result cache may act, per verify role
+    (plans/verify-result-cache-prd.md § Amendments, A3: per-role modes).
+
+    Each role's mode is its own green-tier reload leaf. The kill switch is not
+    here: it lives in the registry's policy_state.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    task_mode: CacheMode = CacheMode.OFF
+    merge_mode: CacheMode = CacheMode.OFF
+
+    def mode_for(self, role: VerifyRole) -> CacheMode:
+        """*role*'s mode; the cache has no background role, so that is always OFF."""
+        if role == 'task':
+            return self.task_mode
+        if role == 'merge':
+            return self.merge_mode
+        return CacheMode.OFF
+
+
 class MergeDeepConfig(BaseModel):
     """Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
 
@@ -1438,6 +1493,15 @@ class MergeDeepConfig(BaseModel):
             'merges. On overrun the dispatch degrades to the adjacent verify. '
             'The build blocks the verifier loop, so this is also the worst-case '
             'stall on finalising a green head. Read live per dispatch; must be > 0.'
+        ),
+    )
+    chain_reservation_timeout_secs: float = Field(
+        default=7200.0,
+        gt=0,
+        description=(
+            'Bound in seconds on how long a built chain\'s links stay reserved '
+            'for its tip verify. On expiry they go back to the ordinary pipeline '
+            'with a WARNING. Read live at each chain\'s confirm; must be > 0.'
         ),
     )
 
@@ -1657,6 +1721,44 @@ class SccacheConfig(BaseModel):
         this model instance.
         """
         return dict(self.backend_env) if self.enabled else {}
+
+
+class VerifyCgroupMemoryConfig(BaseModel):
+    """Memory limits every verify scope is spawned with, as ``systemd-run -p``
+    properties; applied only when verify_use_cgroup_scope is on, one value for
+    every role.
+
+    Leaves are integer GiB, rendered with systemd's base-1024 ``G`` suffix. An
+    unset leaf adds no property (systemd's default applies). high may not
+    exceed max.
+    """
+
+    high_gib: int | None = Field(default=None, ge=1)
+    max_gib: int | None = Field(default=None, ge=1)
+    swap_max_gib: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode='after')
+    def _reject_high_above_max(self) -> 'VerifyCgroupMemoryConfig':
+        if (
+            self.high_gib is not None
+            and self.max_gib is not None
+            and self.high_gib > self.max_gib
+        ):
+            raise ValueError(
+                f'VerifyCgroupMemoryConfig.high_gib={self.high_gib} exceeds '
+                f'max_gib={self.max_gib}: MemoryHigh above MemoryMax never '
+                f'throttles before the kill; lower high_gib or raise max_gib.'
+            )
+        return self
+
+    def systemd_properties(self) -> tuple[str, ...]:
+        """Return ``<Property>=<n>G`` for each set leaf, in a fixed order."""
+        pairs = (
+            ('MemoryHigh', self.high_gib),
+            ('MemoryMax', self.max_gib),
+            ('MemorySwapMax', self.swap_max_gib),
+        )
+        return tuple(f'{prop}={gib}G' for prop, gib in pairs if gib is not None)
 
 
 class JobserverConfig(BaseModel):
@@ -3194,8 +3296,10 @@ _OVERRIDABLE_FIELDS = frozenset({
     'verify_command_timeout_secs',
     'verify_cold_command_timeout_secs',
     'concurrent_verify', 'sequential_lint_first', 'verify_env',
-    'scope_cargo',
+    'scope_cargo', 'verify_cache',
 })
+
+ModuleVerifyCache = Literal['default', 'never']
 
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
@@ -3231,6 +3335,15 @@ class ModuleConfig:
     sequential_lint_first: bool | None = None
     verify_env: dict[str, str] | None = None
     scope_cargo: bool | None = None
+    # 'never' keeps every unit of this module out of the verify-result cache.
+    verify_cache: ModuleVerifyCache = 'default'
+
+    def __post_init__(self) -> None:
+        if self.verify_cache not in get_args(ModuleVerifyCache):
+            raise ValueError(
+                f'module {self.prefix!r}: verify_cache is {self.verify_cache!r}, '
+                f'expected one of {get_args(ModuleVerifyCache)}',
+            )
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
@@ -3346,9 +3459,22 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
             continue
         kwargs = {k: raw[k] for k in _OVERRIDABLE_FIELDS if k in raw}
         if kwargs:
-            configs[prefix] = ModuleConfig(prefix=prefix, **kwargs)
+            configs[prefix] = ModuleConfig(prefix=prefix, **_never_cache_if_unknown(prefix, kwargs))
             logger.info('Loaded module config for %r: %s', prefix, list(kwargs))
     return configs
+
+
+def _never_cache_if_unknown(prefix: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """*kwargs* with an unknown ``verify_cache`` value read as 'never': a typo in
+    one module's yaml keeps that module out of the cache, not the orchestrator down."""
+    value = kwargs.get('verify_cache', 'default')
+    if value in get_args(ModuleVerifyCache):
+        return kwargs
+    logger.error(
+        'module %r: verify_cache is %r, expected one of %s; treating it as never',
+        prefix, value, get_args(ModuleVerifyCache),
+    )
+    return {**kwargs, 'verify_cache': 'never'}
 
 
 _DEFAULT_PRICES: dict[str, dict[str, float]] = {
@@ -3361,12 +3487,11 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
-    # Codex sticker rates. codex reports cached_input_tokens inside input_tokens and astra prices
-    # that split; sol and terra have no cached rate yet, so theirs is an uncached upper bound.
-    # gpt-5.6-sol's rate is promotional through at least 2026-11-21.
+    # Codex sticker rates; each codex arm's cached rate is required by
+    # orchestrator/tests/test_eval_codex_pi_bundles.py::TestCodexSlatePin.
     'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00, 'cached_input_per_1m': 1.00},
-    'gpt-5.6-sol': {'input_per_1m': 4.00, 'output_per_1m': 20.00},
-    'gpt-5.6-terra': {'input_per_1m': 2.00, 'output_per_1m': 12.00},
+    'gpt-6.1-sol': {'input_per_1m': 2.00, 'output_per_1m': 10.00, 'cached_input_per_1m': 0.10},
+    'gpt-6.1-terra': {'input_per_1m': 1.00, 'output_per_1m': 5.00, 'cached_input_per_1m': 0.05},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
     'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
     'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
@@ -3620,6 +3745,76 @@ class ShadowEvalConfig(BaseModel):
         return self.candidate_sample_rates.get(candidate, self.sample_rate)
 
 
+def _prefix_shape_problem(prefix: str) -> str | None:
+    """What makes *prefix* unusable as an unlimited-holder prefix, or None when it is well formed."""
+    if not prefix:
+        return 'must not be empty'
+    if not prefix.endswith('/'):
+        return 'must end in "/"'
+    if prefix.startswith('/'):
+        return 'must be relative (no leading "/")'
+    if '\\' in prefix:
+        return 'must use "/" separators, not "\\"'
+    problems = (_segment_problem(segment) for segment in prefix[:-1].split('/'))
+    return next((problem for problem in problems if problem), None)
+
+
+def _segment_problem(segment: str) -> str | None:
+    """What makes one path *segment* of a prefix match no lock key, or None."""
+    if segment in ('', '.', '..'):
+        return 'must not contain an empty, "." or ".." segment'
+    if segment != segment.strip():
+        return 'must not have a segment with leading or trailing whitespace'
+    if any(char in segment for char in '*?['):
+        return 'is a literal path, not a glob: no "*", "?" or "["'
+    return None
+
+
+class UnlimitedHolderLocksConfig(BaseModel):
+    """Lock keys any number of tasks may hold at once, chosen by rule rather than key by key.
+
+    Matched against the lock KEY, after ``normalize_lock`` at ``lock_depth``. Where
+    it sits among the other limits is stated once, at
+    ``orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._resolve_limit``.
+    The keys stay in every task's lock list; only their holder limit changes.
+    Off unless a project sets it. Restart tier, like ``module_overrides``.
+    """
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    prefixes: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            'Directory prefixes, each a relative path ending in "/". A key matches '
+            'when it lies under one or is that directory itself.'
+        ),
+    )
+    root_markdown: bool = Field(
+        default=False,
+        description='Also match every key at the repository root ending in ".md" (case-sensitive).',
+    )
+
+    @field_validator('prefixes')
+    @classmethod
+    def _well_formed_prefixes(cls, prefixes: tuple[str, ...]) -> tuple[str, ...]:
+        for prefix in prefixes:
+            problem = _prefix_shape_problem(prefix)
+            if problem:
+                raise ValueError(f'unlimited_holder_locks.prefixes entry {prefix!r} {problem}')
+        duplicates = sorted({prefix for prefix in prefixes if prefixes.count(prefix) > 1})
+        if duplicates:
+            raise ValueError(f'unlimited_holder_locks.prefixes lists {duplicates} more than once')
+        return prefixes
+
+    def takes_unlimited_holders(self, lock_key: str) -> bool:
+        """Whether *lock_key*, already normalised to ``lock_depth``, takes unlimited holders."""
+        if self.root_markdown and '/' not in lock_key and lock_key.endswith('.md'):
+            return True
+        return any(
+            lock_key.startswith(prefix) or lock_key == prefix[:-1] for prefix in self.prefixes
+        )
+
+
 # --- Top-level ---
 
 
@@ -3631,6 +3826,9 @@ class OrchestratorConfig(BaseSettings):
     max_per_module: int = Field(default=1)
     lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
+    unlimited_holder_locks: UnlimitedHolderLocksConfig = Field(
+        default_factory=UnlimitedHolderLocksConfig,
+    )
 
     # Run-forever idle poll cadence (seconds).  When the queue drains and the
     # orchestrator is running forever (no --until-idle), it idles and re-polls
@@ -3650,6 +3848,11 @@ class OrchestratorConfig(BaseSettings):
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
+    # Whole-plan or one-step implementer brief, and the bounds each implies:
+    # orchestrator/src/orchestrator/implementer_brief_variant.py (live-shadow-eval PRD decision 14).
+    implementer_brief_variant: ImplementerBriefVariant = Field(
+        default=ImplementerBriefVariant.WHOLE_PLAN,
+    )
     # Independent bound on progress-timeout+resume churn. A ceiling-kill of a
     # productive run (transcript_turns>0) followed by its resume counts as
     # ONE iteration against max_execute_iterations (see
@@ -4226,6 +4429,12 @@ class OrchestratorConfig(BaseSettings):
     verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
     verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
     verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
+    # Memory limits each verify scope is spawned with (`systemd-run -p
+    # MemoryHigh=/MemoryMax=/MemorySwapMax=`), only when verify_use_cgroup_scope
+    # is on; one value covers every role.
+    verify_cgroup_memory: VerifyCgroupMemoryConfig = Field(
+        default_factory=VerifyCgroupMemoryConfig,
+    )
 
     # ── Verify admission control (task 2390 T2; PRD
     # plans/verify-oversubscription-control-prd.md) ────────────────────────
@@ -4563,35 +4772,6 @@ class OrchestratorConfig(BaseSettings):
     orphan_l0_reaper_enabled: bool = Field(default=True)
     orphan_l0_timeout_secs: float = Field(default=600.0)
     orphan_l0_check_interval_secs: float = Field(default=60.0)
-    # Task 2931: freshness grace (seconds) for the divergence-class
-    # ``routing.latest`` liveness gate in the orphan-L0 reaper. The
-    # plan.files/metadata.files divergence false positive recurred after task
-    # 2878 because the lock-free ``reviewer_comprehensive`` /
-    # ``resettled_adjudicator`` stages hold no module locks and are absent
-    # from ``_dispatched``, so ``Scheduler.is_actively_held`` cannot see a task
-    # that is genuinely live mid-dispatch. Those stages DO stamp
-    # ``metadata.routing.latest.decided_at`` fresh per LLM invocation; if that
-    # timestamp is within this grace of the reaper's sweep ``now`` snapshot the
-    # task is live mid-dispatch and its divergence L0 is deferred (not
-    # promoted). Default 300s covers a single long reviewer/adjudicator
-    # invocation while staying well under ``orphan_l0_timeout_secs``=600, so a
-    # genuinely stranded task's stale decision still ages out and promotes.
-    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
-    orphan_l0_dispatch_freshness_secs: float = Field(default=300.0)
-    # Task 2991: freshness grace (seconds) for the merge-phase-liveness gate in
-    # the orphan-L0 divergence reaper. The divergence false positive recurred
-    # for MERGE-stage tasks (successor to task 2931): the pre-enqueue merge
-    # loop (rebase + scoped verify + queue submit) makes NO LLM calls, so it
-    # never refreshes ``metadata.routing.latest.decided_at`` — a legitimately
-    # live merge-stage task therefore fails the ``_has_fresh_dispatch`` gate
-    # and gets false-promoted. A durable ``metadata.merge_phase_liveness.
-    # entered_at`` stamp (restart-survivable, written at merge entry) is read
-    # by ``_has_fresh_merge_phase``; if within this grace of the sweep ``now``
-    # the divergence L0 is deferred (not promoted). Default 600.0 anchored to
-    # ``orchestrator_restart_merge_phase_grace_secs`` (the existing legitimate
-    # pre-enqueue merge-phase duration bound), not a guessed threshold.
-    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
-    orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
     # Info-L0 disposition router (plans/info-l0-disposition-router-prd.md
     # D5/D9/D12, plus beta's reviewer block): routes info-severity L0s at
@@ -5362,6 +5542,9 @@ class OrchestratorConfig(BaseSettings):
     # knobs, which the anchor-coverage gate still falls back to.
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
 
+    # Deterministic-task runner knobs (PRD completion-driven-triggers C1).
+    deterministic: DeterministicConfig = Field(default_factory=DeterministicConfig)
+
     # Scheduler starvation watchdog (task 1880).
     starvation_watchdog: StarvationWatchdogConfig = Field(
         default_factory=StarvationWatchdogConfig,
@@ -5396,6 +5579,10 @@ class OrchestratorConfig(BaseSettings):
     # (chain_cap=0, byte-identical current merge behaviour); the shipped
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
+
+    # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
+    # An absent stanza is OFF for both roles.
+    verify_cache: VerifyCacheConfig = Field(default_factory=VerifyCacheConfig)
 
     # Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md
     # alpha). An absent stanza yields the enabled-by-default instance; the
@@ -5576,6 +5763,46 @@ class OrchestratorConfig(BaseSettings):
             'RemoteRunner.ensure_gate(); a sticky skew bench is not probed (task '
             '6565).  On a passing probe the host re-enters the live pool without '
             'an orchestrator restart.  Must be >= 1.'
+        ),
+    )
+    verify_task_host_policy: VerifyTaskHostPolicy = Field(
+        default='local',
+        description=(
+            "Which task-role verifies may run on a remote verify host.  'local' "
+            '(default) short-circuits the dispatcher before it records anything, '
+            "so every task verify runs locally exactly as before.  'remote_modules' "
+            'makes a verify eligible when its executed module set intersects '
+            "verify_task_remote_modules; 'remote_all' makes every verify eligible.  "
+            'Read per dispatch, so rollback is one reload to \'local\'.  See '
+            'plans/remote-task-leg-verify-prd.md decision 6.'
+        ),
+    )
+    verify_task_remote_modules: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Module prefixes eligible for a remote task verify under "
+            "verify_task_host_policy 'remote_modules' (must then be non-empty).  "
+            'See plans/remote-task-leg-verify-prd.md decision 6.'
+        ),
+    )
+    verify_task_remote_cross_check_every_n: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            'Parity knob: every n-th task verify that returns a remote verdict, '
+            'green or red, counted per orchestrator process, is re-run locally, '
+            'the local verdict authoritative, recording the agreement in the '
+            'dispatch sidecar (the false-green direction).  0 (default) is off.  '
+            'See plans/remote-task-leg-verify-prd.md decision 9.'
+        ),
+    )
+    verify_task_remote_red_confirms_locally: bool = Field(
+        default=False,
+        description=(
+            'Parity knob: a remote red re-runs the ordinary local verify before the '
+            'verdict is returned, and the local verdict is returned (the '
+            'false-red direction).  Default false.  See '
+            'plans/remote-task-leg-verify-prd.md decision 9.'
         ),
     )
 
@@ -5840,6 +6067,29 @@ class OrchestratorConfig(BaseSettings):
                 'short inside the grace window. '
                 'Raise timeouts.steward to >= steward_completion_timeout, or lower '
                 'steward_completion_timeout in your orchestrator.yaml.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _unlimited_holder_prefixes_within_lock_depth(self) -> 'OrchestratorConfig':
+        too_deep = [
+            p for p in self.unlimited_holder_locks.prefixes if p.count('/') > self.lock_depth
+        ]
+        if too_deep:
+            raise ValueError(
+                f'unlimited_holder_locks.prefixes {too_deep} have more path components '
+                f'than lock_depth {self.lock_depth}, so no lock key can ever match them'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _validate_verify_task_remote_modules(self) -> 'OrchestratorConfig':
+        if self.verify_task_host_policy == 'remote_modules' and not self.verify_task_remote_modules:
+            raise ValueError(
+                "verify_task_host_policy 'remote_modules' needs a non-empty "
+                'verify_task_remote_modules; an empty list would make no task '
+                "verify eligible.  Name the module prefixes, or use 'local' or "
+                "'remote_all'."
             )
         return self
 
@@ -6504,6 +6754,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # fairness/starvation_watchdog submodel-group pattern: every threshold
     # is green-tier hot-reloadable.
     _submodel_leaf_paths('psi_admission', PsiAdmissionConfig),
+    # Read at each verify scope spawn (verify.py::_run_cmd via _scope_kw), so a
+    # reload applies from the next spawn, as the task-5205 CPUWeight knobs do.
+    _submodel_leaf_paths('verify_cgroup_memory', VerifyCgroupMemoryConfig),
     # Model allowlist (task beta, plans/adaptive-model-routing-prd.md):
     # green-tier hot-reloadable. apply_reload()'s existing post-apply
     # model_validate re-check already enforces
@@ -6554,6 +6807,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
     # (-> 0) without a restart. See MergeDeepConfig for the rest.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # Verify-result cache (task 5652): read per verify decision, so green tier;
+    # each role's mode is its own leaf, so a task-only edit applies alone.
+    _submodel_leaf_paths('verify_cache', VerifyCacheConfig),
     # Agent-transcript archival (task 2742, PRD alpha) — a new dedicated
     # submodel, same whole-submodel-group idiom: enabled/root and the atomic
     # .retention leaf are all green-tier hot-reloadable with no separate
@@ -6579,6 +6835,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # I-1 / I-3 still bind a reload through apply_reload's whole-config
     # re-validation.
     _submodel_leaf_paths('scoring', ScoringConfig),
+    # Read when each deterministic slot builds its runner, so a reload applies
+    # from the next dispatch.
+    _submodel_leaf_paths('deterministic', DeterministicConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
     # operator to add a path to config_key_census.ignore and hot-reload, and a
@@ -6616,6 +6875,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # the shared live config object, so a flip applies from the next
         # merge attempt.
         'pre_merge_reverify',
+        # Flat field read at use by the brief, the EXECUTE cap and resolve_route off
+        # the shared live object (task 5385), like pre_merge_reverify.
+        'implementer_brief_variant',
         # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
         # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
         # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
@@ -6669,15 +6931,6 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # failure-mode family and stay restart-only)
         'idle_poll_secs',
         'orphan_l0_timeout_secs',
-        # Task 2931: sibling of orphan_l0_timeout_secs — freshness grace for
-        # the divergence-class routing.latest liveness gate; hot-reloadable so
-        # the FP-suppression window can be tuned without a redeploy.
-        'orphan_l0_dispatch_freshness_secs',
-        # Task 2991: sibling of orphan_l0_dispatch_freshness_secs — freshness
-        # grace for the merge-phase-liveness gate in the divergence reaper;
-        # hot-reloadable so the merge-phase FP-suppression window can be tuned
-        # without a redeploy.
-        'orphan_l0_merge_phase_freshness_secs',
         # Siblings of orphan_l0_timeout_secs, read live on each sweep or exit:
         # a retune lands on the next routing pass, and the kill switch must not need a restart.
         'info_l0_router_enabled',
@@ -6735,6 +6988,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # dispatch prefers and cannot split an in-flight merge.  Read the
         # field's trust-anchor caveat before flipping it live.
         'verify_host_policy',
+        # Remote task-leg dispatch policy and parity knobs (task 6670) — read
+        # per dispatch and per remote grant through
+        # task_verify_dispatch.py::policy_from_config, so a reload never
+        # changes a leg already running.
+        'verify_task_host_policy',
+        'verify_task_remote_modules',
+        'verify_task_remote_cross_check_every_n',
+        'verify_task_remote_red_confirms_locally',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task

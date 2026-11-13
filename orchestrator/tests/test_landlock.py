@@ -524,7 +524,7 @@ class TestLandlockSandboxedConflictedMerge:
             for var in ('DF_AGENT_CPU_NICE', 'DF_AGENT_CPU_GOVERN'):
                 monkeypatch.delenv(var, raising=False)
             sandbox_dispatch.set_backend('landlock')
-            write_set = compute_write_set(worktree, home=fake_home)
+            write_set = compute_write_set(worktree, task_id='1', home=fake_home)
             extras = [str(p) for p in write_set.writable_paths()]
 
             self._assert_rr_cache_denied(main, worktree, fake_home, extras)

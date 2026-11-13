@@ -641,7 +641,7 @@ class TestUnrepairableResidueIsPreserved:
         assert payload['escalation_id'] is None
         assert 'nothing was preserved' in payload['hint'].lower()
         assert 'preserved verbatim' not in payload['hint']
-        assert sorted(artifacts.root.glob('markup_residue-*')) == []
+        assert sorted(artifacts.lane_root.glob('markup_residue-*')) == []
 
     @pytest.mark.asyncio
     async def test_the_hint_tells_the_truth_when_nothing_could_be_written(
@@ -876,7 +876,7 @@ class TestTheDeliberateQuotingOverrideOnThisServer:
 
     @staticmethod
     def _envelope_path(artifacts: TaskArtifacts) -> Path:
-        return artifacts.root / 'verdicts' / f'{REVIEWER_ROLE}.json'
+        return artifacts.artifact_path('verdicts') / f'{REVIEWER_ROLE}.json'
 
     @pytest.mark.asyncio
     async def test_the_quoted_summary_lands_verbatim(self, artifacts: TaskArtifacts):
@@ -1006,7 +1006,7 @@ class TestTheWidenedRepairVocabularyStaysContained:
         """Over the whole document: the envelope nests the payload."""
         await self._submit(artifacts)
 
-        text = (artifacts.root / 'verdicts' / f'{REVIEWER_ROLE}.json').read_text('utf-8')
+        text = (artifacts.artifact_path('verdicts') / f'{REVIEWER_ROLE}.json').read_text('utf-8')
         assert 'metadata' not in text
         assert 'swallowed tail' not in text
 
@@ -1111,7 +1111,7 @@ class TestTheWidenedRepairVocabularyStaysContained:
         assert result.data['status'] == 'ok'
         assert result.meta is not None
         assert result.meta['markup_repair']['unrecovered_residue_id'] is None
-        assert sorted(artifacts.root.glob('markup_residue-*')) == []
+        assert sorted(artifacts.lane_root.glob('markup_residue-*')) == []
 
 
 # ---------------------------------------------------------------------------

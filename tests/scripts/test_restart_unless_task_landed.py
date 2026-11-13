@@ -25,6 +25,9 @@ from pathlib import Path
 
 import pytest
 from git_listing import git
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_NAME = 'restart-orchestrators-unless-task-landed.sh'
 REPO_ROOT = Path(__file__).resolve().parents[2]

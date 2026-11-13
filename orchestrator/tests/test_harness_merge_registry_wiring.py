@@ -135,6 +135,7 @@ def harness_for_registry_run_slot() -> Harness:
     h._merge_worker = None
     # The shared registry — this is the object we assert is forwarded.
     h._merge_inflight_registry = InFlightMergeRegistry()
+    h._task_verify_dispatcher = MagicMock()
     h.cost_store = None
     h._run_store = None
     h._run_id = None

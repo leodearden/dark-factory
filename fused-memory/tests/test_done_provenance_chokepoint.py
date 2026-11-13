@@ -15,13 +15,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from pydantic import ValidationError
 from shared.task_metadata import DoneProvenance
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 DECLARED_KINDS = get_args(DoneProvenance.model_fields['kind'].annotation)
 CALLER_REFUSAL = 'DeterministicProvenanceCallerNotPermitted'

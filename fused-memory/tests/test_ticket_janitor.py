@@ -23,8 +23,12 @@ from typing import IO, Literal, overload
 
 import pytest
 import pytest_asyncio
+from _escalation_queue_probe import probe_escalation_queue_io
 from _fm_helpers import LoopFreedomProbe
+from _swallowed_failure_log import swallowed_causes
+from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import ticket_janitor
 from fused_memory.middleware.curation_deferral import (
@@ -38,6 +42,8 @@ from fused_memory.middleware.ticket_janitor import (
     curation_backlog_anchor,
 )
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest_asyncio.fixture
@@ -895,6 +901,163 @@ async def test_probe_defect_path_probes_orchestrator_off_the_event_loop(
 
     probe.assert_loop_stayed_free()
     assert _escalation_categories(tmp_path) == ['infra_issue']
+
+
+@pytest.mark.asyncio
+async def test_ticket_failure_path_files_off_the_event_loop(store, tmp_path, monkeypatch):
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        probe = LoopFreedomProbe()
+        probe_escalation_queue_io(monkeypatch, probe)
+        ticket_id = await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+
+        await TicketJanitor(store, primary_project_root=str(tmp_path)).tick()
+
+        probe.assert_loop_stayed_free()
+        assert _escalation_categories(tmp_path) == ['ticket_failure']
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_defect_path_files_off_the_event_loop(store, tmp_path, monkeypatch):
+    """Drives _submit_infra_escalation, the filer the dedup-outage path shares."""
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        probe = LoopFreedomProbe()
+        probe_escalation_queue_io(monkeypatch, probe)
+
+        def _raising_liveness_probe(pid: str) -> bool:
+            raise RuntimeError('probe broken')
+
+        await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(title='stranded task'),
+        )
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_raising_liveness_probe,
+            probe_defect_threshold=1,
+        )
+
+        await janitor.tick()
+
+        probe.assert_loop_stayed_free()
+        assert _escalation_categories(tmp_path) == ['infra_issue']
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ticket_failure_whose_id_cannot_be_minted_is_retried_next_tick(
+    store, tmp_path, monkeypatch, caplog,
+):
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        ticket_id = await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+        janitor = TicketJanitor(store, primary_project_root=str(tmp_path))
+
+        def _unmintable(self, prefix):
+            raise OSError('counter unwritable')
+
+        with monkeypatch.context() as m:
+            m.setattr(EscalationQueue, 'make_id', _unmintable)
+            await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == []
+        assert swallowed_causes(caplog, 'failed to submit escalation for group') == [OSError]
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is None
+
+        await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == ['ticket_failure']
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is not None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ticket_failure_whose_queue_cannot_be_opened_is_retried_next_tick(
+    store, tmp_path, caplog,
+):
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        ticket_id = await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+        janitor = TicketJanitor(store, primary_project_root=str(tmp_path))
+        queue_dir_blocker = escalation_queue_dir(tmp_path)
+        queue_dir_blocker.write_text('a file where the queue directory belongs')
+
+        await janitor.tick()
+
+        assert swallowed_causes(caplog, 'failed to submit escalation for group') == [FileExistsError]
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is None
+
+        queue_dir_blocker.unlink()
+        await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == ['ticket_failure']
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is not None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_infra_escalation_whose_queue_cannot_be_opened_names_its_cause_and_is_retried(
+    store, tmp_path, caplog,
+):
+    """Drives _submit_infra_escalation, the filer the dedup-outage path shares."""
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        def _raising_liveness_probe(pid: str) -> bool:
+            raise RuntimeError('probe broken')
+
+        await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(title='stranded task'),
+        )
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_raising_liveness_probe,
+            probe_defect_threshold=1,
+        )
+        queue_dir_blocker = escalation_queue_dir(tmp_path)
+        queue_dir_blocker.write_text('a file where the queue directory belongs')
+
+        await janitor.tick()
+
+        assert swallowed_causes(caplog, 'failed to submit infra escalation') == [FileExistsError]
+
+        queue_dir_blocker.unlink()
+        await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == ['infra_issue']
+    finally:
+        handle.close()
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,30 @@
+{
+  "task_id": "5305",
+  "reason": "Move, not growth (PRD plans/merge-lane-quality-prd.md task iota, part 1): the request entry (enqueue_merge_request, register_and_enqueue_merge_request, coalesce_or_enqueue_merge_request and their helpers, MERGE_LANES/_normalize_lane/_aging_key) leaves worker.py for merge_lane/intake.py, the C3 tip-relation family for merge_lane/tip_relation.py, and select_train_members/line_ranges_stackable move IN from workflow.py, which is outside the cluster. worker.py lines 22005 -> 20748 (-1257), prose_lines 12430 -> 11761 (-669), cognitive 2157 -> 1969 (-188); intake.py adds 1154 lines, 509 prose_lines, cognitive 117; tip_relation.py adds 346 lines, 216 prose_lines, cognitive 25; __init__.py 93 -> 94 lines (the _INTAKE submodule constant). Net total:lines 57140 -> 57384 (+244): 57 for the selection code moved in from workflow.py, 64 for the two new module headers, 1 for the facade constant, and 122 for the decomposition of coalesce_or_enqueue_merge_request (cognitive 103 -> 3; every new step <= 9) into named steps with their def lines and the one SPOT slot-leak guard. total:prose_lines 31572 -> 31628 (+56) is the same headers, the moved selection docstrings and the step docstrings. Every other total holds or falls: total:cognitive 4836 -> 4790, total:private_reads 6547 -> 6547, total:patch_targets 55 -> 55 (three leaves renamed 1:1 to where their lookup now resolves). new_function_over_ceiling intake.py::enqueue_merge_request 18 is the rename artifact of a byte-identical move: worker.py::enqueue_merge_request scored 18 on base.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/__init__.py",
+      "baseline": 93,
+      "current": 94
+    },
+    {
+      "measure": "new_function_over_ceiling",
+      "key": "orchestrator/src/orchestrator/merge_lane/intake.py::enqueue_merge_request",
+      "baseline": 15,
+      "current": 18
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57140,
+      "current": 57384
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31572,
+      "current": 31628
+    }
+  ]
+}

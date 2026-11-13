@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from shared.jcodemunch_launch import (
     JCODEMUNCH_COMMAND,
     JCODEMUNCH_ENV,
@@ -17,6 +19,9 @@ from shared.jcodemunch_launch import (
     jcodemunch_install_argv,
     jcodemunch_server_config,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _SHARED_SRC = Path(__file__).resolve().parents[1] / 'src'
 

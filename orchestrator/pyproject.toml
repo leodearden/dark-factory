@@ -60,7 +60,9 @@ include = ["src", "tests", "scripts"]
 # tests/scripts/test_fallback_verify_config.py's chain-independent
 # generalisation. It only widens IMPORT RESOLUTION: the REPO-ROOT ../scripts is
 # absent from `include` above, so its files are not themselves type-checked here.
-extraPaths = ["src", "tests", "../scripts", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
+# "tests/cross_suite_helpers": test helpers shared with tests/scripts (task 8507),
+# ahead of "tests" as tests/conftest.py's sys.path puts it.
+extraPaths = ["src", "tests/cross_suite_helpers", "tests", "../scripts", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own
@@ -79,9 +81,17 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
+extend-select = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"asyncio.get_event_loop".msg = "Raises 'no current event loop' once asyncio.run() has cleared it (task 1711): use asyncio.get_running_loop() in an async body or helper, asyncio.run(coro) in a sync driver, or make_placeholder_future() from orchestrator/tests/_orch_helpers.py for a sync test's placeholder future."
+"asyncio.events.get_event_loop".msg = "Raises 'no current event loop' once asyncio.run() has cleared it (task 1711): use asyncio.get_running_loop() in an async body or helper, asyncio.run(coro) in a sync driver, or make_placeholder_future() from orchestrator/tests/_orch_helpers.py for a sync test's placeholder future."
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["F811"]
+# src/ still calls asyncio.get_event_loop(), outside the retired AST guard's tests-only scope.
+# Its owner is recorded in shared/tests/test_shared_governed_lists.py::RUFF_CONFIG_SUPPRESSIONS.
+"src/**/*.py" = ["TID251"]
 
 # NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
 # `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
@@ -284,11 +294,10 @@ dev = [
     # becoming a timeout landmine. 7.0.1's cost grows roughly cubically
     # in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so the whole
     # 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The ratchet
-    # carries @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s and this
-    # file's own `timeout = 300`-equivalent budget; exceeding it fails the
-    # ratchet test, and only once complexipy's Rust call returns, because signal
-    # cannot interrupt it sooner (see
-    # tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
+    # carries @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT); exceeding it
+    # fails the ratchet test, and only once complexipy's Rust call returns,
+    # because signal cannot interrupt it sooner (see
+    # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
     # Do not relax to >=6 or drop the <7 ceiling without re-measuring.
     "complexipy>=6.2,<7",
     # mutmut — the mutation-score baseline of task 5035 ([tool.mutmut] below).
@@ -298,7 +307,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
-    "pytest-xdist>=3.0",
+    "pytest-xdist>=3.6.0",
     # radon — used ONLY for the reported-not-ratcheted maintainability-index
     # column of scripts/merge_lane_metrics.py --report (radon.metrics.mi_visit;
     # measured 0.00 for both merge_queue.py and git_ops.py, reproducing the

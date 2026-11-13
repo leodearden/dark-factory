@@ -40,9 +40,9 @@ async def build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate | 
         return None
     if gate.account_count == 0:
         logger.warning(
-            'UsageGate resolved ZERO accounts (no CLAUDE_OAUTH_* env and no '
-            'default credential?) — running without failover rather than '
-            'refusing every invocation'
+            'UsageGate: no accounts resolved; running '
+            "UNGATED on the CLI's ambient login "
+            '(usage_cap.fallback_to_default_credential is off)'
         )
         await _shut_down_best_effort(gate, 'the discarded zero-account gate')
         return None

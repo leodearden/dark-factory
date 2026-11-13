@@ -42,6 +42,9 @@ if str(_ESCALATION_SRC) not in sys.path:
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+_CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / "cross_suite_helpers"
+if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
 # Repo root of this worktree.  Used by the autouse ``_isolate_orch_config``
 # fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
@@ -77,12 +80,14 @@ from _orch_helpers import (  # noqa: E402
     stamp_stock_routing_config,
 )
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
     arm_leaked_drain_process_guard,
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
@@ -580,6 +585,10 @@ def pytest_configure(config: pytest.Config) -> None:
     task worktree, where every git command this suite runs would resolve against
     the enclosing worktree's repo (task 3355, incident esc-3072-3).
 
+    It also arms the UsageGate probe-dir sweep confinement (task 6275),
+    importing ``shared.usage_gate`` here because a module-level import after
+    this file's ``sys.path`` setup would need a new ``E402`` suppression.
+
     ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
     list is outside this task's locked scope, so the marker used by the
     ``_hermetic_psi_reader`` fixture below is registered here instead, via
@@ -592,6 +601,9 @@ def pytest_configure(config: pytest.Config) -> None:
     """
     reject_unsafe_basetemp(config)
     arm_leaked_drain_process_guard(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
@@ -1224,6 +1236,13 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # asyncio.sleep() argument instead of a MagicMock crash.
     config.warm_lane_gc_enabled = False
     config.warm_lane_gc_interval_secs = 600.0
+    # Gates both the deterministic recon sweep and the scheduled-deploy
+    # settler, which share this interval.
+    config.deterministic_recon_sweep_enabled = False
+    config.deterministic_recon_sweep_interval_secs = 900.0
+    # Always-on services (task 5344): no enable gate, so the interval must be real.
+    config.merge_heartbeat_interval_secs = 15.0
+    config.stale_service_restart_interval_secs = 15.0
     # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
     # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
     # is a @property on OrchestratorConfig (see config.py) and Harness wires

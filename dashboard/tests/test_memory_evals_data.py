@@ -28,12 +28,21 @@ from __future__ import annotations
 import builtins
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from dashboard.config import DashboardConfig
+from dashboard.data.datum import Datum
+from dashboard.data.escalation_corpus import (
+    EscalationCorpus,
+    EscalationView,
+    Location,
+    measure_corpus,
+    reconciliation_queue,
+)
 
 # The real committed exemplar tree (3207), consumed read-only by the
 # consumer-side boundary test.  dashboard/tests/ -> dashboard/ -> <repo root>.
@@ -251,7 +260,7 @@ def _write_escalation(
 
     Field names mirror ``escalation.models.Escalation`` (``timestamp``, not
     ``created_at``) since that is what the queue actually serialises and what
-    ``load_queue_escalations`` passes through unchanged.
+    ``Escalation.from_dict`` reads back.
     """
     body: dict[str, Any] = {
         'id': esc_id,
@@ -268,6 +277,16 @@ def _write_escalation(
     }
     body.update(extra)
     return _dump(esc_dir / f'{esc_id}.json', body)
+
+
+_RECON_QUEUE_REF = reconciliation_queue(_make_config(_FIXTURE_ROOT))
+_RECON_QUEUE = _RECON_QUEUE_REF.id
+_CORPUS_WALKED_AT = datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC)
+
+
+def _corpus(esc_dir: Path) -> Datum[EscalationCorpus]:
+    """The corpus over the production reconciliation queue, re-pointed at *esc_dir*."""
+    return measure_corpus((replace(_RECON_QUEUE_REF, directory=esc_dir),), now=_CORPUS_WALKED_AT)
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +402,7 @@ class TestTrendsAndCurrentValues:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _two_eval_tree(tmp_path)
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert set(payload) == _PAYLOAD_KEYS
         assert payload['root_present'] is True
@@ -395,7 +414,7 @@ class TestTrendsAndCurrentValues:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _two_eval_tree(tmp_path)
-        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        eval_a = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
 
         assert eval_a['run_stamps'] == ['20260701T031500Z', '20260702T031500Z', '20260703T031500Z']
         assert eval_a['run_count'] == len(eval_a['run_stamps']) == 3
@@ -406,7 +425,7 @@ class TestTrendsAndCurrentValues:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _two_eval_tree(tmp_path)
-        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        eval_a = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
         by_id = {m['metric_id']: m for m in eval_a['metrics']}
 
         assert set(by_id) == {
@@ -429,7 +448,7 @@ class TestTrendsAndCurrentValues:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _two_eval_tree(tmp_path)
-        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        eval_a = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
         latecomer = next(m for m in eval_a['metrics'] if m['metric_id'] == 'latecomer')
 
         assert latecomer['trend']['labels'] == eval_a['run_stamps']
@@ -439,7 +458,7 @@ class TestTrendsAndCurrentValues:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _two_eval_tree(tmp_path)
-        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        eval_a = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
         by_id = {m['metric_id']: m for m in eval_a['metrics']}
 
         prop = by_id['canonical-in-top-5']
@@ -461,7 +480,7 @@ class TestTrendsAndCurrentValues:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _two_eval_tree(tmp_path)
-        evals = build_memory_evals(root, esc_dir)['evals']
+        evals = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals']
 
         assert evals[0]['corpus'] == {
             'project_id': 'dark_factory',
@@ -493,7 +512,7 @@ class TestTrendsAndCurrentValues:
         # The newer run carries no corpus block at all.
         _write_metrics(root, 'eval-a', '20260704T031500Z', [_metric('m', 'count', 2.0)], corpus=None)
 
-        row = build_memory_evals(root, esc_dir)['evals'][0]
+        row = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
 
         assert row['latest_run_stamp'] == '20260704T031500Z'
         assert row['corpus'] is None
@@ -502,7 +521,7 @@ class TestTrendsAndCurrentValues:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _two_eval_tree(tmp_path)
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issues'] == []
         assert payload['issue_count'] == 0
@@ -558,7 +577,7 @@ class TestTrendCap:
         monkeypatch.setattr(memory_evals_module, '_TREND_RUN_CAP', 3)
         root, esc_dir = _n_run_tree(tmp_path, 5)
 
-        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        eval_a = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
 
         assert eval_a['truncated'] is True
         assert eval_a['runs_on_disk'] == 5
@@ -577,7 +596,7 @@ class TestTrendCap:
         monkeypatch.setattr(memory_evals_module, '_TREND_RUN_CAP', 3)
         root, esc_dir = _n_run_tree(tmp_path, 2)
 
-        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        eval_a = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
 
         assert eval_a['truncated'] is False
         assert eval_a['runs_on_disk'] == eval_a['run_count'] == 2
@@ -596,7 +615,7 @@ class TestTrendCap:
 
         root, esc_dir = _many_run_tree(tmp_path, 95)
 
-        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        eval_a = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
 
         assert eval_a['runs_on_disk'] == 95
         assert eval_a['run_count'] == 90
@@ -739,7 +758,7 @@ class TestLimitsProvenance:
 
         root, esc_dir = _limits_tree(tmp_path)
 
-        limits = build_memory_evals(root, esc_dir)['evals'][0]['limits']
+        limits = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['limits']
 
         assert set(limits) == _LIMITS_KEYS
         assert limits['alpha'] == 0.002777777777777778
@@ -757,7 +776,7 @@ class TestLimitsProvenance:
 
         root, esc_dir = _limits_tree(tmp_path)
 
-        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+        rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
         assert _only(rows, 'canonical-in-top-5')['rule_kind'] == 'proportion'
         assert _only(rows, 'dangling-pointers')['rule_kind'] == 'count'
@@ -774,8 +793,8 @@ class TestLimitsProvenance:
         stale_root, esc_dir = _limits_tree(tmp_path / 'stale', limits_run_stamp=_LIMITS_RUNS[0])
         current_root, _ = _limits_tree(tmp_path / 'current', limits_run_stamp=_LIMITS_RUNS[-1])
 
-        stale = build_memory_evals(stale_root, esc_dir)['evals'][0]
-        current = build_memory_evals(current_root, esc_dir)['evals'][0]
+        stale = build_memory_evals(stale_root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
+        current = build_memory_evals(current_root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]
 
         assert stale['latest_run_stamp'] == _LIMITS_RUNS[-1]
         assert stale['limits']['stale_for_latest_run'] is True
@@ -789,7 +808,7 @@ class TestLimitsProvenance:
         # for this metric is the limits artifact's, and it must not be read.
         root, esc_dir = _limits_tree(tmp_path, write_verdicts=False)
 
-        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+        rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
         alarmed_in_limits = _only(rows, 'canonical-in-top-5')
         assert 'verdict' in alarmed_in_limits, 'the verdict column must exist even when empty'
@@ -806,7 +825,7 @@ class TestLimitsProvenance:
 
         root, esc_dir = _limits_tree(tmp_path, write_limits=False)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['evals'][0]['limits'] is None
         assert payload['issue_count'] == len(payload['issues']) == 1
@@ -833,7 +852,7 @@ class TestLimitsProvenance:
             ],
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -932,7 +951,7 @@ class TestVerdicts:
 
         root, esc_dir = _verdicts_tree(tmp_path)
 
-        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+        rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
         assert _only(rows, 'canonical-in-top-5')['verdict'] == 'alarm'
         assert _only(rows, 'dangling-pointers')['verdict'] == 'no_alarm'
@@ -946,7 +965,7 @@ class TestVerdicts:
 
         root, esc_dir = _verdicts_tree(tmp_path)
 
-        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+        rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
         alarmed = _only(rows, 'canonical-in-top-5')
         assert alarmed['fingerprint'] == 'fp-canonical-alarm'
@@ -969,7 +988,7 @@ class TestVerdicts:
 
         root, esc_dir = _verdicts_tree(tmp_path)
 
-        unjudged = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'unjudged-metric')
+        unjudged = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'unjudged-metric')
 
         assert unjudged['verdict'] is None
         assert unjudged['fingerprint'] is None
@@ -985,7 +1004,7 @@ class TestVerdicts:
             _verdict('no-such-eval', 'canonical-in-top-5', 'alarm', fingerprint='fp-orphan-eval'),
         ])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 2
         assert {issue['kind'] for issue in payload['issues']} == {'orphan_verdict'}
@@ -1016,7 +1035,7 @@ class TestVerdicts:
             _verdict(long_eval_id, huge_metric_id, 'alarm', fingerprint='fp-orphan-huge'),
         ])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -1039,7 +1058,7 @@ class TestVerdicts:
 
         root, esc_dir = _verdicts_tree(tmp_path, write_verdicts=False)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -1053,7 +1072,7 @@ class TestVerdicts:
 
         root, esc_dir = _verdicts_tree(tmp_path, write_verdicts=False, per_eval_copy=True)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -1239,7 +1258,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'alarmed-open')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['parity'] == 'alarmed_open'
         assert set(row['escalation']) == _ESCALATION_KEYS
@@ -1269,7 +1288,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'recovered-open')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'recovered-open')
 
         assert row['verdict'] == 'no_alarm'
         assert row['parity'] == 'recovered_open'
@@ -1289,7 +1308,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'insufficient-open')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'insufficient-open')
 
         assert row['verdict'] == 'insufficient_data'
         assert row['parity'] == 'insufficient_data_open'
@@ -1301,7 +1320,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'insufficient-metric')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'insufficient-metric')
 
         assert row['verdict'] == 'insufficient_data'
         assert row['parity'] == 'insufficient_data'
@@ -1315,7 +1334,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'grandfathered-open')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'grandfathered-open')
 
         assert row['verdict'] == 'grandfathered'
         assert row['parity'] == 'grandfathered_open'
@@ -1333,7 +1352,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'grandfathered-metric')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'grandfathered-metric')
 
         assert row['verdict'] == 'grandfathered'
         assert row['parity'] == 'grandfathered'
@@ -1344,7 +1363,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'alarmed-unlinked')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'alarmed-unlinked')
 
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
@@ -1362,7 +1381,7 @@ class TestEscalationJoin:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _join_tree(tmp_path)
-        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+        rows = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics']
 
         assert _only(rows, 'clear-metric')['verdict'] == 'no_alarm'
         assert _only(rows, 'clear-metric')['parity'] == 'clear'
@@ -1386,7 +1405,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _unjudged_open_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'unjudged-open')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'unjudged-open')
 
         assert row['verdict'] is None
         assert row['parity'] == 'unjudged_open'
@@ -1400,7 +1419,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'wrong-category')
+        row = _only(build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals'][0]['metrics'], 'wrong-category')
 
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
@@ -1411,7 +1430,7 @@ class TestEscalationJoin:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        unmatched = build_memory_evals(root, esc_dir)['unmatched_escalations']
+        unmatched = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['unmatched_escalations']
 
         assert [entry['id'] for entry in unmatched] == ['esc-unmatched']
         assert set(unmatched[0]) == _UNMATCHED_KEYS
@@ -1422,14 +1441,11 @@ class TestEscalationJoin:
     def test_resolved_escalation_is_not_rendered_as_open(self, tmp_path: Path) -> None:
         """A CLOSED escalation must not produce an ``alarmed_open`` row.
 
-        The join originally inferred openness from ``load_queue_escalations``
-        not walking the archive subtree.  That inference does not hold:
+        Openness cannot be inferred from a record lying at the queue root:
         ``escalation.queue._archive_resolved`` is best-effort — on ``OSError``
-        it logs a warning and leaves the resolved record in the queue root —
-        and ``dashboard.data.escalations._bucket`` counts ``resolved`` among
-        the very records this same reader returns.  A resolved alarm rendering
-        as open is the parity view asserting the exact falsehood it exists to
-        catch.
+        it logs a warning and leaves the resolved record in the queue root.  A
+        resolved alarm rendering as open is the parity view asserting the
+        exact falsehood it exists to catch.
         """
         from dashboard.data.memory_evals import build_memory_evals
 
@@ -1443,7 +1459,7 @@ class TestEscalationJoin:
             status='resolved', resolved_at='2026-07-30T04:00:00+00:00',
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['escalation'] is None
@@ -1468,7 +1484,7 @@ class TestEscalationJoin:
             status='dismissed',
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         row = _only(payload['evals'][0]['metrics'], 'recovered-open')
 
         assert row['escalation'] is None
@@ -1488,12 +1504,43 @@ class TestEscalationJoin:
         del body['status']
         (esc_dir / 'esc-alarmed-open.json').write_text(json.dumps(body))
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['parity'] == 'alarmed_open'
         assert row['escalation']['id'] == 'esc-alarmed-open'
         assert payload['issue_count'] == 0
+
+    def test_explicit_null_status_is_named_and_not_open_on_either_surface(
+        self, tmp_path: Path,
+    ) -> None:
+        """``"status": null`` survives ``Escalation.from_dict``, which supplies its
+        default only for an ABSENT key.  The corpus' live-pending view does not
+        admit it, so the join names it rather than rendering it as an open alarm
+        the Escalations tab does not count as pending.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        body = json.loads((esc_dir / 'esc-alarmed-open.json').read_text())
+        body['status'] = None
+        (esc_dir / 'esc-alarmed-open.json').write_text(json.dumps(body))
+        corpus = _corpus(esc_dir)
+        assert corpus.value is not None
+        (record,) = [
+            r for r in corpus.value.scan(_RECON_QUEUE).records
+            if r.escalation.id == 'esc-alarmed-open'
+        ]
+        assert not EscalationView.QUEUE_PENDING.admits(record)
+
+        payload = build_memory_evals(root, corpus, _RECON_QUEUE)
+        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+        assert [issue['kind'] for issue in payload['issues']] == ['unknown_escalation_status']
+        assert 'esc-alarmed-open' in payload['issues'][0]['detail']
+        assert 'None' in payload['issues'][0]['detail']
 
     def test_unrecognised_status_is_skipped_and_named(self, tmp_path: Path) -> None:
         """The openness test is POSITIVE, and the resulting skip is a real discard.
@@ -1515,7 +1562,7 @@ class TestEscalationJoin:
             status='quarantined',
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
 
         # Not joined: unknown openness must not be rendered as open.
@@ -1553,7 +1600,7 @@ class TestEscalationJoin:
             status=cast(Any, ['weird']),
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
 
         assert row['escalation'] is None
@@ -1595,7 +1642,7 @@ class TestEscalationJoin:
             timestamp=_JOIN_ESC_TIMESTAMP,
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         named = [i for i in payload['issues'] if i['kind'] == 'unfingerprinted_escalation']
         assert len(named) == 2
@@ -1614,85 +1661,118 @@ class TestEscalationJoin:
         assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
         assert unmatched['esc-unmatched']['reason'] == 'no_matching_verdict'
 
-    def test_a_queue_record_that_is_not_an_object_is_named(self, tmp_path: Path) -> None:
-        """A queue file that parses but is not a JSON object is a genuine discard.
+    def test_a_queue_file_that_is_not_an_object_is_an_unreadable_file(self, tmp_path: Path) -> None:
+        """A queue file that parses but is not a JSON object is not an escalation.
 
-        ``load_queue_escalations`` validates only that a file PARSES, not that
-        its top level is an object, so a stray list or string at the top of a
-        queue file arrives here as a non-dict entry in ``records`` and would
-        otherwise hit a bare ``continue``.  That is exactly the third disposal
-        path the module docstring declares ("parses but is not the expected
-        type"), so it is named ``malformed_escalation_record`` rather than
-        dropped silently.
+        The corpus reads a queue file only when ``Escalation.from_dict`` accepts
+        it, so a stray list or string at the top of a queue file is one
+        ``unreadable_escalation_file`` naming that FILE — the same population
+        the Escalations tab lists under ``skipped`` — never a record of the queue.
         """
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _join_tree(tmp_path)
-        _dump(esc_dir / 'esc-list.json', ['not', 'an', 'object'])
-        _dump(esc_dir / 'esc-string.json', 'a bare string')
+        as_list = _dump(esc_dir / 'esc-list.json', ['not', 'an', 'object'])
+        as_string = _dump(esc_dir / 'esc-string.json', 'a bare string')
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
-        named = [i for i in payload['issues'] if i['kind'] == 'malformed_escalation_record']
-        assert len(named) == 2
-        assert all(i['path'] == str(esc_dir) for i in named)
-        # Per-issue, not a substring check on the concatenation -- pins that
-        # the list record was named `list` and the string record `str`,
-        # rather than merely that both words appear somewhere between them.
-        details = {i['detail'] for i in named}
-        assert any('record is list,' in detail for detail in details)
-        assert any('record is str,' in detail for detail in details)
+        named = [i for i in payload['issues'] if i['kind'] == 'unreadable_escalation_file']
+        assert sorted(i['path'] for i in named) == sorted([str(as_list), str(as_string)])
         # `_join_tree` is a zero-issue baseline (see `_healthy_tree`'s
         # docstring for the sibling guarantee), so the total is pinned, not
         # merely self-consistent with `len(payload['issues'])`.
         assert payload['issue_count'] == 2
+        assert 'malformed_escalation_record' not in {i['kind'] for i in payload['issues']}
         assert set(payload) == _PAYLOAD_KEYS
         # The discard does not poison the rest of the join.
         assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
-        assert 'esc-unmatched' in [e['id'] for e in payload['unmatched_escalations']]
-        # Never read as escalations at all -- not merely unlinked from a row.
         unmatched_ids = [e['id'] for e in payload['unmatched_escalations']]
+        assert 'esc-unmatched' in unmatched_ids
         assert 'esc-list' not in unmatched_ids
         assert 'esc-string' not in unmatched_ids
 
-    def test_a_malformed_record_cannot_blow_up_the_payload(self, tmp_path: Path) -> None:
+    def test_a_record_the_model_rejects_is_an_unreadable_file_not_a_row(self, tmp_path: Path) -> None:
+        """An object missing a required ``Escalation`` field is unreadable, not an escalation.
+
+        It parses as a JSON object, yet ``Escalation.from_dict`` rejects it, so
+        it is outside the queue's population on every surface: it links no
+        metric row and is named once, at its own path.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        path = esc_dir / 'esc-alarmed-open.json'
+        body = json.loads(path.read_text())
+        del body['task_id']
+        path.write_text(json.dumps(body))
+
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
+
+        assert [(i['kind'], i['path']) for i in payload['issues']] == [
+            ('unreadable_escalation_file', str(path)),
+        ]
+        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+
+    def test_a_huge_unreadable_file_cannot_blow_up_the_payload(self, tmp_path: Path) -> None:
         """Naming a discard must not become its own degradation.
 
-        A discarded queue record is arbitrary JSON off disk and may be
-        arbitrarily large — ``load_queue_escalations`` globs ``*.json``, not
-        ``esc-*.json``, so a stray multi-megabyte array in the queue dir would
-        otherwise be ``repr``'d verbatim into the ``detail`` of every dashboard
-        poll's payload.  The reader names WHAT it dropped and its type, not the
-        whole body — and the bound must cap a long value without mangling an
-        ordinary one.
+        A queue file is arbitrary JSON off disk and may be arbitrarily large.
+        Its issue names the file and why it was unreadable, never its body.
         """
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _healthy_tree(tmp_path)
-        _dump(esc_dir / 'esc-huge.json', ['x' * 100] * 1000)
-        _dump(esc_dir / 'esc-short.json', ['a'])
+        huge = _dump(esc_dir / 'esc-huge.json', ['x' * 100] * 1000)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
-        named = [i for i in payload['issues'] if i['kind'] == 'malformed_escalation_record']
-        assert len(named) == 2
         # `_healthy_tree` is a zero-issue baseline by its own docstring, so
         # the total is pinned, not merely self-consistent with the list.
-        assert payload['issue_count'] == 2
+        assert payload['issue_count'] == 1
+        (issue,) = payload['issues']
+        assert issue['kind'] == 'unreadable_escalation_file'
+        assert issue['path'] == str(huge)
+        assert len(issue['detail']) < 500
+        assert 'x' * 100 not in issue['detail']
 
-        truncated = [i for i in named if '…' in i['detail']]
-        not_truncated = [i for i in named if '…' not in i['detail']]
-        assert len(truncated) == 1
-        assert len(not_truncated) == 1
+    def test_the_archive_is_outside_the_join(self, tmp_path: Path) -> None:
+        """Only the live queue root joins; the archive under it holds no live alarm.
 
-        huge_detail = truncated[0]['detail']
-        assert len(huge_detail) < 500
-        assert 'list' in huge_detail
+        A pending ``eval_regression`` record whose fingerprint a verdict claims
+        links nothing from the archive, and a corrupt archived file earns no
+        issue: it cannot hold an alarm missing from this payload.
+        """
+        from escalation.archive import archive_dir_for_date
 
-        # A short body is untouched by the bound -- still a useful, complete detail.
-        short_detail = not_truncated[0]['detail']
-        assert 'list' in short_detail
-        assert "['a']" in short_detail
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        (esc_dir / 'esc-alarmed-open.json').unlink()
+        archive = archive_dir_for_date(esc_dir, _JOIN_ESC_TIMESTAMP)
+        _write_escalation(
+            archive, 'esc-alarmed-open',
+            dedupe_fingerprint=_FP_ALARMED_OPEN, timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+        _corrupt(_write_escalation(archive, 'esc-archived-corrupt'))
+        corpus = _corpus(esc_dir)
+        assert corpus.value is not None
+        scan = corpus.value.scan(_RECON_QUEUE)
+        assert [
+            r.escalation.id for r in scan.records
+            if r.location is Location.ARCHIVE and r.escalation.dedupe_fingerprint == _FP_ALARMED_OPEN
+        ] == ['esc-alarmed-open']
+        assert [u.location for u in scan.unreadable] == [Location.ARCHIVE]
+
+        payload = build_memory_evals(root, corpus, _RECON_QUEUE)
+
+        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+        assert 'esc-alarmed-open' not in [e['id'] for e in payload['unmatched_escalations']]
+        assert payload['issue_count'] == len(payload['issues']) == 0
 
     def test_oversized_escalation_id_is_capped_in_every_join_issue_detail(self, tmp_path: Path) -> None:
         """An escalation's ``id`` is unvalidated JSON, exactly like ``status`` and
@@ -1736,7 +1816,7 @@ class TestEscalationJoin:
             dedupe_fingerprint='f' * 32, timestamp=_JOIN_ESC_TIMESTAMP, id=huge_id,
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # `_join_tree` is a zero-issue baseline; five new records, four new issues
         # (the duplicate pair contributes one issue between the two of them).
@@ -1856,7 +1936,7 @@ class TestUnknownVerdict:
 
         root, esc_dir = _unknown_verdict_tree(tmp_path, 'improved', linked=False)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
 
         assert row['parity'] == 'unknown_verdict'
@@ -1879,7 +1959,7 @@ class TestUnknownVerdict:
 
         root, esc_dir = _unknown_verdict_tree(tmp_path, 'improved', linked=True)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
 
         assert row['parity'] == 'unknown_verdict_open'
@@ -1898,7 +1978,7 @@ class TestUnknownVerdict:
 
         root, esc_dir = _unknown_verdict_tree(tmp_path, {}, linked=False)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
 
         assert row['parity'] == 'unknown_verdict'
@@ -1920,7 +2000,7 @@ class TestUnknownVerdict:
 
         root, esc_dir = _join_tree(tmp_path)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert _only(payload['evals'][0]['metrics'], 'unjudged-metric')['parity'] == 'unjudged'
         assert [i for i in payload['issues'] if i['kind'] == 'unknown_verdict'] == []
@@ -1937,7 +2017,7 @@ class TestUnknownVerdict:
         huge_verdict = 'v' * 5000
         root, esc_dir = _unknown_verdict_tree(tmp_path, huge_verdict, linked=False)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         named = [i for i in payload['issues'] if i['kind'] == 'unknown_verdict']
         assert len(named) == 1
@@ -1988,7 +2068,7 @@ class TestParityVocabularyIsClosedAndExported:
         observed = {
             metric['parity']
             for root, esc_dir in trees
-            for row in build_memory_evals(root, esc_dir)['evals']
+            for row in build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['evals']
             for metric in row['metrics']
         }
 
@@ -2074,7 +2154,7 @@ class TestStormCollapseModelled:
             'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE,
         })
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         storm = payload['evals'][0]['storm_escape']
 
         assert set(storm) == _STORM_KEYS
@@ -2113,7 +2193,7 @@ class TestStormCollapseModelled:
             timestamp=_JOIN_ESC_TIMESTAMP,
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['evals'] == []
         assert payload['storm_escape']['triggered'] is True
@@ -2127,7 +2207,7 @@ class TestStormCollapseModelled:
 
         root, esc_dir = _storm_tree(tmp_path, storm=None, aggregate_escalation=False)
 
-        assert build_memory_evals(root, esc_dir)['storm_escape'] is None
+        assert build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)['storm_escape'] is None
 
     def test_per_metric_links_collapse_into_the_aggregate(self, tmp_path: Path) -> None:
         """No per-metric links during a storm — the aggregate is the one alert."""
@@ -2139,7 +2219,7 @@ class TestStormCollapseModelled:
             per_metric_escalation=True,
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
         rows = payload['evals'][0]['metrics']
 
         for metric_id in ('storm-a', 'storm-b'):
@@ -2169,7 +2249,7 @@ class TestStormCollapseModelled:
             'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE,
         })
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert [entry['id'] for entry in payload['unmatched_escalations']] == []
 
@@ -2183,7 +2263,7 @@ class TestStormCollapseModelled:
             per_metric_escalation=True,
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['evals'][0]['storm_escape'] is None
         rows = payload['evals'][0]['metrics']
@@ -2196,7 +2276,7 @@ class TestStormCollapseModelled:
 
         root, esc_dir = _storm_tree(tmp_path, storm=None, aggregate_escalation=False)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['evals'][0]['storm_escape'] is None
         assert _only(payload['evals'][0]['metrics'], 'storm-a')['parity'] == 'alarmed_unlinked'
@@ -2265,7 +2345,7 @@ class TestCodeBugsAreNotArtifactDegradation:
             memory_evals_mod, '_read_limits', _raiser(AttributeError("no attribute 'alpah'")),
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # The never-500 contract still holds.
         assert set(payload) == _PAYLOAD_KEYS
@@ -2285,7 +2365,7 @@ class TestCodeBugsAreNotArtifactDegradation:
             memory_evals_mod, '_read_verdicts', _raiser(TypeError('unhashable type: dict')),
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert set(payload) == _PAYLOAD_KEYS
         assert payload['issue_count'] == len(payload['issues']) == 1
@@ -2304,7 +2384,7 @@ class TestCodeBugsAreNotArtifactDegradation:
             _raiser(AttributeError("'list' object has no attribute 'get'")),
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert set(payload) == _PAYLOAD_KEYS
         assert payload['issue_count'] == len(payload['issues']) == 1
@@ -2328,7 +2408,7 @@ class TestCodeBugsAreNotArtifactDegradation:
         )
 
         with caplog.at_level(logging.ERROR, logger='dashboard.data.memory_evals'):
-            build_memory_evals(root, esc_dir)
+            build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert len(errors) == 1
@@ -2343,33 +2423,24 @@ class TestCodeBugsAreNotArtifactDegradation:
         ``internal_error``, the narrowing would have gone too far and the
         operator would lose the pointer to the actual broken file.
         """
-        from dashboard.data import memory_evals as memory_evals_mod
         from dashboard.data.memory_evals import build_memory_evals
 
-        # Every tree is built BEFORE any monkeypatch, so the patched Path
-        # method can never affect the fixture that exercises it.
+        # Every tree and corpus is built BEFORE any monkeypatch, so the patched
+        # Path method can never affect the fixture that exercises it.
         root, esc_dir = _healthy_tree(tmp_path)
         root2, esc_dir2 = _healthy_tree(tmp_path / 'second')
-        root3, esc_dir3 = _healthy_tree(tmp_path / 'third')
         _corrupt(root / 'eval-a' / 'limits-current.json')
         _corrupt(root / 'verdicts-current.json')
+        corpus, corpus2 = _corpus(esc_dir), _corpus(esc_dir2)
 
         # Two ValueError-induced boundaries (a corrupt file is a parse error).
-        assert {i['kind'] for i in build_memory_evals(root, esc_dir)['issues']} == {
+        assert {i['kind'] for i in build_memory_evals(root, corpus, _RECON_QUEUE)['issues']} == {
             'unreadable_limits', 'unreadable_verdicts',
         }
 
-        # And the two OSError-induced boundaries, one at a time.
-        monkeypatch.setattr(
-            memory_evals_mod, 'load_queue_escalations',
-            _raiser(PermissionError(13, 'Permission denied')),
-        )
-        assert [i['kind'] for i in build_memory_evals(root2, esc_dir2)['issues']] == [
-            'unreadable_escalations',
-        ]
-
+        # And the OSError-induced one.
         monkeypatch.setattr(Path, 'iterdir', _raiser(PermissionError(13, 'Permission denied')))
-        assert [i['kind'] for i in build_memory_evals(root3, esc_dir3)['issues']] == [
+        assert [i['kind'] for i in build_memory_evals(root2, corpus2, _RECON_QUEUE)['issues']] == [
             'unreadable_root',
         ]
 
@@ -2386,7 +2457,7 @@ class TestStalenessAndDegradedStates:
 
         root, esc_dir = _healthy_tree(tmp_path)
 
-        eval_a = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT + timedelta(hours=1))['evals'][0]
+        eval_a = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE, now=_AGE_RUN_AT + timedelta(hours=1))['evals'][0]
 
         assert eval_a['latest_run_stamp'] == _AGE_RUN
         assert eval_a['latest_run_age_seconds'] == 3600.0
@@ -2398,8 +2469,8 @@ class TestStalenessAndDegradedStates:
         monkeypatch.setattr(memory_evals_module, '_STALE_AFTER_SECONDS', 3600.0)
         root, esc_dir = _healthy_tree(tmp_path)
 
-        fresh = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT + timedelta(seconds=3599))
-        stale = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT + timedelta(seconds=3601))
+        fresh = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE, now=_AGE_RUN_AT + timedelta(seconds=3599))
+        stale = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE, now=_AGE_RUN_AT + timedelta(seconds=3601))
 
         assert fresh['evals'][0]['stale'] is False
         assert stale['evals'][0]['stale'] is True
@@ -2410,7 +2481,7 @@ class TestStalenessAndDegradedStates:
         root, esc_dir = _healthy_tree(tmp_path)
         bad = _corrupt(root / 'eval-a' / 'metrics-20260706T031500Z.json')
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'unreadable_metrics'
@@ -2425,7 +2496,7 @@ class TestStalenessAndDegradedStates:
         root, esc_dir = _healthy_tree(tmp_path)
         bad = _corrupt(root / 'eval-a' / 'limits-current.json')
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'unreadable_limits'
@@ -2438,7 +2509,7 @@ class TestStalenessAndDegradedStates:
         root, esc_dir = _healthy_tree(tmp_path)
         bad = _corrupt(root / 'verdicts-current.json')
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'unreadable_verdicts'
@@ -2452,7 +2523,7 @@ class TestStalenessAndDegradedStates:
         root, esc_dir = _healthy_tree(tmp_path)
         bad = _dump(root / 'eval-a' / 'metrics-20260706T031500Z.json', [{'metric_id': 'x'}])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'malformed_metrics'
@@ -2467,7 +2538,7 @@ class TestStalenessAndDegradedStates:
             {'schema_version': 1, 'run_stamp': '20260706T031500Z', 'metrics': {'oops': 'a dict'}},
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'malformed_metrics'
@@ -2487,14 +2558,14 @@ class TestStalenessAndDegradedStates:
         root, esc_dir = _healthy_tree(tmp_path)
         # Captured BEFORE the corruption: the healthy tree this payload must
         # remain distinguishable from.
-        healthy = build_memory_evals(root, esc_dir)
+        healthy = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         bad = _dump(
             root / 'verdicts-current.json',
             [_verdict('eval-a', 'dangling-pointers', 'alarm', fingerprint='opaque-fp-1')],
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues'])
         malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_verdicts']
@@ -2527,7 +2598,7 @@ class TestStalenessAndDegradedStates:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _healthy_tree(tmp_path)
-        healthy = build_memory_evals(root, esc_dir)
+        healthy = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         bad = _dump(root / 'verdicts-current.json', {
             'schema_version': 1,
@@ -2535,7 +2606,7 @@ class TestStalenessAndDegradedStates:
             'entries': {'eval-a': {'dangling-pointers': 'alarm'}},
         })
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_verdicts']
         assert len(malformed) == 1
@@ -2554,7 +2625,7 @@ class TestStalenessAndDegradedStates:
         root, esc_dir = _healthy_tree(tmp_path)
         _dump(root / 'verdicts-current.json', {'schema_version': 1})
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_verdicts']
         assert len(malformed) == 1
@@ -2578,7 +2649,7 @@ class TestStalenessAndDegradedStates:
             ],
         })
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # The good sibling is still read — the bad element is skipped, not the file.
         assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
@@ -2613,7 +2684,7 @@ class TestStalenessAndDegradedStates:
             {'eval_id': 42, 'metric_id': 'dangling-pointers', 'verdict': 'alarm', 'fingerprint': 'fp-y'},
         ])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # The keyable sibling is still read — bad records cost only themselves.
         assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
@@ -2650,7 +2721,7 @@ class TestStalenessAndDegradedStates:
         ]
         limits_path = _write_limits(root, 'eval-a', run_stamp=_AGE_RUN, verdicts=records)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # Provenance survives — one bad record must not cost the whole block.
         assert payload['evals'][0]['limits'] is not None
@@ -2684,7 +2755,7 @@ class TestStalenessAndDegradedStates:
         body['verdicts'] = {'dangling-pointers': 'count'}
         _dump(limits_path, body)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # The provenance block is NOT discarded — the body parsed and is an object.
         assert payload['evals'][0]['limits'] is not None
@@ -2722,7 +2793,7 @@ class TestStalenessAndDegradedStates:
             },
         })
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['storm_escape'] is not None
         assert payload['storm_escape']['triggered'] is True
@@ -2744,7 +2815,7 @@ class TestStalenessAndDegradedStates:
         root, esc_dir = _healthy_tree(tmp_path)
         bad = _dump(root / 'eval-a' / 'limits-current.json', ['not', 'an', 'object'])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues'])
         malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_limits']
@@ -2772,7 +2843,7 @@ class TestStalenessAndDegradedStates:
 
         root, esc_dir = _healthy_tree(tmp_path, metrics=[_metric('odd-one', 'histogram', 1.4)])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -2794,7 +2865,7 @@ class TestStalenessAndDegradedStates:
 
         root, esc_dir = _healthy_tree(tmp_path, metrics=[_metric(_HUGE_METRIC_ID, _HUGE_KIND, 1.4)])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -2804,7 +2875,7 @@ class TestStalenessAndDegradedStates:
         assert 'which has no chart primitive' in issue['detail']
 
     def test_two_distinct_huge_kinds_sharing_a_prefix_are_not_deduped(self, tmp_path: Path) -> None:
-        """The ``seen_kinds`` dedup key (memory_evals.py::_build_eval) stays UNCAPPED, on purpose.
+        """The ``seen_kinds`` dedup key (memory_evals.py::_name_unrenderable_kinds) stays UNCAPPED, on purpose.
 
         It is an internal set key, never emitted into the payload -- capping
         it would make two distinct kinds differing only past char 120 collide
@@ -2825,7 +2896,7 @@ class TestStalenessAndDegradedStates:
         _write_limits(root, 'eval-a', run_stamp='20260702T031500Z')
         _write_verdicts(root, [], run_stamp='20260702T031500Z')
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         unknown_kind_issues = [i for i in payload['issues'] if i['kind'] == 'unknown_kind']
         assert len(unknown_kind_issues) == 2
@@ -2842,7 +2913,7 @@ class TestStalenessAndDegradedStates:
 
         root, esc_dir = _healthy_tree(tmp_path, metrics=[{'metric_id': 'kindless', 'value': 5.0, 'n': 1}])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -2866,7 +2937,7 @@ class TestStalenessAndDegradedStates:
             tmp_path, metrics=[{'metric_id': _HUGE_METRIC_ID, 'value': 5.0, 'n': 1}],
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -2894,7 +2965,7 @@ class TestStalenessAndDegradedStates:
         _write_limits(root, 'eval-a', run_stamp='20260702T031500Z')
         _write_verdicts(root, [], run_stamp='20260702T031500Z')
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 0
         assert _only(payload['evals'][0]['metrics'], 'latecomer')['trend']['values'] == [None, 7.0]
@@ -2914,7 +2985,7 @@ class TestStalenessAndDegradedStates:
             _metric('dup', 'count', 99.0),
         ])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -2942,7 +3013,7 @@ class TestStalenessAndDegradedStates:
             _metric(_HUGE_METRIC_ID, 'count', 99.0),
         ])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -2967,7 +3038,7 @@ class TestStalenessAndDegradedStates:
             {'metric_id': '', 'kind': 'count', 'value': 2.0, 'n': 1},
         ])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'unidentified_metrics'
@@ -2985,7 +3056,7 @@ class TestStalenessAndDegradedStates:
             _verdict('eval-a', 'dangling-pointers', 'no_alarm', fingerprint='b' * 32, run_stamp=_AGE_RUN),
         ], run_stamp=_AGE_RUN)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -3012,7 +3083,7 @@ class TestStalenessAndDegradedStates:
             _verdict('eval-a', _HUGE_METRIC_ID, 'no_alarm', fingerprint='b' * 32, run_stamp=_AGE_RUN),
         ], run_stamp=_AGE_RUN)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -3037,7 +3108,7 @@ class TestStalenessAndDegradedStates:
         _write_escalation(esc_dir, 'esc-1', dedupe_fingerprint='c' * 32)
         _write_escalation(esc_dir, 'esc-2', dedupe_fingerprint='c' * 32)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         collisions = [i for i in payload['issues'] if i['kind'] == 'duplicate_escalation_fingerprint']
         assert len(collisions) == 1
@@ -3068,7 +3139,7 @@ class TestStalenessAndDegradedStates:
 
         monkeypatch.setattr(Path, 'iterdir', _boom)
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # Present, but unreadable — NOT reported as an empty root, which is the
         # healthy "no eval has ever run" state.
@@ -3080,117 +3151,40 @@ class TestStalenessAndDegradedStates:
         assert set(payload) == _PAYLOAD_KEYS
 
     def test_unreadable_escalations_degrades_the_payload_not_the_response(
-        self, tmp_path: Path, monkeypatch: Any,
+        self, tmp_path: Path,
     ) -> None:
-        """The escalation join is an artifact boundary like every other one here.
+        """An unknown escalation corpus loses the join, names why, and keeps the evals.
 
-        Every other boundary in ``build_memory_evals`` (verdicts, limits, the
-        root walk, each metrics run) is wrapped, so the "never raises" contract
-        holds structurally.  Leaving the join open made that contract depend on
-        auditing every field access inside the index for an unvalidated JSON
-        type — which is how the unhashable-``status`` 500 got in.
-
-        The stub takes ``**_kwargs`` deliberately, and must keep doing so: the
-        caller passes ``skipped=`` now, and a stub that rejected it would raise
-        an arity ``TypeError`` instead of the ``PermissionError`` this test is
-        about.  ``TypeError`` is in ``_ARTIFACT_ERRORS``, so the test would
-        still go GREEN while silently no longer exercising the read boundary at
-        all.  The ``unreadable_escalation_file`` assertion below is the tell:
-        it distinguishes "the whole read failed" (this case) from "the reader
-        ran and skipped some files", which an arity failure could never reach.
+        The corpus datum carries the reason it holds no walk; that reason
+        reaches the payload rather than the join reading as "nothing is
+        escalated".
         """
-        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.datum import unknown_datum
+        from dashboard.data.escalation_corpus import CORPUS_FRESHNESS_BOUND_SECONDS
         from dashboard.data.memory_evals import build_memory_evals
 
-        root, esc_dir = _healthy_tree(tmp_path)
+        root, _esc_dir = _healthy_tree(tmp_path)
+        reason = 'the escalation corpus walk was refused: Permission denied'
 
-        def _boom(_dir: Path, **_kwargs: Any) -> Any:
-            raise PermissionError(13, 'Permission denied')
+        payload = build_memory_evals(
+            root, unknown_datum(reason, CORPUS_FRESHNESS_BOUND_SECONDS), _RECON_QUEUE,
+        )
 
-        monkeypatch.setattr(memory_evals_mod, 'load_queue_escalations', _boom)
-
-        payload = build_memory_evals(root, esc_dir)
-
-        # The eval rows still render — only the join is lost, and it is NAMED
-        # rather than silently reading as "nothing is escalated".
         assert payload['root_present'] is True
         assert payload['evals'] != []
         assert payload['unmatched_escalations'] == []
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'unreadable_escalations'
-        assert payload['issues'][0]['path'] == str(esc_dir)
-        # The failure that was caught is the INJECTED one.  ``detail`` is
-        # ``str(exc)``, so this is what makes an arity ``TypeError`` (which
-        # ``_ARTIFACT_ERRORS`` would swallow, greening this test while
-        # exercising nothing) distinguishable from the read failure the test is
-        # actually about — see the stub's ``**_kwargs`` note above.
-        assert 'Permission denied' in payload['issues'][0]['detail']
-        # The whole read failed, so no per-file skip could have been collected:
-        # this is the plural "the join blew up" kind, never the singular one.
-        assert 'unreadable_escalation_file' not in {i['kind'] for i in payload['issues']}
-        assert set(payload) == _PAYLOAD_KEYS
-
-    def test_partial_skips_survive_a_reader_that_dies_mid_scan(
-        self, tmp_path: Path, monkeypatch: Any,
-    ) -> None:
-        """Skips recorded before the reader blew up are still named.
-
-        ``skipped`` is filled inside the reader but drained by the caller, so
-        the two are only atomic if the drain runs on the exception path too.
-        A reader that dies part-way through the scan — ``glob`` hitting a mode
-        change or an NFS hiccup, the case the ``_ARTIFACT_ERRORS`` wrapper
-        exists for — would otherwise take every skip it had already recorded
-        out with it, leaving only the coarse ``unreadable_escalations`` issue:
-        this change's own silent discard, reappearing one frame up in exactly
-        the degraded scenario it was written to close.
-
-        Both kinds are expected together and they say different things: the
-        plural one means the scan died, the singular ones name the files it had
-        already given up on before dying.
-        """
-        from dashboard.data import memory_evals as memory_evals_mod
-        from dashboard.data.memory_evals import build_memory_evals
-
-        root, esc_dir = _healthy_tree(tmp_path)
-        doomed = esc_dir / 'esc-half-read.json'
-
-        def _die_mid_scan(
-            _dir: Path, *, skipped: list[dict[str, Any]] | None = None, **_kwargs: Any,
-        ) -> Any:
-            # One file was read and skipped; the NEXT dir entry blew the scan up.
-            if skipped is not None:
-                skipped.append({'path': doomed, 'error': 'Expecting value: line 1 column 1'})
-            raise PermissionError(13, 'Permission denied')
-
-        monkeypatch.setattr(memory_evals_mod, 'load_queue_escalations', _die_mid_scan)
-
-        payload = build_memory_evals(root, esc_dir)
-
-        assert payload['issue_count'] == len(payload['issues']) == 2
-        per_file = [i for i in payload['issues'] if i['kind'] == 'unreadable_escalation_file']
-        coarse = [i for i in payload['issues'] if i['kind'] == 'unreadable_escalations']
-        assert len(per_file) == len(coarse) == 1
-        assert per_file[0]['path'] == str(doomed)
-        assert 'Expecting value' in per_file[0]['detail']
-        assert coarse[0]['path'] == str(esc_dir)
-        # The drain does not SWALLOW the reader's exception — it re-raises into
-        # the existing wrapper, which is what produces the coarse issue.
-        assert 'Permission denied' in coarse[0]['detail']
-        assert payload['evals'] != []
-        assert payload['unmatched_escalations'] == []
+        assert reason in payload['issues'][0]['detail']
         assert set(payload) == _PAYLOAD_KEYS
 
     def test_unreadable_queue_file_is_named_in_issues(self, tmp_path: Path) -> None:
-        """The one discard that happens a frame DOWN is named too.
+        """The corpus' unreadable files are named in the payload too.
 
-        ``load_queue_escalations`` skips an unparseable queue file — correct,
-        one corrupt escalation must not crash the join.  But the skip used to
-        stop at a WARNING log, so a corrupt file holding an open alarm left
-        ``unmatched_escalations`` silently short one record while
-        ``issue_count`` stayed 0: the parity view reporting "nothing
-        unexplained" in exactly the case it exists to catch.  The module
-        docstring's no-silent-discard invariant covers every discard INSIDE
-        this module; this pins the one it reaches through the shared reader.
+        One corrupt escalation must not crash the join, but a corrupt file
+        holding an open alarm leaves ``unmatched_escalations`` short one record:
+        unnamed, the parity view would report "nothing unexplained" in exactly
+        the case it exists to catch.
         """
         from dashboard.data.memory_evals import build_memory_evals
 
@@ -3198,7 +3192,7 @@ class TestStalenessAndDegradedStates:
         _write_escalation(esc_dir, 'esc-good', dedupe_fingerprint='g' * 32)
         bad = _corrupt(_write_escalation(esc_dir, 'esc-bad', dedupe_fingerprint='b' * 32))
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -3242,7 +3236,7 @@ class TestStalenessAndDegradedStates:
         first = _corrupt(_write_escalation(esc_dir, 'esc-bad-1'))
         second = _corrupt(_write_escalation(esc_dir, 'esc-bad-2'))
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         named = [i for i in payload['issues'] if i['kind'] == 'unreadable_escalation_file']
         assert len(named) == 2
@@ -3258,7 +3252,7 @@ class TestStalenessAndDegradedStates:
 
         root, esc_dir = _healthy_tree(tmp_path, run_stamp=None)
 
-        payload = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE, now=_AGE_RUN_AT)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'missing_run_stamp'
@@ -3270,7 +3264,7 @@ class TestStalenessAndDegradedStates:
 
         root, esc_dir = _healthy_tree(tmp_path, run_stamp='not-a-stamp')
 
-        payload = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE, now=_AGE_RUN_AT)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'unparseable_run_stamp'
@@ -3279,7 +3273,7 @@ class TestStalenessAndDegradedStates:
         assert payload['evals'][0]['stale'] is False
 
     def test_unparseable_run_stamp_is_capped(self, tmp_path: Path) -> None:
-        """``latest_run_stamp`` is ``isinstance``-guarded (memory_evals.py::_build_eval) but never length-guarded.
+        """``latest_run_stamp`` is ``isinstance``-guarded (memory_evals.py::_run_age_seconds) but never length-guarded.
 
         Same size exposure as the other rendering-vocabulary details: a
         hostile in-body ``run_stamp`` must not blow up the payload.
@@ -3289,7 +3283,7 @@ class TestStalenessAndDegradedStates:
         huge_stamp = '9' * 5000
         root, esc_dir = _healthy_tree(tmp_path, run_stamp=huge_stamp)
 
-        payload = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE, now=_AGE_RUN_AT)
 
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
@@ -3306,7 +3300,7 @@ class TestStalenessAndDegradedStates:
         """
         from dashboard.data.memory_evals import build_memory_evals
 
-        payload = build_memory_evals(tmp_path / 'never-created', tmp_path / 'escalations')
+        payload = build_memory_evals(tmp_path / 'never-created', _corpus(tmp_path / 'escalations'), _RECON_QUEUE)
 
         assert payload['root_present'] is False
         assert payload['evals'] == []
@@ -3319,7 +3313,7 @@ class TestStalenessAndDegradedStates:
         root = tmp_path / 'memory-evals'
         root.mkdir(parents=True)
 
-        payload = build_memory_evals(root, tmp_path / 'escalations')
+        payload = build_memory_evals(root, _corpus(tmp_path / 'escalations'), _RECON_QUEUE)
 
         assert payload['root_present'] is True
         assert payload['evals'] == []
@@ -3344,7 +3338,7 @@ class TestStalenessAndDegradedStates:
         root = tmp_path / 'memory-evals'
         (root / 'e1-retrieval-health').mkdir(parents=True)
 
-        payload = build_memory_evals(root, tmp_path / 'escalations')
+        payload = build_memory_evals(root, _corpus(tmp_path / 'escalations'), _RECON_QUEUE)
 
         assert payload['root_present'] is True
         assert [row['eval_id'] for row in payload['evals']] == ['e1-retrieval-health']
@@ -3386,7 +3380,7 @@ class TestVerdictEvalIdLengthIsBounded:
             _verdict(at_limit_eval, 'dangling-pointers', 'alarm', fingerprint='fp-at-limit'),
         ])
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # No issue carries an oversized structured identity.
         too_long = {
@@ -3425,22 +3419,22 @@ class TestVerdictEvalIdLengthIsBounded:
 
 
 class TestAllIssueFieldsAreBounded:
-    """The fourteen issue kinds in ``required_kinds`` below cannot be silently re-broken.
+    """The thirteen issue kinds in ``required_kinds`` below cannot be silently re-broken.
 
     Every per-site test above protects only the exact assertion it wrote.
     This property test raises that to: re-introducing an unbounded value at
-    any of the sites that feed these fourteen kinds cannot happen silently —
+    any of the sites that feed these thirteen kinds cannot happen silently —
     build one tree hostile in every dimension THOSE sites read unvalidated
     JSON from, then assert every resulting issue's ``detail`` AND its
     structured ``eval_id``/``path`` fields are bounded, and that the
-    observed issue-kind set still covers all fourteen, so a hostile tree
+    observed issue-kind set still covers all thirteen, so a hostile tree
     that quietly stopped triggering half its sites cannot pass by accident.
 
     What this does NOT hold: it does not prove the module overall "cannot
     emit an unbounded detail or field".  A `_issue` call for a kind outside
     ``required_kinds`` — a new kind, or one of the module's other existing
     kinds this hostile tree never triggers — is not exercised here and
-    needs its own per-site bound and test, the same way the fourteen below
+    needs its own per-site bound and test, the same way the thirteen below
     got theirs.
     """
 
@@ -3499,11 +3493,11 @@ class TestAllIssueFieldsAreBounded:
             _verdict(huge_dup_eval, oversized_eval_dup_metric, 'no_alarm', fingerprint='fp-dup-eval-b'),
         ], run_stamp='20260701T031500Z')
 
-        # A malformed (non-object) queue record, oversized, an unreadable
-        # queue file (the one `path=` site that is not a `Path` this module
-        # builds directly — see `unreadable_escalation_file` in
-        # `required_kinds` below), plus three escalation records hitting the
-        # remaining named-not-dropped kinds.
+        # Two unreadable queue files — an oversized non-object and a corrupt
+        # one (the one `path=` site that is not a `Path` this module builds
+        # directly — see `unreadable_escalation_file` in `required_kinds`
+        # below) — plus three escalation records hitting the remaining
+        # named-not-dropped kinds.
         _dump(esc_dir / 'esc-malformed.json', ['x'] * 2000)
         _corrupt(_write_escalation(esc_dir, 'esc-corrupt'))
         _write_escalation(
@@ -3519,13 +3513,13 @@ class TestAllIssueFieldsAreBounded:
             esc_dir, 'esc-dup-2', dedupe_fingerprint='f' * 32, id=huge_escalation_id,
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         required_kinds = {
             'duplicate_limits_verdict', 'duplicate_metric_id', 'duplicate_verdict_entry',
             'unknown_escalation_status', 'unfingerprinted_escalation',
             'duplicate_escalation_fingerprint', 'unparseable_run_stamp', 'missing_kind',
-            'unknown_kind', 'unknown_verdict', 'orphan_verdict', 'malformed_escalation_record',
+            'unknown_kind', 'unknown_verdict', 'orphan_verdict',
             'unidentified_verdicts', 'unreadable_escalation_file',
         }
         observed_kinds = {issue['kind'] for issue in payload['issues']}
@@ -3588,7 +3582,8 @@ class TestShapeMemoryEvals:
         from dashboard.data import redux_api
         from dashboard.data.memory_evals import build_memory_evals
 
-        payload = build_memory_evals(*_two_eval_tree(tmp_path))
+        root, esc_dir = _two_eval_tree(tmp_path)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         shaped = redux_api.shape_memory_evals(**payload)
 
@@ -3607,7 +3602,8 @@ class TestShapeMemoryEvals:
         from dashboard.data import redux_api
         from dashboard.data.memory_evals import build_memory_evals
 
-        payload = build_memory_evals(*_two_eval_tree(tmp_path))
+        root, esc_dir = _two_eval_tree(tmp_path)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         body = redux_api.shape_memory_evals(**payload)['MEMORY_EVALS']
 
@@ -3711,7 +3707,8 @@ class TestShapeMemoryEvals:
         from dashboard.data import redux_api
         from dashboard.data.memory_evals import build_memory_evals
 
-        payload = build_memory_evals(*_two_eval_tree(tmp_path))
+        root, esc_dir = _two_eval_tree(tmp_path)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         def _no_io(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError('shape_memory_evals must not touch the filesystem')
@@ -3774,6 +3771,24 @@ def _route_tree(tmp_path: Path) -> DashboardConfig:
     ], run_stamp=_ROUTE_RUNS[-1])
     _write_escalation(esc_dir, 'esc-eval-1', dedupe_fingerprint=_ROUTE_FINGERPRINT)
     return config
+
+
+def _served_escalations(client) -> dict[str, Any]:
+    """The ESCALATIONS payload the Escalations tab is served, over an empty task substrate."""
+    from _canned_mcp import CannedMCP
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=CannedMCP(status_page_size=2000)):
+        resp = client.get('/api/v2/dashboard/escalations')
+    assert resp.status_code == 200
+    return resp.json()['ESCALATIONS']
+
+
+def _served_subsection(client, queue_id: str) -> dict[str, Any]:
+    """The one ESCALATIONS subsection serving *queue_id*."""
+    (subsection,) = (
+        sub for sub in _served_escalations(client)['subsections'] if sub['id'] == queue_id
+    )
+    return subsection
 
 
 def _payload(**overrides: Any) -> dict[str, Any]:
@@ -4008,7 +4023,7 @@ class TestRootScanCacheability:
             memory_evals_mod, '_build_eval', _raiser(TypeError('unhashable type: dict')),
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         # The never-500 contract survives a bug on EVERY row, not just one.
         assert set(payload) == _PAYLOAD_KEYS
@@ -4048,7 +4063,7 @@ class TestRootScanCacheability:
             memory_evals_mod, '_read_verdicts', _raiser(TypeError('unhashable type: dict')),
         )
 
-        payload = build_memory_evals(root, esc_dir)
+        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
 
         assert set(payload) == _PAYLOAD_KEYS
         assert payload['issue_count'] == len(payload['issues']) == 1
@@ -4135,10 +4150,6 @@ class TestMemoryEvalsEndpoint:
         (``escalation_focus.js::findEscalationRow``), so this pins the contract
         that lookup relies on across the two payloads, not a literal.
         """
-        from unittest.mock import patch
-
-        from _canned_mcp import CannedMCP
-
         from dashboard.app import _memory_evals_cache_clear
         from dashboard.data import escalation_corpus
 
@@ -4148,12 +4159,9 @@ class TestMemoryEvalsEndpoint:
         escalation_corpus._corpus_cache_clear()
 
         queue = client.get(_ROUTE_URL).json()['MEMORY_EVALS']['escalation_queue']
-        with patch('dashboard.data.tasks.mcp_tool_call', new=CannedMCP(status_page_size=2000)):
-            resp = client.get('/api/v2/dashboard/escalations')
+        subsections = _served_escalations(client)['subsections']
         escalation_corpus._corpus_cache_clear()
 
-        assert resp.status_code == 200
-        subsections = resp.json()['ESCALATIONS']['subsections']
         named = [sub for sub in subsections if sub['id'] == queue]
         assert len(named) == 1, (
             f'MEMORY_EVALS.escalation_queue={queue!r} names '
@@ -4193,34 +4201,20 @@ class TestMemoryEvalsEndpoint:
 
         ``test_malformed_artifact_never_500s_and_is_counted`` corrupts a
         METRICS artifact; the escalation queue is the second unvalidated tree
-        this route walks, and it reaches the reader through a different code
-        path (``load_queue_escalations``, reused per INV-5 rather than
-        reimplemented).  This pins the half of the contract this module
-        depends on but does not own: an unparseable queue file is skipped, so
-        the section still renders and the row degrades to unlinked rather than
-        the whole poll 500ing.
-
-        The reader-level contract it depends on is a dependency worth pinning
-        here: if ``load_queue_escalations`` ever started propagating a
-        ``JSONDecodeError``, this route would be one of the callers that
-        breaks, and nothing else here would catch it.
-
-        This test also holds the LOUD half closed.  The skip used to produce no
-        payload issue at all — the discard happened inside the shared reader,
-        one frame below the module that owns the ``issues`` channel — so a
-        corrupt file holding an open alarm left the parity view silently short
-        one escalation and ``unmatched_escalations`` could not be read as
-        exhaustive.  The reader now reports its skips through an opt-in
-        ``skipped`` accumulator and this module names each one; the assertions
-        below (``issue_count`` rising from 0, and the
-        ``unreadable_escalation_file`` kind present) are what keep the gap
-        closed at the route level, where the operator actually sees it.
+        this route reads, through the escalation corpus.  An unparseable queue
+        file leaves the section rendering, degrades the row to unlinked rather
+        than 500ing the poll, and is NAMED: a corrupt file holding an open alarm
+        leaves ``unmatched_escalations`` short one escalation, so ``issue_count``
+        rising from 0 with an ``unreadable_escalation_file`` is what keeps that
+        loss visible where the operator actually sees it.
         """
         from dashboard.app import _memory_evals_cache_clear
+        from dashboard.data import escalation_corpus
 
         config = _route_tree(tmp_path)
         client.app.state.config = config
         _memory_evals_cache_clear()
+        escalation_corpus._corpus_cache_clear()
 
         pre = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
         assert _only(pre['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_open'
@@ -4228,7 +4222,9 @@ class TestMemoryEvalsEndpoint:
 
         _corrupt(config.reconciliation_escalations_dir / 'esc-eval-1.json')
         _memory_evals_cache_clear()
+        escalation_corpus._corpus_cache_clear()
         resp = client.get(_ROUTE_URL)
+        escalation_corpus._corpus_cache_clear()
 
         assert resp.status_code == 200
         payload = resp.json()['MEMORY_EVALS']
@@ -4241,6 +4237,70 @@ class TestMemoryEvalsEndpoint:
         # ...and LOUDLY: the lost alarm is named, not merely absent.
         assert payload['issue_count'] == 1
         assert 'unreadable_escalation_file' in {i['kind'] for i in payload['issues']}
+
+    def test_the_join_reads_the_corpus_walk_the_escalations_tab_reads(
+        self, client, tmp_path: Path,
+    ) -> None:
+        """A memory-evals rebuild joins the walk the Escalations tab is served, not a second read.
+
+        Clearing only the memory-evals cache rebuilds the payload over the
+        cached corpus walk, so a queue change that walk predates is invisible
+        to both surfaces alike, and the next walk shows it to both.
+        """
+        from dashboard.app import _memory_evals_cache_clear
+        from dashboard.data import escalation_corpus
+
+        config = _route_tree(tmp_path)
+        client.app.state.config = config
+        _memory_evals_cache_clear()
+        escalation_corpus._corpus_cache_clear()
+
+        client.get(_ROUTE_URL)
+        corrupted = _corrupt(config.reconciliation_escalations_dir / 'esc-eval-1.json')
+        _memory_evals_cache_clear()
+        cached_walk = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
+        cached_tab = _served_subsection(client, cached_walk['escalation_queue'])
+
+        _memory_evals_cache_clear()
+        escalation_corpus._corpus_cache_clear()
+        fresh_walk = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
+        fresh_tab = _served_subsection(client, fresh_walk['escalation_queue'])
+        escalation_corpus._corpus_cache_clear()
+
+        assert _only(cached_walk['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_open'
+        assert cached_walk['issue_count'] == 0
+        assert [row['id'] for row in cached_tab['escalations']] == ['esc-eval-1']
+        assert cached_tab['skipped'] == []
+
+        assert _only(fresh_walk['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_unlinked'
+        assert 'unreadable_escalation_file' in {i['kind'] for i in fresh_walk['issues']}
+        assert fresh_tab['escalations'] == []
+        assert [skip['path'] for skip in fresh_tab['skipped']] == [str(corrupted)]
+
+    def test_a_corpus_walk_that_raises_degrades_the_join_and_never_500s(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """The route acquires the corpus outside the builder's never-raise guard.
+
+        A walk failure still reaches the payload as the builder's unknown-corpus
+        issue, every eval row intact and the alarm degraded to unlinked.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _route_tree(tmp_path)
+        monkeypatch.setattr(app_module, 'acquire_corpus', _raiser(OSError('queue volume went away')))
+        _memory_evals_cache_clear()
+
+        resp = client.get(_ROUTE_URL)
+
+        assert resp.status_code == 200
+        payload = resp.json()['MEMORY_EVALS']
+        assert payload['evals'][0]['run_stamps'] == list(_ROUTE_RUNS)
+        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_unlinked'
+        (issue,) = payload['issues']
+        assert issue['kind'] == 'unreadable_escalations'
+        assert 'OSError: queue volume went away' in issue['detail']
 
     def test_ttl_cache_single_flights_the_scan(self, client, tmp_path: Path) -> None:
         """Within the TTL window the disk is not re-scanned.
@@ -4420,7 +4480,9 @@ def _exemplar_payload(tmp_path: Path) -> dict:
     """
     from dashboard.data.memory_evals import build_memory_evals
 
-    return build_memory_evals(_FIXTURE_ROOT, tmp_path / 'escalations', now=_EXEMPLAR_NOW)
+    return build_memory_evals(
+        _FIXTURE_ROOT, _corpus(tmp_path / 'escalations'), _RECON_QUEUE, now=_EXEMPLAR_NOW,
+    )
 
 
 def _by_eval(payload: dict) -> dict[str, dict]:

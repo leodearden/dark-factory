@@ -4,10 +4,10 @@
 
 ONE JOB: build the gate from the roster (``config/usage-accounts.yaml``) and
 the unit's ``.env`` alone — no orchestrator config is loaded or needed — for
-the two scripts/ consumers that draw on the fleet's pool:
-``legibility/session_runner.py`` (every trickle and census call, run through
-the orchestrator's own ``shared.cli_invoke.invoke_with_cap_retry``) and
-``sitting/nightly_prepare.py`` (one lease for its headless run). Rotation,
+the two scripts/ consumers that draw on the fleet's pool, both through the
+orchestrator's own ``shared.cli_invoke.invoke_with_cap_retry``:
+``legibility/session_runner.py`` (every trickle and census call) and
+``sitting/nightly_prepare.py`` (its 05:30 headless run). Rotation,
 cap detection and account phase are all ``shared.usage_gate``'s; nothing
 here decides policy.
 

@@ -298,6 +298,8 @@
 #     pre-mark live entries was CONSIDERED and rejected: it costs one extra full
 #     scan and only breaks even once ≥2 entries are live at pass start, which a
 #     pool at rest never is.
+#     AMENDED by task 8089: the fd/cwd walk is narrowed, superseding every
+#     per-call figure above; current figures: lib_live_refs.sh's MEASURED COST.
 #   - α reuse: the base symlink is resolved to its concrete gen PER LANE, and
 #     flock -s is held on that gen during that lane's α call (D8 reader-refcount
 #     seam; same contract as the acquire path). If no gen can be pinned the seed
@@ -754,7 +756,7 @@ fi
 # The resulting drift is the pass duration against a days-scale bound, so it
 # cannot flip a verdict at any plausible margin, and it drifts CONSERVATIVE:
 # lanes visited later in the pass are judged against an older cutoff, so they
-# are preserved rather than reclaimed. The idiom is warm-lane-audit.sh::_age_min's.
+# are preserved rather than reclaimed. The idiom is warm-lane-audit.sh::NOW_EPOCH's.
 NOW_EPOCH="$(date +%s)"
 
 # ── helper: name matches a glob pattern ───────────────────────────────────────
@@ -879,14 +881,10 @@ _record_gate_downgrade_reason() {
     # wrong. Degrading SILENTLY would be worse than the bound not existing —
     # `downgraded_assigned=0` would read as "nothing was stale" when it means
     # "nothing could be judged".
-    # The empty case is tested SEPARATELY and FIRST, because GNU `date -d ''`
-    # does not fail — it succeeds and answers TODAY, so handing it an absent
-    # `updated_at` would read an unstamped record as freshly stamped:
-    # preserved, for a fabricated reason and with no warn.
+    # The parse, and its `date -d ''` gotcha, live in
+    # lib_lane_state.sh::lane_state_epoch.
     local record_epoch
-    if [ -z "$LANE_STATE_UPDATED_AT" ] \
-       || ! record_epoch="$(date -d "$LANE_STATE_UPDATED_AT" +%s 2>/dev/null)" \
-       || [ -z "$record_epoch" ]; then
+    if ! record_epoch="$(lane_state_epoch "$LANE_STATE_UPDATED_AT")"; then
         warn "$name: cannot judge lane-state record age (updated_at='$LANE_STATE_UPDATED_AT') — the staleness bound does not apply, so the record's preserve stands"
         return 0
     fi

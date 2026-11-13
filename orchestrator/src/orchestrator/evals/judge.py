@@ -11,7 +11,6 @@ import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from itertools import combinations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -210,30 +209,6 @@ def _parse_pairwise_verdict(
         confidence=parse_confidence(payload),
         reasoning=str(payload.get('reasoning', '')),
     )
-
-
-async def run_tournament(
-    results: list[dict],
-    task: dict,
-    rounds_per_pair: int = 3,
-) -> list[JudgeVerdict]:
-    """Run all pairwise comparisons, N rounds each for consistency.
-
-    .. deprecated:: Use :func:`run_elo_tournament` for budget-efficient judging.
-    """
-    verdicts = []
-    pairs = list(combinations(results, 2))
-
-    for a, b in pairs:
-        for round_num in range(rounds_per_pair):
-            logger.info(
-                f'Judge: {a["config_name"]} vs {b["config_name"]} '
-                f'(round {round_num + 1}/{rounds_per_pair})'
-            )
-            v = await run_judge(a, b, task)
-            verdicts.append(v)
-
-    return verdicts
 
 
 @dataclass(frozen=True)

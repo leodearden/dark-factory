@@ -50,7 +50,7 @@ Both halves are green-tier hot-tunable, so a noisy detector can be retuned live.
 
 SHAPE
 -----
-Three deliberately separate pieces, following ``merge_skew_tripwire.py`` for
+Deliberately separate pieces, following ``merge_skew_tripwire.py`` for
 the pure/injectable split and ``merge_liveness.py`` for the alarm/recovery pair:
 
 * :class:`ZeroProgressRequeueTracker` — pure per-task streak + span tracking.
@@ -61,6 +61,9 @@ the pure/injectable split and ``merge_liveness.py`` for the alarm/recovery pair:
   worse — the ``has_open_l1`` dedup would then permanently suppress the alarm
   for a genuine LATER recurrence on the same task, silencing the detector after
   one incident per task for the whole life of the queue.
+* :func:`inherit_zero_progress_alarms` — the restart-surviving half of the
+  caller's filed-at memo: it seeds a fresh process's memo from the alarms a
+  prior process left pending, so the recovery half can still reach them.
 * ``sentinel_alarm_wrappers.discharge_sentinel_wrappers`` — the membership rule
   the recovery half shares with ``recovery_emission``'s veto-streak alarm.
 
@@ -117,6 +120,24 @@ _CATEGORY = 'risk_identified'
 #: mint a wrapper of these alarms under the real task id.  Rename both sides
 #: together.
 ZERO_PROGRESS_REQUEUE_ROLE = 'orchestrator-zero-progress-requeue'
+
+
+def _sentinel(task_id: str) -> str:
+    """Return the synthetic task id this detector files *task_id*'s alarm under."""
+    return f'{ZERO_PROGRESS_SENTINEL_PREFIX}{task_id}'
+
+
+def _alarm_subject(esc_task_id: str | None) -> str | None:
+    """Return the real task id behind a :func:`_sentinel` id, else ``None``.
+
+    Also ``None`` for a record with no task_id.
+    """
+    if esc_task_id is None:
+        return None
+    subject = esc_task_id.removeprefix(ZERO_PROGRESS_SENTINEL_PREFIX)
+    if subject == esc_task_id or not subject:
+        return None
+    return subject
 
 
 @dataclass
@@ -288,7 +309,7 @@ def emit_zero_progress_requeue_alert(
         return False
 
     try:
-        sentinel = f'{ZERO_PROGRESS_SENTINEL_PREFIX}{task_id}'
+        sentinel = _sentinel(task_id)
 
         # Dedup: one alert per unresolved incident.  ``has_open_l1`` globs and
         # JSON-parses every pending escalation in the queue, and this runs on
@@ -441,8 +462,8 @@ def resolve_zero_progress_requeue_alert(
     same task — the detector would silence itself after one incident per task,
     for the life of the queue.
 
-    Called on the streak-reset transition, i.e. whenever
-    ``ZeroProgressRequeueTracker.record`` returns 0 after a non-zero streak.
+    Called whenever ``ZeroProgressRequeueTracker.record`` returns 0; the cheap
+    gate below, not the caller, decides whether that warrants a disk check.
     Deliberately NOT gated on ``config.zero_progress_requeue.enabled``:
     disabling the detector must not strand an already-filed blocking alarm.
 
@@ -454,7 +475,8 @@ def resolve_zero_progress_requeue_alert(
         escalation_queue: The :class:`EscalationQueue`, or ``None`` (no-op).
         event_store: Optional event store for the recovery event.
         task_id: The REAL task id that just made progress.
-        recovered_streak: The streak immediately BEFORE the reset.
+        recovered_streak: The streak immediately BEFORE the reset, as this
+            process observed it.
         threshold: ``config.zero_progress_requeue.threshold``.
         filed_at: The same caller-owned memo passed to the emitter.  Its entry
             for ``task_id`` is dropped here, so the next incident on this task
@@ -472,9 +494,9 @@ def resolve_zero_progress_requeue_alert(
 
     # Cheap gate FIRST — a healthy fleet calls this on every DONE, and touching
     # the filesystem there would be a per-dispatch pending-queue scan.  We only
-    # look at disk when this process actually filed (memo hit), or when the
-    # streak that just broke was long enough that a PRIOR process could have
-    # filed for it before a restart.
+    # look at disk when the memo names the task (this process filed, or
+    # inherit_zero_progress_alarms found a prior process's alarm at startup),
+    # or when the streak that just broke was long enough to have filed one.
     was_filed = filed_at is not None and task_id in filed_at
     if not was_filed and recovered_streak < threshold:
         return False
@@ -482,14 +504,17 @@ def resolve_zero_progress_requeue_alert(
     if filed_at is not None:
         filed_at.pop(task_id, None)
 
-    sentinel = f'{ZERO_PROGRESS_SENTINEL_PREFIX}{task_id}'
+    sentinel = _sentinel(task_id)
+    observed = (
+        f' after {recovered_streak} such requeue(s) observed by this process'
+        if recovered_streak else ''
+    )
     resolution = (
-        f'Task {task_id} resumed making progress — the '
-        f'{recovered_streak}-requeue zero-agent-invocation streak '
-        'broke (the task reached a terminal outcome, or requeued '
-        'having actually invoked an agent).  Auto-resolved by the '
-        'zero-progress requeue detector; it will re-file if the '
-        'loop recurs.'
+        f'Task {task_id} resumed making progress — its zero-agent-invocation '
+        f'requeue streak broke{observed} (the task reached a terminal '
+        'outcome, or requeued having actually invoked an agent).  '
+        'Auto-resolved by the zero-progress requeue detector; it will '
+        're-file if the loop recurs.'
     )
     try:
         pending = escalation_queue.get_pending()
@@ -509,8 +534,9 @@ def resolve_zero_progress_requeue_alert(
         return False
 
     logger.info(
-        'Zero-progress requeue alert resolved for task %s after a %d-requeue '
-        'streak broke (%d alarm(s), %d wrapper(s))',
+        'Zero-progress requeue alert resolved for task %s: streak broke after '
+        '%d zero-progress requeue(s) observed by this process '
+        '(%d alarm(s), %d wrapper(s))',
         task_id, recovered_streak, alarms, wrappers,
     )
 
@@ -530,6 +556,35 @@ def resolve_zero_progress_requeue_alert(
             )
 
     return True
+
+
+def inherit_zero_progress_alarms(
+    pending: Iterable[Any], *, filed_at: dict[str, int],
+) -> frozenset[str]:
+    """Seed a fresh process's *filed_at* memo from alarms a prior process filed.
+
+    The tracker and the memo live in memory, so after a restart neither names
+    a task whose alarm is still ``pending`` — and the resolver's cheap gate
+    then never opens for it.  The pending queue is the durable record of what
+    was filed; every record under this detector's sentinel (any level, so a
+    sentinel-bound L2 wrapper counts) seeds its task at ``0``.  That is exact
+    under the memo's contract, "streak at the last disk check": a fresh
+    tracker reads 0.  A live entry keeps its value.
+
+    Args:
+        pending: The escalation queue's pending records, read once by the caller.
+        filed_at: The memo later passed to the emitter and the resolver.
+
+    Returns:
+        The real task ids the pending records name.
+    """
+    subjects = frozenset(
+        subject for esc in pending
+        if (subject := _alarm_subject(esc.task_id)) is not None
+    )
+    for task_id in subjects:
+        filed_at.setdefault(task_id, 0)
+    return subjects
 
 
 def _resolve_own_alarms(

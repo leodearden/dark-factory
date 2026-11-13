@@ -203,8 +203,24 @@ def build_group_merge_request(
 
 
 # ---------------------------------------------------------------------------
-# Helper: build an OrchestratorConfig for cargo workspace train tests
+# Helpers: build this file's OrchestratorConfigs
 # ---------------------------------------------------------------------------
+
+
+def _probe_on_scene_config(project_root: Path, **overrides: Any) -> OrchestratorConfig:
+    """This file's scene config: the main-health probe stays on, as shipped."""
+    return OrchestratorConfig(
+        project_root=project_root,
+        escalate_preexisting_main_break=True,
+        git=GitConfig(
+            main_branch="main",
+            branch_prefix="task/",
+            remote="origin",
+            worktree_dir=".worktrees",
+            push_after_advance=False,
+        ),
+        **overrides,
+    )
 
 
 def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
@@ -218,8 +234,8 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
       use the shared incremental build cache
     - verify_command_timeout_secs=300  (generous for CI; trivial workspace is fast)
     """
-    return OrchestratorConfig(
-        project_root=repo,
+    return _probe_on_scene_config(
+        repo,
         test_command="cargo test --workspace --quiet",
         # Use no-op shell builtins so lint/type_check don't interfere with
         # the Rust workspace.  'true' always exits 0.
@@ -227,13 +243,6 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
         type_check_command="true",
         verify_env={"CARGO_TARGET_DIR": str(target_dir)},
         verify_command_timeout_secs=300.0,
-        git=GitConfig(
-            main_branch="main",
-            branch_prefix="task/",
-            remote="origin",
-            worktree_dir=".worktrees",
-            push_after_advance=False,
-        ),
     )
 
 
@@ -500,16 +509,7 @@ class TestScenario3IntraTrainDispatch:
 
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -554,16 +554,7 @@ class TestScenario4ExtraTrainDispatchBlocked:
         """_deps_satisfied returns False when dependent has no train metadata."""
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -602,16 +593,7 @@ class TestScenario4ExtraTrainDispatchBlocked:
         """
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -1002,17 +984,10 @@ class TestScenario6ParkPrefixDerail:
         await _run(["git", "add", "-A"], cwd=repo6)
         await _run(["git", "commit", "-m", "initial"], cwd=repo6)
 
-        config6 = OrchestratorConfig(
-            project_root=repo6,
+        config6 = _probe_on_scene_config(
+            repo6,
             max_verify_attempts=5,
             max_failure_signature_repeat=3,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops6 = GitOps(config6.git, repo6)
 
@@ -1070,16 +1045,7 @@ class TestScenario6ParkPrefixDerail:
         await _run(["git", "add", "-A"], cwd=repo6b)
         await _run(["git", "commit", "-m", "initial"], cwd=repo6b)
 
-        config6b = OrchestratorConfig(
-            project_root=repo6b,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config6b = _probe_on_scene_config(repo6b)
         git_ops6b = GitOps(config6b.git, repo6b)
 
         wt_info = await git_ops6b.create_worktree("gamma6")
@@ -1213,18 +1179,11 @@ class TestScenario7TrainResume:
         await _run(["git", "add", "-A"], cwd=repo)
         await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-        config7 = OrchestratorConfig(
-            project_root=repo,
+        config7 = _probe_on_scene_config(
+            repo,
             test_command="true",   # no real cargo — verify is mocked
             lint_command="true",
             type_check_command="true",
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops7 = GitOps(config7.git, repo)
 
@@ -1490,18 +1449,11 @@ class TestScenario8MainAdvances:
         await _run(["git", "add", "-A"], cwd=repo)
         await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-        config8r = OrchestratorConfig(
-            project_root=repo,
+        config8r = _probe_on_scene_config(
+            repo,
             test_command="true",
             lint_command="true",
             type_check_command="true",
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops8r = GitOps(config8r.git, repo)
 
@@ -1623,17 +1575,10 @@ class TestScenario9LoopGuardNonTrain:
         await _run(["git", "add", "-A"], cwd=repo9)
         await _run(["git", "commit", "-m", "initial"], cwd=repo9)
 
-        config9 = OrchestratorConfig(
-            project_root=repo9,
+        config9 = _probe_on_scene_config(
+            repo9,
             max_verify_attempts=5,
             max_failure_signature_repeat=3,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops9 = GitOps(config9.git, repo9)
 
@@ -1699,16 +1644,7 @@ class TestScenario10DoneProvGateUnweakened:
 
         # Build a real Scheduler with a minimal OrchestratorConfig.
         # mcp_session=None → uses mcp_call HTTP path (monkeypatched below).
-        config10 = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config10 = _probe_on_scene_config(tmp_path)
         sched10 = Scheduler(config10)
 
         # Stub the MCP transport to return a done_provenance_invalid rejection.
@@ -2028,8 +1964,6 @@ async def _setup_gate_train(
     Returns (git_ops, config, req) ready to submit to a lane.
     Each member adds one unique .txt file so diffs are always non-empty.
     """
-    from orchestrator.config import GitConfig, OrchestratorConfig
-
     repo = tmp_path / "repo"
     repo.mkdir()
     await _run(["git", "init", "-b", "main"], cwd=repo)
@@ -2039,15 +1973,8 @@ async def _setup_gate_train(
     await _run(["git", "add", "-A"], cwd=repo)
     await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-    git_cfg = GitConfig(
-        main_branch="main",
-        branch_prefix="task/",
-        remote="origin",
-        worktree_dir=".worktrees",
-        push_after_advance=False,
-    )
-    config = OrchestratorConfig(project_root=repo, git=git_cfg)
-    git_ops = GitOps(git_cfg, repo)
+    config = _probe_on_scene_config(repo)
+    git_ops = GitOps(config.git, repo)
 
     a_name, b_name, c_name = member_names
 

@@ -947,9 +947,10 @@ def find_loop_blocking_sites_in_trees(
                     continue
                 # (1) The primitive written DIRECTLY in the coroutine body --
                 # no helper anywhere for a definition-side census to point at.
-                # This is the manifest_stamping::_stamp_capability_manifests_impl
-                # shape (read_text + yaml.safe_load + write_text + yaml.safe_dump
-                # inline in one coroutine).
+                # This was the manifest_stamping::_stamp_capability_manifests_impl
+                # shape the scanner was built to see (read_text +
+                # yaml.safe_load + write_text + yaml.safe_dump inline in one
+                # coroutine).
                 primitive = _primitive_for_call(node, ctx)
                 if primitive is None:
                     # (2) The primitive reached THROUGH a sync helper -- the

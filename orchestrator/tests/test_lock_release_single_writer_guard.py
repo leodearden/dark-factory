@@ -10,13 +10,13 @@ single writer for freeing a task's module locks — see contract C5 of
 plans/scheduler-dispatch-scoring-and-lock-layer-prd.md. It is the only path
 that emits a *full-release* ``lock_released`` (``lock_table.release_subset``
 emits the narrower ``reason='plan_refinement'`` partial, which closes only
-the modules it narrows away), and it also snapshots the held modules before
-releasing, clears ``_dispatched`` / ``_dispatched_priority``, arms the
+the modules it narrows away), and it also names the modules ``release``
+returns in that event, clears ``_dispatched`` / ``_dispatched_priority``, arms the
 requeue cooldown, and runs the defensive ``clear_parks_for``.
 
 A call that reaches ``lock_table.release`` directly is worse than a silent
 release: it empties ``_held[task_id]`` first, so the workflow's later
-teardown ``Scheduler.release`` snapshots ``modules == []`` and skips its
+teardown ``Scheduler.release`` gets ``modules == []`` back and skips its
 emit too. The stream is then left with a ``lock_acquired`` that has no
 matching ``lock_released`` anywhere — a stuck-lock artifact that reads as an
 infinite hold to any consumer measuring hold durations from acquire/release
@@ -45,7 +45,6 @@ from pathlib import Path
 from typing import TypeGuard
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
     ORCHESTRATOR_SRC_DIR,
     TREE_PASS_XDIST_GROUP,
@@ -54,8 +53,9 @@ from _tree_scan import (
     TreePass,
     python_files,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
@@ -124,7 +124,7 @@ def _is_lock_table_release(
     Four properties this matcher must have:
 
     - ``ast.Call``-only, so ``ModuleLockTable.release``'s own DEFINITION in
-      scheduler.py (an ``ast.FunctionDef``) is not matched — the invariant
+      lock_table.py (an ``ast.FunctionDef``) is not matched — the invariant
       is about call sites, not about the implementation they call.
     - ``attr == 'release'`` exactly, so ``lock_table.release_subset(...)``
       — which emits its own ``reason='plan_refinement'`` partial — is not
@@ -265,12 +265,9 @@ def test_no_lock_table_release_outside_scheduler_release(tree_pass: TreePass) ->
 
     remediation = (
         'route it through `Scheduler.release(task_id, ...)`, the only site '
-        'that emits a full-release `lock_released` (`release_subset` emits '
-        'only the narrower `plan_refinement` partial) — see contract C5 of '
-        'plans/scheduler-dispatch-scoring-and-lock-layer-prd.md. A direct '
-        '`lock_table.release` empties _held[task_id] first, so the later '
-        'teardown release() snapshots modules == [] and skips its emit too, '
-        'leaving a lock_acquired with no matching lock_released.'
+        'that emits a full-release `lock_released`. Why a direct call leaves '
+        'a lock_acquired with no matching lock_released: see the module '
+        f'docstring of orchestrator/tests/{_THIS_FILE}.'
     )
 
     # Assert the TOTAL as well as the outside-list (belt and braces): a

@@ -1,0 +1,18 @@
+{
+  "task_id": "6275",
+  "reason": "Net-additive guard wiring: orchestrator/tests/conftest.py::pytest_configure arms df_pytest_isolation.py::arm_usage_gate_sweep_confinement with a function-local shared.usage_gate import, because a module-level import after the sys.path setup would need a new E402 noqa line that the INV-12 suppression ratchet rejects.",
+  "measures": [
+    {
+      "measure": "function_local_imports",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 7,
+      "current": 8
+    },
+    {
+      "measure": "total:function_local_imports",
+      "key": "<cluster>",
+      "baseline": 16,
+      "current": 17
+    }
+  ]
+}

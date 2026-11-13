@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec
 
-from orchestrator.artifacts import ReviewAggregation
+from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import (
     AmendmentReviewContext,
@@ -335,13 +335,17 @@ def _make_loop_workflow(tmp_path, *, round0, round1, call_order):
     (no in-scope suggestion) reaches DONE.
     """
     wf = _make_workflow(modules=['src'], lock_depth=1)
-    wf.worktree = tmp_path / 'wt'
+    worktree = tmp_path / 'wt'
+    wf.worktree = worktree
     wf.event_store = None  # inert task-2752 verify-checkpoint block
 
     # artifacts: real root (no archive dirs exist → copytree skipped), counters
     # seeded to 0 so amendment_round/review_cycle are ints, verdict cache inert.
+    paths = TaskArtifacts(worktree, tmp_path)
     wf.artifacts = MagicMock()
-    wf.artifacts.root = tmp_path
+    wf.artifacts.artifact_path.side_effect = paths.artifact_path
+    wf.artifacts.review_archive_dir.side_effect = paths.review_archive_dir
+    wf.artifacts.review_archives_root = paths.review_archives_root
     wf.artifacts.get_review_cycles_total.return_value = 0
     wf.artifacts.get_amendment_rounds_total.return_value = 0
     wf.artifacts.get_cached_verdict.return_value = None
@@ -499,7 +503,7 @@ class TestAmendmentOutOfScopeRouting:
         wf = _make_workflow(modules=['src'])
         wf.mcp = None
         wf.escalation_queue = MagicMock()
-        wf._escalate_suggestions = MagicMock()
+        wf._escalate_suggestions = AsyncMock()
 
         # Round 0: file the out-of-scope complement (records the hash).
         await wf._route_review_suggestions_to_curator(
@@ -512,4 +516,4 @@ class TestAmendmentOutOfScopeRouting:
         )
 
         # Despite two route calls, the fallback fires exactly once.
-        assert cast(MagicMock, wf._escalate_suggestions).call_count == 1
+        assert cast(AsyncMock, wf._escalate_suggestions).await_count == 1

@@ -62,6 +62,9 @@ import shlex
 
 import pytest
 import verify_command_invariants as vci
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Spelled as LITERALS on purpose, even though ``vci`` now exports the same three
 # strings. This file is the module's oracle, so it must be able to disagree with

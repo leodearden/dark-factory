@@ -107,6 +107,32 @@ async def test_the_sweep_ages_out_each_table_and_keeps_fresh_rows(journal):
 
 
 @pytest.mark.asyncio
+async def test_the_sweep_ages_out_mem0_intents_and_idempotent_ops_at_their_configured_horizons(
+    journal,
+):
+    ten_days_ago = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+    intent_id = str(uuid.uuid4())
+    await journal.log_mem0_intent(
+        intent_id=intent_id, write_op_id=str(uuid.uuid4()), content='c', payload_digest=None,
+    )
+    await journal.resolve_mem0_intent(intent_id, 'completed')
+    _backdate(journal, 'mem0_intents', 'id', intent_id,
+              columns=('created_at', 'resolved_at'), to=ten_days_ago)
+    client_op_id = str(uuid.uuid4())
+    await journal.record_idempotent_result(client_op_id, 'update_task', {})
+    _backdate(journal, 'idempotent_ops', 'client_op_id', client_op_id, to=ten_days_ago)
+
+    result = await prune_every_table_at_startup(
+        journal,
+        WriteJournalConfig(mem0_intents_retention_days=5, idempotent_ops_retention_days=15),
+    )
+
+    assert (result['mem0_intents'], result['idempotent_ops']) == (1, 0), result
+    assert _row_count(journal, 'mem0_intents') == 0
+    assert _row_count(journal, 'idempotent_ops') == 1
+
+
+@pytest.mark.asyncio
 async def test_write_ops_and_backend_ops_share_one_row_budget(journal):
     aged = (datetime.now(UTC) - timedelta(days=800)).isoformat()
     for _ in range(3):

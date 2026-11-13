@@ -1,14 +1,8 @@
 """Durable merge-phase liveness stamp/clear + entry wiring (task 2991).
 
-Task 2991 (successor to task 2931): a legitimately-live task in the
-pre-enqueue MERGE phase runs a rebase/scoped-verify/queue-submit loop with NO
-LLM calls, so it never refreshes ``metadata.routing.latest`` — the orphan-L0
-divergence reaper's task-2931 ``_has_fresh_dispatch`` gate cannot see it and
-false-promotes its scope-invariant L0 to a human-facing L1 (cluster
-esc-2789-22). The fix is a DURABLE ``metadata.merge_phase_liveness =
-{'entered_at': <iso>}`` stamp — the restart-survivable analog of
-``routing.latest`` — written at merge entry and read by
-``_has_fresh_merge_phase`` (see test_orphan_l0_reaper.py).
+Task 2991 added a DURABLE ``metadata.merge_phase_liveness =
+{'entered_at': <iso>}`` stamp, written at merge entry. Who reads it is
+stated once, on ``TaskWorkflow._stamp_merge_phase_entered``.
 
 This module unit-tests the workflow producer side:
 
@@ -158,7 +152,7 @@ class TestStampHelper:
         # (a) persisted stamp is exactly {'entered_at': <non-empty iso str>}.
         assert set(stamp) == {'entered_at'}
         assert isinstance(stamp['entered_at'], str) and stamp['entered_at']
-        # Parseable tz-aware ISO-8601 (what _has_fresh_merge_phase reads).
+        # Parseable tz-aware ISO-8601.
         parsed = datetime.fromisoformat(stamp['entered_at'])
         assert parsed.tzinfo is not None
         # (b) sibling metadata keys preserved (read-modify-write via
@@ -284,9 +278,7 @@ class TestClearHelper:
         # get_task raises. Under the old 'merge' mode that fallback was
         # harmless (omitted backend-only keys survived); under 'replace' it
         # would DELETE every backend-only key. So a failed read must SKIP the
-        # durable write entirely — bounded cost: the reaper may keep deferring
-        # for up to orphan_l0_merge_phase_freshness_secs until the stale stamp
-        # ages out (deferral, never suppression).
+        # durable write entirely, leaving a stale stamp.
         f = _make(
             metadata={
                 'merge_phase_liveness': dict(_STAMP),
@@ -331,8 +323,7 @@ class TestClearHelper:
         ``'merge'`` mode did not have: read-modify-write across an ``await``
         boundary, then a WHOLE-BLOB overwrite. Any key another process writes
         between the two round-trips is silently dropped — including
-        ``routing.latest``, the input to the reaper's sibling
-        ``_has_fresh_dispatch`` gate. Pinned here so the next reader finds it
+        ``routing.latest``. Pinned here so the next reader finds it
         as a known property rather than a surprise; it cannot be eliminated
         without a targeted key-delete mode (the backend accepts only
         {'merge', 'additive', 'replace'} — sqlite_task_backend._METADATA_MODES).
@@ -714,7 +705,7 @@ class TestRetryLoopReStamp:
         outcomes = [WorkflowOutcome.REQUEUED, WorkflowOutcome.DONE]
 
         async def _submit(*_a, **_kw):
-            # Snapshot the metadata the reaper would see during this attempt's
+            # Snapshot the metadata a reader would see during this attempt's
             # pre-enqueue window, then faithfully model the production
             # enqueue-boundary clear (_submit_to_merge_queue).
             snapshots.append(copy.deepcopy(wf.task.get('metadata') or {}))
@@ -758,9 +749,7 @@ class TestEnqueueClearWiring:
     """The durable stamp is discharged at the enqueue boundary.
 
     Once the request is on the durable merge journal the pre-enqueue window is
-    over: the task is no longer "live in merge phase" in the sense the reaper
-    gate protects, so a lingering fresh stamp would briefly defer an unrelated
-    stranded divergence orphan. Mirrors the in-memory ``clear_merge_phase``
+    over. Mirrors the in-memory ``clear_merge_phase``
     call it is co-located with (test_workflow.py::
     test_submit_clears_merge_phase_after_enqueue).
     """
@@ -900,8 +889,7 @@ class TestMergeSuccessClearWiring:
 
     @pytest.mark.asyncio
     async def test_terminal_merge_outcome_leaves_stamp_intact(self):
-        # A merge that did NOT succeed returns early — the stamp must survive so
-        # the reaper keeps deferring while the task cycles through merge phase.
+        # A merge that did NOT succeed returns early, leaving the stamp in place.
         f = _make(metadata={'merge_phase_liveness': dict(_STAMP)})
         self._wire_finalise_spies(f, merge_result=WorkflowOutcome.BLOCKED)
 

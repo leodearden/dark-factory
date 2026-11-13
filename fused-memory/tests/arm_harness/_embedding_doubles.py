@@ -15,6 +15,7 @@ from graphiti_core.embedder import EmbedderClient
 from qdrant_client.models import Filter, PointStruct, VectorParams
 from redis.exceptions import ResponseError
 
+from arm_harness._fakes import FakeForkServer
 from fused_memory.arm_harness import checks, graph_copy, topology
 from fused_memory.arm_harness.mem0_replica import Mem0Record, Mem0Snapshot
 from fused_memory.arm_harness.metrics_record import IndexConfiguration
@@ -235,6 +236,7 @@ class FakeGraphClient:
     def __init__(self, log: list[str]) -> None:
         self.log = log
         self.graphs: dict[str, FakeGraph] = {}
+        self.connection = FakeForkServer()
 
     def add(self, graph: FakeGraph) -> None:
         graph.client = self

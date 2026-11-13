@@ -10,7 +10,7 @@ through the matching ``shape_*`` function before serialising as JSON.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -26,15 +26,18 @@ from dashboard.data.burndown import (
     compute_parity_alarm,
     compute_window_completion,
 )
+from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
 from dashboard.data.datum import (
     Datum,
     DatumContractError,
     DatumInvariant,
     DatumState,
     aged_at,
+    map_datum,
     validate_datum,
 )
 from dashboard.data.escalation_corpus import EscalationView
+from dashboard.data.merge_queue import DepthSeries, MergeAttempts
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
@@ -469,17 +472,26 @@ def shape_recon(
 # ---------------------------------------------------------------------------
 
 
-def _wire_served(candidate: object, field: str, served_at: datetime) -> dict[str, object]:
+def _wire_served(
+    candidate: object,
+    field: str,
+    served_at: datetime,
+    *,
+    project: Callable[[Any], object] | None = None,
+) -> dict[str, object]:
     """*candidate* as served at *served_at*: aged, validated and rendered to the wire.
 
     A route fills every Datum field of its payload, so a *field* holding
     anything but a Datum is a wiring bug and raises ``DATUM_REQUIRED``, as
-    does a Datum that breaks its contract at *served_at*.
+    does a Datum that breaks its contract at *served_at*. *project*, when
+    given, reshapes a known value for the wire (:func:`map_datum`).
     """
     if not isinstance(candidate, Datum):
         raise DatumContractError(
             DatumInvariant.DATUM_REQUIRED, f'{field} must be a Datum, got {candidate!r}',
         )
+    if project is not None:
+        candidate = map_datum(candidate, project)
     aged = aged_at(candidate, served_at)
     validate_datum(aged, served_at)
     return aged.to_wire()
@@ -496,30 +508,30 @@ def _wire_views(
     }
 
 
-def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Enrich an outcomes dict with a parallel ``colors`` list.
+def _shape_outcomes(chart: ChartData) -> dict[str, Any]:
+    """An outcome chart's ``{labels, values}`` plus a parallel ``colors`` list.
 
-    Given the raw ``outcomes`` mapping (``{labels, values}`` from the
-    aggregator), returns a new dict with those keys preserved and a
-    ``colors`` key added via :func:`~dashboard.data.outcome_colors.assign_outcome_colors`.
+    The colors come from :func:`~dashboard.data.outcome_colors.assign_outcome_colors`.
     """
-    outcomes = dict(raw or {'labels': [], 'values': []})
-    labels: list[str] = outcomes.get('labels') or []
-    outcomes['colors'] = assign_outcome_colors(labels)
-    return outcomes
+    return {**chart, 'colors': assign_outcome_colors(chart['labels'])}
 
 
-def _shape_depth(raw: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Serve a depth series as ``{labels, values, bucket_minutes}``.
+def _shape_attempts(attempts: MergeAttempts) -> dict[str, Any]:
+    """One window's attempts as the donut's colored chart and the latency block."""
+    return {'outcomes': _shape_outcomes(attempts.outcome_chart()), 'latency': attempts.latency()}
+
+
+def _shape_depth(series: DepthSeries) -> dict[str, Any]:
+    """Serve a depth series as ``{labels, values, bucket_minutes}``, leading zero buckets trimmed.
 
     ``bucket_minutes`` is the width in minutes each bucket spans, None when
     the series names no width.
     """
-    depth = raw or {}
+    trimmed = trim_leading_zero_buckets(series)
     return {
-        'labels': list(depth.get('labels') or []),
-        'values': list(depth.get('values') or []),
-        'bucket_minutes': depth.get('bucket_minutes'),
+        'labels': list(trimmed['labels']),
+        'values': list(trimmed['values']),
+        'bucket_minutes': series.get('bucket_minutes'),
     }
 
 
@@ -537,21 +549,23 @@ def shape_merge_queue(
     from absolute project_root paths to each root's project label
     (``dashboard/project_labels.py::ProjectLabels``) so the React side can
     match against ``PROJECTS[].name``.  Per project: ``depth`` (renamed from
-    ``depth_timeseries``, shaped by :func:`_shape_depth`), ``outcomes``,
-    ``latency`` (whose ``with_duration`` and ``without_duration`` sum to the
-    outcomes total), ``recent``, ``recent_total`` (how many merges the window
-    holds; ``recent`` is capped), ``speculative``, ``active`` (the live
-    probe's entries), ``in_queue``, ``live_probe_configured`` (false keeps
-    the project out of the client's multi-project in-queue totals),
-    ``active_spark``, ``halt``, ``train_events``. ``in_queue``,
-    ``speculative``, ``recent_total`` and ``live_probe_configured`` are
-    required: the route resolves them for every project.
+    ``depth_timeseries``, its value shaped by :func:`_shape_depth`),
+    ``attempts`` (one value ``{outcomes, latency}``, whose latency's
+    ``with_duration`` and ``without_duration`` sum to the outcomes total),
+    ``recent``, ``recent_total`` (how many merges the window holds;
+    ``recent`` is capped), ``speculative``, ``active`` (the live probe's
+    entries), ``in_queue``, ``live_probe_configured`` (false keeps the
+    project out of the client's multi-project in-queue totals),
+    ``active_spark``, ``halt``, ``train_events``, ``train_throughput``.
+    ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
+    ``train_throughput`` and ``live_probe_configured`` are required: the
+    route resolves them for every project.
 
-    ``in_queue``, ``speculative``, ``recent_total`` and every
-    ``recent``/``active`` row's ``title`` are Datums the route resolved, each
-    aged to *served_at*, validated against it and rendered to the wire. A
-    field that is not a Datum, or a Datum that breaks its contract there, is
-    a wiring or shaper bug, and the
+    ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
+    ``train_throughput`` and every ``recent``/``active`` row's ``title`` are
+    Datums the route resolved, each aged to *served_at*, validated against it
+    and rendered to the wire. A field that is not a Datum, or a Datum that
+    breaks its contract there, is a wiring or shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
 
     ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
@@ -562,8 +576,10 @@ def shape_merge_queue(
     projects fall back to ``{offline: True}`` so the UI can render an Offline
     pill on every panel.
     """
-    def _served(candidate: object, field: str) -> dict[str, object]:
-        return _wire_served(candidate, f'MERGE_QUEUE {field}', served_at)
+    def _served(
+        candidate: object, field: str, *, project: Callable[[Any], object] | None = None,
+    ) -> dict[str, object]:
+        return _wire_served(candidate, f'MERGE_QUEUE {field}', served_at, project=project)
 
     def _titled(rows: Iterable[Mapping[str, Any]] | None, table: str) -> list[dict[str, Any]]:
         return [
@@ -578,9 +594,8 @@ def shape_merge_queue(
         spark = sparks.get(pid) or _EMPTY_SERIES
         label = labels.of(pid)
         out[label] = {
-            'depth': _shape_depth(data.get('depth_timeseries')),
-            'outcomes': _shape_outcomes(data.get('outcomes')),
-            'latency': dict(data.get('latency') or {}),
+            'depth': _served(data.get('depth_timeseries'), f'{label}.depth', project=_shape_depth),
+            'attempts': _served(data.get('attempts'), f'{label}.attempts', project=_shape_attempts),
             'recent': _titled(data.get('recent'), f'{label}.recent'),
             'recent_total': _served(data.get('recent_total'), f'{label}.recent_total'),
             'speculative': _served(data.get('speculative'), f'{label}.speculative'),
@@ -593,7 +608,9 @@ def shape_merge_queue(
             },
             'halt': dict(halts.get(label) or {'offline': True}),
             'train_events': [dict(e) for e in (data.get('train_events') or [])],
-            'train_throughput': dict(data.get('train_throughput') or {}),
+            'train_throughput': _served(
+                data.get('train_throughput'), f'{label}.train_throughput', project=dict,
+            ),
             # ι=1894: live retries-per-landing + drift-at-detection metrics
             'metrics': dict(data.get('live_metrics') or {}),
         }

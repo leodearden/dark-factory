@@ -249,14 +249,13 @@ tasks:
     delivered_check:
       kind: manual
       reason: behaviour pinned by boundary rows 26, 31 and 35
-- label: δ1
+- label: δ
   task_id: 6670
-  title: Harness-owned host health and HostPool, injected into the merge worker (HUB
-    carry, stage 1)
-  note: 'Rescoped 2026-10-31 by decision 16: δ1 builds the quarantine set and pool in
-    Harness.__init__ and injects the set, the task_held_by reader and the readmission
-    hook into the worker; no allocator injection and no merge-demand read. The TaskVerifyDispatcher
-    and the build_workflow wiring stay with δ2.'
+  title: Host health, config keys, workflow port and dispatcher wiring (HUB carry; δ1 and δ2
+    merged 2026-11-01)
+  note: 'δ1 (rescoped 2026-10-31 by decision 16 to host health) and δ2 (config keys,
+    policy reader, dispatcher construction, workflow port, workflow_verify.runner) merged
+    into task 6670 on 2026-11-01; task 6671 cancelled.'
   capabilities:
   - name: bench-before-first-merge
     binding: capability→producer — δ1 adds public ensure_host_allocator over the worker's
@@ -290,15 +289,6 @@ tasks:
       paths:
       - orchestrator/src/orchestrator/harness.py
       expect: present
-- label: δ2
-  task_id: 6671
-  title: Workflow consumer, config keys and harness dispatcher wiring (HUB carry,
-    stage 2)
-  note: 'Decompose re-scope: δ2 also owns the config-backed TaskVerifyPolicy reader
-    (task_verify_dispatch.py), constructs the dispatcher in harness.py and passes
-    task_verify= at the harness.py build_workflow call; defaults.yaml carries the
-    new keys. Depends on 6580 (one task-role verify site left).'
-  capabilities:
   - name: task-verify-config-keys
     binding: capability→producer — δ2 adds verify_task_host_policy, verify_task_remote_modules
       (+ validator), verify_task_remote_cross_check_every_n, verify_task_remote_red_confirms_locally
@@ -353,7 +343,7 @@ tasks:
   capabilities:
   - name: integration-module
     binding: capability→producer — ι creates orchestrator/tests/test_task_verify_integration.py;
-      every leg it drives (α β γ δ1 δ2) is in its transitive dependency closure.
+      every leg it drives (α β γ γ2 δ) is in its transitive dependency closure.
     verdict: PASS
     delivered_check:
       kind: path
@@ -361,7 +351,7 @@ tasks:
       - orchestrator/tests/test_task_verify_integration.py
       expect: present
   - name: boundary-sketch-green-e2e
-    binding: DAG-direction — all producers upstream (β, γ, δ2 direct; α, δ1 transitive).
+    binding: DAG-direction — all producers upstream (β, γ, δ direct; α, γ2 transitive).
     verdict: PASS
     delivered_check:
       kind: manual

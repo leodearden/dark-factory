@@ -52,10 +52,10 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, UnlimitedHolderLocksConfig
 from orchestrator.harness import _REBLOCK_GUARD_THRESHOLD, Harness
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
-from orchestrator.scheduler import ModuleLockTable
 
 # ``_row`` / ``LIVE_CLAIMANT`` / ``TTL_SECS`` are the SHARED definitions in
 # ``_orch_helpers`` (task 3540 review amendment).  They were cloned here and in
@@ -853,18 +853,17 @@ class TestResumeLevelGateRemoved:
 def _plan_root(harness: Harness, task_id: str, *, legacy: bool = False) -> Path:
     """The directory the fold must resolve for *task_id*'s plan.json.
 
-    Mirrors the harness's own new-then-old artifact resolution
-    (``Harness._resolve_recovery_artifact``): the W11 ``.task-meta`` SIBLING of
-    the worktree first, the legacy ``<worktree>/.task`` second.  Derived
-    through ``TaskArtifacts.meta_root_for`` / ``Harness._resolve_task_worktree``
-    rather than by joining the path shape by hand, so a relocation moves the
-    fixture with the production resolver instead of silently pointing the test
-    at a directory nothing writes.
+    plan.json is task-scoped, so the fold reads *task_id*'s
+    ``.task-meta/task-<id>`` root first and the legacy ``<worktree>/.task``
+    second.  Derived through ``TaskArtifacts.task_root_for`` /
+    ``Harness._resolve_task_worktree`` rather than by joining the path shape
+    by hand, so a relocation moves the fixture with the production resolver
+    instead of silently pointing the test at a directory nothing writes.
     """
     wt = harness._resolve_task_worktree(task_id)
     if legacy:
         return wt / '.task'
-    return TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, wt.name)
+    return TaskArtifacts.task_root_for(wt.parent, task_id)
 
 
 def _seed_plan(
@@ -1807,6 +1806,28 @@ class TestGrantDeliveryOnALiveWorkflow:
         assert plan_path.read_text() == before
         assert _files_updates(harness) == []
         assert event.is_set(), 'The synchronous wake path must still fire'
+
+    @pytest.mark.parametrize('order', [('3438', '9999'), ('9999', '3438')])
+    async def test_a_grant_in_a_key_another_task_also_holds_is_delivered(
+        self, harness: Harness, tmp_path: Path, order: tuple[str, str]
+    ):
+        """A key with room for many holders is still the slot's own lock (task 5467).
+
+        Whichever of the two holders took it last, the live slot counts as
+        holding it, so a grant inside it widens the plan."""
+        esc, _event, _queue = _live_slot_grant(harness, tmp_path, ['docs/guide/b.md'])
+        lock_table = ModuleLockTable(OrchestratorConfig(
+            max_per_module=1, lock_depth=_LOCK_DEPTH,
+            unlimited_holder_locks=UnlimitedHolderLocksConfig(prefixes=('docs/',)),
+        ))
+        for holder in order:
+            assert lock_table.try_acquire(holder, ['docs/guide/a.md'])
+        harness.scheduler.lock_table = lock_table
+        plan_path = _seed_plan(harness, files=['docs/guide/a.md'])
+
+        await _drive(harness, esc)
+
+        assert json.loads(plan_path.read_text())['files'] == ['docs/guide/a.md', 'docs/guide/b.md']
 
     async def test_a_grantless_resolve_on_a_live_workflow_schedules_nothing(
         self, harness: Harness, tmp_path: Path

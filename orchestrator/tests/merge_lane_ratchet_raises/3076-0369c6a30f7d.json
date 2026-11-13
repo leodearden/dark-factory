@@ -1,0 +1,42 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 work \u2014 explicit never-steal guard (_refuse_in_use_steal) so the now-legal IN_USE -> ASSIGNED edge cannot re-key a lane holding another task's live child",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 39,
+      "current": 41
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 663,
+      "current": 681
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 301,
+      "current": 305
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4827,
+      "current": 4829
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57339,
+      "current": 57357
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31948,
+      "current": 31952
+    }
+  ]
+}

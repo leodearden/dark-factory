@@ -1230,9 +1230,8 @@ def check_canonical_routing(
     * ``entity_types``, the only route to ``EntityNode.attributes``, is
       never supplied by any caller, so attributes are always ``{}``.
 
-    So the marker is never stored — hence never readable by its only live
-    reader (``pick_survivor`` in ``scripts/audit_duplicate_memories.py``,
-    which reads ``metadata.get('canonical')`` off Mem0 scroll results) and
+    So the marker is never stored — hence never readable by any reader,
+    all of which read Mem0 payloads — and
     never countable by the <=1-per-``(project, topic)`` probe, whose two
     round-trips are Qdrant payload filters.  Admitting such a write would
     silently destroy a caller's assertion, which is the fail-soft the house

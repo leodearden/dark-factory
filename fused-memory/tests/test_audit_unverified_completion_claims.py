@@ -19,8 +19,12 @@ from _distinct_git_repo import init_distinct_git_repo
 from _fm_helpers import load_script_module
 from shared.project_layout import tasks_db
 from shared.task_store_schema import TASK_STORE_DDL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_read_only import RO_COMMAND
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
@@ -1781,6 +1785,27 @@ class TestProbeBuilders:
         assert probe('5999', 'reify') is None  # another tag is not this tree
         assert probe('4040', 'reify') is None  # no such task -> unresolvable
         assert probe('5422', 'dark_factory') is None  # wrong project's tree
+
+    async def test_task_status_probe_stub_store_logs_the_refusal(
+        self, tmp_path, caplog
+    ) -> None:
+        """The 0-byte decoy is logged as connect_ro's EMPTY_STUB refusal, not as
+        `no such table: tasks`, and the claim stays UNVERIFIABLE."""
+        root = tmp_path / 'proj'
+        db_path = tasks_db(root)
+        db_path.parent.mkdir(parents=True)
+        db_path.write_bytes(b'')
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            probe = await _mod._build_task_status_probe(
+                {'reify': str(root)}, {'reify': {'5422'}}
+            )
+
+        assert probe('5422', 'reify') is None
+        logged = [r.exc_info[1] for r in caplog.records if r.exc_info]
+        assert len(logged) == 1
+        assert isinstance(logged[0], TaskDbUnreadable)
+        assert logged[0].reason is TaskDbProblem.EMPTY_STUB
 
     async def test_task_status_probe_missing_db_creates_nothing(
         self, tmp_path

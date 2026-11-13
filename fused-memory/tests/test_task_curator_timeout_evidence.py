@@ -1,6 +1,6 @@
 """TaskCurator LLM call sites: tool scoping and timeout evidence (task 3995).
 
-Driven through ``curate`` / ``curate_batch`` with the corpus build and the LLM
+Driven through ``curate`` / ``curate_prepared`` with the corpus build and the LLM
 call stubbed. A failed single call is observed where the curator reports it,
 on its escalator. A failed batch is bisected rather than escalated, so it is
 observed through its log and the calls its halves make.
@@ -81,9 +81,11 @@ async def _curate_batch(
 ) -> list[CuratorDecision]:
     titles = [f'T{i}' for i in range(len(pools))]
     with _stub_corpus(curator, dict(zip(titles, pools, strict=True))):
-        return await curator.curate_batch(
-            [CandidateTask(title=title) for title in titles], project_id='p', project_root='/p',
-        )
+        bundles = [
+            await curator.prepare_candidate(CandidateTask(title=title), 'p', '/p')
+            for title in titles
+        ]
+        return await curator.curate_prepared(bundles, project_id='p', project_root='/p')
 
 
 def _gated_curator(

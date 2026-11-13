@@ -270,6 +270,30 @@ scoped, unlike all four siblings, because its hazard is introduced MID-session
 by another test rather than present at session start — task 4966 measured
 exactly that as a 1-in-3 flake, green standalone and green in its own file.
 
+SIXTH DEFENCE — an ambient ``CLAUDE_BINARY`` can never reroute a faked ``claude``.
+
+Since task 4448 every shared claude spawn takes ``CLAUDE_BINARY`` ahead of PATH,
+so a test that hides or fakes ``claude`` by editing PATH, and proves it with
+``shutil.which``, passes for the wrong reason under an operator's override: the
+spawn runs the real CLI.  ``_df_claude_binary_unset`` is function scoped, for
+the same mid-session reason as the fifth.  The literal name is pinned to
+shared's resolver behaviourally by
+``tests/scripts/test_claude_binary_isolation.py``.
+
+SEVENTH DEFENCE — a ``UsageGate`` a test builds in-process never sweeps the real
+tempdir.
+
+Its dead-PID probe-dir sweep (task 3086) is confined to a private per-test root
+in the four rootdirs that build gates — ``shared``, ``orchestrator``,
+``fused-memory`` and ``scripts/tests`` — each armed by
+:func:`arm_usage_gate_sweep_confinement`.  That list is the known coverage
+boundary, and nothing checks it: a fifth rootdir that starts building gates
+sweeps the real tempdir, with no test failing, until its conftest arms the
+plugin too.  The plugin patches this process, so it cannot reach a spawned
+child: a gate built in a child sweeps whatever tempdir the child inherits, and
+that child's spawner must pass a private ``TMPDIR``, as
+``orchestrator/tests/test_sighup.py::_exit_after_hup_then_term`` does.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -291,11 +315,13 @@ import math
 import os
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
 import warnings
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
+from types import ModuleType
 from typing import Any, NamedTuple, assert_never
 
 import pytest
@@ -660,10 +686,10 @@ def deploy_clock_snapshot(
 # The provenance vocabulary (task 4823) — the three spellings four tiers must
 # agree on and none can import from another (see the module docstring's
 # stdlib+pytest import constraint). `scripts/restart-all-orchestrators.sh` and
-# `scripts/orchestrator-watchdog.py` each mirror them as their own literals, and
-# all three mirrors are pinned together by
+# `scripts/_watchdog_state.py` (the watchdog's clock writer) each mirror them as
+# their own literals, and all three mirrors are pinned together by
 # tests/scripts/test_restart_all_orchestrators.py and
-# tests/scripts/test_orchestrator_watchdog.py, which assert against THESE
+# tests/scripts/test_watchdog_state.py, which assert against THESE
 # objects rather than against strings of their own.
 PYTEST_SESSION_TOKEN_ENV = 'DF_PYTEST_SESSION_TOKEN'
 CLOCK_PROVENANCE_SOURCE_KEY = 'source'
@@ -2265,6 +2291,131 @@ def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
 
 
 # ---------------------------------------------------------------------------
+# UsageGate probe-dir sweep confinement (tasks 5328, 6275)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='session')
+def _df_usage_gate_sweep_parent(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp('usage-gate-sweep')
+
+
+@pytest.fixture
+def usage_gate_sweep_root(_df_usage_gate_sweep_parent: Path) -> Path:
+    """The private, initially empty dir every UsageGate probe-dir sweep in this test is confined to.
+
+    Request it to plant dirs the sweep should see.
+    """
+    return Path(tempfile.mkdtemp(dir=_df_usage_gate_sweep_parent))
+
+
+@pytest.fixture
+def real_probe_dir_sweep() -> bool:
+    """Opt this test out of :func:`confine_usage_gate_sweep` (task 3086).
+
+    The test must itself redirect ``tempfile.gettempdir`` — e.g.
+    ``patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path))``
+    — because the real sweep deletes under it.
+    """
+    return True
+
+
+# Above Linux's PID_MAX_LIMIT (2**22): no process can ever own this PID.
+_NEVER_LIVE_PID = 2**22 + 1
+
+
+@pytest.fixture
+def plant_dead_pid_dir() -> Callable[[Path, str], Path]:
+    """Return ``plant(base, prefix)``, making a dir that a dead-PID sweep of *prefix* under *base* reclaims.
+
+    The dir is ``<base>/<prefix>ghost-<pid>`` for a PID no process can own. Like
+    a real probe dir it holds a ``.credentials.json``, and it is aged an hour,
+    past the sweep's min-age floor.
+    """
+
+    def plant(base: Path, prefix: str) -> Path:
+        ghost = base / f'{prefix}ghost-{_NEVER_LIVE_PID}'
+        ghost.mkdir()
+        (ghost / '.credentials.json').write_text('')
+        an_hour_ago = time.time() - 3600
+        os.utime(ghost, (an_hour_ago, an_hour_ago))
+        return ghost
+
+    return plant
+
+
+def confine_usage_gate_sweep(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    usage_gate_module: ModuleType,
+) -> None:
+    """Re-base, not stub, the probe-dir sweep of every UsageGate this test builds in-process.
+
+    ``UsageGate.__init__`` sweeps dead-PID probe dirs under the system tempdir.
+    Confining that sweep for every test means safety no longer rests on which
+    test first set the once-per-process mark. ``real_probe_dir_sweep`` is the
+    escape hatch. ``usage_gate_sweep_root`` is resolved on the first sweep, so a
+    test that builds no gate and does not request it creates no directory.
+    *usage_gate_module* is ``shared.usage_gate``, passed in because this module
+    may not import ``shared`` (see the module docstring's import constraint).
+    """
+    if 'real_probe_dir_sweep' in request.fixturenames:
+        return
+    real_sweep = usage_gate_module.sweep_stale_pid_dirs
+
+    def _confined_sweep(prefix: str, **kwargs: Any) -> int:
+        if 'base_dir' not in kwargs:
+            kwargs['base_dir'] = request.getfixturevalue('usage_gate_sweep_root')
+        return real_sweep(prefix, **kwargs)
+
+    monkeypatch.setattr(usage_gate_module, 'sweep_stale_pid_dirs', _confined_sweep, raising=True)
+
+
+_USAGE_GATE_SWEEP_PLUGIN = 'df-usage-gate-sweep-confinement'
+
+
+def arm_usage_gate_sweep_confinement(config: pytest.Config, usage_gate_module: ModuleType) -> None:
+    """Confine every test's UsageGate probe-dir sweep for this session, from ``pytest_configure``.
+
+    Registers :func:`usage_gate_sweep_root`, :func:`real_probe_dir_sweep`,
+    :func:`plant_dead_pid_dir` and an autouse fixture applying
+    :func:`confine_usage_gate_sweep` to
+    *usage_gate_module*. Idempotent, because a session that collects several
+    test roots runs each root's ``pytest_configure``. Only the first arm's
+    module is patched, so a re-arm with a different module object is refused
+    with ``pytest.UsageError`` rather than leaving that module's gates unconfined.
+    """
+    armed = config.pluginmanager.get_plugin(_USAGE_GATE_SWEEP_PLUGIN)
+    if armed is not None:
+        if armed.usage_gate_module is not usage_gate_module:
+            raise pytest.UsageError(
+                f'the UsageGate probe-dir sweep confinement already patches '
+                f'{armed.usage_gate_module!r}, so it cannot also confine '
+                f'{usage_gate_module!r}; every test root must arm it with the '
+                f'one shared.usage_gate module object this session imports'
+            )
+        return
+
+    @pytest.fixture(autouse=True)
+    def confine(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+        confine_usage_gate_sweep(request, monkeypatch, usage_gate_module)
+
+    plugin = type(
+        '_UsageGateSweepConfinementPlugin',
+        (),
+        {
+            'usage_gate_module': usage_gate_module,
+            '_df_usage_gate_sweep_parent': _df_usage_gate_sweep_parent,
+            'usage_gate_sweep_root': usage_gate_sweep_root,
+            'real_probe_dir_sweep': real_probe_dir_sweep,
+            'plant_dead_pid_dir': plant_dead_pid_dir,
+            '_df_confine_usage_gate_sweep': confine,
+        },
+    )
+    config.pluginmanager.register(plugin, _USAGE_GATE_SWEEP_PLUGIN)
+
+
+# ---------------------------------------------------------------------------
 # Synthetic fixture unit names (task 3799)
 # ---------------------------------------------------------------------------
 
@@ -2836,3 +2987,24 @@ def _df_git_env_hermetic():
         for key in git_redirect_env(os.environ):
             del os.environ[key]
         os.environ.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# Ambient claude-binary override
+# ---------------------------------------------------------------------------
+
+CLAUDE_BINARY_ENV = 'CLAUDE_BINARY'
+
+
+@pytest.fixture(autouse=True)
+def _df_claude_binary_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SIXTH DEFENCE — an ambient ``CLAUDE_BINARY`` never reaches a test body.
+
+    ``shared.cli_invoke::claude_binary_spec`` reads it ahead of PATH, so a test
+    that hides or fakes ``claude`` by editing PATH can still be routed to the
+    real CLI, and verify inherits the orchestrator's environment. FUNCTION
+    scoped like :func:`_df_git_env_hermetic`, because a leak can arrive
+    mid-session. ``monkeypatch`` restores the pre-test value, and a test may
+    still set the variable deliberately.
+    """
+    monkeypatch.delenv(CLAUDE_BINARY_ENV, raising=False)

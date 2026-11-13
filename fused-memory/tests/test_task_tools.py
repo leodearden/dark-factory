@@ -10,8 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _TOOLS_LOGGER = 'fused_memory.server.tools'
 
@@ -419,7 +422,7 @@ async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
     key; dropping done_provenance is refused with the same canonical dict the
     interceptor returns. Metadata is sent as a dict, so the tool's own
     json.dumps coercion is on the path."""
-    from _fm_helpers import _init_git_repo
+    from _fm_git_repos import _init_git_repo
 
     from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
     from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
@@ -553,9 +556,9 @@ async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
 ):
     """Through the MCP tool, a 'null' metadata payload is decoded to an
     omitted metadata argument (task 6130): the call writes no metadata, so the
-    stored blob, done_provenance included, is left untouched."""
-    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
-
+    stored blob, done_provenance included, is left untouched. With no other
+    field it is a fieldless call, which task 4867 refuses instead of
+    reporting a success that wrote nothing."""
     server, interceptor = real_task_stack
     root = str(tmp_path)
     before = await _seed_task_with_done_provenance(interceptor, root)
@@ -563,7 +566,7 @@ async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
     result = await server._tool_manager.call_tool(
         'update_task', {'id': '1', 'project_root': root, 'metadata': 'null'},
     )
-    assert interceptor_write_succeeded(result), result
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
     assert (await interceptor.get_task('1', root))['metadata'] == before
 
 
@@ -774,6 +777,36 @@ async def test_update_task_status_none_still_allowed(
         {'id': '1', 'project_root': '/project', 'status': None},
     )
     task_interceptor.update_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'ignored_arguments',
+    [{}, {'append': True}, {'metadata_mode': 'merge'}, {'tag': 'master'}],
+    ids=['bare', 'append-only', 'metadata_mode-only', 'tag-only'],
+)
+async def test_update_task_with_no_mutating_field_returns_typed_error(
+    real_task_stack, tmp_path, ignored_arguments,
+):
+    """Task 4867: a fieldless update_task reports failure, never ``updated``.
+
+    esc-3147-7 and esc-3671-7 came from a misnamed ``metadata`` argument being
+    dropped, so the call wrote nothing and still reported success. The
+    refusal reaches callers as the same ``error_type`` dict every other raw
+    backend refusal uses, through the real tool, interceptor and backend. No
+    task is created: the refusal is a floor that precedes the row lookup.
+    """
+    server, _interceptor = real_task_stack
+
+    result = await server._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': str(tmp_path), **ignored_arguments},
+    )
+
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
+    assert result['error'].startswith('TASKMASTER_TOOL_ERROR: '), result
+    assert 'metadata' in result['error'], result
+    assert 'updated' not in result, result
 
 
 # ------------------------------------------------------------------
@@ -1817,7 +1850,7 @@ async def test_resolve_ticket_idempotent_passthrough_strips_whitespace(
 
     The MCP wire schema enforces ``ticket: str``, so int passthrough is
     only meaningful at the interceptor layer; it's covered by the
-    ``_looks_like_task_id`` unit tests in test_task_interceptor.py.
+    ``looks_like_task_id`` unit tests in shared/tests/test_task_submit.py.
     """
     from unittest.mock import AsyncMock
     task_interceptor.resolve_ticket = AsyncMock()

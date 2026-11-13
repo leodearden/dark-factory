@@ -43,6 +43,9 @@ from shared.usage_gate import (
     InvokeSlot,
     UsageGate,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _make_gate(

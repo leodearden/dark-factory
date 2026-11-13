@@ -122,6 +122,11 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # no RestartSteps= setting. Ignoring." at load and moves on). An installed unit
 # missing this line therefore has no growing backoff at all, silently, and the
 # only way that gets corrected on the host is for this checker to report it.
+#
+# KillMode=mixed is host-invariant too (task 9493). Without it an installed unit
+# silently keeps the default control-group, where a restart double-signals the
+# server and SIGTERMs the subprocesses of live tool calls; listing it here is
+# what lets setup-host's parity gate report that and --fix append it in place.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     *ENV_POLICY.required_directives(UnitFamily.FUSED_MEMORY),
     "WatchdogSec=120",
@@ -130,6 +135,7 @@ REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     "RestartSteps=4",
     "TimeoutStartSec=300",
     "TimeoutStopSec=90",
+    "KillMode=mixed",
 )
 
 # Directive PREFIXES that MUST be present (as the start of some non-comment
@@ -148,11 +154,43 @@ REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=", "ExecSt
 # only report these, never synthesize them.
 AOF_GATE_SCRIPT = "scripts/falkordb_aof_gate.py"
 AOF_GATE_DRIFT = f"ExecStartPre= running {AOF_GATE_SCRIPT} (task 6330)"
+# The compose services whose `up` cannot recreate falkordb, named as defined
+# in fused-memory/docker/docker-compose.yml. That holds only while none of them
+# declares a dependency, because compose starts a service's dependencies too;
+# tests/scripts/test_check_fused_memory_unit_parity.py::test_every_ungated_compose_service_starts_alone
+# pins it.
+UNGATED_COMPOSE_SERVICES: frozenset[str] = frozenset({"embedder"})
 BARE_COMPOSE_UP_DRIFT = (
-    "no ExecStartPre= running a bare `docker compose ... up` "
-    f"(it recreates falkordb without {AOF_GATE_SCRIPT})"
+    "no ExecStartPre= running a `docker compose ... up` that names services beyond "
+    f"UNGATED_COMPOSE_SERVICES {sorted(UNGATED_COMPOSE_SERVICES)} "
+    f"(it could recreate falkordb without {AOF_GATE_SCRIPT})"
 )
-_BARE_COMPOSE_UP = re.compile(r"docker[ -]compose\b.*\sup(\s|$)")
+_COMPOSE_UP = re.compile(r"docker[ -]compose\b.*\sup(\s|$)")
+
+
+def compose_up_services(line: str) -> frozenset[str] | None:
+    """The services a compose `up` on *line* names, or None when it runs no compose `up`.
+
+    They are the `up`'s non-option tokens, so an option's separate value token
+    is read as a service too. An empty set means the `up` names none, which
+    brings up every service.
+    """
+    match = _COMPOSE_UP.search(line)
+    if match is None:
+        return None
+    return frozenset(token for token in line[match.end():].split() if not token.startswith("-"))
+
+
+def compose_up_bypasses_aof_gate(line: str) -> bool:
+    """True when *line* runs a compose `up` that could recreate falkordb.
+
+    Anything compose_up_services reads outside UNGATED_COMPOSE_SERVICES counts,
+    and so does naming no service, so an unrecognised `up` fails closed.
+    """
+    services = compose_up_services(line)
+    if services is None:
+        return False
+    return not services or not services <= UNGATED_COMPOSE_SERVICES
 
 
 def _log(message: str, *, stream=None) -> None:
@@ -219,9 +257,11 @@ def find_drift(
     Prefix misses are appended, in order, after the exact-match misses.
 
     With ``check_aof_gate``, a unit whose ExecStartPre= lines exist but none
-    runs AOF_GATE_SCRIPT reports AOF_GATE_DRIFT, and one with a bare compose-up
-    ExecStartPre= reports BARE_COMPOSE_UP_DRIFT, appended last. A unit with no
-    ExecStartPre= at all is already reported by its prefix miss.
+    runs AOF_GATE_SCRIPT reports AOF_GATE_DRIFT, and one with an ExecStartPre=
+    compose up naming services beyond UNGATED_COMPOSE_SERVICES (see
+    compose_up_bypasses_aof_gate) reports BARE_COMPOSE_UP_DRIFT, appended
+    last. A unit with no ExecStartPre= at all is already reported by its
+    prefix miss.
 
     Args:
         unit_text: The full text of the systemd unit file.
@@ -254,9 +294,31 @@ def _aof_gate_drift(service_lines: list[str]) -> list[str]:
     drift = []
     if not any(AOF_GATE_SCRIPT in line for line in exec_start_pre):
         drift.append(AOF_GATE_DRIFT)
-    if any(_BARE_COMPOSE_UP.search(line) for line in exec_start_pre):
+    if any(compose_up_bypasses_aof_gate(line) for line in exec_start_pre):
         drift.append(BARE_COMPOSE_UP_DRIFT)
     return drift
+
+
+def _compose_up_bypass_details(unit_text: str) -> list[str]:
+    """Name each ExecStartPre= line BARE_COMPOSE_UP_DRIFT flags, with the services read from it."""
+    service_lines = parse_unit_sections(unit_text).get(SERVICE_SECTION, [])
+    details = []
+    for line in service_lines:
+        if line.startswith("ExecStartPre=") and compose_up_bypasses_aof_gate(line):
+            services = sorted(compose_up_services(line) or ())
+            details.append(f"      {line}")
+            details.append(f"      read as services: {services or 'none, so every service'}")
+    return details
+
+
+def _drift_entries(drift: list[str], unit_text: str) -> str:
+    """One `  - ` line per drift entry, each BARE_COMPOSE_UP_DRIFT followed by its offending lines."""
+    entries = []
+    for entry in drift:
+        entries.append(f"  - {entry}")
+        if entry == BARE_COMPOSE_UP_DRIFT:
+            entries.extend(_compose_up_bypass_details(unit_text))
+    return "\n".join(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -454,13 +516,9 @@ def main(argv: Sequence[str]) -> int:
         _log(f"[ok] {installed_path}: parity — all required directives present.")
         return ParityExit.PARITY
 
-    # rstrip: the joined list ends in a newline, which under a per-line _log
-    # would render one final line holding nothing but the tag.
     _log(
-        (
-            f"[drift] {installed_path}: missing required directives:\n"
-            + "".join(f"  - {d}\n" for d in drift)
-        ).rstrip("\n")
+        f"[drift] {installed_path}: missing required directives:\n"
+        + _drift_entries(drift, unit_text)
     )
 
     if args.fix:
@@ -482,11 +540,9 @@ def main(argv: Sequence[str]) -> int:
         residual = find_drift(fixed_text)
         if residual:
             _log(
-                (
-                    f"[drift] {installed_path}: --fix cannot synthesize host-specific "
-                    f"directive(s) (value carries host paths — add them by hand):\n"
-                    + "".join(f"  - {d}\n" for d in residual)
-                ).rstrip("\n"),
+                f"[drift] {installed_path}: --fix cannot synthesize host-specific "
+                f"directive(s) (value carries host paths — add them by hand):\n"
+                + _drift_entries(residual, fixed_text),
                 stream=sys.stderr,
             )
             return ParityExit.FINDING

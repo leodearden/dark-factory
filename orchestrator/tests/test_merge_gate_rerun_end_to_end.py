@@ -38,6 +38,7 @@ from unittest.mock import patch
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _serial_recovery_helpers import effective_worker_count
 
 from orchestrator import verify as verify_module
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -192,8 +193,9 @@ def test_merge_gate_isolated_rerun_actually_runs_the_test(tmp_path):
 @pytest.mark.xdist_group('merge_gate_rerun_real_pytest')
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 def test_merge_gate_rerun_that_only_errors_at_setup_is_unconfirmable(tmp_path):
-    """Under xdist this body runs and ``worker_id`` is ``'gw<N>'``; the re-run's
-    ``-p no:xdist`` unregisters the fixture, so it ERRORs at setup with
+    """Under xdist this body runs and ``worker_id`` is ``'gw<N>'``. This tree
+    configures no xdist, so the confirm takes the recovery form, whose
+    ``-p no:xdist`` unregisters the fixture: it ERRORs at setup with
     "fixture 'worker_id' not found".  MEASURED before task 3880:
     ``fails_in_isolation``.
     """
@@ -209,6 +211,44 @@ def test_merge_gate_rerun_that_only_errors_at_setup_is_unconfirmable(tmp_path):
     assert suppression.verdict is FlakeVerdict.unconfirmable, rendered
     assert (suppression.unconfirmable_reason or '').startswith('rerun_setup_errors_only:'), rendered
     assert suppression.test_ids == (WORKER_ID_PROBE_NODE_ID,), suppression.test_ids
+
+
+@pytest.mark.xdist_group('merge_gate_rerun_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+def test_merge_gate_confirms_a_worker_id_test_where_the_config_runs_xdist(tmp_path):
+    """Task 6650: the confirm's ``-n 0`` keeps xdist loaded, so ``worker_id`` resolves.
+
+    MEASURED RED before task 6650: ``unconfirmable``, reason
+    ``rerun_setup_errors_only:...``.
+    """
+    _write_worker_id_probe(tmp_path)
+    (tmp_path / 'pyproject.toml').write_text(
+        '[tool.pytest.ini_options]\naddopts = "-n auto --dist loadgroup"\n', encoding='utf-8',
+    )
+    real_run_cmd = verify_module._run_cmd
+    seen: list[str] = []
+
+    async def spy(cmd, *args, **kwargs):
+        seen.append(cmd)
+        return await real_run_cmd(cmd, *args, **kwargs)
+
+    with patch.object(verify_module, '_run_cmd', spy):
+        suppression = asyncio.run(confirm_isolated_rerun_verdict(
+            tmp_path, _make_config(tmp_path), [_module_config()],
+            _failing_result(node_id=WORKER_ID_PROBE_NODE_ID),
+            call_site='merge_gate',
+        ))
+
+    pytest_argvs = [c for c in seen if 'pytest' in c]
+    assert pytest_argvs, f'no pytest command was ever run; commands seen: {seen}'
+    rendered = pytest_argvs[-1]
+    assert suppression.verdict is FlakeVerdict.passes_in_isolation, (
+        f'verdict={suppression.verdict} reason={suppression.unconfirmable_reason!r}\n'
+        f'the command it actually ran was: {rendered!r}'
+    )
+    tokens = shlex.split(rendered)
+    assert effective_worker_count(tokens) == '0', rendered
+    assert 'no:xdist' not in tokens, rendered
 
 
 @pytest.mark.xdist_group('merge_gate_rerun_real_pytest')

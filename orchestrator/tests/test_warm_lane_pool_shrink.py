@@ -168,7 +168,7 @@ async def _acquire_three_live_lanes(git_ops: GitOps) -> str:
         assert isinstance(wt, WorktreeInfo), f'acquire for {task_id} failed: {wt!r}'
 
     lane2 = base / '_lane-2'
-    ta = TaskArtifacts(lane2, TaskArtifacts.meta_root_for(base, lane2.name))
+    ta = TaskArtifacts.for_task(lane2, '43')
     ta.init('43', _title('43'), 'd')
     ta.write_plan(_make_plan(3, 5, '43'))
     (lane2 / 'wip43.txt').write_text('task 43 work in progress\n')

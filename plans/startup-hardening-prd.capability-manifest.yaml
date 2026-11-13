@@ -1,0 +1,147 @@
+# Machine-readable twin of startup-hardening-prd.capability-manifest.md
+# Schema: shared/src/shared/capability_manifest.py::CapabilityManifestDoc
+# task_id values are stamped by commit_planning at decompose.
+prd: plans/startup-hardening-prd.md
+schema_version: 1
+signal_leaves: ["γ", "η"]
+tasks:
+  - label: "α"
+    task_id: 8267
+    title: "Startup-step runner: every startup sweep non-fatal by default, per-entry isolation, one L1 per failed step"
+    capabilities:
+      - name: "startup-step-runner-module"
+        binding: "capability→producer — new orchestrator/src/orchestrator/startup_steps.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class StartupStep"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "startup-step-failed-event-type"
+        binding: "capability→producer — additive EventType member"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "startup_step_failed"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "ad-hoc-startup-try-except-removed"
+        binding: "rejection-mechanism — 1c0a's ad-hoc 'Failed to recover pending merges' block is gone once the runner owns the policy"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Failed to recover pending merges"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "β"
+    task_id: 8268
+    title: "Merge worker constructed at 1b, loop and survivor reap launched after finish_startup()"
+    capabilities:
+      - name: "merge-loop-launched-after-startup"
+        binding: "capability→producer — new Harness._launch_merge_worker_loop called after finish_startup"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_launch_merge_worker_loop"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "stop-guard-invariant-pinned"
+        binding: "manual — a test asserts worker.stop() is not called when the loop was never launched"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural invariant judged by β's fault-injection test, not a grep"
+  - label: "γ"
+    task_id: 8269
+    title: "Crash-loop breaker: consecutive-startup-failure journal, K=3 quarantine, one born-at-L2, exit_reason/startup_completed_at on runs"
+    capabilities:
+      - name: "crash-loop-sentinel"
+        binding: "capability→producer — born-at-L2 keyed on the sentinel task id"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "orchestrator-startup-crash-loop"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "runs-startup-completed-at-column"
+        binding: "capability→producer — additive migration via add_column_if_missing_sync"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "startup_completed_at"
+          paths: ["orchestrator/src/orchestrator/run_store.py"]
+          expect: present
+      - name: "runs-exit-reason-column"
+        binding: "capability→producer — additive migration via add_column_if_missing_sync"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "exit_reason"
+          paths: ["orchestrator/src/orchestrator/run_store.py"]
+          expect: present
+  - label: "δ"
+    task_id: 8270
+    title: "Watchdog: NRestarts restart-rate alarm into dark-factory's queue, honour start-limit-hit, per-unit liveness min-interval, --report RESTARTS"
+    capabilities:
+      - name: "watchdog-reads-nrestarts"
+        binding: "capability→producer — systemctl show -p NRestarts,Result in main()"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "NRestarts"
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: present
+      - name: "orchestrator-liveness-revive-min-interval"
+        binding: "capability→producer — mirrors FM_LIVENESS_RESTART_MIN_INTERVAL_SECS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS"
+          paths: ["scripts/orchestrator-watchdog.py"]
+          expect: present
+      - name: "page-via-escalation-submit"
+        binding: "capability→producer (wired) — escalation/src/escalation/submit.py present; dashboard-watchdog precedent"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "argv shape is judged by δ's tests against submit.py's argparse boundary"
+  - label: "ε"
+    task_id: 8271
+    title: "StartLimitIntervalSec=1800 on the nine committed orchestrator units, the factory-init template and the unit-file tests"
+    capabilities:
+      - name: "units-resized"
+        binding: "capability→producer — nine committed units carry the new value"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "StartLimitIntervalSec=1800"
+          paths: ["scripts/"]
+          expect: present
+      - name: "old-value-retired"
+        binding: "rejection-mechanism — no committed orchestrator unit still says 600"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "StartLimitIntervalSec=600"
+          paths: ["skills/factory-init/references/supervised-unit.md"]
+          expect: absent
+  - label: "ζ"
+    task_id: 8273
+    title: "Deploy: install the resized units, daemon-reload, drained fleet sweep (human gate)"
+    capabilities:
+      - name: "units-installed-and-fleet-restarted"
+        binding: "manual — human deploy gate; check_orchestrator_unit_parity.py is the post-condition"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "host action outside the sandbox write-set"
+  - label: "η"
+    task_id: 8274
+    title: "Observation 7 days after ζ: the producers wrote in production (INV-13)"
+    capabilities:
+      - name: "production-observation-recorded"
+        binding: "manual — delayed milestone; record appended to PRD §9"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a measurement over live stores, judged by the record it appends"

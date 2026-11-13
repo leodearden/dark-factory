@@ -29,7 +29,7 @@
 // one of them after the first chip change.
 //
 // ONE MAP, ONE RENDER SITE. app.jsx renders the notices for TAB_ENDPOINTS[tab]
-// once, for the active tab, rather than thirteen per-tab banners, so adding a
+// once, for the active tab, rather than one banner per tab, so adding a
 // tab is a one-line edit here. poll_scope.test.mjs machine-checks BOTH
 // directions — every path is a real endpointsFor() key, and every app.jsx tab
 // id has an entry — because a map that silently stops matching a renamed
@@ -66,6 +66,7 @@ const TAB_ENDPOINTS = Object.freeze({
     '/api/v2/dashboard/orchestrators',
     '/api/v2/dashboard/scheduler',
     '/api/v2/dashboard/invariants',
+    '/api/v2/dashboard/prds',
   ]),
   scheduler: Object.freeze(['/api/v2/dashboard/scheduler']),
   curator: Object.freeze(['/api/v2/dashboard/curator']),
@@ -87,6 +88,9 @@ const TAB_ENDPOINTS = Object.freeze({
     '/api/v2/dashboard/escalation-analytics',
   ]),
   'esc-analytics': Object.freeze(['/api/v2/dashboard/escalation-analytics']),
+  // Its own /quality read is on demand (data.js::ON_DEMAND_KEYS.quality);
+  // this is its project selector's PROJECTS.
+  quality: Object.freeze(['/api/v2/dashboard/orchestrators']),
 })
 
 // The endpoint PATHS the always-mounted chrome reads, whatever tab is open.

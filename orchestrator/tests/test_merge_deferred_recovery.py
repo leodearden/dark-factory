@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from _live_merge_worker import running_merge_worker
+from _merge_lane_fakes import lane_scene_config
 from _workflow_helpers import FakeScheduler
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -51,10 +52,8 @@ from orchestrator.merge_lane import (
     MergeRequest,
     QueuedBranch,
 )
-from orchestrator.merge_lane.worker import (
-    SpeculativeMergeWorker,
-    coalesce_or_enqueue_merge_request,
-)
+from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 from orchestrator.scheduler import train_order_key
 
 NOW = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
@@ -793,7 +792,7 @@ class TestRecoveryAfterARestart:
 
         worker.halt_for_wip('test')
         await intake.put(held_train_request(git_ops, sched, 'train-live-4737', ['live1', 'live2']))
-        config = OrchestratorConfig(project_root=root, git=git_ops.config)
+        config = lane_scene_config(root, git_ops.config)
         await submit_single(registry, single_request(config, 'carrier'), intake)
         parked = {tid: list(history) for tid, history in sched.statuses.items()}
         async with running_merge_worker(worker):

@@ -1,4 +1,4 @@
-"""Server-side grouped reads: canonical + amendment digests + sighting count.
+"""Server-side grouped reads: canonical + amendment texts + sighting count.
 
 An amendment or sighting (task 3195's ``KIND_REGISTRY`` members) is an
 ordinary Mem0 entry with its own UUID whose ``metadata`` carries
@@ -7,8 +7,9 @@ children are indistinguishable peers of the canonical they attach to, which
 is the esc-5541 failure mode: untagged survivors outrank the entry they
 amend.  This module composes the three landed Mem0 read primitives
 (``count_memories_by_metadata`` / ``get_memories_by_metadata`` /
-``get_memory_by_id``) into ONE grouped document per canonical — bounded
-amendment digests plus an EXACT sighting count.
+``get_memory_by_id``) into ONE grouped document per canonical — a bounded
+list of amendments, each carrying its text up to a cap, plus an EXACT
+sighting count.
 
 LAYERING CONSTRAINT (load-bearing — see ``server/tools.py``'s call sites and
 ``docs/prds/memory-metadata-vocabulary.md``):
@@ -45,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 # whole, so an upward-resolved parent's ``metadata`` matches what the SAME
 # record carries when it arrives as a direct search hit.
 from fused_memory.backends.mem0_client import split_managed_metadata
+from fused_memory.config.schema import WriteTriageConfig
 
 # The experimental-key prefix, composed rather than re-spelled — see
 # CONTESTED_METADATA_KEY below.
@@ -58,6 +60,7 @@ from fused_memory.models.memory import MemoryResult
 # the text, and a third private copy would be a fourth place to drift (INV-5).
 from fused_memory.services.memory_service import _MEM0_CONTENT_KEYS
 from fused_memory.utils.async_utils import gather_collect
+from fused_memory.utils.clip_disclosure import elide_text
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Iterable, Mapping, Sequence
@@ -74,17 +77,32 @@ CHILD_KINDS = frozenset({AMENDMENT_KIND, SIGHTING_KIND})
 #: the write seam by task 3197).
 PARENT_ID_KEY = 'parent_id'
 
-#: Max characters of an amendment body carried in a digest.  A digest is a
-#: pointer, not a copy — the full text stays one ``get_memory_by_id`` away.
-_DIGEST_CHARS = 240
+#: The judge's shipped per-field cap, used only when a direct caller names none;
+#: the search and get_memory_by_id tools pass the live value.  A reader of the
+#: parent sees an amendment's text up to the same cap the judge read it at.
+DEFAULT_AMENDMENT_TEXT_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default
 
-#: Appended when a body was cut, so a truncated digest is never mistaken for
-#: the whole amendment.
-_DIGEST_ELLIPSIS = '…'
 
-#: Max digests listed for one canonical.  A wider fan-out is reported by the
-#: EXACT count plus a ``truncated`` marker rather than by a longer list.
-_AMENDMENT_DIGEST_CAP = 10
+def _require_positive_text_cap(amendment_text_chars: object) -> None:
+    """Reject a bad cap at the entry point, ahead of any fault containment.
+
+    Inside the child reads a bad cap would be reported as ``children_unavailable``
+    — a caller's error mistaken for a backend fault.
+    """
+    if (
+        not isinstance(amendment_text_chars, int)
+        or isinstance(amendment_text_chars, bool)
+        or amendment_text_chars <= 0
+    ):
+        raise ValueError(
+            f'amendment_text_chars must be a positive int, got {amendment_text_chars!r}'
+        )
+
+#: Max amendments listed for one canonical.  A wider fan-out is reported by the
+#: EXACT count plus a ``truncated`` marker rather than by a longer list.  Public
+#: because, with ``DEFAULT_AMENDMENT_TEXT_CHARS``, it bounds how much amendment
+#: text one grouped parent can carry to a reader.
+AMENDMENT_LIST_CAP = 10
 
 #: Set on a grouped block whose child reads FAILED.  Its presence is the record
 #: that the grouping is INCOMPLETE — a block carrying it is never used to
@@ -139,7 +157,7 @@ CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested'
 #: and cannot cause a false-positive drop.
 ORIGIN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
 
-#: The metadata keys a nested entry (digest or pinned child) carries: the
+#: The metadata keys a nested entry (amendment or pinned child) carries: the
 #: origin tags plus the supersession mark, so a superseded child reads as
 #: superseded wherever it is nested.
 NESTED_ENTRY_METADATA_KEYS = (*ORIGIN_PROJECT_TAG_KEYS, SUPERSEDED_BY_METADATA_KEY)
@@ -193,9 +211,9 @@ async def _bounded_gather(coros: Iterable[Awaitable[Any]]) -> list:
 def is_contested_child(meta: Mapping[str, Any] | None) -> bool:
     """True when *meta* marks a child as CONTESTING its parent.
 
-    A contested child is never suppressed into a digest: demoting a correction
-    to truncated text under the very entry it contests is the esc-5712
-    five-week-wrong-appendix shape.
+    A contested child is never suppressed into its parent's amendment list:
+    demoting a correction to capped text under the very entry it contests is
+    the esc-5712 five-week-wrong-appendix shape.
     """
     return bool((meta or {}).get(CONTESTED_METADATA_KEY))
 
@@ -209,11 +227,9 @@ def _child_text(payload: Mapping[str, Any]) -> str:
     return ''
 
 
-def _digest(text: str) -> str:
-    """Truncate *text* to ``_DIGEST_CHARS``, marking a cut with an ellipsis."""
-    if len(text) <= _DIGEST_CHARS:
-        return text
-    return text[:_DIGEST_CHARS] + _DIGEST_ELLIPSIS
+def amendment_text(text: str, cap: int = DEFAULT_AMENDMENT_TEXT_CHARS) -> str:
+    """What a reader of the parent sees of an amendment: *text* up to *cap*, a cut marked and counted."""
+    return elide_text(text, cap, field='content').text
 
 
 def _nested_entry_metadata(meta: Mapping[str, Any] | None) -> dict[str, str]:
@@ -227,8 +243,8 @@ def _nested_entry_metadata(meta: Mapping[str, Any] | None) -> dict[str, str]:
     rather than incidental.  The supersession mark rides along with the origin
     tags, so a superseded child is read as superseded, not as current.
 
-    WHY the emitters stop narrowing this away: a nested entry (an amendment
-    digest, a pinned matched child) is agent-visible content that the
+    WHY the emitters stop narrowing this away: a nested entry (a listed
+    amendment, a pinned matched child) is agent-visible content that the
     orchestrator briefing renders verbatim into a dispatched agent's
     ``# Context`` block.  Its cross-project filter classifies an entry by
     reading a project tag off that entry's own ``metadata`` — so a nested
@@ -244,22 +260,19 @@ def _nested_entry_metadata(meta: Mapping[str, Any] | None) -> dict[str, str]:
     }
 
 
-def _digest_entry(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Build one digest entry from a scrolled child row."""
+def _amendment_entry(row: Mapping[str, Any], amendment_text_chars: int) -> dict[str, Any]:
+    """Build one amendment entry from a scrolled child row."""
     payload = row.get('metadata') or {}
     entry = {
         'id': row.get('id'),
-        'digest': _digest(_child_text(payload)),
+        'content': amendment_text(_child_text(payload), amendment_text_chars),
         'created_at': row.get('created_at'),
         'kind': payload.get('kind', AMENDMENT_KIND),
     }
-    # A contested child appears in BOTH places — here AND as a surviving
-    # top-level hit — which is strictly more informative than either alone.
-    # Omitted (never False) when uncontested, per the fault-only convention.
     if is_contested_child(payload):
         entry['contested'] = True
     # The child's ORIGIN project and supersession mark, so a consumer holding
-    # only this digest can still classify the body it carries — see
+    # only this entry can still classify the body it carries — see
     # :func:`_nested_entry_metadata`.  Omitted (never ``{}``) when the child
     # carries none, matching the fault-only/omit-when-absent convention
     # ``contested`` and ``truncated`` already follow: the common corpus is
@@ -269,7 +282,7 @@ def _digest_entry(row: Mapping[str, Any]) -> dict[str, Any]:
     return entry
 
 
-def _digest_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
+def _amendment_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
     """Deterministic (created_at, id) ordering; a missing timestamp sorts first.
 
     Coerced to str so a ``None`` created_at cannot raise comparing None to str
@@ -277,10 +290,10 @@ def _digest_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
     were given.
 
     This orders the sample; it does not choose it.  The backend caps the scroll
-    at ``_AMENDMENT_DIGEST_CAP`` BEFORE this module ever sorts, so WHICH
+    at ``AMENDMENT_LIST_CAP`` BEFORE this module ever sorts, so WHICH
     cap-sized subset of a wide fan-out comes back is arbitrary.  That
     arbitrariness is precisely why a swallowed child can never be assumed
-    present in the digest list — see :func:`_pin_matched_child`.
+    present in the amendment list — see :func:`_pin_matched_child`.
     """
     return (row.get('created_at') or '', row.get('id') or '')
 
@@ -289,20 +302,24 @@ async def build_grouped_document(
     service: Any,
     project_id: str,
     canonical_id: str,
+    *,
+    amendment_text_chars: int = DEFAULT_AMENDMENT_TEXT_CHARS,
 ) -> dict[str, Any] | None:
     """Build the grouped block for *canonical_id*, or ``None`` when childless.
 
     Returns ``{'amendments': [...], 'amendment_count': int, 'sighting_count':
-    int}``.  The sighting count always comes from the EXACT count API — never
-    ``len(scroll)``, which would silently under-report a fan-out wider than
-    the scroll limit.
+    int}``; each amendment entry carries ``content``, its text cut at
+    *amendment_text_chars* by :func:`amendment_text`, and a contesting one is
+    also marked ``contested``.  The sighting count always comes
+    from the EXACT count API — never ``len(scroll)``, which would silently
+    under-report a fan-out wider than the scroll limit.
 
     COST ORDERING (mirrors task 3197's delete gate, for the same reason): the
     un-kinded TOTAL child count runs FIRST and short-circuits on zero, so the
     common path — every canonical on today's corpus, where ``parent_id`` has
     zero live footprint — pays one cheap exact count and issues no scroll at
     all.  The detail reads are paid only when they buy something the total
-    cannot: the per-kind split and the child bodies the digests need, and they
+    cannot: the per-kind split and the child bodies the entries need, and they
     then run CONCURRENTLY with each other (they share no data dependency).
 
     FAULT CONTAINMENT: a failed child read returns
@@ -312,10 +329,14 @@ async def build_grouped_document(
     exactly so this distinction survives; collapsing it here would tell an
     operator a canonical has no children because a backend timed out.  Nothing
     partial is returned alongside the marker, so no consumer can read half a
-    grouping as a whole one.
+    grouping as a whole one.  A bad *amendment_text_chars* is the caller's
+    error, not a read fault, so it raises ``ValueError`` instead.
     """
+    _require_positive_text_cap(amendment_text_chars)
     try:
-        return await _read_grouped_document(service, project_id, canonical_id)
+        return await _read_grouped_document(
+            service, project_id, canonical_id, amendment_text_chars,
+        )
     except Exception as exc:
         logger.warning(
             'grouped_read: child reads FAILED for canonical_id=%s in project=%s; '
@@ -332,6 +353,7 @@ async def _read_grouped_document(
     service: Any,
     project_id: str,
     canonical_id: str,
+    amendment_text_chars: int,
 ) -> dict[str, Any] | None:
     """The child reads themselves — see :func:`build_grouped_document`.
 
@@ -366,19 +388,22 @@ async def _read_grouped_document(
         service.get_memories_by_metadata(
             project_id=project_id,
             filters={PARENT_ID_KEY: canonical_id, 'kind': AMENDMENT_KIND},
-            limit=_AMENDMENT_DIGEST_CAP,
+            limit=AMENDMENT_LIST_CAP,
         ),
     ))
     for outcome in (sighting_count, amendment_count, rows):
         if isinstance(outcome, Exception):
             raise outcome
-    digests = [_digest_entry(row) for row in sorted(rows or [], key=_digest_sort_key)]
+    amendments = [
+        _amendment_entry(row, amendment_text_chars)
+        for row in sorted(rows or [], key=_amendment_sort_key)
+    ]
     # A non-zero total means children EXIST, so the block is emitted even when
     # none of them is an amendment or a sighting — reporting an empty group for
     # a parent that demonstrably has children would be the silent under-report
     # the total probe exists to prevent.
     block: dict[str, Any] = {
-        'amendments': digests,
+        'amendments': amendments,
         'amendment_count': amendment_count,
         'sighting_count': sighting_count,
     }
@@ -387,13 +412,22 @@ async def _read_grouped_document(
     # ``DescendantScan.truncated`` does on the delete path.  Omitted (never
     # False) when the listing is complete, matching the search tool's
     # fault-only degraded-key convention.
-    if amendment_count > len(digests):
+    if amendment_count > len(amendments):
         block['truncated'] = True
     return block
 
 
-def _parent_id_in_meta(meta: Mapping[str, Any] | None) -> str | None:
+def child_parent_id(meta: Mapping[str, Any] | None) -> str | None:
     """The parent id *meta* points at, or ``None`` when it is not a child's.
+
+    Modules that ask "is this Mem0 record a child, and of what?" call this
+    rather than restating the rule. One copy remains:
+    ``services/topic_anchor.py::_is_child_shaped``, kept because importing this
+    module from ``services`` would close an import cycle. That copy is
+    stricter: it answers "not a child" for a non-``str`` ``kind``, where this
+    function raises ``TypeError`` on an unhashable one, so swapping it for a
+    call to this function must keep that guard. Task 6720 moves this function
+    into ``memory_metadata.py`` and removes that copy.
 
     A child is identified STRICTLY by ``metadata.parent_id`` plus a child
     ``kind`` (D5): a shared ``topic`` is not a grouping key, and two entries
@@ -408,9 +442,9 @@ def _parent_id_in_meta(meta: Mapping[str, Any] | None) -> str | None:
     return None
 
 
-def _child_parent_id(result: Any) -> str | None:
-    """:func:`_parent_id_in_meta` for a search hit."""
-    return _parent_id_in_meta(getattr(result, 'metadata', None))
+def _search_hit_parent_id(hit: Any) -> str | None:
+    """:func:`child_parent_id` for a search hit."""
+    return child_parent_id(getattr(hit, 'metadata', None))
 
 
 def _is_mem0(result: Any) -> bool:
@@ -506,7 +540,7 @@ def _carve_outs_allow_suppression(
     * UNRESOLVABLE PARENT — a dangling ``parent_id`` must never make a child's
       content unreachable, so an unresolved parent suppresses nothing;
     * CONTESTED (D6 / esc-5712) — a correction must never be demoted to a
-      truncated digest under the entry it contests;
+      capped amendment entry under the entry it contests;
     * FAILED or EMPTY GROUPING — we never learned what that parent's children
       are (a backend fault, or a count that disagrees with the hit in hand), so
       we cannot claim this child is represented there.
@@ -526,13 +560,13 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
 
     Suppressing a child is only honest when the block that replaces it actually
     carries it, and two live paths break that: a matched amendment beyond
-    ``_AMENDMENT_DIGEST_CAP`` (the retained sample is arbitrary — see
-    :func:`_digest_sort_key`) and ANY matched sighting, which the
-    amendment-only digest scroll can never list.  In both, the matched id and
-    its text would vanish from the response entirely.
+    ``AMENDMENT_LIST_CAP`` (the retained sample is arbitrary — see
+    :func:`_amendment_sort_key`) and ANY matched sighting, which the
+    amendment-only scroll can never list.  In both, the matched id and its
+    text would vanish from the response entirely.
 
     The body is taken from the hit ALREADY IN HAND — zero extra backend reads —
-    and carried in FULL rather than truncated to ``_DIGEST_CHARS``: that text
+    and carried in FULL rather than cut by :func:`amendment_text`: that text
     was in the response before grouping, so cutting it here would BE the
     retrieval regression.  Each pinned body appears exactly once, so the
     grouped response can never exceed the ungrouped one it replaces.
@@ -540,13 +574,12 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     Pins land in a SEPARATE ``matched_children`` list, never in ``amendments``:
     a sighting is not an amendment, and ``amendment_count`` / ``truncated``
     must keep meaning exactly what the count API said.  When the child is
-    already listed as a digest (the common in-cap amendment case) that entry is
-    marked in place and GAINS THE FULL BODY rather than being duplicated into a
-    second list — a digest alone is truncated to ``_DIGEST_CHARS``, so marking
-    it and stopping there would hand back strictly less text than the ungrouped
-    response carried, which is the very regression this function exists to
-    stop.  ``digest`` keeps its own meaning (the bounded pointer every listed
-    amendment carries); ``content`` is added ALONGSIDE it.
+    already listed (the common in-cap amendment case) that entry is marked in
+    place and its ``content`` is REPLACED BY THE FULL BODY rather than the
+    child being duplicated into a second list — a listed entry's text is cut
+    at the amendment text cap, so marking it and stopping there would hand
+    back less text than the ungrouped response carried, which is the very
+    regression this function exists to stop.
 
     A pinned entry also carries the child's ORIGIN-PROJECT TAGS and
     supersession mark (see :func:`_nested_entry_metadata`) alongside ``kind``,
@@ -562,20 +595,20 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
         # Not pinnable and not verifiable; the caller keeps such a hit.
         return
     body = getattr(hit, 'content', '') or ''
-    for digest in block.get('amendments') or []:
-        if digest.get('id') == child_id:
+    for listed in block.get('amendments') or []:
+        if listed.get('id') == child_id:
             # No re-stamp of the projected metadata here, deliberately: this
-            # entry came from :func:`_digest_entry`, which already projected it
+            # entry came from :func:`_amendment_entry`, which already projected it
             # from the RAW Qdrant payload — a superset of the normalised
             # ``hit.metadata`` read below — so re-stamping could only introduce
             # a disagreement between two reads of the same record.  The
             # asymmetry is intent, not oversight.
-            digest['matched'] = True
-            # Unconditional, not "only when the digest was cut": the invariant
+            listed['matched'] = True
+            # Unconditional, not "only when the text was cut": the invariant
             # a consumer can rely on is "a matched entry carries the body the
             # ungrouped response would have shown", and a rule with an
             # is-it-long-enough branch is one a reader has to re-derive.
-            digest['content'] = body
+            listed['content'] = body
             return
     pinned: list[dict[str, Any]] = block.setdefault(MATCHED_CHILDREN_KEY, [])
     if any(entry.get('id') == child_id for entry in pinned):
@@ -597,8 +630,9 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
 def _represented_ids(parent_block: Mapping[str, Any] | None) -> set[str]:
     """Every child id *parent_block* demonstrably accounts for.
 
-    A digest names the child it summarises; a pin (:func:`_pin_matched_child`)
-    carries the child's full body.  Either is representation; nothing else is.
+    A listed amendment names the child whose text it carries; a pin
+    (:func:`_pin_matched_child`) carries the child's full body.  Either is
+    representation; nothing else is.
     """
     block = parent_block or {}
     ids: set[str] = set()
@@ -646,6 +680,8 @@ async def group_search_results(
     service: Any,
     project_id: str,
     results: Sequence[Any],
+    *,
+    amendment_text_chars: int = DEFAULT_AMENDMENT_TEXT_CHARS,
 ) -> list[dict[str, Any]]:
     """Collapse child hits into their parents' grouped documents, in rank order.
 
@@ -669,6 +705,7 @@ async def group_search_results(
         own warning) — this function returns a plain ``list``.  Read those
         attributes BEFORE calling it.
     """
+    _require_positive_text_cap(amendment_text_chars)
     hits = list(results)
     # NON-EMPTY is part of "usable id" everywhere in this module: mem0 hits are
     # built with ``id=item.get('id', '')``, so '' is reachable, and it is not an
@@ -682,7 +719,7 @@ async def group_search_results(
     child_parents = {
         index: parent_id
         for index, hit in enumerate(hits)
-        if (parent_id := _child_parent_id(hit)) is not None
+        if (parent_id := _search_hit_parent_id(hit)) is not None
     }
     absent = [
         parent_id
@@ -702,7 +739,7 @@ async def group_search_results(
                 hit_id
                 for hit in hits
                 if _is_mem0(hit)
-                and _child_parent_id(hit) is None
+                and _search_hit_parent_id(hit) is None
                 and isinstance(hit_id := getattr(hit, 'id', None), str)
                 and hit_id  # '' is not an id: probing it costs a guaranteed-zero count
             ]
@@ -718,7 +755,10 @@ async def group_search_results(
     # would be an up-to-1000-wide burst of Qdrant counts on the hottest read
     # path, contending with the search that produced the hits.
     blocks = await _bounded_gather(
-        build_grouped_document(service, project_id, target_id) for target_id in groupable
+        build_grouped_document(
+            service, project_id, target_id, amendment_text_chars=amendment_text_chars,
+        )
+        for target_id in groupable
     )
     block_by_id: dict[str, Any] = {}
     for target_id, block in zip(groupable, blocks, strict=True):
@@ -739,7 +779,7 @@ async def group_search_results(
     # PIN every child that is about to be swallowed into its parent's block,
     # BEFORE any suppression decision is taken.  Suppressing a child is only
     # honest when the block that replaces it demonstrably carries it, and the
-    # digest list alone does not: a matched amendment beyond the cap or ANY
+    # amendment list alone does not: a matched amendment beyond the cap or ANY
     # matched sighting is absent from it.  Pinning satisfies both goals at once
     # — the canonical still absorbs its children (esc-5541) and the matched
     # text stays reachable (D6) — at zero extra backend reads.
@@ -806,6 +846,8 @@ async def group_memory_document(
     project_id: str,
     memory_id: str,
     record: Mapping[str, Any],
+    *,
+    amendment_text_chars: int = DEFAULT_AMENDMENT_TEXT_CHARS,
 ) -> dict[str, Any] | None:
     """The grouped block for an EXACT point-id read, or ``None`` when there is none.
 
@@ -834,13 +876,18 @@ async def group_memory_document(
     satisfy D6 — a child's content is never unreachable — one by keeping the
     child, the other by surfacing the group.
     """
-    parent_id = _parent_id_in_meta(record.get('metadata'))
+    _require_positive_text_cap(amendment_text_chars)
+    parent_id = child_parent_id(record.get('metadata'))
     if parent_id is None:
-        return await build_grouped_document(service, project_id, memory_id)
+        return await build_grouped_document(
+            service, project_id, memory_id, amendment_text_chars=amendment_text_chars,
+        )
     # Independent reads, so issued together: the parent's grouping and the
     # existence probe that says whether the pointer resolves at all.
     block, parent_record = await gather_collect((
-        build_grouped_document(service, project_id, parent_id),
+        build_grouped_document(
+            service, project_id, parent_id, amendment_text_chars=amendment_text_chars,
+        ),
         service.get_memory_by_id(project_id=project_id, memory_id=parent_id),
     ))
     parent: dict[str, Any] = {'id': parent_id}

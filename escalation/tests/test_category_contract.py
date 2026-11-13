@@ -12,10 +12,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
-from _filing_tools import call_blocker, call_info
+from _filing_tools import call_blocker, call_info, call_promote
 
 from escalation.categories import (
     EscalationCategory,
@@ -28,7 +27,6 @@ from escalation.server import create_server
 
 _REGISTERED_AHEAD_OF_ANY_PRODUCER = (
     'milestone_check_stalled',
-    'review_due',
 )
 
 _AGENT_INSTRUCTED = (
@@ -215,11 +213,6 @@ class TestQueueChokepoint:
 _FILING = {'task_id': 't1', 'agent_role': 'implementer', 'summary': 's'}
 
 
-async def _promote(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('promote_to_l2')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
 class TestMcpToolGate:
     @pytest.fixture
@@ -253,7 +246,7 @@ class TestMcpToolGate:
         )
         queue.submit(member)
 
-        result = await _promote(
+        result = await call_promote(
             create_server(queue),
             task_id='t1',
             agent_role='escalation-watcher-auto',

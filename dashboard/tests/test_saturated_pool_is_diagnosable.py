@@ -7,6 +7,12 @@ like a dead endpoint. The fake saturates at the transport layer, so the real
 fan-out seam (``first_success``, the shielded exchange, ``safe_gather_result``)
 is exercised rather than stubbed.
 
+The two route scenarios run through ``httpx.ASGITransport`` on
+``shared/src/shared/testing_virtual_clock.py::virtual_clock_test``: TestClient's
+portal loop runs on the host clock, where a stall can expire an enclosing
+deadline before the pool's own failure is observed. The curator scenario's host
+stall is what pins that.
+
 Each per-request budget is a private module constant with no config seam (the
 same constants ``test_app_http_limits.py`` and ``test_metrics_curator.py``
 patch), so the dotted paths below are the one place these tests name them.
@@ -19,17 +25,21 @@ than a named ``PoolTimeout``.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
+import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import aiosqlite
 import httpx
 import pytest
+from shared.testing_virtual_clock import virtual_clock_test
 
+from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalations, merge_halt, merge_queue, task_runtime, task_snapshot
 from dashboard.data import memory as memory_data
+from dashboard.data.db import DbPool
 from dashboard.data.metrics import METRICS_SCHEMA, collect_metrics_snapshot
 
 _SATURATED_URL = 'http://saturated-pool.test'
@@ -43,53 +53,45 @@ _MEMORY_BUDGET = 'dashboard.api.memory._MEMORY_ENDPOINT_TIMEOUT_SECONDS'
 _SAMPLER_BUDGET = 'dashboard.data.metrics._HTTP_SAMPLER_TIMEOUT_SECONDS'
 _SNAPSHOT_BUDGET = 'dashboard.data.task_snapshot.PER_CALL_TIMEOUT'
 _FAST_BUDGET_SECONDS = 0.05
+_HOST_STALL_SECONDS = memory_data.enclosing_deadline(_FAST_BUDGET_SECONDS)
 
 
 class _SaturatedPoolTransport(httpx.AsyncBaseTransport):
     """httpcore on a full pool: wait out THIS request's pool budget, then raise.
 
-    The message is empty because that is how httpcore raises it.
+    The message is empty because that is how httpcore raises it. A non-zero
+    *host_stall_seconds* blocks the loop thread before raising, as a starved
+    xdist worker does: the wall clock moves while the event loop cannot run.
     """
+
+    def __init__(self, host_stall_seconds: float = 0.0) -> None:
+        self._host_stall_seconds = host_stall_seconds
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(request.extensions['timeout']['pool'])
+        time.sleep(self._host_stall_seconds)
         raise httpx.PoolTimeout('')
 
 
 @pytest.fixture()
-def saturated_app(client, monkeypatch):
-    """The isolated-lifespan TestClient, pointed at a saturated pool.
+def fresh_mcp_sessions():
+    """Reset the process-global MCP session cache on both sides.
 
-    The URL is unique to this module so no background sampler shares a
-    failure-streak key with it and demotes the asserted WARNING to DEBUG.
+    It is keyed by URL, so no cached session lets a test skip the saturated
+    handshake, and none outlives the test. The fan-out failure streaks keyed by
+    the same URL are reset with it, so no earlier test demotes an asserted
+    WARNING to DEBUG.
     """
     memory_data.reset_sessions()
-    monkeypatch.setattr(
-        client.app.state,
-        'config',
-        dataclasses.replace(client.app.state.config, fused_memory_urls=[_SATURATED_URL]),
-    )
-    monkeypatch.setattr(
-        client.app.state,
-        'http_client',
-        httpx.AsyncClient(transport=_SaturatedPoolTransport()),
-    )
-    yield client
+    yield
     memory_data.reset_sessions()
 
 
 @pytest.fixture()
-async def saturated_client():
-    """An ``httpx.AsyncClient`` over ``_SaturatedPoolTransport``.
-
-    The MCP session cache is process-global and keyed by URL, so it is reset on
-    both sides: no cached session lets a test skip the saturated handshake, and
-    none outlives the test.
-    """
-    memory_data.reset_sessions()
+async def saturated_client(fresh_mcp_sessions):
+    """An ``httpx.AsyncClient`` over ``_SaturatedPoolTransport``."""
     async with httpx.AsyncClient(transport=_SaturatedPoolTransport()) as client:
         yield client
-    memory_data.reset_sessions()
 
 
 @pytest.fixture()
@@ -108,11 +110,34 @@ def _warnings(caplog: pytest.LogCaptureFixture, logger_name: str) -> list[str]:
     ]
 
 
-def test_curator_legs_name_pool_timeout(saturated_app, caplog, monkeypatch):
+async def _get_saturated_route(
+    path: str, project_root: Path, transport: _SaturatedPoolTransport,
+) -> httpx.Response:
+    """GET *path* from the dashboard app, its MCP egress on *transport*, on the calling loop."""
+    config = DashboardConfig(project_root=project_root, fused_memory_urls=[_SATURATED_URL])
+    pool = DbPool()
+    async with httpx.AsyncClient(transport=transport) as mcp:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(app.state, 'config', config, raising=False)
+            mp.setattr(app.state, 'db', pool, raising=False)
+            mp.setattr(app.state, 'http_client', mcp, raising=False)
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url='http://test',
+                ) as client:
+                    return await client.get(path)
+            finally:
+                await pool.close_all()
+
+
+@virtual_clock_test
+async def test_curator_legs_name_pool_timeout(fresh_mcp_sessions, tmp_path, caplog, monkeypatch):
     monkeypatch.setattr(_CURATOR_BUDGET, _FAST_BUDGET_SECONDS)
 
     with caplog.at_level(logging.WARNING):
-        resp = saturated_app.get('/api/v2/dashboard/curator')
+        resp = await _get_saturated_route(
+            '/api/v2/dashboard/curator', tmp_path, _SaturatedPoolTransport(_HOST_STALL_SECONDS),
+        )
 
     assert resp.status_code == 200
     fanout = _warnings(caplog, _FANOUT_LOGGER)
@@ -136,11 +161,14 @@ def test_curator_legs_name_pool_timeout(saturated_app, caplog, monkeypatch):
     )
 
 
-def test_memory_route_names_pool_timeout(saturated_app, caplog, monkeypatch):
+@virtual_clock_test
+async def test_memory_route_names_pool_timeout(fresh_mcp_sessions, tmp_path, caplog, monkeypatch):
     monkeypatch.setattr(_MEMORY_BUDGET, _FAST_BUDGET_SECONDS)
 
     with caplog.at_level(logging.WARNING):
-        resp = saturated_app.get('/api/v2/dashboard/memory')
+        resp = await _get_saturated_route(
+            '/api/v2/dashboard/memory', tmp_path, _SaturatedPoolTransport(),
+        )
 
     assert resp.status_code == 200
     fanout = _warnings(caplog, _FANOUT_LOGGER)

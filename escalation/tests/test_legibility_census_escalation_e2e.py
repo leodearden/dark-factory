@@ -46,7 +46,15 @@ if (_LEGIBILITY_DIR := str(Path(_SCRIPTS_DIR) / 'legibility')) not in sys.path:
 
 # The package form keeps ONE `legibility.alarm` module object, the one that
 # holds `own_endpoint`'s grant.
-from legibility import alarm, census, check_transcript_persistence, check_trickle_health, nightly
+from legibility import (
+    alarm,
+    census,
+    census_run,
+    check_transcript_persistence,
+    check_trickle_health,
+    config,
+    nightly,
+)
 
 # WHY `with alarm.own_endpoint():` AROUND EVERY REAL POST BELOW.
 #
@@ -109,7 +117,7 @@ def _live_config_path(tmp_path, port):
 
 def _live_cfg(tmp_path, port):
     """A LegibilityConfig pointed at *port*."""
-    return census.config.load_config(_live_config_path(tmp_path, port))
+    return config.load_config(_live_config_path(tmp_path, port))
 
 
 def _the_one_escalation(queue):
@@ -180,7 +188,7 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
     def _raising_run_census(**kwargs):
         raise RuntimeError(_RAISED_MESSAGE)
 
-    monkeypatch.setattr(census, 'run_census', _raising_run_census)
+    monkeypatch.setattr(census_run, 'run_census', _raising_run_census)
 
     with alarm.own_endpoint():
         exit_code = census.main(['--project-root', str(project_root), '--force'])

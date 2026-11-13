@@ -32,9 +32,10 @@ import logging
 import os
 import pathlib
 import types
+from collections.abc import Iterable
+from typing import NamedTuple
 
 import pytest
-from _ast_guard import parse_python_module
 from _store_mutation_preflight_contract import (
     FAIL_CLOSED_MARKERS,
     SENTINEL,
@@ -42,11 +43,15 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
+from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -437,12 +442,14 @@ TESTS_DIR = pathlib.Path(__file__).parent
 # real-time budget approaching 60s MUST set @pytest.mark.timeout(N) to opt up
 # -- otherwise a single slow run takes down the whole suite."
 #
-# These three qualify since the sweep went recursive: each parses/walks 328
-# modules (~1.46M AST nodes), measured at 20-49s per sweep on a machine at load
-# average 290. That is 82% of the default cap, i.e. inside its noise band --
-# and the failure it would cause is a whole-suite deadlock, not a red test.
-# Sized at 5x the observed worst case: this is a backstop against a genuine
-# hang, NOT a performance assertion, so it must not trip on load alone.
+# These three qualify because they share one recursive sweep,
+# `preflight_sweep`: it parses and walks 328 modules (~1.46M AST nodes),
+# measured at 20-49s per sweep on a machine at load average 290. pytest-timeout
+# arms over setup too, so that sweep is charged to whichever of the three runs
+# first. That is 82% of the default cap, i.e. inside its noise band -- and the
+# failure it would cause is a whole-suite deadlock, not a red test. Sized at 5x
+# the observed worst case: this is a backstop against a genuine hang, NOT a
+# performance assertion, so it must not trip on load alone.
 _SWEEP_TIMEOUT = 300
 
 # The name every one of the 14 suites gave its hand-rolled autouse fixture
@@ -527,6 +534,35 @@ def _neutralising_autouse_fixture(node: ast.AST) -> bool:
     return any(_neutralises_the_guard(stmt) for stmt in node.body)
 
 
+def _raises_store_mutation_unavailable(node: ast.Raise) -> bool:
+    """Whether *node* raises the sentinel itself; guard #2's shape."""
+    return node.exc is not None and 'StoreMutationUnavailable' in ast.unparse(node.exc)
+
+
+# Guarding the marker LITERAL rather than a `_fail_closed_records` function
+# name is the stronger check: it also catches a re-divergence that inlines the
+# filter into a test body, or renames the helper.
+#
+# Guards the FAIL-CLOSED marker only -- `FAIL_CLOSED_MARKERS[0]`, not the whole
+# tuple -- and that is deliberate, not an arity oversight. Measured 2026-09-04
+# across all 328 test modules: the fail-closed marker appears as an
+# `ast.Constant` in 0 of them, while the remedy noun (`FAIL_CLOSED_MARKERS[1]`)
+# appears in 48, because it is ordinary English that unrelated suites have
+# every right to mention. Sweeping the whole tuple would buy 48 false positives
+# and an allowlist, which is self-defeating for a drift guard -- the same
+# reasoning guard #2 gives for keying on the `raise` shape rather than setattr.
+#
+# The narrower sweep is still sufficient for the property that matters: the two
+# markers travel together in one tuple, and a suite inlining the diagnosis has
+# to spell the distinctive half in order to match a real record.
+_GUARDED_MARKER = FAIL_CLOSED_MARKERS[0]
+
+
+def _spells_the_guarded_marker(node: ast.Constant) -> bool:
+    """Whether *node* is a str literal carrying the marker; guard #3's shape."""
+    return isinstance(node.value, str) and _GUARDED_MARKER in node.value
+
+
 def _test_modules() -> list[pathlib.Path]:
     """Every collected test module in this TREE, in a stable order.
 
@@ -547,16 +583,63 @@ def _test_modules() -> list[pathlib.Path]:
     Cost: 328 modules and ~1.46M AST nodes, against 257 modules / ~1.25M nodes
     top-level. Wall clock is dominated by the parse and swings widely with
     machine load (6-23s measured for the identical work on 2026-09-04), so no
-    figure is pinned here. What is structural: the parse is paid ONCE per
-    session, not once per guard — `parse_python_module` is `functools.cache`d on
-    the path, so the three guards below share it, and each then pays only its
-    own `ast.walk` (~2-5s).
+    figure is pinned here. What is structural: one pass, `_sweep_test_modules`,
+    serves all three guards on one pinned xdist worker (`_SWEEP_GROUP_NAME`).
     """
     return sorted(
         path
         for path in TESTS_DIR.rglob('test_*.py')
         if '__pycache__' not in path.parts
     )
+
+
+class _PreflightSweep(NamedTuple):
+    """Each guard's offender labels, in path order and then walk order."""
+
+    hand_rolled_fixtures: tuple[str, ...]
+    deny_raisers: tuple[str, ...]
+    inlined_markers: tuple[str, ...]
+
+
+def _sweep_test_modules(paths: Iterable[pathlib.Path], *, root: pathlib.Path) -> _PreflightSweep:
+    """Parse and walk each module ONCE, classifying every node for all three guards.
+
+    Keeps labels, not trees: a plain `ast.parse` rather than the
+    `functools.cache`d `_ast_guard.parse_python_module`, so each tree is
+    released after its module instead of being pinned for the worker's whole
+    session.
+    """
+    hand_rolled_fixtures: list[str] = []
+    deny_raisers: list[str] = []
+    inlined_markers: list[str] = []
+    for path in paths:
+        rel = path.relative_to(root)
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == _HAND_ROLLED_FIXTURE_NAME:
+                    hand_rolled_fixtures.append(f'{rel}:{node.lineno}:{node.name} (name)')
+                elif _neutralising_autouse_fixture(node):
+                    hand_rolled_fixtures.append(f'{rel}:{node.lineno}:{node.name} (shape)')
+            elif isinstance(node, ast.Raise) and _raises_store_mutation_unavailable(node):
+                deny_raisers.append(f'{rel}:{node.lineno}')
+            elif isinstance(node, ast.Constant) and _spells_the_guarded_marker(node):
+                inlined_markers.append(f'{rel}:{node.lineno}')
+    return _PreflightSweep(
+        hand_rolled_fixtures=tuple(hand_rolled_fixtures),
+        deny_raisers=tuple(deny_raisers),
+        inlined_markers=tuple(inlined_markers),
+    )
+
+
+# One loadgroup worker runs the three sweep consumers, so `preflight_sweep` is
+# built once per run rather than once per worker that drew one of them.
+_SWEEP_GROUP_NAME = 'store_mutation_preflight_sweep'
+
+
+@pytest.fixture(scope='module')
+def preflight_sweep() -> _PreflightSweep:
+    return _sweep_test_modules(_test_modules(), root=TESTS_DIR)
 
 
 class TestNoHandRolledNeutraliseFixture:
@@ -573,22 +656,16 @@ class TestNoHandRolledNeutraliseFixture:
     under ANY name whose body rebinds `assert_store_mutation_allowed`, which is
     what a rename would actually look like. The second is the one with teeth.
 
-    Asserts over PARSED source (`_ast_guard.parse_python_module`), so prose in a
+    Asserts over PARSED source (the shared `preflight_sweep`), so prose in a
     docstring that merely names the old fixture cannot trip it.
     """
 
+    @pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
     @pytest.mark.timeout(_SWEEP_TIMEOUT)
-    def test_no_test_module_defines_its_own_neutralise_fixture(self) -> None:
-        offenders: list[str] = []
-        for path in _test_modules():
-            tree = parse_python_module(path)
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                if node.name == _HAND_ROLLED_FIXTURE_NAME:
-                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}:{node.name} (name)')
-                elif _neutralising_autouse_fixture(node):
-                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}:{node.name} (shape)')
+    def test_no_test_module_defines_its_own_neutralise_fixture(
+        self, preflight_sweep: _PreflightSweep
+    ) -> None:
+        offenders = preflight_sweep.hand_rolled_fixtures
 
         assert not offenders, (
             f'{len(offenders)} hand-rolled neutralising fixture(s) found — an '
@@ -626,18 +703,12 @@ class TestNoHandRolledDenyRaiser:
     so the assertion sites that name the exception are untouched.
     """
 
+    @pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
     @pytest.mark.timeout(_SWEEP_TIMEOUT)
-    def test_no_test_module_raises_store_mutation_unavailable(self) -> None:
-        offenders: list[str] = []
-        for path in _test_modules():
-            tree = parse_python_module(path)
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Raise)
-                    and node.exc is not None
-                    and 'StoreMutationUnavailable' in ast.unparse(node.exc)
-                ):
-                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}')
+    def test_no_test_module_raises_store_mutation_unavailable(
+        self, preflight_sweep: _PreflightSweep
+    ) -> None:
+        offenders = preflight_sweep.deny_raisers
 
         assert not offenders, (
             f'{len(offenders)} hand-rolled `StoreMutationUnavailable` raiser(s) '
@@ -651,25 +722,6 @@ class TestNoHandRolledDenyRaiser:
 # ---------------------------------------------------------------------------
 # Drift guard #3 — the fail-closed marker literal lives only in the helper
 # ---------------------------------------------------------------------------
-
-# Guarding the marker LITERAL rather than a `_fail_closed_records` function
-# name is the stronger check: it also catches a re-divergence that inlines the
-# filter into a test body, or renames the helper.
-#
-# Guards the FAIL-CLOSED marker only -- `FAIL_CLOSED_MARKERS[0]`, not the whole
-# tuple -- and that is deliberate, not an arity oversight. Measured 2026-09-04
-# across all 328 test modules: the fail-closed marker appears as an
-# `ast.Constant` in 0 of them, while the remedy noun (`FAIL_CLOSED_MARKERS[1]`)
-# appears in 48, because it is ordinary English that unrelated suites have
-# every right to mention. Sweeping the whole tuple would buy 48 false positives
-# and an allowlist, which is self-defeating for a drift guard -- the same
-# reasoning guard #2 gives for keying on the `raise` shape rather than setattr.
-#
-# The narrower sweep is still sufficient for the property that matters: the two
-# markers travel together in one tuple, and a suite inlining the diagnosis has
-# to spell the distinctive half in order to match a real record.
-_GUARDED_MARKER = FAIL_CLOSED_MARKERS[0]
-
 
 class TestNoInlinedFailClosedMarker:
     """Whole-tree AST drift guard: the fail-closed marker may not be spelled in
@@ -690,18 +742,12 @@ class TestNoInlinedFailClosedMarker:
     and are correctly outside this sweep.
     """
 
+    @pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
     @pytest.mark.timeout(_SWEEP_TIMEOUT)
-    def test_no_test_module_spells_the_fail_closed_marker(self) -> None:
-        offenders: list[str] = []
-        for path in _test_modules():
-            tree = parse_python_module(path)
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Constant)
-                    and isinstance(node.value, str)
-                    and _GUARDED_MARKER in node.value
-                ):
-                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}')
+    def test_no_test_module_spells_the_fail_closed_marker(
+        self, preflight_sweep: _PreflightSweep
+    ) -> None:
+        offenders = preflight_sweep.inlined_markers
 
         assert not offenders, (
             f'{len(offenders)} inlined `{_GUARDED_MARKER}` literal(s) found. '
@@ -710,3 +756,117 @@ class TestNoInlinedFailClosedMarker:
             "'<the script's logger name>')` instead, so the fail-closed "
             'marker is spelled once:\n  ' + '\n  '.join(offenders)
         )
+
+
+# ---------------------------------------------------------------------------
+# The one pass the three guards share
+# ---------------------------------------------------------------------------
+
+
+def _write_module(root: pathlib.Path, rel: str, source: str) -> pathlib.Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding='utf-8')
+    return path
+
+
+_SHAPED_FIXTURE_BODY = (
+    "    monkeypatch.setattr(mod, 'assert_store_mutation_allowed', lambda **_kw: None)\n"
+)
+
+
+class TestSweepTestModules:
+    def test_the_historical_fixture_name_is_flagged_by_name(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(
+            tmp_path, 'test_a.py', f'def {_HAND_ROLLED_FIXTURE_NAME}():\n    pass\n'
+        )
+
+        sweep = _sweep_test_modules([path], root=tmp_path)
+
+        assert sweep.hand_rolled_fixtures == (f'test_a.py:1:{_HAND_ROLLED_FIXTURE_NAME} (name)',)
+
+    def test_an_autouse_fixture_rebinding_the_guard_is_flagged_by_shape(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'import pytest\n\n\n'
+            '@pytest.fixture(autouse=True)\n'
+            'def _no_preflight(monkeypatch):\n' + _SHAPED_FIXTURE_BODY,
+        )
+
+        sweep = _sweep_test_modules([path], root=tmp_path)
+
+        assert sweep.hand_rolled_fixtures == ('test_a.py:5:_no_preflight (shape)',)
+
+    def test_a_non_autouse_fixture_rebinding_the_guard_is_not_flagged(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'import pytest\n\n\n'
+            '@pytest.fixture\n'
+            'def _rigged(monkeypatch):\n' + _SHAPED_FIXTURE_BODY,
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).hand_rolled_fixtures == ()
+
+    def test_a_raise_of_the_sentinel_is_a_deny_raiser(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(
+            tmp_path, 'test_a.py', "def f():\n    raise mod.StoreMutationUnavailable('x')\n"
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).deny_raisers == ('test_a.py:2',)
+
+    def test_an_assertion_naming_the_sentinel_is_not_a_deny_raiser(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'def f():\n    with pytest.raises(StoreMutationUnavailable):\n        pass\n',
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).deny_raisers == ()
+
+    def test_a_string_carrying_the_marker_is_an_inlined_marker(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(tmp_path, 'test_a.py', f'X = {FAIL_CLOSED_MARKERS[0]!r}\n')
+
+        assert _sweep_test_modules([path], root=tmp_path).inlined_markers == ('test_a.py:1',)
+
+    def test_a_clean_module_reports_nothing(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(tmp_path, 'test_a.py', 'def test_ok():\n    assert True\n')
+
+        assert _sweep_test_modules([path], root=tmp_path) == _PreflightSweep(
+            hand_rolled_fixtures=(), deny_raisers=(), inlined_markers=()
+        )
+
+    def test_labels_follow_the_path_order_and_are_relative_to_the_root(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        raiser = "def f():\n    raise StoreMutationUnavailable('x')\n"
+        later = _write_module(tmp_path, 'test_z.py', raiser)
+        nested = _write_module(tmp_path, 'sub/test_b.py', raiser)
+
+        sweep = _sweep_test_modules([later, nested], root=tmp_path)
+
+        assert sweep.deny_raisers == ('test_z.py:2', 'sub/test_b.py:2')
+
+
+def test_the_tree_sweeps_share_one_xdist_worker(request: pytest.FixtureRequest) -> None:
+    sweeps = {
+        TestNoHandRolledNeutraliseFixture.test_no_test_module_defines_its_own_neutralise_fixture,
+        TestNoHandRolledDenyRaiser.test_no_test_module_raises_store_mutation_unavailable,
+        TestNoInlinedFailClosedMarker.test_no_test_module_spells_the_fail_closed_marker,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, 'function', None) in sweeps
+    ]
+    if not selected:
+        pytest.skip('no tree sweep is selected in this session')
+
+    assert single_xdist_group(selected) == _SWEEP_GROUP_NAME

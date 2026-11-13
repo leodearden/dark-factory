@@ -23,7 +23,7 @@ import contextlib
 from pathlib import Path
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, RecordingEscalations
+from _merge_lane_fakes import FakeClock, FakeVerifier, RecordingEscalations, lane_scene_config
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -77,7 +77,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_branch_with_file(
@@ -394,21 +394,21 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     git_ops: GitOps,
     config: OrchestratorConfig,
 ) -> None:
-    """Within-cap verifier restart must NOT clear _inflight or _redispatch.
+    """Within-cap verifier restart must NOT clear _inflight or the redispatch park.
 
     The supervisor path (_spawn_loop + _on_loop_task_done restart branch) must
-    never touch self._inflight, self._redispatch, or the seeded entries' result
+    never touch self._inflight, self._intake.pending_redispatch(), or the seeded entries' result
     Futures.  The restarted _verifier_loop naturally resumes draining them
     (_finalize_inflight's `if not req.result.done()` guard makes re-finalization
     idempotent).
 
     Procedure:
-      1. Seed worker._redispatch with one DecidedItem (request 'sv7-park').
+      1. Seed worker._intake.pending_redispatch() with one DecidedItem (request 'sv7-park').
       2. Seed worker._inflight with an InflightEntry (verify_task=None) wrapping
          a second, distinct DecidedItem (request 'sv7-task').
       3. Replace _verifier_loop with an idle stub.
       4. Build a dead task (RuntimeError) and invoke _on_loop_task_done directly.
-      5. Assert: escalation submitted, new task spawned, _redispatch and _inflight
+      5. Assert: escalation submitted, new task spawned, redispatch park and _inflight
          unchanged, Future not resolved.
     """
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -450,7 +450,7 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     )
 
     # Seed the instance deques
-    worker._redispatch.append(parked_item)
+    worker._intake.request_redispatch(parked_item)
     worker._inflight.append(inflight_entry)
 
     # Replace _verifier_loop with an idle stub so the spawned restart task

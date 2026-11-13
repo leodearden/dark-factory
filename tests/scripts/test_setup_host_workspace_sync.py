@@ -5,6 +5,7 @@ The slice runs with `uv` replaced by a recording stub, so nothing is installed.
 
 import pathlib
 
+import pytest
 from setup_host_sections import (
     REPO_ROOT,
     run_section,
@@ -12,6 +13,9 @@ from setup_host_sections import (
     stub_bin_dir,
     write_stub,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _START = 'info "Syncing Python'
 _END = 'info "Installing fused-memory systemd unit"'

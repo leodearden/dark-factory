@@ -1,0 +1,18 @@
+{
+  "task_id": "8507",
+  "reason": "Net-additive (task 8507): orchestrator/tests/conftest.py puts the new orchestrator/tests/cross_suite_helpers/ directory on sys.path with the same idempotent not-in-sys.path guard as its four sibling import roots, so orchestrator tests import the relocated _fake_t3_server statically. Folding the five guards into one loop would lower the measure but breaks tests/scripts/test_pytest_workspace_collection.py::test_subproject_conftests_add_tests_dir_to_sys_path, which pins the literal sys.path.insert(0, str(_TESTS_DIR)), and orphans the _SRC/_SHARED_SRC/_ESCALATION_SRC names cited by fused-memory/tests/conftest.py and orchestrator/tests/test_deterministic_runner.py.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 50,
+      "current": 51
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5066,
+      "current": 5067
+    }
+  ]
+}

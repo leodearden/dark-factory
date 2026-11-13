@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import pytest
 
-from shared.secret_env import agent_subprocess_env, is_secret_env_name, secret_env_values
+from shared.secret_env import (
+    agent_subprocess_env,
+    is_secret_env_name,
+    secret_env_values,
+    without_agent_endpoint_vars,
+)
 
 SECRET_NAMES = (
     'CLAUDE_OAUTH_TOKEN_A',
@@ -17,6 +22,7 @@ SECRET_NAMES = (
     'CLAUDE_CODE_OAUTH_TOKEN',
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_OAUTH_TOKEN',
+    'ANTHROPIC_AUTH_TOKEN',
     'OPENAI_API_KEY',
     'GEMINI_API_KEY',
     'PERPLEXITY_API_KEY',
@@ -99,6 +105,16 @@ class TestAgentSubprocessEnv:
         child = agent_subprocess_env(_environ_with_secrets())
         assert {k for k in child if is_secret_env_name(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
 
+    def test_drops_a_proxied_shells_endpoint_selection(self):
+        environ = {
+            **_environ_with_secrets(),
+            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8317',
+            'ANTHROPIC_AUTH_TOKEN': 'proxy-' + 'x' * 40,
+        }
+        child = agent_subprocess_env(environ)
+        assert 'ANTHROPIC_BASE_URL' not in child
+        assert 'ANTHROPIC_AUTH_TOKEN' not in child
+
     def test_drops_python_env_selection(self):
         environ = {
             'VIRTUAL_ENV': '/srv/orch/.venv',
@@ -114,6 +130,26 @@ class TestAgentSubprocessEnv:
         assert child['PATH'] == '/usr/bin:/bin'
         assert child['CLAUDE_CODE_OAUTH_TOKEN'] == environ['CLAUDE_CODE_OAUTH_TOKEN']
         assert 'CLAUDE_OAUTH_TOKEN_A' not in child
+
+
+class TestWithoutAgentEndpointVars:
+    def test_drops_the_endpoint_and_its_client_key(self):
+        environ = {
+            **_environ_with_secrets(),
+            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8317',
+            'ANTHROPIC_AUTH_TOKEN': 'proxy-' + 'x' * 40,
+        }
+        child = without_agent_endpoint_vars(environ)
+        assert 'ANTHROPIC_BASE_URL' not in child
+        assert 'ANTHROPIC_AUTH_TOKEN' not in child
+
+    def test_drops_python_env_selection(self):
+        child = without_agent_endpoint_vars({**ORDINARY_ENV, 'VIRTUAL_ENV': '/srv/orch/.venv'})
+        assert 'VIRTUAL_ENV' not in child
+
+    def test_keeps_every_other_credential(self):
+        environ = {**_environ_with_secrets(), 'HF_DOWNLOAD_TOKEN': 'hf-' + 'h' * 40}
+        assert without_agent_endpoint_vars(environ) == environ
 
 
 class TestSecretEnvValues:

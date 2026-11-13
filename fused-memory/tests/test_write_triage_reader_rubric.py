@@ -18,6 +18,8 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.server.grouped_read import DEFAULT_AMENDMENT_TEXT_CHARS, amendment_text
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'write_triage_reader_rubric.py'
 
 
@@ -768,17 +770,18 @@ class TestQuoteFound:
         assert not _mod().quote_found(quote, 'x needle here y')
 
 
+_CUT = DEFAULT_AMENDMENT_TEXT_CHARS
 _TAIL_WORDS = ' '.join(f'w{index:03d}' for index in range(60))
-_LONG_CHILD = 'a' * 100 + ' needle here ' + _TAIL_WORDS
-"""A child cut at 240: 'w010' lies wholly before the cut, 'w025' straddles it, 'w040' lies after."""
+_LONG_CHILD = 'a' * (_CUT - 140) + ' needle here ' + _TAIL_WORDS
+"""A child cut at the shipped amendment cap: 'w010' lies wholly before the cut, 'w025' straddles it, 'w040' lies after."""
 
 
 class TestDigestVisible:
     def test_the_fixture_straddles_the_cut_where_it_says(self) -> None:
         start = _LONG_CHILD.index('w025')
-        assert start < 240 < start + len('w025')
-        assert _LONG_CHILD.index('w040') > 240
-        assert _LONG_CHILD.index('w010') + len('w010') < 240
+        assert start < _CUT < start + len('w025')
+        assert _LONG_CHILD.index('w040') > _CUT
+        assert _LONG_CHILD.index('w010') + len('w010') < _CUT
 
     @pytest.mark.parametrize(('spans', 'visible'), [
         (['needle here'], True),
@@ -793,10 +796,15 @@ class TestDigestVisible:
     ) -> None:
         assert _mod().digest_visible(spans, _LONG_CHILD) is visible
 
-    @pytest.mark.parametrize('child', ['short text with a needle in it', 'b' * 236 + ' end'])
-    def test_a_child_of_240_characters_or_fewer_shows_every_span(self, child: str) -> None:
-        assert len(child) <= 240
+    @pytest.mark.parametrize('child', ['short text with a needle in it', 'b' * (_CUT - 4) + ' end'])
+    def test_a_child_no_longer_than_the_cap_shows_every_span(self, child: str) -> None:
+        assert len(child) <= _CUT
         assert _mod().digest_visible([child.split()[-1]], child)
+
+    def test_a_span_is_visible_exactly_when_it_lies_in_the_amendment_text_a_reader_sees(self) -> None:
+        shown = amendment_text(_LONG_CHILD)
+        for word in _LONG_CHILD.split():
+            assert _mod().digest_visible([word], _LONG_CHILD) is _mod().quote_found(word, shown), word
 
     def test_an_empty_span_list_is_refused(self) -> None:
         with pytest.raises(ValueError, match='span'):

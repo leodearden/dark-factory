@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import MockAddEpisodeResult, MockEdge, install_identity_mocks
+from _queued_write_fixtures import envelope, episode_write
 
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.dependency_direction_check import (
@@ -468,14 +469,11 @@ async def _write(
     result = _result(facts, field=field)
     svc.graphiti.add_episode = AsyncMock(return_value=result)
     return await svc._execute_graphiti_write(
-        'add_episode',
-        {
-            'name': 'ep',
-            'content': 'episode body',
-            'source': 'text',
-            'group_id': group_id,
-            'source_description': '',
-        },
+        episode_write(
+            envelope=envelope(group_id=group_id),
+            name='ep',
+            content='episode body',
+        ),
     )
 
 

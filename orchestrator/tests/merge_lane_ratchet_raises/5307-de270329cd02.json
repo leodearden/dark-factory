@@ -1,0 +1,36 @@
+{
+  "task_id": "5307",
+  "reason": "Net-additive safety work, not a refactor that failed. Task 5307 gates thin-warm-lane.sh's rm on a live process reference (T4, exit 75 shared with the flock refusal), so GitOps._run_thin_warm_lane's rc=75 DEBUG line can no longer claim 'flock held' for every 75: it now says 'busy' cause-neutrally and carries the script's stderr token (LANE_LOCK_CONTENDED:/LANE_LIVE_REF:). The git_ops.py +9 lines are all prose: the corrected exit-code taxonomy (75 now has two causes; 2 now includes a missing lib_live_refs.sh) and release_warm_lane's skip-not-defer statement, both pointing at the scripts README Delta 12. The +2 private_reads are a NEW test file, test_run_thin_warm_lane_live_ref.py, driving _run_thin_warm_lane against the real shipped script; release_warm_lane, the public caller, needs a configured pool and git lane and emits unrelated WARNINGs that collide with the test's no-WARNING assertion.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 15857,
+      "current": 15866
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9280,
+      "current": 9289
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57293,
+      "current": 57302
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6658,
+      "current": 6660
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31934,
+      "current": 31943
+    }
+  ]
+}
