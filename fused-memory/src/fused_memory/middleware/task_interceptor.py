@@ -96,6 +96,7 @@ from fused_memory.middleware.curator_zot_duplicate_sweep import (
 from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.done_provenance import (
     GitProbeRunner,
+    StaleEvidenceMode,
     check_reopen_freshness,
     provenance_kind,
     provenance_stamp_now,
@@ -1864,13 +1865,13 @@ class TaskInterceptor:
                 # resolved_provenance in time to be persisted.
                 _reopen_freshness_err = await check_reopen_freshness(
                     task_id,
-                    resolved_provenance,
-                    done_provenance,
-                    before,
-                    project_root,
-                    agent_id,
-                    is_recon_stage_write,
-                    self._reject_stale_done_evidence_mode(),
+                    resolved_provenance=resolved_provenance,
+                    raw_done_provenance=done_provenance,
+                    before=before,
+                    project_root=project_root,
+                    agent_id=agent_id,
+                    is_recon_stage=is_recon_stage_write,
+                    mode=self._reject_stale_done_evidence_mode(),
                     git_runner=self._git_runner,
                 )
                 if _reopen_freshness_err is not None:
@@ -6315,7 +6316,7 @@ class TaskInterceptor:
         task_status = getattr(cfg, 'task_status', None)
         return bool(getattr(task_status, 'enforce_transitions', False))
 
-    def _reject_stale_done_evidence_mode(self) -> str:
+    def _reject_stale_done_evidence_mode(self) -> StaleEvidenceMode:
         """Return the reopen-freshness gate mode: ``'warn'`` or ``'enforce'``.
 
         ``'warn'`` (the default) when config or its ``reconciliation``

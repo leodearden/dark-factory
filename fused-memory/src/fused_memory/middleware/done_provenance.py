@@ -10,7 +10,7 @@ against the task's last reopen. The per-kind contract lives on
 import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import Any, NamedTuple, Protocol, get_args
+from typing import Any, Literal, NamedTuple, Protocol, get_args
 
 from pydantic import ValidationError
 from shared.git_async import GitResult
@@ -567,7 +567,7 @@ def _done_evidence_stale_error(
     branch on ``error`` uniformly, matching the flat refusal shape of the
     interceptor's other done-write gates
     (``middleware/task_interceptor.py::_terminal_exit_error``,
-    ``::_done_gate_error``).
+    ``middleware/task_interceptor.py::_done_gate_error``).
     """
     return {
         'success': False,
@@ -624,16 +624,19 @@ def _valid_stale_evidence_override(override: object, is_recon_stage: bool) -> bo
     )
 
 
+StaleEvidenceMode = Literal['warn', 'enforce']
+
+
 async def check_reopen_freshness(
     task_id: str,
+    *,
     resolved_provenance: dict | None,
     raw_done_provenance: object,
     before: Any,
     project_root: str,
     agent_id: str | None,
     is_recon_stage: bool,
-    mode: str,
-    *,
+    mode: StaleEvidenceMode,
     git_runner: GitProbeRunner,
 ) -> dict | None:
     """Reject (enforce) or no-op (warn) a done-write citing PRE-reopen evidence.
