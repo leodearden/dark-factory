@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fake_systemd_run import fake_systemd_run as fake_systemd_run
 from _merge_lane_fakes import FakeVerifier, VerifyScript
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -24,7 +25,7 @@ from orchestrator.merge_lane.worker import (
     _DryRunInvestigationHandles,
     _run_post_merge_verify,
 )
-from orchestrator.verify import VerifyResult, run_verification
+from orchestrator.verify import CheckRun, LegSlot, VerifyResult, classify_leg, run_verification
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES, FailureCategory
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import ToolKind
@@ -34,10 +35,14 @@ _SCOPE_START_REFUSED = 'Failed to start transient scope unit: Transport endpoint
 # Measured 2026-10-22, systemd 255.4-1ubuntu8.18, `systemd-run --user --scope --quiet --collect` with an unreachable user bus; rc=1, entire output.
 _BUS_CONNECT_REFUSED = 'Failed to connect to bus: No such file or directory\n'
 
+# Never observed from a verify launch: no text rule could have named it in advance.
+_UNOBSERVED_REFUSAL = 'Failed to connect to bus: Permission denied\n'
+
 _SAMPLES = [
     pytest.param(_SCOPE_START_REFUSED, id='scope-start-refused'),
     pytest.param(_BUS_CONNECT_REFUSED, id='bus-connect-refused'),
 ]
+_ALL_REFUSALS = [*_SAMPLES, pytest.param(_UNOBSERVED_REFUSAL, id='unobserved-reason')]
 
 
 class TestClassifiesScopeSpawnFailureAsEnvTransient:
@@ -94,15 +99,45 @@ class TestCommandThatRanKeepsItsOwnVerdict:
         ) == FailureCategory.UNKNOWN_TEST_FAILURE
 
 
-@pytest.fixture(params=_SAMPLES)
-def unreachable_bus(request, tmp_path, monkeypatch) -> str:
+class TestRefusedLaunchIsDecidedByStructure:
+
+    @pytest.mark.parametrize('slot', list(LegSlot))
+    @pytest.mark.parametrize('output', ['anything', 'FAILED tests/x.py::t - AssertionError\n'])
+    def test_refused_leg_is_env_transient_whatever_it_printed(self, slot, output):
+        category = classify_leg(slot, 1, output, False, 'pytest tests/', scope_launch_refused=True)
+        assert category == FailureCategory.ENV_TRANSIENT
+
+    @pytest.mark.parametrize(
+        ('rc', 'timed_out', 'cmd'),
+        [(0, False, 'pytest'), (1, True, 'pytest'), (1, False, None)],
+        ids=['green', 'timed-out', 'no-command'],
+    )
+    def test_check_run_refuses_a_refusal_that_is_not_a_red_run(self, rc, timed_out, cmd):
+        with pytest.raises(ValueError, match='scope_launch_refused') as raised:
+            CheckRun(
+                label=LegSlot.TEST, cmd=cmd, rc=rc, output='', timed_out=timed_out,
+                started_at=None, duration_secs=0.0, scope_launch_refused=True,
+            )
+        message = str(raised.value)
+        assert f'rc={rc}' in message
+        assert f'timed_out={timed_out}' in message
+        assert f'cmd={cmd!r}' in message
+
+    @pytest.mark.parametrize(('rc', 'timed_out'), [(0, False), (1, True)], ids=['green', 'timed-out'])
+    def test_classify_leg_refuses_the_same_impossible_states(self, rc, timed_out):
+        with pytest.raises(ValueError, match='scope_launch_refused') as raised:
+            classify_leg(LegSlot.LINT, rc, '', timed_out, 'ruff check', scope_launch_refused=True)
+        assert f'rc={rc}' in str(raised.value)
+        assert f'timed_out={timed_out}' in str(raised.value)
+
+
+def _install_refusing_systemd_run(tmp_path: Path, monkeypatch, refusal: str) -> None:
     """Put a ``systemd-run`` first on PATH that refuses, as with no user bus.
 
-    It prints the grounded refusal to stderr and exits 1 without exec'ing its
-    payload, so the real ``shutil.which`` + ``create_subprocess_exec`` spawn
-    path produces the production leg output. Returns the refusal printed.
+    It prints *refusal* to stderr and exits 1 without exec'ing its payload, so
+    the real ``shutil.which`` + ``create_subprocess_exec`` spawn path produces
+    the production leg output.
     """
-    refusal: str = request.param
     fakebin = tmp_path / 'fakebin'
     fakebin.mkdir()
     script = fakebin / 'systemd-run'
@@ -113,7 +148,20 @@ def unreachable_bus(request, tmp_path, monkeypatch) -> str:
     )
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv('PATH', f'{fakebin}{os.pathsep}' + os.environ['PATH'])
-    return refusal
+
+
+@pytest.fixture(params=_SAMPLES)
+def unreachable_bus(request, tmp_path, monkeypatch) -> str:
+    """A refusing ``systemd-run`` printing a grounded refusal; returns the refusal."""
+    _install_refusing_systemd_run(tmp_path, monkeypatch, request.param)
+    return request.param
+
+
+@pytest.fixture(params=_ALL_REFUSALS)
+def refusing_launcher(request, tmp_path, monkeypatch) -> str:
+    """A refusing ``systemd-run`` for every reason, observed or not; returns the refusal."""
+    _install_refusing_systemd_run(tmp_path, monkeypatch, request.param)
+    return request.param
 
 
 @pytest.fixture
@@ -150,6 +198,42 @@ class TestScopedVerifyWithUnreachableBus:
         result = await _verify_with_unreachable_bus(worktree)
         assert result.passed is False
         assert result.category == FailureCategory.ENV_TRANSIENT, result.summary
+
+
+@pytest.mark.usefixtures('code_default_config', 'refusing_launcher')
+class TestRefusalReasonDoesNotMatter:
+
+    @pytest.mark.asyncio
+    async def test_every_leg_refused_is_env_transient_for_any_reason(self, worktree):
+        result = await _verify_with_unreachable_bus(worktree)
+        assert result.passed is False
+        assert result.category == FailureCategory.ENV_TRANSIENT, result.summary
+
+
+async def _verify_in_started_scope(worktree: Path, test_command: str) -> VerifyResult:
+    return await run_verification(
+        worktree,
+        OrchestratorConfig(verify_use_cgroup_scope=True),
+        module_config=ModuleConfig(
+            prefix='pkg', test_command=test_command,
+            lint_command=None, type_check_command=None,
+        ),
+        max_retries=0,
+        role='task',
+    )
+
+
+@pytest.mark.usefixtures('code_default_config', 'fake_systemd_run')
+class TestStartedScopeKeepsItsOwnVerdict:
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('test_command', ['exit 1', 'if then fi'], ids=['red', 'syntax-error'])
+    async def test_red_command_in_a_started_scope_is_not_env_transient(
+        self, worktree, test_command,
+    ):
+        result = await _verify_in_started_scope(worktree, test_command)
+        assert result.passed is False
+        assert result.category != FailureCategory.ENV_TRANSIENT, result.summary
 
 
 def _make_git_ops() -> MagicMock:
