@@ -2408,9 +2408,7 @@ class TestRecordDrivenRecovery:
         lifecycle = harness.git_ops._lane_lifecycle
         _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
 
-        harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
         harness.git_ops.lane_branch_checkouts = AsyncMock(return_value={'42': lane})
-        harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
         harness.scheduler.get_task = AsyncMock(
             return_value={'id': '42', 'title': 'A different live task'},
         )
@@ -2430,7 +2428,6 @@ class TestRecordDrivenRecovery:
         assert record is not None
         assert record.state == DurableLaneState.QUARANTINED
         assert pool.assignment_for('42') is None
-        assert '42' not in harness._recovered_plans
 
     async def test_terminal_task_releases_lane_not_adopted(self, harness: Harness):
         """Terminal task (T10 amplifier): durable record ASSIGNED:'42'

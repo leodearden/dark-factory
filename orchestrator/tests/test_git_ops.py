@@ -7432,9 +7432,10 @@ class TestOrphanWorktreeHelpers:
         outcome = await git_ops.quarantine_worktree(info.path, 'q-count', 'unit-test')
 
         assert outcome.dest is not None
-        assert outcome.branch == f'task/{outcome.dest.name}'
+        parked_branch = f'task/{outcome.dest.name}'
+        assert outcome.branch == parked_branch
         assert outcome.tip_sha is not None
-        assert await git_ops.resolve_branch_sha(outcome.branch) == outcome.tip_sha
+        assert await git_ops.resolve_branch_sha(parked_branch) == outcome.tip_sha
         assert outcome.unique_commit_count == 2
 
     async def test_commits_beyond_main_counts_or_reports_none(self, git_ops: GitOps):
@@ -7458,8 +7459,9 @@ class TestOrphanWorktreeHelpers:
         assert dest.parent == git_ops.quarantine_base
         assert dest.name.startswith('q-full-')
         assert not (git_ops.quarantine_base / 'task').exists()
-        assert outcome.branch == f'task/{dest.name}'
-        assert await git_ops.resolve_branch_sha(outcome.branch) is not None
+        parked_branch = f'task/{dest.name}'
+        assert outcome.branch == parked_branch
+        assert await git_ops.resolve_branch_sha(parked_branch) is not None
         assert await _branches_matching(git_ops, 'task/q-full') == ''
         assert await _branches_matching(git_ops, 'task/task/*') == ''
         assert not info.path.exists()
