@@ -172,8 +172,9 @@ class TestLiveRecordTimes:
             },
         )
 
-        assert record.created_at == datetime(2026, 11, 12, 3, tzinfo=UTC)
-        assert record.created_at.utcoffset() == timedelta(hours=-7)
+        created = record.created_at
+        assert created == datetime(2026, 11, 12, 3, tzinfo=UTC)
+        assert created is not None and created.utcoffset() == timedelta(hours=-7)
         assert record.updated_at == datetime(2026, 11, 12, 3, 0, 0, 500000, tzinfo=UTC)
 
     @pytest.mark.parametrize(
