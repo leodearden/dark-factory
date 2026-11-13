@@ -3,9 +3,10 @@
 Each is an additive key on an existing event: who was queued at which tier
 (``merge_queued``), what was waiting at each pick and which of those pairs the
 suffix conflict graph held as conflicting (``merge_dequeued``), and which
-requests one verify covered (``merge_verify``). The graph is fail-open and may
-predate the pick, so each request also says whether the graph covered it
-(``in_graph``); pairs are counted only among the listed requests. Nothing here
+requests one verify covered (``merge_verify``). The graph may predate the pick,
+so each request also says whether it was in the suffix at the graph's last
+recompute (``in_graph``), though its pairs may still be unassessed; pairs are
+counted only among the listed requests. Nothing here
 decides anything; a would-be pick order is computed offline from these rows,
 never in-process.
 """
