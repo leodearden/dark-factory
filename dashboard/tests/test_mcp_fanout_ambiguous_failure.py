@@ -74,6 +74,7 @@ async def test_possibly_delivered_failure_stops_at_the_failing_url(exc):
         log_label='test', offline_result=_offline, ambiguous_result=_ambiguous,
     )
 
+    assert isinstance(result, dict)
     (error,) = result['ambiguous']
     assert error.startswith('http://a: ')
     assert type(exc).__name__ in error
@@ -148,6 +149,7 @@ async def test_whole_operation_deadline_is_ambiguous():
         5,
     )
 
+    assert isinstance(result, dict)
     (error,) = result['ambiguous']
     assert error.startswith('http://a: TimeoutError')
     assert attempted == ['http://a']
