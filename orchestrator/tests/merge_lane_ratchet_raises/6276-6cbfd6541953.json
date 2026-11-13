@@ -1,0 +1,18 @@
+{
+  "task_id": "6276",
+  "reason": "Task 6276: validate_landing_evidence refuses delivered_checks supplied without the caller's delivered_checks.enabled leaf (_checks_enabled_leaf); the inert git_ops.config fallback (_differential_disarmed) is deleted because a real GitOps.config is GitConfig, so two production sites ran the rescue with the kill switch off. Net-additive guard.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 165,
+      "current": 166
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5195,
+      "current": 5196
+    }
+  ]
+}

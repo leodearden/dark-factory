@@ -906,12 +906,6 @@ async def _differential_parent_ref(
     return fork_point if isinstance(fork_point, str) and fork_point else parent_ref
 
 
-def _differential_disarmed(git_ops: GitOps, enabled: bool) -> bool:
-    """Whether ``delivered_checks.enabled`` is off, from the caller or ``git_ops``."""
-    checks_config = getattr(getattr(git_ops, 'config', None), 'delivered_checks', None)
-    return not (enabled and getattr(checks_config, 'enabled', True))
-
-
 async def _delivered_checks_differential(
     git_ops: GitOps,
     effect_check_sha: str,
@@ -919,7 +913,7 @@ async def _delivered_checks_differential(
     probe: dict[str, Any],
     *,
     anchor_is_branch_tip: bool = False,
-    enabled: bool = True,
+    enabled: bool,
 ) -> bool:
     """The SECOND accept path: did *effect_check_sha* MAKE a declared
     capability true? (task 3116 part b.)
@@ -967,14 +961,12 @@ async def _delivered_checks_differential(
     HEAD advance mid-differential can only change the freshness of the third,
     not the "this commit made it true" core.
 
-    KILL SWITCH.  Honours ``config.delivered_checks.enabled``, the same flag
-    ``Harness._delivered_checks_withhold`` honours for the mark-done gate.
-    Without it, disabling the delivered-checks feature would still leave this
-    consumer of it running task-declared checks (amendment pass, review
-    finding).  A stand-in git_ops carrying no config reads as ENABLED, which
-    is the pre-amendment behaviour.  A real ``GitOps.config`` is the ``git``
-    sub-config and carries no ``delivered_checks`` either, so a caller holding
-    the project config passes the leaf as *enabled*.
+    KILL SWITCH.  Honours *enabled*, the caller's ``delivered_checks.enabled``
+    leaf, the same flag ``Harness._delivered_checks_withhold`` honours for the
+    mark-done gate.  Without it, disabling the delivered-checks feature would
+    still leave this consumer of it running task-declared checks (amendment
+    pass, review finding).  Nothing is read off *git_ops*: a real
+    ``GitOps.config`` is the ``git`` sub-config, which carries no such field.
 
     LAZY import (``# noqa: PLC0415``), mirroring
     :func:`file_unattributed_landing_escalation`'s ``escalation.models``
@@ -992,7 +984,7 @@ async def _delivered_checks_differential(
     ``delivered_checks_error`` and logged, and declines the upgrade — the
     fail-safe direction for an accept path is to not accept.
     """
-    if _differential_disarmed(git_ops, enabled):
+    if not enabled:
         # Switched off fleet-wide. Recorded, never silent: an operator who
         # disabled the feature must be able to see in the escalation that the
         # second accept path was not merely unlucky.
@@ -1747,6 +1739,27 @@ def _delivered_checks_state(
     return 'evaluated' if delivered_checks else 'none_declared'
 
 
+def _checks_enabled_leaf(
+    delivered_checks: list[dict[str, Any]] | None, checks_enabled: bool | None,
+) -> bool:
+    """The kill switch for *delivered_checks*; supplied checks require the leaf.
+
+    A call site that supplies checks, even ``[]``, must state the project's
+    ``delivered_checks.enabled``: no default can stand in for it, because
+    ``True`` arms the rescue with the feature switched off and ``False``
+    renders "disabled" while it is on.  An unwired site (``None``) never
+    reaches the differential, so its leaf is never consulted.
+    """
+    if checks_enabled is None and delivered_checks is not None:
+        raise TypeError(
+            'validate_landing_evidence: supplied delivered_checks (state '
+            f'{_delivered_checks_state(delivered_checks)!r}) require checks_enabled, '
+            "the project's delivered_checks.enabled leaf; pass "
+            'checks_enabled=<OrchestratorConfig>.delivered_checks.enabled'
+        )
+    return bool(checks_enabled)
+
+
 async def _candidate_effect_verdict(
     git_ops: GitOps,
     candidate_sha: str,
@@ -1754,7 +1767,7 @@ async def _candidate_effect_verdict(
     probe: dict[str, Any],
     *,
     method: LandingMethod,
-    checks_enabled: bool = True,
+    checks_enabled: bool,
 ) -> LandingVerdict:
     """The FIX 1' effect-present guard on an ALREADY-ATTRIBUTED sha.
 
@@ -1856,7 +1869,7 @@ async def validate_landing_evidence(
     candidate_sha: str | None = None,
     pattern_template: str | None = None,
     delivered_checks: list[dict[str, Any]] | None = None,
-    checks_enabled: bool = True,
+    checks_enabled: bool | None = None,
 ) -> LandingVerdict:
     """Validate already-landed evidence for *task_id* on *branch*.
 
@@ -1942,12 +1955,13 @@ async def validate_landing_evidence(
             If ``delivered_checks_state == 'unwired'`` is still appearing in
             escalations after 4500 has landed, that is the bug: one of the
             seven sites regressed to the default.
-        checks_enabled: The project's ``delivered_checks.enabled`` leaf.
-            False disarms the second accept path, recorded as
-            ``probe['delivered_checks_outcome'] == 'disabled'``. A caller
-            holding the project config must pass it, because a real
-            ``GitOps.config`` carries no ``delivered_checks`` (see the KILL
-            SWITCH paragraph of :func:`_delivered_checks_differential`).
+        checks_enabled: The project's ``delivered_checks.enabled`` leaf,
+            the kill switch's only source (a real ``GitOps.config`` carries no
+            ``delivered_checks``). False disarms the second accept path,
+            recorded as ``probe['delivered_checks_outcome'] == 'disabled'``.
+            REQUIRED whenever *delivered_checks* is supplied, ``[]``
+            included: omitting it then raises TypeError. The capstone (task
+            4500/5297) makes it required together with *delivered_checks*.
 
     Returns:
         A :class:`LandingVerdict`.
@@ -1956,6 +1970,7 @@ async def validate_landing_evidence(
     # policies; until now the only way to tell which one produced a verdict was
     # to know which branch the caller's arguments had taken.  Naming it here
     # makes it readable off the verdict itself.
+    enabled = _checks_enabled_leaf(delivered_checks, checks_enabled)
     method = (
         LandingMethod.merge_marker if candidate_sha is not None
         else LandingMethod.citation
@@ -1985,7 +2000,7 @@ async def validate_landing_evidence(
         # apply ONLY the FIX 1' effect-present guard to candidate_sha.
         return await _candidate_effect_verdict(
             git_ops, candidate_sha, delivered_checks, probe, method=method,
-            checks_enabled=checks_enabled,
+            checks_enabled=enabled,
         )
 
     citation = await git_ops.find_task_citation_commit(
@@ -2046,7 +2061,7 @@ async def validate_landing_evidence(
         # a pre-branch baseline (see _differential_parent_ref).
         if delivered_checks and await _delivered_checks_differential(
             git_ops, effect_check_sha, delivered_checks, probe,
-            anchor_is_branch_tip=anchor_is_branch_tip, enabled=checks_enabled,
+            anchor_is_branch_tip=anchor_is_branch_tip, enabled=enabled,
         ):
             return _accept(citation)
         return _reject(LandingReason.effect_absent)
