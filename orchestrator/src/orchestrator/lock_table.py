@@ -7,6 +7,7 @@ every lock and park event from these methods' return values.
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +30,10 @@ from orchestrator.pin_reservation import (
 from orchestrator.time_sources import resolve_wall_time_source
 
 logger = logging.getLogger(__name__)
+
+#: The holder limit of a key no count of holders can fill: every limit test is
+#: ``len(<set of task ids>) >= limit``, and no Python collection is that long.
+UNLIMITED_HOLDERS = sys.maxsize
 
 
 class _ParkKey(NamedTuple):
@@ -891,21 +896,26 @@ class ModuleLockTable:
                 result[m] = task_id
         return result
 
-    # --- Limit lookup (unchanged) ---
+    # --- Limit lookup ---
 
     def _limit_for(self, module: str) -> int:
         module = normalize_lock(module, self._config.lock_depth)
         if module not in self._limits:
-            mc = self._config.for_module(module)
-            if mc and mc.module_overrides and module in mc.module_overrides:
-                self._limits[module] = mc.module_overrides[module]
-            elif module in self._config.module_overrides:
-                self._limits[module] = self._config.module_overrides[module]
-            elif mc and mc.max_per_module is not None:
-                self._limits[module] = mc.max_per_module
-            else:
-                self._limits[module] = self._config.max_per_module
+            self._limits[module] = self._resolve_limit(module)
         return self._limits[module]
+
+    def _resolve_limit(self, key: str) -> int:
+        """*key*'s holder limit: an exact override, then the unlimited-holder rule, then the width."""
+        mc = self._config.for_module(key)
+        if mc and mc.module_overrides and key in mc.module_overrides:
+            return mc.module_overrides[key]
+        if key in self._config.module_overrides:
+            return self._config.module_overrides[key]
+        if self._config.unlimited_holder_locks.covers(key):
+            return UNLIMITED_HOLDERS
+        if mc and mc.max_per_module is not None:
+            return mc.max_per_module
+        return self._config.max_per_module
 
     # --- Public API ---
 

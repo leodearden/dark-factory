@@ -3745,6 +3745,66 @@ class ShadowEvalConfig(BaseModel):
         return self.candidate_sample_rates.get(candidate, self.sample_rate)
 
 
+def _prefix_shape_problem(prefix: str) -> str | None:
+    """What makes *prefix* unusable as an unlimited-holder prefix, or None when it is well formed."""
+    if not prefix:
+        return 'must not be empty'
+    if not prefix.endswith('/'):
+        return 'must end in "/"'
+    if prefix.startswith('/'):
+        return 'must be relative (no leading "/")'
+    if '\\' in prefix:
+        return 'must use "/" separators, not "\\"'
+    if any(segment in ('', '.', '..') for segment in prefix[:-1].split('/')):
+        return 'must not contain an empty, "." or ".." segment'
+    return None
+
+
+class UnlimitedHolderLocksConfig(BaseModel):
+    """Lock keys any number of tasks may hold at once, chosen by rule rather than key by key.
+
+    Matched against the lock KEY, after ``normalize_lock`` at ``lock_depth``, by
+    ``orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._limit_for``:
+    an exact ``module_overrides`` entry beats it, and it beats ``max_per_module``.
+    The keys stay in every task's lock list; only their holder limit changes.
+    Off unless a project sets it. Restart tier, like ``module_overrides``.
+    """
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    prefixes: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            'Directory prefixes, each a relative path ending in "/". A key matches '
+            'when it lies under one or is that directory itself.'
+        ),
+    )
+    root_markdown: bool = Field(
+        default=False,
+        description='Also match every key at the repository root ending in ".md" (case-sensitive).',
+    )
+
+    @field_validator('prefixes')
+    @classmethod
+    def _well_formed_prefixes(cls, prefixes: tuple[str, ...]) -> tuple[str, ...]:
+        for prefix in prefixes:
+            problem = _prefix_shape_problem(prefix)
+            if problem:
+                raise ValueError(f'unlimited_holder_locks.prefixes entry {prefix!r} {problem}')
+        duplicates = sorted({prefix for prefix in prefixes if prefixes.count(prefix) > 1})
+        if duplicates:
+            raise ValueError(f'unlimited_holder_locks.prefixes lists {duplicates} more than once')
+        return prefixes
+
+    def covers(self, lock_key: str) -> bool:
+        """Whether *lock_key*, already normalised to ``lock_depth``, takes unlimited holders."""
+        if self.root_markdown and '/' not in lock_key and lock_key.endswith('.md'):
+            return True
+        return any(
+            lock_key.startswith(prefix) or lock_key == prefix[:-1] for prefix in self.prefixes
+        )
+
+
 # --- Top-level ---
 
 
@@ -3756,6 +3816,9 @@ class OrchestratorConfig(BaseSettings):
     max_per_module: int = Field(default=1)
     lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
+    unlimited_holder_locks: UnlimitedHolderLocksConfig = Field(
+        default_factory=UnlimitedHolderLocksConfig,
+    )
 
     # Run-forever idle poll cadence (seconds).  When the queue drains and the
     # orchestrator is running forever (no --until-idle), it idles and re-polls
