@@ -11406,6 +11406,7 @@ class TaskWorkflow:
         amendment_suggestions = (
             amendment_ctx.amended_suggestions if amendment_ctx is not None else None
         )
+        rulings = await self._read_rulings(since=None, briefed='review round')
         stagger = self.config.reviewer_stagger_secs
 
         # Staggered launch — spread OAuth session creation
@@ -11414,6 +11415,7 @@ class TaskWorkflow:
                 await asyncio.sleep(idx * stagger)
             return await self._run_reviewer(
                 role, diff, amendment_suggestions=amendment_suggestions, subject=subject,
+                rulings=rulings,
             )
 
         tasks = [_staggered(i, r) for i, r in enumerate(roster)]
@@ -11433,7 +11435,7 @@ class TaskWorkflow:
                     results[i] = await self._run_reviewer(
                         roster[i], diff,
                         amendment_suggestions=amendment_suggestions,
-                        subject=subject,
+                        subject=subject, rulings=rulings,
                     )
                 except Exception as exc:
                     results[i] = exc
@@ -11579,16 +11581,19 @@ class TaskWorkflow:
         self, role: AgentRole, diff: str,
         amendment_suggestions: list[dict] | None = None,
         *, subject: ReviewSubject | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> dict:
         """Run a single reviewer and read its verdict artifact.
 
         *amendment_suggestions*, when set, threads the post-amendment advisory
         scope section into the reviewer prompt (task 2750). *subject*, when
         set, briefs the context-complete generation from it instead of *diff*.
+        *rulings* are every ruling on the task, read once per review round by
+        ``_review``.
         """
         assert self.worktree is not None and self.artifacts is not None
         notes = self._reviewer_notes()
-        rulings = await self._escalation_rulings(role.name, since=None)
+        self._record_rulings_briefed(role.name, rulings, since=None)
         if subject is None:
             build_prompt = partial(
                 self.briefing.build_reviewer_prompt,
@@ -11812,7 +11817,11 @@ class TaskWorkflow:
         return in_scope
 
     async def _replan(self, reviews) -> None:
-        """Feed review feedback back to architect for re-planning."""
+        """Feed review feedback back to architect for re-planning.
+
+        The architect is shown every ruling, as the reviewers whose findings it
+        answers are, whenever the plan was last confirmed.
+        """
         assert self.worktree is not None and self.artifacts is not None
         self.plan = self.artifacts.read_plan()
         feedback = reviews.format_for_replan()
@@ -11820,9 +11829,7 @@ class TaskWorkflow:
         async def build_prompt() -> str:
             return await self.briefing.build_replan_prompt(
                 self.task, feedback,
-                rulings=await self._escalation_rulings(
-                    ARCHITECT.name, since=plan_confirmed_at(self._live_plan()),
-                ),
+                rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
             )
 
         await self._invoke(ARCHITECT, build_prompt, self.worktree)
@@ -19015,23 +19022,36 @@ class TaskWorkflow:
     async def _escalation_rulings(
         self, role: str, *, since: datetime | None,
     ) -> tuple[Ruling, ...]:
-        """The task's rulings resolved after *since* to brief *role* with; a queue fault costs only the rulings.
+        """The task's rulings resolved after *since* to brief *role* with, recorded as briefed."""
+        rulings = await self._read_rulings(since=since, briefed=role)
+        self._record_rulings_briefed(role, rulings, since=since)
+        return rulings
 
-        The read scans the queue archive, so it runs off the event loop (task 4567).
+    async def _read_rulings(
+        self, *, since: datetime | None, briefed: str,
+    ) -> tuple[Ruling, ...]:
+        """The task's rulings resolved after *since*; a queue fault costs only the rulings.
+
+        The read scans the queue archive, so it runs off the event loop (task
+        4567).  *briefed* names the briefing in the fault's log line.
         """
         queue = self.escalation_queue
         if queue is None:
             return ()
         try:
             records = await asyncio.to_thread(queue.get_by_task, self.task_id, status='resolved')
-            rulings = select_rulings(records, since=since)
+            return select_rulings(records, since=since)
         except Exception as exc:
             logger.warning(
                 'Task %s: reading the escalation rulings for the %s briefing failed '
-                '(%s: %s); the %s runs without them',
-                self.task_id, role, type(exc).__name__, exc, role, exc_info=True,
+                '(%s: %s); it proceeds without them',
+                self.task_id, briefed, type(exc).__name__, exc, exc_info=True,
             )
             return ()
+
+    def _record_rulings_briefed(
+        self, role: str, rulings: Sequence[Ruling], *, since: datetime | None,
+    ) -> None:
         if rulings and self.event_store:
             self.event_store.emit(
                 EventType.escalation_rulings_briefed, task_id=self.task_id, role=role,
@@ -19040,7 +19060,6 @@ class TaskWorkflow:
                     'since': since.isoformat() if since is not None else None,
                 },
             )
-        return rulings
 
     def _apply_note_dispositions(self, reviews: ReviewAggregation) -> None:
         """Apply the review round's verdicts on the task's info notes (D2); a note left pending is the exit router's."""

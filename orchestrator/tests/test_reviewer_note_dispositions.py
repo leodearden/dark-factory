@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Generic, TypeVar
 from unittest.mock import AsyncMock
 
 import pytest
@@ -172,37 +173,57 @@ class _NoteRecordingBriefing(FakeBriefing):
         self.briefed.append((generation, [note.id for note in notes or ()]))
 
 
-class _FullRun:
+_Recorder = TypeVar('_Recorder', bound=FakeBriefing)
+
+
+class _WorkflowRun(Generic[_Recorder]):
+    """A real ``TaskWorkflow.run()`` of *assignment* in a fresh repo: *stub* answers every agent, *recorder* every briefing."""
+
     def __init__(
-        self, tmp_path: Path, monkeypatch, stub: _DispositioningStub, *,
-        briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY, router_enabled: bool = True,
+        self, tmp_path: Path, monkeypatch, stub: AgentStub, recorder: _Recorder,
+        assignment: TaskAssignment, *, briefing: ReviewBriefing, router_enabled: bool,
     ) -> None:
         repo = tmp_path / 'repo'
         repo.mkdir()
         _init_repo(repo)
         config = _run_config(repo, briefing=briefing, router_enabled=router_enabled)
         self.workflow, _scheduler, self.queue = _build_workflow_with_escalation(
-            config, _make_git_ops(config.project_root), _assignment(), stub, tmp_path,
+            config, _make_git_ops(config.project_root), assignment, stub, tmp_path,
         )
-        self.briefing = _NoteRecordingBriefing()
-        self.workflow.briefing = self.briefing
+        self.briefing = recorder
+        self.workflow.briefing = recorder
         self._monkeypatch = monkeypatch
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', AsyncMock(return_value=PASSED),
         )
-        self.workflow.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        self.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        self.workflow.event_store = self.event_store
         self.curator = FakeCurator()
         self.workflow.scheduler.dispatch_tool = self.curator
 
-    def fail_the_first_queue_read_after_verification(self) -> None:
-        """The reviewer's note read is the first queue read once verification passes."""
+    async def run(self) -> WorkflowOutcome:
+        return (await self.workflow.run()).outcome
+
+
+class _FullRun(_WorkflowRun[_NoteRecordingBriefing]):
+    def __init__(
+        self, tmp_path: Path, monkeypatch, stub: _DispositioningStub, *,
+        briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY, router_enabled: bool = True,
+    ) -> None:
+        super().__init__(
+            tmp_path, monkeypatch, stub, _NoteRecordingBriefing(), _assignment(),
+            briefing=briefing, router_enabled=router_enabled,
+        )
+
+    def fail_the_first_note_read_after_verification(self) -> None:
+        """The reviewer's note read is the first pending-record read once verification passes."""
         armed = False
         read = self.queue.get_by_task
 
         def get_by_task(*args, **kwargs):
             nonlocal armed
-            if armed:
+            if armed and kwargs.get('status') == 'pending':
                 armed = False
                 raise OSError('disk unreadable')
             return read(*args, **kwargs)
@@ -215,19 +236,14 @@ class _FullRun:
         self._monkeypatch.setattr(self.queue, 'get_by_task', get_by_task)
         self._monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify)
 
-    async def run(self) -> WorkflowOutcome:
-        return (await self.workflow.run()).outcome
-
     def current(self, note: Escalation) -> Escalation:
         current = self.queue.get(note.id)
         assert current is not None
         return current
 
     def rows(self, esc_id: str) -> list[dict]:
-        store = self.workflow.event_store
-        assert store is not None
         return [
-            row['data'] for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)
+            row['data'] for row in self.event_store.fetch_events_by_type(EventType.info_l0_dispositioned)
             if row['data']['escalation_id'] == esc_id
         ]
 
@@ -275,7 +291,7 @@ class TestReviewerIsBriefedWithItsNotes:
     ):
         run = _FullRun(tmp_path, monkeypatch, _DispositioningStub())
         _file_note(run.queue)
-        run.fail_the_first_queue_read_after_verification()
+        run.fail_the_first_note_read_after_verification()
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
             assert await run.run() == WorkflowOutcome.DONE
