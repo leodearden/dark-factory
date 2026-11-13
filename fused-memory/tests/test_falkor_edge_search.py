@@ -196,6 +196,26 @@ class TestEdgeFulltextSearch:
         assert 'e.group_id IN $group_ids' in query.cypher
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('text', 'group_ids'),
+        [
+            ('Please note _ is the Python throwaway variable', ['g']),
+            ('note `` empty code span', ['g']),
+            ('<alpha>{beta}[gamma] task 877', ['g']),
+            ('alpha beta', ['a-b']),
+            ('alpha beta', None),
+        ],
+    )
+    async def test_the_union_is_the_fulltext_query_graphiti_builds_for_every_leg(
+        self, text: str, group_ids: list[str] | None
+    ) -> None:
+        """The node and episode legs get theirs from graphiti's fulltext_query; the edge leg's union must not drift from it."""
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+        await search_utils.edge_fulltext_search(driver, text, SearchFilters(), group_ids, 20)
+
+        assert issued[-1].params['query'] == search_utils.fulltext_query(text, group_ids, driver)
+
+    @pytest.mark.asyncio
     async def test_an_invalid_group_id_is_refused_before_any_query(self) -> None:
         """As graphiti's own fulltext_query does; build_edge_queries escapes group ids, it does not validate them."""
         driver, issued = hardened_driver([CANNED_EDGE_RECORD])
@@ -273,6 +293,12 @@ class TestEdgeFulltextIdentifierTier:
         assert union.params['query'] == '(@group_id:"g") (alpha | 877)'
         assert union.params['promoted_uuids'] == ['edge-uuid']
         assert 'ORDER BY e.uuid IN $promoted_uuids DESC, score DESC' in union.cypher
+
+    @pytest.mark.asyncio
+    async def test_a_tier_that_exactly_fills_the_leg_is_promoted(self) -> None:
+        _, union = await self._issued('alpha 877', tier_rows=self.LIMIT)
+
+        assert union.params['promoted_uuids'] == ['edge-uuid'] * self.LIMIT
 
     @pytest.mark.asyncio
     async def test_a_tier_larger_than_the_leg_promotes_nothing(self) -> None:

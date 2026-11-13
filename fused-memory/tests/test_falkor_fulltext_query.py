@@ -692,6 +692,10 @@ class TestBuildEdgeQueries:
     ) -> None:
         assert build_edge_queries(text, ['g'], 128).intersection == intersection
 
+    def test_an_intersection_without_a_union_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='without a union'):
+            EdgeFulltextQueries(union='', intersection='(877)')
+
     def test_no_searchable_term_gives_no_queries(self) -> None:
         assert build_edge_queries('the and of', ['g'], 128) == EdgeFulltextQueries(
             union='', intersection=''
