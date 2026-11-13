@@ -37,6 +37,9 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # Task 2931: crisp test grace for the divergence-class routing.latest
     # freshness gate, decoupled from the 300.0 source default.
     mock_orch_config.orphan_l0_dispatch_freshness_secs = 120.0
+    # Task 2991's merge-phase gate at its 600.0 source default, so a fresh
+    # merge_phase_liveness stamp is compared against a number.
+    mock_orch_config.orphan_l0_merge_phase_freshness_secs = 600.0
     mock_orch_config.info_l0_router_enabled = True
     mock_orch_config.info_l0_router_ticket_timeout_secs = 900.0
     mock_orch_config.info_l0_router_max_conversions_per_sweep = 20
@@ -1479,13 +1482,50 @@ def _submit_aged_blocking(
     return esc
 
 
-def _make_live(harness: Harness, tid: str, *, claimant_run_id: str | None) -> AsyncMock:
+def _submit_aged_divergence(
+    harness: Harness,
+    task_id: str,
+    seconds_ago: float,
+    *,
+    filing_claimant_run_id: str | None,
+) -> Escalation:
+    """An aged L0 in the shape `TaskWorkflow._escalate_scope_invariant_violation` files.
+
+    `suggested_action='investigate_and_retry'` keeps it off the
+    done-step-commit arm.
+    """
+    queue = _bound_queue(harness)
+    ts = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='orchestrator',
+        severity='blocking',
+        category='infra_issue',
+        summary=f'plan.files/metadata.files divergence detected for task {task_id}',
+        detail='detail',
+        suggested_action='investigate_and_retry',
+        timestamp=ts,
+        level=0,
+        filing_claimant_run_id=filing_claimant_run_id,
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _make_live(
+    harness: Harness,
+    tid: str,
+    *,
+    claimant_run_id: str | None,
+    metadata: dict | None = None,
+) -> AsyncMock:
     """Make *tid* read as held by an incarnation stamped *claimant_run_id*."""
     harness.scheduler.is_actively_held = MagicMock(return_value=True)
     getter = AsyncMock(return_value={
         'status': 'in-progress',
         'claimant_run_id': claimant_run_id,
-        'metadata': {},
+        'metadata': metadata or {},
     })
     harness.scheduler.get_task = getter  # type: ignore[method-assign]
     return getter
@@ -1596,6 +1636,108 @@ class TestOrphanL0PromotesOnFilingIncarnationDeath:
             f'one record must cost at most one get_task, got '
             f'{getter.await_count}'
         )
+
+
+def _ago(seconds: float) -> str:
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+
+
+def _no_stamp() -> dict:
+    return {}
+
+
+def _routing_stamp(seconds_ago: float = 5.0) -> dict:
+    return {'routing': {'latest': {
+        'role': 'reviewer_comprehensive', 'decided_at': _ago(seconds_ago),
+    }}}
+
+
+def _merge_phase_stamp(seconds_ago: float = 5.0) -> dict:
+    return {'merge_phase_liveness': {'entered_at': _ago(seconds_ago)}}
+
+
+def _pending_l1s(harness: Harness, tid: str) -> list[Escalation]:
+    return [
+        e for e in _bound_queue(harness).get_by_task(tid, status='pending')
+        if e.level == 1
+    ]
+
+
+@pytest.mark.asyncio
+class TestDivergenceL0FollowsTheFilingIncarnationAlone:
+    """A divergence L0's fate is decided by its filer's liveness, never by a stamp.
+
+    A live in-slot reviewer or adjudicator always carries a live signal, so the
+    filing-incarnation arm already defers its L0.  A `routing.latest` or
+    `merge_phase_liveness` stamp on the task row therefore proves nothing the
+    arm has not: it is left by a FINISHED invocation, or by a NEWER incarnation
+    that spec S6 forbids from keeping a prior incarnation's L0 alive.
+    """
+
+    @pytest.mark.parametrize(
+        'stamp',
+        [
+            pytest.param(_no_stamp, id='no-stamp'),
+            pytest.param(_routing_stamp, id='fresh-routing'),
+            pytest.param(_merge_phase_stamp, id='fresh-merge-phase'),
+        ],
+    )
+    async def test_a_dead_filers_divergence_l0_is_promoted_despite_a_newer_incarnations_fresh_stamp(
+        self, harness: Harness, stamp,
+    ) -> None:
+        esc = _submit_aged_divergence(
+            harness, 'T1', 120.0, filing_claimant_run_id=_FILER_ID,
+        )
+        harness._escalation_events['T1'] = MagicMock()
+        _make_live(harness, 'T1', claimant_run_id=_LIVE_ID, metadata=stamp())
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        refreshed = _bound_queue(harness).get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+        assert len(_pending_l1s(harness, 'T1')) == 1
+
+    @pytest.mark.parametrize(
+        'stamp',
+        [
+            pytest.param(_routing_stamp, id='fresh-routing'),
+            pytest.param(_merge_phase_stamp, id='fresh-merge-phase'),
+        ],
+    )
+    async def test_a_signal_less_divergence_l0_is_promoted_without_reading_its_stamps(
+        self, harness: Harness, stamp,
+    ) -> None:
+        _submit_aged_divergence(
+            harness, 'T1', 120.0, filing_claimant_run_id=_FILER_ID,
+        )
+        getter = AsyncMock(return_value={'status': 'in-progress', 'metadata': stamp()})
+        harness.scheduler.get_task = getter  # type: ignore[method-assign]
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+        assert len(_pending_l1s(harness, 'T1')) == 1
+        getter.assert_not_awaited()
+
+    async def test_a_live_in_slot_reviewers_divergence_l0_is_deferred_however_old_its_dispatch(
+        self, harness: Harness,
+    ) -> None:
+        """The esc-3000-2 shape: a reviewer dispatch more than 610s before the sweep."""
+        esc = _submit_aged_divergence(
+            harness, 'T1', 650.0, filing_claimant_run_id=_FILER_ID,
+        )
+        harness._escalation_events['T1'] = MagicMock()
+        _make_live(
+            harness, 'T1', claimant_run_id=_FILER_ID,
+            metadata=_routing_stamp(seconds_ago=650.0),
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = _bound_queue(harness).get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+        assert _pending_l1s(harness, 'T1') == []
 
 
 @pytest.mark.asyncio
