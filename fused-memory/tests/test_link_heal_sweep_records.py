@@ -811,6 +811,52 @@ class TestTheWriteTimeCalibrationGate:
         assert report.counts.applied == 1
 
 
+class TestThePlanTimeCalibrationGate:
+    """A plan run that files its escapes is one about to be applied, so for a
+    calibration-gated source it withholds stale-basis heals before staging its own."""
+
+    @pytest.mark.asyncio
+    async def test_a_gated_plan_about_to_be_applied_withholds_stale_basis_heals_first(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        first = await _sweep_plan(harness, ledger, _answering(), tmp_path)
+        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+
+        second = await _sweep_plan(
+            harness, ledger,
+            FakeAdjudicator(ANSWERS.__getitem__, prompt_sha256=SECOND_PROMPT_SHA256),
+            tmp_path, filer=RecordingFiler(),
+        )
+
+        staged = ledger.run_actions(first.run_id)
+        assert {(row.planned.child_id, row.planned.action) for row in staged} == STAGED_HEALS
+        for row in staged:
+            assert row.state is ActionState.WITHHELD_UNCALIBRATED
+            assert row.executed_run_id == second.run_id
+        assert second.counts.withheld_uncalibrated == len(staged)
+        records = {r.child_id: r for r in ledger.run_records(second.run_id)}
+        assert records[MISFILED].disposition is Disposition.STAGED
+
+    @pytest.mark.asyncio
+    async def test_an_ungated_plan_never_withholds(self, harness, ledger, tmp_path):
+        _seed(harness)
+        first = await run_adjudicator_plan(
+            adjudicate=_answering(), store=harness.store(), census=harness.mem0, ledger=ledger,
+            limits=LIMITS, projects=PROJECTS, plan_path_for=lambda _run_id: tmp_path / 'a.json',
+        )
+
+        second = await run_adjudicator_plan(
+            adjudicate=FakeAdjudicator(ANSWERS.__getitem__, prompt_sha256=SECOND_PROMPT_SHA256),
+            store=harness.store(), census=harness.mem0, ledger=ledger, limits=LIMITS,
+            projects=PROJECTS, plan_path_for=lambda _run_id: tmp_path / 'b.json',
+            filer=RecordingFiler(),
+        )
+
+        assert second.counts.withheld_uncalibrated == 0
+        assert all(row.state is ActionState.PLANNED for row in ledger.run_actions(first.run_id))
+
+
 def _seed_misfile_heavy(harness: LinkHealHarness) -> None:
     """Twenty in-window sighting links, eight of them misfiled: a 0.40 misfile share."""
     for n in range(20):

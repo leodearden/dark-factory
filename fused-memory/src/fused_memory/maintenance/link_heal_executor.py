@@ -135,6 +135,12 @@ STREAK_STOP = 'write_failure_streak'
 SHARE_STOP = 'adjudicated_share_ceiling'
 PLAN_DOCUMENT_STOP = 'plan_document_unwritten'
 
+#: The run sources whose heals are written only while the adjudicator behind each
+#: heal's verdict has a passing calibration. An apply of one withholds every other
+#: heal; so does a plan run of one that files its escapes, which is a run about to
+#: be applied, before it stages its own heals.
+CALIBRATION_GATED_SOURCES = frozenset({RunSource.SWEEP})
+
 
 @dataclass(frozen=True)
 class RunLimits:
@@ -740,14 +746,11 @@ async def run_adjudicator_plan(
     created_in: CreatedWindow | None = None,
     filer: EscapeFiler | None = None,
     presence_projects: Sequence[str] = (),
-    withhold_uncalibrated: bool = False,
 ) -> RunReport:
     """A non-writing run of *source* planning heals from the link adjudicator's verdicts.
 
     Only the links whose child *created_in* admits are read, when it is given.
     A parent is looked for in *presence_projects* as well as *projects*.
-    *withhold_uncalibrated* is passed to :func:`_publish_plan`: a run about to be
-    applied withholds stale-basis heals before staging its own.
     The adjudicator is asked only about the links the verdict rows decide and
     that this adjudicator (model and prompt version) has not judged at their
     current texts, so a model or brief change asks again. Every read
@@ -756,7 +759,10 @@ async def run_adjudicator_plan(
     never ledgered. Only heals in *enabled_actions* are staged (``None`` stages
     every one). A share over its ceiling is recorded as ``would_escape``, never
     filed; so is a failure storm, unless *filer* is given, which files it and
-    discloses it as ``escaped``.
+    discloses it as ``escaped``. A run given a *filer* is about to be applied, so
+    for a source in :data:`CALIBRATION_GATED_SOURCES` it first withholds the
+    pending heals whose adjudicator has no passing calibration (see
+    :func:`_publish_plan`).
     """
     reads = await read_links(
         store, census, projects, created_in, presence_projects=presence_projects,
@@ -787,7 +793,7 @@ async def run_adjudicator_plan(
         ledger=ledger, limits=limits, projects=projects, source=source,
         plan_path=plan_path_for(run_id), escapes=storms if filer is None else (),
         escaped=escaped, enabled_actions=enabled_actions,
-        withhold_uncalibrated=withhold_uncalibrated,
+        withhold_uncalibrated=filer is not None and source in CALIBRATION_GATED_SOURCES,
     )
 
 
@@ -998,11 +1004,6 @@ async def _drain(
 
 def _projects(pending: Sequence[ActionRow]) -> list[str]:
     return list(dict.fromkeys(row.planned.project_id for row in pending))
-
-
-#: The run sources whose heals are written only while the adjudicator behind each
-#: heal's verdict has a passing calibration.
-CALIBRATION_GATED_SOURCES = frozenset({RunSource.SWEEP})
 
 
 def _withhold_uncalibrated(
