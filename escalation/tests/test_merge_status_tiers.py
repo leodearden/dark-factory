@@ -36,6 +36,7 @@ from orchestrator.merge_lane import (
     MergeCancelRefusal,
     MergeCancelVerdict,
     MergeLane,
+    MergeOutcome,
     MergeRequest,
     OperatorMergeCancel,
     QueuedBranch,
@@ -269,6 +270,25 @@ def _verdict(outcome: GitAuthorityOutcome) -> GitAuthorityVerdict:
     return GitAuthorityVerdict(outcome=outcome)
 
 
+def _lane_request(
+    tmp_path: Path, *, train: dict[str, Any] | None = None, **flags: Any,
+) -> MergeRequest:
+    fields: dict[str, Any] = dict(
+        task_id=_TASK,
+        branch=QueuedBranch.parse(_BRANCH, 'task/'),
+        worktree=tmp_path,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=_config(tmp_path),
+        result=asyncio.get_running_loop().create_future(),
+        **flags,
+    )
+    if train is None:
+        return MergeRequest(**fields)
+    return GroupMergeRequest(**fields, **train)
+
+
 @pytest.fixture(autouse=True)
 def probe(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     mock = AsyncMock(return_value=_verdict(GitAuthorityOutcome.no_signal))
@@ -326,6 +346,59 @@ class TestHistoryNeverSetsAnOutcomeState:
         assert 'hint' not in response
         assert response['last_outcome']['is_current_run'] is True
         assert response['last_outcome']['run_id'] == _CURRENT
+
+
+class TestCurrentRunTierCarriesTheRowsMergeSha:
+    async def _finalize_through_the_lane(
+        self, tmp_path: Path, current: Any, outcome: MergeOutcome,
+    ) -> None:
+        request = _lane_request(tmp_path, request_id='mr-1')
+        await enqueue_merge_request(asyncio.Queue(), request, current)
+        request.result.set_result(outcome)
+        await asyncio.sleep(0)
+
+    @pytest.mark.parametrize(
+        'key',
+        [{'request_id': 'mr-1'}, {'branch': _BRANCH}, {'task_id': _TASK}],
+        ids=['request_id', 'branch', 'task_id'],
+    )
+    async def test_a_done_finalized_this_run_answers_with_its_merge_sha(
+        self, tmp_path: Path, key: dict[str, str],
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        await self._finalize_through_the_lane(
+            tmp_path, current, MergeOutcome('done', merge_sha=_MERGE_SHA),
+        )
+
+        response = await _poll(_server(tmp_path, current), **key)
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert response['merge_sha'] == _MERGE_SHA
+        assert response['last_outcome']['merge_sha'] == _MERGE_SHA
+        assert 'kind' not in response, 'only the git tier is kind: found_on_main'
+
+    async def test_a_row_without_a_merge_sha_renders_none(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+        await self._finalize_through_the_lane(tmp_path, current, MergeOutcome('done'))
+
+        response = await _poll(_server(tmp_path, current), request_id='mr-1')
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert 'merge_sha' not in response
+
+    async def test_a_prior_run_merge_sha_stays_in_last_outcome(
+        self, tmp_path: Path,
+    ) -> None:
+        prior, current = _event_stores(tmp_path)
+        _finalize(prior, request_id='mr-old', state='done', merge_sha=_MERGE_SHA)
+
+        response = await _poll(_server(tmp_path, current), request_id='mr-old')
+
+        assert response['state'] is MergeState.stale_record
+        assert 'merge_sha' not in response
+        assert response['last_outcome']['merge_sha'] == _MERGE_SHA
 
 
 class TestJournalTier:
@@ -843,24 +916,6 @@ class TestMergeCancelThroughTheLane:
             merge_inflight_registry=registry,
         )
 
-    def _request(
-        self, tmp_path: Path, *, train: dict[str, Any] | None = None, **flags: Any,
-    ) -> MergeRequest:
-        fields: dict[str, Any] = dict(
-            task_id=_TASK,
-            branch=QueuedBranch.parse(_BRANCH, 'task/'),
-            worktree=tmp_path,
-            pre_rebased=False,
-            task_files=None,
-            module_configs=[],
-            config=_config(tmp_path),
-            result=asyncio.get_running_loop().create_future(),
-            **flags,
-        )
-        if train is None:
-            return MergeRequest(**fields)
-        return GroupMergeRequest(**fields, **train)
-
     def _escalations(self, tmp_path: Path) -> list[Any]:
         return EscalationQueue(tmp_path / 'esc').get_by_task(_TASK)
 
@@ -868,7 +923,7 @@ class TestMergeCancelThroughTheLane:
         self, tmp_path: Path,
     ) -> None:
         _, current = _event_stores(tmp_path)
-        request = self._request(tmp_path, awaited_by_workflow=True)
+        request = _lane_request(tmp_path, awaited_by_workflow=True)
         server = await self._lane_holding(tmp_path, current, request)
         queued = await _poll(server, request_id=request.request_id)
 
@@ -885,7 +940,7 @@ class TestMergeCancelThroughTheLane:
         self, tmp_path: Path,
     ) -> None:
         _, current = _event_stores(tmp_path)
-        request = self._request(tmp_path)
+        request = _lane_request(tmp_path)
         server = await self._lane_holding(tmp_path, current, request)
 
         response = await call_merge_cancel(server, request_id=request.request_id)
@@ -901,7 +956,7 @@ class TestMergeCancelThroughTheLane:
         self, tmp_path: Path,
     ) -> None:
         _, current = _event_stores(tmp_path)
-        request = self._request(tmp_path)
+        request = _lane_request(tmp_path)
         registry = InFlightMergeRegistry()
         registry.acquire(
             request.branch.bare_id, _TASK, request.result, request_id=request.request_id,
@@ -925,7 +980,7 @@ class TestMergeCancelThroughTheLane:
 
     async def test_a_train_is_refused_with_its_code(self, tmp_path: Path) -> None:
         _, current = _event_stores(tmp_path)
-        train = self._request(tmp_path, train=dict(
+        train = _lane_request(tmp_path, train=dict(
             train_id='train-1',
             member_task_ids=['41', _TASK],
             tip_branch=QueuedBranch.parse(_BRANCH, 'task/'),
