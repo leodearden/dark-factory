@@ -52,9 +52,7 @@ from fused_memory.memory_metadata import (
     parent_liveness_violation,
     validate_memory_metadata,
 )
-from fused_memory.middleware import (
-    dead_letter_escalator,  # a module import on purpose: see tests/middleware/test_dead_letter_escalator.py::TestImportsCleanlyOnItsOwn
-)
+from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware.dependency_direction_check import (
     DependencyDirectionFinding,
     build_dependency_index,
