@@ -5,11 +5,13 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from _scan_race_helpers import (
+    concurrently_pruned_rmtree,
     pruning_read_text,
     relocating_read_text,
     unreadable_read_text,
@@ -654,6 +656,36 @@ class TestRunStartupSweep:
             r.name == 'escalation.sweep' and r.levelno == logging.INFO
             for r in caplog.records
         ), f'Expected INFO report line; got: {[r.getMessage() for r in caplog.records]}'
+
+    def test_concurrent_prune_of_a_stale_subdir_costs_neither_pass_4_nor_the_summary(
+        self, tmp_path: Path, caplog
+    ):
+        """A stale subdir another prune removed first must not abort the startup sweep.
+
+        Without the tolerance the FileNotFoundError escapes pass 3, pass 4 never
+        runs, and the single startup summary line is lost.
+        """
+        stale_dir = tmp_path / 'archive' / '2026-01-01'
+        stale_dir.mkdir(parents=True)
+        (stale_dir / 'esc-9-1.json').write_text('{}')
+        lock = _write_lock(tmp_path, 'esc-1-1')
+
+        with (
+            caplog.at_level(logging.INFO, logger='escalation.sweep'),
+            patch.object(shutil, 'rmtree', concurrently_pruned_rmtree(stale_dir)),
+        ):
+            report = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        assert report.pruned_dirs == 0, 'the concurrent prune removed it, not this sweep'
+        assert report.orphan_locks_reaped == 1, 'pass 4 must still run'
+        assert not lock.exists()
+        assert not stale_dir.exists()
+        infos = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.sweep' and r.levelno == logging.INFO
+        ]
+        assert len(infos) == 1, infos
+        assert 'pruned_dirs=0' in infos[0] and 'orphan_locks=1' in infos[0], infos[0]
 
 
 class TestSweepSurvivesRecordVanishedMidScan:
