@@ -1360,9 +1360,9 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
 # for a submodel-backed key with live readers is the correct refusal.
 #
-# gate_escalated_at / before_done_ran_at / before_done_verified_at /
-# before_done_verified_pid are the DeterministicRunner's own stamps
-# (CLAUDE.md "Deterministic task kind").
+# gate_escalated_at / gate_escalated_preconditions / before_done_ran_at /
+# before_done_verified_at / before_done_verified_pid are the
+# DeterministicRunner's own stamps (CLAUDE.md "Deterministic task kind").
 #
 # Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, and the three
 # `related_tasks` aliases — `related_task`, `related_df_tasks`,
@@ -1414,6 +1414,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # stamped by the task curator on every create its dedupe pass did not judge; the re-dedupe sweep key
         'dedupe_skipped',
         'gate_escalated_at',
+        'gate_escalated_preconditions',
         'before_done_ran_at',
         'before_done_verified_at',
         'before_done_verified_pid',
