@@ -61,6 +61,7 @@ import signal
 import sys
 import time
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -208,7 +209,12 @@ def _send_ntfy(url: str, escalation: Escalation) -> None:
     urllib.request.urlopen(ntfy_request(url, escalation))
 
 
-def _emit(esc: Escalation, ntfy_url: str | None) -> None:
+def _emit(
+    esc: Escalation,
+    ntfy_url: str | None,
+    *,
+    send: Callable[[str, Escalation], None] = _send_ntfy,
+) -> None:
     """Print escalation JSON to stdout and optionally send an ntfy push notification.
 
     The push is best-effort: a failure is reported (invariant (c)) and then
@@ -218,7 +224,7 @@ def _emit(esc: Escalation, ntfy_url: str | None) -> None:
     print(json.dumps(esc.to_dict(), indent=2))
     if ntfy_url:
         try:
-            _send_ntfy(ntfy_url, esc)
+            send(ntfy_url, esc)
         except Exception as e:
             logger.error('WATCHER_NTFY_OUTCOME: FAILED esc=%s url=%s: %s', esc.id, ntfy_url, e)
 
