@@ -9,21 +9,33 @@ Contract: plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-pr
 from __future__ import annotations
 
 import functools
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from types import MappingProxyType
-from typing import Final
+from typing import Final, TypedDict, TypeVar
 
 from pydantic import BaseModel
 
-from shared.config_fields import DeclaredField, Leaf, declared_fields
+from shared.config_fields import (
+    DeclaredField,
+    DeprecatedSpelling,
+    Leaf,
+    Table,
+    declared_fields,
+    reloadable_paths,
+)
+
+M = TypeVar('M', bound=BaseModel)
+
+_ABSENT_RENDERED: Final = '<absent>'
 
 
 class _Absent:
     __slots__ = ()
 
     def __repr__(self) -> str:
-        return '<absent>'
+        return _ABSENT_RENDERED
 
     def __reduce__(self) -> str:
         return 'ABSENT'
@@ -45,6 +57,15 @@ class ConfigDiff:
     unchanged: int
 
 
+class ReloadReport(TypedDict):
+    reloaded: bool
+    applied: dict[str, dict[str, object]]
+    restart_required: dict[str, dict[str, object]]
+    unchanged: int
+    error: str | None
+    deprecated: list[dict[str, str]]
+
+
 def iter_leaves(
     model_cls: type[BaseModel], model: BaseModel | None
 ) -> Iterator[tuple[str, object]]:
@@ -53,13 +74,32 @@ def iter_leaves(
 
 
 def diff_config(live: BaseModel, fresh: BaseModel, reloadable: frozenset[str]) -> ConfigDiff:
-    applied: dict[str, Change] = {}
-    restart_required: dict[str, Change] = {}
-    for changes in _change_groups(live, fresh).values():
-        bucket = applied if changes.keys() <= reloadable else restart_required
-        bucket.update(changes)
-    unchanged = len(_leaf_fields(type(live))) - len(applied) - len(restart_required)
-    return ConfigDiff(MappingProxyType(applied), MappingProxyType(restart_required), unchanged)
+    diff, _ = _planned_reload(live, fresh, reloadable)
+    return diff
+
+
+def apply_reload(
+    live: M,
+    fresh: M,
+    *,
+    reloadable: frozenset[str] | None = None,
+    deprecated: Sequence[DeprecatedSpelling] = (),
+) -> ReloadReport:
+    if reloadable is None:
+        reloadable = reloadable_paths(type(live))
+    diff, write_points = _planned_reload(live, fresh, reloadable)
+    undo: list[tuple[_Slot, object]] = []
+    try:
+        for point in write_points:
+            _put(_slots(live, point), _fresh_value(fresh, point), undo)
+        type(live).model_validate(live.model_dump())
+    except BaseException as exc:
+        for slot, previous in reversed(undo):
+            _assign(slot, previous)
+        if not isinstance(exc, ValueError):
+            raise
+        return _report(False, {}, diff, deprecated, error=f'hybrid-invariant: {exc}')
+    return _report(True, diff.applied_candidates, diff, deprecated, error=None)
 
 
 @functools.cache
@@ -67,6 +107,23 @@ def _leaf_fields(model_cls: type[BaseModel]) -> tuple[DeclaredField, ...]:
     return tuple(
         declared for declared in declared_fields(model_cls) if isinstance(declared.shape, Leaf)
     )
+
+
+def _planned_reload(
+    live: BaseModel, fresh: BaseModel, reloadable: frozenset[str]
+) -> tuple[ConfigDiff, list[tuple[str, ...]]]:
+    applied: dict[str, Change] = {}
+    restart_required: dict[str, Change] = {}
+    write_points: list[tuple[str, ...]] = []
+    for point, changes in _change_groups(live, fresh).items():
+        if changes.keys() <= reloadable:
+            applied.update(changes)
+            write_points.append(point)
+        else:
+            restart_required.update(changes)
+    unchanged = len(_leaf_fields(type(live))) - len(applied) - len(restart_required)
+    diff = ConfigDiff(MappingProxyType(applied), MappingProxyType(restart_required), unchanged)
+    return diff, write_points
 
 
 def _change_groups(
@@ -117,3 +174,95 @@ def _child(node: object, name: str) -> object:
 
 def _is_hole(node: object) -> bool:
     return node is None or node is ABSENT
+
+
+@dataclass(frozen=True)
+class _Slot:
+    container: BaseModel | MutableMapping[str, object]
+    key: str
+
+
+def _slots(live: BaseModel, point: tuple[str, ...]) -> list[_Slot]:
+    key_enums = _table_key_enums(type(live))
+    slots: list[_Slot] = []
+    node: object = live
+    for depth, name in enumerate(point):
+        if isinstance(node, BaseModel):
+            slots.append(_Slot(node, name))
+        elif isinstance(node, MutableMapping):
+            slots.append(_Slot(node, key_enums[point[:depth]](name)))
+        else:
+            raise TypeError(
+                f'{".".join(point[:depth])} holds a {type(node).__qualname__}, '
+                f'which a reload cannot write into'
+            )
+        node = _child(node, name)
+    return slots
+
+
+@functools.cache
+def _table_key_enums(model_cls: type[BaseModel]) -> Mapping[tuple[str, ...], type[StrEnum]]:
+    return MappingProxyType({
+        declared.segments: declared.shape.key_enum
+        for declared in declared_fields(model_cls)
+        if isinstance(declared.shape, Table)
+    })
+
+
+def _fresh_value(fresh: BaseModel, point: tuple[str, ...]) -> object:
+    value = _read(fresh, point)
+    return value.model_copy(deep=True) if isinstance(value, BaseModel) else value
+
+
+def _put(slots: list[_Slot], value: object, undo: list[tuple[_Slot, object]]) -> None:
+    slot = slots[-1]
+    if isinstance(slot.container, BaseModel) and slot.container.model_config.get('frozen'):
+        if len(slots) == 1:
+            raise TypeError(
+                f'cannot reload into the frozen root {type(slot.container).__qualname__}'
+            )
+        _put(slots[:-1], slot.container.model_copy(update={slot.key: value}), undo)
+        return
+    undo.append((slot, _child(slot.container, slot.key)))
+    _assign(slot, value)
+
+
+def _assign(slot: _Slot, value: object) -> None:
+    if isinstance(slot.container, BaseModel):
+        object.__setattr__(slot.container, slot.key, value)
+    elif value is ABSENT:
+        del slot.container[slot.key]
+    else:
+        slot.container[slot.key] = value
+
+
+def _report(
+    reloaded: bool,
+    applied: Mapping[str, Change],
+    diff: ConfigDiff,
+    deprecated: Sequence[DeprecatedSpelling],
+    *,
+    error: str | None,
+) -> ReloadReport:
+    return ReloadReport(
+        reloaded=reloaded,
+        applied=_rendered(applied),
+        restart_required=_rendered(diff.restart_required),
+        unchanged=diff.unchanged,
+        error=error,
+        deprecated=[
+            {'old_path': spelling.old_path, 'new_path': spelling.new_path}
+            for spelling in deprecated
+        ],
+    )
+
+
+def _rendered(changes: Mapping[str, Change]) -> dict[str, dict[str, object]]:
+    return {
+        path: {'old': _rendered_value(change.old), 'new': _rendered_value(change.new)}
+        for path, change in changes.items()
+    }
+
+
+def _rendered_value(value: object) -> object:
+    return _ABSENT_RENDERED if value is ABSENT else value
