@@ -42,8 +42,8 @@ def test_a_second_release_does_not_reset_the_lag():
 @pytest.mark.asyncio
 async def test_a_deadline_set_while_held_survives_a_real_stall_past_its_budget():
     with held_loop_clock() as release:
-        # noqa: wall-clock-deadline — this deadline is the subject under test, and its expiry is the asserted outcome
-        waiter = asyncio.ensure_future(asyncio.wait_for(asyncio.Event().wait(), timeout=0.05))
+        never = asyncio.get_running_loop().create_future()
+        waiter = asyncio.ensure_future(asyncio.wait_for(never, timeout=0.05))
         await asyncio.to_thread(time.sleep, 0.2)
         for _ in range(5):
             await asyncio.sleep(0)
