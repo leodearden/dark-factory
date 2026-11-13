@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.task_metadata import parse_metadata
 
 from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE, DeterministicRunner
 from orchestrator.scheduler import TaskAssignment
@@ -253,3 +254,16 @@ async def test_gate_stamped_before_preconditions_were_recorded_still_closes(queu
     outcome = await _dispatch(scheduler, queue)
 
     _assert_closed_citing(scheduler, outcome, legacy.id)
+
+
+@pytest.mark.asyncio
+async def test_preconditions_stamp_is_a_recognised_metadata_key(queue):
+    scheduler = _SchedulerDouble(
+        _gate_task(deps=[10], milestone={'mode': 'dated', 'at': '2026-11-12T00:00:00+00:00'}),
+    )
+    assert await _dispatch(scheduler, queue) == WorkflowOutcome.BLOCKED
+
+    _meta, warnings = parse_metadata(scheduler.task['metadata'], direction='read')
+
+    unknown = [w.field for w in warnings if w.code == 'unknown_key']
+    assert unknown == [], f'runner-written metadata keys not blessed: {unknown}'
