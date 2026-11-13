@@ -1684,7 +1684,7 @@
     "orchestrator/tests/test_workflow_signature_loop_guard.py": {"patch_targets": [], "private_reads": 12},
     "orchestrator/tests/test_workflow_skew_surfacing.py": {"patch_targets": ["intake.enqueue_merge_request"], "private_reads": 17},
     "orchestrator/tests/test_workflow_state_machine_boundary.py": {"patch_targets": [], "private_reads": 98},
-    "orchestrator/tests/test_workflow_status_on_resume.py": {"patch_targets": [], "private_reads": 35},
+    "orchestrator/tests/test_workflow_status_on_resume.py": {"patch_targets": [], "private_reads": 34},
     "orchestrator/tests/test_workflow_task_root.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_workflow_terminal_report.py": {"patch_targets": [], "private_reads": 12},
     "orchestrator/tests/test_workflow_train_attribution.py": {"patch_targets": ["worker.reverify_member_solo"], "private_reads": 69},
