@@ -26,6 +26,7 @@ from _link_heal_harness import (
     FAKE_ADJUDICATOR_MODEL,
     FAKE_PROMPT_SHA256,
     PROJECTS,
+    REIFY,
     Answer,
     FakeAdjudicator,
     LinkHealHarness,
@@ -275,9 +276,11 @@ NOW = datetime(2026, 11, 2, tzinfo=UTC)
 DAY = timedelta(hours=24)
 
 
-def _settings(*, writes: bool = False, dry_run: bool = False) -> SweepSettings:
+def _settings(
+    *, writes: bool = False, dry_run: bool = False, projects: tuple[str, ...] = PROJECTS,
+) -> SweepSettings:
     return SweepSettings(
-        projects=PROJECTS, writes=writes, dry_run=dry_run, actions=SWEEP_ACTIONS, window_hours=24,
+        projects=projects, writes=writes, dry_run=dry_run, actions=SWEEP_ACTIONS, window_hours=24,
     )
 
 
@@ -601,10 +604,12 @@ class TestTheShareEscape:
         assert _report_json(report)['undo_run_id'] is None
 
 
-def _seed_one(harness: LinkHealHarness, n: int, text: str, created_at: str) -> str:
+def _seed_one(
+    harness: LinkHealHarness, n: int, text: str, created_at: str, *, project: str = DF,
+) -> str:
     child = _id('eeeeeeee', n)
     harness.seed_link(
-        kind=SIGHTING_KIND, child=child, parent=_id('ffffffff', n),
+        kind=SIGHTING_KIND, child=child, parent=_id('ffffffff', n), project=project,
         child_text=text, parent_text=f'the parent of {text}', meta={'created_at': created_at},
     )
     return child
@@ -687,6 +692,48 @@ class TestTheWindow:
         )
 
         assert _window(report) == (NOW, third)
+
+    @pytest.mark.asyncio
+    async def test_a_one_project_sweep_leaves_the_other_projects_window_open(
+        self, harness, ledger, tmp_path,
+    ):
+        same = FakeAdjudicator(lambda _text: Verdict.SAME)
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        child = _seed_one(
+            harness, 1, 'a reify sighting', (NOW + timedelta(hours=2)).isoformat(), project=REIFY,
+        )
+        await _sweep(
+            harness, ledger, tmp_path, settings=_settings(projects=(DF,)), filer=RecordingFiler(),
+            adjudicate=same, now=NOW + timedelta(hours=6),
+        )
+        last = NOW + timedelta(hours=12)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            adjudicate=same, now=last,
+        )
+
+        assert _window(report) == (NOW, last)
+        assert child in {record.child_id for record in ledger.run_records(report.plan_run_id)}
+
+    @pytest.mark.asyncio
+    async def test_a_later_since_does_not_skip_the_gap_before_it(self, harness, ledger, tmp_path):
+        same = FakeAdjudicator(lambda _text: Verdict.SAME)
+        await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
+        child = _seed_one(harness, 1, 'a gap sighting', (NOW + timedelta(hours=2)).isoformat())
+        await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            adjudicate=same, now=NOW + timedelta(hours=6), since=NOW + timedelta(hours=4),
+        )
+        nightly = NOW + timedelta(hours=12)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler(),
+            adjudicate=same, now=nightly,
+        )
+
+        assert _window(report) == (NOW, nightly)
+        assert child in {record.child_id for record in ledger.run_records(report.plan_run_id)}
 
     @pytest.mark.asyncio
     async def test_a_complete_sweep_says_so(self, harness, ledger, tmp_path):

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     UndoTarget,
     UnknownRun,
 )
-from fused_memory.maintenance.link_heal_store import LiveRecord, text_sha256
+from fused_memory.maintenance.link_heal_store import CreatedWindow, LiveRecord, text_sha256
 from fused_memory.server.grouped_read import CONTESTED_METADATA_KEY
 
 PROJECT = 'dark_factory'
@@ -907,6 +908,74 @@ class TestAdjudications:
                 reason='r',
                 model='opus',
             )
+
+
+T0 = datetime(2026, 11, 1, tzinfo=UTC)
+T1 = datetime(2026, 11, 2, tzinfo=UTC)
+T2 = datetime(2026, 11, 3, tzinfo=UTC)
+T3 = datetime(2026, 11, 4, tzinfo=UTC)
+
+
+class TestPerProjectSweepWindows:
+    @staticmethod
+    def _swept(
+        ledger: LinkHealLedger,
+        since: datetime,
+        until: datetime,
+        *,
+        projects: tuple[str, ...] = (PROJECT,),
+        complete: bool = True,
+    ) -> None:
+        run_id = ledger.start_run(RunSource.SWEEP, writes=False)
+        ledger.record_sweep_window(
+            run_id, CreatedWindow(since=since, until=until), projects=projects, complete=complete,
+        )
+
+    def test_a_complete_window_sets_only_its_own_projects_watermark(self, ledger):
+        self._swept(ledger, T0, T1)
+
+        assert ledger.sweep_watermark(PROJECT) == T1
+        assert ledger.sweep_watermark('reify') is None
+
+    @pytest.mark.parametrize(('since', 'until'), [(T1, T2), (T0, T3)])
+    def test_a_complete_window_starting_at_or_before_the_watermark_extends_it(
+        self, ledger, since, until,
+    ):
+        self._swept(ledger, T0, T1)
+
+        self._swept(ledger, since, until)
+
+        assert ledger.sweep_watermark(PROJECT) == until
+
+    def test_a_complete_window_starting_after_the_watermark_leaves_it_alone(self, ledger):
+        self._swept(ledger, T0, T1)
+
+        self._swept(ledger, T2, T3)
+
+        assert ledger.sweep_watermark(PROJECT) == T1
+
+    def test_a_later_contiguous_window_still_extends_from_before_the_gap(self, ledger):
+        self._swept(ledger, T0, T1)
+        self._swept(ledger, T2, T3)
+
+        self._swept(ledger, T1, T2)
+
+        assert ledger.sweep_watermark(PROJECT) == T2
+
+    def test_an_incomplete_window_never_moves_it(self, ledger):
+        self._swept(ledger, T0, T1, complete=False)
+        assert ledger.sweep_watermark(PROJECT) is None
+
+        self._swept(ledger, T0, T1)
+        self._swept(ledger, T1, T2, complete=False)
+
+        assert ledger.sweep_watermark(PROJECT) == T1
+
+    def test_one_window_over_two_projects_moves_both(self, ledger):
+        self._swept(ledger, T0, T1, projects=(PROJECT, 'reify'))
+
+        assert ledger.sweep_watermark(PROJECT) == T1
+        assert ledger.sweep_watermark('reify') == T1
 
 
 class TestRunLock:
