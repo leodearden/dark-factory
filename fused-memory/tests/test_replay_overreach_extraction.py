@@ -27,6 +27,7 @@ from graphiti_core.prompts.extract_nodes import ExtractedEntities
 from graphiti_core.prompts.models import Message
 from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
 from pydantic import BaseModel
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
@@ -36,6 +37,8 @@ from fused_memory.backends.llm_token_usage import (
     measure_llm_tokens,
 )
 from fused_memory.config.schema import FusedMemoryConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 mod = load_script_module(SCRIPTS / 'replay_overreach_extraction.py', mod_name='replay_overreach_extraction')
