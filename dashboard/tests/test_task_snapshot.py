@@ -201,7 +201,8 @@ class TestCannedMCP:
         canned = CannedMCP(rows=[_raw_row(1, 'pending')])
         row_keys = ['id', 'title', 'description', 'details', 'testStrategy', 'status',
                     'dependencies', 'priority', 'subtasks', 'updatedAt', 'metadata',
-                    'claimant_run_id', 'heartbeat_at', 'candidate_key']
+                    'claimant_run_id', 'heartbeat_at', 'candidate_key',
+                    'created_at', 'created_at_source']
 
         answer = await canned(None, 'u', 'get_tasks',
                               {'project_root': '/p', 'fields': [*row_keys, 'metadata.x_Key_2']})

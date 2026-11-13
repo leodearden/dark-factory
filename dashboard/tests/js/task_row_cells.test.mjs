@@ -1,7 +1,7 @@
 // Module-contract tests for task_row_cells.js — the pure render DECISIONS
-// behind the two cells of a task row's claim column: the stranded badge at its
-// three sites (tab_tasks.jsx renderNode, tab_tasks.jsx TaskDetail, tabs.jsx
-// OrchTab) and the agent cell it sits beside at two of them.
+// behind a task row's cells: the stranded badge at its three sites
+// (tab_tasks.jsx renderNode, tab_tasks.jsx TaskDetail, tabs.jsx OrchTab), the
+// agent cell it sits beside at two of them, and TaskDetail's filed cell.
 //
 // WHAT THIS SUITE ASSERTS, AND WHAT IT DELIBERATELY DOES NOT. Only the RENDER
 // decision: which descriptor comes back, with what label/title/margin, and when
@@ -64,9 +64,14 @@ function loadTaskRowCells() {
 
 const cells = loadTaskRowCells().cells;
 
-const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum, STRAND_TITLE, MUTED_COLOR } = cells;
+const {
+  strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum, filedCellState,
+  STRAND_TITLE, MUTED_COLOR,
+} = cells;
 
-const EXPECTED_FUNCTION_NAMES = ['strandBadgeState', 'agentCellState', 'locksCellState', 'schedulerLocksDatum'];
+const EXPECTED_FUNCTION_NAMES = [
+  'strandBadgeState', 'agentCellState', 'locksCellState', 'schedulerLocksDatum', 'filedCellState',
+];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'STRAND_TITLE', 'MUTED_COLOR'];
 
 test('default-imported module exposes the task-row render decisions', () => {
@@ -451,3 +456,60 @@ test('schedulerLocksDatum: before the first /scheduler receipt nothing is known'
   assert.equal(datum.state, 'unknown');
   assert.equal(datum.reason, 'not yet fetched');
 });
+
+// ---------------------------------------------------------------------------
+// filedCellState — the task's filing time, always beside its named proxy
+//
+// The date is the UTC calendar day of created_at; the source is shown
+// verbatim. A date with no named proxy is what this cell must never show.
+// ---------------------------------------------------------------------------
+
+const FILED_EM_DASH = loadTaskRowCells().window.DF_DATUM.EM_DASH;
+const NO_FILING_TIME = 'no creation time is recorded for this task';
+// Late in the UTC day, so a local-time slice shows the next day in any
+// positive-offset zone.
+const LATE_FILED = '2026-11-12T23:59:59.999Z';
+
+test('filedCellState: a stamped filing time shows its UTC date and names its proxy', () => {
+  assert.deepEqual(filedCellState({ created_at: LATE_FILED, created_at_source: 'stamped' }), {
+    text: '2026-11-12 (stamped)',
+    title: `filed ${LATE_FILED}; time proxy: stamped`,
+  });
+});
+
+for (const source of ['first_event', 'pending_since', 'updated_at']) {
+  test(`filedCellState: the backfill proxy ${source} is named verbatim`, () => {
+    assert.deepEqual(filedCellState({ created_at: LATE_FILED, created_at_source: source }), {
+      text: `2026-11-12 (${source})`,
+      title: `filed ${LATE_FILED}; time proxy: ${source}`,
+    });
+  });
+}
+
+test('filedCellState: a filing time with no recorded proxy says so', () => {
+  const expected = {
+    text: '2026-11-12 (source not recorded)',
+    title: `filed ${LATE_FILED}; time proxy not recorded`,
+  };
+  assert.deepEqual(filedCellState({ created_at: LATE_FILED, created_at_source: null }), expected);
+  assert.deepEqual(filedCellState({ created_at: LATE_FILED }), expected);
+  assert.deepEqual(filedCellState({ created_at: LATE_FILED, created_at_source: '' }), expected);
+});
+
+test('filedCellState: no recorded filing time is a placeholder that says so', () => {
+  const expected = { text: FILED_EM_DASH, title: NO_FILING_TIME };
+  assert.deepEqual(filedCellState({ created_at: null, created_at_source: 'stamped' }), expected);
+  assert.deepEqual(filedCellState({ created_at_source: 'stamped' }), expected);
+  assert.deepEqual(filedCellState({}), expected);
+  assert.deepEqual(filedCellState(null), expected);
+  assert.deepEqual(filedCellState(undefined), expected);
+});
+
+for (const raw of ['not-a-time', '', 12345]) {
+  test(`filedCellState: an unparseable created_at ${JSON.stringify(raw)} is a placeholder naming it`, () => {
+    assert.deepEqual(filedCellState({ created_at: raw, created_at_source: 'stamped' }), {
+      text: FILED_EM_DASH,
+      title: `${NO_FILING_TIME}: created_at ${JSON.stringify(raw)} is not a timestamp`,
+    });
+  });
+}

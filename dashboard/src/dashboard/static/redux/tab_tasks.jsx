@@ -10,7 +10,7 @@ const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, u
 const { computeNeighborhood, focusGroupView, layoutSignature, taskGraphLayout } = window.DF_GRAPH_LAYOUT;
 const { ProjectPrdLanes, PrdContentionLine } = window.DF_PRD_LANES;
 const { projectPrdView, projectPrdContention } = window.DF_PRD_LANES_VIEW;
-const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum } = window.DF_TASK_ROW_CELLS;
+const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum, filedCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNoticesFor } = window.DF_TASKS_OFFLINE_BANNER;
 const { invariantChipFor, chainChipFor } = window.DF_INVARIANT_CHIP;
@@ -391,6 +391,7 @@ function TaskDetail({ task, allTasks }) {
               columns; deliberately INDEPENDENT of `agent` below, which is only
               worktree presence and stays truthy after the agent dies. */}
           {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
+        <span className="k">filed</span>{(() => { const fc = filedCellState(task); return <span style={{ fontFamily: 'var(--mono)', fontSize: 11 }} title={fc.title}>{fc.text}</span>; })()}
         {deferralCellState(task) && (
           <React.Fragment>
             <span className="k">hold</span>
