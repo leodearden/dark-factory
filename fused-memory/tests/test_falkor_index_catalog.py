@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import itertools
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import redis.exceptions
-from _falkor_index_doubles import LIVE_HEADER, rows_for
+from _falkor_index_doubles import LIVE_HEADER, rows_for, statements_read, statements_written
 
 from fused_memory.backends import falkor_indices
 from fused_memory.backends.falkor_indices import (
@@ -60,30 +59,22 @@ class TestIndexRecordsFromRows:
         assert falkor_indices.index_records_from_rows(LIVE_HEADER, None) == []
 
 
-def _catalog_graph(rows):
-    result = MagicMock()
-    result.header = LIVE_HEADER
-    result.result_set = rows
-    graph = MagicMock()
-    graph.ro_query = AsyncMock(return_value=result)
-    graph.query = AsyncMock()
-    return graph
-
-
 @pytest.mark.asyncio
 class TestReadIndexRecords:
-    async def test_reads_the_catalog_on_the_read_only_path(self):
+    async def test_reads_the_catalog_on_the_read_only_path(self, make_graph_mock):
         rows = rows_for(expected_index_set())
-        graph = _catalog_graph(rows)
+        graph = make_graph_mock(rows, header=LIVE_HEADER)
 
         records = await falkor_indices.read_index_records(graph)
 
         assert records == falkor_indices.index_records_from_rows(LIVE_HEADER, rows)
-        graph.ro_query.assert_awaited_once_with(INDEX_CATALOG_QUERY)
-        graph.query.assert_not_awaited()
+        assert statements_read(graph) == [INDEX_CATALOG_QUERY]
+        assert statements_written(graph) == []
 
-    async def test_an_absent_result_set_yields_no_records(self):
-        assert await falkor_indices.read_index_records(_catalog_graph(None)) == []
+    async def test_an_empty_catalog_yields_no_records(self, make_graph_mock):
+        graph = make_graph_mock(header=LIVE_HEADER)
+
+        assert await falkor_indices.read_index_records(graph) == []
 
 
 def _settled_records():
