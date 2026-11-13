@@ -8,10 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from shared.config_fields import (
     ConfigDeclarationError,
+    LegacySpelling,
     Reload,
     RestartOnlyRows,
     TableLegacy,
     declared_fields,
+    legacy_spellings,
     reloadable_paths,
 )
 
@@ -189,3 +191,130 @@ def test_a_misplaced_marker_is_a_declaration_error_naming_path_and_value(model_c
 
 def test_a_declaration_error_is_a_type_error():
     assert issubclass(ConfigDeclarationError, TypeError)
+
+
+class Admission(BaseModel):
+    slots: Annotated[int, LegacySpelling('old_slots')] = 4
+
+
+class ScalarSpelled(BaseModel):
+    admission: Admission = Field(default_factory=Admission)
+
+
+class KnobMajorTable(BaseModel):
+    roles: Annotated[dict[Role, Row], TableLegacy.knob_major('models', 'model')] = Field(
+        default_factory=dict
+    )
+
+
+ROW_MAP = TableLegacy(
+    rows={
+        'unblock_auto.model': ('unblock_auto', 'model'),
+        'watcher_model': ('reviewer', 'model'),
+    }
+)
+
+
+class RowMapTable(BaseModel):
+    roles: Annotated[dict[Role, Row], ROW_MAP] = Field(default_factory=dict)
+
+
+class UnionedTable(BaseModel):
+    roles: Annotated[
+        dict[Role, Row],
+        TableLegacy.knob_major('models', 'model'),
+        TableLegacy.knob_major('budgets', 'budget_usd'),
+        ROW_MAP,
+    ] = Field(default_factory=dict)
+
+
+def test_a_scalar_spelling_maps_its_root_relative_old_path_to_the_field_path():
+    assert dict(legacy_spellings(ScalarSpelled)) == {'old_slots': 'admission.slots'}
+
+
+def test_knob_major_maps_every_row_of_the_key_enum():
+    assert dict(legacy_spellings(KnobMajorTable)) == {
+        f'models.{role.value}': f'roles.{role.value}.model' for role in Role
+    }
+
+
+def test_a_row_map_maps_each_old_path_to_its_row_and_knob():
+    assert dict(legacy_spellings(RowMapTable)) == {
+        'unblock_auto.model': 'roles.unblock_auto.model',
+        'watcher_model': 'roles.reviewer.model',
+    }
+
+
+def test_several_table_markers_on_one_field_union():
+    expected = {f'models.{role.value}': f'roles.{role.value}.model' for role in Role}
+    expected |= {f'budgets.{role.value}': f'roles.{role.value}.budget_usd' for role in Role}
+    expected |= {
+        'unblock_auto.model': 'roles.unblock_auto.model',
+        'watcher_model': 'roles.reviewer.model',
+    }
+    assert dict(legacy_spellings(UnionedTable)) == expected
+
+
+def _assign_item(container, key, value) -> None:
+    container[key] = value
+
+
+def test_the_spelling_map_is_read_only():
+    with pytest.raises(TypeError):
+        _assign_item(legacy_spellings(ScalarSpelled), 'another', 'admission.slots')
+
+
+class DoublyClaimed(BaseModel):
+    first: Annotated[int, LegacySpelling('legacy_knob')] = 0
+    second: Annotated[int, LegacySpelling('legacy_knob')] = 0
+
+
+class Shadowing(BaseModel):
+    flat: int = 0
+    slots: Annotated[int, LegacySpelling('flat')] = 1
+
+
+class RowMapNamingAStranger(BaseModel):
+    roles: Annotated[
+        dict[Role, Row], TableLegacy(rows={'stranger_model': ('nope', 'model')})
+    ] = Field(default_factory=dict)
+
+
+class KnobMajorNamingAStranger(BaseModel):
+    roles: Annotated[dict[Role, Row], TableLegacy.knob_major('temps', 'temperature')] = Field(
+        default_factory=dict
+    )
+
+
+class SpelledRow(BaseModel):
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    model: Annotated[str, LegacySpelling('old_model')] = 'sonnet'
+
+
+class SpellingInsideARow(BaseModel):
+    roles: dict[Role, SpelledRow] = Field(default_factory=dict)
+
+
+@pytest.mark.parametrize(
+    ('model_cls', 'named'),
+    [
+        (DoublyClaimed, ('legacy_knob', 'first', 'second')),
+        (Shadowing, ('flat', 'slots')),
+        (RowMapNamingAStranger, ('roles', 'nope', 'architect', 'reviewer', 'unblock_auto')),
+        (KnobMajorNamingAStranger, ('roles', 'temperature', 'model', 'budget_usd', 'max_turns')),
+        (SpellingInsideARow, ('roles.', 'old_model')),
+    ],
+    ids=[
+        'old-path-declared-twice',
+        'old-path-shadows-a-declared-path',
+        'table-legacy-row-not-in-key-enum',
+        'table-legacy-knob-not-a-row-field',
+        'legacy-spelling-inside-a-table-row',
+    ],
+)
+def test_an_inconsistent_spelling_is_a_declaration_error_naming_the_values(model_cls, named):
+    with pytest.raises(ConfigDeclarationError) as raised:
+        legacy_spellings(model_cls)
+    for text in named:
+        assert text in str(raised.value)
