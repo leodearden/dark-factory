@@ -433,6 +433,8 @@ No waivers.
 
 **Threshold home and re-bases.** The filing-time values are above, and each value's home is its gate task's `before_done.args` (D9). Re-bases are appended here as dated lines.
 
+- 2026-11-13: task 7159 built ε's nightly sweep (`link_heal.py sweep`, windowed on child `created_at`, staging only `link_heal.sweep_actions`), the timer files (`scripts/fused-memory-link-heal.{sh,service,timer}`, `scripts/install-link-heal-timer.sh`), the 02:15 ladder row and the soak-calibration gate (`link_heal.py calibrate`; writes need `link_heal.writes` plus a passing calibration of the exact model and prompt). Task 6188 keeps only ε's `summary.json`/`_7d` metrics residue.
+
 ## 10. Open questions (tactical)
 
 1. **Ledger file location.** Suggested: beside `write_journal.db` under `reconciliation.data_dir`. Decide in α from how the CLI and timer resolve the fused-memory data dir.

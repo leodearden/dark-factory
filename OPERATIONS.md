@@ -3225,6 +3225,7 @@ missing `LoadState` detector).
 
 | Slot | Job | Units |
 |---|---|---|
+| 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
 | 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
 | 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`) | `fused-memory-memory-eval.timer` |
@@ -3241,7 +3242,8 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones,
+for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
+02:15 one; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones,
 [Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one, and
 [The owner sweep timer (06:00) and its age](#the-owner-sweep-timer-0600-and-its-age) in §12a
 for the 06:00 one.
@@ -3266,6 +3268,76 @@ harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
 reconciliation. Those residual units do **not** collide with the new 04:30 job:
 they carry a different unit name, and a re-armed sweep would merely fail
 `203/EXEC` alongside it rather than contend for anything.
+
+### Nightly link-heal sweep (02:15)
+
+The sweep asks the link adjudicator about the write-triage links made since
+the last complete sweep, and heals the misfiled ones. The contract is
+`plans/write-triage-link-healing-prd.md` H1 and H2 (task 7159). Its four files are
+`scripts/fused-memory-link-heal.{sh,service,timer}` and
+`scripts/install-link-heal-timer.sh`, which kicks no immediate run. Installing
+it is the post-merge deterministic deploy described above. This section does
+not claim the timer is installed: `systemctl --user list-timers --all` is the
+check.
+
+- **What one run examines.** `fused-memory/scripts/link_heal.py sweep` plans
+  over every link in each project of `link_heal.projects` (else the home
+  project) whose child was created inside the run window. The window runs from
+  the end of the last complete sweep, or `link_heal.sweep_window_hours` back
+  from the first one, up to now. A run with a read or adjudication failure
+  does not move the window, so the next run examines those links again. Only
+  the heals in `link_heal.sweep_actions` (default `detach`, `relabel`) are
+  staged; every other heal is recorded as `not_enabled`.
+- **When it writes.** It writes only when `link_heal.writes: true` is set, no
+  `--dry-run` is given, and the latest calibration of the adjudicator's exact
+  model and prompt version (the sha256 of the rendered system prompt) passed.
+  Otherwise the report's Writes line says `dry-run` or
+  `withheld (uncalibrated)` / `withheld (calibration_failed)`. A writing run
+  keeps the per-run cap and the backlog, share-ceiling and write-failure
+  escapes, and also files the adjudicator failure storm.
+- **Calibrate first, and again after any model or brief change.** From the
+  main checkout (the soak data is gitignored there):
+
+  ```bash
+  python fused-memory/scripts/link_heal.py calibrate \
+      --ratings data/write-triage-soak-2026-10-19/correctness/adjudications.jsonl \
+      --items data/write-triage-soak-2026-10-19/correctness/items_all.json
+  ```
+
+  It asks the adjudicator about every rated pair and scores the misfile and
+  CORRECTS binaries against the final rater verdict. A binary passes when its
+  kappa is at least the raters' own kappa, minus
+  `link_heal.calibration_kappa_margin` (0.10). The raters' kappa is the second
+  rater against the primary, recomputed from the file. That floor applies
+  pooled, and to each project with at least
+  `link_heal.calibration_min_project_items` (60) rated pairs. At most 5% of
+  pairs may go unanswered. Exit 0 is a pass. Exit 1 is a fail, and files a
+  blocking `link-heal-calibration` escalation naming the report.
+- **Run it by hand.** `link_heal.py sweep [--dry-run] [--project P ...]`. The
+  one-off backlog run, covering everything since triage went live, is
+  `link_heal.py sweep --since 2026-10-11T00:00:00+00:00`. `--since` needs a UTC
+  offset. The cap drains a large backlog over several nights. To drain it at
+  once, review the latest sweep plan document that `status` lists, then run
+  `link_heal.py apply --sweep --approved-plan-sha <its sha>`.
+- **Undo.** A report whose run applied anything names that apply run as
+  `undo_run_id`, with the literal command
+  `link_heal.py undo --run <apply run id>`.
+- **What it leaves.**
+  - A JSON and a Markdown report,
+    `<reconciliation.data_dir>/link-heal-reports/link-heal-sweep-<date>-<run8>.{json,md}`.
+    They give counts by project × decision × verdict × action, the escapes
+    filed and would-escape, the window, the calibration status and the undo
+    run.
+  - One info escalation per run naming the report: category
+    `link_heal_run_report`, anchor `link-heal-run-report`, never folded.
+  - The records, in `<reconciliation.data_dir>/link_heal.db`. Each examined
+    link has its child and parent exactly as read, the verdict with its
+    model, prompt version and reason, the decision and its disposition, and
+    each write's before and after snapshots. The records are append-only and
+    never pruned.
+- **Exit codes.** 0 when the run is complete, or partial only by the cap or
+  stale skips. 1 on a read, adjudication or write failure, or a stopped run.
+  2 when the run was refused before it started.
 
 ### Transcript secret sweep (02:30)
 
