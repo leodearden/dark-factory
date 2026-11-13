@@ -10,6 +10,7 @@ key already covers the whole tree and these reads cannot escape it.
 
 from __future__ import annotations
 
+import ast
 import functools
 import subprocess
 import sys
@@ -38,6 +39,11 @@ COLLECT_TIMEOUT_SECS = 600
 MOVED_GUARDS = (
     'test_reify_closure_staleness_sweep_retired.py',
     'test_design_invariants_consistency.py',
+    'TestCheckedInManifestCorpus',
+    'TestCheckedInOpenVerdictEvidence',
+    'TestCheckedInScriptCheckTargets',
+    'test_committed_exemplar_sidecar_validates',
+    'test_every_checked_in_sidecar_lives_where_its_prd_derives',
 )
 
 #: Repo-relative homes the whole-file moves vacated.
@@ -45,6 +51,94 @@ VACATED_PATHS = (
     'tests/scripts/test_reify_closure_staleness_sweep_retired.py',
     'scripts/tests/test_design_invariants_consistency.py',
 )
+
+
+SHARED_TESTS_DIR = REPO_ROOT / 'shared' / 'tests'
+
+#: Names a module binds to the repository root.
+REPO_ROOT_NAMES = frozenset({'REPO_ROOT', '_REPO_ROOT', 'ROOT'})
+
+#: The capability-manifest corpus walker; with no argument it walks the real tree.
+CORPUS_WALKER = 'discover_manifests'
+
+
+def _is_file_parents_chain(node: ast.expr) -> bool:
+    """``Path(__file__)…parents[n]``, through any ``.resolve()``-style links."""
+    if not (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == 'parents'
+    ):
+        return False
+    link = node.value.value
+    while isinstance(link, (ast.Call, ast.Attribute)):
+        if isinstance(link, ast.Call) and isinstance(link.func, ast.Name):
+            return link.func.id == 'Path' and any(
+                isinstance(arg, ast.Name) and arg.id == '__file__' for arg in link.args
+            )
+        link = link.func if isinstance(link, ast.Call) else link.value
+    return False
+
+
+def _is_repo_root(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Name) and node.id in REPO_ROOT_NAMES
+    ) or _is_file_parents_chain(node)
+
+
+def _is_plans_literal(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and (node.value == 'plans' or node.value.startswith('plans/'))
+    )
+
+
+def _joins_repo_root_to_plans(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Div)
+        and _is_repo_root(node.left)
+        and _is_plans_literal(node.right)
+    )
+
+
+def _walks_the_real_corpus(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    callee = node.func
+    name = callee.id if isinstance(callee, ast.Name) else getattr(callee, 'attr', None)
+    if name != CORPUS_WALKER:
+        return False
+    arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+    return not arguments or any(_is_repo_root(argument) for argument in arguments)
+
+
+def _lists_tracked_plans(node: ast.expr) -> bool:
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return False
+    return any(
+        isinstance(element, ast.Constant) and element.value == 'ls-files'
+        for element in node.elts
+    ) and any(_is_plans_literal(element) for element in node.elts)
+
+
+def plans_reads(source: str) -> list[str]:
+    """Every site in *source* that reads the committed ``plans/`` tree.
+
+    Three shapes: a repository-root anchor joined to ``plans``, a corpus walk
+    over the real tree, and a ``git ls-files`` argv naming ``plans``.
+    """
+    return [
+        f'line {node.lineno}: {ast.unparse(node)}'
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.expr)
+        and (
+            _joins_repo_root_to_plans(node)
+            or _walks_the_real_corpus(node)
+            or _lists_tracked_plans(node)
+        )
+    ]
 
 
 @functools.cache
@@ -91,3 +185,49 @@ def test_every_moved_guard_is_collected_from_the_module() -> None:
 def test_no_moved_file_remains_at_its_old_path() -> None:
     remaining = [path for path in VACATED_PATHS if (REPO_ROOT / path).exists()]
     assert not remaining, f'moved into {MODULE_PREFIX}/ but still present: {remaining}'
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        "REPO_ROOT / 'plans' / 'x.yaml'",
+        "_REPO_ROOT / 'plans/x-prd.md'",
+        "ROOT / 'plans'",
+        "Path(__file__).resolve().parents[2] / 'plans'",
+        "Path(__file__).parents[2] / 'plans/x.yaml'",
+        'discover_manifests()',
+        'discover_manifests(REPO_ROOT)',
+        'corpus.discover_manifests(repo_root=REPO_ROOT)',
+        "subprocess.run(['git', 'ls-files', '--', 'plans'])",
+        "subprocess.run(['git', '-C', str(root), 'ls-files', '-z', 'plans/'])",
+    ],
+)
+def test_plans_reads_flags_a_read_of_the_committed_plans_tree(source: str) -> None:
+    assert plans_reads(source), source
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        "tmp_path / 'plans'",
+        "tmp_path / 'plans' / 'x.yaml'",
+        "prd = 'plans/x.yaml'",
+        'discover_manifests(tmp_path)',
+        "REPO_ROOT / 'docs' / 'prds'",
+        "subprocess.run(['git', 'ls-files', '--', 'docs'])",
+    ],
+)
+def test_plans_reads_passes_synthetic_plans_data(source: str) -> None:
+    assert plans_reads(source) == [], source
+
+
+def test_shared_tests_read_no_committed_plans() -> None:
+    reads = {
+        str(path.relative_to(REPO_ROOT)): found
+        for path in sorted(SHARED_TESTS_DIR.glob('*.py'))
+        if (found := plans_reads(path.read_text(encoding='utf-8')))
+    }
+    assert not reads, (
+        f'shared/tests reads the committed plans/ tree, which its cache key does '
+        f'not cover; move the reader into {MODULE_PREFIX}/: {reads}'
+    )
