@@ -39,6 +39,10 @@ from suite_census_outcomes import (
 ARCHIVED_JUNIT = 'data/verify-logs/*/attempt-*.junit-*.xml.gz'
 LIVE_JUNIT = '.worktrees/*/.df-verify-junit/report*.xml'
 VERIFY_LOGS = 'data/verify-logs/*/attempt-*.test-*.log'
+# Every row is a failure of the test it names, whatever its call site or verdict: each
+# follows a run in which that test went red (offline-lane passes included), and the failed
+# floor errs high. The ledger's test-less sentinel resolves to no test, so stays Unresolved.
+# Pinned by scripts/tests/test_suite_census_evidence.py::TestFlakeOccurrenceCallSites.
 FLAKE_QUERY = 'SELECT rowid, observed_at, test_id FROM flake_occurrence ORDER BY rowid'
 
 # The producer is orchestrator/src/orchestrator/verify.py::_archive_junit_report.
