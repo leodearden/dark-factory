@@ -9,12 +9,10 @@ to route through the multi-backend dispatcher below.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import re
-import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -24,9 +22,9 @@ from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
     CRASH_RECOVERY_RESUME_PROMPT,
     AgentResult,
+    CliRunner,
     SubprocessResult,
     TranscriptWatch,
-    _materialize_stdin,
     apply_spawn_env,
     build_claude_argv,
     invoke_claude_agent,
@@ -35,9 +33,6 @@ from shared.cli_invoke import (  # noqa: F401
     require_non_blank_prompt,
     run_cli_subprocess,
 )
-
-# Process-group termination helper for subprocess tree cleanup
-from shared.proc_group import terminate_process_group
 from shared.process_cost import ProcessCostBasis
 from shared.python_env import without_python_env_selection
 from shared.secret_env import agent_subprocess_env, without_agent_endpoint_vars
@@ -161,6 +156,8 @@ async def invoke_agent(
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
     resume_prior_total_cost_usd: float | None = None,
+    *,
+    runner: CliRunner = run_cli_subprocess,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
@@ -193,6 +190,8 @@ async def invoke_agent(
     packaged default price table; see ``_estimate_cost``.
     The codex backend maps *allowed_tools* / *disallowed_tools* onto its
     sandbox (see ``codex_exec_argv``).
+    *runner* spawns every backend's CLI; tests inject one in place of
+    ``run_cli_subprocess``.
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -224,6 +223,7 @@ async def invoke_agent(
             timeout_seconds=timeout_seconds, prices=prices,
             max_turns=max_turns,
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            runner=runner,
         )
     elif backend == 'gemini':
         return await _invoke_gemini(
@@ -232,6 +232,7 @@ async def invoke_agent(
             sandbox_modules=sandbox_modules, sandbox_extras=sandbox_extras,
             effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
+            runner=runner,
         )
     elif backend == 'pi':
         return await _invoke_pi(
@@ -243,6 +244,7 @@ async def invoke_agent(
             oauth_token=oauth_token, resume_session_id=resume_session_id,
             session_id=session_id, timeout_seconds=timeout_seconds,
             env_overrides=env_overrides, prices=prices,
+            runner=runner,
         )
     elif backend == 'zcode':
         return await _invoke_zcode(
@@ -252,6 +254,7 @@ async def invoke_agent(
             mcp_config=mcp_config, sandbox_modules=sandbox_modules,
             sandbox_extras=sandbox_extras, effort=effort,
             timeout_seconds=timeout_seconds, env_overrides=env_overrides, prices=prices,
+            runner=runner,
         )
     elif backend == 'mimo':
         return await _invoke_mimo(
@@ -261,6 +264,7 @@ async def invoke_agent(
             mcp_config=mcp_config, sandbox_modules=sandbox_modules,
             sandbox_extras=sandbox_extras, effort=effort,
             timeout_seconds=timeout_seconds, env_overrides=env_overrides, prices=prices,
+            runner=runner,
         )
     else:
         raise ValueError(f'Unknown backend: {backend!r}')
@@ -568,6 +572,8 @@ async def _invoke_codex(
     max_turns: int | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke OpenAI Codex CLI.
 
@@ -591,8 +597,8 @@ async def _invoke_codex(
     uniformity/observability only: codex-cli (verified 0.143.0, full `codex
     exec --help`) has NO native --max-turns flag and NO budget flag, so
     neither cap is natively enforceable here. The wall-clock watchdog
-    (*timeout_seconds*, enforced by `_run_subprocess_local`'s
-    `asyncio.wait_for`) is the sole ceiling on a codex invocation — parity
+    (*timeout_seconds*, enforced by the runner's flat timeout,
+    ``transcript=None``) is the sole ceiling on a codex invocation — parity
     with the pi backend (PRD open-Q3). Do not read cap enforcement into the
     mere presence of these params.
     """
@@ -616,9 +622,9 @@ async def _invoke_codex(
         cmd, without_python_env_selection(os.environ), cwd, sandbox_modules, sandbox_extras,
     )
 
-    result = await _run_subprocess_local(
-        cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
-        stdin_data=codex_input,
+    result = await runner(
+        cmd, cwd, env, backend='codex', model=model, timeout_seconds=timeout_seconds,
+        stdin_data=codex_input, transcript=None,
     )
     return _parse_codex_output(result, model, prices)
 
@@ -798,6 +804,8 @@ async def _invoke_gemini(
     sandbox_extras: list[str] | None = None,
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke Google Gemini CLI."""
     temp_files: list[Path] = []
@@ -820,7 +828,10 @@ async def _invoke_gemini(
             cmd, without_python_env_selection(os.environ), cwd, sandbox_modules, sandbox_extras,
         )
 
-        result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
+        result = await runner(
+            cmd, cwd, env, backend='gemini', model=model, timeout_seconds=timeout_seconds,
+            transcript=None,
+        )
         return _parse_gemini_output(result, model, prices)
 
     finally:
@@ -1176,6 +1187,8 @@ async def _invoke_pi(
     timeout_seconds: float | None = None,
     env_overrides: dict[str, str] | None = None,
     prices: dict[str, Any] | None = None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke the pi coding agent CLI (@earendil-works/pi-coding-agent).
 
@@ -1290,7 +1303,10 @@ async def _invoke_pi(
         cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
         _warn_if_argv_near_arg_max(cmd)
 
-        result = await _run_subprocess_local(cmd, cwd, env, 'pi', model, max_budget_usd, timeout_seconds)
+        result = await runner(
+            cmd, cwd, env, backend='pi', model=model, timeout_seconds=timeout_seconds,
+            transcript=None,
+        )
         return _parse_pi_output(result, model, prices)
 
     finally:
@@ -1386,6 +1402,8 @@ async def _invoke_zcode(
     timeout_seconds: float | None,
     env_overrides: dict[str, str] | None,
     prices: dict[str, Any] | None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke the ZCode CLI in a private run home; the wall clock is its only bound."""
     endpoint = ZCodeEndpoint.from_env_overrides(env_overrides)
@@ -1410,8 +1428,9 @@ async def _invoke_zcode(
             zcode_spawn_env(base_env, home),
             cwd, sandbox_modules, [*(sandbox_extras or []), str(home.root)],
         )
-        result = await _run_subprocess_local(
-            cmd, cwd, env, 'zcode', model, max_budget_usd, timeout_seconds,
+        result = await runner(
+            cmd, cwd, env, backend='zcode', model=model, timeout_seconds=timeout_seconds,
+            transcript=None,
         )
     return parse_zcode_output(
         result,
@@ -1441,6 +1460,8 @@ async def _invoke_mimo(
     timeout_seconds: float | None,
     env_overrides: dict[str, str] | None,
     prices: dict[str, Any] | None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Run one ``mimo run`` in a private MIMOCODE_HOME, then read its usage from that home's session store."""
     endpoint = MimoEndpoint.from_env_overrides(env_overrides)
@@ -1468,8 +1489,9 @@ async def _invoke_mimo(
 
         async def spawn(argv: list[str], timeout: float, stdin: bytes = b'') -> SubprocessResult:
             cmd, wrapped_env = _sandbox_spawn(argv, env, cwd, sandbox_modules, extras)
-            return await _run_subprocess_local(
-                cmd, cwd, wrapped_env, 'mimo', model, max_budget_usd, timeout, stdin_data=stdin,
+            return await runner(
+                cmd, cwd, wrapped_env, backend='mimo', model=model, timeout_seconds=timeout,
+                stdin_data=stdin, transcript=None,
             )
 
         run = await spawn(mimo_run_argv(model, cwd, effort), timeout_seconds, prompt.encode())
@@ -1479,119 +1501,6 @@ async def _invoke_mimo(
         cost_of=lambda uncached, output, cached: _estimate_cost(
             model, uncached + cached, output, prices, cached_input_tokens=cached,
         ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers (orchestrator-local, for non-Claude backends)
-# ---------------------------------------------------------------------------
-
-async def _run_subprocess_local(
-    cmd: list[str],
-    cwd: Path,
-    env: dict[str, str],
-    backend: str,
-    model: str,
-    max_budget_usd: float,
-    timeout_seconds: float | None = None,
-    stdin_data: bytes | None = None,
-) -> SubprocessResult:
-    """Run a subprocess, log output, enforce budget timeout.
-
-    *stdin_data*, when set, is delivered on the process's stdin (mirrors
-    shared.cli_invoke.run_cli_subprocess's stdin_data param, used by the
-    codex backend to deliver instructions without a worktree file — see
-    _invoke_codex). When None (gemini/pi callers), behavior is
-    byte-identical to before this param existed.
-
-    Like the shared runner, the payload is pre-materialized into an unlinked
-    temp file BEFORE spawn rather than written to a pipe afterwards, so an
-    event-loop stall cannot make the child miss its stdin deadline (task 3147
-    — see shared.cli_invoke._materialize_stdin for the confirmed failure mode).
-    The helper is imported, never re-implemented, so the two runners cannot
-    drift apart.
-    """
-    logger.info(f'Invoking agent: backend={backend} model={model} cwd={cwd} budget=${max_budget_usd}')
-    logger.info(f'Command: {" ".join(cmd[:15])}...')
-
-    start_ms = int(time.monotonic() * 1000)
-
-    # Pre-materialize the payload BEFORE the child exists (task 3147); see the
-    # docstring above.  stdin_data is None must still yield stdin=None.
-    stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd),
-            env=env,
-            stdin=stdin_file,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-    finally:
-        # Close the parent's handle once the child has its own dup — this is
-        # what delivers EOF to the child.  In a `finally` so a raising
-        # create_subprocess_exec cannot leak the fd.
-        if stdin_file is not None:
-            stdin_file.close()
-    # Capture pgid at spawn; start_new_session guarantees pgid == pid.
-    pgid = proc.pid
-
-    # Outer try: a cancel landing *inside* the TimeoutError handler's
-    # terminate_process_group await (SIGTERM already sent, SIGKILL escalation
-    # pending) must still be caught here too — an exception raised inside an
-    # except block is not caught by a sibling handler of the same try, so a
-    # CancelledError handler that was only a sibling of `except TimeoutError:`
-    # would let that escalation be abandoned with a SIGTERM-ignoring child
-    # left alive.
-    try:
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                # No `input=`: stdin was pre-materialized as a real fd before
-                # spawn (task 3147), so communicate() performs reads only.
-                proc.communicate(),
-                timeout=timeout_seconds,
-            )
-        except TimeoutError:
-            await terminate_process_group(proc, pgid)
-            duration_ms = int(time.monotonic() * 1000) - start_ms
-            return SubprocessResult(
-                stdout='',
-                stderr=f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)',
-                returncode=1,
-                duration_ms=duration_ms,
-                timed_out=True,
-            )
-    except asyncio.CancelledError:
-        # Orchestrator shutdown / steward-stop path: the awaiting task was
-        # cancelled.  Without this, proc.communicate() is cancelled but the
-        # child process GROUP is never signalled and the agent survives as an
-        # orphan still editing/committing in its worktree.  Mirrors the
-        # already-blessed handler in shared/src/shared/cli_invoke.py (:2433)
-        # and orchestrator/src/orchestrator/steward.py (:405).
-        # No comm_task to reap: asyncio.wait_for already cancels and awaits
-        # its inner task before propagating CancelledError.
-        if proc.returncode is None:
-            logger.warning(
-                f'Subprocess cancelled — terminating process group for pid {proc.pid}'
-            )
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
-        raise
-
-    duration_ms = int(time.monotonic() * 1000) - start_ms
-
-    stderr_text = stderr.decode()[-2000:] if stderr else ''
-    if stderr_text:
-        logger.info(f'Agent stderr (last 1000): {stderr_text[-1000:]}')
-    logger.info(f'Agent exit code: {proc.returncode}')
-    logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout.decode()[:500]}')
-
-    return SubprocessResult(
-        stdout=stdout.decode(),
-        stderr=stderr_text,
-        returncode=proc.returncode if proc.returncode is not None else 1,
-        duration_ms=duration_ms,
     )
 
 

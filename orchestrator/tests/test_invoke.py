@@ -8,9 +8,7 @@ import json
 import logging
 import os
 import re
-import signal
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,7 +20,6 @@ from shared.invocation_outcome import CapHit
 from shared.process_cost import ProcessCostBasis
 from shared.testing_fake_claude import install_fake_claude_cli
 from shared.testing_resume_rejection import measured_resume_rejection
-from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.agents.invoke import (
@@ -32,7 +29,6 @@ from orchestrator.agents.invoke import (
     _invoke_pi,
     _parse_codex_output,
     _parse_gemini_output,
-    _run_subprocess_local,
     codex_exec_argv,
     invoke_agent,
     invoke_with_cap_retry,
@@ -279,272 +275,6 @@ class TestCapHitResume:
             assert got.success is True
 
 
-# ── _run_subprocess_local timed_out, _parse_codex_output, _parse_gemini_output ─
-
-
-@pytest.mark.asyncio
-class TestRunSubprocessLocalTimedOut:
-
-    async def test_run_subprocess_local_sets_timed_out_on_timeout(self, tmp_path):
-        """_run_subprocess_local propagates timed_out=True when TimeoutError fires.
-
-        This test only verifies that the timed_out flag and error message are
-        set correctly on the returned SubprocessResult.  It does not assert
-        that terminate_process_group is called — that is covered by a separate
-        test that patches the helper directly.
-        """
-        proc = MagicMock()
-        proc.pid = 12345  # int required so pgid safety-check doesn't TypeError
-        proc.communicate = AsyncMock(side_effect=TimeoutError)
-        proc.wait = AsyncMock()
-        proc.returncode = None
-
-        async def fake_exec(*args, **kwargs):
-            return proc
-
-        with (
-            patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-                  side_effect=fake_exec),
-            patch('orchestrator.agents.invoke.terminate_process_group',
-                  new_callable=AsyncMock),
-        ):
-            result = await _run_subprocess_local(
-                ['fake'], cwd=tmp_path, env={}, backend='codex', model='gpt-5.4',
-                max_budget_usd=1.0, timeout_seconds=0.1,
-            )
-
-        assert result.timed_out is True
-        assert 'Process killed after' in result.stderr and 'timeout' in result.stderr
-        assert result.returncode == 1
-
-    async def test_run_subprocess_local_timeout_calls_terminate_process_group(self, tmp_path):
-        """terminate_process_group is awaited (not proc.kill) when TimeoutError fires."""
-        proc = MagicMock()
-        proc.pid = 12345  # int so pgid capture and safety-check pass
-        proc.communicate = AsyncMock(side_effect=TimeoutError)
-        proc.wait = AsyncMock()
-        proc.returncode = None
-
-        async def fake_exec(*args, **kwargs):
-            return proc
-
-        with (
-            patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-                  side_effect=fake_exec),
-            patch('orchestrator.agents.invoke.terminate_process_group',
-                  new_callable=AsyncMock) as mock_tpg,
-        ):
-            result = await _run_subprocess_local(
-                ['fake'], cwd=tmp_path, env={}, backend='codex', model='gpt-5.4',
-                max_budget_usd=1.0, timeout_seconds=0.1,
-            )
-
-        mock_tpg.assert_awaited_once()
-        # First positional arg must be the proc, second must be the captured pgid
-        call_args = mock_tpg.call_args
-        assert call_args.args[0] is proc
-        assert call_args.args[1] == 12345
-        assert result.timed_out is True
-
-
-# ── _run_subprocess_local cancellation (task 3224) ──────────────────────────
-#
-# shared/tests is NOT on this suite's sys.path (conftest.py adds
-# orchestrator/tests, orchestrator/src, shared/src, escalation/src only), so
-# these helpers mirror shared/tests/test_proc_group.py's _pgid_gone_within /
-# _kill_group rather than importing them.
-
-
-async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
-    """Poll until a process group is fully reaped by the kernel.
-
-    A one-shot ``os.killpg(pgid, 0)`` right after a kill is racy: reaping is
-    asynchronous (grandchildren can be reparented to a subreaper and linger
-    as zombies briefly), so this asserts the real contract — eventual group
-    death — via a bounded poll instead of a single check.
-
-    PermissionError (EPERM) is also treated as "gone": it can only fire once
-    the kernel has recycled *pgid* to a process owned by another user, which
-    means the group this test spawned is definitively no longer around.
-    """
-    iterations = max(1, int(timeout / step))
-    for _ in range(iterations):
-        try:
-            os.killpg(pgid, 0)
-        except (ProcessLookupError, PermissionError):
-            return True
-        await asyncio.sleep(step)
-    return False
-
-
-def _kill_group(pgid: int) -> None:
-    """Best-effort SIGKILL of an entire process group (test cleanup only).
-
-    Precondition: *pgid* must belong to a process known to still be ALIVE.
-    Calling this after the process has already been reaped risks landing on
-    a recycled, unrelated process group.
-    """
-    with contextlib.suppress(ProcessLookupError, OSError):
-        os.killpg(pgid, signal.SIGKILL)
-
-
-@pytest.mark.asyncio
-class TestRunSubprocessLocalCancellation:
-
-    @pytest.mark.timeout(20)
-    async def test_cancellation_reaps_real_process_group(self, tmp_path):
-        """Cancelling the awaiting task must reap the real OS process group.
-
-        Regression test for task 3224: _run_subprocess_local spawns with
-        start_new_session=True but (pre-fix) has no except asyncio.CancelledError
-        handler, so asyncio.wait_for(proc.communicate(...)) is cancelled while
-        the spawned process group is never signalled — the agent survives as
-        an orphan still editing/committing in its worktree.
-
-        Drives a REAL ``sleep 30`` subprocess (not a mock) and asserts the OS
-        process group is actually gone after cancellation, via a bounded poll
-        on os.killpg(pgid, 0). A mock-only "terminate_process_group was
-        called" assertion would pass even with the wrong pgid and would not
-        have caught the original orphan.
-        """
-        # Capture the real spawner BEFORE patching -- orchestrator.agents.invoke.asyncio
-        # IS the global asyncio module, so a self-delegating spy captured after
-        # patching would recurse into itself.
-        real_exec = asyncio.create_subprocess_exec
-
-        spawned: list[asyncio.subprocess.Process] = []
-
-        async def spy_exec(*args, **kwargs):
-            proc = await real_exec(*args, **kwargs)
-            # This patches the *global* asyncio module attribute, so for the
-            # duration of the `with` block below EVERY subprocess spawned
-            # anywhere in this worker process (e.g. this suite's background
-            # git-subprocess workers, see conftest.py's
-            # _reap_leaked_merge_workers) flows through this spy too. Only
-            # record the ``sleep 30`` this test actually launched, so an
-            # unrelated concurrent spawn landing first can't be mistaken for
-            # it and have its process group polled/killed below.
-            if args[:2] == ('sleep', '30'):
-                spawned.append(proc)
-            return proc
-
-        pgid = None
-        try:
-            with patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-                        side_effect=spy_exec):
-                task = asyncio.ensure_future(_run_subprocess_local(
-                    ['sleep', '30'],
-                    cwd=tmp_path,
-                    env=dict(os.environ),
-                    backend='codex',
-                    model='gpt-5.4',
-                    max_budget_usd=1.0,
-                    timeout_seconds=30.0,
-                ))
-
-                # Bounded poll (~2s max) until the spy has recorded the spawned proc.
-                deadline = asyncio.get_running_loop().time() + 2.0
-                while not spawned and asyncio.get_running_loop().time() < deadline:
-                    await asyncio.sleep(0.05)
-                assert len(spawned) == 1, (
-                    f'expected exactly one matching "sleep 30" spawn within 2s, '
-                    f'got {len(spawned)}: {spawned}'
-                )
-
-                proc = spawned[0]
-                pgid = proc.pid  # start_new_session ⇒ pgid == pid
-
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-
-            assert await _pgid_gone_within(pgid), (
-                f'Process group {pgid} was not reaped within 5s after '
-                f'cancellation — orphaned agent process group left running.'
-            )
-        finally:
-            if pgid is not None and spawned and spawned[0].returncode is None:
-                _kill_group(pgid)
-
-    async def test_cancel_during_timeout_kill_still_reaps_group(self, tmp_path):
-        """A cancel landing inside the TimeoutError handler's kill must still reap.
-
-        If the awaiting task is cancelled while terminate_process_group is
-        already running (SIGTERM sent, SIGKILL escalation pending), a handler
-        that is only a SIBLING of `except TimeoutError:` cannot catch it --
-        an exception raised inside an except block is not caught by a sibling
-        handler of the same try. That would abandon the escalation with a
-        SIGTERM-ignoring child left alive. This asserts the cancellation is
-        instead caught by something that also wraps the timeout-kill path, so
-        terminate_process_group is retried.
-
-        Fully mocked -- no real process, no sleep-based timing. The fake
-        terminate_process_group hangs deterministically (on an unset Event)
-        on its first call so the test can synchronize on "the task is now
-        suspended inside the kill" without guessing at a sleep duration.
-        """
-        proc = MagicMock()
-        proc.pid = 12345  # int so pgid capture and safety-check pass
-        proc.communicate = AsyncMock(side_effect=TimeoutError)
-        proc.wait = AsyncMock()
-        proc.returncode = None
-
-        async def fake_exec(*args, **kwargs):
-            return proc
-
-        calls: list[tuple] = []
-        entered = asyncio.Event()
-        hang_forever = asyncio.Event()  # never set -- first call hangs until cancelled
-
-        async def fake_terminate_process_group(*args, **kwargs):
-            # *args/**kwargs (rather than a `grace_secs=5.0`-defaulted
-            # parameter) so the recorded call distinguishes "grace_secs was
-            # passed as a keyword" from "grace_secs was omitted and a local
-            # default filled in" -- the real
-            # shared.proc_group.terminate_process_group declares grace_secs
-            # keyword-only, and a defaulted fake parameter would silently
-            # accept (and record 5.0 for) a positional-arg regression too.
-            calls.append((args, kwargs))
-            if len(calls) == 1:
-                entered.set()
-                await hang_forever.wait()
-
-        with (
-            patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-                  side_effect=fake_exec),
-            patch('orchestrator.agents.invoke.terminate_process_group',
-                  side_effect=fake_terminate_process_group),
-        ):
-            task = asyncio.ensure_future(_run_subprocess_local(
-                ['fake'], cwd=tmp_path, env={}, backend='codex', model='gpt-5.4',
-                max_budget_usd=1.0, timeout_seconds=0.01,
-            ))
-
-            # Wait until the task is provably suspended inside the
-            # TimeoutError handler's terminate_process_group await.
-            await asyncio.wait_for(entered.wait(), timeout=5)
-
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-        assert len(calls) == 2, (
-            f'expected terminate_process_group to be retried once the cancel '
-            f'landed during the abandoned timeout-kill, got {len(calls)} '
-            f'call(s): {calls}'
-        )
-        second_args, second_kwargs = calls[1]
-        assert second_args[1] == 12345, f'pgid mismatch on retry: {calls[1]}'
-        # Must be a keyword, equal to 5.0 -- catches both "kwarg dropped"
-        # (kwargs would be {}) and "passed positionally" (it would show up
-        # in second_args instead, not second_kwargs).
-        assert second_kwargs.get('grace_secs') == 5.0, (
-            f'expected grace_secs=5.0 passed as a keyword on retry (the real '
-            f'shared.proc_group.terminate_process_group declares grace_secs '
-            f'keyword-only), got {calls[1]}'
-        )
-
-
 _CODEX_VALID_JSONL_STDOUT = (
     json.dumps({'type': 'thread.started', 'thread_id': 'tid-1'}) + '\n'
     + json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'hello'}}) + '\n'
@@ -608,14 +338,13 @@ class TestCodexCallerPropagatesTimedOut:
         """_invoke_codex returns AgentResult with timed_out=True when subprocess timed out."""
         timed_result = SubprocessResult(stdout='', stderr='timeout', returncode=1,
                                          duration_ms=100, timed_out=True)
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=timed_result):
-            agent = await _invoke_codex(
-                prompt='hello', system_prompt='sys', cwd=tmp_path,
-                model='gpt-5.4', max_budget_usd=1.0,
-                mcp_config=None, sandbox_modules=None, effort=None,
-                timeout_seconds=30.0,
-            )
+        agent = await _invoke_codex(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            model='gpt-5.4', max_budget_usd=1.0,
+            mcp_config=None, sandbox_modules=None, effort=None,
+            timeout_seconds=30.0,
+            runner=AsyncMock(return_value=timed_result),
+        )
         assert agent.timed_out is True
 
 
@@ -637,10 +366,7 @@ class TestCodexNoAgentsMdWorktreeLeak:
 
         captured: dict = {}
 
-        async def fake_run_subprocess_local(
-            cmd, cwd, env, backend, model, max_budget_usd, timeout_seconds,
-            stdin_data=None,
-        ):
+        async def fake_runner(cmd, cwd, env, *, stdin_data=None, **kwargs):
             # AT subprocess-call time (before any finally-block cleanup runs):
             # record whether AGENTS.md exists, and mirror GitOps.commit's
             # real staging command to see what a commit right now would pick up.
@@ -657,13 +383,12 @@ class TestCodexNoAgentsMdWorktreeLeak:
             captured['stdin_data'] = stdin_data
             return SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
 
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   side_effect=fake_run_subprocess_local):
-            await _invoke_codex(
-                prompt='S3NT_USER', system_prompt='S3NT_SYS', cwd=tmp_path,
-                model='gpt-5.4', max_budget_usd=1.0,
-                mcp_config=None, sandbox_modules=None, effort=None,
-            )
+        await _invoke_codex(
+            prompt='S3NT_USER', system_prompt='S3NT_SYS', cwd=tmp_path,
+            model='gpt-5.4', max_budget_usd=1.0,
+            mcp_config=None, sandbox_modules=None, effort=None,
+            runner=fake_runner,
+        )
 
         assert captured['agents_md_exists'] is False
         assert 'AGENTS.md' not in captured['staged_names']
@@ -860,17 +585,16 @@ class TestCodexMcpServersNeverWrittenIntoCwd:
     async def _invoke_with_mcp(self, cwd: Path) -> dict:
         captured: dict = {}
 
-        async def fake_run_subprocess_local(cmd, cwd, *args, **kwargs):
+        async def fake_runner(cmd, cwd, *args, **kwargs):
             captured['cwd_entries'] = sorted(cwd.iterdir())
             return SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
 
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   side_effect=fake_run_subprocess_local):
-            await _invoke_codex(
-                prompt='p', system_prompt='s', cwd=cwd, model='gpt-6-astra',
-                max_budget_usd=1.0, mcp_config=_CODEX_MCP_CONFIG,
-                sandbox_modules=None, effort=None,
-            )
+        await _invoke_codex(
+            prompt='p', system_prompt='s', cwd=cwd, model='gpt-6-astra',
+            max_budget_usd=1.0, mcp_config=_CODEX_MCP_CONFIG,
+            sandbox_modules=None, effort=None,
+            runner=fake_runner,
+        )
         return captured
 
     @pytest.mark.asyncio
@@ -900,15 +624,15 @@ class TestInvokeCodexRunsTheBuiltArgv:
 
     async def test_runner_receives_the_built_argv(self, tmp_path) -> None:
         empty = SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=empty) as run:
-            await _invoke_codex(
-                prompt='p', system_prompt='s', cwd=tmp_path, model='gpt-6-astra',
-                max_budget_usd=1.0, mcp_config=_CODEX_MCP_CONFIG, sandbox_modules=None,
-                effort='high',
-                allowed_tools=REVIEWER_COMPREHENSIVE.allowed_tools,
-                disallowed_tools=REVIEWER_COMPREHENSIVE.disallowed_tools,
-            )
+        run = AsyncMock(return_value=empty)
+        await _invoke_codex(
+            prompt='p', system_prompt='s', cwd=tmp_path, model='gpt-6-astra',
+            max_budget_usd=1.0, mcp_config=_CODEX_MCP_CONFIG, sandbox_modules=None,
+            effort='high',
+            allowed_tools=REVIEWER_COMPREHENSIVE.allowed_tools,
+            disallowed_tools=REVIEWER_COMPREHENSIVE.disallowed_tools,
+            runner=run,
+        )
 
         assert run.call_args.args[0] == codex_exec_argv(
             'gpt-6-astra', effort='high', mcp_config=_CODEX_MCP_CONFIG,
@@ -925,14 +649,13 @@ class TestGeminiCallerPropagatesTimedOut:
         """_invoke_gemini returns AgentResult with timed_out=True when subprocess timed out."""
         timed_result = SubprocessResult(stdout='', stderr='timeout', returncode=1,
                                          duration_ms=100, timed_out=True)
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=timed_result):
-            agent = await _invoke_gemini(
-                prompt='hello', system_prompt='sys', cwd=tmp_path,
-                model='gemini-3.1-pro-preview', max_budget_usd=1.0,
-                mcp_config=None, sandbox_modules=None, effort=None,
-                timeout_seconds=30.0,
-            )
+        agent = await _invoke_gemini(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            model='gemini-3.1-pro-preview', max_budget_usd=1.0,
+            mcp_config=None, sandbox_modules=None, effort=None,
+            timeout_seconds=30.0,
+            runner=AsyncMock(return_value=timed_result),
+        )
         assert agent.timed_out is True
 
 
@@ -977,15 +700,14 @@ class TestPricesThreadedToParser:
         codex_result = SubprocessResult(
             stdout=_CODEX_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
         )
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=codex_result):
-            agent = await _invoke_codex(
-                prompt='hello', system_prompt='sys', cwd=tmp_path,
-                model='o4-mini', max_budget_usd=1.0,
-                mcp_config=None, sandbox_modules=None, effort=None,
-                timeout_seconds=30.0,
-                prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
-            )
+        agent = await _invoke_codex(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            model='o4-mini', max_budget_usd=1.0,
+            mcp_config=None, sandbox_modules=None, effort=None,
+            timeout_seconds=30.0,
+            prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
+            runner=AsyncMock(return_value=codex_result),
+        )
         assert agent.cost_usd == pytest.approx((10 * 100.0 + 5 * 100.0) / 1_000_000)
 
     async def test_invoke_agent_forwards_prices_to_invoke_codex(self, tmp_path):
@@ -993,14 +715,13 @@ class TestPricesThreadedToParser:
         codex_result = SubprocessResult(
             stdout=_CODEX_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
         )
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=codex_result):
-            agent = await invoke_agent(
-                prompt='hello', system_prompt='sys', cwd=tmp_path,
-                backend='codex', model='o4-mini', max_budget_usd=1.0,
-                sandbox_modules=None, effort=None, timeout_seconds=30.0,
-                prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
-            )
+        agent = await invoke_agent(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            backend='codex', model='o4-mini', max_budget_usd=1.0,
+            sandbox_modules=None, effort=None, timeout_seconds=30.0,
+            prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
+            runner=AsyncMock(return_value=codex_result),
+        )
         assert agent.cost_usd == pytest.approx((10 * 100.0 + 5 * 100.0) / 1_000_000)
 
     async def test_invoke_gemini_forwards_prices_to_parser(self, tmp_path):
@@ -1008,15 +729,14 @@ class TestPricesThreadedToParser:
         gemini_result = SubprocessResult(
             stdout=_GEMINI_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
         )
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=gemini_result):
-            agent = await _invoke_gemini(
-                prompt='hello', system_prompt='sys', cwd=tmp_path,
-                model='gemini-3-flash', max_budget_usd=1.0,
-                mcp_config=None, sandbox_modules=None, effort=None,
-                timeout_seconds=30.0,
-                prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
-            )
+        agent = await _invoke_gemini(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            model='gemini-3-flash', max_budget_usd=1.0,
+            mcp_config=None, sandbox_modules=None, effort=None,
+            timeout_seconds=30.0,
+            prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
+            runner=AsyncMock(return_value=gemini_result),
+        )
         assert agent.cost_usd == pytest.approx((10 * 50.0 + 5 * 50.0) / 1_000_000)
 
     async def test_invoke_agent_forwards_prices_to_invoke_gemini(self, tmp_path):
@@ -1024,14 +744,13 @@ class TestPricesThreadedToParser:
         gemini_result = SubprocessResult(
             stdout=_GEMINI_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
         )
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=gemini_result):
-            agent = await invoke_agent(
-                prompt='hello', system_prompt='sys', cwd=tmp_path,
-                backend='gemini', model='gemini-3-flash', max_budget_usd=1.0,
-                sandbox_modules=None, effort=None, timeout_seconds=30.0,
-                prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
-            )
+        agent = await invoke_agent(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            backend='gemini', model='gemini-3-flash', max_budget_usd=1.0,
+            sandbox_modules=None, effort=None, timeout_seconds=30.0,
+            prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
+            runner=AsyncMock(return_value=gemini_result),
+        )
         assert agent.cost_usd == pytest.approx((10 * 50.0 + 5 * 50.0) / 1_000_000)
 
 
@@ -1053,23 +772,22 @@ _PI_VALID_JSONL_STDOUT = '\n'.join(json.dumps(e) for e in [
 @pytest.mark.asyncio
 class TestInvokePiCore:
     """`_invoke_pi` core invocation (deliverable #2): builds the spike-template
-    argv, runs it via the UNCHANGED `_run_subprocess_local`, and parses the
+    argv, runs it via the injected runner, and parses the
     result via `_parse_pi_output`."""
 
     async def test_returns_parsed_success_result(self, tmp_path):
         pi_result = SubprocessResult(
             stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
         )
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=pi_result):
-            agent = await _invoke_pi(
-                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
-                max_budget_usd=1.0,
-                allowed_tools=['Bash', 'mcp__fused-memory__add_memory'],
-                disallowed_tools=None, mcp_config=None, sandbox_modules=None,
-                effort=None, oauth_token=None, resume_session_id=None,
-                session_id=None, timeout_seconds=30.0, prices=None,
-            )
+        agent = await _invoke_pi(
+            'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+            max_budget_usd=1.0,
+            allowed_tools=['Bash', 'mcp__fused-memory__add_memory'],
+            disallowed_tools=None, mcp_config=None, sandbox_modules=None,
+            effort=None, oauth_token=None, resume_session_id=None,
+            session_id=None, timeout_seconds=30.0, prices=None,
+            runner=AsyncMock(return_value=pi_result),
+        )
         assert agent.success is True
         assert agent.cost_usd > 0.0
         assert agent.session_id == 'sess-invoke-1'
@@ -1079,16 +797,16 @@ class TestInvokePiCore:
         pi_result = SubprocessResult(
             stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
         )
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=pi_result) as mock_run:
-            await _invoke_pi(
-                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
-                max_budget_usd=1.0,
-                allowed_tools=['Bash', 'mcp__fused-memory__add_memory'],
-                disallowed_tools=None, mcp_config=None, sandbox_modules=None,
-                effort=None, oauth_token=None, resume_session_id=None,
-                session_id=None, timeout_seconds=30.0, prices=None,
-            )
+        mock_run = AsyncMock(return_value=pi_result)
+        await _invoke_pi(
+            'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+            max_budget_usd=1.0,
+            allowed_tools=['Bash', 'mcp__fused-memory__add_memory'],
+            disallowed_tools=None, mcp_config=None, sandbox_modules=None,
+            effort=None, oauth_token=None, resume_session_id=None,
+            session_id=None, timeout_seconds=30.0, prices=None,
+            runner=mock_run,
+        )
         cmd = mock_run.call_args.args[0]
         assert cmd[0] == 'pi'
         for token in ('--mode', 'json', '-p', '--model', 'anthropic/claude-haiku-4-5',
@@ -1101,15 +819,14 @@ class TestInvokePiCore:
         timed_result = SubprocessResult(
             stdout='', stderr='timeout', returncode=1, duration_ms=100, timed_out=True,
         )
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=timed_result):
-            agent = await _invoke_pi(
-                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
-                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
-                mcp_config=None, sandbox_modules=None, effort=None,
-                oauth_token=None, resume_session_id=None, session_id=None,
-                timeout_seconds=30.0, prices=None,
-            )
+        agent = await _invoke_pi(
+            'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+            max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+            mcp_config=None, sandbox_modules=None, effort=None,
+            oauth_token=None, resume_session_id=None, session_id=None,
+            timeout_seconds=30.0, prices=None,
+            runner=AsyncMock(return_value=timed_result),
+        )
         assert agent.timed_out is True
 
     async def test_mcp_config_written_via_write_pi_mcp_config(self, tmp_path):
@@ -1121,8 +838,6 @@ class TestInvokePiCore:
         )
         mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
         with (
-            patch('orchestrator.agents.invoke._run_subprocess_local',
-                  new_callable=AsyncMock, return_value=pi_result),
             patch('orchestrator.agents.invoke._write_pi_mcp_config') as mock_write,
         ):
             await _invoke_pi(
@@ -1131,6 +846,7 @@ class TestInvokePiCore:
                 mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
                 oauth_token=None, resume_session_id=None, session_id=None,
                 timeout_seconds=30.0, prices=None,
+                runner=AsyncMock(return_value=pi_result),
             )
         mock_write.assert_called_once()
         assert mcp_cfg in mock_write.call_args.args
@@ -1150,20 +866,20 @@ class TestInvokePiCore:
         big_system_prompt = 'you are an architect. ' * 50
         captured: dict = {}
 
-        async def fake_run(cmd, cwd, env, backend, model, max_budget_usd, timeout_seconds):
+        async def fake_run(cmd, cwd, env, **kwargs):
             captured['value'] = cmd[cmd.index('--system-prompt') + 1]
             captured['path'] = Path(captured['value'].removeprefix('@'))
             captured['content_during_call'] = captured['path'].read_text()
             return pi_result
 
-        with patch('orchestrator.agents.invoke._run_subprocess_local', side_effect=fake_run):
-            await _invoke_pi(
-                'hello', big_system_prompt, cwd=tmp_path, model='anthropic/claude-haiku-4-5',
-                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
-                mcp_config=None, sandbox_modules=None, effort=None,
-                oauth_token=None, resume_session_id=None, session_id=None,
-                timeout_seconds=30.0, prices=None,
-            )
+        await _invoke_pi(
+            'hello', big_system_prompt, cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+            max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+            mcp_config=None, sandbox_modules=None, effort=None,
+            oauth_token=None, resume_session_id=None, session_id=None,
+            timeout_seconds=30.0, prices=None,
+            runner=fake_run,
+        )
 
         assert captured['value'].startswith('@'), captured['value']
         assert big_system_prompt not in captured['value']
@@ -1190,21 +906,21 @@ class TestInvokePiMcpConfigBackupRestore:
         )
         captured: dict = {}
 
-        async def fake_run(cmd, cwd, env, backend, model, max_budget_usd, timeout_seconds):
+        async def fake_run(cmd, cwd, env, **kwargs):
             # While _invoke_pi is "running" (subprocess in flight), the
             # repo's own .mcp.json has been swapped out for pi's config.
             captured['content_during_call'] = mcp_json_path.read_text()
             return pi_result
 
         mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
-        with patch('orchestrator.agents.invoke._run_subprocess_local', side_effect=fake_run):
-            await _invoke_pi(
-                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
-                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
-                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
-                oauth_token=None, resume_session_id=None, session_id=None,
-                timeout_seconds=30.0, prices=None,
-            )
+        await _invoke_pi(
+            'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+            max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+            mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+            oauth_token=None, resume_session_id=None, session_id=None,
+            timeout_seconds=30.0, prices=None,
+            runner=fake_run,
+        )
 
         written_during_call = json.loads(captured['content_during_call'])
         assert written_during_call['mcpServers']['fused-memory']['directTools'] is True
@@ -1221,15 +937,14 @@ class TestInvokePiMcpConfigBackupRestore:
             stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
         )
         mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=pi_result):
-            await _invoke_pi(
-                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
-                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
-                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
-                oauth_token=None, resume_session_id=None, session_id=None,
-                timeout_seconds=30.0, prices=None,
-            )
+        await _invoke_pi(
+            'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+            max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+            mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+            oauth_token=None, resume_session_id=None, session_id=None,
+            timeout_seconds=30.0, prices=None,
+            runner=AsyncMock(return_value=pi_result),
+        )
 
         assert not mcp_json_path.exists()
         assert not (tmp_path / '.mcp.json.pi-invoke-backup').exists()
@@ -1250,8 +965,6 @@ class TestInvokePiMcpCacheWarmWarning:
         missing_cache = tmp_path / 'not-warmed' / 'mcp-cache.json'
         mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
         with (
-            patch('orchestrator.agents.invoke._run_subprocess_local',
-                  new_callable=AsyncMock, return_value=pi_result),
             patch('orchestrator.agents.invoke._pi_mcp_cache_path', return_value=missing_cache),
             caplog.at_level(logging.WARNING),
         ):
@@ -1261,6 +974,7 @@ class TestInvokePiMcpCacheWarmWarning:
                 mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
                 oauth_token=None, resume_session_id=None, session_id=None,
                 timeout_seconds=30.0, prices=None,
+                runner=AsyncMock(return_value=pi_result),
             )
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert any(
@@ -1277,8 +991,6 @@ class TestInvokePiMcpCacheWarmWarning:
         warmed_cache.write_text('{}')
         mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
         with (
-            patch('orchestrator.agents.invoke._run_subprocess_local',
-                  new_callable=AsyncMock, return_value=pi_result),
             patch('orchestrator.agents.invoke._pi_mcp_cache_path', return_value=warmed_cache),
             caplog.at_level(logging.WARNING),
         ):
@@ -1288,6 +1000,7 @@ class TestInvokePiMcpCacheWarmWarning:
                 mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
                 oauth_token=None, resume_session_id=None, session_id=None,
                 timeout_seconds=30.0, prices=None,
+                runner=AsyncMock(return_value=pi_result),
             )
         warnings = [r for r in caplog.records if 'direct-tools cache' in r.getMessage()]
         assert not warnings
@@ -1301,7 +1014,7 @@ class TestInvokePiFlags:
     and the no-silent-cap warning when a spec is unmappable (wildcard)."""
 
     async def _invoke(self, tmp_path, **overrides):
-        """Invoke _invoke_pi with sensible defaults, patched _run_subprocess_local,
+        """Invoke _invoke_pi with sensible defaults, an injected runner,
         returning the mock so callers can inspect argv/env via call_args."""
         pi_result = SubprocessResult(
             stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
@@ -1317,9 +1030,8 @@ class TestInvokePiFlags:
         kwargs.update(overrides)
         prompt = kwargs.pop('prompt')
         system_prompt = kwargs.pop('system_prompt')
-        with patch('orchestrator.agents.invoke._run_subprocess_local',
-                   new_callable=AsyncMock, return_value=pi_result) as mock_run:
-            await _invoke_pi(prompt, system_prompt, **kwargs)
+        mock_run = AsyncMock(return_value=pi_result)
+        await _invoke_pi(prompt, system_prompt, **kwargs, runner=mock_run)
         return mock_run
 
     async def test_effort_maps_to_thinking_flag(self, tmp_path):
@@ -2038,38 +1750,6 @@ class TestReleaseProbeSlotOnException:
         gate.release_probe_slot.assert_called_once_with('tok-a')
 
 
-# ── _run_subprocess_local process-group fix ──────────────────────────────────
-
-
-@pytest.mark.asyncio
-class TestRunSubprocessLocalProcessGroup:
-    """_run_subprocess_local must spawn subprocesses in their own process group."""
-
-    async def test_run_subprocess_local_passes_start_new_session_true(self, tmp_path):
-        """create_subprocess_exec is called with start_new_session=True.
-
-        Failing test -- _run_subprocess_local does not pass that kwarg yet.
-        """
-        captured_kwargs: dict = {}
-
-        async def fake_exec(*args, **kwargs):
-            captured_kwargs.update(kwargs)
-            proc = MagicMock()
-            proc.communicate = AsyncMock(return_value=(b'', b''))
-            proc.returncode = 0
-            proc.kill = MagicMock()
-            proc.wait = AsyncMock()
-            return proc
-
-        with patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-                   side_effect=fake_exec):
-            await _run_subprocess_local(
-                ['echo', 'hi'], cwd=tmp_path, env={},
-                backend='codex', model='gpt-5.4', max_budget_usd=1.0,
-            )
-        assert captured_kwargs.get('start_new_session') is True
-
-
 # ── _make_gate factory contract ───────────────────────────────────────────────
 
 
@@ -2235,97 +1915,6 @@ class TestSandboxPathRejectsBlankPrompt:
         assert captured['stdin_data'] == b'a real prompt'
         assert 'a real prompt' not in captured['cmd'], (
             'the prompt is a stdin payload, never an argv element'
-        )
-
-
-# ── stdin-starvation race, local runner (task 3147 / esc-3118-1) ─────────────
-#
-# _run_subprocess_local is a SECOND, independent implementation of the spawn
-# path carrying the codex backend's payload, and it had the byte-for-byte
-# identical defect as shared.cli_invoke.run_cli_subprocess: stdin=PIPE plus
-# communicate(input=...), i.e. the payload written by the EVENT LOOP after
-# execve.  Fixing only the shared runner would have left a live instance of
-# exactly the bug this task exists to close.
-
-# The stub CLI and the loop-starving exec fake are IMPORTED from
-# shared.testing_stdin (see this module's imports), not re-declared here.  They
-# were briefly duplicated from shared/tests/test_cli_invoke.py because
-# `shared.tests` is not an importable package under the orchestrator pytest
-# rootdir; the fix was to move the single definition into the shipped `shared`
-# package — which orchestrator already depends on — alongside shared.testing.
-# One copy means an edit to the stub's rejection signature cannot land in one
-# suite and silently miss the other.
-
-
-@pytest.mark.asyncio
-class TestStdinStarvationRaceLocal:
-    """_run_subprocess_local delivers stdin even when the loop stalls after spawn."""
-
-    @pytest.mark.timeout(30)
-    async def test_local_runner_delivers_stdin_when_loop_starved(self, tmp_path):
-        """A 1.0s post-spawn loop stall must not cost the codex child its payload."""
-        stub = tmp_path / 'stub_cli.py'
-        stub.write_text(STDIN_STARVATION_STUB)
-
-        payload = b'Y' * 4242
-
-        with patch(
-            'orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-            side_effect=make_starving_exec(1.0),
-        ):
-            result = await _run_subprocess_local(
-                [sys.executable, str(stub)],
-                tmp_path,
-                env={},
-                backend='codex',
-                model='stub',
-                max_budget_usd=1.0,
-                timeout_seconds=20.0,
-                stdin_data=payload,
-            )
-
-        assert result.returncode == 0, (
-            f'stub CLI rejected the invocation; stderr={result.stderr!r}'
-        )
-        assert result.stdout.strip() == f'GOT:{len(payload)}'
-        assert 'no stdin data received' not in result.stderr
-        assert 'Input must be provided' not in result.stderr
-
-    async def test_none_stdin_data_still_inherits_stdin(self, tmp_path):
-        """stdin_data=None must still spawn with stdin=None (inherited).
-
-        Protects the gemini and pi branches, which pass the prompt on argv,
-        pass stdin_data=None, and rely on inherited stdin.
-        """
-        captured_kwargs: dict = {}
-
-        async def fake_exec(*args, **kwargs):
-            captured_kwargs.update(kwargs)
-            proc = MagicMock()
-            proc.communicate = AsyncMock(return_value=(b'', b''))
-            proc.returncode = 0
-            proc.terminate = MagicMock()
-            proc.kill = MagicMock()
-            proc.wait = AsyncMock()
-            return proc
-
-        with patch(
-            'orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-            side_effect=fake_exec,
-        ):
-            await _run_subprocess_local(
-                ['gemini', '-p', 'hello'],
-                tmp_path,
-                env={},
-                backend='gemini',
-                model='stub',
-                max_budget_usd=1.0,
-                stdin_data=None,
-            )
-
-        assert 'stdin' in captured_kwargs
-        assert captured_kwargs['stdin'] is None, (
-            f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
         )
 
 

@@ -168,7 +168,7 @@ class TestNonClaudeBackendsSpawnThroughTheRunner:
         await _invoke(backend, worktree, spy)
 
         expected_stdin = b'SYS\n\ndo step-1' if backend == 'codex' else None
-        assert [(s.kw['stdin_data'], s.kw['timeout_seconds']) for s in spy.spawns] == [
+        assert [(s.kw.get('stdin_data'), s.kw['timeout_seconds']) for s in spy.spawns] == [
             (expected_stdin, TIMEOUT_SECS),
         ]
 
