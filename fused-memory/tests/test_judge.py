@@ -3475,6 +3475,29 @@ class TestARepeatedReviewErrorHaltsTruthfully:
         mock_journal.set_halt.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_a_persisted_verdict_is_returned_and_resets_the_streak_even_if_the_trend_check_fails(
+        self, mock_journal,
+    ):
+        unwindowable = JudgeVerdict(
+            run_id='run-old', reviewed_at=datetime(2026, 1, 1),
+            severity=VerdictSeverity.moderate,
+        )
+        mock_journal.get_recent_verdicts = AsyncMock(return_value=[unwindowable])
+        judge = self._judge(mock_journal)
+        mock_journal.add_verdict = AsyncMock(side_effect=[
+            RuntimeError('disk full'), RuntimeError('disk full'), None,
+            RuntimeError('disk full'), RuntimeError('disk full'),
+        ])
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            results = [await judge.review_run('run-x') for _ in range(5)]
+
+        assert isinstance(results[2], JudgeVerdict)
+        assert results[2].severity == VerdictSeverity.ok
+        assert not judge.is_halted(self._PID)
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_review_errors_never_halt_with_the_master_switch_off(self, mock_journal):
         judge = self._judge(mock_journal, halt_on_judge_serious=False)
         mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))

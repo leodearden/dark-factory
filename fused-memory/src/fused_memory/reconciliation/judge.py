@@ -268,24 +268,35 @@ class NoVerdict:
     detail: str = ''
 
 
-#: The halt reason a no-verdict streak gives, chosen by its LAST failure's
-#: reason: a review error must not be described as a judge outage.
-_NO_VERDICT_HALT_REASONS: dict[NoVerdictReason, str] = {
-    NoVerdictReason.JUDGE_INFRA_FAILURE: (
-        'judge-unreachable halt: reconciliation judge outage '
-        '(cap-storm/CLI failure) — project halted after {count} '
-        'consecutive infra failures; last error: {error}'
-    ),
-    NoVerdictReason.REVIEW_ERROR: (
-        'judge-review-error halt: the reconciliation judge failed to complete a '
-        'review — project halted after {count} consecutive no-verdict failures; '
-        'last error: {error}'
-    ),
-}
+@dataclass(frozen=True)
+class _CountedNoVerdict:
+    """How one streak-counting no-verdict reason is logged, and how it halts."""
 
-_NO_VERDICT_LOG_EVENTS: dict[NoVerdictReason, str] = {
-    NoVerdictReason.JUDGE_INFRA_FAILURE: 'reconciliation.judge_infra_failure',
-    NoVerdictReason.REVIEW_ERROR: 'reconciliation.judge_review_error',
+    log_event: str
+    halt_reason_template: str
+
+
+#: The no-verdict reasons that count toward a project's no-verdict streak.
+#: RUN_NOT_FOUND and PROJECT_HALTED never reach a loaded review, so they never
+#: count. A streak's halt reason is chosen by its LAST failure: a review error
+#: must not be described as a judge outage.
+_COUNTED_NO_VERDICTS: dict[NoVerdictReason, _CountedNoVerdict] = {
+    NoVerdictReason.JUDGE_INFRA_FAILURE: _CountedNoVerdict(
+        log_event='reconciliation.judge_infra_failure',
+        halt_reason_template=(
+            'judge-unreachable halt: reconciliation judge outage '
+            '(cap-storm/CLI failure) — project halted after {count} '
+            'consecutive infra failures; last error: {error}'
+        ),
+    ),
+    NoVerdictReason.REVIEW_ERROR: _CountedNoVerdict(
+        log_event='reconciliation.judge_review_error',
+        halt_reason_template=(
+            'judge-review-error halt: the reconciliation judge failed to complete '
+            'a review — project halted after {count} consecutive no-verdict '
+            'failures; last error: {error}'
+        ),
+    ),
 }
 
 
@@ -452,6 +463,12 @@ class Judge:
                     )
 
             await self.journal.add_verdict(verdict)
+            # The verdict is persisted, so the review completed: reset the
+            # no-verdict streak here and return the verdict whatever the trend
+            # check does. A reset at transport success would let a failure
+            # after it (parse, add_verdict) recur forever without ever
+            # reaching the threshold.
+            self._no_verdict_streaks.success(run.project_id)
 
             logger.info(
                 'reconciliation.judge_verdict',
@@ -463,13 +480,9 @@ class Judge:
                 },
             )
 
-            # Check error trends using the windowed verdicts + the fresh one
-            await self._check_error_trends(run.project_id, trend_verdicts + [verdict])
-
-            # Only a COMPLETED review resets the no-verdict streak: a reset at
-            # transport success would let a failure after it (parse, add_verdict,
-            # trends) recur forever without ever reaching the threshold.
-            self._no_verdict_streaks.success(run.project_id)
+            await self._check_trends_after_verdict(
+                run.project_id, run_id, trend_verdicts + [verdict],
+            )
             return verdict
 
         except Exception as e:
@@ -480,6 +493,23 @@ class Judge:
                 )
             return await self._record_no_verdict_failure(
                 run.project_id, run_id, reason=NoVerdictReason.REVIEW_ERROR, error=e,
+            )
+
+    async def _check_trends_after_verdict(
+        self, project_id: str, run_id: str, verdicts: list[JudgeVerdict],
+    ) -> None:
+        """Run the trend check for a verdict that is already persisted.
+
+        A failure here is logged at ERROR and never turns the persisted verdict
+        into a NoVerdict: the review did complete.
+        """
+        try:
+            await self._check_error_trends(project_id, verdicts)
+        except Exception:
+            logger.error(
+                'reconciliation.judge_trend_check_failed',
+                extra={'run_id': run_id, 'project_id': project_id},
+                exc_info=True,
             )
 
     async def _record_no_verdict_failure(
@@ -510,7 +540,16 @@ class Judge:
         propagates it as the run's result). The streak is reset elsewhere when a
         review completes (see review_run), so only genuinely-consecutive
         failures reach the threshold.
+
+        Raises ValueError for a *reason* that never counts toward the streak.
         """
+        counted = _COUNTED_NO_VERDICTS.get(reason)
+        if counted is None:
+            raise ValueError(
+                f'no-verdict reason {reason.value!r} never counts toward the '
+                f'no-verdict streak; counted reasons: '
+                f'{sorted(r.value for r in _COUNTED_NO_VERDICTS)}'
+            )
         detail = (
             str(error) if isinstance(error, JudgeInfraError)
             else f'{type(error).__name__}: {error}'
@@ -521,7 +560,7 @@ class Judge:
 
         if not step.fired:
             logger.warning(
-                _NO_VERDICT_LOG_EVENTS[reason],
+                counted.log_event,
                 extra={
                     'run_id': run_id,
                     'project_id': project_id,
@@ -544,7 +583,7 @@ class Judge:
         # then (if enabled) halt truthfully.
         self._no_verdict_streaks.forget((project_id,))
         if self.config.halt_on_judge_serious:
-            halt_reason = _NO_VERDICT_HALT_REASONS[reason].format(count=count, error=detail)
+            halt_reason = counted.halt_reason_template.format(count=count, error=detail)
             await self._apply_halt(project_id, reason=halt_reason)
             logger.error(f'Judge: halting project {project_id} — {halt_reason}')
         else:
@@ -714,7 +753,7 @@ Review this run and provide your verdict as JSON.
             # as JudgeInfraError so review_run counts/backs-off/escalates it
             # identically to other transport failures, instead of letting it
             # propagate opaquely into review_run's broad except (which would
-            # swallow it as a generic failure with no infra-failure accounting).
+            # miscount it as a REVIEW_ERROR rather than a judge infra failure).
             raise JudgeInfraError(f'Claude CLI judge cap-wait exhausted: {e}') from e
 
         if result.success:
