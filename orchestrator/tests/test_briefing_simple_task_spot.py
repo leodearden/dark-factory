@@ -23,7 +23,7 @@ from orchestrator.agents.roles import ROLES, SIMPLE_TASK, SIMPLE_TASK_WORKFLOW
 _TOOL_CALL = re.compile(r'`(?:mcp__plan-tools__)?(\w+)\(')
 
 _FOLLOWUP_SUMMARY = 'The retry loop swallows the timeout'
-_DELIVERED_CHECK_NAME = 'cap'
+_DELIVERED_CHECK_NAME = 'spot-6564-check'
 
 
 def _task(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -76,7 +76,7 @@ def _signature_spellings(text: str) -> list[str]:
 
 
 def _tool_name(spelling: str) -> str:
-    return spelling.split('(', 1)[0].removeprefix('mcp__plan-tools__')
+    return spelling.split('(', 1)[0]
 
 
 class TestSimpleTaskWorkflowSingleHome:
