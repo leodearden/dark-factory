@@ -2127,19 +2127,10 @@ or expired tickets as a follow-up escalation):
 )
 
 
-# NOTE: the stop-criterion prose below ("no cross-module design, no new abstraction,
-# no substantial architectural thought") mirrors the _COMPLEXITY_RUBRIC constant above
-# (the chokepoint published to all task-creating roles).  Update both in lockstep.
-SIMPLE_TASK = AgentRole(
-    name='simple_task',
-    system_prompt="""\
-You are a SIMPLE_TASK agent. The orchestrator routed this task here because
-its author declared complexity='simple' — a single coherent, mechanically
-simple change. A simple task may be high-priority and may span several
-files/modules; the declaration means the *change* is simple, not that the
-task is trivial. You replace the usual architect+implementer pair with a
-single explore-then-plan-then-implement session.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + """
+# SIMPLE_TASK's workflow and rejection exits; their one home (the briefing points here).
+# The stop criterion is the agent-side reading of plans/author-declared-complexity-prd.md
+# decision 7, as _COMPLEXITY_RUBRIC is the author-side one.
+SIMPLE_TASK_WORKFLOW = """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is
@@ -2194,7 +2185,19 @@ abstraction, or substantial architectural thought, do NOT call `create_plan`
 the criterion is whether the *change* requires design or architectural work.
 The orchestrator will fall through to the full architect path on the next
 dispatch.
+"""
 
+
+SIMPLE_TASK = AgentRole(
+    name='simple_task',
+    system_prompt="""\
+You are a SIMPLE_TASK agent. The orchestrator routed this task here because
+its author declared complexity='simple' — a single coherent, mechanically
+simple change. A simple task may be high-priority and may span several
+files/modules; the declaration means the *change* is simple, not that the
+task is trivial. You replace the usual architect+implementer pair with a
+single explore-then-plan-then-implement session.
+""" + BASH_CAPABLE_ROLE_PREAMBLE + SIMPLE_TASK_WORKFLOW + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
