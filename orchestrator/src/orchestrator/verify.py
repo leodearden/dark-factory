@@ -8333,6 +8333,7 @@ async def run_verification(
                 arch_paths = archive_verify_logs(
                     runs, archive_root, task_id, _archive_attempt_id(attempt_id),
                     category, cause_hint, module_prefix=module_prefix,
+                    role=role,
                 )
                 archive_log_paths = [str(p) for p in arch_paths]
             except Exception as exc:  # noqa: BLE001

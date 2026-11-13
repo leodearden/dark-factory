@@ -9855,11 +9855,7 @@ class TestBuildSummaryPayload:
 
 
 class TestArchiveVerifyLogs:
-    """Tests for the new archive_verify_logs helper (task 1768).
-
-    These tests import the symbol directly and will fail with ImportError /
-    AttributeError until step-2 implements the function — that is the RED state.
-    """
+    """Tests for archive_verify_logs (introduced by task 1768)."""
 
     def _archive(
         self,
@@ -9872,7 +9868,7 @@ class TestArchiveVerifyLogs:
         *,
         module_prefix=None,
     ):
-        from orchestrator.verify import archive_verify_logs  # noqa: PLC0415
+        from orchestrator.verify import archive_verify_logs
         return archive_verify_logs(
             runs, archive_root, task_id, attempt_id, category, cause_hint,
             module_prefix=module_prefix,

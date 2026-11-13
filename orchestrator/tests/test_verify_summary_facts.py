@@ -145,7 +145,7 @@ class TestTheSummaryCarriesTheRole:
         as 'merge', and ``verify_runner.RemoteRunner.run_task_verify`` passes 'task'
         through ``RemoteRunner._archive_failure_streams``.
         """
-        from orchestrator.verify import archive_verify_logs  # noqa: PLC0415
+        from orchestrator.verify import archive_verify_logs
 
         archive_root = tmp_path / 'archive'
         archive_verify_logs(
@@ -159,7 +159,7 @@ class TestTheSummaryCarriesTheRole:
         """'merge' is the DEFAULT, for the local merge-lane call site in
         ``run_verification``, which passes no role.
         """
-        from orchestrator.verify import archive_verify_logs  # noqa: PLC0415
+        from orchestrator.verify import archive_verify_logs
 
         archive_root = tmp_path / 'archive'
         archive_verify_logs(
