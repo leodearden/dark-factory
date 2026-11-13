@@ -24,7 +24,9 @@ Usage:
         the sha of the pending plan document, every pending heal is applied and
         the per-run cap is lifted.
         When the adjudications behind the pending heals pass a share ceiling,
-        nothing is written.
+        nothing is written. --sweep is refused while link_heal.writes is off,
+        and any sweep heal whose verdict came from an adjudicator with no
+        passing calibration is withheld, not written.
     undo --run RUN_ID
         Take back every heal one apply run applied. RUN_ID may be its first 8 characters.
         A run with no heal still applied (a plan run, an undo run, an apply run
@@ -131,6 +133,7 @@ EXIT_REFUSED = 2
 NO_WRITING_RUN = 'no link-heal run has written here'
 STATUS_COUNTS = (
     'planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap', 'adjudication_failed',
+    'withheld_uncalibrated',
 )
 PLAN_SOURCES = (
     RunSource.CORPUS, RunSource.ADJUDICATOR, RunSource.DETERMINISTIC, RunSource.SWEEP,
@@ -517,6 +520,11 @@ async def _plan_from_corpus(args: argparse.Namespace, session: _Session) -> RunR
 
 
 async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:
+    if args.source is RunSource.SWEEP and not session.config.link_heal.writes:
+        raise Refused(
+            'apply --sweep: sweep heals are written only while link_heal.writes is on; '
+            'no run was started',
+        )
     await session.probe(_first_project(session.ledger.pending_actions(args.source)))
     return await run_apply(
         store=session.store,
