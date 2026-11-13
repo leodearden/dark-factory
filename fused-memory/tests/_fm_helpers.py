@@ -31,7 +31,7 @@ import types
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -45,9 +45,7 @@ from fused_memory.backends.graphiti_client import (
     PagedRead,
     ReadCompleteness,
 )
-
-if TYPE_CHECKING:
-    from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.services.durable_queue import DurableWriteQueue
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -730,7 +728,7 @@ def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.S
 # Shared durable-queue retry-budget factory (task 4847)
 # ---------------------------------------------------------------------------
 
-def make_retry_budget_queue(tmp_path, execute, **overrides) -> 'DurableWriteQueue':
+def make_retry_budget_queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
     """A DurableWriteQueue with plain budget 5, extended transient budget 12,
     sub-second backoff, and no ``transient_error_names=`` override, so the
     shipped DEFAULT_TRANSIENT_ERROR_NAMES decides which budget applies.
@@ -738,10 +736,6 @@ def make_retry_budget_queue(tmp_path, execute, **overrides) -> 'DurableWriteQueu
     The single definition that keeps task 3585's and task 3586's attempt
     counts comparable. *overrides* replace any constructor keyword.
     """
-    # Lazy: the fused_memory.services package eagerly loads MemoryService
-    # (~4s in a fresh process), and conftest imports this module every session.
-    from fused_memory.services.durable_queue import DurableWriteQueue
-
     # Annotated: without it pyright joins the heterogeneous literal values into
     # a single narrow type and rejects the ** unpacking below.
     kwargs: dict[str, Any] = dict(
