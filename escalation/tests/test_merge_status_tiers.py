@@ -131,6 +131,14 @@ class _UnreadableJournal(MergeQueueStore):
         raise OSError('journal unreadable')
 
 
+def _unreadable(store: Any) -> Any:
+    """Overwrite *store*'s runs.db with non-database bytes, so every later read fails to open it."""
+    store.db_path.write_bytes(b'not a database' * 64)
+    for sidecar in ('-wal', '-shm'):
+        Path(f'{store.db_path}{sidecar}').unlink(missing_ok=True)
+    return store
+
+
 def _live_worker(*entries: dict[str, Any]) -> types.SimpleNamespace:
     return types.SimpleNamespace(snapshot=lambda: {'entries': list(entries)})
 
@@ -426,6 +434,26 @@ class TestProbeFailureEndsTheWalk:
         assert response['reason'] == MergeReason.probe_failed
         assert response['source'] == 'live'
 
+    @pytest.mark.parametrize(
+        'key',
+        [{'request_id': 'mr-1'}, {'branch': _BRANCH}, {'task_id': _TASK}],
+        ids=['request_id', 'branch', 'task_id'],
+    )
+    async def test_an_unreadable_event_store_is_an_event_store_probe_failure(
+        self, tmp_path: Path, key: dict[str, str]
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        _finalize(current, request_id='mr-1', state='done')
+        server = _server(tmp_path, _unreadable(current))
+
+        response = await _poll(server, **key)
+
+        assert response['state'] is MergeState.unknown
+        assert response['reason'] == MergeReason.probe_failed
+        assert response['source'] == 'event_store'
+        assert response['hint'] == hint_for(MergeReason.probe_failed)
+        assert response['last_outcome'] is None
+
 
 class TestAliasResolution:
     async def test_b6_a_train_id_resolves_to_its_newest_member_record(
@@ -578,6 +606,13 @@ class TestMergeCancelDurableResolution:
         journal = _journal(tmp_path, store_type=_UnreadableJournal)
 
         response = await self._cancel(_server(tmp_path, current, journal=journal), 'mr-x')
+
+        assert response['state'] is MergeState.unknown
+
+    async def test_an_unreadable_event_store_is_unknown(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+
+        response = await self._cancel(_server(tmp_path, _unreadable(current)), 'mr-x')
 
         assert response['state'] is MergeState.unknown
 
