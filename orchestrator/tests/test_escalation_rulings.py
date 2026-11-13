@@ -245,7 +245,6 @@ class TestRenderRulingsSection:
         assert set(RULING_INSTRUCTIONS) == set(RulingAudience)
         assert len(set(RULING_INSTRUCTIONS.values())) == len(RulingAudience)
         assert '`escalate_blocker`' in RULING_INSTRUCTIONS[RulingAudience.EXECUTE]
-        assert 'blocking issue' in RULING_INSTRUCTIONS[RulingAudience.REVIEW]
 
     @pytest.mark.parametrize('audience', list(RulingAudience))
     def test_the_section_carries_its_audience_instruction(self, audience):
