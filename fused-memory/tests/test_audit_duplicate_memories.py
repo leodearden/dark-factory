@@ -6228,9 +6228,9 @@ _LIVENESS_PLAN_KEYS = frozenset({
 # stays attributable to the task that caused it.
 _PER_CATEGORY_PLAN_KEYS = frozenset({'ann_threshold_by_category'})
 
-# Task 3136: the per-member retention counts the weekly duplicate-cluster
-# report reads beside the clusters.
-_REPORT_FEED_PLAN_KEYS = frozenset({'retained_carveout'})
+# Task 3136: the retention counts, child counts and scan coverage the weekly
+# duplicate-cluster report reads beside the clusters.
+_REPORT_FEED_PLAN_KEYS = frozenset({'retained_carveout', 'child_counts', 'scan_coverage'})
 
 
 class TestBuildSweepPlanLivenessRecurrences:

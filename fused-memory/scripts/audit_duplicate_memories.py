@@ -132,12 +132,12 @@ additionally carries ``liveness_snapshot_recurrence_groups``,
 alongside the pre-existing keys, which keep their exact meaning and shape.
 Suppress the artifacts with ``--no-metrics``.
 
-ORDERING NOTE -- scheduling and gate-filing belong to task 3136, not here.
-This script is a detector with a stable CLI and a stable stdout contract;
-3136 owns when it runs and what is done with the report. 3136's timer may
-subsume the eval program's leaf-epsilon invocation, so NEITHER owns the only
-schedule: adding a second trigger here would create a duplicate, and
-assuming 3136 always fires would leave the eval series with holes.
+ORDERING NOTE -- scheduling belongs to the callers, not here. This script
+is a detector with a stable CLI and a stable stdout contract. Task 3136's
+weekly timer drives it through ``scripts/duplicate_cluster_report.py``, once
+per category and with ``--no-metrics``, so the e6 metric series keeps
+``memory_eval_runner`` as its single producer. Do not add a trigger here:
+it would duplicate one of those two schedules.
 
 Structural parallel to ``scripts/audit_duplicate_tasks.py`` (union-find
 near-duplicate clustering + pick_survivor + dry-run/apply split) and the Mem0
@@ -1410,6 +1410,52 @@ def split_retained(losers: list[dict]) -> tuple[list[dict], list[dict[str, Any]]
     return deletable, retained
 
 
+def member_facts(record: dict) -> dict[str, Any]:
+    """The per-member projection the duplicate-cluster report diffs on.
+
+    ``canonical`` is the same strict reading ``pick_survivor`` uses, so the
+    word means one thing across the survivor choice and the report.
+    """
+    metadata = record.get('metadata') or {}
+    return {
+        'id': record.get('id'),
+        'created_at': record.get('created_at'),
+        'topic': metadata.get('topic'),
+        'canonical': is_canonical(metadata),
+        'parent_id': metadata.get('parent_id'),
+        'kind': metadata.get('kind'),
+    }
+
+
+def count_children(
+    memories: Iterable[dict], categories: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Count the records in *categories* attached to each ``(parent_id, kind)``.
+
+    Every scanned record counts, clustered or not: after the write-triage
+    flip a re-emission attaches as a sighting child, so its recurrence shows
+    up here rather than as cluster growth. Kind-agnostic by design: the
+    recorded ``metadata.kind`` is the key, so no kind vocabulary is imported.
+    Rows are sorted by ``(-count, str(parent_id), str(kind))``.
+    """
+    swept = frozenset(categories)
+    counts: dict[tuple[Any, Any], int] = {}
+    for record in memories:
+        if record.get('category') not in swept:
+            continue
+        metadata = record.get('metadata') or {}
+        parent_id = metadata.get('parent_id')
+        if parent_id:
+            key = (parent_id, metadata.get('kind'))
+            counts[key] = counts.get(key, 0) + 1
+    rows = [
+        {'parent_id': parent_id, 'kind': kind, 'count': count}
+        for (parent_id, kind), count in counts.items()
+    ]
+    rows.sort(key=lambda r: (-r['count'], str(r['parent_id']), str(r['kind'])))
+    return rows
+
+
 _MAX_LEXICAL_RATIO_MEMBERS = 40
 """Members of one cluster scanned exhaustively for ``lexical_max_ratio``.
 
@@ -1666,6 +1712,7 @@ def build_sweep_plan(
     ann_threshold: float | None = None,
     ann_threshold_by_category: Mapping[str, float] | None = None,
     unevidenced_categories: Iterable[str] = (),
+    scan_coverage: Mapping[str, Mapping[str, int]] | None = None,
 ) -> dict[str, Any]:
     """Orchestrate filtering -> dual-path clustering -> survivor selection -> report.
 
@@ -1708,6 +1755,9 @@ def build_sweep_plan(
             tell which number gated which category. An EMPTY mapping says no
             category was calibrated; ``None`` means the caller ran without
             the ANN path at all.
+        scan_coverage: The caller's per-category scan counts, echoed so a
+            consumer of the stdout plan can tell a truncated scan from a
+            clean one. ``None`` when the caller has none (a pure-core call).
 
     Returns:
         JSON-serialisable plan dict. Pre-existing keys keep their exact
@@ -1740,6 +1790,11 @@ def build_sweep_plan(
         apply gate — it is surfaced for human review and consolidation only.
         Task 3098 authorizes detection of the pattern, not disposition of the
         records that exhibit it.
+
+        Three keys feed task 3136's duplicate-cluster report: each group's
+        ``members`` (one ``member_facts`` row per ``member_ids`` entry, same
+        order), the plan's ``child_counts`` (see ``count_children``) and
+        ``scan_coverage`` (the *scan_coverage* argument echoed, or ``None``).
     """
     near_duplicate_groups: list[dict[str, Any]] = []
     # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
@@ -1862,6 +1917,7 @@ def build_sweep_plan(
                 'survivor_id': survivor.get('id'),
                 'survivor_content': survivor.get('content'),
                 'member_ids': [m.get('id') for m in group],
+                'members': [member_facts(m) for m in group],
                 'category': category,
                 'found_by': found_by,
                 'lexical_clustered': bool(group_lexical),
@@ -1914,6 +1970,12 @@ def build_sweep_plan(
         'topic_carveout_clusters': len(topic_carveout_groups),
         'topic_carveout_groups': topic_carveout_groups,
         'retained_carveout': retained_carveout,
+        'child_counts': count_children(memories, categories),
+        'scan_coverage': (
+            {c: dict(stats) for c, stats in scan_coverage.items()}
+            if scan_coverage is not None
+            else None
+        ),
         'liveness_snapshot_recurrence_clusters': len(liveness_groups),
         'liveness_snapshot_recurrence_groups': liveness_groups,
         'liveness_snapshot_disclosure': liveness_disclosure,
@@ -3208,6 +3270,9 @@ async def _run(args: argparse.Namespace) -> int:
             unevidenced_categories=categories_without_own_cutoff(
                 memory, categories, args.ann_threshold, project_id=args.project_id,
             ),
+            scan_coverage={
+                c: {**scan_stats[c], 'scan_limit': args.scan_limit} for c in categories
+            },
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
         # A failed stdout stops the run before any side effect.
