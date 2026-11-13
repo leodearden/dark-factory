@@ -16642,8 +16642,9 @@ class GitOps:
         pool = self.warm_lane_pool
         assigned = pool.assignment_for(branch_name) if pool is not None else None
         quarantined = await self._quarantine_cold_incarnation(branch_name, reason)
+        quarantined_dest = quarantined.dest if quarantined is not None else None
         parked_name = (
-            quarantined.dest.name if quarantined is not None else f'{branch_name}-{_utc_stamp()}'
+            quarantined_dest.name if quarantined_dest is not None else f'{branch_name}-{_utc_stamp()}'
         )
         parked_branch = quarantined.branch if quarantined is not None else None
         if had_branch and parked_branch is None:
@@ -16657,7 +16658,7 @@ class GitOps:
         parked = ParkedIncarnation(
             parked_branch=parked_branch,
             parked_tip=await self.resolve_branch_sha(parked_branch) if parked_branch else None,
-            quarantined_worktree=str(quarantined.dest) if quarantined is not None else None,
+            quarantined_worktree=str(quarantined_dest) if quarantined_dest is not None else None,
             relocated_meta_roots=tuple(relocated),
         )
         logger.warning(
