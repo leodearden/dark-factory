@@ -38,7 +38,7 @@ agree" forever, while nothing is being compared.
 WHERE THE γ VECTOR COMES FROM, and why it is not the obvious import.  The
 vectors are read from ``shared.locking``, NOT from
 ``fused_memory.middleware.lock_charter_guard``.  Both carry the same canonical
-allowlist and ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``
+allowlist and ``tests/repo_guards/test_lock_charter_reify_parity.py::TestFileExtensionsDriftGuard``
 pins that copy independently, so the two cannot disagree about what
 dark-factory declares — but only ``shared`` is importable from this script's
 gate lane (``uv run --project shared``; ``shared/pyproject.toml`` declares no
@@ -165,7 +165,7 @@ def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOU
     LOUD on failure, by design, and the distinction matters.  The in-suite
     copies of this call (``_reify_guard_vector`` in
     ``fused-memory/tests/test_lock_charter_guard.py`` and
-    ``shared/tests/test_locking.py``) hard-assert ``rc == 0`` for the same
+    ``tests/repo_guards/test_lock_charter_reify_parity.py``) hard-assert ``rc == 0`` for the same
     reason recorded there: measured 2026-08-09 on the live script, an
     unrecognised flag prints usage to stderr and exits 2, so a
     skip-on-any-non-zero would silently retire the comparison the moment reify

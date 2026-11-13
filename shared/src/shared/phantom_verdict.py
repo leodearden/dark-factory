@@ -180,7 +180,7 @@ def coerce_findings(raw: str | bytes | None) -> list[Any]:
     The except is deliberately NARROW (``json.JSONDecodeError``/``TypeError``,
     the two things a bad column can actually raise) rather than a broad
     ``except Exception``: a genuinely unexpected error must still surface.  See
-    ``shared/tests/silent_fallthrough_scan.py``.
+    ``tests/repo_guards/silent_fallthrough_scan.py``.
     """
     if not raw:
         return []

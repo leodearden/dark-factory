@@ -90,7 +90,7 @@ tests:
 
 - ``tests/test_lock_charter_guard.py::test_extension_drift_guard``
   (pins this copy against ``_CANONICAL_EXTENSIONS``)
-- ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``
+- ``tests/repo_guards/test_lock_charter_reify_parity.py::TestFileExtensionsDriftGuard``
   (pins the ``shared.locking`` copy against the same canonical vector)
 """
 
@@ -196,7 +196,7 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # that are actually swept.
 #
 # Drift guard (this γ copy): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
-# Drift guard (shared copy in shared/locking.py): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
+# Drift guard (shared copy in shared/locking.py): tests/repo_guards/test_lock_charter_reify_parity.py::TestExtensionlessFilenamesDriftGuard
 # Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
 #   sweeps both repos' tracked corpora, so the 9th extension-less file surfaces
 #   as a red test rather than as another LockCharterViolation incident.

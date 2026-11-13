@@ -209,7 +209,7 @@ one prior attempt at a class-level citation guard (task 4240) burned
 $35.97 over 18 `recovery_vetoed` events without landing. Where a line
 number *is* load-bearing — a gate key, or guard prose an assertion pins —
 it gets fixed structurally instead; see task 1910's re-key of
-`shared/tests/silent_fallthrough_allowlist.py` to
+`tests/repo_guards/silent_fallthrough_allowlist.py` to
 `(relpath, qualname, content_hash)`, which notes that keys "omit `lineno`
 entirely".
 
@@ -524,7 +524,7 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
 it's the single normative copy; don't restate them elsewhere (a restatement
 here went stale once already — task 3802, and
-`scripts/tests/test_design_invariants_consistency.py` now fails if a copy
+`tests/repo_guards/test_design_invariants_consistency.py` now fails if a copy
 comes back; citing one invariant by name is still fine). If you're hand-writing a task (not going through
 `/prd`) for a nontrivial design change, walk it against the same checklist
 yourself before filing.

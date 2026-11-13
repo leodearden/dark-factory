@@ -16,8 +16,8 @@ and fails on any violation not present in the documented baseline ALLOWLIST.
 
 References:
   - plans/silent-fallthrough-dedup-prd.md (PRD task σ)
-  - shared/tests/silent_fallthrough_allowlist.py (baseline)
-  - shared/tests/silent_fallthrough_scan.py (scanner)
+  - tests/repo_guards/silent_fallthrough_allowlist.py (baseline)
+  - tests/repo_guards/silent_fallthrough_scan.py (scanner)
 """
 from __future__ import annotations
 
@@ -801,7 +801,7 @@ def tree_scan_data(first_party_tree: Sequence[ParsedFile]) -> _TreeScanData:
     re-scanning the tree independently on each test invocation. The enumerate/
     read/parse half now comes from the session-scoped ``first_party_tree``
     fixture (conftest.py), which is shared with every other gate module — see
-    ``shared/tests/test_tree_scan_sharing.py``.
+    ``tests/repo_guards/test_tree_scan_sharing.py``.
 
     The scan covers 461 first-party files today; the "~215 files" figure this
     docstring used to quote was stale by more than a factor of two.
@@ -884,7 +884,7 @@ class TestWholeTreeGate:
             raise AssertionError(
                 "Silent-fallthrough violations found outside the baseline allowlist.\n"
                 "Fix the violation (preferred) or add a documented entry to\n"
-                "shared/tests/silent_fallthrough_allowlist.py (non-silent, with reason).\n"
+                "tests/repo_guards/silent_fallthrough_allowlist.py (non-silent, with reason).\n"
                 f"\nOffending sites ({len(unblessed)}):\n{offender_list}"
             )
 
@@ -1027,6 +1027,6 @@ class TestAllowlistIntegrity:
             ]
             raise AssertionError(
                 "Stale allowlist entries: the violation no longer exists in the source tree.\n"
-                "Remove these entries from shared/tests/silent_fallthrough_allowlist.py:\n"
+                "Remove these entries from tests/repo_guards/silent_fallthrough_allowlist.py:\n"
                 + "\n".join(f"  {e}" for e in stale_display)
             )

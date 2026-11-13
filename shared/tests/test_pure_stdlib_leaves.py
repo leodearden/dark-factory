@@ -37,7 +37,7 @@ DESIGN.
 
 References:
   - shared/tests/test_verify_admission.py:188 (``python -c`` child pattern)
-  - shared/tests/silent_fallthrough_scan.py (stdlib AST scanner + contract)
+  - tests/repo_guards/silent_fallthrough_scan.py (stdlib AST scanner + contract)
 """
 
 from __future__ import annotations

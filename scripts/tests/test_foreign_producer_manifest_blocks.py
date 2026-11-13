@@ -2,7 +2,7 @@
 another project's registry binds ``external_task_id`` and never a local
 ``task_id``, and so contributes no descriptor row to this project's audits.
 Reads only TRACKED GIT FILES and opens no database — the same legitimacy as
-shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus.
+tests/repo_guards/test_checked_in_capability_manifests.py::TestCheckedInManifestCorpus.
 """
 from __future__ import annotations
 

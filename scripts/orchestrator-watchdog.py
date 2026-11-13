@@ -582,7 +582,7 @@ class _JournalLog:
 
     Intentionally exposes ONLY ``.warning()`` — the minimal attribute-call
     surface required by the silent-fallthrough gate's WARN_METHODS check
-    (see shared/tests/silent_fallthrough_scan.py::_handler_has_warn_log).
+    (see tests/repo_guards/silent_fallthrough_scan.py::_handler_has_warn_log).
     This is not a general-purpose logging facade: other call sites in this
     module (e.g. probe_port's diagnostics) intentionally keep calling the
     bare ``log()`` helper directly, since those are not silent-fallthrough

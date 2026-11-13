@@ -489,7 +489,7 @@ def census(path: Path) -> int:
 
 > The new `TaskConfigDir` construction site destroys its dir without
 > archiving the transcripts first. Add an `UNARCHIVED_GAP` entry for that
-> site to `shared/tests/config_dir_archival_allowlist.py` so the
+> site to `tests/repo_guards/config_dir_archival_allowlist.py` so the
 > archival-parity guard stops flagging it. The entry's `follow_up` reads
 > "matches the existing pattern" — no task or ticket is cited, and no
 > ratification row is added.
@@ -776,7 +776,7 @@ G7's walk instruction or to Step 5.5 was needed — both read the normative
 doc at run time, so INV-11's arrival is enough. The two gate-text edits
 this change did require (G7's trigger-shape entry and the family-inventory
 row) are not rehearsal misses: neither enumeration auto-extends, which is
-why `scripts/tests/test_design_invariants_consistency.py` now fails the
+why `tests/repo_guards/test_design_invariants_consistency.py` now fails the
 moment a heading lands without them.
 
 Isolation re-checked while walking: no other trigger shape fires on
@@ -813,7 +813,7 @@ G7's walk instruction or to Step 5.5 was needed — both read the normative
 doc at run time, so INV-12's arrival is enough. The two gate-text edits
 this change did require (G7's trigger-shape entry and the family-inventory
 row) are not rehearsal misses: neither enumeration auto-extends, which is
-why `scripts/tests/test_design_invariants_consistency.py` fails the moment
+why `tests/repo_guards/test_design_invariants_consistency.py` fails the moment
 a heading lands without them.
 
 Isolation re-checked while walking: no other trigger shape fires on either
@@ -847,7 +847,7 @@ as it read on 2026-09-25, not a live pin.
 G7's walk instruction or to Step 5.5 was needed. The two gate-text edits
 this change did require (G7's trigger-shape entry and the family-inventory
 row) are not rehearsal misses: neither enumeration auto-extends, which is
-why `scripts/tests/test_design_invariants_consistency.py` fails the moment
+why `tests/repo_guards/test_design_invariants_consistency.py` fails the moment
 a heading lands without them.
 
 Isolation re-checked while walking: no other trigger shape fires on either
@@ -891,7 +891,7 @@ doc at run time, so INV-14's arrival is enough. The gate-text edits this
 change did require (G7's trigger-shape entry, the family-inventory row and
 the Calibration pointer) are not rehearsal misses: none of those
 enumerations auto-extends, which is why
-`scripts/tests/test_design_invariants_consistency.py` fails the moment a
+`tests/repo_guards/test_design_invariants_consistency.py` fails the moment a
 heading lands without the first two.
 
 Isolation re-checked while walking. INV-5 `no-lockstep-duplication` is

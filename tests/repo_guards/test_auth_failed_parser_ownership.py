@@ -305,7 +305,7 @@ class TestSingleResetsParserOwnership:
         assert missing == [], (
             f'discovered production source root(s) absent from the shared '
             f'first-party tree: {missing}. Add them to '
-            f'shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS; never narrow '
+            f'tests/repo_guards/silent_fallthrough_scan.py::SCOPE_ROOTS; never narrow '
             f'this discovery. (A `<pkg>/src` holding no Python at all also trips '
             f'this check.)'
         )
@@ -330,7 +330,7 @@ class TestSingleResetsParserOwnership:
             f'production module(s) under a discovered `<pkg>/src` root that the '
             f'shared first-party tree excludes: {dropped}. The ownership scan '
             f'cannot see them. Rename them out of the exclusions in '
-            f'shared/tests/silent_fallthrough_scan.py::iter_first_party_files, or '
+            f'tests/repo_guards/silent_fallthrough_scan.py::iter_first_party_files, or '
             f'narrow those exclusions; never let this scan narrow silently.'
         )
 

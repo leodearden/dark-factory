@@ -722,8 +722,8 @@ class TestWholeTreeGate:
             f'project .mcp.json, and account-scoped connectors still connect '
             f'there.\n'
             f'\n'
-            f'shared/tests is the FIRST segment of the repo test_command, so this '
-            f'red blocks verify for EVERY subsequent task until it is resolved. '
+            f'tests/repo_guards is never cached, so every merge gate runs this gate '
+            f'and this red blocks verify for EVERY subsequent task until it is resolved. '
             f'Fix the call site; do not weaken this assertion.\n'
             f'\n'
             f'If a caller GENUINELY needs ambient MCP, there is deliberately no '
@@ -765,7 +765,7 @@ class TestPrefilterParity:
 
     Walking every parsed AST for Call nodes costs several times what walking
     only the files whose source spells a target name costs, and
-    ``shared/tests`` is the FIRST segment of the repo test_command — so its
+    ``tests/repo_guards`` is never cached, so every merge gate runs it — so its
     runtime is charged to every subsequent task. The filter is sound by
     construction (a call cannot appear in a file whose source never spells the
     name), and these two tests are what keep that claim honest rather than

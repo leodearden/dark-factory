@@ -19,7 +19,7 @@ names so it remains self-contained in the fused-memory virtual environment
 predates this relocation).  The two copies are **not** connected by a
 re-export; drift between them is caught by explicit equality tests:
 
-- ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``
+- ``tests/repo_guards/test_lock_charter_reify_parity.py::TestFileExtensionsDriftGuard``
   (pins this copy)
 - ``fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard``
   (pins the lock_charter_guard.py copy)
@@ -43,10 +43,10 @@ by its extension-less sibling (``test_extensionless_drift_guard_vs_reify_script`
 which pins this vector against ``--list-extensionless``.
 
 WHAT IS ACTUALLY ENFORCED, precisely — the Tier-1 guards compare each Python
-copy against a literal in its OWN test file, so they cannot see the other two
+copy against a literal in its OWN test suite, so they cannot see the other two
 copies; only the Tier-2 guards reach across a source boundary.  Both vectors
 are therefore pinned against the bash emitters from BOTH sides — α in
-``shared/tests/test_locking.py`` and γ in
+``tests/repo_guards/test_lock_charter_reify_parity.py`` and γ in
 ``fused-memory/tests/test_lock_charter_guard.py`` — and α↔γ agreement follows
 transitively (α == bash and γ == bash ⇒ α == γ).  That two-sided arrangement is
 what makes three-way α/γ/bash agreement ENFORCED rather than merely asserted in
@@ -102,7 +102,7 @@ __all__ = [
 # Widened 58 -> 59 on 2026-08-06: `csv` — caught by the corpus->allowlist guard
 # (test_every_tracked_extension_is_allowlisted) once plans/evidence/
 # scheduler-scoring-2026-08-06/*.csv landed on dark-factory main (e1c51efa8d).
-# Drift guard (this shared copy): shared/tests/test_locking.py::TestFileExtensionsDriftGuard
+# Drift guard (this shared copy): tests/repo_guards/test_lock_charter_reify_parity.py::TestFileExtensionsDriftGuard
 # Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
 # ---------------------------------------------------------------------------
 
@@ -221,7 +221,7 @@ FILE_EXTENSIONS: frozenset[str] = frozenset(
 # local one: weigh a candidate against every targeted repo, not only the two
 # that are actually swept.
 #
-# Drift guard (this shared copy): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
+# Drift guard (this shared copy): tests/repo_guards/test_lock_charter_reify_parity.py::TestExtensionlessFilenamesDriftGuard
 # Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
 # Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
 #   sweeps both repos' tracked corpora, so the 9th extension-less file surfaces

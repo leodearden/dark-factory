@@ -212,7 +212,7 @@ class TestEverySiteIsAudited:
             )
             + '\n\nA TaskConfigDir holds an agent CLAUDE_CONFIG_DIR, so whatever '
               'destroys it destroys that agent session\'s transcripts with it. '
-              'Record this site in shared/tests/config_dir_archival_allowlist.py '
+              'Record this site in tests/repo_guards/config_dir_archival_allowlist.py '
               'with what destroys the dir and a disposition of ARCHIVED / '
               'UNARCHIVED_BY_DESIGN / UNARCHIVED_GAP plus a rationale. Decide '
               'whether the transcripts are worth keeping — do not silence the gate.'

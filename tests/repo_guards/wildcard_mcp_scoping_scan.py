@@ -359,7 +359,7 @@ def find_wildcard_mcp_scoping_sites(
     Args:
         tree: Parsed module, walked READ-ONLY. Under the session-scoped
             ``first_party_tree`` fixture this object is shared with every other
-            gate in ``shared/tests``.
+            gate in ``tests/repo_guards``.
         filename: Path string recorded on each site, for display. The caller's
             spelling is honoured verbatim; the gate keys on a repo-relative
             path, not on whatever the parser was told.

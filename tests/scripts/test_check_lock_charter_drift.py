@@ -60,7 +60,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 # `fused_memory.middleware.lock_charter_guard`, which is not importable under
 # this directory's `uv run --project shared` environment.  shared's copy is
 # independently pinned to the same canonical vector by
-# shared/tests/test_locking.py::TestFileExtensionsDriftGuard, so the script and
+# tests/repo_guards/test_lock_charter_reify_parity.py::TestFileExtensionsDriftGuard, so the script and
 # the in-suite Tier-1 guard cannot disagree about what dark-factory declares.
 DF_EXTENSIONS = sorted(FILE_EXTENSIONS)
 DF_EXTENSIONLESS = sorted(EXTENSIONLESS_FILENAMES)
