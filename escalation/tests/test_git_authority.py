@@ -446,7 +446,7 @@ def _confirming_check_runner(refs_run: list[str]) -> Callable[..., Any]:
     to *refs_run*, so a test can tell a check that never ran from one that
     ran and declined.
     """
-    from orchestrator.delivered_checks import (  # type: ignore[reportMissingImports]
+    from orchestrator.delivered_checks import (
         DeliveredCheckResult,
     )
 
