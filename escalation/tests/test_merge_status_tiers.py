@@ -955,14 +955,14 @@ class TestLiveTier:
         submitted = await call_merge_request(
             server, task_id=_TASK, branch=_TASK, worktree=str(tmp_path), lane='normal',
         )
+        assert submitted['status'] == 'queued'
+        assert submitted['eta_seconds'] is not None
         try:
             entries.append(_live_entry(submitted['request_id']))
             polled = await _poll(server, request_id=submitted['request_id'])
         finally:
             mq.get_nowait().result.cancel()
 
-        assert submitted['status'] == 'queued'
-        assert submitted['eta_seconds'] is not None
         assert polled['source'] == 'live'
         assert polled['request_id'] == submitted['request_id']
         assert polled['eta_seconds'] is not None
