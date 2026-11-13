@@ -128,7 +128,7 @@ _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD = 5
 _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL = 'merge-flake-suppression-storm'
 
 def _bump_suppression_streak_and_maybe_escalate(
-    escalation_queue: Any, task_id: str | None, merge_sha: str,
+    escalation_queue: Any, task_id: str | None, merge_sha: str, *, call_site: FlakeCallSite,
 ) -> None:
     """Advance the suppression streak; file a born-at-L2 storm escalation at
     the threshold, then reset the counter (INV-4).
@@ -171,6 +171,12 @@ def _bump_suppression_streak_and_maybe_escalate(
     reading this counter as "merges since reset" is misreading it — read the
     ``flake_occurrence`` rows, which carry ``merge_sha`` and can be grouped.
     """
+    site = FlakeCallSite(call_site)
+    if site not in _CALL_SITES_WITH_LIVE_SIGNALS:
+        raise ValueError(
+            f'call_site={site} has no live signals, so it cannot feed the storm streak; '
+            f'only {", ".join(_CALL_SITES_WITH_LIVE_SIGNALS)} do',
+        )
     global _merge_flake_suppression_streak
     _merge_flake_suppression_streak += 1
     if _merge_flake_suppression_streak < _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD:
@@ -385,6 +391,7 @@ def _is_suppression(s: FlakeSuppression, guard: _Guard) -> bool:
 def _fire_live_signals(
     suppressions: Sequence[FlakeSuppression],
     *,
+    call_site: FlakeCallSite,
     head_sha: str,
     observing_task_id: str | None,
     event_store: EventStore | None,
@@ -406,7 +413,7 @@ def _fire_live_signals(
         guard(
             'streak',
             lambda: _bump_suppression_streak_and_maybe_escalate(
-                escalation_queue, observing_task_id, head_sha,
+                escalation_queue, observing_task_id, head_sha, call_site=call_site,
             ),
         )
 
@@ -463,7 +470,7 @@ async def record_call_site_observations(
     if call_site in _CALL_SITES_WITH_LIVE_SIGNALS:
         _fire_live_signals(
             suppressions,
-            head_sha=head_sha, observing_task_id=observing_task_id,
+            call_site=call_site, head_sha=head_sha, observing_task_id=observing_task_id,
             event_store=event_store, escalation_queue=escalation_queue, guard=guard,
         )
 
