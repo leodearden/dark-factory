@@ -593,16 +593,16 @@ class TestXdistWorkers:
 
         Ruling D17 (task 3353) wants the count in effect.
         """
-        from orchestrator.verify import _xdist_workers  # noqa: PLC0415
+        from orchestrator.verify import _xdist_workers
 
         assert _xdist_workers(cmd, {})['n_flag'] == expected
 
     def test_the_stamp_reads_the_cap_verify_appends(self):
-        from orchestrator.verify import (  # noqa: PLC0415
+        from orchestrator.verify import (
             _with_pytest_numprocesses_str,
             _xdist_workers,
         )
-        from orchestrator.verify_cmd import worker_count_values  # noqa: PLC0415
+        from orchestrator.verify_cmd import worker_count_values
 
         capped = _with_pytest_numprocesses_str(TESTS_SCRIPTS_TEST_COMMAND, '8')
 
