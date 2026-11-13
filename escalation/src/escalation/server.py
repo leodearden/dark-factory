@@ -1338,8 +1338,9 @@ def create_server(
 
     *merge_inflight_registry* is an optional ``InFlightMergeRegistry`` injected
     for testing.  When *merge_queue* is not None and no registry is supplied, a
-    fresh registry is created lazily inside this function so it is shared across
-    all ``merge_request`` calls for the lifetime of the server.  When
+    fresh registry is created lazily inside this function so it is shared by
+    ``merge_request``, ``merge_status`` and ``merge_cancel`` for the lifetime of
+    the server.  When
     *merge_queue* is None (escalation standalone — orchestrator not wired) the
     registry is never imported, preserving the standalone import path.
 
@@ -1587,6 +1588,7 @@ def create_server(
             InFlightMergeRegistry,
         )
         _registry = InFlightMergeRegistry()
+    del merge_inflight_registry  # one registry, one name: every tool below reads _registry
 
     # Server-side durable-intent waiter store (β1 D2/I5).
     # Keyed by request_id; each entry is a WaiterRecord holding the shielded
@@ -5526,9 +5528,9 @@ def create_server(
             logger.warning('merge_status: snapshot() failed', exc_info=True)
             raise _ProbeFailed(MergeStatusSource.live) from exc
         eta = None
-        if merge_inflight_registry is not None:
+        if _registry is not None:
             with contextlib.suppress(Exception):
-                eta = merge_inflight_registry.eta_seconds(entry['branch'])
+                eta = _registry.eta_seconds(entry['branch'])
         return MergeStatusAnswer.outcome(
             source=MergeStatusSource.live,
             fields={
