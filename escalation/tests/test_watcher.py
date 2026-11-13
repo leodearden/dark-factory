@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -962,6 +963,34 @@ class TestMain:
         _write_esc(queue_dir, _esc('esc-74-1', **fields))
 
         assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '0.05', *extra_argv]) == code
+
+    @pytest.mark.parametrize('deliver', [os.rename, os.link], ids=['moved-to', 'create'])
+    def test_arrival_after_launch_is_delivered_by_mains_armed_watch(
+        self,
+        queue_dir: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        deliver: Callable[[Path, Path], None],
+    ):
+        """Without --baseline, an arrival at any moment must exit 0.
+
+        The staged file sits outside the queue dir, so its only queue event is
+        the delivery itself: a rename (MOVED_TO) or a hard link (CREATE, with
+        the content already complete). A main that arms no watch, or arms it
+        without that flag, misses a post-scan arrival and exits 124.
+        """
+        esc = _esc('esc-75-1')
+        staged = tmp_path / f'{esc.id}.json'
+        staged.write_text(esc.to_json())
+        timer = threading.Timer(0.3, deliver, (staged, queue_dir / staged.name))
+        timer.start()
+        try:
+            assert _exit_code(['--queue-dir', str(queue_dir), '--timeout', '5']) == 0
+        finally:
+            timer.cancel()
+            timer.join()
+
+        assert json.loads(capsys.readouterr().out) == esc.to_dict()
 
 
 class TestExclusions:
