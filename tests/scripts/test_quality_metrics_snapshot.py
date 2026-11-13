@@ -15,7 +15,7 @@ import platform
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,26 @@ import pytest
 import quality_metrics_snapshot as snapshot
 import source_measures
 from git_listing import git
+from quality_snapshot_fixtures import (
+    BASE_FILES,
+    GRAPH_FILES,
+    MOD_BEFORE,
+    TRIVIAL_TEST,
+    WORKSPACE_PYPROJECT,
+    SnapshotEdit,
+    as_schema_1,
+    as_schema_2,
+    commit,
+    committed_repo,
+    diff_chain,
+    diff_of,
+    diff_section,
+    measured_snapshot,
+    read_json,
+    rewriting,
+    run_snapshot,
+    write_files,
+)
 from quality_snapshot_identity import below_run_id_and_cost
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -30,83 +50,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 
-_PYPROJECT = '[tool.uv.workspace]\nmembers = ["alpha", "beta"]\n'
-
-#: The row-5 'before' source: complexipy 6.2 scores f at 2, and the file at 2.
-_MOD_BEFORE = (
-    '"""The row-5 fixture."""\n'
-    '# f holds two sequential ifs.\n'
-    'def f(a, b):\n'
-    '    if a:\n'
-    '        x = 1\n'
-    '    if b:\n'
-    '        x = 2\n'
-    '    return 0\n'
-)
-
-_TRIVIAL_TEST = 'def test_x():\n    assert True\n'
-
-_BASE: dict[str, str] = {
-    'alpha/src/alpha/__init__.py': '',
-    'alpha/src/alpha/mod.py': _MOD_BEFORE,
-    'alpha/tests/test_mod.py': _TRIVIAL_TEST,
-    'beta/src/beta/b.py': 'B = 1\n',
-    'beta/tests/test_b.py': _TRIVIAL_TEST,
-    'scripts/x.py': 'X = 1\n',
-    'scripts/tests/test_x.py': _TRIVIAL_TEST,
-    'tests/test_y.py': _TRIVIAL_TEST,
-    'hooks/h.py': 'H = 1\n',
-}
-
-_BASE_DOMAIN = frozenset(path for path in _BASE if not path.startswith('hooks/'))
-
-_COMMITTER = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
-
-
-def _write(root: Path, files: dict[str, str]) -> None:
-    for relpath, text in files.items():
-        target = root / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding='utf-8')
-
-
-def _repo(tmp_path: Path, files: dict[str, str]) -> Path:
-    """A committed repo under *tmp_path*; a 'pyproject.toml' in *files* overrides the default."""
-    root = tmp_path / 'repo'
-    root.mkdir()
-    git(root, 'init', '-q')
-    _write(root, {'pyproject.toml': _PYPROJECT, **files})
-    git(root, 'add', '-A')
-    git(root, *_COMMITTER, 'commit', '--no-verify', '-q', '-m', 'base')
-    return root
-
-
-def _commit(
-    root: Path,
-    message: str,
-    *,
-    write: dict[str, str] | None = None,
-    remove: Iterable[str] = (),
-    moves: Iterable[tuple[str, str]] = (),
-) -> None:
-    _write(root, write or {})
-    for relpath in remove:
-        git(root, 'rm', '-q', relpath)
-    for source, destination in moves:
-        git(root, 'mv', source, destination)
-    git(root, 'add', '-A')
-    git(root, *_COMMITTER, 'commit', '--no-verify', '--allow-empty', '-q', '-m', message)
-
-
-def _run(root: Path, out: Path, *extra: str) -> int:
-    return snapshot.main(['--run-id', 'run-1', '--out', str(out), '--root', str(root), *extra])
-
-
-def _measured(tmp_path: Path, files: dict[str, str]) -> dict[str, Any]:
-    root = _repo(tmp_path, files)
-    out = tmp_path / 'out' / 'snapshot.json'
-    assert _run(root, out) == 0
-    return json.loads(out.read_text(encoding='utf-8'))
+_BASE_DOMAIN = frozenset(path for path in BASE_FILES if not path.startswith('hooks/'))
 
 
 def _run_in_a_process(root: Path, out: Path, run_id: str, *, hash_seed: str) -> None:
@@ -136,10 +80,10 @@ def _run_in_a_process(root: Path, out: Path, run_id: str, *, hash_seed: str) -> 
 
 class TestTheDomain:
     def test_exactly_the_tracked_member_files_are_measured(self, tmp_path: Path) -> None:
-        root = _repo(tmp_path, _BASE)
-        _write(root, {'alpha/src/alpha/untracked.py': 'U = 1\n'})
+        root = committed_repo(tmp_path, BASE_FILES)
+        write_files(root, {'alpha/src/alpha/untracked.py': 'U = 1\n'})
         out = tmp_path / 'out' / 'snapshot.json'
-        assert _run(root, out) == 0
+        assert run_snapshot(root, out) == 0
         files = json.loads(out.read_text(encoding='utf-8'))['files']
         assert set(files) == _BASE_DOMAIN
         assert {path: (record['member'], record['kind']) for path, record in files.items()} == {
@@ -156,7 +100,7 @@ class TestTheDomain:
     def test_members_are_reported_in_declared_order_with_their_file_counts(
         self, tmp_path: Path
     ) -> None:
-        measured = _measured(tmp_path, _BASE)
+        measured = measured_snapshot(tmp_path, BASE_FILES)
         assert measured['evidence']['members'] == [
             {'name': 'alpha', 'pseudo': False, 'domain_files': 3},
             {'name': 'beta', 'pseudo': False, 'domain_files': 2},
@@ -167,15 +111,15 @@ class TestTheDomain:
 
 class TestTheHeader:
     def test_top_level_keys_in_contract_order(self, tmp_path: Path) -> None:
-        assert list(_measured(tmp_path, _BASE)) == [
+        assert list(measured_snapshot(tmp_path, BASE_FILES)) == [
             'schema_version', 'instrument', 'run_id', 'as_of_sha', 'since',
             'evidence', 'cost', 'params', 'files', 'functions', 'import_graph',
         ]
 
     def test_header_values(self, tmp_path: Path) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         out = tmp_path / 'out' / 'snapshot.json'
-        assert _run(root, out) == 0
+        assert run_snapshot(root, out) == 0
         measured = json.loads(out.read_text(encoding='utf-8'))
         assert measured['schema_version'] == 3
         assert measured['instrument'] == 'quality-metrics-snapshot'
@@ -211,13 +155,13 @@ def _blob_on_disk(relpath: str) -> str:
 
 class TestFileRecords:
     def test_a_src_record_carries_the_shared_measures(self, tmp_path: Path) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         out = tmp_path / 'out' / 'snapshot.json'
-        assert _run(root, out) == 0
+        assert run_snapshot(root, out) == 0
         files = json.loads(out.read_text(encoding='utf-8'))['files']
         path = 'alpha/src/alpha/mod.py'
         record = files[path]
-        size = source_measures.file_size_measures(_MOD_BEFORE, path=path)
+        size = source_measures.file_size_measures(MOD_BEFORE, path=path)
         assert (record['lines'], record['prose_lines']) == (size.lines, size.prose_lines)
         assert record['prose_ratio'] == round(size.prose_lines / size.lines, 4)
         assert (
@@ -229,22 +173,22 @@ class TestFileRecords:
         assert record['blob'] == git(root, 'hash-object', path).strip()
         assert (record['module'], record['package_init']) == ('alpha.mod', False)
         assert record['function_local_imports'] == source_measures.function_local_imports(
-            _MOD_BEFORE, path=path
+            MOD_BEFORE, path=path
         )
         assert record['reexport_names'] == sorted(
-            source_measures.reexport_names(_MOD_BEFORE, path=path)
+            source_measures.reexport_names(MOD_BEFORE, path=path)
         )
         package = files['alpha/src/alpha/__init__.py']
         assert (package['module'], package['package_init']) == ('alpha', True)
 
     def test_a_module_with_no_functions_has_an_empty_max(self, tmp_path: Path) -> None:
-        record = _measured(tmp_path, _BASE)['files']['beta/src/beta/b.py']
+        record = measured_snapshot(tmp_path, BASE_FILES)['files']['beta/src/beta/b.py']
         assert (
             record['cognitive_max'], record['cognitive_max_function'], record['functions']
         ) == (0, None, 0)
 
     def test_an_empty_file_has_no_prose_ratio(self, tmp_path: Path) -> None:
-        files = _measured(tmp_path, {**_BASE, 'alpha/src/alpha/empty.py': ''})['files']
+        files = measured_snapshot(tmp_path, {**BASE_FILES, 'alpha/src/alpha/empty.py': ''})['files']
         assert files['alpha/src/alpha/empty.py']['lines'] == 0
         assert files['alpha/src/alpha/empty.py']['prose_ratio'] is None
 
@@ -253,7 +197,7 @@ class TestFileRecords:
             'def b(x):\n    if x:\n        return 1\n    return 0\n\n\n'
             'def a(x):\n    if x:\n        return 1\n    return 0\n'
         )
-        record = _measured(tmp_path, {**_BASE, 'alpha/src/alpha/tie.py': tie})['files'][
+        record = measured_snapshot(tmp_path, {**BASE_FILES, 'alpha/src/alpha/tie.py': tie})['files'][
             'alpha/src/alpha/tie.py'
         ]
         assert (record['cognitive_max'], record['cognitive_max_function']) == (1, 'a')
@@ -262,11 +206,11 @@ class TestFileRecords:
 class TestTheFunctionsMap:
     def test_only_src_functions_are_listed_by_path_and_qualname(self, tmp_path: Path) -> None:
         # Every test file in the fixture defines test_x; none of them is listed.
-        assert _measured(tmp_path, _BASE)['functions'] == {'alpha/src/alpha/mod.py::f': 2}
+        assert measured_snapshot(tmp_path, BASE_FILES)['functions'] == {'alpha/src/alpha/mod.py::f': 2}
 
     def test_files_and_functions_are_in_sorted_key_order(self, tmp_path: Path) -> None:
         extra = {'alpha/src/alpha/a_first.py': 'def g():\n    return 1\n'}
-        measured = _measured(tmp_path, {**_BASE, **extra})
+        measured = measured_snapshot(tmp_path, {**BASE_FILES, **extra})
         assert list(measured['files']) == sorted(measured['files'])
         assert list(measured['functions']) == sorted(measured['functions'])
         assert len(measured['functions']) == 2
@@ -274,16 +218,16 @@ class TestTheFunctionsMap:
 
 class TestRendering:
     def test_rendering_a_parsed_snapshot_reproduces_its_text(self, tmp_path: Path) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         out = tmp_path / 'out' / 'snapshot.json'
-        assert _run(root, out) == 0
+        assert run_snapshot(root, out) == 0
         text = out.read_text(encoding='utf-8')
         assert snapshot.render_snapshot(json.loads(text)) == text
 
     def test_each_file_and_function_is_one_line(self, tmp_path: Path) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         out = tmp_path / 'out' / 'snapshot.json'
-        assert _run(root, out) == 0
+        assert run_snapshot(root, out) == 0
         text = out.read_text(encoding='utf-8')
         measured = json.loads(text)
         lines = text.splitlines()
@@ -296,9 +240,9 @@ class TestAnUnreadableFile:
     def test_it_is_named_and_skipped_and_the_run_is_incomplete(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, {**_BASE, 'alpha/src/alpha/broken.py': 'def (:\n'})
+        root = committed_repo(tmp_path, {**BASE_FILES, 'alpha/src/alpha/broken.py': 'def (:\n'})
         out = tmp_path / 'out' / 'snapshot.json'
-        assert _run(root, out) == 0
+        assert run_snapshot(root, out) == 0
         measured = json.loads(out.read_text(encoding='utf-8'))
         evidence = measured['evidence']
         assert evidence['unreadable'] == ['alpha/src/alpha/broken.py']
@@ -312,14 +256,14 @@ class TestTheCommandLine:
     def test_a_run_without_diff_ends_by_saying_there_was_no_previous(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, _BASE)
-        assert _run(root, tmp_path / 'out' / 'snapshot.json') == 0
+        root = committed_repo(tmp_path, BASE_FILES)
+        assert run_snapshot(root, tmp_path / 'out' / 'snapshot.json') == 0
         printed = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
         assert printed[-1] == 'no previous snapshot given; since = none'
 
     def test_the_real_entry_point_measures_and_writes(self, tmp_path: Path) -> None:
         out = tmp_path / 'out' / 'snapshot.json'
-        _run_in_a_process(_repo(tmp_path, _BASE), out, 'r', hash_seed='0')
+        _run_in_a_process(committed_repo(tmp_path, BASE_FILES), out, 'r', hash_seed='0')
         assert out.is_file()
 
     @pytest.mark.parametrize(
@@ -343,7 +287,7 @@ class TestTheParamsMode:
     def test_it_prints_the_params_a_measurement_records_as_one_json_line(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        recorded = _measured(tmp_path, _BASE)['params']
+        recorded = measured_snapshot(tmp_path, BASE_FILES)['params']
         capsys.readouterr()
         assert snapshot.main(['--params']) == 0
         printed = capsys.readouterr().out.splitlines()
@@ -353,22 +297,6 @@ class TestTheParamsMode:
 
 # ---------------------------------------------------------------------------
 # The import graph: nodes are module import names.
-
-_GRAPH: dict[str, str] = {
-    'alpha/src/pkg/__init__.py': 'THING = 1\n',
-    'alpha/src/pkg/a.py': 'from pkg import THING\n',
-    'alpha/src/pkg/b.py': 'from pkg import c\n',
-    'alpha/src/pkg/c.py': 'X = 1\n',
-    'alpha/src/a.py': 'import b\n',
-    'alpha/src/b.py': 'import a\n',
-    'alpha/src/c.py': 'from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import d\n',
-    'alpha/src/d.py': 'from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import c\n',
-    'alpha/src/e.py': 'import os\n\n\ndef f():\n    import a\n    return a\n',
-    'beta/src/beta/b.py': 'import pkg.c\n',
-    'alpha/tests/test_pkg.py': 'from pkg import a\nimport pkg.c\n',
-    'scripts/x.py': 'import legibility.y\n',
-    'scripts/legibility/y.py': 'Y = 1\n',
-}
 
 _RELATIVE: dict[str, str] = {
     'alpha/src/rel/__init__.py': 'NAME = 1\n',
@@ -406,7 +334,7 @@ _DEFERRED_SHAPES = (
 class TestTheImportGraph:
     @pytest.fixture
     def measured(self, tmp_path: Path) -> dict[str, Any]:
-        return _measured(tmp_path, _GRAPH)
+        return measured_snapshot(tmp_path, GRAPH_FILES)
 
     def test_it_has_exactly_the_six_sections(self, measured: dict[str, Any]) -> None:
         assert list(measured['import_graph']) == [
@@ -460,7 +388,7 @@ class TestTheImportGraph:
     def test_each_src_records_function_local_imports_are_its_deferred_entries(
         self, tmp_path: Path
     ) -> None:
-        measured = _measured(tmp_path, {**_BASE, 'alpha/src/alpha/late.py': _DEFERRED_SHAPES})
+        measured = measured_snapshot(tmp_path, {**BASE_FILES, 'alpha/src/alpha/late.py': _DEFERRED_SHAPES})
         deferred_from = [entry['from'] for entry in measured['import_graph']['deferred']]
         src_records = [r for r in measured['files'].values() if r['kind'] == 'src']
         for record in src_records:
@@ -490,7 +418,7 @@ class TestTheImportGraph:
         }
 
     def test_relative_imports_resolve(self, tmp_path: Path) -> None:
-        graph = _measured(tmp_path, _RELATIVE)['import_graph']
+        graph = measured_snapshot(tmp_path, _RELATIVE)['import_graph']
         edges = graph['edges']
         for edge in (
             ['rel.sub', 'rel'],
@@ -508,9 +436,9 @@ class TestTheImportGraph:
         assert not [edge for edge in edges if edge[0] == 'z']
 
     def test_an_unreadable_module_is_still_a_node(self, tmp_path: Path) -> None:
-        measured = _measured(
+        measured = measured_snapshot(
             tmp_path,
-            {**_BASE, 'alpha/src/broken.py': 'def (:\n', 'alpha/src/user.py': 'import broken\n'},
+            {**BASE_FILES, 'alpha/src/broken.py': 'def (:\n', 'alpha/src/user.py': 'import broken\n'},
         )
         assert ['user', 'broken'] in measured['import_graph']['edges']
         assert 'alpha/src/broken.py' in measured['evidence']['unreadable']
@@ -537,7 +465,7 @@ _CYCLE_SETS: dict[str, str] = {
 class TestTheCycleSets:
     @pytest.fixture
     def measured(self, tmp_path: Path) -> dict[str, Any]:
-        return _measured(tmp_path, _CYCLE_SETS)
+        return measured_snapshot(tmp_path, _CYCLE_SETS)
 
     def test_each_set_adds_the_edges_of_a_later_moment(self, measured: dict[str, Any]) -> None:
         graph = measured['import_graph']
@@ -610,7 +538,7 @@ _SRC_ONLY_FIELDS = frozenset({
 class TestTheTestsKindMeasures:
     @pytest.fixture
     def files(self, tmp_path: Path) -> dict[str, Any]:
-        return _measured(tmp_path, _PATCHING)['files']
+        return measured_snapshot(tmp_path, _PATCHING)['files']
 
     def test_private_names_patched_by_string_or_object_path(self, files: dict[str, Any]) -> None:
         # Row 10: the public leaf and the third-party os._exit do not count, and
@@ -678,7 +606,7 @@ _MOD_SPLIT = (
     '    return 0\n'
 )
 
-_MOD_ONE_MORE_IF = _MOD_BEFORE.replace('    return 0\n', '    if a:\n        x = 3\n    return 0\n')
+_MOD_ONE_MORE_IF = MOD_BEFORE.replace('    return 0\n', '    if a:\n        x = 3\n    return 0\n')
 
 _MOVED = 'measure per heuristic 14, not a target'
 
@@ -687,64 +615,11 @@ def _assignments(count: int) -> str:
     return ''.join(f'x{number} = {number}\n' for number in range(count))
 
 
-def _load(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding='utf-8'))
-
-
-def _chain(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    base_files: dict[str, str],
-    *changes: Any,
-) -> list[tuple[dict[str, Any], list[str]]]:
-    """Measure the base commit, then each change in turn with --diff against the one before.
-
-    Each entry is (snapshot, the diff lines its measuring run printed after the
-    'wrote' line); the --current form is checked to print the same lines.
-    """
-    root = _repo(tmp_path, base_files)
-    previous = tmp_path / 's1.json'
-    assert snapshot.main(['--run-id', 'run-1', '--out', str(previous), '--root', str(root)]) == 0
-    results: list[tuple[dict[str, Any], list[str]]] = [(_load(previous), [])]
-    for number, change in enumerate(changes, start=2):
-        change(root)
-        current = tmp_path / f's{number}.json'
-        capsys.readouterr()
-        argv = ['--run-id', f'run-{number}', '--out', str(current), '--root', str(root)]
-        assert snapshot.main([*argv, '--diff', str(previous)]) == 0
-        printed = capsys.readouterr().out.splitlines()
-        assert printed[0].startswith('wrote '), printed
-        assert snapshot.main(['--current', str(current), '--diff', str(previous)]) == 0
-        assert capsys.readouterr().out.splitlines() == printed[1:]
-        results.append((_load(current), printed[1:]))
-        previous = current
-    return results
-
-
-def _diff_of(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], base_files: dict[str, str], change: Any
-) -> list[str]:
-    return _chain(tmp_path, capsys, base_files, change)[1][1]
-
-
-def _section(diff: list[str], header: str) -> list[str]:
-    start = diff.index(header) + 1
-    end = next(
-        (index for index in range(start, len(diff)) if not diff[index].startswith('  ')),
-        len(diff),
-    )
-    return diff[start:end]
-
-
-def _rewrite(relpath: str, text: str) -> Any:
-    return lambda root: _commit(root, f'rewrite {relpath}', write={relpath: text})
-
-
 class TestDiffLayout:
     def test_the_sections_come_in_the_contract_order(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        diff = _diff_of(tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/mod.py', _MOD_SPLIT))
+        diff = diff_of(tmp_path, capsys, BASE_FILES, rewriting('alpha/src/alpha/mod.py', _MOD_SPLIT))
         headers = [line for line in diff if not line.startswith('  ')]
         assert headers[0].startswith('current: run-2 as_of ')
         assert headers[1].startswith('previous: run-1 as_of ')
@@ -754,8 +629,8 @@ class TestDiffLayout:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         path = tmp_path / 'out' / 'snapshot.json'
-        assert _run(_repo(tmp_path, _BASE), path) == 0
-        sha = _load(path)['as_of_sha']
+        assert run_snapshot(committed_repo(tmp_path, BASE_FILES), path) == 0
+        sha = read_json(path)['as_of_sha']
         capsys.readouterr()
         assert snapshot.main(['--current', str(path), '--diff', str(path)]) == 0
         assert capsys.readouterr().out.splitlines() == [
@@ -771,8 +646,8 @@ class TestTheComplexityPair:
     def test_a_split_moves_complexity(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        diff = _diff_of(tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/mod.py', _MOD_SPLIT))
-        assert _section(diff, self._PAIR) == [
+        diff = diff_of(tmp_path, capsys, BASE_FILES, rewriting('alpha/src/alpha/mod.py', _MOD_SPLIT))
+        assert diff_section(diff, self._PAIR) == [
             '  alpha/src/alpha/mod.py: max 2 -> 1, total 2 -> 2; max down, total flat or '
             'down: complexity moved, per docs/code-quality.md §What to measure',
         ]
@@ -780,19 +655,19 @@ class TestTheComplexityPair:
     def test_a_new_branch_adds_complexity(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        diff = _diff_of(
-            tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/mod.py', _MOD_ONE_MORE_IF)
+        diff = diff_of(
+            tmp_path, capsys, BASE_FILES, rewriting('alpha/src/alpha/mod.py', _MOD_ONE_MORE_IF)
         )
-        [line] = _section(diff, self._PAIR)
+        [line] = diff_section(diff, self._PAIR)
         assert line.startswith('  alpha/src/alpha/mod.py: max 2 -> ')
         assert line.endswith('; total up: complexity added')
 
     def test_a_merge_with_a_flat_total_carries_no_reading(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        base = {**_BASE, 'alpha/src/alpha/mod.py': _MOD_SPLIT}
-        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/alpha/mod.py', _MOD_BEFORE))
-        assert _section(diff, self._PAIR) == ['  alpha/src/alpha/mod.py: max 1 -> 2, total 2 -> 2']
+        base = {**BASE_FILES, 'alpha/src/alpha/mod.py': _MOD_SPLIT}
+        diff = diff_of(tmp_path, capsys, base, rewriting('alpha/src/alpha/mod.py', MOD_BEFORE))
+        assert diff_section(diff, self._PAIR) == ['  alpha/src/alpha/mod.py: max 1 -> 2, total 2 -> 2']
 
 
 class TestHeuristic14Crossings:
@@ -802,18 +677,18 @@ class TestHeuristic14Crossings:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         base = {
-            **_BASE,
+            **BASE_FILES,
             'alpha/src/alpha/z_grow.py': _assignments(1490),
             'alpha/src/alpha/a_shrink.py': _assignments(2010),
         }
 
         def resize(root: Path) -> None:
-            _commit(root, 'resize', write={
+            commit(root, 'resize', write={
                 'alpha/src/alpha/z_grow.py': _assignments(2010),
                 'alpha/src/alpha/a_shrink.py': _assignments(1490),
             })
 
-        assert _section(_diff_of(tmp_path, capsys, base, resize), self._CROSSINGS) == [
+        assert diff_section(diff_of(tmp_path, capsys, base, resize), self._CROSSINGS) == [
             f'  alpha/src/alpha/a_shrink.py: 2010 -> 1490 lines, crossed 1500 down; {_MOVED}',
             f'  alpha/src/alpha/a_shrink.py: 2010 -> 1490 lines, ALARM crossed 2000 down; {_MOVED}',
             f'  alpha/src/alpha/z_grow.py: 1490 -> 2010 lines, crossed 1500 up; {_MOVED}',
@@ -823,8 +698,8 @@ class TestHeuristic14Crossings:
     def test_an_added_file_crosses_up_from_zero(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        diff = _diff_of(tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/big.py', _assignments(2010)))
-        assert _section(diff, self._CROSSINGS) == [
+        diff = diff_of(tmp_path, capsys, BASE_FILES, rewriting('alpha/src/alpha/big.py', _assignments(2010)))
+        assert diff_section(diff, self._CROSSINGS) == [
             f'  alpha/src/alpha/big.py: 0 -> 2010 lines, crossed 1500 up; {_MOVED}',
             f'  alpha/src/alpha/big.py: 0 -> 2010 lines, ALARM crossed 2000 up; {_MOVED}',
         ]
@@ -835,15 +710,15 @@ class TestRenames:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         def move(root: Path) -> None:
-            _commit(root, 'move', moves=[('alpha/src/alpha/mod.py', 'alpha/src/alpha/moved.py')])
+            commit(root, 'move', moves=[('alpha/src/alpha/mod.py', 'alpha/src/alpha/moved.py')])
 
-        diff = _diff_of(tmp_path, capsys, _BASE, move)
-        assert _section(diff, 'files renamed (same blob):') == [
+        diff = diff_of(tmp_path, capsys, BASE_FILES, move)
+        assert diff_section(diff, 'files renamed (same blob):') == [
             '  alpha/src/alpha/mod.py -> alpha/src/alpha/moved.py',
         ]
         for header in _DIFF_SECTIONS:
             if header != 'files renamed (same blob):':
-                assert _section(diff, header) == ['  (none)'], header
+                assert diff_section(diff, header) == ['  (none)'], header
 
     @pytest.mark.parametrize(
         ('source', 'destination'),
@@ -857,74 +732,74 @@ class TestRenames:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], source: str, destination: str
     ) -> None:
         def move(root: Path) -> None:
-            _commit(root, 'move', moves=[(source, destination)])
+            commit(root, 'move', moves=[(source, destination)])
 
-        diff = _diff_of(tmp_path, capsys, _BASE, move)
-        assert _section(diff, 'files renamed (same blob):') == ['  (none)']
-        assert _section(diff, 'files added:') == [f'  {destination}']
-        assert _section(diff, 'files removed:') == [f'  {source}']
+        diff = diff_of(tmp_path, capsys, BASE_FILES, move)
+        assert diff_section(diff, 'files renamed (same blob):') == ['  (none)']
+        assert diff_section(diff, 'files added:') == [f'  {destination}']
+        assert diff_section(diff, 'files removed:') == [f'  {source}']
         for header in _DIFF_SECTIONS:
             if header not in ('files renamed (same blob):', 'files added:', 'files removed:'):
-                assert _section(diff, header) == ['  (none)'], header
+                assert diff_section(diff, header) == ['  (none)'], header
 
     def test_an_empty_file_moved_between_a_src_and_a_tests_root_is_not_a_rename(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         def swap(root: Path) -> None:
-            _commit(
+            commit(
                 root,
                 'swap',
                 remove=['alpha/src/alpha/__init__.py'],
                 write={'alpha/tests/__init__.py': ''},
             )
 
-        diff = _diff_of(tmp_path, capsys, _BASE, swap)
-        assert _section(diff, 'files renamed (same blob):') == ['  (none)']
-        assert _section(diff, 'files added:') == ['  alpha/tests/__init__.py']
-        assert _section(diff, 'files removed:') == ['  alpha/src/alpha/__init__.py']
+        diff = diff_of(tmp_path, capsys, BASE_FILES, swap)
+        assert diff_section(diff, 'files renamed (same blob):') == ['  (none)']
+        assert diff_section(diff, 'files added:') == ['  alpha/tests/__init__.py']
+        assert diff_section(diff, 'files removed:') == ['  alpha/src/alpha/__init__.py']
 
     def test_an_empty_file_is_never_a_rename(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         def swap(root: Path) -> None:
-            _commit(
+            commit(
                 root,
                 'swap',
                 remove=['alpha/src/alpha/__init__.py'],
                 write={'beta/src/beta/__init__.py': ''},
             )
 
-        diff = _diff_of(tmp_path, capsys, _BASE, swap)
-        assert _section(diff, 'files renamed (same blob):') == ['  (none)']
-        assert _section(diff, 'files added:') == ['  beta/src/beta/__init__.py']
-        assert _section(diff, 'files removed:') == ['  alpha/src/alpha/__init__.py']
+        diff = diff_of(tmp_path, capsys, BASE_FILES, swap)
+        assert diff_section(diff, 'files renamed (same blob):') == ['  (none)']
+        assert diff_section(diff, 'files added:') == ['  beta/src/beta/__init__.py']
+        assert diff_section(diff, 'files removed:') == ['  alpha/src/alpha/__init__.py']
 
     def test_a_blob_that_left_or_arrived_at_several_paths_is_not_paired(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        base = {**_BASE, 'alpha/src/alpha/c1.py': 'C = 1\n', 'alpha/src/alpha/c2.py': 'C = 1\n'}
+        base = {**BASE_FILES, 'alpha/src/alpha/c1.py': 'C = 1\n', 'alpha/src/alpha/c2.py': 'C = 1\n'}
 
         def move(root: Path) -> None:
-            _commit(root, 'move', moves=[
+            commit(root, 'move', moves=[
                 ('alpha/src/alpha/c1.py', 'alpha/src/alpha/z2.py'),
                 ('alpha/src/alpha/c2.py', 'alpha/src/alpha/a9.py'),
             ])
 
-        diff = _diff_of(tmp_path, capsys, base, move)
-        assert _section(diff, 'files renamed (same blob):') == ['  (none)']
-        assert _section(diff, 'files added:') == [
+        diff = diff_of(tmp_path, capsys, base, move)
+        assert diff_section(diff, 'files renamed (same blob):') == ['  (none)']
+        assert diff_section(diff, 'files added:') == [
             '  alpha/src/alpha/a9.py',
             '  alpha/src/alpha/z2.py',
         ]
-        assert _section(diff, 'files removed:') == [
+        assert diff_section(diff, 'files removed:') == [
             '  alpha/src/alpha/c1.py',
             '  alpha/src/alpha/c2.py',
         ]
 
     def test_a_path_whose_kind_changed_is_compared_within_one_kind(self, tmp_path: Path) -> None:
         path = tmp_path / 'out' / 'snapshot.json'
-        assert _run(_repo(tmp_path, _BASE), path) == 0
-        previous = _load(path)
+        assert run_snapshot(committed_repo(tmp_path, BASE_FILES), path) == 0
+        previous = read_json(path)
         edited = copy.deepcopy(previous)
         edited['files']['scripts/x.py'] = {
             **previous['files']['scripts/tests/test_x.py'],
@@ -934,16 +809,16 @@ class TestRenames:
         tests_header = 'test files (private patch targets, private reads):'
 
         forward = snapshot.diff_lines(edited, previous)
-        assert _section(forward, tests_header) == ['  scripts/x.py: +pkg._p']
-        assert _section(forward, 'import graph:') == ['  (none)']
+        assert diff_section(forward, tests_header) == ['  scripts/x.py: +pkg._p']
+        assert diff_section(forward, 'import graph:') == ['  (none)']
 
         backward = snapshot.diff_lines(previous, edited)
-        assert _section(backward, tests_header) == ['  scripts/x.py: -pkg._p']
-        assert _section(backward, 'import graph:') == ['  (none)']
+        assert diff_section(backward, tests_header) == ['  scripts/x.py: -pkg._p']
+        assert diff_section(backward, 'import graph:') == ['  (none)']
 
 
 _GRAPH_BASE: dict[str, str] = {
-    **_BASE,
+    **BASE_FILES,
     'alpha/src/a.py': 'A = 1\n',
     'alpha/src/b.py': 'B = 1\n',
     'alpha/src/e.py': 'def f():\n    return 1\n',
@@ -967,14 +842,14 @@ class TestImportGraphChanges:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         reverted = {path: _GRAPH_BASE[path] for path in _GRAPH_CHANGED}
-        chain = _chain(
+        chain = diff_chain(
             tmp_path,
             capsys,
             _GRAPH_BASE,
-            lambda root: _commit(root, 'couple', write=_GRAPH_CHANGED),
-            lambda root: _commit(root, 'decouple', write=reverted),
+            lambda root: commit(root, 'couple', write=_GRAPH_CHANGED),
+            lambda root: commit(root, 'decouple', write=reverted),
         )
-        added = _section(chain[1][1], self._GRAPH)
+        added = diff_section(chain[1][1], self._GRAPH)
         for line in (
             '  edge added: a -> b',
             '  edge added: b -> a',
@@ -985,7 +860,7 @@ class TestImportGraphChanges:
             '  deferred import added: e: a',
         ):
             assert line in added, (line, added)
-        removed = _section(chain[2][1], self._GRAPH)
+        removed = diff_section(chain[2][1], self._GRAPH)
         for line in (
             '  edge removed: a -> b',
             '  edge removed: b -> a',
@@ -1002,17 +877,17 @@ class TestImportGraphChanges:
     ) -> None:
         coupled = {**_GRAPH_BASE, **_GRAPH_CHANGED}
         shifted = '\n' + _GRAPH_CHANGED['alpha/src/pkg/a.py']
-        diff = _diff_of(tmp_path, capsys, coupled, _rewrite('alpha/src/pkg/a.py', shifted))
-        assert _section(diff, self._GRAPH) == ['  (none)']
+        diff = diff_of(tmp_path, capsys, coupled, rewriting('alpha/src/pkg/a.py', shifted))
+        assert diff_section(diff, self._GRAPH) == ['  (none)']
 
     def test_a_function_local_import_closing_a_cycle_is_a_hidden_cycle_only(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        base = {**_BASE, 'alpha/src/f.py': 'import g\n', 'alpha/src/g.py': 'G = 1\n'}
-        diff = _diff_of(
-            tmp_path, capsys, base, _rewrite('alpha/src/g.py', 'def h():\n    import f\n    return f\n')
+        base = {**BASE_FILES, 'alpha/src/f.py': 'import g\n', 'alpha/src/g.py': 'G = 1\n'}
+        diff = diff_of(
+            tmp_path, capsys, base, rewriting('alpha/src/g.py', 'def h():\n    import f\n    return f\n')
         )
-        assert _section(diff, self._GRAPH) == [
+        assert diff_section(diff, self._GRAPH) == [
             '  edge added: g -> f',
             '  deferred import added: g: f',
             '  cycle-closing deferred import added: g: f',
@@ -1024,12 +899,12 @@ class TestImportGraphChanges:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         base = {
-            **_BASE,
+            **BASE_FILES,
             'alpha/src/f.py': 'F = 1\n',
             'alpha/src/g.py': 'def h():\n    import f\n    return f\n',
         }
-        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/f.py', 'import g\nF = 1\n'))
-        assert _section(diff, self._GRAPH) == [
+        diff = diff_of(tmp_path, capsys, base, rewriting('alpha/src/f.py', 'import g\nF = 1\n'))
+        assert diff_section(diff, self._GRAPH) == [
             '  edge added: f -> g',
             '  cycle-closing deferred import added: g: f',
             '  hidden cycle added: f, g',
@@ -1044,48 +919,27 @@ class TestImportGraphChanges:
             'from typing import TYPE_CHECKING\n\n\ndef h():\n    import f\n    return f\n\n\n'
             'def k():\n    if TYPE_CHECKING:\n        import f\n    return TYPE_CHECKING\n'
         )
-        base = {**_BASE, 'alpha/src/f.py': 'import g\n', 'alpha/src/g.py': guarded}
+        base = {**BASE_FILES, 'alpha/src/f.py': 'import g\n', 'alpha/src/g.py': guarded}
         unguarded = guarded.replace('    if TYPE_CHECKING:\n        import f\n', '    import f\n')
-        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/g.py', unguarded))
-        assert _section(diff, self._GRAPH) == ['  cycle-closing deferred import added: g: f']
+        diff = diff_of(tmp_path, capsys, base, rewriting('alpha/src/g.py', unguarded))
+        assert diff_section(diff, self._GRAPH) == ['  cycle-closing deferred import added: g: f']
 
     def test_a_type_checking_only_cycle_is_a_typing_cycle_only(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        base = {**_BASE, 'alpha/src/c.py': 'X = 1\n', 'alpha/src/d.py': 'X = 1\n'}
+        base = {**BASE_FILES, 'alpha/src/c.py': 'X = 1\n', 'alpha/src/d.py': 'X = 1\n'}
 
         def couple(root: Path) -> None:
-            _commit(root, 'couple', write={
-                'alpha/src/c.py': _GRAPH['alpha/src/c.py'],
-                'alpha/src/d.py': _GRAPH['alpha/src/d.py'],
+            commit(root, 'couple', write={
+                'alpha/src/c.py': GRAPH_FILES['alpha/src/c.py'],
+                'alpha/src/d.py': GRAPH_FILES['alpha/src/d.py'],
             })
 
-        assert _section(_diff_of(tmp_path, capsys, base, couple), self._GRAPH) == [
+        assert diff_section(diff_of(tmp_path, capsys, base, couple), self._GRAPH) == [
             '  edge added: c -> d',
             '  edge added: d -> c',
             '  typing cycle added: c, d',
         ]
-
-
-def _as_schema_2(taken: dict[str, Any]) -> dict[str, Any]:
-    """What a pre-8463 measurement of the same tree recorded: no python_version or instrument params."""
-    old = copy.deepcopy(taken)
-    old['schema_version'] = 2
-    del old['params']['python_version'], old['params']['instrument']
-    return old
-
-
-def _as_schema_1(taken: dict[str, Any]) -> dict[str, Any]:
-    """What a pre-6612 measurement of the same tree recorded, e.g. plans/quality-metrics/review-all-dark_factory-20261008.json."""
-    old = _as_schema_2(taken)
-    old['schema_version'] = 1
-    graph = old['import_graph']
-    del graph['hidden_cycles'], graph['typing_cycles']
-    for entry in graph['deferred']:
-        del entry['closes_cycle']
-    for record in old['files'].values():
-        record.pop('cycle_closing_imports', None)
-    return old
 
 
 def _unknown_in_schema_1(side: str) -> list[str]:
@@ -1099,36 +953,36 @@ def _unknown_in_schema_1(side: str) -> list[str]:
 class TestASchema1SnapshotIsStillRead:
     @pytest.fixture
     def taken(self, tmp_path: Path) -> dict[str, Any]:
-        return _measured(tmp_path, _GRAPH)
+        return measured_snapshot(tmp_path, GRAPH_FILES)
 
     def test_it_is_valid(self, taken: dict[str, Any]) -> None:
-        old = _as_schema_1(taken)
+        old = as_schema_1(taken)
         assert snapshot.validate_snapshot(old, origin='v1') == old
 
     def test_its_absent_cycle_sets_are_unknown_on_either_side(self, taken: dict[str, Any]) -> None:
         # Nothing else in the section: deferred entries compare equal without closes_cycle.
-        old = _as_schema_1(taken)
-        assert _section(snapshot.diff_lines(taken, old), 'import graph:') == _unknown_in_schema_1(
+        old = as_schema_1(taken)
+        assert diff_section(snapshot.diff_lines(taken, old), 'import graph:') == _unknown_in_schema_1(
             'previous'
         )
-        assert _section(snapshot.diff_lines(old, taken), 'import graph:') == _unknown_in_schema_1(
+        assert diff_section(snapshot.diff_lines(old, taken), 'import graph:') == _unknown_in_schema_1(
             'current'
         )
 
     def test_a_measuring_run_diffs_against_one(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, _GRAPH)
+        root = committed_repo(tmp_path, GRAPH_FILES)
         first, second, previous = tmp_path / 's1.json', tmp_path / 's2.json', tmp_path / 'prev.json'
-        assert _run(root, first) == 0
-        previous.write_text(json.dumps(_as_schema_1(_load(first))), encoding='utf-8')
+        assert run_snapshot(root, first) == 0
+        previous.write_text(json.dumps(as_schema_1(read_json(first))), encoding='utf-8')
         capsys.readouterr()
-        assert _run(root, second, '--diff', str(previous)) == 0
+        assert run_snapshot(root, second, '--diff', str(previous)) == 0
         printed = capsys.readouterr().out.splitlines()
-        assert _section(printed, 'import graph:') == _unknown_in_schema_1('previous')
+        assert diff_section(printed, 'import graph:') == _unknown_in_schema_1('previous')
         assert snapshot.main(['--current', str(second), '--diff', str(previous)]) == 0
         printed = capsys.readouterr().out.splitlines()
-        assert _section(printed, 'import graph:') == _unknown_in_schema_1('previous')
+        assert diff_section(printed, 'import graph:') == _unknown_in_schema_1('previous')
 
     @pytest.mark.parametrize(
         ('named', 'edit'),
@@ -1146,9 +1000,9 @@ class TestASchema1SnapshotIsStillRead:
         ],
     )
     def test_one_carrying_a_schema_2_field_is_refused(
-        self, taken: dict[str, Any], named: str, edit: _Edit
+        self, taken: dict[str, Any], named: str, edit: SnapshotEdit
     ) -> None:
-        old = _as_schema_1(taken)
+        old = as_schema_1(taken)
         edit(old)
         with pytest.raises(source_measures.MetricsError) as raised:
             snapshot.validate_snapshot(old, origin='v1')
@@ -1169,10 +1023,10 @@ class TestASchema1SnapshotIsStillRead:
 class TestASchema2SnapshotIsStillRead:
     @pytest.fixture
     def taken(self, tmp_path: Path) -> dict[str, Any]:
-        return _measured(tmp_path, _GRAPH)
+        return measured_snapshot(tmp_path, GRAPH_FILES)
 
     def test_it_is_valid(self, taken: dict[str, Any]) -> None:
-        old = _as_schema_2(taken)
+        old = as_schema_2(taken)
         assert snapshot.validate_snapshot(old, origin='v2') == old
 
     @pytest.mark.parametrize(
@@ -1197,7 +1051,7 @@ class TestASchema2SnapshotIsStillRead:
 class TestMeasurementIdentity:
     @pytest.fixture
     def taken(self, tmp_path: Path) -> dict[str, Any]:
-        return _measured(tmp_path, _GRAPH)
+        return measured_snapshot(tmp_path, GRAPH_FILES)
 
     def test_it_is_the_recorded_sha_and_params_as_canonical_json(self, taken: dict[str, Any]) -> None:
         identity = snapshot.measurement_identity(taken)
@@ -1219,7 +1073,7 @@ class TestMeasurementIdentity:
     ) -> None:
         # Decision 17: identity is (as_of_sha, params), not the checkout path nor the str-hash
         # seed. Seeds 1 and 5 iterate this fixture's import-edge set in different orders.
-        root = _repo(tmp_path, _SUMMARY_FILES)
+        root = committed_repo(tmp_path, _SUMMARY_FILES)
         pinned = tmp_path / 'pinned'
         git(root, 'worktree', 'add', '--detach', str(pinned), 'HEAD')
         first, second = tmp_path / 'a.json', tmp_path / 'b.json'
@@ -1230,7 +1084,7 @@ class TestMeasurementIdentity:
         assert below_run_id_and_cost(first) == below_run_id_and_cost(second)
         assert a['run_id'] != b['run_id']
 
-    @pytest.mark.parametrize('as_older', [_as_schema_2, _as_schema_1], ids=['schema-2', 'schema-1'])
+    @pytest.mark.parametrize('as_older', [as_schema_2, as_schema_1], ids=['schema-2', 'schema-1'])
     def test_an_older_schema_has_no_identity(
         self, taken: dict[str, Any], as_older: Callable[[dict[str, Any]], dict[str, Any]]
     ) -> None:
@@ -1245,8 +1099,8 @@ class TestMeasurementIdentity:
         [
             pytest.param(lambda t: (t, copy.deepcopy(t)), id='one-identity'),
             pytest.param(lambda t: (t, _with_complexipy(t, '0.0.0')), id='params-changed'),
-            pytest.param(lambda t: (t, _as_schema_2(t)), id='schema-3-and-2'),
-            pytest.param(lambda t: (_as_schema_2(t), _as_schema_2(t)), id='both-schema-2'),
+            pytest.param(lambda t: (t, as_schema_2(t)), id='schema-3-and-2'),
+            pytest.param(lambda t: (as_schema_2(t), as_schema_2(t)), id='both-schema-2'),
         ],
     )
     def test_a_shared_identity_is_exactly_a_diff_without_params_differ(
@@ -1280,7 +1134,7 @@ class TestParamsDiffer:
 
     @pytest.fixture
     def taken(self, tmp_path: Path) -> dict[str, Any]:
-        return _measured(tmp_path, _GRAPH)
+        return measured_snapshot(tmp_path, GRAPH_FILES)
 
     @staticmethod
     def _new_params(taken: dict[str, Any]) -> tuple[str, str]:
@@ -1289,7 +1143,7 @@ class TestParamsDiffer:
 
     def test_a_schema_2_previous_reads_instrument_unknown(self, taken: dict[str, Any]) -> None:
         instrument, python = self._new_params(taken)
-        diff = snapshot.diff_lines(taken, _as_schema_2(taken))
+        diff = snapshot.diff_lines(taken, as_schema_2(taken))
         assert diff[0] == (
             f'params differ: instrument unknown -> {instrument}; python_version unknown -> {python}'
         )
@@ -1298,18 +1152,18 @@ class TestParamsDiffer:
 
     def test_a_schema_1_previous_reads_the_same(self, taken: dict[str, Any]) -> None:
         assert (
-            snapshot.diff_lines(taken, _as_schema_1(taken))[:2]
-            == snapshot.diff_lines(taken, _as_schema_2(taken))[:2]
+            snapshot.diff_lines(taken, as_schema_1(taken))[:2]
+            == snapshot.diff_lines(taken, as_schema_2(taken))[:2]
         )
 
     def test_the_reverse_direction(self, taken: dict[str, Any]) -> None:
         instrument, python = self._new_params(taken)
-        assert snapshot.diff_lines(_as_schema_2(taken), taken)[0] == (
+        assert snapshot.diff_lines(as_schema_2(taken), taken)[0] == (
             f'params differ: instrument {instrument} -> unknown; python_version {python} -> unknown'
         )
 
     def test_unknown_never_equals_unknown(self, taken: dict[str, Any]) -> None:
-        old = _as_schema_2(taken)
+        old = as_schema_2(taken)
         assert snapshot.diff_lines(old, old)[0] == (
             'params differ: instrument unknown -> unknown; python_version unknown -> unknown'
         )
@@ -1330,11 +1184,11 @@ class TestParamsDiffer:
     ) -> None:
         current, previous = tmp_path / 'current.json', tmp_path / 'previous.json'
         current.write_text(snapshot.render_snapshot(taken), encoding='utf-8')
-        previous.write_text(snapshot.render_snapshot(_as_schema_2(taken)), encoding='utf-8')
+        previous.write_text(snapshot.render_snapshot(as_schema_2(taken)), encoding='utf-8')
         capsys.readouterr()
         assert snapshot.main(['--current', str(current), '--diff', str(previous)]) == 0
         printed = capsys.readouterr().out.splitlines()
-        assert printed[:2] == snapshot.diff_lines(taken, _as_schema_2(taken))[:2]
+        assert printed[:2] == snapshot.diff_lines(taken, as_schema_2(taken))[:2]
         assert printed[0].startswith('params differ: instrument unknown -> ')
 
     def test_the_committed_10_08_snapshot_reads_instrument_unknown(
@@ -1363,21 +1217,21 @@ class TestTestFileCoupling:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         base = {
-            **_BASE,
+            **BASE_FILES,
             'alpha/src/pkg/__init__.py': '',
             'alpha/src/pkg/mod.py': '_x = 1\n_y = 2\n',
             'alpha/tests/test_mod.py': _COUPLING_BEFORE,
         }
-        chain = _chain(
-            tmp_path, capsys, base, _rewrite('alpha/tests/test_mod.py', _COUPLING_AFTER)
+        chain = diff_chain(
+            tmp_path, capsys, base, rewriting('alpha/tests/test_mod.py', _COUPLING_AFTER)
         )
         before = source_measures.private_reads(_COUPLING_BEFORE, path='before.py')
         after = source_measures.private_reads(_COUPLING_AFTER, path='after.py')
-        assert _section(chain[1][1], self._TESTS) == [
+        assert diff_section(chain[1][1], self._TESTS) == [
             f'  alpha/tests/test_mod.py: +pkg.mod._x; private reads {before} -> {after}',
         ]
         reverse = snapshot.diff_lines(chain[0][0], chain[1][0])
-        assert _section(reverse, self._TESTS) == [
+        assert diff_section(reverse, self._TESTS) == [
             f'  alpha/tests/test_mod.py: -pkg.mod._x; private reads {after} -> {before}',
         ]
 
@@ -1386,21 +1240,21 @@ class TestCompleteness:
     def test_an_unreadable_previous_file_is_unknown_not_added(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        base = {**_BASE, 'alpha/src/alpha/broken.py': 'def (:\n'}
-        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/alpha/broken.py', 'X = 1\n'))
+        base = {**BASE_FILES, 'alpha/src/alpha/broken.py': 'def (:\n'}
+        diff = diff_of(tmp_path, capsys, base, rewriting('alpha/src/alpha/broken.py', 'X = 1\n'))
         previous = next(line for line in diff if line.startswith('previous: '))
         assert previous.endswith(' complete=false')
-        assert _section(diff, 'unreadable (measures unknown, never zero):') == [
+        assert diff_section(diff, 'unreadable (measures unknown, never zero):') == [
             '  previous: alpha/src/alpha/broken.py',
         ]
-        assert _section(diff, 'files added:') == ['  (none)']
-        pair = _section(diff, 'complexity pair (max per function, module total):')
+        assert diff_section(diff, 'files added:') == ['  (none)']
+        pair = diff_section(diff, 'complexity pair (max per function, module total):')
         assert not [line for line in pair if 'broken.py' in line]
 
     def test_a_measured_diff_records_since_and_no_first_run_line(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        chain = _chain(tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/mod.py', _MOD_SPLIT))
+        chain = diff_chain(tmp_path, capsys, BASE_FILES, rewriting('alpha/src/alpha/mod.py', _MOD_SPLIT))
         (first, _), (second, diff) = chain
         assert second['since'] == first['as_of_sha']
         assert not [line for line in diff if 'no previous snapshot given' in line]
@@ -1420,7 +1274,7 @@ _SUMMARY_FILES: dict[str, str] = {
     # Declared out of name order, so name order is what is pinned.
     'pyproject.toml': '[tool.uv.workspace]\nmembers = ["beta", "alpha"]\n',
     'alpha/src/alpha/__init__.py': 'THING = 1\n',
-    'alpha/src/alpha/mod.py': _MOD_BEFORE,
+    'alpha/src/alpha/mod.py': MOD_BEFORE,
     'alpha/src/alpha/big.py': _assignments(2010),
     'alpha/src/alpha/shim.py': 'from alpha.mod import f\n',
     'alpha/src/alpha/late.py': 'def g():\n    import alpha.mod\n    return alpha.mod\n',
@@ -1430,10 +1284,10 @@ _SUMMARY_FILES: dict[str, str] = {
         "    with patch('alpha.mod._x'):\n        assert mod._y\n"
     ),
     'beta/src/beta/b.py': 'B = 1\n',
-    'beta/tests/test_b.py': _TRIVIAL_TEST,
+    'beta/tests/test_b.py': TRIVIAL_TEST,
     'scripts/x.py': 'X = 1\n',
-    'scripts/tests/test_x.py': _TRIVIAL_TEST,
-    'tests/test_y.py': _TRIVIAL_TEST,
+    'scripts/tests/test_x.py': TRIVIAL_TEST,
+    'tests/test_y.py': TRIVIAL_TEST,
 }
 
 
@@ -1487,11 +1341,11 @@ class TestTheSummary:
     @pytest.fixture
     def measured(self, tmp_path: Path) -> Path:
         path = tmp_path / 'out' / 'snapshot.json'
-        assert _run(_repo(tmp_path, _SUMMARY_FILES), path) == 0
+        assert run_snapshot(committed_repo(tmp_path, _SUMMARY_FILES), path) == 0
         return path
 
     def test_the_header_lines(self, measured: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        taken = _load(measured)
+        taken = read_json(measured)
         graph = taken['import_graph']
         summary = _summary_of(measured, capsys)
         table_at = summary.index(_SUMMARY_HEADER)
@@ -1509,10 +1363,10 @@ class TestTheSummary:
     def test_a_schema_1_snapshot_names_its_cycle_sets_unknown(
         self, measured: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        taken = _load(measured)
+        taken = read_json(measured)
         graph = taken['import_graph']
         old = tmp_path / 'schema-1.json'
-        old.write_text(json.dumps(_as_schema_1(taken)), encoding='utf-8')
+        old.write_text(json.dumps(as_schema_1(taken)), encoding='utf-8')
         summary = _summary_of(old, capsys)
         assert (
             f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
@@ -1526,7 +1380,7 @@ class TestTheSummary:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         path = tmp_path / 'out' / 'snapshot.json'
-        assert _run(_repo(tmp_path, {**_BASE, 'alpha/src/alpha/broken.py': 'def (:\n'}), path) == 0
+        assert run_snapshot(committed_repo(tmp_path, {**BASE_FILES, 'alpha/src/alpha/broken.py': 'def (:\n'}), path) == 0
         summary = _summary_of(path, capsys)
         assert 'files: 8/9 measured, complete=false' in summary
         at = summary.index('unreadable (measures unknown, never zero):')
@@ -1544,7 +1398,7 @@ class TestTheSummary:
     def test_each_cell_is_a_count_a_total_or_the_pair(
         self, measured: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        taken = _load(measured)
+        taken = read_json(measured)
         _header, rows = _table(_summary_of(measured, capsys))
         by_member: dict[str, list[dict[str, Any]]] = {}
         for record in taken['files'].values():
@@ -1572,7 +1426,7 @@ class TestTheSummary:
 _SINGLE_PACKAGE_FILES: dict[str, str] = {
     'pyproject.toml': '[project]\nname = "solo"\n',
     'src/solo/__init__.py': '',
-    'src/solo/mod.py': _MOD_BEFORE,
+    'src/solo/mod.py': MOD_BEFORE,
     'tests/test_mod.py': (
         'from unittest.mock import patch\n\n\ndef test_it():\n'
         "    with patch('solo.mod._helper'):\n        assert True\n"
@@ -1586,13 +1440,13 @@ class TestASinglePackageProject:
     @pytest.fixture
     def measured(self, tmp_path: Path) -> Path:
         path = tmp_path / 'out' / 'snapshot.json'
-        assert _run(_repo(tmp_path, _SINGLE_PACKAGE_FILES), path) == 0
+        assert run_snapshot(committed_repo(tmp_path, _SINGLE_PACKAGE_FILES), path) == 0
         return path
 
     def test_the_package_and_the_scripts_pseudo_member_are_the_domain(
         self, measured: Path
     ) -> None:
-        taken = _load(measured)
+        taken = read_json(measured)
         assert {
             path: (record['member'], record['kind']) for path, record in taken['files'].items()
         } == {
@@ -1608,7 +1462,7 @@ class TestASinglePackageProject:
         assert taken['evidence']['complete'] is True
 
     def test_src_files_are_named_by_their_path_below_src(self, measured: Path) -> None:
-        taken = _load(measured)
+        taken = read_json(measured)
         files = taken['files']
         package = files['src/solo/__init__.py']
         assert (package['module'], package['package_init']) == ('solo', True)
@@ -1618,7 +1472,7 @@ class TestASinglePackageProject:
     def test_the_package_import_names_reach_the_patch_target_measure(
         self, measured: Path
     ) -> None:
-        record = _load(measured)['files']['tests/test_mod.py']
+        record = read_json(measured)['files']['tests/test_mod.py']
         assert record['private_patch_targets'] == ['solo.mod._helper']
 
     def test_the_summary_has_a_row_for_the_package(
@@ -1635,7 +1489,7 @@ class TestASinglePackageProject:
 def _refused(root: Path, capsys: pytest.CaptureFixture[str], *extra: str) -> str:
     """Run against *root*, assert the refusal wrote nothing, and return stderr."""
     out = root.parent / 'never' / 'snapshot.json'
-    assert _run(root, out, *extra) == 2
+    assert run_snapshot(root, out, *extra) == 2
     assert not out.parent.exists()
     return capsys.readouterr().err
 
@@ -1667,22 +1521,22 @@ class TestADirtyDomainIsRefused:
     def test_a_modified_member_file(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, _BASE)
-        _write(root, {'alpha/src/alpha/mod.py': 'CHANGED = 1\n'})
+        root = committed_repo(tmp_path, BASE_FILES)
+        write_files(root, {'alpha/src/alpha/mod.py': 'CHANGED = 1\n'})
         assert 'alpha/src/alpha/mod.py' in _refused(root, capsys)
 
     def test_a_staged_deletion(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         git(root, 'rm', '-q', 'beta/src/beta/b.py')
         assert 'beta/src/beta/b.py' in _refused(root, capsys)
 
     def test_untracked_files_and_files_outside_the_domain_are_not_dirt(
         self, tmp_path: Path
     ) -> None:
-        root = _repo(tmp_path, _BASE)
-        _write(root, {'alpha/src/alpha/untracked.py': 'U = 1\n', 'hooks/h.py': 'H = 2\n'})
+        root = committed_repo(tmp_path, BASE_FILES)
+        write_files(root, {'alpha/src/alpha/untracked.py': 'U = 1\n', 'hooks/h.py': 'H = 2\n'})
         out = tmp_path / 'out' / 'snapshot.json'
-        assert _run(root, out) == 0
+        assert run_snapshot(root, out) == 0
         assert out.is_file()
 
 
@@ -1695,7 +1549,7 @@ class TestAMovedHeadIsRefused:
     ) -> None:
         # A merge landing mid-run, simulated by a git that commits on its first
         # `status`: the dirty check precedes measuring, the HEAD check follows it.
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         before = git(root, 'rev-parse', 'HEAD').strip()
         real_git = shutil.which('git')
         assert real_git is not None
@@ -1719,7 +1573,7 @@ class TestToolFaultsAreRefused:
     def test_neither_a_workspace_nor_a_project_name(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, {**_BASE, 'pyproject.toml': '[tool.ruff]\nline-length = 100\n'})
+        root = committed_repo(tmp_path, {**BASE_FILES, 'pyproject.toml': '[tool.ruff]\nline-length = 100\n'})
         err = _refused(root, capsys)
         assert '[project].name' in err
         assert 'tool.uv.workspace' in err
@@ -1730,7 +1584,7 @@ class TestToolFaultsAreRefused:
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         empty_bin = tmp_path / 'empty-bin'
         empty_bin.mkdir()
         monkeypatch.setenv('PATH', str(empty_bin))
@@ -1744,7 +1598,7 @@ class TestToolFaultsAreRefused:
     ) -> None:
         # complexipy_version is the seam require_complexipy documents for
         # seeding a version; no measure is patched.
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         monkeypatch.setattr(source_measures, 'complexipy_version', lambda: '7.0.1')
         err = _refused(root, capsys)
         assert '7.0.1' in err
@@ -1754,21 +1608,21 @@ class TestToolFaultsAreRefused:
         root = tmp_path / 'repo'
         root.mkdir()
         git(root, 'init', '-q')
-        _write(root, {'pyproject.toml': _PYPROJECT, **_BASE})
+        write_files(root, {'pyproject.toml': WORKSPACE_PYPROJECT, **BASE_FILES})
         git(root, 'add', '-A')
         assert 'HEAD' in _refused(root, capsys)
 
 
 class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
     def test_a_missing_file(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         previous = tmp_path / 'missing.json'
         assert str(previous) in _refused(root, capsys, '--diff', str(previous))
 
     def test_a_file_that_is_not_json(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         previous = tmp_path / 'previous.json'
         previous.write_text('not json\n', encoding='utf-8')
         assert str(previous) in _refused(root, capsys, '--diff', str(previous))
@@ -1776,7 +1630,7 @@ class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
     def test_another_instruments_json(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         previous = tmp_path / 'previous.json'
         previous.write_text(
             json.dumps({'schema_version': 1, 'instrument': 'merge-lane-ratchet'}), encoding='utf-8'
@@ -1788,9 +1642,9 @@ class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
     def test_another_schema_version(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, _BASE)
+        root = committed_repo(tmp_path, BASE_FILES)
         measured = tmp_path / 'measured.json'
-        assert _run(root, measured) == 0
+        assert run_snapshot(root, measured) == 0
         previous = tmp_path / 'previous.json'
         previous.write_text(
             json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 4}),
@@ -1802,14 +1656,12 @@ class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
         assert 'schema_version' in err
 
 
-_Edit = Callable[[dict[str, Any]], object]
-
 #: A src and a tests record of the summary fixture.
 _SRC_PATH = 'alpha/src/alpha/mod.py'
 _TESTS_PATH = 'alpha/tests/test_mod.py'
 
 
-def _setting(*keys: str | int, to: object) -> _Edit:
+def _setting(*keys: str | int, to: object) -> SnapshotEdit:
     """An edit that sets the value at *keys* inside a snapshot to *to*."""
 
     def edit(taken: dict[str, Any]) -> None:
@@ -1911,7 +1763,7 @@ _MISSHAPEN: list[Any] = [
 ]
 
 
-def _bump(field: str, by: int = 1) -> _Edit:
+def _bump(field: str, by: int = 1) -> SnapshotEdit:
     return lambda taken: taken['evidence'].update({field: taken['evidence'][field] + by})
 
 
@@ -1938,8 +1790,8 @@ class TestAMalformedSnapshotIsRefused:
     def taken(self, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
         tmp_path = tmp_path_factory.mktemp('malformed')
         path = tmp_path / 'out' / 'snapshot.json'
-        assert _run(_repo(tmp_path, _SUMMARY_FILES), path) == 0
-        return _load(path)
+        assert run_snapshot(committed_repo(tmp_path, _SUMMARY_FILES), path) == 0
+        return read_json(path)
 
     def _compared(
         self, tmp_path: Path, current: dict[str, Any], previous: dict[str, Any]
@@ -1959,7 +1811,7 @@ class TestAMalformedSnapshotIsRefused:
         taken: dict[str, Any],
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
-        edit: _Edit,
+        edit: SnapshotEdit,
     ) -> tuple[Path, str]:
         edited = copy.deepcopy(taken)
         edit(edited)
@@ -1974,7 +1826,7 @@ class TestAMalformedSnapshotIsRefused:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
         where: str,
-        edit: _Edit,
+        edit: SnapshotEdit,
     ) -> None:
         given, err = self._refusal(taken, tmp_path, capsys, edit)
         assert str(given) in err
@@ -1987,7 +1839,7 @@ class TestAMalformedSnapshotIsRefused:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
         where: str,
-        edit: _Edit,
+        edit: SnapshotEdit,
     ) -> None:
         given, err = self._refusal(taken, tmp_path, capsys, edit)
         assert str(given) in err
@@ -1999,7 +1851,7 @@ def test_two_src_files_importing_as_one_module_name_are_refused(
 ) -> None:
     # The import graph is keyed by module name, so an ambiguous one would be a
     # wrong graph.
-    root = _repo(tmp_path, {**_BASE, 'alpha/src/x.py': 'Y = 1\n'})
+    root = committed_repo(tmp_path, {**BASE_FILES, 'alpha/src/x.py': 'Y = 1\n'})
     err = _refused(root, capsys)
     assert 'alpha/src/x.py' in err
     assert 'scripts/x.py' in err
