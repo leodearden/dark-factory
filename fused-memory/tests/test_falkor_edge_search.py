@@ -232,6 +232,52 @@ class TestEdgeFulltextSearch:
         assert issued == []
 
 
+class TestEdgeFulltextIdentifierTier:
+    """An edge matching every identifier term ranks first when the whole tier fits in the leg."""
+
+    LIMIT = 20
+
+    @classmethod
+    async def _issued(cls, query: str, tier_rows: int = 1) -> list[IssuedQuery]:
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD] * tier_rows)
+        await search_utils.edge_fulltext_search(
+            driver, query, SearchFilters(edge_uuids=['x']), ['g'], cls.LIMIT
+        )
+        return issued
+
+    @pytest.mark.asyncio
+    async def test_the_tier_query_intersects_the_identifiers_under_the_leg_filters(self) -> None:
+        tier, _ = await self._issued('alpha 877')
+
+        assert tier.params['query'] == '(877)'
+        assert tier.params['tier_cap'] == self.LIMIT + 1
+        assert (tier.params['group_ids'], tier.params['edge_uuids']) == (['g'], ['x'])
+        assert '$group_ids' in tier.cypher
+        assert '$edge_uuids' in tier.cypher
+        assert 'ORDER BY' not in tier.cypher.upper()
+        assert 'MATCH' not in tier.cypher.upper()
+
+    @pytest.mark.asyncio
+    async def test_the_union_ranks_the_tier_first_then_by_score(self) -> None:
+        _, union = await self._issued('alpha 877')
+
+        assert union.params['query'] == ' (alpha | 877)'
+        assert union.params['promoted_uuids'] == ['edge-uuid']
+        assert 'ORDER BY e.uuid IN $promoted_uuids DESC, score DESC' in union.cypher
+
+    @pytest.mark.asyncio
+    async def test_a_tier_larger_than_the_leg_promotes_nothing(self) -> None:
+        _, union = await self._issued('alpha 877', tier_rows=self.LIMIT + 1)
+
+        assert union.params['promoted_uuids'] == []
+
+    @pytest.mark.asyncio
+    async def test_a_query_without_identifiers_issues_only_the_union(self) -> None:
+        (union,) = await self._issued('alpha beta')
+
+        assert union.params['promoted_uuids'] == []
+
+
 class TestEdgeSimilaritySearch:
     @staticmethod
     async def _search(

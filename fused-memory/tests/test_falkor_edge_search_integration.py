@@ -379,6 +379,20 @@ RARE_TERM_FACTS = {
 }
 
 
+# Measured on scratch FalkorDB 41800 while planning task 9542: the union alone
+# ranks long-id 21st for IDENTIFIER_QUERY.
+IDENTIFIER_FACTS = {
+    **{f'prose-{i}': 'task context decisions related' for i in range(20)},
+    'long-id': (
+        'AllAccountsCappedException catch sites were added in the production orchestrator'
+        ' via ticket 877 commit 371d4763 after the usage cap work landed'
+    ),
+    'filler-1': 'unrelated filler sentence one',
+    'filler-2': 'unrelated filler sentence two',
+}
+IDENTIFIER_QUERY = 'task 877 context and related decisions'
+
+
 class TestEdgeFulltextRanking:
     @pytest.mark.asyncio
     async def test_a_rare_term_outranks_common_terms_on_shorter_facts(self, seed_facts):
@@ -387,6 +401,33 @@ class TestEdgeFulltextRanking:
         ranking = await seeded.bm25_ranking('task zyzzogeton alpha', 5)
 
         assert ranking[0] == 'long-rare', ranking
+
+    @pytest.mark.asyncio
+    async def test_an_edge_matching_every_identifier_outranks_prose_edges(self, seed_facts):
+        seeded = await seed_facts(IDENTIFIER_FACTS)
+
+        ranking = await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
+
+        assert ranking[0] == 'long-id', ranking
+
+    @pytest.mark.asyncio
+    async def test_identifiers_are_conjunctive(self, seed_facts):
+        seeded = await seed_facts(IDENTIFIER_FACTS)
+
+        ranking = await seeded.bm25_ranking('task 877 999 context and related decisions', 5)
+
+        assert 'long-id' not in ranking, ranking
+
+    @pytest.mark.asyncio
+    async def test_tier_and_union_queries_plan_without_a_per_row_scan(self, seed_facts):
+        seeded = await seed_facts(IDENTIFIER_FACTS)
+        issued = spy_on_queries(seeded.driver)
+
+        await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
+        plans = [await explain(seeded.graph, query) for query in issued]
+
+        assert len(plans) == 2, 'the tier query, then the union'
+        assert [non_leaf_scans(plan) for plan in plans] == [[], []], [str(plan) for plan in plans]
 
 
 # --- Cosine leg ---------------------------------------------------------------
