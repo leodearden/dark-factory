@@ -15,9 +15,9 @@ The shipped design comes from the steward ruling on esc-9542-1:
   included.
 
 The query policy lives in `fused-memory/src/fused_memory/backends/falkor_fulltext.py::build_edge_queries`.
-The tier's live-edge predicate is `falkor_edge_search.py::_ACTIVE_EDGE_PREDICATE`.
-It is a noted copy of `graphiti_client.py::_ACTIVE_EDGE_PREDICATE`, because
-`graphiti_client` imports `falkor_edge_search`.
+The tier's live-edge predicate is
+`fused-memory/src/fused_memory/backends/relates_to_schema.py::ACTIVE_EDGE_PREDICATE`,
+the same predicate the read path applies.
 
 Item 1 of the task, dropping the prefix from the edge leg's union, is closed:
 **measured and rejected: the prefix's non-additive scoring helps write-path
