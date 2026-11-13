@@ -60,7 +60,8 @@ async def restore_on_raise(
     """The span a caller that minted *run_id* runs that run in. Any raise, a
     deadline or shutdown cancellation included, re-buffers the run's drained
     events unless the journal records it completed, then propagates. The
-    restore is shielded, so a second cancellation cannot abort it (task 6695)."""
+    restore is shielded, so a further cancellation of the caller does not abort
+    it, though the caller then no longer waits for it to land (task 6695)."""
     try:
         yield
     except (Exception, asyncio.CancelledError):

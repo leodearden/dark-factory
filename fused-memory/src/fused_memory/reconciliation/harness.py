@@ -3479,8 +3479,12 @@ class ReconciliationHarness:
             assembled_payload: Optional token-budgeted payload from ContextAssembler.
                     When provided, Stage 1 uses this instead of generic
                     time-windowed episode/memory fetches.
-            run_id: caller-minted id for this run, so a caller whose deadline
-                    timed out can still scope the restore of its events (task 6453).
+            run_id: caller-minted id for this run. The drain happens before
+                    the run row is written, so the caller must hold
+                    ``restore_on_raise(journal, buffer, project_id, run_id)``
+                    around the call: a raise or cancellation in between would
+                    otherwise strand the drained events under a run id with no
+                    row (tasks 6453, 6695). Task 9757 writes the row first.
         """
         # task 1143: pre-flight guard — raises before any side effects (no journal row,
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
@@ -6406,38 +6410,43 @@ class BacklogIterator:
         tier: TierConfig,
     ) -> bool:
         """Drain and process one chunk as its own run; False when it failed
-        and iteration must stop. On any raise, cancellation included, its own
-        events are restored first."""
+        and iteration must stop. A failure is escalated before its events are
+        restored, so a deadline expiring during the restore cannot suppress the
+        escalation; on any raise, cancellation included, the chunk's own events
+        are restored."""
         run_id = str(uuid4())
         chunk_id = str(uuid4())
         try:
             async with restore_on_raise(self.journal, self.buffer, project_id, run_id):
-                await self.buffer.drain_by_ids(
-                    project_id, [e.id for e in assembled.events], run_id=run_id,
-                )
-                await self.journal.record_chunk_boundary(
-                    project_id, chunk_id, len(assembled.events),
-                )
+                try:
+                    await self.buffer.drain_by_ids(
+                        project_id, [e.id for e in assembled.events], run_id=run_id,
+                    )
+                    await self.journal.record_chunk_boundary(
+                        project_id, chunk_id, len(assembled.events),
+                    )
 
-                logger.info(
-                    f'Backlog chunk {chunk_num}: processing {len(assembled.events)} events '
-                    f'({assembled.total_tokens} tokens, {len(assembled.context_items)} context items, '
-                    f'{assembled.events_remaining} remaining) for {project_id}'
-                )
+                    logger.info(
+                        f'Backlog chunk {chunk_num}: processing {len(assembled.events)} events '
+                        f'({assembled.total_tokens} tokens, {len(assembled.context_items)} context items, '
+                        f'{assembled.events_remaining} remaining) for {project_id}'
+                    )
 
-                await self.harness.run_full_cycle(
-                    project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
-                    tier=tier,
-                    events=assembled.events,
-                    assembled_payload=assembled,
-                    run_id=run_id,
-                )
-        except Exception as e:
-            logger.error(f'Backlog chunk {chunk_num} failed: {e}')
-            self.harness._escalate(
-                'recon_backlog_overflow', chunk_id,
-                f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
-            )
+                    await self.harness.run_full_cycle(
+                        project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
+                        tier=tier,
+                        events=assembled.events,
+                        assembled_payload=assembled,
+                        run_id=run_id,
+                    )
+                except Exception as e:
+                    logger.error(f'Backlog chunk {chunk_num} failed: {e}')
+                    self.harness._escalate(
+                        'recon_backlog_overflow', chunk_id,
+                        f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
+                    )
+                    raise
+        except Exception:
             return False
         return True
 

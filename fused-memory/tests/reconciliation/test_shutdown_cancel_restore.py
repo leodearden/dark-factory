@@ -1,4 +1,6 @@
-"""A cancellation between a run's drain and its journal row re-buffers that run's events (task 6695)."""
+"""A cancellation between a run's drain and its journal row re-buffers that run's
+events, and a cancellation during a failed chunk's restore does not suppress its
+escalation (task 6695)."""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from escalation.queue import EscalationQueue
 
 from fused_memory.models.reconciliation import EventSource, EventType, ReconciliationEvent
 from fused_memory.reconciliation.harness import BacklogIterator
@@ -19,13 +22,19 @@ from reconciliation.harness_fixtures import make_harness_config, open_harness
 PROJECT_ID = 'test-project'
 
 
+@pytest.fixture
+def escalation_queue(tmp_path):
+    return EscalationQueue(tmp_path / 'esc')
+
+
 @pytest_asyncio.fixture
-async def harness(tmp_path):
+async def harness(tmp_path, escalation_queue):
     async with open_harness(
         tmp_path,
         taskmaster=AsyncMock(),
         config=make_harness_config(judge_enabled=False),
         known_projects={PROJECT_ID: '/tmp/test-project'},
+        escalation_queue=escalation_queue,
     ) as h:
         yield h
 
@@ -101,3 +110,35 @@ async def test_backlog_iterator_shutdown_cancel_before_the_run_row_restores_the_
     assert task.cancelled()
     assert await harness.buffer.count_buffered(PROJECT_ID) == 3
     assert await harness.journal.get_recent_runs(PROJECT_ID) == []
+
+
+@pytest.mark.asyncio
+async def test_backlog_chunk_failure_escalates_even_when_a_cancel_lands_during_its_restore(
+    harness, escalation_queue, monkeypatch,
+):
+    """The cancel stands in for the iteration deadline expiring mid-restore."""
+    await _push_events(harness, 1)
+    monkeypatch.setattr(
+        harness.journal, 'record_chunk_boundary',
+        AsyncMock(side_effect=RuntimeError('disk I/O error')),
+    )
+    original_restore = harness.buffer.restore_drained
+    iterator_task_ref: list[asyncio.Task[None]] = []
+
+    async def restore_cancelling_the_iterator(*args, **kwargs):
+        iterator_task_ref[0].cancel()
+        return await original_restore(*args, **kwargs)
+
+    monkeypatch.setattr(harness.buffer, 'restore_drained', restore_cancelling_the_iterator)
+    iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+
+    tasks_before = asyncio.all_tasks()
+    task = asyncio.create_task(iterator.run(PROJECT_ID))
+    iterator_task_ref.append(task)
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await asyncio.gather(*(asyncio.all_tasks() - tasks_before))
+
+    assert task.cancelled()
+    assert [e for e in escalation_queue.get_pending() if e.category == 'recon_backlog_overflow']
+    assert await harness.buffer.count_buffered(PROJECT_ID) == 1
