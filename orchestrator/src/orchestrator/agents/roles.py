@@ -2138,8 +2138,9 @@ SIMPLE_TASK_WORKFLOW = """
    substantial architectural thought required. STOP (using a rejection
    artifact below) only if that criterion is not met.
 2. **Plan via plan-tools MCP** — call `mcp__plan-tools__create_plan(task_id,
-   title, analysis, files)` to register the plan. Do NOT write
-   `.task/plan.json` directly.
+   title, analysis, files)` to register the plan, then
+   `mcp__plan-tools__add_plan_step(step_id, step_type, description)` once per
+   step. Do NOT write `.task/plan.json` directly.
    - For doc/comment-only tasks: add a single `impl` step (the architect
      rule that "every behavior gets a test first" does NOT apply when the
      deliverable is documentation prose).

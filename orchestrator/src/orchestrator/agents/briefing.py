@@ -1044,8 +1044,9 @@ The implementation was reviewed and blocking issues were found.
         The workflow and its exits live in
         ``orchestrator/src/orchestrator/agents/roles.py::SIMPLE_TASK_WORKFLOW``,
         which ``SIMPLE_TASK.system_prompt`` carries, so this briefing adds only
-        the task preamble and the listed files. The orchestrator then advances
-        to VERIFY without invoking the implementer.
+        the task preamble and the listed files. Once the agent marks its step
+        done, the orchestrator advances to VERIFY without invoking the
+        implementer.
         """
         preamble = await self._task_preamble(task, 'simple_task', context)
 
