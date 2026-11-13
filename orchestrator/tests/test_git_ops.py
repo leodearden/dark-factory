@@ -7153,6 +7153,26 @@ class TestColdReattachIdentityGuard:
     reaped-but-retained shape (worktree dir gone, only the branch survives)
     instead of a registered worktree."""
 
+    async def test_cold_reattach_mismatch_stamps_the_live_plan_with_the_stored_title(
+        self, git_ops: GitOps,
+    ):
+        await _build_cold_orphan_branch(git_ops, 'cold-stamp')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-stamp', 'Trajectory beta: spline solver',
+        )
+        live = TaskArtifacts.for_task(git_ops.worktree_base / 'cold-stamp', 'cold-stamp')
+        live.task_root.mkdir(parents=True, exist_ok=True)
+        live.write_plan({'task_id': 'cold-stamp', 'title': 'Cycle-breaker beta: dedup edges', 'steps': []})
+
+        await git_ops.create_worktree('cold-stamp', expected_title='Cycle-breaker beta: dedup edges')
+
+        (parking,) = git_ops.quarantine_base.glob('cold-stamp-*')
+        assert (parking / '.task' / 'plan.json').is_file()
+        entry = live.read_plan()['_quarantined_from'][-1]
+        assert entry['reason'] == 'cold-reattach-identity-mismatch'
+        assert entry['stored_title'] == 'Trajectory beta: spline solver'
+        assert entry['parking'] == str(parking)
+
     async def test_cold_reattach_quarantines_on_identity_mismatch(
         self, git_ops: GitOps, caplog,
     ):

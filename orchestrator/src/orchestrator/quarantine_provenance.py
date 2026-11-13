@@ -11,8 +11,11 @@ parks a lane under ``quarantine_base`` and describes the parking as a
 - a ``_quarantined_from`` back-pointer appended to the live task-root
   plan.json (:func:`stamp_quarantined_from`), which the next dispatch and a
   replanning architect read, and which ``create_plan`` carries forward
-  through :func:`quarantined_from_of`. A parking of an earlier task's work
-  under a recycled id gets no back-pointer: the live plan is not that task's.
+  through :func:`quarantined_from_of`. Every relocation is stamped; an
+  identity-mismatch parking also records the worktree's ``stored_title``,
+  so a reader comparing it with the task's title can tell a recycled id
+  from a retitled task. An entry is not proof the parked work was this
+  task's own.
 
 Built only on ``orchestrator.artifacts``; git_ops, harness, lane_lifecycle and
 plan_tools import this module, never the other way round.

@@ -1383,8 +1383,9 @@ class TestRecoveryTerminalTaskLaneRelease:
 @pytest.mark.asyncio
 class TestRecordDrivenQuarantineProvenance:
     """Task 4845: each record-driven quarantine in recovery parks a resolvable
-    branch and emits its payload; it leaves a back-pointer in the live task
-    plan only when the parked work is that task's own.
+    branch, emits its payload, and stamps a back-pointer in the live task
+    plan, carrying the stored title when the quarantine was an identity
+    mismatch.
 
     Real git, real GitOps: the writer (acquire_warm_lane) feeds the reader
     (_recover_crashed_tasks) across a simulated restart, as
