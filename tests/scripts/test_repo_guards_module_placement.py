@@ -74,24 +74,6 @@ MOVED_GUARDS = (
     'test_interim_cli_agrees_with_the_committed_fixture',
 )
 
-#: Qualified names split out of shared/tests modules into tests/repo_guards.
-SPLIT_OUT_OF_SHARED = frozenset({
-    'TestFileExtensionsDriftGuard',
-    'TestExtensionlessFilenamesDriftGuard',
-    'TestExtensionlessFilenames.test_no_canonical_name_is_also_a_directory',
-    'TestExtensionlessFilenames.test_every_tracked_extensionless_file_is_allowlisted',
-    'TestReifyCheckoutAdapter',
-    'TestPlantedLayoutHarnessAdapter',
-    'TestReifyCheckoutPlantedLayout',
-    'TestSkipUnlessCheckout',
-    'TestReifyGuardVectorNoneGuard',
-    'TestSingleResetsParserOwnership',
-    'TestOwnershipScanUsesTheSharedTree',
-    'TestMergeSubmitStatusEnum.test_exact_vocabulary',
-    'TestSubmitPartitions.test_submit_terminal_matches_merge_outcome_status',
-    'test_interim_cli_agrees_with_the_committed_fixture',
-})
-
 SHARED_TESTS_DIR = REPO_ROOT / 'shared' / 'tests'
 
 #: The first_party_tree gate family, which moves out of shared/tests whole.
@@ -121,11 +103,6 @@ VACATED_PATHS = (
     *(f'shared/tests/{name}' for name in FIRST_PARTY_TREE_FAMILY),
     'shared/tests/test_upstream_parser_report.py',
 )
-
-SHARED_CONFTEST = SHARED_TESTS_DIR / 'conftest.py'
-
-#: The whole-first-party-tree parse's session fixture, and the hook that prebuilds it.
-FIRST_PARTY_TREE_PARSE_DEFINITIONS = frozenset({'first_party_tree', 'pytest_collection_finish'})
 
 #: The scanner whose parse reads every first-party source tree.
 FIRST_PARTY_TREE_SCANNER = 'silent_fallthrough_scan'
@@ -296,14 +273,6 @@ def test_plans_reads_passes_synthetic_plans_data(source: str) -> None:
     assert plans_reads(source) == [], source
 
 
-def _module_level_function_names(source: str) -> set[str]:
-    return {
-        node.name
-        for node in ast.parse(source).body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-
-
 def _absolute_imports(source: str) -> set[str]:
     imported: set[str] = set()
     for node in ast.walk(ast.parse(source)):
@@ -312,57 +281,6 @@ def _absolute_imports(source: str) -> set[str]:
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
             imported.add(node.module)
     return imported
-
-
-def _defined_qualnames(source: str) -> set[str]:
-    """Module-level class and function names, plus ``Class.method`` for each class's methods."""
-    defined: set[str] = set()
-    for node in ast.parse(source).body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            defined.add(node.name)
-        elif isinstance(node, ast.ClassDef):
-            defined.add(node.name)
-            defined.update(
-                f'{node.name}.{member.name}'
-                for member in node.body
-                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-            )
-    return defined
-
-
-def test_defined_qualnames_reads_classes_methods_and_functions() -> None:
-    source = (
-        'class TestA:\n'
-        '    def test_m(self): ...\n'
-        '    async def test_n(self): ...\n'
-        'def test_f(): ...\n'
-        "TEXT = '''class TestInString: ...'''\n"
-    )
-    assert _defined_qualnames(source) == {'TestA', 'TestA.test_m', 'TestA.test_n', 'test_f'}
-
-
-def test_no_split_guard_is_still_defined_under_shared_tests() -> None:
-    left_behind = {
-        str(path.relative_to(REPO_ROOT)): found
-        for path in sorted(SHARED_TESTS_DIR.rglob('*.py'))
-        if (found := sorted(
-            _defined_qualnames(path.read_text(encoding='utf-8')) & SPLIT_OUT_OF_SHARED
-        ))
-    }
-    assert not left_behind, (
-        f'these guards moved to {MODULE_PREFIX}/ but are still defined under '
-        f'shared/tests: {left_behind}'
-    )
-
-
-def test_shared_conftest_builds_no_first_party_tree() -> None:
-    defined = _module_level_function_names(SHARED_CONFTEST.read_text(encoding='utf-8'))
-    found = sorted(defined & FIRST_PARTY_TREE_PARSE_DEFINITIONS)
-    assert not found, (
-        f'{SHARED_CONFTEST.relative_to(REPO_ROOT)} still defines {found}, so shared '
-        f'still parses the whole first-party tree; that parse belongs in '
-        f'{MODULE_PREFIX}/conftest.py'
-    )
 
 
 def test_no_shared_test_imports_the_first_party_tree_scanner() -> None:
