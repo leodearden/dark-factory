@@ -114,8 +114,13 @@ def stamp_quarantined_from(artifacts: TaskArtifacts, stamp: Mapping[str, Any]) -
     """Append *stamp* to the plan's ``_quarantined_from`` list; False, writing nothing, when there is no plan.
 
     A body-only edit: the plan's steps and lifecycle, its confirmation
-    included, are kept.
+    included, are kept. Raises ValueError, writing nothing, for a stamp that
+    does not match ``STAMP_FIELDS``, since :func:`quarantined_from_of` would
+    silently drop it at the next re-plan.
     """
+    problems = _stamp_problems(stamp)
+    if problems:
+        raise ValueError(f'malformed {QUARANTINED_FROM_KEY} stamp: {"; ".join(problems)}')
     with artifacts.plan_mutex():
         plan = artifacts.read_plan_model()
         if plan is None:
@@ -131,19 +136,31 @@ def record_quarantine_provenance(worktree: Path, task_id: str, outcome: Quaranti
     """Snapshot the task's artifacts into the parking, then stamp the live plan. Never raises.
 
     *worktree* is the lane's path BEFORE the move, which is what its lane
-    ``.task-meta`` root is named after.
+    ``.task-meta`` root is named after. The two records are independent: a
+    failed snapshot is logged and the stamp is still attempted.
     """
     if outcome.dest is None:
         return
     try:
         artifacts = TaskArtifacts.for_task(worktree, task_id)
+    except Exception:
+        _log_unrecorded('the task artifacts', worktree, task_id, outcome.dest)
+        return
+    try:
         snapshot_into_parking(artifacts, outcome.dest)
+    except Exception:
+        _log_unrecorded('the artifact snapshot', worktree, task_id, outcome.dest)
+    try:
         stamp_quarantined_from(artifacts, _stamp_for(outcome, outcome.dest, reason))
     except Exception:
-        logger.warning(
-            'quarantine provenance: could not record the parking of %s (task %s) at %s',
-            worktree, task_id, outcome.dest, exc_info=True,
-        )
+        _log_unrecorded(f'the {QUARANTINED_FROM_KEY} stamp', worktree, task_id, outcome.dest)
+
+
+def _log_unrecorded(record: str, worktree: Path, task_id: str, parking: Path) -> None:
+    logger.warning(
+        'quarantine provenance: could not record %s for the parking of %s (task %s) at %s',
+        record, worktree, task_id, parking, exc_info=True,
+    )
 
 
 def _stamp_for(outcome: QuarantineOutcome, parking: Path, reason: str) -> dict[str, Any]:
@@ -167,12 +184,20 @@ def quarantined_from_of(plan: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _well_formed(entry: object) -> bool:
+    return not _stamp_problems(entry)
+
+
+def _stamp_problems(entry: object) -> list[str]:
+    """Each way *entry* fails ``STAMP_FIELDS``: a missing key, or a value of a type it does not accept."""
     if not isinstance(entry, Mapping):
-        return False
-    return all(
-        key in entry and isinstance(entry[key], accepted) and not isinstance(entry[key], bool)
-        for key, accepted in STAMP_FIELDS.items()
-    )
+        return [f'not a mapping: {type(entry).__name__}']
+    problems = []
+    for key, accepted in STAMP_FIELDS.items():
+        if key not in entry:
+            problems.append(f'missing {key!r}')
+        elif not isinstance(entry[key], accepted) or isinstance(entry[key], bool):
+            problems.append(f'{key!r} is a {type(entry[key]).__name__}')
+    return problems
 
 
 def _projected(entry: Mapping[str, Any]) -> dict[str, Any]:

@@ -9,6 +9,7 @@ re-plan.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.artifacts import PlanConfirmation, PlanState, TaskArtifacts
+from orchestrator.mcp.plan_tools import _create_plan
 from orchestrator.quarantine_provenance import (
     NOT_RELOCATED,
     QUARANTINED_FROM_KEY,
@@ -206,6 +208,26 @@ class TestStampQuarantinedFrom:
         assert artifacts.read_plan()[QUARANTINED_FROM_KEY] == [stamp]
 
 
+class TestStampValidation:
+    @pytest.mark.parametrize(
+        ('stamp', 'named'),
+        [
+            ({k: v for k, v in _stamp().items() if k != 'tip_sha'}, "missing 'tip_sha'"),
+            (_stamp(unique_commit_count=True), "'unique_commit_count' is a bool"),
+            (_stamp(reason=None), "'reason' is a NoneType"),
+        ],
+    )
+    def test_a_malformed_stamp_is_refused_and_writes_nothing(
+        self, artifacts: TaskArtifacts, stamp: dict, named: str,
+    ):
+        before = artifacts.artifact_path('plan.json').read_bytes()
+
+        with pytest.raises(ValueError, match=named):
+            stamp_quarantined_from(artifacts, stamp)
+
+        assert artifacts.artifact_path('plan.json').read_bytes() == before
+
+
 class TestRecordQuarantineProvenance:
     def test_snapshots_then_stamps(self, artifacts: TaskArtifacts, lane, tmp_path):
         parking = tmp_path / 'quarantine' / '42-20261112T000000Z'
@@ -235,17 +257,43 @@ class TestRecordQuarantineProvenance:
         assert artifacts.artifact_path('plan.json').read_bytes() == before
         assert (lane / '.task' / 'plan.json').is_symlink()
 
-    def test_an_invalid_task_id_returns_normally(self, lane, tmp_path):
+    def test_an_invalid_task_id_returns_normally(self, lane, tmp_path, caplog):
         outcome = QuarantineOutcome(dest=tmp_path / 'q')
 
-        record_quarantine_provenance(lane, 'bad id!', outcome, 'orphan-reaper')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.quarantine_provenance'):
+            record_quarantine_provenance(lane, 'bad id!', outcome, 'orphan-reaper')
 
-    def test_an_unwritable_parking_returns_normally(self, artifacts: TaskArtifacts, lane, tmp_path):
+        (warning,) = caplog.records
+        assert 'could not record the task artifacts' in warning.getMessage()
+        assert 'bad id!' in warning.getMessage()
+
+    def test_an_unwritable_parking_still_stamps_the_live_plan(
+        self, artifacts: TaskArtifacts, lane, tmp_path, caplog,
+    ):
         blocker = tmp_path / 'a-file'
         blocker.write_text('not a directory')
-        outcome = QuarantineOutcome(dest=blocker / 'parking')
+        outcome = QuarantineOutcome(dest=blocker / 'parking', branch='task/42-X')
 
-        record_quarantine_provenance(lane, '42', outcome, 'orphan-reaper')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.quarantine_provenance'):
+            record_quarantine_provenance(lane, '42', outcome, 'orphan-reaper')
+
+        (warning,) = caplog.records
+        assert 'could not record the artifact snapshot' in warning.getMessage()
+        assert '(task 42)' in warning.getMessage()
+        (entry,) = artifacts.read_plan()[QUARANTINED_FROM_KEY]
+        assert entry['branch'] == 'task/42-X'
+        assert entry['parking'] == str(blocker / 'parking')
+
+    def test_a_produced_stamp_survives_a_re_plan(self, artifacts: TaskArtifacts, lane, tmp_path):
+        parking = tmp_path / 'quarantine' / '42-20261112T000000Z'
+        parking.mkdir(parents=True)
+        outcome = QuarantineOutcome(dest=parking, branch='task/42-X', tip_sha='abc', unique_commit_count=3)
+        record_quarantine_provenance(lane, '42', outcome, 'recovery-record-divergence')
+        (produced,) = artifacts.read_plan()[QUARANTINED_FROM_KEY]
+
+        assert _create_plan(artifacts, '42', 'Re-plan', 'A2', ['b.py'])['status'] == 'ok'
+
+        assert artifacts.read_plan()[QUARANTINED_FROM_KEY] == [produced]
 
 
 class TestQuarantinedFromOf:
