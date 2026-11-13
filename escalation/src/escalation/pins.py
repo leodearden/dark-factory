@@ -69,11 +69,12 @@ __all__ = [
     'PinReport',
     'classify_pins',
     'is_queue_handoff',
+    'needs_human',
     'pinned_only_by_human_parked',
 ]
 
-#: The escalation level at which a record is in front of a HUMAN (L2) — see
-#: :func:`pinned_only_by_human_parked`.
+#: The escalation level at which a record is in front of a HUMAN (L2) — read
+#: by :func:`pinned_only_by_human_parked` and :func:`needs_human`.
 HUMAN_PARKED_MIN_LEVEL: int = 2
 
 
@@ -288,9 +289,8 @@ def _classify_record(
     # Link 3b — a BORN_AT_L2 severity (critical/urgent) at level 0 is
     # CONTRADICTORY state: such records are created directly at L2 and routed
     # straight to a human, which is why every in-repo producer stamps
-    # `level=2` alongside them and why
-    # `orchestrator/src/orchestrator/workflow.py::_needs_human` treats a
-    # born-at-L2 severity as needing a human at any level.
+    # `level=2` alongside them and why `needs_human` treats a born-at-L2
+    # severity as needing a human at any level.
     # Fail it safe to pinning for exactly the reason link 3 is written `!= 0`
     # — a human-routed record must never fall into the conversion-eligible
     # branch below on the strength of a level field that contradicts it.
@@ -514,11 +514,30 @@ def is_queue_handoff(record: PinRecord) -> bool:
 
     True iff the shared chain classifies *record* as ``QUEUE_HANDOFF``.
     ``live_claimant=True`` with no live id makes an L0 fail safe to a handoff,
-    so in practice only info never gates.  Consumer:
-    ``orchestrator/src/orchestrator/workflow.py::_needs_human`` (task 5222 /
-    PRD gamma).
+    so in practice only info never gates.  Consumer: :func:`needs_human`
+    (task 5222 / PRD gamma).
     """
     return bool(classify_pins('', [record], live_claimant=True).queue_handoff)
+
+
+def needs_human(record: PinRecord) -> bool:
+    """Can only a human dispose of this ONE record — no steward applies?
+
+    True for a born-at-L2 severity (``critical``/``urgent``, routed straight
+    to a human; matched exactly, not normalised) at any level, or for a
+    ``level >= HUMAN_PARKED_MIN_LEVEL`` record that :func:`is_queue_handoff`
+    calls a handoff (PRD ``plans/info-l0-disposition-router-prd.md`` D3),
+    so an info L2 never needs one and an unknown severity fails safe to
+    needing one.  Consumers:
+    ``orchestrator/src/orchestrator/workflow.py::_is_gating_escalation``
+    together with the entry and tail checks of
+    ``TaskWorkflow._wait_for_resolution``, and
+    ``orchestrator/src/orchestrator/recovery_pins.py::records_pin_blocked_recovery``
+    (task 6145).
+    """
+    return record.severity in BORN_AT_L2_SEVERITIES or (
+        record.level >= HUMAN_PARKED_MIN_LEVEL and is_queue_handoff(record)
+    )
 
 
 def _is_human_level(level: object) -> bool:
