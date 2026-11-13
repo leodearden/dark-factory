@@ -474,8 +474,8 @@ on `not_found` and returns 404 immediately.  The executable contract for this be
 **Routing consequence for every write proxy.** Because the URLs are network paths to one store,
 a write that may have reached the server is never retried on another URL: the second attempt
 would apply it again, and none of the tools behind `dashboard/src/dashboard/app.py::_mcp_write_proxy`
-dedupes server-side. Only connect-phase failures (`httpx.ConnectError`, `httpx.ConnectTimeout`,
-`httpx.PoolTimeout`), raised before a request byte is sent, fail over. Anything else, the
+dedupes server-side. Only connect-phase failures, raised before a request byte is sent and
+listed in `dashboard/src/dashboard/data/mcp_fanout.py::_UNDELIVERED_FAILURES`, fail over. Anything else, the
 whole-operation deadline included, answers 502 `fused_memory_outcome_unknown`. The mechanism is
 `dashboard/src/dashboard/data/mcp_fanout.py::first_success`'s `ambiguous_result`; the
 executable contract is

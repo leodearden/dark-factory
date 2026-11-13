@@ -273,9 +273,11 @@ def test_each_caught_failure_type_returns_502(client, exc, expected_error):
     This is a regression-pin test: the production except clause catches
     ConnectError, TimeoutException, HTTPStatusError, and ValueError. Any future
     refactor that drops one of these types will fail this parametrized test,
-    surfacing the contract break immediately. Only a ConnectError proves the
-    cancel never reached the server, so only it is ``fused_memory_unreachable``;
-    the others may have landed and answer ``fused_memory_outcome_unknown``.
+    surfacing the contract break immediately. Of these four, only ConnectError
+    proves the cancel never reached the server (the full set is
+    ``mcp_fanout.py::_UNDELIVERED_FAILURES``), so only it is
+    ``fused_memory_unreachable``; the others may have landed and answer
+    ``fused_memory_outcome_unknown``.
     """
     with _patched_cancel_seams(exc) as (mock_mcp, _seams):
         resp = client.post(

@@ -530,7 +530,8 @@ async def first_success(
     ``TimeoutError``, or a caller-raised ``ValueError`` signalling a soft
     failure; see that tuple for what each one means — the failing URL's cached
     MCP session is invalidated, the error is recorded, and the loop continues
-    to the next URL. Any other exception type propagates uncaught.
+    to the next URL, unless ``ambiguous_result`` is given (see below). Any
+    other exception type propagates uncaught.
 
     Before the builtin ``TimeoutError`` was listed there, it propagated
     uncaught (it is not a ``httpx.TimeoutException``), which is why
@@ -549,10 +550,10 @@ async def first_success(
     reached the server ends the fan-out with ``ambiguous_result(errors)``,
     because every URL reaches the same store and repeating the call on another
     one could apply it twice (DESIGN.md "Curator Tickets & Routing
-    Invariant"). Only ``httpx.ConnectError``, ``httpx.ConnectTimeout`` and
-    ``httpx.PoolTimeout`` rule delivery out and still fail over. The
-    whole-operation deadline counts as ambiguous, because the abandoned
-    exchange keeps running (``memory.py::_post``).
+    Invariant"). Only the members of :data:`_UNDELIVERED_FAILURES` rule
+    delivery out and still fail over. The whole-operation deadline counts as
+    ambiguous, because the abandoned exchange keeps running
+    (``memory.py::_post``).
 
     **Per-URL failures are surfaced at WARNING on transition only** — see
     :func:`log_fanout_failure`. The fall-through is silent to the caller (a
@@ -594,7 +595,8 @@ async def first_success(
     in their own 2-5s ``asyncio.wait_for``. A caller wanting a looser bound
     passes a larger float; a caller wanting a tighter one keeps its own
     enclosing ``wait_for``. Expiry is an ordinary per-URL failure: it is logged,
-    collected, invalidated and fallen through like any other.
+    collected, invalidated and fallen through like any other, except under
+    ``ambiguous_result``, where it counts as ambiguous and ends the fan-out.
 
     **A cancellation invalidates the in-flight URL's session and then
     re-raises.** ``asyncio.CancelledError`` derives from ``BaseException``, so
