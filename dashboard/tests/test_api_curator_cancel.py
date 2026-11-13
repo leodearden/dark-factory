@@ -246,31 +246,38 @@ def test_not_found_returns_404(client):
 
 
 # ---------------------------------------------------------------------------
-# step-7: all servers unreachable → 502
+# step-7: every caught failure type → 502
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    'exc',
+    ('exc', 'expected_error'),
     [
-        httpx.ConnectError('refused'),
-        httpx.TimeoutException('timed out'),
-        httpx.HTTPStatusError(
-            '500 Internal Server Error',
-            request=httpx.Request('POST', 'http://x'),
-            response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
+        (httpx.ConnectError('refused'), 'fused_memory_unreachable'),
+        (httpx.TimeoutException('timed out'), 'fused_memory_outcome_unknown'),
+        (
+            httpx.HTTPStatusError(
+                '500 Internal Server Error',
+                request=httpx.Request('POST', 'http://x'),
+                response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
+            ),
+            'fused_memory_outcome_unknown',
         ),
-        ValueError('bad MCP payload'),
+        (ValueError('bad MCP payload'), 'fused_memory_outcome_unknown'),
     ],
     ids=['ConnectError', 'TimeoutException', 'HTTPStatusError', 'ValueError'],
 )
-def test_all_servers_unreachable_returns_502(client, exc):
-    """Each of the four caught exception types → 502 fused_memory_unreachable.
+def test_each_caught_failure_type_returns_502(client, exc, expected_error):
+    """Each of the four caught exception types → 502, keyed by whether delivery is ruled out.
 
     This is a regression-pin test: the production except clause catches
     ConnectError, TimeoutException, HTTPStatusError, and ValueError. Any future
     refactor that drops one of these types will fail this parametrized test,
-    surfacing the contract break immediately.
+    surfacing the contract break immediately. Of these four, only ConnectError
+    proves the cancel never reached the server (the full set is
+    ``mcp_fanout.py::_UNDELIVERED_FAILURES``), so only it is
+    ``fused_memory_unreachable``; the others may have landed and answer
+    ``fused_memory_outcome_unknown``.
     """
     with _patched_cancel_seams(exc) as (mock_mcp, _seams):
         resp = client.post(
@@ -280,7 +287,7 @@ def test_all_servers_unreachable_returns_502(client, exc):
 
     assert resp.status_code == 502
     data = resp.json()
-    assert data.get('error') == 'fused_memory_unreachable'
+    assert data.get('error') == expected_error
     assert 'detail' in data
     assert isinstance(data['detail'], str)
     # Default config has exactly one URL → exactly one cancel_ticket dial

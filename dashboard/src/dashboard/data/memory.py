@@ -37,20 +37,18 @@ logger = logging.getLogger(__name__)
 # Twin of orchestrator.mcp_lifecycle's use of shared.mcp_idempotency (task
 # 2712; hoisted into the shared module by task 2766 so the two McpSession
 # twins share one frozenset + injection helper instead of drifting copies):
-# mutating task tools get a client-supplied idempotency key so a retried
-# write dedupes server-side instead of double-applying. Inert today (the
-# dashboard issues only reads).
+# the tools in shared.mcp_idempotency.MUTATING_TASK_TOOLS get a
+# client-supplied idempotency key so a retried write dedupes server-side.
+# This dashboard never calls any of them, so the injection is inert here.
 #
-# CAVEAT (not yet write-safe by construction on this path): unlike the
-# orchestrator twin, this _raw_call has NO transport retry loop, so the
-# injection generates a FRESH key per invocation. The orchestrator's
-# inject-once-before-the-retry-loop invariant — the property that makes
-# transport retries reuse one key and dedupe — does NOT hold here. If the
-# dashboard ever gains a mutating call that a higher layer retries by
-# re-invoking _raw_call, that caller must thread one stable client_op_id
-# across attempts (or a retry loop must be added here); a fresh per-attempt
-# uuid4 would NOT trigger server-side dedup. Safe today only because reads
-# never dedup and a caller-supplied key is preserved.
+# The dashboard's own writes, the tools behind app.py::_mcp_write_proxy, carry
+# no key, because the server has no dedupe for them. They are kept from
+# double-applying by never being repeated after a failure that may have
+# reached the server (mcp_fanout.py::first_success's ambiguous_result).
+#
+# CAVEAT: this _raw_call has no retry loop, so the injection mints a FRESH key
+# per invocation. A future caller that retries a MUTATING_TASK_TOOLS call by
+# re-invoking _raw_call must thread one stable client_op_id across attempts.
 
 
 _exchanges: set[asyncio.Task[httpx.Response]] = set()

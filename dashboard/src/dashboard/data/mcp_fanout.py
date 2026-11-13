@@ -217,6 +217,20 @@ FANOUT_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
     ValueError,
 )
 
+# The transport failures raised before a request byte leaves the client: no
+# connection was established, the connect timed out, or no pool slot was ever
+# acquired. Only these prove a mutating call was not delivered.
+_UNDELIVERED_FAILURES: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+
+def _delivery_ruled_out(exc: BaseException) -> bool:
+    subject = exc.__cause__ if isinstance(exc, PreformattedFanoutError) else exc
+    return isinstance(subject, _UNDELIVERED_FAILURES)
+
 
 # ── per-URL whole-operation deadline (task 4958) ────────────────────
 #
@@ -328,6 +342,9 @@ class PreformattedFanoutError(ValueError):
     legitimate message whose first token happened to look like an identifier
     followed by ``': '`` would be silently stripped of its real type name,
     with no way for a call site to opt out.
+
+    Raise it ``from`` the real cause: :func:`first_success` reads
+    ``__cause__`` to decide whether delivery was ruled out.
     """
 
 
@@ -502,6 +519,7 @@ async def first_success(
     offline_result: Callable[[list[str]], V],
     log_failures: bool = True,
     per_url_timeout: float | None = None,
+    ambiguous_result: Callable[[list[str]], V] | None = None,
 ) -> V:
     """Call *call(url)* for each URL in order; return the first success.
 
@@ -512,7 +530,8 @@ async def first_success(
     ``TimeoutError``, or a caller-raised ``ValueError`` signalling a soft
     failure; see that tuple for what each one means — the failing URL's cached
     MCP session is invalidated, the error is recorded, and the loop continues
-    to the next URL. Any other exception type propagates uncaught.
+    to the next URL, unless ``ambiguous_result`` is given (see below). Any
+    other exception type propagates uncaught.
 
     Before the builtin ``TimeoutError`` was listed there, it propagated
     uncaught (it is not a ``httpx.TimeoutException``), which is why
@@ -525,6 +544,16 @@ async def first_success(
     caller reproduce its own existing offline shape (e.g.
     ``{'offline': True, 'error': '; '.join(errors)}``) while preserving the
     per-URL error detail.
+
+    ``ambiguous_result=None`` means every caught failure fails over, which is
+    right for reads. A callable is for MUTATING calls: a failure that may have
+    reached the server ends the fan-out with ``ambiguous_result(errors)``,
+    because every URL reaches the same store and repeating the call on another
+    one could apply it twice (DESIGN.md "Curator Tickets & Routing
+    Invariant"). Only the members of :data:`_UNDELIVERED_FAILURES` rule
+    delivery out and still fail over. The whole-operation deadline counts as
+    ambiguous, because the abandoned exchange keeps running
+    (``memory.py::_post``).
 
     **Per-URL failures are surfaced at WARNING on transition only** — see
     :func:`log_fanout_failure`. The fall-through is silent to the caller (a
@@ -566,7 +595,8 @@ async def first_success(
     in their own 2-5s ``asyncio.wait_for``. A caller wanting a looser bound
     passes a larger float; a caller wanting a tighter one keeps its own
     enclosing ``wait_for``. Expiry is an ordinary per-URL failure: it is logged,
-    collected, invalidated and fallen through like any other.
+    collected, invalidated and fallen through like any other, except under
+    ``ambiguous_result``, where it counts as ambiguous and ends the fan-out.
 
     **A cancellation invalidates the in-flight URL's session and then
     re-raises.** ``asyncio.CancelledError`` derives from ``BaseException``, so
@@ -610,6 +640,8 @@ async def first_success(
                 log_fanout_failure(log_label, url, e)
             errors.append(f'{url}: {describe_exc(e)}')
             invalidate_session(url)
+            if ambiguous_result is not None and not _delivery_ruled_out(e):
+                return ambiguous_result(errors)
         else:
             # Unconditional, unlike the failure report: a timeout can open a
             # streak even at a log_failures=False site, and a streak left open

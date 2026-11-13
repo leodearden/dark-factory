@@ -1103,6 +1103,13 @@ def _fused_memory_unreachable_response(errors: list[str]) -> JSONResponse:
     )
 
 
+def _fused_memory_outcome_unknown_response(errors: list[str]) -> JSONResponse:
+    return JSONResponse(
+        {'error': 'fused_memory_outcome_unknown', 'detail': '; '.join(errors)},
+        status_code=502,
+    )
+
+
 async def _mcp_write_proxy(
     http_client: httpx.AsyncClient,
     config: DashboardConfig,
@@ -1114,9 +1121,14 @@ async def _mcp_write_proxy(
     """The single MCP-write proxy behind the curator-cancel and scheduler write routes.
 
     Validation and argument construction stay in the calling route handler.
-    This fans *tool_name* out over all fused_memory_urls and returns the first
-    success, rendering transport errors, mapping not_found to 404 when
-    *treat_not_found_as_404*, and answering 502 when every URL fails.
+    This calls *tool_name* on fused_memory_urls in order, rendering transport
+    errors and mapping not_found to 404 when *treat_not_found_as_404*. It fails
+    over to the next URL only when the failure proves the request never reached
+    the server, answering 502 ``fused_memory_unreachable`` when every URL fails
+    that way. Any other failure answers 502 ``fused_memory_outcome_unknown``
+    without trying another URL, because every URL reaches the same store and
+    none of these tools is idempotent (DESIGN.md "Curator Tickets & Routing
+    Invariant").
     """
 
     async def _call(url: str) -> JSONResponse:
@@ -1144,6 +1156,7 @@ async def _mcp_write_proxy(
         # stays quiet and the failure is reported exactly once.
         log_failures=False,
         offline_result=_fused_memory_unreachable_response,
+        ambiguous_result=_fused_memory_outcome_unknown_response,
     )
 
 
