@@ -17,18 +17,15 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-# Re-export shared Claude invocation primitives for backwards compatibility
-from shared.cli_invoke import (  # noqa: F401
-    CAP_HIT_RESUME_PROMPT,
-    CRASH_RECOVERY_RESUME_PROMPT,
+from shared.cli_invoke import (
     AgentResult,
+    ArgvWrapper,
     CliRunner,
     SubprocessResult,
     TranscriptWatch,
     apply_spawn_env,
     build_claude_argv,
     invoke_claude_agent,
-    invoke_with_cap_retry,
     parse_claude_output,
     require_non_blank_prompt,
     run_cli_subprocess,
@@ -213,6 +210,7 @@ async def invoke_agent(
             absolute_cap_secs=absolute_cap_secs,
             strict_mcp_config=strict_mcp_config,
             resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+            runner=runner,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -270,6 +268,28 @@ async def invoke_agent(
         raise ValueError(f'Unknown backend: {backend!r}')
 
 
+def _sandbox_wrap(
+    cwd: Path,
+    sandbox_modules: list[str] | None,
+    sandbox_extras: list[str] | None,
+) -> ArgvWrapper | None:
+    """The argv wrap a requested sandbox applies, or None when none is requested."""
+    if sandbox_modules is None:
+        return None
+    from orchestrator.agents.sandbox_dispatch import wrap_command
+
+    def wrap(cmd: list[str]) -> list[str]:
+        return wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
+    return wrap
+
+
+def _sandbox_env(env: Mapping[str, str], sandbox_modules: list[str] | None) -> dict[str, str]:
+    """A copy of *env*, with rerere turned off when a sandbox is requested."""
+    if sandbox_modules is None:
+        return dict(env)
+    return {**env, **sandbox_git_config_env(env)}
+
+
 def _sandbox_spawn(
     cmd: list[str],
     env: Mapping[str, str],
@@ -278,13 +298,8 @@ def _sandbox_spawn(
     sandbox_extras: list[str] | None,
 ) -> tuple[list[str], dict[str, str]]:
     """The argv and env every backend spawns: a requested sandbox wraps *cmd* and turns rerere off."""
-    if sandbox_modules is None:
-        return cmd, dict(env)
-    from orchestrator.agents.sandbox_dispatch import wrap_command
-    return (
-        wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras),
-        {**env, **sandbox_git_config_env(env)},
-    )
+    wrap = _sandbox_wrap(cwd, sandbox_modules, sandbox_extras)
+    return (wrap(cmd) if wrap is not None else cmd), _sandbox_env(env, sandbox_modules)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +350,8 @@ async def _invoke_claude_with_sandbox(
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
     resume_prior_total_cost_usd: float | None = None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
@@ -352,8 +369,8 @@ async def _invoke_claude_with_sandbox(
     # miss a dispatch site.  setdefault lets explicit caller values win.
     env_overrides = apply_bash_cwd_reset_env(apply_mcp_startup_env(env_overrides))
 
-    # For sandboxed invocations we need to build the command ourselves
-    # and use the lower-level shared primitives
+    # For sandboxed invocations we build the command ourselves and hand the
+    # runner the sandbox wrap to apply before spawn.
     if sandbox_modules is not None:
         from orchestrator.agents.sandbox_dispatch import resolve_active_backend
         active = resolve_active_backend()
@@ -403,15 +420,14 @@ async def _invoke_claude_with_sandbox(
             # LAUNCHER_PID scrub.
             apply_spawn_env(env, spawn_env)
 
-            cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
-
             try:
-                result = await run_cli_subprocess(
-                    cmd, cwd, env,
+                result = await runner(
+                    cmd, cwd, _sandbox_env(env, sandbox_modules),
                     backend='claude',
                     model=model,
                     timeout_seconds=timeout_seconds,
                     stdin_data=stdin_data,
+                    wrap_argv=_sandbox_wrap(cwd, sandbox_modules, sandbox_extras),
                     transcript=TranscriptWatch(
                         session_id=(resume_session_id or session_id),
                         config_dir=config_dir,
@@ -450,6 +466,7 @@ async def _invoke_claude_with_sandbox(
         absolute_cap_secs=absolute_cap_secs,
         strict_mcp_config=strict_mcp_config,
         resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+        runner=runner,
     )
 
 

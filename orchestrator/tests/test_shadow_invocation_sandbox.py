@@ -8,7 +8,6 @@ Only the spawn itself is faked.
 
 from __future__ import annotations
 
-import functools
 import json
 import subprocess
 from pathlib import Path
@@ -18,7 +17,7 @@ import pytest
 import pytest_asyncio
 from _git_fixtures import seed_repo
 from _workflow_helpers import FakeBriefing, FakeScheduler, _make_git_ops, fixed_prompt
-from shared.cli_invoke import AgentResult, SubprocessResult, invoke_claude_agent
+from shared.cli_invoke import AgentResult, SubprocessResult
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invocation_scope import invocation_scope
@@ -116,12 +115,15 @@ async def _dispatched_kwargs(
     return recorded[0]
 
 
-async def _spawned_argv(kwargs: dict[str, Any], monkeypatch) -> list[str]:
+async def _spawned_argv(kwargs: dict[str, Any]) -> list[str]:
     """Run the REAL ``invoke_agent`` on *kwargs*; return the argv it would spawn."""
     captured: list[list[str]] = []
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kw: Any) -> SubprocessResult:
-        captured.append(list(cmd))
+    async def fake_runner(
+        cmd: list[str], cwd: Path, env: dict[str, str], *,
+        wrap_argv: Any = None, **kw: Any,
+    ) -> SubprocessResult:
+        captured.append(wrap_argv(cmd) if wrap_argv else list(cmd))
         return SubprocessResult(
             stdout=json.dumps({
                 'result': 'ok', 'is_error': False, 'subtype': 'success',
@@ -131,13 +133,7 @@ async def _spawned_argv(kwargs: dict[str, Any], monkeypatch) -> list[str]:
             stderr='', returncode=0, duration_ms=100, timed_out=False,
         )
 
-    monkeypatch.setattr('orchestrator.agents.invoke.run_cli_subprocess', fake_run_subprocess)
-    monkeypatch.setattr(
-        'orchestrator.agents.invoke.invoke_claude_agent',
-        functools.partial(invoke_claude_agent, runner=fake_run_subprocess),
-    )
-
-    await invoke_agent(**kwargs)
+    await invoke_agent(**kwargs, runner=fake_runner)
 
     assert len(captured) == 1, f'expected one spawn, got {captured!r}'
     return captured[0]
@@ -161,7 +157,7 @@ async def test_shadow_implementer_is_strict_and_landlock_wrapped(
     assert kwargs['strict_mcp_config'] == scope.strict_mcp_config
     assert kwargs['sandbox_modules'] == scope.sandbox_modules
 
-    argv = await _spawned_argv(kwargs, monkeypatch)
+    argv = await _spawned_argv(kwargs)
 
     assert argv[1].endswith('landlock_exec.py')
     assert ('--writable', worktree) in zip(argv, argv[1:], strict=False)
@@ -179,7 +175,7 @@ async def test_corpus_eval_implementer_stays_unsandboxed(
 
     assert kwargs['sandbox_modules'] is None
 
-    argv = await _spawned_argv(kwargs, monkeypatch)
+    argv = await _spawned_argv(kwargs)
 
     assert argv[0] == pinned_claude
     assert not any(token.endswith('landlock_exec.py') for token in argv)

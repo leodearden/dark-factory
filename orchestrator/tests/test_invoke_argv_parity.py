@@ -139,11 +139,11 @@ async def _drive_non_sandbox(inputs: dict[str, Any], cwd: Path) -> list[str]:
 
 
 async def _drive_sandbox(inputs: dict[str, Any], cwd: Path) -> list[str]:
-    """Invoke the sandbox path and capture the (unwrapped) argv handed to run_cli_subprocess."""
-    captured: list[list[str]] = []
+    """Invoke the sandbox path and capture the unwrapped argv handed to the runner."""
+    captured: list[tuple[list[str], list[str]]] = []
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> SubprocessResult:
-        captured.append(list(cmd))
+    async def fake_runner(cmd: list[str], *args: Any, **kwargs: Any) -> SubprocessResult:
+        captured.append((list(cmd), kwargs['wrap_argv'](list(cmd))))
         return _make_subprocess_result()
 
     def fake_wrap_command(
@@ -157,23 +157,22 @@ async def _drive_sandbox(inputs: dict[str, Any], cwd: Path) -> list[str]:
     with (
         patch('orchestrator.agents.sandbox_dispatch.resolve_active_backend', return_value='bwrap'),
         patch('orchestrator.agents.sandbox_dispatch.wrap_command', side_effect=fake_wrap_command),
-        patch('orchestrator.agents.invoke.run_cli_subprocess', side_effect=fake_run_subprocess),
     ):
         await _invoke_claude_with_sandbox(
             prompt='hello',
             system_prompt='sys prompt',
             cwd=cwd,
             sandbox_modules=['shared'],
+            runner=fake_runner,
             **inputs,
         )
 
     assert len(captured) == 1, f'expected exactly one subprocess invocation; got {captured!r}'
-    argv = captured[0]
-    prefix_len = len(_SANDBOX_SENTINEL_PREFIX)
-    assert argv[:prefix_len] == _SANDBOX_SENTINEL_PREFIX, (
-        f'expected sandbox argv to start with sentinel wrap {_SANDBOX_SENTINEL_PREFIX!r}; got {argv[:prefix_len + 2]!r}'
+    argv, wrapped = captured[0]
+    assert wrapped == [*_SANDBOX_SENTINEL_PREFIX, *argv], (
+        f'expected the wrap to prepend the sentinel {_SANDBOX_SENTINEL_PREFIX!r}; got {wrapped[:4]!r}'
     )
-    return argv[prefix_len:]
+    return argv
 
 
 @pytest.mark.asyncio

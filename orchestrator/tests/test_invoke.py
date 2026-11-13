@@ -15,7 +15,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
-from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult, SubprocessResult
+from shared.cli_invoke import (
+    CAP_HIT_RESUME_PROMPT,
+    AgentResult,
+    SubprocessResult,
+    invoke_with_cap_retry,
+)
 from shared.invocation_outcome import CapHit
 from shared.process_cost import ProcessCostBasis
 from shared.testing_fake_claude import install_fake_claude_cli
@@ -31,7 +36,6 @@ from orchestrator.agents.invoke import (
     _parse_gemini_output,
     codex_exec_argv,
     invoke_agent,
-    invoke_with_cap_retry,
 )
 from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, REVIEWER_COMPREHENSIVE
 
@@ -668,8 +672,6 @@ class TestSandboxCallerPropagatesTimedOut:
         timed_result = SubprocessResult(stdout='', stderr='timeout', returncode=1,
                                          duration_ms=100, timed_out=True)
         with (
-            patch('orchestrator.agents.invoke.run_cli_subprocess',
-                  new_callable=AsyncMock, return_value=timed_result),
             patch('orchestrator.agents.sandbox.is_bwrap_available', return_value=True),
             patch('orchestrator.agents.sandbox.build_bwrap_command', side_effect=lambda cmd, *a, **k: cmd),
         ):
@@ -681,6 +683,7 @@ class TestSandboxCallerPropagatesTimedOut:
                 permission_mode='bypassPermissions',
                 sandbox_modules=['src'],
                 effort=None, timeout_seconds=30.0,
+                runner=AsyncMock(return_value=timed_result),
             )
         assert agent.timed_out is True
 
@@ -1197,10 +1200,6 @@ class TestSandboxPathForwardsSessionConfig:
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
                 side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
-            patch(
-                'orchestrator.agents.invoke.run_cli_subprocess',
-                side_effect=mock_run_subprocess,
-            ),
         ):
             await _invoke_claude_with_sandbox(
                 prompt='hello', system_prompt='sys', cwd=tmp_path,
@@ -1210,6 +1209,7 @@ class TestSandboxPathForwardsSessionConfig:
                 permission_mode='bypassPermissions',
                 sandbox_modules=['m'],
                 effort=None, timeout_seconds=30.0,
+                runner=mock_run_subprocess,
                 session_id='sid-xyz',
                 config_dir=cfg_dir,
             )
@@ -1288,10 +1288,6 @@ class TestStartupGraceSecsForwarding:
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
                 side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
-            patch(
-                'orchestrator.agents.invoke.run_cli_subprocess',
-                side_effect=mock_run_subprocess,
-            ),
         ):
             await _invoke_claude_with_sandbox(
                 prompt='hello', system_prompt='sys', cwd=tmp_path,
@@ -1301,6 +1297,7 @@ class TestStartupGraceSecsForwarding:
                 permission_mode='bypassPermissions',
                 sandbox_modules=['m'],
                 effort=None, timeout_seconds=30.0,
+                runner=mock_run_subprocess,
                 startup_grace_secs=33.0,
             )
 
@@ -1390,10 +1387,6 @@ class TestSpawnEnvForwarding:
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
                 side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
-            patch(
-                'orchestrator.agents.invoke.run_cli_subprocess',
-                side_effect=mock_run_subprocess,
-            ),
         ):
             await _invoke_claude_with_sandbox(
                 prompt='hello', system_prompt='sys', cwd=tmp_path,
@@ -1403,6 +1396,7 @@ class TestSpawnEnvForwarding:
                 permission_mode='bypassPermissions',
                 sandbox_modules=['m'],
                 effort=None, timeout_seconds=30.0,
+                runner=mock_run_subprocess,
                 spawn_env=spawn_env,
             )
 
@@ -1447,10 +1441,6 @@ class TestSpawnEnvForwarding:
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
                 side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
-            patch(
-                'orchestrator.agents.invoke.run_cli_subprocess',
-                side_effect=mock_run_subprocess,
-            ),
         ):
             await _invoke_claude_with_sandbox(
                 prompt='hello', system_prompt='sys', cwd=tmp_path,
@@ -1460,6 +1450,7 @@ class TestSpawnEnvForwarding:
                 permission_mode='bypassPermissions',
                 sandbox_modules=['m'],
                 effort=None, timeout_seconds=30.0,
+                runner=mock_run_subprocess,
                 spawn_env=spawn_env,
             )
 
@@ -1531,10 +1522,6 @@ class TestProgressExtensionParamsForwarding:
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
                 side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
-            patch(
-                'orchestrator.agents.invoke.run_cli_subprocess',
-                side_effect=mock_run_subprocess,
-            ),
         ):
             await _invoke_claude_with_sandbox(
                 prompt='hello', system_prompt='sys', cwd=tmp_path,
@@ -1544,6 +1531,7 @@ class TestProgressExtensionParamsForwarding:
                 permission_mode='bypassPermissions',
                 sandbox_modules=['m'],
                 effort=None, timeout_seconds=30.0,
+                runner=mock_run_subprocess,
                 working_idle_secs=1800.0,
                 absolute_cap_secs=7200.0,
             )
@@ -1583,6 +1571,7 @@ class TestSandboxExtrasForwarding:
             return cmd
 
         async def mock_run_subprocess(cmd, cwd, env, **kwargs):
+            kwargs['wrap_argv'](cmd)
             return SubprocessResult(
                 stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
             )
@@ -1596,10 +1585,6 @@ class TestSandboxExtrasForwarding:
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
                 side_effect=capturing_wrap_command,
             ),
-            patch(
-                'orchestrator.agents.invoke.run_cli_subprocess',
-                side_effect=mock_run_subprocess,
-            ),
         ):
             await _invoke_claude_with_sandbox(
                 prompt='hello', system_prompt='sys', cwd=tmp_path,
@@ -1609,6 +1594,7 @@ class TestSandboxExtrasForwarding:
                 permission_mode='bypassPermissions',
                 sandbox_modules=[],
                 effort=None, timeout_seconds=30.0,
+                runner=mock_run_subprocess,
                 sandbox_extras=['/abs/carveout'],
             )
 
@@ -1835,7 +1821,7 @@ class TestSandboxPathRejectsBlankPrompt:
     """
 
     @staticmethod
-    def _sandbox_patches(run_subprocess, argv_mock=None):
+    def _sandbox_patches(argv_mock=None):
         argv_patch = (
             patch('orchestrator.agents.invoke.build_claude_argv', argv_mock)
             if argv_mock is not None
@@ -1850,7 +1836,6 @@ class TestSandboxPathRejectsBlankPrompt:
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
                 side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
-            patch('orchestrator.agents.invoke.run_cli_subprocess', side_effect=run_subprocess),
             argv_patch,
         )
 
@@ -1863,9 +1848,9 @@ class TestSandboxPathRejectsBlankPrompt:
             )
         )
         argv_mock = MagicMock(return_value=(['claude', '--print'], []))
-        backend_p, wrap_p, run_p, argv_p = self._sandbox_patches(run_mock, argv_mock)
+        backend_p, wrap_p, argv_p = self._sandbox_patches(argv_mock)
 
-        with backend_p, wrap_p, run_p, argv_p, pytest.raises(ValueError):
+        with backend_p, wrap_p, argv_p, pytest.raises(ValueError):
             await _invoke_claude_with_sandbox(
                 prompt=prompt, system_prompt='sys', cwd=tmp_path,
                 model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
@@ -1874,6 +1859,7 @@ class TestSandboxPathRejectsBlankPrompt:
                 permission_mode='bypassPermissions',
                 sandbox_modules=['m'],
                 effort=None, timeout_seconds=30.0,
+                runner=run_mock,
             )
 
         # No temp files may be created and no subprocess spawned for a blank
@@ -1899,9 +1885,9 @@ class TestSandboxPathRejectsBlankPrompt:
                 stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
             )
 
-        backend_p, wrap_p, run_p, _ = self._sandbox_patches(mock_run_subprocess)
+        backend_p, wrap_p, _ = self._sandbox_patches()
 
-        with backend_p, wrap_p, run_p:
+        with backend_p, wrap_p:
             await _invoke_claude_with_sandbox(
                 prompt='a real prompt', system_prompt='sys', cwd=tmp_path,
                 model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
@@ -1910,6 +1896,7 @@ class TestSandboxPathRejectsBlankPrompt:
                 permission_mode='bypassPermissions',
                 sandbox_modules=['m'],
                 effort=None, timeout_seconds=30.0,
+                runner=mock_run_subprocess,
             )
 
         assert captured['stdin_data'] == b'a real prompt'
