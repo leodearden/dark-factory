@@ -9,14 +9,17 @@ import logging
 import os
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from inotify_simple import Event, INotify, flags
 
 from escalation.models import Escalation
-from escalation.watcher import _emit, _initial_scan, ntfy_request
+from escalation.watcher import _emit, _initial_scan, ntfy_request, watch
 
 
 @pytest.fixture
@@ -575,6 +578,271 @@ class TestInitialScan:
             f"Expected >=1 WARNING mentioning 'watcher._initial_scan'; "
             f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
         )
+
+
+class FakeClock:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, secs: float) -> None:
+        self.now += secs
+
+
+class ScriptedSource:
+    """An EventSource whose reads replay scripted batches.
+
+    Each batch runs at read time, so it can write arrivals into the queue dir
+    or move the clock, and returns the filenames to report as MOVED_TO events.
+    """
+
+    def __init__(self, batches: list[Callable[[], list[str]]]) -> None:
+        self._batches = list(batches)
+        self.reads: list[int | None] = []
+
+    def read(self, timeout: int | None = None) -> list[Event]:
+        self.reads.append(timeout)
+        if not self._batches:
+            if timeout is None:
+                raise AssertionError('would block forever')
+            return []
+        names = self._batches.pop(0)()
+        return [Event(wd=1, mask=flags.MOVED_TO, cookie=0, name=n) for n in names]
+
+
+def _arrive(queue_dir: Path, esc: Escalation) -> str:
+    """File esc the way every queue writer does: tmp-file + rename (invariant (a))."""
+    name = f'{esc.id}.json'
+    tmp = queue_dir / f'.{name}.tmp'
+    tmp.write_text(esc.to_json())
+    os.rename(tmp, queue_dir / name)
+    return name
+
+
+def _watch(queue_dir: Path, source: ScriptedSource, **overrides) -> Escalation | None:
+    kwargs: dict = {
+        'task_id': None,
+        'level': None,
+        'timeout': None,
+        'current_excludes': lambda: frozenset(),
+        'clock': FakeClock(),
+    }
+    kwargs.update(overrides)
+    return watch(queue_dir, source, **kwargs)
+
+
+def _esc(esc_id: str, **fields) -> Escalation:
+    defaults: dict = {
+        'task_id': esc_id.split('-')[1],
+        'agent_role': 'orchestrator',
+        'severity': 'blocking',
+        'category': 'task_failure',
+        'summary': esc_id,
+    }
+    defaults.update(fields)
+    return Escalation(id=esc_id, **defaults)
+
+
+@pytest.fixture
+def queue_dir(tmp_path: Path) -> Path:
+    path = tmp_path / 'queue'
+    path.mkdir()
+    return path
+
+
+class TestWatch:
+    """watch() returns the first pending match, scanning first and then polling."""
+
+    def test_pending_on_disk_is_returned_without_reading(self, queue_dir: Path):
+        esc = _esc('esc-50-1')
+        _write_esc(queue_dir, esc)
+        source = ScriptedSource([])
+
+        result = _watch(queue_dir, source)
+
+        assert result is not None and result.id == esc.id
+        assert source.reads == []
+
+    def test_arrival_on_first_read_is_returned(self, queue_dir: Path):
+        esc = _esc('esc-51-1')
+        source = ScriptedSource([lambda: [_arrive(queue_dir, esc)]])
+
+        result = _watch(queue_dir, source)
+
+        assert result is not None and result.id == esc.id
+        assert source.reads == [None]
+
+    def test_non_escalation_names_are_skipped(self, queue_dir: Path):
+        """Names failing the esc-*.json gate are never read, even if they hold a valid record."""
+        decoy = _esc('esc-52-9', summary='decoy behind a non-escalation name')
+        for name in ('unrelated.json', 'x.tmp'):
+            (queue_dir / name).write_text(decoy.to_json())
+        esc = _esc('esc-52-1')
+        source = ScriptedSource([
+            lambda: ['unrelated.json', 'x.tmp', ''],
+            lambda: [_arrive(queue_dir, esc)],
+        ])
+
+        result = _watch(queue_dir, source)
+
+        assert result is not None and result.id == esc.id
+        assert len(source.reads) == 2
+
+    def test_excluded_arrival_is_delivered_then_dropped(self, queue_dir: Path):
+        esc = _esc('esc-53-1')
+        source = ScriptedSource([lambda: [_arrive(queue_dir, esc)]])
+
+        result = _watch(
+            queue_dir, source, timeout=5, current_excludes=lambda: frozenset({esc.id}),
+        )
+
+        assert result is None
+        assert source.reads == [5000, 5000]
+
+    def test_non_excluded_sibling_of_excluded_arrival_is_returned(self, queue_dir: Path):
+        excluded = _esc('esc-54-1')
+        live = _esc('esc-54-2')
+        source = ScriptedSource([
+            lambda: [_arrive(queue_dir, excluded), _arrive(queue_dir, live)],
+        ])
+
+        result = _watch(queue_dir, source, current_excludes=lambda: frozenset({excluded.id}))
+
+        assert result is not None and result.id == live.id
+
+    def test_excludes_are_reevaluated_each_poll(self, queue_dir: Path):
+        """An id excluded after the scan but before its event is processed is suppressed."""
+        esc = _esc('esc-55-1')
+        excluded: set[str] = set()
+
+        def exclude_then_arrive() -> list[str]:
+            excluded.add(esc.id)
+            return [_arrive(queue_dir, esc)]
+
+        source = ScriptedSource([exclude_then_arrive])
+
+        result = _watch(
+            queue_dir, source, timeout=5, current_excludes=lambda: frozenset(excluded),
+        )
+
+        assert result is None
+
+    @pytest.mark.parametrize(
+        ('fields', 'filters', 'returned'),
+        [
+            pytest.param({'status': 'resolved'}, {}, False, id='not-pending'),
+            pytest.param({'level': 1}, {'level': 0}, False, id='level-mismatch'),
+            pytest.param({'level': 1}, {'level': 1}, True, id='level-match'),
+            pytest.param({'task_id': '99'}, {'task_id': '42'}, False, id='task-mismatch'),
+            pytest.param({'task_id': '42'}, {'task_id': '42'}, True, id='task-match'),
+        ],
+    )
+    def test_arrival_must_be_pending_and_pass_the_filters(
+        self, queue_dir: Path, fields: dict, filters: dict, returned: bool,
+    ):
+        esc = _esc('esc-56-1', **fields)
+        source = ScriptedSource([lambda: [_arrive(queue_dir, esc)]])
+
+        result = _watch(queue_dir, source, timeout=5, **filters)
+
+        assert (result is not None and result.id == esc.id) is returned
+
+    def test_undecodable_arrival_is_warned_and_sibling_returned(
+        self, queue_dir: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        esc = _esc('esc-57-1')
+
+        def binary_then_valid() -> list[str]:
+            (queue_dir / 'esc-binary.json').write_bytes(b'\xff\xfe\x00\x80')
+            return ['esc-binary.json', _arrive(queue_dir, esc)]
+
+        source = ScriptedSource([binary_then_valid])
+
+        with caplog.at_level(logging.WARNING):
+            result = _watch(queue_dir, source)
+
+        assert result is not None and result.id == esc.id
+        assert any(
+            r.levelno == logging.WARNING
+            and 'watcher.watch' in r.getMessage()
+            and 'esc-binary.json' in r.getMessage()
+            for r in caplog.records
+        ), [(r.levelname, r.getMessage()) for r in caplog.records]
+
+    def test_returns_none_when_nothing_arrives_before_timeout(self, queue_dir: Path):
+        source = ScriptedSource([])
+
+        assert _watch(queue_dir, source, timeout=2) is None
+        assert source.reads == [2000]
+
+    def test_read_timeout_is_recomputed_from_the_clock(self, queue_dir: Path):
+        clock = FakeClock()
+        esc = _esc('esc-58-1')
+
+        def time_passes() -> list[str]:
+            clock.advance(1.5)
+            return ['unrelated.json']
+
+        source = ScriptedSource([time_passes, lambda: [_arrive(queue_dir, esc)]])
+
+        result = _watch(queue_dir, source, timeout=5, clock=clock)
+
+        assert result is not None and result.id == esc.id
+        assert source.reads == [5000, 3500]
+
+    def test_deadline_passed_during_a_poll_returns_without_another_read(
+        self, queue_dir: Path,
+    ):
+        clock = FakeClock()
+
+        def overrun() -> list[str]:
+            clock.advance(6)
+            return ['unrelated.json']
+
+        source = ScriptedSource([overrun])
+
+        assert _watch(queue_dir, source, timeout=5, clock=clock) is None
+        assert source.reads == [5000]
+
+    def test_deadline_starts_after_the_scan(self, queue_dir: Path):
+        clock = FakeClock()
+        scans: list[None] = []
+
+        def slow_first_excludes() -> frozenset[str]:
+            if not scans:
+                clock.advance(3)
+            scans.append(None)
+            return frozenset()
+
+        esc = _esc('esc-59-1')
+        source = ScriptedSource([lambda: [_arrive(queue_dir, esc)]])
+
+        _watch(
+            queue_dir, source, timeout=5, clock=clock, current_excludes=slow_first_excludes,
+        )
+
+        assert source.reads[0] == 5000
+
+    def test_real_inotify_delivers_an_arrival_after_the_scan(self, queue_dir: Path):
+        esc = _esc('esc-60-1')
+
+        with INotify() as inotify:
+            inotify.add_watch(str(queue_dir), flags.CREATE | flags.MOVED_TO)
+
+            class ArriveThenRead:
+                def read(self, timeout: int | None = None) -> list[Event]:
+                    if not (queue_dir / f'{esc.id}.json').exists():
+                        _arrive(queue_dir, esc)
+                    return inotify.read(timeout=timeout)
+
+            result = watch(
+                queue_dir, ArriveThenRead(), task_id=None, level=None, timeout=5,
+                current_excludes=lambda: frozenset(), clock=time.monotonic,
+            )
+
+        assert result is not None and result.id == esc.id
 
 
 class TestInitialScanMain:
