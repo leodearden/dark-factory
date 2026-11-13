@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import types
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,77 @@ def _journal(
 class _UnreadableJournal(MergeQueueStore):
     def load(self) -> list[Any]:
         raise OSError('journal unreadable')
+
+
+class _OneReadFails(EventStore):
+    """A runs.db on which one merge_finalized reader fails in one run scope; every other read is real.
+
+    The failing read does what the real store does with a failed read: a
+    strict one raises, a fire-safe one reads as a miss.
+    """
+
+    def __init__(self, db_path: Path, *, reader: Any, cross_run: bool) -> None:
+        super().__init__(db_path, _CURRENT)
+        self._failing = (reader, cross_run)
+
+    def _fails(self, reader: Any, *, cross_run: bool, fire_safe: bool) -> bool:
+        if (reader, cross_run) != self._failing:
+            return False
+        if fire_safe:
+            return True
+        raise sqlite3.OperationalError('disk I/O error')
+
+    def latest_merge_finalized(
+        self,
+        request_id: str | None = None,
+        branch: str | None = None,
+        task_id: str | None = None,
+        *,
+        cross_run: bool = False,
+        fire_safe: bool = True,
+    ) -> dict | None:
+        if self._fails(EventStore.latest_merge_finalized, cross_run=cross_run, fire_safe=fire_safe):
+            return None
+        return super().latest_merge_finalized(
+            request_id, branch, task_id, cross_run=cross_run, fire_safe=fire_safe,
+        )
+
+    def merge_finalized_absorbing(
+        self, request_id: str, *, cross_run: bool = False, fire_safe: bool = True,
+    ) -> dict | None:
+        if self._fails(
+            EventStore.merge_finalized_absorbing, cross_run=cross_run, fire_safe=fire_safe,
+        ):
+            return None
+        return super().merge_finalized_absorbing(
+            request_id, cross_run=cross_run, fire_safe=fire_safe,
+        )
+
+    def merge_finalized_superseded_by(
+        self, superseded_by: str, *, cross_run: bool = False, fire_safe: bool = True,
+    ) -> list[dict]:
+        if self._fails(
+            EventStore.merge_finalized_superseded_by, cross_run=cross_run, fire_safe=fire_safe,
+        ):
+            return []
+        return super().merge_finalized_superseded_by(
+            superseded_by, cross_run=cross_run, fire_safe=fire_safe,
+        )
+
+
+def _history_unreadable(tmp_path: Path) -> _OneReadFails:
+    """A runs.db whose prior-run read fails while this run's rows still read."""
+    return _OneReadFails(
+        tmp_path / 'runs.db', reader=EventStore.latest_merge_finalized, cross_run=True,
+    )
+
+
+def _unreadable(store: Any) -> Any:
+    """Overwrite *store*'s runs.db with non-database bytes, so every later read fails to open it."""
+    store.db_path.write_bytes(b'not a database' * 64)
+    for sidecar in ('-wal', '-shm'):
+        Path(f'{store.db_path}{sidecar}').unlink(missing_ok=True)
+    return store
 
 
 def _live_worker(*entries: dict[str, Any]) -> types.SimpleNamespace:
@@ -426,6 +498,117 @@ class TestProbeFailureEndsTheWalk:
         assert response['reason'] == MergeReason.probe_failed
         assert response['source'] == 'live'
 
+    @pytest.mark.parametrize(
+        'key',
+        [{'request_id': 'mr-1'}, {'branch': _BRANCH}, {'task_id': _TASK}],
+        ids=['request_id', 'branch', 'task_id'],
+    )
+    async def test_an_unreadable_event_store_is_an_event_store_probe_failure(
+        self, tmp_path: Path, key: dict[str, str]
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        _finalize(current, request_id='mr-1', state='done')
+        server = _server(tmp_path, _unreadable(current))
+
+        response = await _poll(server, **key)
+
+        assert response['state'] is MergeState.unknown
+        assert response['reason'] == MergeReason.probe_failed
+        assert response['source'] == 'event_store'
+        assert response['hint'] == hint_for(MergeReason.probe_failed)
+        assert response['last_outcome'] is None
+
+    @pytest.mark.parametrize(
+        'key', [{'task_id': _TASK}, {'request_id': 'mr-x'}], ids=['task_id', 'request_id'],
+    )
+    async def test_unreadable_history_is_a_cross_run_probe_failure(
+        self, tmp_path: Path, key: dict[str, str]
+    ) -> None:
+        store = _history_unreadable(tmp_path)
+
+        response = await _poll(_server(tmp_path, store), **key)
+
+        assert response['state'] is MergeState.unknown
+        assert response['reason'] == MergeReason.probe_failed
+        assert response['source'] == 'event_store_cross_run'
+        assert response['last_outcome'] is None
+
+    @pytest.mark.parametrize(
+        ('reader', 'cross_run', 'source'),
+        [
+            (EventStore.latest_merge_finalized, False, 'event_store'),
+            (EventStore.merge_finalized_absorbing, False, 'event_store'),
+            (EventStore.latest_merge_finalized, True, 'event_store_cross_run'),
+            (EventStore.merge_finalized_absorbing, True, 'event_store_cross_run'),
+            (EventStore.merge_finalized_superseded_by, True, 'event_store_cross_run'),
+        ],
+        ids=[
+            'current-latest', 'current-absorbing',
+            'cross-latest', 'cross-absorbing', 'cross-superseded_by',
+        ],
+    )
+    async def test_each_read_a_request_id_poll_makes_reports_its_own_failure(
+        self, tmp_path: Path, reader: Any, cross_run: bool, source: str
+    ) -> None:
+        store = _OneReadFails(tmp_path / 'runs.db', reader=reader, cross_run=cross_run)
+
+        response = await _poll(_server(tmp_path, store), request_id='mr-x')
+
+        assert response['state'] is MergeState.unknown
+        assert response['reason'] == MergeReason.probe_failed
+        assert response['source'] == source
+        assert response['last_outcome'] is None
+
+    async def test_unreadable_history_does_not_preempt_the_current_run_tier(
+        self, tmp_path: Path
+    ) -> None:
+        store = _history_unreadable(tmp_path)
+        _finalize(store, request_id='mr-1', state='done')
+
+        response = await _poll(_server(tmp_path, store), request_id='mr-1')
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert response['last_outcome'] is None
+
+    async def test_unreadable_history_does_not_preempt_the_journal_tier(
+        self, tmp_path: Path
+    ) -> None:
+        store = _history_unreadable(tmp_path)
+        journal = _journal(tmp_path, _journal_entry('mr-j'))
+
+        response = await _poll(_server(tmp_path, store, journal=journal), task_id=_TASK)
+
+        assert response['state'] is MergeState.journaled
+        assert response['source'] == 'journal'
+        assert response['last_outcome'] is None
+
+    async def test_unreadable_history_does_not_preempt_the_git_tier(
+        self, tmp_path: Path, probe: AsyncMock
+    ) -> None:
+        probe.return_value = _verdict(GitAuthorityOutcome.found_on_main)
+        store = _history_unreadable(tmp_path)
+
+        response = await _poll(_server(tmp_path, store), task_id=_TASK)
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'git'
+        assert response['last_outcome'] is None
+
+    async def test_an_unreadable_event_store_does_not_preempt_a_live_answer(
+        self, tmp_path: Path
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        server = _server(
+            tmp_path, _unreadable(current), worker=_live_worker(_live_entry('mr-new')),
+        )
+
+        response = await _poll(server, branch=_BRANCH)
+
+        assert response['state'] == 'queued'
+        assert response['source'] == 'live'
+        assert response['last_outcome'] is None
+
 
 class TestAliasResolution:
     async def test_b6_a_train_id_resolves_to_its_newest_member_record(
@@ -578,6 +761,13 @@ class TestMergeCancelDurableResolution:
         journal = _journal(tmp_path, store_type=_UnreadableJournal)
 
         response = await self._cancel(_server(tmp_path, current, journal=journal), 'mr-x')
+
+        assert response['state'] is MergeState.unknown
+
+    async def test_an_unreadable_event_store_is_unknown(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+
+        response = await self._cancel(_server(tmp_path, _unreadable(current)), 'mr-x')
 
         assert response['state'] is MergeState.unknown
 
