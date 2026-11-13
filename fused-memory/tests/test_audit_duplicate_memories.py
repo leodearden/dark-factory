@@ -2014,23 +2014,27 @@ class TestBuildSweepPlanTopicCarveout:
         assert set(carved['member_ids']) == {'m1', 'm2'}
         assert carved['topic'] == 'venv'
 
-    def test_differing_topics_still_yield_delete_candidates(self):
+    def test_differing_topics_are_reported_but_no_member_is_deletable(self):
         memories = [
             _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
             _topic_memory('m2', _VENV_GOTCHA_B, 'rustfmt'),
         ]
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
         assert plan['clusters_total'] == 1
-        assert len(plan['delete_candidates']) == 1
+        (group,) = plan['near_duplicate_groups']
+        assert set(group['member_ids']) == {'m1', 'm2'}
+        assert plan['delete_candidates'] == []
+        assert group['survivor_id'] == 'm1'
+        assert group['retained_member_ids'] == [{'id': 'm2', 'reason': 'topic_stamped'}]
         assert plan['topic_carveout_clusters'] == 0
 
-    def test_partially_missing_topic_still_yields_delete_candidates(self):
+    def test_partially_missing_topic_makes_only_the_unstamped_member_deletable(self):
         memories = [
             _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
             _topic_memory('m2', _VENV_GOTCHA_B, None),
         ]
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
-        assert len(plan['delete_candidates']) == 1
+        assert plan['delete_candidates'] == ['m2']
         assert plan['topic_carveout_clusters'] == 0
 
     def test_carveout_applies_to_all_three_categories(self):
