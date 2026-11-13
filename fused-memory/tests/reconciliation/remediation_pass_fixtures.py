@@ -17,7 +17,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
-import pytest
+from escalation.queue import EscalationQueue
 from shared.scheduler_state import SchedulerStateSnapshot
 
 import fused_memory.reconciliation.harness as harness_module
@@ -39,9 +39,6 @@ from reconciliation.harness_fixtures import (
     make_harness_config,
     stub_stage_runs,
 )
-
-pytest.importorskip('escalation.queue')
-from escalation.queue import EscalationQueue  # noqa: E402
 
 PROJECT_ID = 'test-project'
 PROJECT_ROOT = '/tmp/test-project'

@@ -19,6 +19,8 @@ import logging
 
 import pytest
 import pytest_asyncio
+from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
 import fused_memory.reconciliation.harness as harness_module
 from fused_memory.reconciliation.harness import LIVENESS_UNKNOWN_DETAIL_KEY
@@ -33,10 +35,6 @@ from reconciliation.remediation_pass_fixtures import (
     in_progress_task,
     prepare_remediation_pass,
 )
-
-pytest.importorskip('escalation.queue')
-from escalation.queue import EscalationQueue  # noqa: E402
-from shared.project_layout import escalation_queue_dir  # noqa: E402
 
 _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
 
