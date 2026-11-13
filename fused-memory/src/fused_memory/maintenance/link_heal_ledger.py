@@ -10,8 +10,8 @@ committed with its planned rows; :meth:`LinkHealLedger.run_records` joins them
 into the run's :class:`CandidateRecord` view. A calibration of the adjudicator
 is kept per model and prompt version, so the gate on writes asks for exactly the
 adjudicator it would write with. Each sweep run records the creation window it
-examined, and the newest complete one is where the next sweep starts. Nothing
-here is ever pruned.
+examined for each project it covered; a project's next sweep starts where its
+unbroken run of complete windows ends. Nothing here is ever pruned.
 
 :class:`RunLock` keeps runs one at a time: an exclusive ``flock`` plus a JSON
 record of its holder. The kernel drops a crashed holder's ``flock``, which is
@@ -219,11 +219,13 @@ CREATE INDEX IF NOT EXISTS calibrations_by_prompt ON calibrations (model, prompt
 CREATE TABLE IF NOT EXISTS sweep_windows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
     since TEXT NOT NULL,
     until TEXT NOT NULL,
     complete INTEGER NOT NULL,
     at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS sweep_windows_by_project ON sweep_windows (project_id, id);
 """
 
 #: Columns added after their table first shipped: an older ledger gains them in place.
@@ -937,25 +939,38 @@ class LinkHealLedger:
         ).fetchone()
         return None if row is None else _calibration_row(row)
 
-    def record_sweep_window(self, run_id: str, window: CreatedWindow, *, complete: bool) -> None:
-        """Record the window sweep run *run_id* examined; only a *complete* one moves
-        the watermark."""
+    def record_sweep_window(
+        self,
+        run_id: str,
+        window: CreatedWindow,
+        *,
+        projects: Sequence[str],
+        complete: bool,
+    ) -> None:
+        """Record the window sweep run *run_id* examined, once for each of *projects*;
+        only a *complete* one can move a project's watermark."""
+        since = window.since.astimezone(UTC).isoformat()
+        until = window.until.astimezone(UTC).isoformat()
+        at = _now()
         with self._conn:
-            self._conn.execute(
-                'INSERT INTO sweep_windows (run_id, since, until, complete, at) '
-                'VALUES (?, ?, ?, ?, ?)',
-                (
-                    run_id, window.since.astimezone(UTC).isoformat(),
-                    window.until.astimezone(UTC).isoformat(), int(complete), _now(),
-                ),
+            self._conn.executemany(
+                'INSERT INTO sweep_windows (run_id, project_id, since, until, complete, at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                [(run_id, project_id, since, until, int(complete), at) for project_id in projects],
             )
 
-    def sweep_watermark(self) -> datetime | None:
-        """The end of the newest complete sweep window: where the next sweep starts."""
-        row = self._conn.execute(
-            'SELECT until FROM sweep_windows WHERE complete = 1 ORDER BY id DESC LIMIT 1',
-        ).fetchone()
-        return None if row is None else datetime.fromisoformat(row['until'])
+    def sweep_watermark(self, project_id: str) -> datetime | None:
+        """The end of the unbroken run of complete sweep windows from *project_id*'s
+        first sweep: where its next sweep starts."""
+        rows = self._conn.execute(
+            'SELECT since, until FROM sweep_windows WHERE project_id = ? AND complete = 1 '
+            'ORDER BY id',
+            (project_id,),
+        )
+        return _contiguous_end(
+            CreatedWindow(since=datetime.fromisoformat(since), until=datetime.fromisoformat(until))
+            for since, until in rows
+        )
 
     def snapshot(self, project_id: str, record: LiveRecord) -> int:
         """The id of *record*'s snapshot, stored now unless this exact state already is."""
@@ -993,6 +1008,19 @@ class LinkHealLedger:
 
     def _action_rows(self, sql: str, params: Sequence[Any]) -> list[ActionRow]:
         return [_action_row(row) for row in self._conn.execute(sql, params)]
+
+
+def _contiguous_end(windows: Iterable[CreatedWindow]) -> datetime | None:
+    """The end of the unbroken run of *windows*, taken in order from the first. A later
+    window extends it only when it starts at or before the end so far; one starting
+    after it leaves a gap, so it does not move it."""
+    end: datetime | None = None
+    for window in windows:
+        if end is None:
+            end = window.until
+        elif window.since <= end:
+            end = max(end, window.until)
+    return end
 
 
 def _lastrowid(cursor: sqlite3.Cursor) -> int:

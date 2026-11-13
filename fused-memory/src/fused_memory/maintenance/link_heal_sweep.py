@@ -112,11 +112,21 @@ def _heal_actions(values: Sequence[str]) -> frozenset[HealAction]:
 
 
 def resolve_window(
-    ledger: LinkHealLedger, *, now: datetime, since: datetime | None, window_hours: int,
+    ledger: LinkHealLedger,
+    *,
+    now: datetime,
+    since: datetime | None,
+    window_hours: int,
+    projects: Sequence[str],
 ) -> CreatedWindow:
-    """``[since, now)``. With no *since*, the window starts where the last complete
-    sweep's ended, or *window_hours* before *now* when no sweep has completed."""
-    start = since or ledger.sweep_watermark() or now - timedelta(hours=window_hours)
+    """``[since, now)``. With no *since*, the window starts at the earliest start over
+    *projects*: each project's sweep watermark, or *window_hours* before *now* for a
+    project no sweep has completed. Re-examining a project's links from an earlier
+    start is harmless: adjudications are reused and pending heals are deduped."""
+    if since is not None:
+        return CreatedWindow(since=since, until=now)
+    fallback = now - timedelta(hours=window_hours)
+    start = min(ledger.sweep_watermark(project) or fallback for project in projects)
     return CreatedWindow(since=start, until=now)
 
 
@@ -159,11 +169,17 @@ async def run_sweep(
     """Plan a sweep over the links created in its window, heal what it staged when it
     may write, and report the run.
 
-    Only a complete plan run moves the window's watermark, so links a failed read
-    or adjudication left undecided are examined again by the next sweep. A sweep
-    that may write files its adjudicator storm. One that may not only forecasts it.
+    The window is recorded for each project the sweep covers, and only a complete
+    plan run moves a project's watermark, so links a failed read or adjudication
+    left undecided, a project the sweep did not cover, and a gap before an explicit
+    *since* are all examined by a later sweep. Examining a link again is harmless:
+    adjudications are reused and pending heals are deduped. A sweep that may write
+    files its adjudicator storm. One that may not only forecasts it.
     """
-    window = resolve_window(ledger, now=now, since=since, window_hours=settings.window_hours)
+    window = resolve_window(
+        ledger, now=now, since=since, window_hours=settings.window_hours,
+        projects=settings.projects,
+    )
     calibration = ledger.latest_calibration(adjudicate.model, adjudicate.prompt_sha256)
     withheld = settings.withheld(calibration)
     plan = await run_adjudicator_plan(
@@ -179,7 +195,9 @@ async def run_sweep(
         created_in=window,
         filer=filer if withheld is None else None,
     )
-    ledger.record_sweep_window(plan.run_id, window, complete=plan.counts.complete)
+    ledger.record_sweep_window(
+        plan.run_id, window, projects=settings.projects, complete=plan.counts.complete,
+    )
     applied = None if withheld is not None else await run_apply(
         store=store, ledger=ledger, limits=limits, filer=filer, source=RunSource.SWEEP,
     )
