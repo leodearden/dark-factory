@@ -699,7 +699,8 @@ def _derive_date(records: list[dict[str, Any]]) -> str:
 def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:
     """Prefer the real transcript file's parent dir name (ground truth);
     fall back to ``inventory.encode_cwd`` of the derived *cwd* when no *path*
-    is given, or to 'unknown' when *cwd* itself could not be derived."""
+    is given or its parent dir name is empty, or to 'unknown' when *cwd*
+    itself could not be derived."""
     if path is not None:
         parent_name = Path(path).parent.name
         if parent_name:
