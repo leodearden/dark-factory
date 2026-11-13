@@ -1553,8 +1553,10 @@ class InflightStatus(StrEnum):
     A single str-compatible Enum (task 1990 / MQ-invariants ε) shared by both
     dataclasses' ``status`` fields — ``InflightEntry.status`` carries the two
     PREDISPATCH members, or DROPPED / REQUEUED once a verify has vacated the
-    entry (see :attr:`InflightEntry.vacated`); ``InflightVerifyResult.status``
-    carries only the first three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).
+    entry (see :attr:`InflightEntry.vacated`), or VERIFIED_PENDING_LANDING,
+    which the verify stamps on its own entry when its lease is released at
+    the verdict (task 8526); ``InflightVerifyResult.status`` carries only the
+    first three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).
     Members are ``str`` instances (mirrors ``event_store.EventType`` /
     ``verify_runner.DriftVerdict``), so every existing ``==`` / ``in``
     comparison against the raw sentinel strings keeps working unchanged.
@@ -1565,6 +1567,7 @@ class InflightStatus(StrEnum):
     RUNNER_UNAVAILABLE = 'RUNNER_UNAVAILABLE'
     ABANDONED_PREDISPATCH = 'ABANDONED_PREDISPATCH'
     REQUEUED_PREDISPATCH = 'REQUEUED_PREDISPATCH'
+    VERIFIED_PENDING_LANDING = 'VERIFIED_PENDING_LANDING'
 
 
 class OutcomeKind(StrEnum):
@@ -1869,13 +1872,17 @@ class LeaseActivity(StrEnum):
     hang on an ssh connect) or after it returned (task 2822's cross-check, a
     task-6155 parked gate, which runs nothing remote since task 8525); the
     runner does not tell the two apart.
-    FINISHED holds the lease until finalize with nothing left to run.
+    FINISHED is a held lease whose verify is done: a verdict kept on the
+    persistent merge lane until landing, or a hand-built entry.
+    VERIFIED_PENDING_LANDING holds no lease: the verdict is in, the lease was
+    released, and the entry awaits its in-order landing (task 8526).
     """
 
     DISPATCHING = 'dispatching'
     VERIFYING = 'verifying'
     NO_LIVE_DISPATCH = 'no_live_dispatch'
     FINISHED = 'finished'
+    VERIFIED_PENDING_LANDING = 'verified_pending_landing'
 
     @property
     def is_live(self) -> bool:
@@ -1908,10 +1915,11 @@ def lease_activity(lease: HostLease, pending_task: asyncio.Task[object] | None) 
 
 @dataclass(frozen=True)
 class LeaseRow:
-    """One held host lease: who holds it and what it is doing (task 5290).
+    """One frontier entry's host: who holds it and what it is doing (task 5290).
 
     The typed row behind ``snapshot()``'s ``occupancy.leases`` (:meth:`to_wire`)
-    and the heartbeat's ``verifying N/M hosts`` segment.
+    and the heartbeat's ``verifying N/M hosts`` segment.  A row is a held
+    lease, or an entry released at its verdict on *host* (:attr:`holds_lease`).
     """
 
     host: str
@@ -1919,6 +1927,11 @@ class LeaseRow:
     request_id: str
     activity: LeaseActivity
     host_quarantined: bool
+
+    @property
+    def holds_lease(self) -> bool:
+        """Whether the host is still leased, rather than released at the verdict."""
+        return self.activity is not LeaseActivity.VERIFIED_PENDING_LANDING
 
     @property
     def counts_verifying(self) -> bool:
@@ -1961,7 +1974,8 @@ class InflightEntry:
     Fields
     ------
     item           : the SpeculativeItem being verified
-    lease          : the HostLease held for this verify (None for passthroughs)
+    lease          : the HostLease held for this verify (None for passthroughs,
+                     and once the verify released it at its verdict)
     verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
     merge_wt       : the merge worktree path.  The PRE-verify fact UNTIL δ's
                      adoption publishes the post-verify one onto it (task
@@ -1985,7 +1999,10 @@ class InflightEntry:
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
     status         : optional sentinel.  ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH are
                      set by _dispatch_item; DROPPED / REQUEUED by the entry's own verify
-                     when it vacates the entry (see :attr:`vacated`, task 4582).
+                     when it vacates the entry (see :attr:`vacated`, task 4582);
+                     VERIFIED_PENDING_LANDING by the verify when it releases the
+                     lease at its verdict (task 8526).
+    verdict_host   : the host a released verdict came from, or ``None``.
     chain          : the :class:`ChainResult` this dispatch's verify was
                      REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
                      ordinary adjacent-verify path.  Its READER is
@@ -2034,7 +2051,7 @@ class InflightEntry:
     was_speculative: bool
     passthrough_outcome: MergeOutcome | None = None
     verify_result: VerifyResult | None = None  # None = pass; VerifyResult = fail/skip
-    status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
+    status: InflightStatus | None = None    # sentinel: see InflightStatus
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
     permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
     chain: ChainResult | None = None        # γ (task 3185): the deep chain this verify was redirected onto
@@ -2044,6 +2061,7 @@ class InflightEntry:
     verify_base: VerifyBaseFacts | None = None
     gate: PendingGate | None = None
     verify_base_divergence: VerifyBaseDivergence | None = None
+    verdict_host: str | None = None
 
     @property
     def pending_task(self) -> asyncio.Task[object] | None:

@@ -214,6 +214,7 @@ from orchestrator.merge_lane.types import (
     InflightVerifyResult,
     ItemLifecycleState,
     LandingCandidate,
+    LeaseActivity,
     LeaseRow,
     MainHealthAutoHealRegistry,
     MergeCancelRefusal,
@@ -4384,11 +4385,12 @@ def _lease_part(row: LeaseRow) -> str:
 
 
 def _occupancy_suffix(rows: Sequence[LeaseRow], *, hosts_total: int) -> str:
-    """The heartbeat's `` | verifying N/M hosts: ...`` segment; '' with no lease held.
+    """The heartbeat's `` | verifying N/M hosts: ...`` segment; '' with no row.
 
-    N counts the hosts of :func:`_verifying_by_host`, and every lease is named,
+    N counts the hosts of :func:`_verifying_by_host`, and every row is named,
     so a held lease with nothing running on its host reads
-    ``laptop=5300(finished)``.
+    ``laptop=5300(finished)``, and an entry released at its verdict
+    ``laptop=5300(verified_pending_landing)``.
     """
     if not rows:
         return ''
@@ -12492,19 +12494,31 @@ class SpeculativeMergeWorker:
     def _lease_rows(
         self, fh_entry: InflightEntry | None, occupying: Sequence[InflightEntry],
     ) -> list[LeaseRow]:
-        """One :class:`LeaseRow` per held lease: the finalize head, then *occupying*."""
+        """One :class:`LeaseRow` per entry with a host: the finalize head, then *occupying*."""
         return [
-            self._lease_row(entry, entry.lease) for entry in (fh_entry, *occupying)
-            if entry is not None and entry.lease is not None
+            row for entry in (fh_entry, *occupying)
+            if entry is not None and (row := self._entry_row(entry)) is not None
         ]
 
-    def _lease_row(self, entry: InflightEntry, lease: HostLease) -> LeaseRow:
+    def _entry_row(self, entry: InflightEntry) -> LeaseRow | None:
+        """*entry*'s held lease, or the host it released at its verdict (task 8526)."""
+        if entry.lease is not None:
+            return self._host_row(
+                entry, entry.lease.name, lease_activity(entry.lease, entry.pending_task),
+            )
+        if entry.status is InflightStatus.VERIFIED_PENDING_LANDING and entry.verdict_host:
+            return self._host_row(
+                entry, entry.verdict_host, LeaseActivity.VERIFIED_PENDING_LANDING,
+            )
+        return None
+
+    def _host_row(self, entry: InflightEntry, host: str, activity: LeaseActivity) -> LeaseRow:
         return LeaseRow(
-            host=lease.name,
+            host=host,
             task_id=entry.item.request.task_id,
             request_id=entry.item.request.request_id,
-            activity=lease_activity(lease, entry.pending_task),
-            host_quarantined=lease.name in self._runner_quarantine,
+            activity=activity,
+            host_quarantined=host in self._runner_quarantine,
         )
 
     def _hosts_total(self) -> int:
@@ -12514,16 +12528,18 @@ class SpeculativeMergeWorker:
     def _occupancy_block(self, rows: Sequence[LeaseRow]) -> dict:
         """:meth:`snapshot`'s ``occupancy``, from :meth:`_lease_rows`.
 
-        by_host / inflight_by_host / hosts_busy / inflight_total are LEASE
-        occupancy; ``leases`` and ``verifying_by_host`` say what each lease is
-        doing (task 5290).
+        by_host / inflight_by_host / hosts_busy are LEASE occupancy, so a row
+        released at its verdict is left out; inflight_total counts every row,
+        and ``leases`` and ``verifying_by_host`` say what each is doing
+        (tasks 5290, 8526).
         """
-        inflight_by_host = _task_ids_by_host(rows)
+        leased = [row for row in rows if row.holds_lease]
+        inflight_by_host = _task_ids_by_host(leased)
         return {
             'hosts_total': self._hosts_total(),
             'hosts_busy': len(inflight_by_host),
             # LOSSY on purpose (historical shape): the last occupant per host.
-            'by_host': {row.host: row.task_id for row in rows},
+            'by_host': {row.host: row.task_id for row in leased},
             'inflight_by_host': inflight_by_host,
             'inflight_total': len(rows),
             'leases': [row.to_wire() for row in rows],
@@ -12559,12 +12575,15 @@ class SpeculativeMergeWorker:
             inflight_by_host: {host: [task_id, ...]} — lossless, every leased
               occupant present.  Ordered finalize head first, then _inflight
               order, mirroring `entries`.
-            inflight_total: total leased in-flight entries across all hosts.
-            These four are LEASE occupancy: a lease is not evidence that its
-            host is reachable or verifying (task 5290).  The activity view:
+            inflight_total: leased in-flight entries plus entries released
+              at their verdict and awaiting landing (task 8526).
+            hosts_busy / by_host / inflight_by_host are LEASE occupancy: a
+            lease is not evidence that its host is reachable or verifying
+            (task 5290).  The activity view:
             leases: one {host, task_id, request_id, activity,
-              host_quarantined} row per lease, in inflight_by_host order;
-              activity is a :class:`LeaseActivity` value.
+              host_quarantined} row per such entry, finalize head first;
+              activity is a :class:`LeaseActivity` value, and a released
+              entry's host is the one its verdict came from.
             verifying_by_host: {host: [task_id, ...]} for the leases whose
               activity is live and whose host is not quarantined.
           hosts: list of per-host state dicts (task 3275), one per host the
