@@ -8,9 +8,9 @@ here or its imports fail at collection:
 2. ``scripts/`` — ``from legibility import invariants`` in
    test_design_invariants_consistency.py, and ``import governed_list_agreement``
    in test_repo_guards_governed_lists.py;
-3. ``shared/tests/`` — helpers that stay beside shared's own unit tests, such as
-   ``capability_manifest_corpus``. The dependency runs one way only: nothing in
-   shared/tests imports from here.
+3. ``shared/tests/cross_suite_helpers/`` — helpers that stay beside shared's own
+   unit tests, such as ``capability_manifest_corpus``. The dependency runs one
+   way only: nothing in shared/tests imports from here.
 
 Inserted in reverse priority, so this directory wins a basename collision.
 """
@@ -21,6 +21,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-for _path in (REPO_ROOT / 'shared' / 'tests', REPO_ROOT / 'scripts', Path(__file__).resolve().parent):
+for _path in (
+    REPO_ROOT / 'shared' / 'tests' / 'cross_suite_helpers',
+    REPO_ROOT / 'scripts',
+    Path(__file__).resolve().parent,
+):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))

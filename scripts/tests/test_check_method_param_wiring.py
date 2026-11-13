@@ -21,7 +21,8 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # scripts/tests -> scripts -> repo root. Same idiom as
-# shared/tests/capability_manifest_corpus.py; correct inside a worktree too.
+# shared/tests/cross_suite_helpers/capability_manifest_corpus.py; correct
+# inside a worktree too.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'check_method_param_wiring.py'
 MEM0_CLIENT = 'fused-memory/src/fused_memory/backends/mem0_client.py'

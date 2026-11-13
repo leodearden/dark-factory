@@ -8,7 +8,7 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
   - TestLoader: load_capability_manifest / parse_capability_manifest.
   - TestManifestCorpusDiscovery / TestCheckManifest / TestIterScriptChecks /
     TestCheckScriptTarget / TestCommittedFileMode / TestMissingFromWorktreeMessage:
-    the sibling test-support module shared/tests/capability_manifest_corpus.py
+    the test-support module shared/tests/cross_suite_helpers/capability_manifest_corpus.py
     (task 3362) against planted and failing inputs.
   - TestSidecarPath: the PRD key → sidecar path rule, over examples (task 6582).
   - TestDeliveredCheckMeta / TestMechanicalCheckKinds / TestMetadataRegistration:

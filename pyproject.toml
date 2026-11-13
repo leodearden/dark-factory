@@ -45,6 +45,9 @@ extraPaths = [
     # names over same-directory siblings. Why, and the guards that enforce it:
     # tests/scripts/test_no_vestigial_import_pragmas.py.
     "orchestrator/tests/cross_suite_helpers",
+    # The same rule for shared's helpers that tests/repo_guards imports
+    # (task 5654).
+    "shared/tests/cross_suite_helpers",
 ]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"

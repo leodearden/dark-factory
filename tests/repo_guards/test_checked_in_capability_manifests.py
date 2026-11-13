@@ -3,7 +3,7 @@
 These guards read the committed plans/ and docs/prds/ trees and the git index,
 which no shared cache key covers, so they live in this never-cached module.
 The schema's unit tests stay in shared/tests/test_capability_manifest.py; the
-corpus walker they share is shared/tests/capability_manifest_corpus.py.
+corpus walker they share is shared/tests/cross_suite_helpers/capability_manifest_corpus.py.
 """
 
 from __future__ import annotations

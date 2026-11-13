@@ -810,7 +810,7 @@ def _stale_scope_findings(
 # ---------------------------------------------------------------------------
 
 #: Mirrors ``fused_memory.server.manifest_stamping._SIDECAR_SUFFIX`` and
-#: ``shared/tests/capability_manifest_corpus.py::MANIFEST_SUFFIX``.
+#: ``shared/tests/cross_suite_helpers/capability_manifest_corpus.py::MANIFEST_SUFFIX``.
 #: Re-declared rather than imported for the same reason the latter does it:
 #: ``shared`` must not depend on ``fused_memory``.
 _MANIFEST_SUFFIX = '.capability-manifest.yaml'

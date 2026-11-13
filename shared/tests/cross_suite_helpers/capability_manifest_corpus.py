@@ -6,7 +6,10 @@ unit tests and by the checked-in corpus guard in
 ``tests/repo_guards/test_checked_in_capability_manifests.py``. Importable bare
 (``from capability_manifest_corpus import ...``) because
 ``shared/tests/conftest.py`` and ``tests/repo_guards/conftest.py`` both insert
-this ``tests/`` directory onto ``sys.path``.
+this ``cross_suite_helpers/`` directory onto ``sys.path``, and both pyright
+tables list it in ``extraPaths``. The directory holds helpers only, no test
+module or conftest, so listing it claims no suite's names (see
+``tests/scripts/test_no_vestigial_import_pragmas.py::test_no_root_extrapaths_entry_holds_a_test_module_or_conftest``).
 
 Why ``git ls-files``, not ``Path.rglob``
 -----------------------------------------
@@ -40,11 +43,12 @@ from shared.capability_manifest import load_capability_manifest
 #: fused_memory.
 MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
-#: shared/tests/capability_manifest_corpus.py -> parents[0]=shared/tests,
-#: parents[1]=shared, parents[2]=repo root. Mirrors
+#: shared/tests/cross_suite_helpers/capability_manifest_corpus.py ->
+#: parents[0]=shared/tests/cross_suite_helpers, parents[1]=shared/tests,
+#: parents[2]=shared, parents[3]=repo root. Mirrors
 #: fused-memory/tests/test_lock_charter_guard.py's _DF_REPO_ROOT; correct
 #: inside a worktree checkout too.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class GitUnavailable(RuntimeError):

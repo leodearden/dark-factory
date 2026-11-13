@@ -14,6 +14,11 @@ if str(_SRC) not in sys.path:
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+# Helpers this suite shares with tests/repo_guards/, which inserts the same
+# directory (the orchestrator/tests/cross_suite_helpers precedent, task 8507).
+_CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / 'cross_suite_helpers'
+if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
 # runs `cd shared && uv run pytest tests/`, which makes rootdir the SUBPROJECT —
