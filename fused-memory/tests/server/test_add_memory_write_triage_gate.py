@@ -1986,21 +1986,27 @@ class TestAFailOpenIsMarkedOnTheAck:
         assert TRIAGE_FAIL_OPEN_KEY not in result, f'{result!r}'
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ('label', 'overrides'),
-        [
-            ('a healthy empty search', {}),
-            ('a force-store', {'metadata': {'allow_near_duplicate': True}}),
-        ],
-    )
-    async def test_a_genuine_stored_is_not_marked(self, monkeypatch, label, overrides) -> None:
+    async def test_a_healthy_empty_search_is_not_marked(self, monkeypatch) -> None:
         _install_counter(monkeypatch)
         mock_service = self._service(return_value=SearchResults([]))
 
-        result = await _call(create_mcp_server(mock_service), **overrides)
+        result = await _call(create_mcp_server(mock_service))
 
-        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{label}: {result!r}'
-        assert TRIAGE_FAIL_OPEN_KEY not in result, f'{label}: {result!r}'
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert TRIAGE_FAIL_OPEN_KEY not in result, f'{result!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_force_store_skips_retrieval_and_is_not_marked(self, monkeypatch) -> None:
+        _install_counter(monkeypatch)
+        mock_service = self._service(side_effect=RuntimeError('retrieval must not run'))
+
+        result = await _call(
+            create_mcp_server(mock_service), metadata={'allow_near_duplicate': True},
+        )
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert TRIAGE_FAIL_OPEN_KEY not in result, f'{result!r}'
+        mock_service.search.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_triage_disabled_is_not_marked(self) -> None:
