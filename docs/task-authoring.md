@@ -973,7 +973,7 @@ action); task goes `blocked` until resolved.
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
 | present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
-| absent | `true` | escalate born-at-L2 immediately; `done` after `resume`; re-fires instead if resumed behind a new dependency or milestone | **pure gate** |
+| absent | `true` | escalate born-at-L2 immediately; `done` after `resume`; re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
@@ -1017,11 +1017,16 @@ curator closure distinguishable from a generic one in the audit trail.
 dependency (by CLAUDE.md's `planning_mode=True` → `add_dependency` →
 `commit_planning` rule) and/or a `milestone` (§6), then
 `resolve_issue(action='resume')`. When the hold lands, the runner files a
-fresh `milestone_gate` itself, because the task now waits on more than its
+fresh gate escalation itself, because the task now waits on more than its
 `gate_escalated_preconditions` record (rationale:
 `docs/deterministic-runner.md` §3), so nobody clears `gate_escalated_at` by
 hand. Wiring the hold after the resume races: the task re-pends with
-nothing new to wait on and closes.
+nothing new to wait on and closes. One transitional exception: a gate
+whose metadata has no `gate_escalated_preconditions` record fired before
+task 9520 deployed, and closes when the hold lands. For it, set
+`gate_escalated_at` to null after wiring the hold and before the resume,
+so the gate files afresh. The exception can go once no blocked gate lacks
+the record.
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks

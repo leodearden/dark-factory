@@ -679,7 +679,11 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
    §"Milestone tasks (dated / delayed)"; wire the dependency by CLAUDE.md's `planning_mode=True`
    → `add_dependency` → `commit_planning` rule), and only then `resume` the gate. The runner files
    a fresh gate when the hold lands, because the task now waits on more than when it fired
-   (docs/task-authoring.md §5); never clear `gate_escalated_at` by hand.
+   (docs/task-authoring.md §5); never clear `gate_escalated_at` by hand. One transitional
+   exception: a gate whose metadata has no `gate_escalated_preconditions` fired before task 9520
+   deployed and closes when the hold lands, so for it set `gate_escalated_at` to null after
+   wiring the hold and before the resume. Drop this exception once no blocked gate lacks the
+   record.
 4. Recovering a preserved payload into the task the brief names.
 5. Appending a finding to an existing owner task, ONLY while that task is `pending`, because task
    text is never re-read after dispatch (see "Findings for another task's owner").

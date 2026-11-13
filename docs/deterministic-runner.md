@@ -375,8 +375,9 @@ way and closed as `pure gate resolved` the moment it landed, with no human
 step. So on resume
 `orchestrator/src/orchestrator/gate_preconditions.py::gate_held_since_escalation`
 compares what the task waits on now with the `gate_escalated_preconditions`
-record its filing stamped, and the runner re-files a fresh `milestone_gate`
-and stays BLOCKED when a local dependency or an `external_deps` entry was
+record its filing stamped, and the runner re-files a fresh gate escalation
+(`milestone_gate`, or `review_due` for a `trigger_chain` human gate) and
+stays BLOCKED when a local dependency or an `external_deps` entry was
 added, or a present `milestone` differs. The re-file restamps the record,
 so the next resolution with nothing new closes normally. Removing a
 dependency or a milestone never re-fires, because it never extends the
