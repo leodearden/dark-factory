@@ -136,8 +136,10 @@ prints 0.17.1.
   worktree's own `.env`, if any, then stops at the empty file in the run
   home. The sentinel is needed on its own account: the run home lives under
   `/tmp`, which every sandboxed agent can write, so without it a `.env`
-  planted in `/tmp` would be loaded. The subprocess cwd and the landlock
-  grants stay on the real worktree.
+  planted in `/tmp` would be loaded. It holds against the agent ZCode runs,
+  whose tools start only after the walk; a concurrent peer agent is a
+  residual below. The subprocess cwd and the landlock grants stay on the
+  real worktree.
 - Measured with that layout: the canary was absent, and the MCP child's cwd
   still resolved to the worktree. Upstream's
   `core/src/tool/handlers/bash-cwd-policy.ts` accepts a symlinked session
@@ -145,7 +147,12 @@ prints 0.17.1.
 - The regression probe is `orchestrator/tests/test_zcode_dotenv_live.py`. It
   drives the real `zcode` under landlock against a local endpoint that
   answers 401, which ends the run in about 3 s, after ZCode has started its
-  MCP children. It is skipped where `zcode` or landlock is missing.
+  MCP children. A control run first shows that a value from a worktree's own
+  `.env` does reach the MCP child, so the probe cannot pass merely because
+  its observation channel went blind. It is skipped where `zcode` is
+  missing, and where landlock is missing unless `DF_REQUIRE_SANDBOX_TESTS=1`
+  arms the host, in which case it fails. Measured 2026-11-13: it fails
+  against the old `--cwd <worktree>` wiring and passes against the fence.
 - Residuals:
   - The worktree's own `.env` is still loaded. Dark-factory worktrees have
     none: `.env` is gitignored and nothing provisions one.
@@ -153,6 +160,16 @@ prints 0.17.1.
     with its own tools, because landlock grants read on `/`.
   - An implementer step committing under the symlinked workspace has not
     been measured; see Not established.
+  - The fence does not hold against a concurrent peer agent. The run home
+    sits under `/tmp`, which `landlock_exec.py` makes writable for every
+    sandboxed agent, and all of them run as one uid, so the home's 0700 mode
+    keeps no peer out. Before ZCode's startup walk, a peer could delete the
+    sentinel, letting the walk reach a planted `/tmp/.env`, or retarget
+    `<run home>/workspace` at the checkout. That adds no capability a peer
+    lacks today: it can already rewrite the same home's
+    `.zcode/cli/config.json` or `.gitconfig`, and read the checkout's `.env`
+    directly (task 9561). Follow-up ticket `tkt_0RWXYYX0E1AHT5BZWS5GVSHGMQ`
+    covers moving run homes out of the shared `/tmp` grant.
 
 ## Protocol
 
