@@ -10,13 +10,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
 from shared.cli_invoke import (
     AgentResult,
-    _SubprocessResult,
+    SubprocessResult,
     invoke_claude_agent,
     invoke_with_cap_retry,
 )
@@ -38,8 +37,8 @@ def pinned_claude(monkeypatch, tmp_path: Path) -> str:
     return str(exec_file)
 
 
-def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
-    """Build a minimal _SubprocessResult that _parse_claude_output can parse."""
+def _make_subprocess_result(**overrides: Any) -> SubprocessResult:
+    """Build a minimal SubprocessResult that parse_claude_output can parse."""
     stdout = json.dumps({
         'result': 'ok',
         'is_error': False,
@@ -57,66 +56,71 @@ def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
         'timed_out': False,
     }
     defaults.update(overrides)
-    return _SubprocessResult(**defaults)
+    return SubprocessResult(**defaults)
 
 
 @pytest.mark.asyncio
-async def test_sandbox_wrap_applied_to_argv(tmp_path: Path, pinned_claude: str) -> None:
-    """When sandbox_wrap is set, _invoke_claude applies it to cmd before spawning.
-
-    The wrapped argv should start with the wrap token ('WRAP') but still
-    contain the resolved claude binary as the wrapped command.  Confirms the hook fires between
-    temp-file creation and _run_subprocess, as designed.
-    """
-    captured: list[list[str]] = []
-
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> _SubprocessResult:
-        captured.append(list(cmd))
-        return _make_subprocess_result()
-
-    with patch('shared.cli_invoke._run_subprocess', side_effect=fake_run_subprocess):
-        await invoke_claude_agent(
-            prompt='hello',
-            system_prompt='sys',
-            cwd=tmp_path,
-            sandbox_wrap=lambda cmd: ['WRAP'] + cmd,
-        )
-
-    assert len(captured) == 1, 'Expected exactly one subprocess invocation'
-    argv = captured[0]
-    assert argv[0] == 'WRAP', f'Expected wrapped argv to start with WRAP; got {argv[:3]}'
-    assert pinned_claude in argv, f'Expected wrapped argv to contain claude; got {argv[:5]}'
-
-
-@pytest.mark.asyncio
-async def test_sandbox_wrap_none_leaves_argv_unchanged(
+async def test_sandbox_wrap_reaches_the_runner_as_wrap_argv(
     tmp_path: Path, pinned_claude: str,
 ) -> None:
-    """When sandbox_wrap is None (default), cmd is passed to _run_subprocess unchanged.
+    """When sandbox_wrap is set, the runner gets it as wrap_argv with the unwrapped argv.
+
+    The runner applies the wrap once, before spawn (pinned in
+    test_cli_runner.py), so _invoke_claude must hand it over untouched rather
+    than pre-wrapping the claude argv itself.
+    """
+    captured: list[tuple[list[str], dict[str, Any]]] = []
+
+    async def fake_runner(cmd: list[str], cwd: Path, env: dict, **kwargs: Any) -> SubprocessResult:
+        captured.append((list(cmd), kwargs))
+        return _make_subprocess_result()
+
+    def wrap(cmd: list[str]) -> list[str]:
+        return ['WRAP', *cmd]
+
+    await invoke_claude_agent(
+        prompt='hello',
+        system_prompt='sys',
+        cwd=tmp_path,
+        sandbox_wrap=wrap,
+        runner=fake_runner,
+    )
+
+    assert len(captured) == 1, 'Expected exactly one runner invocation'
+    argv, kwargs = captured[0]
+    assert argv[0] == pinned_claude, f'Expected the unwrapped claude argv; got {argv[:3]}'
+    assert kwargs['wrap_argv'] is wrap
+
+
+@pytest.mark.asyncio
+async def test_sandbox_wrap_none_reaches_the_runner_as_none(
+    tmp_path: Path, pinned_claude: str,
+) -> None:
+    """When sandbox_wrap is None (default), the runner gets wrap_argv=None.
 
     The first token in the captured argv must be the resolved claude binary,
     confirming no accidental transformation — in particular that NO sandbox
     wrapper was prepended.
     """
-    captured: list[list[str]] = []
+    captured: list[tuple[list[str], dict[str, Any]]] = []
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> _SubprocessResult:
-        captured.append(list(cmd))
+    async def fake_runner(cmd: list[str], cwd: Path, env: dict, **kwargs: Any) -> SubprocessResult:
+        captured.append((list(cmd), kwargs))
         return _make_subprocess_result()
 
-    with patch('shared.cli_invoke._run_subprocess', side_effect=fake_run_subprocess):
-        await invoke_claude_agent(
-            prompt='hello',
-            system_prompt='sys',
-            cwd=tmp_path,
-            # sandbox_wrap intentionally omitted (defaults to None)
-        )
+    await invoke_claude_agent(
+        prompt='hello',
+        system_prompt='sys',
+        cwd=tmp_path,
+        runner=fake_runner,
+    )
 
     assert len(captured) == 1
-    argv = captured[0]
+    argv, kwargs = captured[0]
     assert argv[0] == pinned_claude, (
         f'Expected unchanged argv to start with the claude binary; got {argv[:3]}'
     )
+    assert kwargs['wrap_argv'] is None
 
 
 # ── invoke_with_cap_retry forwarding tests ────────────────────────────────────

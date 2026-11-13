@@ -24,15 +24,16 @@ from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
     CRASH_RECOVERY_RESUME_PROMPT,
     AgentResult,
+    SubprocessResult,
+    TranscriptWatch,
     _materialize_stdin,
-    _parse_claude_output,
-    _run_subprocess,
-    _SubprocessResult,
     apply_spawn_env,
     build_claude_argv,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    parse_claude_output,
     require_non_blank_prompt,
+    run_cli_subprocess,
 )
 
 # Process-group termination helper for subprocess tree cleanup
@@ -401,16 +402,21 @@ async def _invoke_claude_with_sandbox(
             cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
 
             try:
-                result = await _run_subprocess(
-                    cmd, cwd, env, model, timeout_seconds,
+                result = await run_cli_subprocess(
+                    cmd, cwd, env,
+                    backend='claude',
+                    model=model,
+                    timeout_seconds=timeout_seconds,
                     stdin_data=stdin_data,
-                    session_id=(resume_session_id or session_id),
-                    config_dir=config_dir,
-                    startup_grace_secs=startup_grace_secs,
-                    working_idle_secs=working_idle_secs,
-                    absolute_cap_secs=absolute_cap_secs,
+                    transcript=TranscriptWatch(
+                        session_id=(resume_session_id or session_id),
+                        config_dir=config_dir,
+                        startup_grace_secs=startup_grace_secs,
+                        working_idle_secs=working_idle_secs,
+                        absolute_cap_secs=absolute_cap_secs,
+                    ),
                 )
-                return _parse_claude_output(
+                return parse_claude_output(
                     result,
                     resumed=bool(resume_session_id),
                     prior_total_cost_usd=resume_prior_total_cost_usd,
@@ -617,12 +623,12 @@ async def _invoke_codex(
     return _parse_codex_output(result, model, prices)
 
 
-def _codex_exit_line(result: _SubprocessResult) -> str:
+def _codex_exit_line(result: SubprocessResult) -> str:
     return f'codex exited rc={result.returncode}' + (' (timed out)' if result.timed_out else '')
 
 
 def _parse_codex_output(
-    result: _SubprocessResult,
+    result: SubprocessResult,
     model: str,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
@@ -823,7 +829,7 @@ async def _invoke_gemini(
 
 
 def _parse_gemini_output(
-    result: _SubprocessResult,
+    result: SubprocessResult,
     model: str,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
@@ -976,7 +982,7 @@ def _pi_thinking(effort: str | None) -> str | None:
 
 
 def _parse_pi_output(
-    result: _SubprocessResult,
+    result: SubprocessResult,
     model: str,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
@@ -1460,7 +1466,7 @@ async def _invoke_mimo(
         env = mimo_spawn_env(base_env, home)
         extras = [*(sandbox_extras or []), str(home.root)]
 
-        async def spawn(argv: list[str], timeout: float, stdin: bytes = b'') -> _SubprocessResult:
+        async def spawn(argv: list[str], timeout: float, stdin: bytes = b'') -> SubprocessResult:
             cmd, wrapped_env = _sandbox_spawn(argv, env, cwd, sandbox_modules, extras)
             return await _run_subprocess_local(
                 cmd, cwd, wrapped_env, 'mimo', model, max_budget_usd, timeout, stdin_data=stdin,
@@ -1489,11 +1495,11 @@ async def _run_subprocess_local(
     max_budget_usd: float,
     timeout_seconds: float | None = None,
     stdin_data: bytes | None = None,
-) -> _SubprocessResult:
+) -> SubprocessResult:
     """Run a subprocess, log output, enforce budget timeout.
 
     *stdin_data*, when set, is delivered on the process's stdin (mirrors
-    shared.cli_invoke._run_subprocess's stdin_data param, used by the
+    shared.cli_invoke.run_cli_subprocess's stdin_data param, used by the
     codex backend to deliver instructions without a worktree file — see
     _invoke_codex). When None (gemini/pi callers), behavior is
     byte-identical to before this param existed.
@@ -1550,7 +1556,7 @@ async def _run_subprocess_local(
         except TimeoutError:
             await terminate_process_group(proc, pgid)
             duration_ms = int(time.monotonic() * 1000) - start_ms
-            return _SubprocessResult(
+            return SubprocessResult(
                 stdout='',
                 stderr=f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)',
                 returncode=1,
@@ -1581,7 +1587,7 @@ async def _run_subprocess_local(
     logger.info(f'Agent exit code: {proc.returncode}')
     logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout.decode()[:500]}')
 
-    return _SubprocessResult(
+    return SubprocessResult(
         stdout=stdout.decode(),
         stderr=stderr_text,
         returncode=proc.returncode if proc.returncode is not None else 1,

@@ -8,6 +8,7 @@ Only the spawn itself is faked.
 
 from __future__ import annotations
 
+import functools
 import json
 import subprocess
 from pathlib import Path
@@ -17,7 +18,7 @@ import pytest
 import pytest_asyncio
 from _git_fixtures import seed_repo
 from _workflow_helpers import FakeBriefing, FakeScheduler, _make_git_ops, fixed_prompt
-from shared.cli_invoke import AgentResult, _SubprocessResult
+from shared.cli_invoke import AgentResult, SubprocessResult, invoke_claude_agent
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invocation_scope import invocation_scope
@@ -119,9 +120,9 @@ async def _spawned_argv(kwargs: dict[str, Any], monkeypatch) -> list[str]:
     """Run the REAL ``invoke_agent`` on *kwargs*; return the argv it would spawn."""
     captured: list[list[str]] = []
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kw: Any) -> _SubprocessResult:
+    async def fake_run_subprocess(cmd: list[str], *args: Any, **kw: Any) -> SubprocessResult:
         captured.append(list(cmd))
-        return _SubprocessResult(
+        return SubprocessResult(
             stdout=json.dumps({
                 'result': 'ok', 'is_error': False, 'subtype': 'success',
                 'cost_usd': 0.01, 'duration_ms': 100, 'num_turns': 1,
@@ -130,8 +131,11 @@ async def _spawned_argv(kwargs: dict[str, Any], monkeypatch) -> list[str]:
             stderr='', returncode=0, duration_ms=100, timed_out=False,
         )
 
-    monkeypatch.setattr('orchestrator.agents.invoke._run_subprocess', fake_run_subprocess)
-    monkeypatch.setattr('shared.cli_invoke._run_subprocess', fake_run_subprocess)
+    monkeypatch.setattr('orchestrator.agents.invoke.run_cli_subprocess', fake_run_subprocess)
+    monkeypatch.setattr(
+        'orchestrator.agents.invoke.invoke_claude_agent',
+        functools.partial(invoke_claude_agent, runner=fake_run_subprocess),
+    )
 
     await invoke_agent(**kwargs)
 

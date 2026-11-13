@@ -28,14 +28,14 @@ import pytest
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
-    _parse_claude_output,
-    _SubprocessResult,
+    SubprocessResult,
     build_failure_message,
     classify_agent_failure,
     invoke_claude_agent,
     invoke_with_cap_retry,
     is_cli_invocation_rejected,
     is_zero_output_timeout,
+    parse_claude_output,
 )
 from shared.invocation_outcome import (
     CLI_INPUT_REQUIRED_MARKERS,
@@ -56,8 +56,8 @@ FAST_EXIT_STDERR = (
 )
 
 
-def _fast_exit_subprocess(**overrides: object) -> _SubprocessResult:
-    """The esc-3118-1 payload as a ``_SubprocessResult``.
+def _fast_exit_subprocess(**overrides: object) -> SubprocessResult:
+    """The esc-3118-1 payload as a ``SubprocessResult``.
 
     duration_ms=17331 is the measured wall clock of the observed instance --
     deliberately OUTSIDE the pre-existing ``< 5000`` heuristic cap-safety-net
@@ -74,17 +74,17 @@ def _fast_exit_subprocess(**overrides: object) -> _SubprocessResult:
         'transcript_turns': None,
     }
     kwargs.update(overrides)
-    return _SubprocessResult(**kwargs)  # type: ignore[arg-type]
+    return SubprocessResult(**kwargs)  # type: ignore[arg-type]
 
 
 class TestParseClaudeOutputMintsCliInputRejectedSubtype:
-    """``_parse_claude_output``'s empty-stdout branch must disambiguate a
+    """``parse_claude_output``'s empty-stdout branch must disambiguate a
     pre-turn CLI *rejection* from a genuine empty-output failure, exactly as
     task 2360 disambiguated a productive timeout kill from one.
     """
 
     def test_fast_exit_mints_error_cli_input_rejected(self):
-        result = _parse_claude_output(_fast_exit_subprocess())
+        result = parse_claude_output(_fast_exit_subprocess())
         assert result.subtype == 'error_cli_input_rejected', (
             f'expected the distinct pre-turn-rejection subtype, got '
             f'{result.subtype!r} -- laundering the cause into the generic '
@@ -93,11 +93,11 @@ class TestParseClaudeOutputMintsCliInputRejectedSubtype:
         assert result.success is False
 
     def test_predicate_is_true_for_the_fast_exit_payload(self):
-        result = _parse_claude_output(_fast_exit_subprocess())
+        result = parse_claude_output(_fast_exit_subprocess())
         assert is_cli_invocation_rejected(result) is True
 
     def test_stderr_is_preserved_verbatim(self):
-        result = _parse_claude_output(_fast_exit_subprocess())
+        result = parse_claude_output(_fast_exit_subprocess())
         assert result.stderr == FAST_EXIT_STDERR, (
             'the CLI stderr is the ONLY evidence of the real cause and must '
             'survive parsing verbatim'
@@ -107,20 +107,20 @@ class TestParseClaudeOutputMintsCliInputRejectedSubtype:
     def test_genuine_empty_output_is_unchanged(self):
         """NEGATIVE: an empty-stdout failure with unrelated stderr keeps the
         existing generic subtype and the predicate stays False."""
-        result = _parse_claude_output(
+        result = parse_claude_output(
             _fast_exit_subprocess(stderr='some unrelated warning\n')
         )
         assert result.subtype == 'error_empty_output'
         assert is_cli_invocation_rejected(result) is False
 
     def test_empty_stderr_is_unchanged(self):
-        result = _parse_claude_output(_fast_exit_subprocess(stderr=''))
+        result = parse_claude_output(_fast_exit_subprocess(stderr=''))
         assert result.subtype == 'error_empty_output'
         assert is_cli_invocation_rejected(result) is False
 
     def test_productive_timeout_kill_is_unchanged(self):
         """NEGATIVE: task 2360's productive-kill arm must keep winning."""
-        result = _parse_claude_output(
+        result = parse_claude_output(
             _fast_exit_subprocess(
                 stderr='killed\n', timed_out=True, transcript_turns=3
             )
@@ -131,13 +131,13 @@ class TestParseClaudeOutputMintsCliInputRejectedSubtype:
     def test_marker_on_a_timed_out_run_is_not_a_rejection(self):
         """A KILLED run is not a pre-turn rejection, even if the marker text
         happens to be on stderr: the timeout arms stay authoritative."""
-        killed_with_marker = _parse_claude_output(
+        killed_with_marker = parse_claude_output(
             _fast_exit_subprocess(timed_out=True, transcript_turns=3)
         )
         assert killed_with_marker.subtype == 'error_timeout_killed_with_progress'
         assert is_cli_invocation_rejected(killed_with_marker) is False
 
-        killed_no_progress = _parse_claude_output(
+        killed_no_progress = parse_claude_output(
             _fast_exit_subprocess(timed_out=True, transcript_turns=0)
         )
         assert killed_no_progress.subtype == 'error_empty_output'
@@ -178,7 +178,7 @@ class TestParseClaudeOutputMintsCliInputRejectedSubtype:
         )
 
     def test_marker_match_is_case_insensitive(self):
-        result = _parse_claude_output(
+        result = parse_claude_output(
             _fast_exit_subprocess(
                 stderr='ERROR: INPUT MUST BE PROVIDED EITHER THROUGH STDIN '
                 'OR AS A PROMPT ARGUMENT WHEN USING --PRINT\n'
@@ -193,7 +193,7 @@ class TestParseClaudeOutputMintsCliInputRejectedSubtype:
         WHY no timeout-keyed consumer ever catches this failure -- the
         predicate is keyed to the timeout family and the fast exit is not a
         timeout (``timed_out=False``)."""
-        result = _parse_claude_output(_fast_exit_subprocess())
+        result = parse_claude_output(_fast_exit_subprocess())
         assert result.timed_out is False
         assert is_zero_output_timeout(result) is False
 
@@ -207,7 +207,7 @@ class TestPredicateAndClassifierAgree:
     CLI_INPUT_REJECTED rule (which builds the escalation summary) originally
     keyed on DIFFERENT evidence: the predicate on
     success/timed_out/turns/cost + the stderr markers, the rule purely on
-    ``subtype``.  Since ``_parse_claude_output`` mints that subtype only
+    ``subtype``.  Since ``parse_claude_output`` mints that subtype only
     inside its empty-stdout branch, a rejection that emitted some stdout --
     or one whose subtype a caller stamped by hand -- could be retried as a
     rejection and then reported as EMPTY_OUTPUT.  Each now consults the
@@ -243,7 +243,7 @@ class TestPredicateAndClassifierAgree:
                 {'stderr': 'some other terminal noise\n'}, id='subtype_only'
             ),
             # Stderr only: a rejection that emitted stdout never entered
-            # _parse_claude_output's empty-stdout branch, so no subtype was
+            # parse_claude_output's empty-stdout branch, so no subtype was
             # minted.  The retry layer fires on it, so the classifier must too.
             pytest.param(
                 {'subtype': '', 'output': 'partial banner text'},
@@ -306,7 +306,7 @@ class TestPredicateAndClassifierAgree:
         """A hand-stamped subtype on a BILLED run is contradictory evidence,
         and the two layers deliberately resolve it differently.
 
-        The shape is unreachable from our own parser: ``_parse_claude_output``
+        The shape is unreachable from our own parser: ``parse_claude_output``
         mints ``error_cli_input_rejected`` only when stdout is empty, and an
         empty stdout is exactly the case where turns/cost were never parsed
         (so both are 0).  Only a hand-stamp produces it.
@@ -335,7 +335,7 @@ class TestClassifyAgentFailureCliInputRejected:
 
     @staticmethod
     def _fast_exit_result() -> AgentResult:
-        return _parse_claude_output(_fast_exit_subprocess())
+        return parse_claude_output(_fast_exit_subprocess())
 
     def test_kind_value_is_stable(self):
         assert AgentFailureKind.CLI_INPUT_REJECTED.value == 'cli_input_rejected'
@@ -391,7 +391,7 @@ class TestClassifyAgentFailureCliInputRejected:
     def test_plain_empty_output_still_classifies_as_empty_output(self):
         """REGRESSION: the existing generic rule is untouched."""
         cls = classify_agent_failure(
-            _parse_claude_output(_fast_exit_subprocess(stderr='unrelated\n'))
+            parse_claude_output(_fast_exit_subprocess(stderr='unrelated\n'))
         )
         assert cls.kind is AgentFailureKind.EMPTY_OUTPUT
         assert cls.summary == 'agent returned empty output'
@@ -424,7 +424,7 @@ class TestClassifyInvocationCliInputRejectedIsNotACap:
         assert CLI_INPUT_REQUIRED_MARKERS
 
     def test_fast_exit_classifies_as_cli_local_error_not_unclassified(self):
-        result = _parse_claude_output(_fast_exit_subprocess())
+        result = parse_claude_output(_fast_exit_subprocess())
         outcome = classify_invocation(result, strict_confirm=True, backend='claude')
         assert isinstance(outcome, CliLocalError), (
             f'expected CliLocalError so the cap safety-net escape fires, got '
@@ -503,7 +503,7 @@ class TestCliInputRejectedIsNeverReportedAsACapHit:
         """duration_ms=2100 -- deliberately INSIDE the pre-existing ``< 5000``
         heuristic cap-safety-net window, unlike the 17331ms observed instance
         that escaped it by luck."""
-        return _parse_claude_output(_fast_exit_subprocess(duration_ms=2100))
+        return parse_claude_output(_fast_exit_subprocess(duration_ms=2100))
 
     async def test_no_account_is_ever_reported_capped(self):
         gate = make_gate_mock(account_count=2)
@@ -566,12 +566,12 @@ def _rejected(duration_ms: int = 2100) -> AgentResult:
     """A pre-turn CLI rejection.  Defaults to a SUB-5s duration, i.e. inside
     the heuristic cap-safety-net window, so these drives also pin that the new
     retry branch sits ABOVE that net."""
-    return _parse_claude_output(_fast_exit_subprocess(duration_ms=duration_ms))
+    return parse_claude_output(_fast_exit_subprocess(duration_ms=duration_ms))
 
 
 def _plain_empty_output() -> AgentResult:
     """The generic empty-output failure -- same shape, no marker on stderr."""
-    return _parse_claude_output(_fast_exit_subprocess(stderr='some unrelated noise\n'))
+    return parse_claude_output(_fast_exit_subprocess(stderr='some unrelated noise\n'))
 
 
 def _succeeded() -> AgentResult:
@@ -898,33 +898,29 @@ class TestNonBlankPromptPrecondition:
     """
 
     @staticmethod
-    def _patched_dispatch():
-        """Patch the subprocess spawn AND argv build so a leak past the guard
-        is visible as a call rather than a real ``claude`` process."""
-        return (
-            patch(
-                'shared.cli_invoke._run_subprocess',
-                new_callable=AsyncMock,
-                return_value=_SubprocessResult(
-                    stdout='', stderr='', returncode=0, duration_ms=10
-                ),
-            ),
-            patch(
-                'shared.cli_invoke.build_claude_argv',
-                return_value=(['claude', '--print'], []),
-            ),
+    def _dispatch_doubles():
+        """A runner AND a patched argv build, so a leak past the guard is
+        visible as a call rather than a real ``claude`` process."""
+        runner = AsyncMock(
+            return_value=SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=10),
         )
+        argv_patch = patch(
+            'shared.cli_invoke.build_claude_argv',
+            return_value=(['claude', '--print'], []),
+        )
+        return runner, argv_patch
 
     async def _assert_no_dispatch(self, prompt, **kwargs):
-        run_patch, argv_patch = self._patched_dispatch()
-        with run_patch as run_mock, argv_patch as argv_mock, pytest.raises(ValueError):
+        runner, argv_patch = self._dispatch_doubles()
+        with argv_patch as argv_mock, pytest.raises(ValueError):
             await invoke_claude_agent(
                 prompt=prompt,
                 system_prompt='sys',
                 cwd=Path('/tmp'),
+                runner=runner,
                 **kwargs,
             )
-        run_mock.assert_not_called()
+        runner.assert_not_called()
         argv_mock.assert_not_called()
 
     async def test_empty_prompt_raises_before_any_subprocess(self):
@@ -1002,14 +998,15 @@ class TestNonBlankPromptPrecondition:
 
     async def test_a_normal_prompt_still_dispatches(self):
         """REGRESSION: the guard must not narrow the happy path."""
-        run_patch, argv_patch = self._patched_dispatch()
-        with run_patch as run_mock, argv_patch:
+        runner, argv_patch = self._dispatch_doubles()
+        with argv_patch:
             await invoke_claude_agent(
                 prompt='a real prompt',
                 system_prompt='sys',
                 cwd=Path('/tmp'),
+                runner=runner,
             )
-        run_mock.assert_called_once()
+        runner.assert_called_once()
 
     async def test_a_normal_prompt_still_dispatches_through_cap_retry(self):
         gate = make_gate_mock(account_count=2)
