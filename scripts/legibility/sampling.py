@@ -269,26 +269,12 @@ def dedupe_shapes(records: Sequence[ScoredRecord]) -> list[ScoredRecord]:
 # stratified_sample — budget-after-stratification sampler (PRD §5.2 point 2, §8.4)
 # ---------------------------------------------------------------------------
 
-DEFAULT_DIGEST_MAX_BYTES = 15360
-"""The PRD §7.2 per-digest soft cap, in bytes.
-
-``nightly.DEFAULT_MAX_DIGEST_BYTES`` is an ALIAS of this name, not a second
-definition — the two spellings are one word-order swap apart, so independent
-literals would drift invisibly. :func:`legibility.digest.build_digest`'s own
-``max_bytes`` default is still a separate literal (``digest.py`` is outside
-task 3268's scope); ``TestDigestByteCostFn`` pins the two equal so drift
-fails a test.
-
-Used by :func:`stratified_sample` as its conservative flat per-record charge
-when no ``cost_fn`` is injected, and as :func:`digest_byte_cost_fn`'s default
-render cap. Charging it flat over-estimates any realistic digest — but do NOT
-build a hard-cap invariant on that. §7.2 is a SOFT cap:
-:func:`legibility.digest._truncate_sections` stops trimming once every section
-is empty "even if the (now section-free) digest is still over the cap — a soft
-cap can't shrink the frontmatter itself". A digest whose frontmatter alone
-exceeds *max_bytes* (a pathological ``cwd``/``session`` value, or a very small
-injected cap) therefore renders LARGER than this constant, and neither the flat
-fallback nor this value is a bound in that case."""
+DEFAULT_DIGEST_MAX_BYTES = digest.DEFAULT_MAX_BYTES
+"""An alias of :data:`legibility.digest.DEFAULT_MAX_BYTES`, the PRD §7.2
+per-digest soft cap. :func:`stratified_sample` charges it flat per record when
+no ``cost_fn`` is injected, and it is :func:`digest_byte_cost_fn`'s default
+render cap. The flat charge over-estimates any realistic digest but is not a
+bound: see :data:`legibility.digest.DEFAULT_MAX_BYTES` on the cap being soft."""
 
 
 def render_cache_key(path: Path, max_bytes: int, renderer) -> tuple:
