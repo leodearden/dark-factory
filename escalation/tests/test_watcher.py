@@ -132,6 +132,18 @@ class TestNtfyRequest:
         assert req.get_header('Tags') == 'rotating_light'
 
 
+def _outage(url: str, esc: Escalation) -> None:
+    raise RuntimeError('simulated ntfy outage')
+
+
+class _RecordingSender:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, url: str, esc: Escalation) -> None:
+        self.calls.append((url, esc.id))
+
+
 class TestEmitNtfyFailure:
     """A dropped push must be countable, and must cost the operator nothing else.
 
@@ -139,22 +151,15 @@ class TestEmitNtfyFailure:
     — watcher.py was the one module in the package with no logger, so the
     failure never reached the stream the watcher's other failures travel, and
     carried no marker an operator or skill agent could grep for.  Because
-    `_emit` runs at most once per process (both call sites `sys.exit(0)` on
+    `_emit` runs at most once per process (its one call site in main exits on
     the next line), the only countable unit is the marker line itself,
     aggregated across the re-arm loop's stderr.
     """
 
-    @staticmethod
-    def _failing_ntfy():
-        return patch(
-            'escalation.watcher._send_ntfy',
-            side_effect=RuntimeError('simulated ntfy outage'),
-        )
-
     def test_failure_logs_the_marker_at_error(self, blocking_escalation: Escalation, caplog):
         """(a) ERROR on escalation.watcher, carrying marker + id + cause."""
-        with self._failing_ntfy(), caplog.at_level(logging.ERROR, logger='escalation.watcher'):
-            _emit(blocking_escalation, 'https://ntfy.sh/t')
+        with caplog.at_level(logging.ERROR, logger='escalation.watcher'):
+            _emit(blocking_escalation, 'https://ntfy.sh/t', send=_outage)
 
         matching = [
             r for r in caplog.records
@@ -187,8 +192,7 @@ class TestEmitNtfyFailure:
         writes to stderr.  `TestMarkerReachesRealStderr` below pins that
         delivery, in a real child process, where it can actually be observed.
         """
-        with self._failing_ntfy():
-            _emit(blocking_escalation, 'https://ntfy.sh/t')
+        _emit(blocking_escalation, 'https://ntfy.sh/t', send=_outage)
 
         assert capsys.readouterr().err == '', (
             'The failure must go through logging, not a bare print to stderr'
@@ -203,8 +207,7 @@ class TestEmitNtfyFailure:
         without `2>&1`, so a diagnostic leaking there would break every
         consumer.
         """
-        with self._failing_ntfy():
-            _emit(blocking_escalation, 'https://ntfy.sh/t')
+        _emit(blocking_escalation, 'https://ntfy.sh/t', send=_outage)
 
         parsed = json.loads(capsys.readouterr().out)
         assert parsed['id'] == blocking_escalation.id, f'Unexpected stdout payload: {parsed}'
@@ -212,8 +215,7 @@ class TestEmitNtfyFailure:
 
     def test_failure_does_not_raise(self, blocking_escalation: Escalation):
         """(d) The push is best-effort — its failure never propagates."""
-        with self._failing_ntfy():
-            _emit(blocking_escalation, 'https://ntfy.sh/t')  # must not raise
+        _emit(blocking_escalation, 'https://ntfy.sh/t', send=_outage)  # must not raise
 
     def test_successful_push_logs_no_error(self, blocking_escalation: Escalation, caplog):
         """(d) A working push raises no false outage signal.
@@ -222,9 +224,13 @@ class TestEmitNtfyFailure:
         the countable unit of an OUTAGE, so a success line carrying the same
         prefix would make every count of it wrong.
         """
-        with patch('escalation.watcher._send_ntfy'), caplog.at_level(logging.DEBUG):
-            _emit(blocking_escalation, 'https://ntfy.sh/t')
+        sender = _RecordingSender()
+        with caplog.at_level(logging.DEBUG):
+            _emit(blocking_escalation, 'https://ntfy.sh/t', send=sender)
 
+        assert sender.calls == [('https://ntfy.sh/t', blocking_escalation.id)], (
+            f'The push must be sent exactly once to the given URL: {sender.calls}'
+        )
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
             f'A successful push must log no ERROR; got: '
             f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
@@ -232,6 +238,14 @@ class TestEmitNtfyFailure:
         assert not [
             r for r in caplog.records if 'WATCHER_NTFY_OUTCOME' in r.getMessage()
         ], 'The marker must mean a DROPPED push and nothing else'
+
+    def test_no_url_sends_nothing(self, blocking_escalation: Escalation, capsys):
+        """Without --ntfy-url the escalation is still printed, and no push is attempted."""
+        sender = _RecordingSender()
+        _emit(blocking_escalation, None, send=sender)
+
+        assert sender.calls == []
+        assert json.loads(capsys.readouterr().out)['id'] == blocking_escalation.id
 
 
 class TestMarkerReachesRealStderr:
