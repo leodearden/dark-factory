@@ -36,6 +36,7 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.escalation_rulings import Ruling
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.lock_table import UncontestedAcquisition
@@ -496,12 +497,14 @@ class FakeBriefing:
         self, task: dict, worktree=None, context: str | None = None,
         *, include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Plan task: {task.get("title", "")}'
 
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict, worktree=None,
         context: str | None = None,
+        *, rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Complete partial plan: {task.get("title", "")}'
 
@@ -509,7 +512,8 @@ class FakeBriefing:
         self, plan: dict, context: str | None = None,
         rebase_notice: dict | None = None, task_id: str | None = None,
         wip_notice: list[dict] | None = None,
-        *, scope_drift=None,
+        *, rulings: Sequence[Ruling] = (),
+        scope_drift=None,
     ) -> str:
         return 'Implement the plan'
 
@@ -517,6 +521,7 @@ class FakeBriefing:
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
         *, attempt_context=None, scope_drift=None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Fix: {failures[:100]}'
 
@@ -525,6 +530,7 @@ class FakeBriefing:
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
         open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         # `amendment_suggestions` is keyword-only in both the Protocol and
         # the production method; it was positional-or-keyword here, which is
@@ -536,6 +542,7 @@ class FakeBriefing:
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
         open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         first_path = subject.change.files[0].path if subject.change.files else ''
         return f'Review-d2 ({reviewer_type}): {first_path}'
@@ -572,14 +579,15 @@ class FakeBriefing:
     async def build_amender_prompt(
         self, plan: dict, suggestions: list, locked_modules: list,
         context: str | None = None, task_id: str | None = None,
-        *, scope_drift=None,
+        *, rulings: Sequence[Ruling] = (),
+        scope_drift=None,
     ) -> str:
         return 'Amend the plan'
 
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict, changed_files: list,
         worktree=None, context: str | None = None, *, text_drift=None,
-        integrity_refusal=None,
+        integrity_refusal=None, rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 
@@ -596,11 +604,13 @@ class FakeBriefing:
 
     async def build_replan_prompt(
         self, task: dict, review_feedback: str, context: str | None = None,
+        *, rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Replan: {review_feedback[:100]}'
 
     async def build_simple_task_prompt(
         self, task: dict, worktree=None, context: str | None = None,
+        *, rulings: Sequence[Ruling] = (),
     ) -> str:
         return f'Simple task: {task.get("title", "")}'
 

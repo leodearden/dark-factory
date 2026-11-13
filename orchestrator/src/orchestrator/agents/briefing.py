@@ -26,6 +26,12 @@ from orchestrator.agents.review_briefing import (
     review_action_section,
 )
 from orchestrator.config import OrchestratorConfig
+from orchestrator.escalation_rulings import (
+    Ruling,
+    RulingAudience,
+    one_line,
+    render_rulings_section,
+)
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
 from orchestrator.scope_drift import ScopeDriftReport
@@ -104,19 +110,21 @@ def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
     return f"""\
 ## {note.id}
 
-- filed by: {_one_line(note.agent_role)}
+- filed by: {one_line(note.agent_role)}
 - filed at: {note.timestamp}
-- summary: {_one_line(note.summary)}
-- suggested action: {_one_line(note.suggested_action) or '(none)'}
+- summary: {one_line(note.summary)}
+- suggested action: {one_line(note.suggested_action) or '(none)'}
 - detail:
 
 {quoted}
 """
 
 
-def _one_line(text: str | None) -> str:
-    """*text* with its line breaks collapsed, so a field cannot start a heading of its own; null reads as empty."""
-    return ' '.join((text or '').split())
+def _with_review_rulings(prompt: str, rulings: Sequence[Ruling]) -> str:
+    """*prompt* with the reviewer's rulings block appended; no rulings leave it byte-identical."""
+    section = render_rulings_section(rulings, RulingAudience.REVIEW)
+    return prompt + '\n' + section if section else prompt
+
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -581,6 +589,7 @@ class BriefingAssembler:
         *,
         include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt for the architect agent.
 
@@ -601,6 +610,7 @@ class BriefingAssembler:
                 None or empty — the truly-fresh first dispatch — the prompt is
                 byte-identical to the pre-γ baseline, so nothing is added on
                 the common path.
+            rulings: rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
         """
         preamble = await self._task_preamble(
             task, 'architect', context, include_files=False,
@@ -655,7 +665,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 {preamble}
 
 {prior_proposal_section}{committed_section}
-# Action
+{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
 2. Produce a TDD implementation plan using the plan-tools MCP tools:
@@ -678,6 +688,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         *,
         text_drift: TaskTextDrift | None = None,
         integrity_refusal: DoneStepIntegrityVerdict | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt for the architect to revalidate a plan after blast-radius requeue.
 
@@ -685,6 +696,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         locks were contended.  Main has since advanced (the contending task
         merged).  The architect reviews the existing plan against the changes
         and either confirms, updates, or recreates it.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
         """
         preamble = await self._task_preamble(task, 'architect', context)
         prior_proposal_section = self._format_prior_proposal(task)
@@ -719,6 +732,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         notice = _TEXT_DRIFT_NOTICES[text_drift] if text_drift is not None else ''
         text_drift_section = f'{notice}\n\n' if notice else ''
         refusal_section = _integrity_refusal_section(integrity_refusal)
+        rulings_section = render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)
         dispositions = ', '.join(f'`{d}`' for d in sorted(DESCOPE_DISPOSITIONS))
 
         return f"""\
@@ -744,7 +758,7 @@ and either confirm it, update it, or recreate it from scratch.
 
 {files_section}
 
-{refusal_section}## Action
+{refusal_section}{rulings_section}## Action
 
 1. Read the overlapping files (if any) to understand what changed.
 2. Decide whether your plan is still valid.
@@ -774,6 +788,8 @@ and either confirm it, update it, or recreate it from scratch.
         partial_plan: dict,
         worktree: Path | None = None,  # noqa: ARG002 — interface symmetry
         context: str | None = None,
+        *,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt to finish a partial plan left by an interrupted session.
 
@@ -784,6 +800,8 @@ and either confirm it, update it, or recreate it from scratch.
         whatever is missing, then finalize. The architect may also discard the
         partial entirely (``create_plan`` overwrites it) if it reflects a
         flawed approach.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
         """
         preamble = await self._task_preamble(task, 'architect', context)
 
@@ -808,7 +826,7 @@ to start over from nothing.
 {plan_json}
 ```
 
-## Action
+{render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)}## Action
 
 1. Read the relevant files to re-ground yourself in the task and verify the
    existing steps are still correct against the CURRENT state of the codebase
@@ -999,12 +1017,16 @@ without calling `confirm_plan()` and the task will be re-planned.
         task: dict,
         review_feedback: str,
         context: str | None = None,
+        *,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Architect pass that extends the plan to answer blocking review issues.
 
         The plan is never copied into the prompt: plan.json is its single home,
         read through the lane's ``.task/plan.json``, so a replayed prompt cannot
         show stale steps.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
         """
         preamble = await self._task_preamble(task, 'architect', context)
 
@@ -1017,7 +1039,7 @@ The implementation was reviewed and blocking issues were found.
 
 {review_feedback}
 
-## Action
+{render_rulings_section(rulings, RulingAudience.PLAN, heading_level=2)}## Action
 
 1. Read `.task/plan.json` for the current plan and each step's status — it
    is not reproduced here.
@@ -1038,6 +1060,8 @@ The implementation was reviewed and blocking issues were found.
         task: dict,
         worktree: Path | None = None,
         context: str | None = None,
+        *,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt for the SIMPLE_TASK agent (Lever C).
 
@@ -1047,6 +1071,9 @@ The implementation was reviewed and blocking issues were found.
         the task preamble and the listed files. Once the agent marks its step
         done, the orchestrator advances to VERIFY without invoking the
         implementer.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the
+        PLAN_AND_EXECUTE audience, since this one agent both plans and implements.
         """
         preamble = await self._task_preamble(task, 'simple_task', context)
 
@@ -1060,7 +1087,7 @@ The implementation was reviewed and blocking issues were found.
         return f"""\
 {preamble}
 
-# Action
+{render_rulings_section(rulings, RulingAudience.PLAN_AND_EXECUTE)}# Action
 
 Make this change end-to-end in this one session, following the workflow in
 your role instructions; it also says when to stop and which exit to report
@@ -1077,6 +1104,7 @@ instead.
         task_id: str | None = None,
         wip_notice: list[dict] | None = None,
         *,
+        rulings: Sequence[Ruling] = (),
         scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the implementer agent.
@@ -1089,7 +1117,8 @@ instead.
         (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
         orchestrator/tests/test_briefing_progress_spot.py. The Action paragraph
         follows config.implementer_brief_variant and, for the same reason, names
-        no step id.
+        no step id. *rulings* are rendered by ``orchestrator/escalation_rulings.py``
+        for the EXECUTE audience.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1188,7 +1217,7 @@ Before writing any new code, walk the pending steps in plan order:
    instead of re-implementing from scratch. Only write new code if the
    step is genuinely unsatisfied by what's already on disk.
 
-# Action
+{render_rulings_section(rulings, RulingAudience.EXECUTE)}# Action
 
 {_implementer_action(self.config.implementer_brief_variant)}
 """
@@ -1201,6 +1230,7 @@ Before writing any new code, walk the pending steps in plan order:
         context: str | None = None,
         task_id: str | None = None,
         *,
+        rulings: Sequence[Ruling] = (),
         scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for an amendment pass — implementer applies in-scope
@@ -1224,6 +1254,8 @@ Before writing any new code, walk the pending steps in plan order:
         Renders NO iteration history (task 5744), for the same reason as
         :meth:`build_implementer_prompt`: iterations.jsonl is its single home
         and the Action section below mandates reading it.
+
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the EXECUTE audience.
 
         Rule 3 tells the agent not to file a scope request in this pass; one
         filed anyway is still applied at the pass boundary
@@ -1301,7 +1333,7 @@ This task holds locks for the following modules:
 
 {suggestions_body}
 
-# Action
+{render_rulings_section(rulings, RulingAudience.EXECUTE)}# Action
 
 1. Read `.task/plan.json` and `.task/iterations.jsonl` to refresh context on
    what was already done.
@@ -1316,6 +1348,7 @@ This task holds locks for the following modules:
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
         *, attempt_context: VerifyAttemptContext | None = None,
+        rulings: Sequence[Ruling] = (),
         scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the debugger agent.
@@ -1323,6 +1356,8 @@ This task holds locks for the following modules:
         *attempt_context* adds a ``# Verify Attempt`` section naming the
         failed attempt and the causes of earlier ones in the same loop; with
         ``None`` the prompt is byte-identical to the attempt-less form.
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the
+        EXECUTE audience.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1349,7 +1384,7 @@ This task holds locks for the following modules:
 {failures}
 ```
 
-# Action
+{render_rulings_section(rulings, RulingAudience.EXECUTE)}# Action
 
 1. Analyze the root cause of each failure.
 2. Make minimal, targeted fixes.
@@ -1363,6 +1398,7 @@ This task holds locks for the following modules:
         task: dict | None = None,
         diff_cap_chars: int = DIFF_ONLY_DIFF_CAP_CHARS,
         open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build prompt for a reviewer agent.
 
@@ -1386,7 +1422,9 @@ This task holds locks for the following modules:
         Production callers leave the default.
 
         *open_info_notes* lists the task's open info notes for the reviewer to
-        disposition; none leaves the prompt byte-identical.
+        disposition; none leaves the prompt byte-identical. *rulings* are
+        rendered by ``orchestrator/escalation_rulings.py`` for the REVIEW
+        audience, ahead of the notes.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
@@ -1412,19 +1450,21 @@ This task holds locks for the following modules:
         if amendment_suggestions:
             prompt += '\n' + amendment_scope_section(amendment_suggestions)
 
+        prompt = _with_review_rulings(prompt, rulings)
         return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
 
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
         open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         """Build the context-complete (D2) reviewer prompt for *subject*.
 
         Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
         scopes it; the rendering lives in ``agents/review_briefing.py``.
-        *open_info_notes* is appended exactly as :meth:`build_reviewer_prompt`
-        appends it.
+        *open_info_notes* and *rulings* are appended exactly as
+        :meth:`build_reviewer_prompt` appends them.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
@@ -1435,6 +1475,7 @@ This task holds locks for the following modules:
             task_block=self._format_task(subject.task, include_test_strategy=True),
             amendment_suggestions=amendment_suggestions,
         )
+        prompt = _with_review_rulings(prompt, rulings)
         return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
 
     def _with_open_info_notes(

@@ -8,10 +8,12 @@ evidence is in frame. Decision, rationale and known gaps: docs/eval-replay-frame
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import OrchestratorConfig
+from orchestrator.escalation_rulings import Ruling
 
 # Bump whenever the block text changes materially, so one id means one briefing.
 REPLAY_FRAME_ID = 'honest-frame-v1'
@@ -75,9 +77,11 @@ class ReplayFramedBriefingAssembler(BriefingAssembler):
         *,
         include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         return await super().build_architect_prompt(
             task, worktree, context,
             include_prior_proposals=include_prior_proposals,
             committed_work=committed_work,
+            rulings=rulings,
         ) + build_replay_frame_block(self._base_commit)

@@ -41,6 +41,7 @@ from orchestrator.config import (
     TimeoutsConfig,
     UnblockAutoConfig,
 )
+from orchestrator.escalation_rulings import Ruling
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.mcp.verdict_tools import _envelope
@@ -151,6 +152,7 @@ class NoteRecordingBriefing(FakeBriefing):
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
         open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         self._record(ReviewBriefing.DIFF_ONLY, open_info_notes)
         return await super().build_reviewer_prompt(reviewer_type, diff, context)
@@ -159,6 +161,7 @@ class NoteRecordingBriefing(FakeBriefing):
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
         open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         self._record(ReviewBriefing.CONTEXT_COMPLETE, open_info_notes)
         return await super().build_context_complete_reviewer_prompt(reviewer_type, subject, context)
@@ -221,14 +224,14 @@ class RouterRun:
         )
         return self.workflow
 
-    def fail_the_first_queue_read_after_verification(self) -> None:
-        """The reviewer's note read is the first queue read once verification passes."""
+    def fail_the_first_note_read_after_verification(self) -> None:
+        """The reviewer's note read is the first pending-record read once verification passes."""
         armed = False
         read = self.queue.get_by_task
 
         def get_by_task(*args, **kwargs):
             nonlocal armed
-            if armed:
+            if armed and kwargs.get('status') == 'pending':
                 armed = False
                 raise OSError('disk unreadable')
             return read(*args, **kwargs)

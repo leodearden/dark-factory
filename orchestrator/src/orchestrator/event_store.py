@@ -96,6 +96,14 @@ class EventType(StrEnum):
     #   reviewer-leg disposition, which is made at no exit; ticket: the
     #   curator ticket id, or null; decided_at: ISO-8601 UTC.
     info_l0_dispositioned = 'info_l0_dispositioned'
+    # A briefing carried the task's escalation rulings (task 4764).  Producer:
+    # orchestrator/workflow.py::TaskWorkflow._record_rulings_briefed, once per
+    # build that found any and, for a review round, which reads the rulings
+    # once, once per reviewer briefed; the role column is the briefed role.
+    # data: {escalation_ids, since}
+    #   escalation_ids: the rulings listed, oldest first; since: the ISO-8601
+    #   plan-confirmation cutoff they were selected after, or null for every ruling.
+    escalation_rulings_briefed = 'escalation_rulings_briefed'
 
     # Waste detection
     waste_detected = 'waste_detected'

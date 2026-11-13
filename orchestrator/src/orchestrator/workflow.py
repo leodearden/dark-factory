@@ -119,6 +119,7 @@ from orchestrator.escalation_router import (
     reviewer_notes,
     router_owns,
 )
+from orchestrator.escalation_rulings import Ruling, plan_confirmed_at, select_rulings
 from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
@@ -647,6 +648,7 @@ class _BriefingLike(Protocol):
         self, task: dict, worktree: Path | None = ..., context: str | None = ...,
         *, include_prior_proposals: bool = ...,
         committed_work: list[dict] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -664,18 +666,21 @@ class _BriefingLike(Protocol):
         self, plan: dict, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
         wip_notice: list[dict] | None = ...,
-        *, scope_drift: ScopeDriftReport | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
+        scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_amender_prompt(
         self, plan: dict,
         suggestions: list[dict], locked_modules: list[str],
         context: str | None = ..., task_id: str | None = ...,
-        *, scope_drift: ScopeDriftReport | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
+        scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
         *, attempt_context: VerifyAttemptContext | None = ...,
+        rulings: Sequence[Ruling] = ...,
         scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
@@ -683,11 +688,13 @@ class _BriefingLike(Protocol):
         *, amendment_suggestions: list[dict] | None = ...,
         task: dict | None = ...,
         open_info_notes: Sequence[Escalation] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
         open_info_notes: Sequence[Escalation] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str: ...
     async def build_revalidation_prompt(
@@ -696,10 +703,12 @@ class _BriefingLike(Protocol):
         context: str | None = ...,
         *, text_drift: TaskTextDrift | None = ...,
         integrity_refusal: DoneStepIntegrityVerdict | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict,
         worktree: Path | None = ..., context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_plan_tightening_prompt(
         self, task: dict, plan: dict, not_touched: list[str],
@@ -710,10 +719,12 @@ class _BriefingLike(Protocol):
     ) -> str: ...
     async def build_replan_prompt(
         self, task: dict, review_feedback: str, context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_simple_task_prompt(
         self, task: dict, worktree: Path | None = ...,
         context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_completion_judge_prompt(
         self, plan: dict, iteration_log: list[dict], diff: str,
@@ -5566,6 +5577,7 @@ class TaskWorkflow:
                 return await self.briefing.build_plan_completion_prompt(
                     self.task, self._live_plan() or existing_plan,
                     worktree=self.worktree,
+                    rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
                 )
 
             build_prompt = build_completion_prompt
@@ -5614,11 +5626,13 @@ class TaskWorkflow:
                 # (e.g. blast-radius lock denied) — fall through.
 
             changed_files = revalidation_changed_files
+            confirmed_at = plan_confirmed_at(existing_plan)
 
             async def build_revalidation_prompt() -> str:
                 return await self.briefing.build_revalidation_prompt(
                     self.task, self._live_plan() or existing_plan, changed_files,
                     worktree=self.worktree, text_drift=text_drift,
+                    rulings=await self._escalation_rulings(ARCHITECT.name, since=confirmed_at),
                 )
 
             build_prompt = build_revalidation_prompt
@@ -5669,6 +5683,7 @@ class TaskWorkflow:
                     self.task, worktree=self.worktree,
                     include_prior_proposals=include_prior_proposals,
                     committed_work=committed_work,
+                    rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
                 )
 
             build_prompt = build_fresh_prompt
@@ -6021,12 +6036,14 @@ class TaskWorkflow:
         if verdict.passed:
             return None
         assert self.worktree is not None
+        confirmed_at = plan_confirmed_at(before)
 
         async def build_remedy_prompt() -> str:
             return await self.briefing.build_revalidation_prompt(
                 self.task, self._live_plan(), changed_files,
                 worktree=self.worktree, text_drift=text_drift,
                 integrity_refusal=verdict,
+                rulings=await self._escalation_rulings(ARCHITECT.name, since=confirmed_at),
             )
 
         if outcome := await self._run_architect_for_plan(build_remedy_prompt):
@@ -6328,10 +6345,11 @@ class TaskWorkflow:
         """
         assert self.worktree is not None and self.artifacts is not None
 
-        build_prompt = partial(
-            self.briefing.build_simple_task_prompt,
-            self.task, worktree=self.worktree,
-        )
+        async def build_prompt() -> str:
+            return await self.briefing.build_simple_task_prompt(
+                self.task, worktree=self.worktree,
+                rulings=await self._escalation_rulings(SIMPLE_TASK.name, since=None),
+            )
 
         try:
             result = await self._invoke(SIMPLE_TASK, build_prompt, self.worktree)
@@ -10478,6 +10496,9 @@ class TaskWorkflow:
         return await self.briefing.build_implementer_prompt(
             plan, rebase_notice=rebase_notice,
             task_id=self.task_id, wip_notice=await self._detect_tip_wip_commits(plan),
+            rulings=await self._escalation_rulings(
+                IMPLEMENTER.name, since=plan_confirmed_at(plan),
+            ),
             scope_drift=scope_drift,
         )
 
@@ -11288,9 +11309,13 @@ class TaskWorkflow:
                 failure_report: str = failure_report,
                 attempt_context: VerifyAttemptContext = attempt_context,
             ) -> str:
+                plan = self._live_plan()
                 return await self.briefing.build_debugger_prompt(
-                    failure_report, self._live_plan(), task_id=self.task_id,
+                    failure_report, plan, task_id=self.task_id,
                     attempt_context=attempt_context,
+                    rulings=await self._escalation_rulings(
+                        DEBUGGER.name, since=plan_confirmed_at(plan),
+                    ),
                     scope_drift=scope_drift,
                 )
 
@@ -11614,6 +11639,7 @@ class TaskWorkflow:
         amendment_suggestions = (
             amendment_ctx.amended_suggestions if amendment_ctx is not None else None
         )
+        rulings = await self._read_rulings(since=None, briefed='review round')
         stagger = self.config.reviewer_stagger_secs
 
         # Staggered launch — spread OAuth session creation
@@ -11622,6 +11648,7 @@ class TaskWorkflow:
                 await asyncio.sleep(idx * stagger)
             return await self._run_reviewer(
                 role, diff, amendment_suggestions=amendment_suggestions, subject=subject,
+                rulings=rulings,
             )
 
         tasks = [_staggered(i, r) for i, r in enumerate(roster)]
@@ -11641,7 +11668,7 @@ class TaskWorkflow:
                     results[i] = await self._run_reviewer(
                         roster[i], diff,
                         amendment_suggestions=amendment_suggestions,
-                        subject=subject,
+                        subject=subject, rulings=rulings,
                     )
                 except Exception as exc:
                     results[i] = exc
@@ -11787,26 +11814,30 @@ class TaskWorkflow:
         self, role: AgentRole, diff: str,
         amendment_suggestions: list[dict] | None = None,
         *, subject: ReviewSubject | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> dict:
         """Run a single reviewer and read its verdict artifact.
 
         *amendment_suggestions*, when set, threads the post-amendment advisory
         scope section into the reviewer prompt (task 2750). *subject*, when
         set, briefs the context-complete generation from it instead of *diff*.
+        *rulings* are every ruling on the task, read once per review round by
+        ``_review``.
         """
         assert self.worktree is not None and self.artifacts is not None
         notes = self._reviewer_notes()
+        self._record_rulings_briefed(role.name, rulings, since=None)
         if subject is None:
             build_prompt = partial(
                 self.briefing.build_reviewer_prompt,
                 role.name, diff, amendment_suggestions=amendment_suggestions,
-                task=self.task, open_info_notes=notes,
+                task=self.task, open_info_notes=notes, rulings=rulings,
             )
         else:
             build_prompt = partial(
                 self.briefing.build_context_complete_reviewer_prompt,
                 role.name, subject, amendment_suggestions=amendment_suggestions,
-                open_info_notes=notes,
+                open_info_notes=notes, rulings=rulings,
             )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
@@ -12019,13 +12050,21 @@ class TaskWorkflow:
         return in_scope
 
     async def _replan(self, reviews) -> None:
-        """Feed review feedback back to architect for re-planning."""
+        """Feed review feedback back to architect for re-planning.
+
+        The architect answers reviewer findings, which are judged against every
+        ruling, so it is shown every ruling however recently the plan was confirmed.
+        """
         assert self.worktree is not None and self.artifacts is not None
         self.plan = self.artifacts.read_plan()
-        build_prompt = partial(
-            self.briefing.build_replan_prompt,
-            self.task, reviews.format_for_replan(),
-        )
+        feedback = reviews.format_for_replan()
+
+        async def build_prompt() -> str:
+            return await self.briefing.build_replan_prompt(
+                self.task, feedback,
+                rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
+            )
+
         await self._invoke(ARCHITECT, build_prompt, self.worktree)
         self.plan = self.artifacts.read_plan()
 
@@ -12108,11 +12147,15 @@ class TaskWorkflow:
         locked_modules = list(self.modules)
 
         async def build_prompt(scope_drift: ScopeDriftReport | None) -> str:
+            plan = self._live_plan()
             return await self.briefing.build_amender_prompt(
-                plan=self._live_plan(),
+                plan=plan,
                 suggestions=in_scope,
                 locked_modules=locked_modules,
                 task_id=self.task_id,
+                rulings=await self._escalation_rulings(
+                    IMPLEMENTER.name, since=plan_confirmed_at(plan),
+                ),
                 scope_drift=scope_drift,
             )
 
@@ -19204,6 +19247,48 @@ class TaskWorkflow:
                 self.task_id, type(exc).__name__, exc, exc_info=True,
             )
             return []
+
+    async def _escalation_rulings(
+        self, role: str, *, since: datetime | None,
+    ) -> tuple[Ruling, ...]:
+        """The task's rulings resolved after *since* to brief *role* with, recorded as briefed."""
+        rulings = await self._read_rulings(since=since, briefed=role)
+        self._record_rulings_briefed(role, rulings, since=since)
+        return rulings
+
+    async def _read_rulings(
+        self, *, since: datetime | None, briefed: str,
+    ) -> tuple[Ruling, ...]:
+        """The task's rulings resolved after *since*; a queue fault costs only the rulings.
+
+        The read scans the queue archive, so it runs off the event loop (task
+        4567).  *briefed* names the briefing in the fault's log line.
+        """
+        queue = self.escalation_queue
+        if queue is None:
+            return ()
+        try:
+            records = await asyncio.to_thread(queue.get_by_task, self.task_id, status='resolved')
+            return select_rulings(records, since=since)
+        except Exception as exc:
+            logger.warning(
+                'Task %s: reading the escalation rulings for the %s briefing failed '
+                '(%s: %s); it proceeds without them',
+                self.task_id, briefed, type(exc).__name__, exc, exc_info=True,
+            )
+            return ()
+
+    def _record_rulings_briefed(
+        self, role: str, rulings: Sequence[Ruling], *, since: datetime | None,
+    ) -> None:
+        if rulings and self.event_store:
+            self.event_store.emit(
+                EventType.escalation_rulings_briefed, task_id=self.task_id, role=role,
+                data={
+                    'escalation_ids': [ruling.escalation_id for ruling in rulings],
+                    'since': since.isoformat() if since is not None else None,
+                },
+            )
 
     def _apply_note_dispositions(self, reviews: ReviewAggregation) -> None:
         """Apply the review round's verdicts on the task's info notes (D2); a note left pending is the exit router's."""
