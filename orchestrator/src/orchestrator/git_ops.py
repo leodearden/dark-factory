@@ -16425,13 +16425,13 @@ class GitOps:
         normalized here, once, through
         ``shared/src/shared/branch_names.py::bare_queued_branch_id``. The
         worktree moves to ``quarantine_base/<bare>-<UTC-ts>``. The branch
-        ``<prefix><bare>`` is renamed to ``<prefix><bare>-<ts>`` only when the
-        moved worktree is the one holding it, and WIP is committed only onto
-        that branch being parked. A registered worktree holding another
-        branch, or none, is moved with that checkout and its WIP intact, and
-        ``outcome.branch`` is None. A dir git no longer lists as a worktree is
-        moved with a plain rename; its branch is left alone when a registered
-        worktree elsewhere holds it.
+        ``<prefix><bare>`` is renamed to ``<prefix><bare>-<ts>`` unless ANOTHER
+        registered worktree holds it; the rule is the same whether the moved
+        worktree holds it, is detached, is on another branch, or is no longer
+        registered. ``outcome.branch`` is None only when no branch was parked.
+        WIP is committed only when the moved worktree holds the branch being
+        parked; any other checkout moves with its WIP intact. A dir git no
+        longer lists as a worktree is moved with a plain rename.
 
         A relocation is recorded before this returns
         (``orchestrator/src/orchestrator/quarantine_provenance.py::record_quarantine_provenance``):
