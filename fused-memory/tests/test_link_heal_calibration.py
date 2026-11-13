@@ -411,6 +411,7 @@ class TestRunCalibration:
             row = ledger.adjudication_at(
                 item.project, item.child_id, item.parent_id,
                 text_sha256(item.child_text), text_sha256(item.parent_text),
+                model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=FAKE_PROMPT_SHA256,
             )
             if item is unanswered:
                 assert row is None

@@ -43,6 +43,8 @@ PROJECT = 'dark_factory'
 PARENT = '22222222-2222-2222-2222-222222222222'
 CHILD_SHA = 'c' * 64
 PARENT_SHA = 'p' * 64
+MODEL = 'opus'
+PROMPT_SHA = '9' * 64
 
 
 def _child(n: int) -> str:
@@ -188,7 +190,7 @@ class TestSchema:
         LinkHealLedger(db).close()
 
 
-def test_an_adjudication_written_before_prompt_versions_reads_back_with_none(tmp_path):
+def test_an_adjudication_written_before_prompt_versions_is_never_reused(tmp_path):
     db = tmp_path / 'link_heal.db'
     conn = sqlite3.connect(db)
     try:
@@ -208,13 +210,14 @@ def test_an_adjudication_written_before_prompt_versions_reads_back_with_none(tmp
 
     ledger = LinkHealLedger(db)
     try:
-        row = ledger.adjudication_at(PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA)
+        row = ledger.adjudication_at(
+            PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA,
+            model='opus', prompt_sha256=PROMPT_SHA,
+        )
     finally:
         ledger.close()
 
-    assert row is not None
-    assert row.record.prompt_sha256 is None
-    assert row.record.verdict is Verdict.SAME
+    assert row is None
 
 
 def test_a_prompt_version_round_trips(ledger):
@@ -223,7 +226,9 @@ def test_a_prompt_version_round_trips(ledger):
 
     ledger.add_adjudications(run_id, [record])
 
-    row = ledger.adjudication_at(PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA)
+    row = ledger.adjudication_at(
+        PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA, model=MODEL, prompt_sha256='d' * 64,
+    )
     assert row is not None
     assert row.record == record
 
@@ -788,6 +793,8 @@ def _record(
     parent: str = PARENT,
     child_sha: str = CHILD_SHA,
     parent_sha: str = PARENT_SHA,
+    model: str = MODEL,
+    prompt_sha256: str = PROMPT_SHA,
 ) -> AdjudicationRecord:
     return AdjudicationRecord(
         project_id=PROJECT,
@@ -797,7 +804,8 @@ def _record(
         parent_sha256=parent_sha,
         verdict=verdict,
         reason=f'reason {n}',
-        model='opus',
+        model=model,
+        prompt_sha256=prompt_sha256,
     )
 
 
@@ -823,7 +831,9 @@ class TestAdjudications:
         second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
         (newest,) = ledger.add_adjudications(second, [_record(1, verdict=Verdict.RELATED)])
 
-        row = ledger.adjudication_at(PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA)
+        row = ledger.adjudication_at(
+            PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA, model=MODEL, prompt_sha256=PROMPT_SHA,
+        )
 
         assert row is not None
         assert row.adjudication_id == newest
@@ -838,9 +848,11 @@ class TestAdjudications:
             {'child_sha256': 'd' * 64},
             {'parent_sha256': 'q' * 64},
             {'parent_id': '33333333-3333-3333-3333-333333333333'},
+            {'model': 'another-model'},
+            {'prompt_sha256': 'e' * 64},
         ],
     )
-    def test_adjudication_at_misses_on_another_text_or_parent(self, ledger, changed):
+    def test_adjudication_at_misses_on_another_text_parent_or_adjudicator(self, ledger, changed):
         run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
         ledger.add_adjudications(run_id, [_record(1)])
         lookup = {
@@ -849,10 +861,29 @@ class TestAdjudications:
             'parent_id': PARENT,
             'child_sha256': CHILD_SHA,
             'parent_sha256': PARENT_SHA,
+            'model': MODEL,
+            'prompt_sha256': PROMPT_SHA,
             **changed,
         }
 
         assert ledger.adjudication_at(**lookup) is None
+
+    def test_adjudication_at_is_the_newest_by_exactly_that_adjudicator(self, ledger):
+        first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        (own,) = ledger.add_adjudications(first, [_record(1, verdict=Verdict.SAME)])
+        second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.add_adjudications(second, [
+            _record(1, verdict=Verdict.RELATED, model='another-model'),
+            _record(1, verdict=Verdict.RELATED, prompt_sha256='e' * 64),
+        ])
+
+        row = ledger.adjudication_at(
+            PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA, model=MODEL, prompt_sha256=PROMPT_SHA,
+        )
+
+        assert row is not None
+        assert row.adjudication_id == own
+        assert row.record.verdict is Verdict.SAME
 
     def test_adjudication_verdicts_are_those_of_the_named_runs(self, ledger):
         first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)

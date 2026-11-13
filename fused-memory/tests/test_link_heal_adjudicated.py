@@ -51,7 +51,12 @@ from fused_memory.maintenance.link_heal_executor import (
     run_adjudicator_plan,
     run_apply,
 )
-from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
+from fused_memory.maintenance.link_heal_ledger import (
+    ActionState,
+    AdjudicationRecord,
+    LinkHealLedger,
+    RunSource,
+)
 from fused_memory.maintenance.link_heal_store import text_sha256
 from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.server.grouped_read import (
@@ -138,6 +143,7 @@ class TestAnAdjudicatedVerdictPlansAHeal:
         assert row.planned.basis_source is BasisSource.ADJUDICATOR
         adjudication = ledger.adjudication_at(
             DF, CHILD, PARENT, text_sha256(CHILD_TEXT), text_sha256(PARENT_TEXT),
+            model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=FAKE_PROMPT_SHA256,
         )
         assert adjudication is not None
         assert row.planned.basis_key == str(adjudication.adjudication_id)
@@ -181,6 +187,7 @@ class TestTheRecordsCarryTheAdjudication:
 
         adjudication = ledger.adjudication_at(
             DF, CHILD, PARENT, text_sha256(CHILD_TEXT), text_sha256(PARENT_TEXT),
+            model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=FAKE_PROMPT_SHA256,
         )
         assert adjudication is not None
         assert adjudication.record.prompt_sha256 == FAKE_PROMPT_SHA256
@@ -213,7 +220,7 @@ class TestTheRecordsCarryTheAdjudication:
         harness.seed_link(kind=SIGHTING_KIND)
         first = await adjudicated_plan(harness, ledger, always(Verdict.EXTENDS), tmp_path / 'a.json')
         (original,) = ledger.run_records(first.run_id)
-        later = FakeAdjudicator(lambda _text: Verdict.RELATED, prompt_sha256=SECOND_PROMPT_SHA256)
+        later = FakeAdjudicator(lambda _text: Verdict.RELATED)
 
         second = await adjudicated_plan(harness, ledger, later, tmp_path / 'b.json')
 
@@ -287,6 +294,51 @@ class TestJudgedPairsAreReused:
         assert dict(second.counts.planned_by_action) == {HealAction.RELABEL.value: 1}
 
     @pytest.mark.asyncio
+    async def test_another_prompt_version_asks_again_and_reuses_nothing(
+        self, harness, ledger, tmp_path,
+    ):
+        children = seed_sightings(harness, 3)
+        first_fake = always(Verdict.EXTENDS)
+        await adjudicated_plan(harness, ledger, first_fake, tmp_path / 'a.json')
+        later = FakeAdjudicator(lambda _text: Verdict.EXTENDS, prompt_sha256=SECOND_PROMPT_SHA256)
+
+        second = await adjudicated_plan(harness, ledger, later, tmp_path / 'b.json')
+
+        assert sorted(pair.key for pair in later.pairs) == sorted(
+            pair.key for pair in first_fake.pairs
+        )
+        assert second.counts.adjudications_reused == 0
+        found = by_child(ledger.run_records(second.run_id))
+        for n, child in enumerate(children):
+            made = ledger.adjudication_at(
+                DF, child, PARENT, text_sha256(f'sighting {n}'), text_sha256(PARENT_TEXT),
+                model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=SECOND_PROMPT_SHA256,
+            )
+            assert made is not None
+            assert made.run_id == second.run_id
+            assert made.record.prompt_sha256 == SECOND_PROMPT_SHA256
+            assert found[child].basis_key == str(made.adjudication_id)
+            assert found[child].prompt_sha256 == SECOND_PROMPT_SHA256
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_by_another_model_is_never_reused(self, harness, ledger, tmp_path):
+        harness.seed_link(kind=SIGHTING_KIND)
+        calibration = ledger.start_run(RunSource.CALIBRATION, writes=False)
+        ledger.add_adjudications(calibration, [AdjudicationRecord(
+            project_id=DF, child_id=CHILD, parent_id=PARENT,
+            child_sha256=text_sha256(CHILD_TEXT), parent_sha256=text_sha256(PARENT_TEXT),
+            verdict=Verdict.RELATED, reason='calibrated', model='another-model',
+            prompt_sha256=FAKE_PROMPT_SHA256,
+        )])
+        fake = always(Verdict.EXTENDS)
+
+        report = await adjudicated_plan(harness, ledger, fake, tmp_path / 'p.json')
+
+        assert [pair.child_text for pair in fake.pairs] == [CHILD_TEXT]
+        assert report.counts.adjudications_reused == 0
+        assert dict(report.counts.planned_by_action) == {HealAction.RELABEL.value: 1}
+
+    @pytest.mark.asyncio
     async def test_an_edited_child_is_adjudicated_again(self, harness, ledger, tmp_path):
         harness.seed_link(kind=SIGHTING_KIND)
         await adjudicated_plan(harness, ledger, always(Verdict.EXTENDS), tmp_path / 'p.json')
@@ -311,6 +363,7 @@ class TestAFailedAdjudication:
 
         assert ledger.adjudication_at(
             DF, CHILD, PARENT, text_sha256(CHILD_TEXT), text_sha256(PARENT_TEXT),
+            model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=FAKE_PROMPT_SHA256,
         ) is None
         assert ledger.adjudication_verdicts({report.run_id}) == []
         assert report.counts.adjudication_failed == 1
