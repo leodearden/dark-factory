@@ -16,10 +16,12 @@ from typing import Any
 
 import pytest
 from _merge_lane_fakes import RecordingEscalations, lane_scene_config
+from _reviewer_trial_mining_fixtures import build_synthetic_runs_db
 from escalation.categories import EscalationCategory
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.event_store import EventType
+from orchestrator.evals.reviewer_trial.mining import mine_fn_candidates
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.types import (
     DecidedItem,
@@ -235,10 +237,11 @@ class TestAlarmVerifyBaseDivergence:
         alarm_verify_base_divergence(escalations, divergence, event_store=events)
 
         [filed] = escalations.filed
+        assert filed.task_id == VERIFY_BASE_DIVERGENCE_SENTINEL
         assert events.emitted == [(
             EventType.escalation_created,
             {
-                'task_id': divergence.task_id,
+                'task_id': filed.task_id,
                 'data': {
                     **divergence.to_wire(),
                     'escalation_id': filed.id,
@@ -247,6 +250,21 @@ class TestAlarmVerifyBaseDivergence:
                 },
             },
         )]
+
+    async def test_a_hit_is_not_charged_to_the_dispatched_task_as_a_reviewer_miss(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        divergence = _divergence(config)
+        db = build_synthetic_runs_db(tmp_path, [{'task_id': divergence.task_id, 'review_cycles': 1}])
+        events = EventStore(db, run_id='run-test')
+
+        alarm_verify_base_divergence(RecordingEscalations(), divergence, event_store=events)
+
+        assert [
+            (row['task_id'], row['data']['task_id'])
+            for row in events.fetch_events_by_type(EventType.escalation_created)
+        ] == [(VERIFY_BASE_DIVERGENCE_SENTINEL, divergence.task_id)]
+        assert mine_fn_candidates(db) == []
 
     async def test_open_l1_suppresses_a_second_filing(
         self, config: OrchestratorConfig,
