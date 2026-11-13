@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -96,21 +99,63 @@ def _fake_pgid() -> int:
     return candidate
 
 
-def _wait_for_recorded_pid(pidfile: Path, *, within: float = 30.0) -> int:
-    """Block until *pidfile* holds a complete pid line; runs off-loop because the loop clock may be held."""
+def _wait_for_recorded_pid(
+    pidfile: Path, abandon: threading.Event, *, within: float = 30.0,
+) -> int | None:
+    """Block until *pidfile* holds a complete pid line, or return None once *abandon* is set.
+
+    Runs off-loop because the loop clock may be held.
+    """
     deadline = time.monotonic() + within
-    while time.monotonic() < deadline:
+    while not abandon.is_set():
         try:
             text = pidfile.read_text()
         except FileNotFoundError:
             text = ''
         if text.endswith('\n'):
             return int(text)
-        time.sleep(0.01)
-    raise AssertionError(
-        f'{pidfile} never held a complete pid line within {within}s: '
-        f'the script never recorded its grandchild'
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f'{pidfile} never held a complete pid line within {within}s: '
+                f'the script never recorded its grandchild'
+            )
+        abandon.wait(0.01)
+    return None
+
+
+RunScriptTask = asyncio.Task[tuple[int, str]]
+
+
+async def _await_recorded_pid(pidfile: Path, run: RunScriptTask) -> int:
+    """The pid the script records for its grandchild, or *run*'s own outcome if it ends first."""
+    abandon = threading.Event()
+    pid_wait = asyncio.ensure_future(
+        asyncio.to_thread(_wait_for_recorded_pid, pidfile, abandon),
     )
+    try:
+        await asyncio.wait({run, pid_wait}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        abandon.set()
+    pid = await pid_wait
+    if pid is None or run.done():
+        outcome = await run
+        raise AssertionError(
+            f'run_script returned {outcome!r} before the script recorded its grandchild'
+        )
+    return pid
+
+
+async def _tear_down_through_the_budget(run: RunScriptTask, release: Callable[[], None]) -> None:
+    """Let a still-pending *run* reach its own timeout teardown, which kills the script's group.
+
+    Cancelling it instead would skip that teardown (run_script catches only
+    TimeoutError) and leak the script and its grandchild.
+    """
+    if run.done():
+        return
+    release()
+    with contextlib.suppress(ScriptTimeout):
+        await run
 
 
 @pytest.mark.asyncio
@@ -185,15 +230,22 @@ class TestBeforeDoneSubprocessTimeoutHardening:
                     timeout=10,
                 ),
             )
-            grandchild_pid = await asyncio.to_thread(_wait_for_recorded_pid, pidfile)
-            grandchild = capture(grandchild_pid)
-            assert grandchild is not None, (
-                f'the precondition is a live grandchild in the script\'s group '
-                f'when the budget starts, but pid {grandchild_pid} is not running'
-            )
-            release()
-            with pytest.raises(ScriptTimeout) as excinfo:
-                await run
+            try:
+                grandchild_pid = await _await_recorded_pid(pidfile, run)
+                grandchild = capture(grandchild_pid)
+                assert grandchild is not None, (
+                    f'the precondition is a live, recorded grandchild when the budget '
+                    f'starts, but recorded pid {grandchild_pid} is not running'
+                )
+                assert os.getpgid(grandchild_pid) != os.getpgrp(), (
+                    f'the precondition is a grandchild in the script\'s own process '
+                    f'group, but pid {grandchild_pid} is in pytest\'s group {os.getpgrp()}'
+                )
+                release()
+                with pytest.raises(ScriptTimeout) as excinfo:
+                    await run
+            finally:
+                await _tear_down_through_the_budget(run, release)
 
         exc = excinfo.value
         assert exc.timeout_secs == 1, (

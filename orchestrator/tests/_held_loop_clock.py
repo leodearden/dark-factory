@@ -36,12 +36,20 @@ class HeldClock:
 
 @contextlib.contextmanager
 def held_loop_clock() -> Iterator[Callable[[], None]]:
-    """Hold the running loop's ``time()`` for the block; yields the release callable."""
+    """Hold the running loop's ``time()`` for the block; yields the release callable.
+
+    Exit restores the loop's own clock by deleting the instance override, so a
+    loop that already carries one (a nested hold included) is refused.
+    """
     loop = asyncio.get_running_loop()
+    if 'time' in vars(loop):
+        raise RuntimeError(
+            f'held_loop_clock needs the loop\'s own time(), but {loop!r} already has '
+            f'an instance-level override {vars(loop)["time"]!r}'
+        )
     clock = HeldClock(loop.time)
     loop.time = clock
     try:
         yield clock.release
     finally:
-        clock.release()
         del loop.time

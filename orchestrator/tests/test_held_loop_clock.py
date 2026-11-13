@@ -56,16 +56,46 @@ async def test_a_deadline_set_while_held_survives_a_real_stall_past_its_budget()
             await waiter
 
 
+def _assert_reads_its_own_clock(loop: asyncio.AbstractEventLoop) -> None:
+    before = time.monotonic()
+    now = loop.time()
+    after = time.monotonic()
+    assert before <= now <= after, (
+        f'loop.time() must be time.monotonic() again after the block, but read {now!r} '
+        f'outside [{before!r}, {after!r}]: the held clock was left installed'
+    )
+
+
 @pytest.mark.asyncio
 async def test_leaving_the_block_restores_the_loops_own_clock():
     loop = asyncio.get_running_loop()
     with held_loop_clock() as release:
         await asyncio.to_thread(time.sleep, 0.05)
         release()
-    before = time.monotonic()
-    now = loop.time()
-    after = time.monotonic()
-    assert before <= now <= after, (
-        f'loop.time() must be time.monotonic() again after the block, but read {now!r} '
-        f'outside [{before!r}, {after!r}]: the lagged held clock was left installed'
-    )
+    _assert_reads_its_own_clock(loop)
+
+
+class _RaisedInsideTheHold(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_an_exception_inside_the_block_still_restores_the_loops_own_clock():
+    loop = asyncio.get_running_loop()
+    with pytest.raises(_RaisedInsideTheHold), held_loop_clock():
+        await asyncio.to_thread(time.sleep, 0.05)
+        raise _RaisedInsideTheHold
+    _assert_reads_its_own_clock(loop)
+
+
+@pytest.mark.asyncio
+async def test_a_hold_over_an_already_overridden_loop_clock_is_refused():
+    loop = asyncio.get_running_loop()
+    with held_loop_clock() as release:
+        outer = loop.time
+        refused = pytest.raises(RuntimeError, match='already has an instance-level override')
+        with refused, held_loop_clock():
+            pass
+        assert loop.time is outer, 'a refused hold must leave the clock in force untouched'
+        release()
+    _assert_reads_its_own_clock(loop)
