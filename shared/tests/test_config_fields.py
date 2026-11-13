@@ -16,6 +16,7 @@ from shared.config_fields import (
     Reload,
     RestartOnlyRows,
     TableLegacy,
+    UnplaceableSpelling,
     declared_fields,
     legacy_spellings,
     pivot_legacy_spellings,
@@ -318,8 +319,39 @@ def test_a_scalar_spelling_disagreeing_with_its_new_path_conflicts():
     with pytest.raises(ConflictingSpellings) as raised:
         pivot_legacy_spellings(ScalarSpelled, {'old_slots': 6, 'admission': {'slots': 7}})
     assert (raised.value.old_path, raised.value.new_path) == ('old_slots', 'admission.slots')
+    assert raised.value.new_value_path == 'admission.slots'
     for text in ('old_slots', 'admission.slots', '6', '7'):
         assert text in str(raised.value)
+
+
+REVIEWER_MODEL_SPELLINGS = (
+    DeprecatedSpelling('models.reviewer', 'roles.reviewer.model'),
+    DeprecatedSpelling('watcher_model', 'roles.reviewer.model'),
+)
+
+
+def test_two_agreeing_old_spellings_of_one_new_path_give_two_deprecations():
+    data = {'models': {'reviewer': 'opus'}, 'watcher_model': 'opus'}
+    assert pivot_legacy_spellings(UnionedTable, data) == (
+        {'roles': {'reviewer': {'model': 'opus'}}},
+        REVIEWER_MODEL_SPELLINGS,
+    )
+
+
+def test_two_disagreeing_old_spellings_of_one_new_path_conflict_naming_both_old_paths():
+    data = {'models': {'reviewer': 'opus'}, 'watcher_model': 'sonnet'}
+    with pytest.raises(ConflictingSpellings) as raised:
+        pivot_legacy_spellings(UnionedTable, data)
+    conflict = raised.value
+    assert (conflict.old_path, conflict.new_value_path, conflict.new_path) == (
+        'watcher_model',
+        'models.reviewer',
+        'roles.reviewer.model',
+    )
+    message = str(conflict)
+    for text in ("models.reviewer='opus'", "watcher_model='sonnet'", 'roles.reviewer.model'):
+        assert text in message
+    assert 'roles.reviewer.model=' not in message
 
 
 class UnblockAuto(BaseModel):
@@ -414,6 +446,39 @@ def test_an_undeclared_key_stays_exactly_where_it_was():
 )
 def test_a_key_that_cannot_be_placed_stays_at_its_old_path_unreported(model_cls, data):
     assert pivot_legacy_spellings(model_cls, data) == (data, ())
+
+
+@pytest.mark.parametrize(
+    ('model_cls', 'data', 'named'),
+    [
+        (
+            ScalarSpelled,
+            {'old_slots': 9, 'admission': Admission()},
+            ('old_slots', 'admission.slots', 'admission', 'Admission'),
+        ),
+        (
+            PivotTable,
+            {'models': {'architect': 'opus'}, 'roles': {Role.ARCHITECT: Row()}},
+            ('models.architect', 'roles.architect.model', 'roles.architect', 'Row'),
+        ),
+    ],
+    ids=['submodel-instance', 'table-row-instance'],
+)
+def test_an_old_spelling_blocked_by_a_model_instance_is_refused_not_dropped(
+    model_cls, data, named
+):
+    with pytest.raises(UnplaceableSpelling) as raised:
+        pivot_legacy_spellings(model_cls, data)
+    assert (raised.value.old_path, raised.value.new_path, raised.value.holder_path) == named[:3]
+    for text in named:
+        assert text in str(raised.value)
+
+
+def test_an_unplaceable_spelling_is_a_value_error_so_a_root_validator_surfaces_it():
+    assert issubclass(UnplaceableSpelling, ValueError)
+    with pytest.raises(ValidationError) as raised:
+        PivotTable.model_validate({'models': {'architect': 'opus'}, 'roles': {Role.ARCHITECT: Row()}})
+    assert 'models.architect' in str(raised.value)
 
 
 def test_a_root_before_validator_loads_an_old_spelling_at_its_new_path():

@@ -233,39 +233,72 @@ class DeprecatedSpelling:
 
 
 class ConflictingSpellings(ValueError):
-    def __init__(self, old_path: str, new_path: str, old_value: object, new_value: object) -> None:
+    def __init__(
+        self,
+        old_path: str,
+        new_path: str,
+        old_value: object,
+        new_value: object,
+        *,
+        new_value_path: str,
+    ) -> None:
+        if new_value_path == new_path:
+            relation = f'{old_path} is the old spelling of {new_path}'
+        else:
+            relation = f'both are old spellings of {new_path}'
         super().__init__(
-            f'{old_path}={old_value!r} and {new_path}={new_value!r} disagree: {old_path} '
-            f'is the old spelling of {new_path}; set only {new_path}'
+            f'{old_path}={old_value!r} and {new_value_path}={new_value!r} disagree: '
+            f'{relation}; set only {new_path}'
         )
         self.old_path = old_path
         self.new_path = new_path
         self.old_value = old_value
         self.new_value = new_value
+        self.new_value_path = new_value_path
+
+
+class UnplaceableSpelling(ValueError):
+    def __init__(self, old_path: str, new_path: str, holder_path: str, holder_type: type) -> None:
+        super().__init__(
+            f'{old_path} is the old spelling of {new_path}, but {holder_path} holds a '
+            f'{holder_type.__qualname__} instance, which the pivot cannot move a value into; '
+            f'set {new_path} on that instance instead of {old_path}'
+        )
+        self.old_path = old_path
+        self.new_path = new_path
+        self.holder_path = holder_path
+        self.holder_type = holder_type
 
 
 def pivot_legacy_spellings(
     model_cls: type[BaseModel], data: Mapping[str, object]
 ) -> tuple[dict[str, object], tuple[DeprecatedSpelling, ...]]:
     pivoted = _copy_mappings(data)
+    placed_from: dict[tuple[str, ...], str] = {}
     deprecated: list[DeprecatedSpelling] = []
     for move in _legacy_moves(model_cls):
         old_chain = _container_chain(pivoted, move.old)
         if old_chain is None:
             continue
+        spelling = move.spelling
         old_value = old_chain[-1][move.old[-1]]
         new_chain = _container_chain(pivoted, move.new)
         if new_chain is not None:
             new_value = new_chain[-1][move.new[-1]]
             if new_value != old_value:
-                spelling = move.spelling
                 raise ConflictingSpellings(
-                    spelling.old_path, spelling.new_path, old_value, new_value
+                    spelling.old_path,
+                    spelling.new_path,
+                    old_value,
+                    new_value,
+                    new_value_path=placed_from.get(move.new, spelling.new_path),
                 )
-        elif not _place(pivoted, move.new, old_value):
+        elif _place(pivoted, move, old_value):
+            placed_from[move.new] = spelling.old_path
+        else:
             continue
         _prune(old_chain, move.old, keep=_declared_segments(model_cls))
-        deprecated.append(move.spelling)
+        deprecated.append(spelling)
     return pivoted, tuple(deprecated)
 
 
@@ -372,14 +405,18 @@ def _container_chain(
     return chain if segments[-1] in chain[-1] else None
 
 
-def _place(tree: dict[str, object], segments: tuple[str, ...], value: object) -> bool:
+def _place(tree: dict[str, object], move: _Move, value: object) -> bool:
     node = tree
-    for name in segments[:-1]:
+    for depth, name in enumerate(move.new[:-1], start=1):
         child = node.setdefault(name, {})
+        if isinstance(child, BaseModel):
+            spelling = move.spelling
+            holder_path = '.'.join(move.new[:depth])
+            raise UnplaceableSpelling(spelling.old_path, spelling.new_path, holder_path, type(child))
         if not isinstance(child, dict):
             return False
         node = child
-    node[segments[-1]] = value
+    node[move.new[-1]] = value
     return True
 
 
