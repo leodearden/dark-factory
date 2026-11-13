@@ -3364,6 +3364,8 @@ check.
   - One info escalation per run naming the report, or naming why the report
     could not be written (the run then exits 1): category
     `link_heal_run_report`, anchor `link-heal-run-report`, never folded.
+    Filing it dismisses the previous run's record if that is still pending, so
+    only the newest report is open work; every report stays on disk.
   - The records, in `<reconciliation.data_dir>/link_heal.db`. Each examined
     link has its child and parent exactly as read, the verdict with its
     model, prompt version and reason, the decision and its disposition, and

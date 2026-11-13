@@ -206,6 +206,8 @@ class TestTheLinkHealCalibrationAndRunReportRoutes:
         )
 
     def test_a_run_report_files_info_and_never_folds(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
         from fused_memory.maintenance.link_heal_executor import (
             RUN_REPORT_ANCHOR,
         )
@@ -216,16 +218,55 @@ class TestTheLinkHealCalibrationAndRunReportRoutes:
         assert first is not None
         assert second is not None
         assert second != first
-        records = _filed(tmp_path)
-        assert sorted(record['summary'] for record in records) == [
+        records = EscalationQueue(tmp_path / 'data' / 'escalations').get_by_task(RUN_REPORT_ANCHOR)
+        assert sorted(record.summary for record in records) == [
             'link-heal sweep: one.md', 'link-heal sweep: two.md',
         ]
         for record in records:
-            assert record['task_id'] == RUN_REPORT_ANCHOR == 'link-heal-run-report'
-            assert record['status'] == 'pending'
-            assert (record['category'], record['severity'], record['level']) == (
+            assert record.task_id == RUN_REPORT_ANCHOR == 'link-heal-run-report'
+            assert (record.category, record.severity, record.level) == (
                 'link_heal_run_report', 'info', 1,
             )
+
+    def test_a_new_run_report_dismisses_the_one_still_pending_before_it(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.maintenance.link_heal_executor import (
+            RUN_REPORT_ANCHOR,
+        )
+
+        first = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+        second = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: two.md', 'two.md')
+
+        assert first is not None and second is not None
+        queue = EscalationQueue(tmp_path / 'data' / 'escalations')
+        pending = queue.get_by_task(RUN_REPORT_ANCHOR, status='pending')
+        assert [record.id for record in pending] == [second]
+        dismissed = queue.get(first)
+        assert dismissed is not None
+        assert dismissed.status == 'dismissed'
+        assert second in (dismissed.resolution or '')
+
+    def test_a_run_report_leaves_another_filer_s_pending_record_alone(self, tmp_path):
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.maintenance.link_heal_executor import (
+            RUN_REPORT_ANCHOR,
+        )
+
+        queue = EscalationQueue(tmp_path / 'data' / 'escalations')
+        foreign = queue.submit(Escalation(
+            id=queue.make_id(RUN_REPORT_ANCHOR), task_id=RUN_REPORT_ANCHOR,
+            agent_role='someone-else', severity='info', category='link_heal_run_report',
+            summary='not a link-heal filing', detail='', suggested_action='', level=1,
+        ))
+
+        self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+
+        stored = queue.get(foreign)
+        assert stored is not None
+        assert stored.status == 'pending'
 
     def test_a_run_report_suggests_the_undo_command_operators_are_shown(self, tmp_path):
         from fused_memory.maintenance.link_heal_executor import (

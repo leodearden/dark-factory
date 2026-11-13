@@ -52,6 +52,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from shared.project_layout import escalation_queue_dir
 from shared.safe_io import atomic_write_text
 from shared.streak import KeyedStreaks
 
@@ -326,12 +327,15 @@ def render_escape_detail(detail: Mapping[str, Any]) -> str:
 @dataclass(frozen=True)
 class _EscapeRoute:
     """Where an anchor's escapes land. ``dedupe`` folds a filing into the anchor's open
-    record; a route whose every filing carries its own payload must not fold."""
+    record; a route whose every filing carries its own payload must not fold.
+    ``supersede`` dismisses the anchor's earlier pending records once a new one is
+    filed: each is one run's report, and only the newest is open work."""
 
     category: str
     suggested_action: str
     severity: str = 'blocking'
     dedupe: bool = True
+    supersede: bool = False
 
 
 _ESCAPE_ROUTES: Mapping[str, _EscapeRoute] = MappingProxyType({
@@ -398,6 +402,7 @@ _ESCAPE_ROUTES: Mapping[str, _EscapeRoute] = MappingProxyType({
         ),
         severity='info',
         dedupe=False,
+        supersede=True,
     ),
 })
 
@@ -416,7 +421,7 @@ class FoldedEscapeFiler:
 
     def __call__(self, escape: Escape) -> str | None:
         route = _ESCAPE_ROUTES[escape.anchor]
-        return file_folded_escalation(
+        escalation_id = file_folded_escalation(
             self._project_root,
             anchor_task_id=escape.anchor,
             agent_role=self.AGENT_ROLE,
@@ -430,6 +435,37 @@ class FoldedEscapeFiler:
             level=1,
             dedupe=route.dedupe,
         )
+        if route.supersede and escalation_id is not None:
+            self._dismiss_superseded(escape.anchor, escalation_id)
+        return escalation_id
+
+    def _dismiss_superseded(self, anchor: str, newest_id: str) -> None:
+        """Dismiss every pending record this filer filed under *anchor* before
+        *newest_id*. Never raises: the new record is filed whatever happens here."""
+        if self._project_root is None:
+            return
+        try:
+            from escalation.queue import EscalationQueue
+        except ImportError:  # pragma: no cover — without the package nothing was filed
+            return
+        try:
+            queue = EscalationQueue(escalation_queue_dir(self._project_root))
+            earlier = queue.get_by_task(anchor, status='pending', agent_role=self.AGENT_ROLE)
+            for record in earlier:
+                if record.id == newest_id:
+                    continue
+                queue.resolve(
+                    record.id,
+                    f'superseded by {newest_id}, the newer {anchor} record; '
+                    'each run\'s report stays on disk',
+                    dismiss=True,
+                    resolved_by=self.AGENT_ROLE,
+                    resolution_class='benign',
+                )
+        except Exception:
+            self._log.exception(
+                'link_heal: could not dismiss the %s records %s supersedes', anchor, newest_id,
+            )
 
 
 def _file(filer: EscapeFiler, escape: Escape | None) -> tuple[Mapping[str, Any], ...]:
