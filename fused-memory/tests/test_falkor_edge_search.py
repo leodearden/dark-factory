@@ -26,6 +26,7 @@ from graphiti_core.search.search_filters import SearchFilters
 
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE
 
 if TYPE_CHECKING:
     from falkordb.asyncio import FalkorDB
@@ -258,12 +259,12 @@ class TestEdgeFulltextIdentifierTier:
         assert 'MATCH' not in tier.cypher.upper()
 
     @pytest.mark.asyncio
-    async def test_only_the_tier_query_excludes_retired_edges(self) -> None:
+    async def test_only_the_tier_query_applies_the_active_edge_predicate(self) -> None:
         """Retired edges are not promoted, while the ranked rows keep graphiti's filter semantics."""
         tier, union = await self._issued('alpha 877')
 
-        assert 'e.invalid_at IS NULL' in tier.cypher
-        assert 'e.invalid_at IS NULL' not in union.cypher
+        assert ACTIVE_EDGE_PREDICATE in tier.cypher
+        assert ACTIVE_EDGE_PREDICATE not in union.cypher
 
     @pytest.mark.asyncio
     async def test_the_union_ranks_the_tier_first_then_by_score(self) -> None:
