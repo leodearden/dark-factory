@@ -1,8 +1,8 @@
 """What an eval cell refuses, so that it writes no production state.
 
 An eval cell runs a real ``TaskWorkflow`` against fixture worktrees. It is built
-with none of the stores through which a production workflow writes, and a store
-handed to the cell factory is refused before any workflow exists
+with none of the collaborators through which a production workflow writes, and
+one handed to the cell factory is refused before any workflow exists
 (plans/review-all-s1-one-escalation-filing-entry-point-prd.md §Contracts C11).
 """
 
@@ -19,18 +19,18 @@ from orchestrator.event_store import EventStore
 
 
 class EvalHermeticityError(ValueError):
-    """An eval cell was handed a store through which it would write production state."""
+    """An eval cell was given a collaborator through which it would write production state."""
 
     def __init__(self, field: str, value: object) -> None:
         self.field = field
         super().__init__(
-            f'eval cell handed {field}={value!r}: an eval cell is built with no '
-            f'production store, so it writes no production state'
+            f'eval cell given {field}={value!r}: an eval cell is built with no '
+            f'production writer, so it writes no production state'
         )
 
 
 @dataclass(frozen=True)
-class WorkflowStores:
+class ProductionWriters:
     """The ``build_workflow`` collaborators through which a ``TaskWorkflow`` writes production state.
 
     Fields are named as ``build_workflow``'s own keyword arguments. The
@@ -44,12 +44,12 @@ class WorkflowStores:
     cost_store: CostStore | None = None
 
 
-NO_STORES = WorkflowStores()
+NO_PRODUCTION_WRITERS = ProductionWriters()
 
 
-def refuse_production_stores(stores: WorkflowStores) -> None:
-    """Raise ``EvalHermeticityError`` for the first store *stores* holds, in declaration order."""
-    for field in dataclasses.fields(stores):
-        value = getattr(stores, field.name)
+def refuse_production_writers(writers: ProductionWriters) -> None:
+    """Raise ``EvalHermeticityError`` for the first writer *writers* holds, in declaration order."""
+    for field in dataclasses.fields(writers):
+        value = getattr(writers, field.name)
         if value is not None:
             raise EvalHermeticityError(field.name, value)
