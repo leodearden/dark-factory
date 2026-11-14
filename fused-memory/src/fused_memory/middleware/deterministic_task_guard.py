@@ -83,6 +83,7 @@ from pydantic import ValidationError
 from shared.before_done_paths import (
     CwdRefused,
     FactoryRootUnresolved,
+    ScriptRefused,
     ScriptRootRefused,
     resolve_before_done_paths,
 )
@@ -625,17 +626,14 @@ def _validate_before_done(
             hint="Omit 'kind' (defaults to 'deploy'), or set it to 'deploy' or 'predicate'.",
         )
 
-    # script: required non-empty string
-    script = before_done.get('script')
-    if not isinstance(script, str) or not script.strip():
-        return _validation_error(
-            "before_done.script is required and must be a non-empty string path.",
-            hint="Set 'script' to a relative path of an executable file under project_root.",
-        )
-
     try:
         paths = resolve_before_done_paths(
             before_done, Path(project_root).resolve(), factory_root_resolver,
+        )
+    except ScriptRefused as exc:
+        return _validation_error(
+            str(exc),
+            hint="Set 'script' to a relative path of an executable file under project_root.",
         )
     except CwdRefused as exc:
         return _validation_error(
@@ -662,7 +660,9 @@ def _validate_before_done(
             ),
         )
     script_base = paths.script_base.resolve()
-    err = _validate_script_under(script, paths.script, script_base, paths.script_root.base_name)
+    err = _validate_script_under(
+        before_done['script'], paths.script, script_base, paths.script_root.base_name,
+    )
     if err is not None:
         return err
 

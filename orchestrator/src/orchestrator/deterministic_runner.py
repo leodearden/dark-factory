@@ -2230,8 +2230,9 @@ class DeterministicRunner:
           summary/detail wording — that text is the only thing telling a human
           which guard fired.
         - Any other ``shared.before_done_paths.BeforeDonePathsRefused`` (a
-          record that arrived through ``update_task`` with a non-string cwd or
-          a ``script_root`` it may not use, task 9116) -> likewise an INFRA
+          record that arrived through ``update_task`` with a missing,
+          non-string or blank script, a non-string cwd, or a ``script_root``
+          it may not use, task 9116) -> likewise an INFRA
           fault: the check was never run.  Summary "Predicate before_done
           refused (check not run)"; the detail names the refused field.
         - CARRIER SPLIT (task 4678 / r3, PRD R-D6 + C-5): for a task carrying

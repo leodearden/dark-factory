@@ -61,6 +61,10 @@ class ScriptRootRefused(BeforeDonePathsRefused):
     value, or ``'factory'`` on a non-predicate."""
 
 
+class ScriptRefused(BeforeDonePathsRefused):
+    """``before_done.script`` is absent, not a string, or blank."""
+
+
 class CwdRefused(BeforeDonePathsRefused):
     """``before_done.cwd`` is present but not a string path."""
 
@@ -88,8 +92,19 @@ def _script_root(before_done: Mapping[str, Any]) -> ScriptRoot:
         ) from None
 
 
+def _before_done_script(before_done: Mapping[str, Any]) -> str:
+    script = before_done.get('script')
+    if not isinstance(script, str) or not script.strip():
+        raise ScriptRefused(
+            'before_done.script is required and must be a non-empty string path '
+            f'(got {type(script).__name__} {script!r}).',
+        )
+    return script
+
+
 def _script_base(
     before_done: Mapping[str, Any],
+    script: str,
     script_root: ScriptRoot,
     project_root: Path,
     factory_root_resolver: Callable[[], Path | None],
@@ -101,7 +116,7 @@ def _script_base(
         raise ScriptRootRefused(f'before_done.{conflict}')
     factory_root = factory_root_resolver()
     if factory_root is None:
-        raise FactoryRootUnresolved(before_done['script'])
+        raise FactoryRootUnresolved(script)
     return factory_root
 
 
@@ -128,15 +143,17 @@ def resolve_before_done_paths(
     is the file that runs; ``cwd`` always joins ``project_root``.
 
     Raises ``BeforeDonePathsRefused``, checking in this order:
+    ``ScriptRefused`` for a missing, non-string or blank script,
     ``CwdRefused`` for a non-string cwd, ``ScriptRootRefused`` for a base the
     record may not use, ``FactoryRootUnresolved`` when the resolver finds no
     dark-factory root.
     """
+    script = _before_done_script(before_done)
     cwd = _before_done_cwd(before_done)
     script_root = _script_root(before_done)
-    base = _script_base(before_done, script_root, project_root, factory_root_resolver)
+    base = _script_base(before_done, script, script_root, project_root, factory_root_resolver)
     return BeforeDonePaths(
-        script=base / before_done['script'],
+        script=base / script,
         script_root=script_root,
         script_base=base,
         cwd=project_root / cwd if cwd else project_root,

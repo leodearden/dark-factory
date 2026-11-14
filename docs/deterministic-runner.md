@@ -92,8 +92,9 @@ never reach this first-dispatch check).
 **Refused `before_done` record** (task 9116): next, still before the
 stamp, the runner resolves the record's paths once through
 `shared/src/shared/before_done_paths.py::resolve_before_done_paths`.  A
-`BeforeDonePathsRefused` (a non-string `cwd`, or a `script_root` the
-record may not use, reaching the runner through `update_task`) files a
+`BeforeDonePathsRefused` (a missing, non-string or blank `script`, a
+non-string `cwd`, or a `script_root` the record may not use, reaching the
+runner through `update_task`) files a
 born-at-L2 `infra_issue` — summary "Deploy refused before_done:
 <target_unit>", or "Deploy refused before_done (no target_unit)" — and
 blocks without running the deploy, without stamping `before_done_ran_at`
