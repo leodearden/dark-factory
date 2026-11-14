@@ -1,0 +1,13 @@
+[Unit]
+Description=Escalate a failed quality-metrics snapshot of %i
+Documentation=file:///home/leo/src/dark-factory/scripts/quality_snapshot_alarm.py
+
+[Service]
+Type=oneshot
+# A separate unit, so the alarm's own failure never rewrites the snapshot
+# unit's Result; the argument's home is scripts/legibility-trickle-health@.service.
+WorkingDirectory=/home/leo/src/dark-factory
+EnvironmentFile=-%E/dark-factory/quality-snapshot/%i.env
+ExecStart=/home/leo/src/dark-factory/.venv/bin/python /home/leo/src/dark-factory/scripts/quality_snapshot_alarm.py --project-id %i
+StandardOutput=journal
+StandardError=journal
