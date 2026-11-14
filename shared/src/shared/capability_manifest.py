@@ -8,7 +8,8 @@ accompanies a PRD's ``.capability-manifest.md`` (see
 field and of a producer task's ``metadata.delivered_checks``; the scheduler
 (orchestrator, task δ) is the canonical reader of ``metadata.delivered_checks``
 at the dispatch gate. :func:`sidecar_path` is the one home of the rule that
-derives a PRD's sidecar path from its PRD key.
+derives a PRD's sidecar path from its PRD key, and :func:`sidecar_for` the one
+home of where that sidecar sits under a project root.
 
 This module also registers the ``metadata.delivered_checks`` sub-model with
 ``shared.task_metadata``'s W10 extension point
@@ -23,9 +24,10 @@ comment at the bottom of this module).
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Final, Literal, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -35,6 +37,7 @@ from shared.task_metadata import ExternalDep, register_metadata_submodel
 __all__ = [
     'CHECK_SUBJECT_FIELD',
     'MECHANICAL_CHECK_KINDS',
+    'SIDECAR_SUFFIX',
     'CapabilityManifestDoc',
     'DeliveredCheck',
     'DeliveredCheckMeta',
@@ -42,10 +45,11 @@ __all__ = [
     'ManifestTask',
     'load_capability_manifest',
     'parse_capability_manifest',
+    'sidecar_for',
     'sidecar_path',
 ]
 
-_SIDECAR_SUFFIX = '.capability-manifest.yaml'
+SIDECAR_SUFFIX: Final = '.capability-manifest.yaml'
 
 
 def sidecar_path(prd_key: str) -> str:
@@ -53,7 +57,26 @@ def sidecar_path(prd_key: str) -> str:
 
     ``plans/x-prd.md`` → ``plans/x-prd.capability-manifest.yaml``.
     """
-    return re.sub(r'\.md$', '', prd_key) + _SIDECAR_SUFFIX
+    return re.sub(r'\.md$', '', prd_key) + SIDECAR_SUFFIX
+
+
+def sidecar_for(prd_path: object, project_root: str | os.PathLike[str]) -> str | None:
+    """The root-relative POSIX path of the sidecar commit_planning would open for *prd_path* under *project_root*.
+
+    ``None`` when *prd_path* is not a non-empty str, cannot be resolved (an
+    embedded NUL), or resolves outside the root; contract C3 of
+    ``plans/review-all-s20-cli-invocation-and-usage-gate-prd.md``.
+    """
+    if not isinstance(prd_path, str) or not prd_path:
+        return None
+    root = Path(project_root).resolve()
+    try:
+        resolved = (root / sidecar_path(prd_path)).resolve()
+    except ValueError:
+        return None
+    if not resolved.is_relative_to(root):
+        return None
+    return resolved.relative_to(root).as_posix()
 
 
 def _check_kind_conditional_fields(
