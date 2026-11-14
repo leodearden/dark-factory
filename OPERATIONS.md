@@ -3824,11 +3824,12 @@ as ALIVE. Never-ran, staleness, an abnormal `Result`, or any other status (1,
 2 = a usage error or uv, 203 = exec failure) all FAIL. DEGRADED is not exit 1
 because a crash would then read as a finding. The probe does not accept 0
 alone because it would then fail a health unit that is correctly reporting a
-broken trickle, as happened nightly from 2026-09-29 (task 6205). Binding: once
-this probe is on main, task 10045 files one delayed-milestone predicate per
-project (`check_trickle_health_liveness.sh <project_id> 72`,
-`after_secs=604800`, depending on deploys 6205 and 6312) and records their ids
-here. These milestones are one-shot: a `done` predicate never runs again.
+broken trickle, as happened nightly from 2026-09-29 (task 6205). Binding: task
+6902 filed one delayed-milestone predicate per project, each running
+`check_trickle_health_liveness.sh <project_id> 72` with `after_secs=604800`:
+task 10103 for dark_factory (after deploy 6205) and task 10104 for reify (after
+deploy 6312). These milestones are one-shot: a `done` predicate never runs
+again.
 
 **Reading the verdict.** Each door has its own remedy, and conflating them
 is how an operator ends up tuning the sampler for a crashed coder:
