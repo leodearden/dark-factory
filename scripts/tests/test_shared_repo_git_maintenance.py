@@ -12,6 +12,7 @@ sys.path insertion.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -200,3 +201,105 @@ def test_runs_both_git_commands_niced_and_idle_io(tmp_path, capsys, monkeypatch)
     assert all(argv[: len(NICED_GIT)] == NICED_GIT for argv in recorded)
     assert recorded[0][-4:] == ["repack", "-d", "-q", "-n"]
     assert recorded[1][-3:] == ["commit-graph", "write", "--reachable"]
+
+
+def _unwritable_pack_dir(repo: Path) -> Path:
+    pack_dir = Path(_git(repo, "rev-parse", "--absolute-git-dir").strip()) / "objects" / "pack"
+    pack_dir.chmod(0o555)
+    return pack_dir
+
+
+def test_repos_run_one_at_a_time_in_order_and_a_failure_does_not_stop_the_run(tmp_path, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the read-only pack dir that makes repack fail")
+    repo_a = _repo_with_loose_objects(tmp_path / "a")
+    repo_b = _repo_with_loose_objects(tmp_path / "b")
+    missing = tmp_path / "missing"
+    repo_c = _repo_with_loose_objects(tmp_path / "c")
+    pack_dir = _unwritable_pack_dir(repo_b)
+    try:
+        rc, records, _err = _run(capsys, _hermetic_argv(tmp_path, repo_a, repo_b, missing, repo_c))
+    finally:
+        pack_dir.chmod(0o755)
+
+    assert [record["root"] for record in records] == [
+        str(root.resolve()) for root in (repo_a, repo_b, missing, repo_c)
+    ]
+    assert [record["outcome"] for record in records] == [
+        "maintained", "failed", "not-a-repo", "maintained",
+    ]
+    assert records[1]["repack_rc"] != 0
+    assert records[1]["commit_graph_rc"] is None
+    assert rc == 1
+
+
+def test_never_walks_up_into_an_enclosing_repo(tmp_path, capsys):
+    enclosing = _repo_with_loose_objects(tmp_path / "enclosing")
+    subdir = enclosing / "plain-subdir"
+    subdir.mkdir()
+    loose = _loose_count(enclosing)
+
+    _rc, records, _err = _run(capsys, _hermetic_argv(tmp_path, subdir))
+
+    assert [record["outcome"] for record in records] == ["not-a-repo"]
+    assert _loose_count(enclosing) == loose
+    assert not _commit_graph(enclosing).exists()
+
+
+@pytest.mark.parametrize("marker", ["gc.pid", "objects/maintenance.lock"])
+def test_a_busy_repo_is_left_alone(tmp_path, capsys, marker):
+    repo = _repo_with_loose_objects(tmp_path / "repo")
+    (Path(_git(repo, "rev-parse", "--absolute-git-dir").strip()) / marker).write_text("", encoding="utf-8")
+    loose = _loose_count(repo)
+
+    _rc, records, _err = _run(capsys, _hermetic_argv(tmp_path, repo))
+
+    assert [record["outcome"] for record in records] == ["busy"]
+    assert _loose_count(repo) == loose
+
+
+def test_never_two_runs_at_once(tmp_path, capsys):
+    repo = _repo_with_loose_objects(tmp_path / "repo")
+    argv = _hermetic_argv(tmp_path, repo)
+    lock_path = tmp_path / "maint.lock"
+    loose = _loose_count(repo)
+
+    with lock_path.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        rc, records, err = _run(capsys, argv)
+
+    assert rc == 0
+    assert records == []
+    assert _loose_count(repo) == loose
+    assert str(lock_path) in err
+
+
+def test_the_default_roster_is_every_root_an_orchestrator_unit_runs(tmp_path, capsys):
+    repo = _repo_with_loose_objects(tmp_path / "repo")
+    units = tmp_path / "units"
+    units.mkdir()
+    (units / "orchestrator-fake.service").write_text(
+        f"[Service]\nExecStart=/usr/bin/true --config {repo}/dark-factory-orchestrator.yaml\n",
+        encoding="utf-8",
+    )
+
+    rc, records, _err = _run(
+        capsys, ["--units-dir", str(units), "--lock-file", str(tmp_path / "maint.lock")]
+    )
+
+    assert rc == 0
+    assert [(record["root"], record["outcome"]) for record in records] == [
+        (str(repo.resolve()), "maintained")
+    ]
+
+
+def test_an_empty_roster_is_loud(tmp_path, capsys):
+    units = tmp_path / "units"
+    units.mkdir()
+
+    rc, records, _err = _run(
+        capsys, ["--units-dir", str(units), "--lock-file", str(tmp_path / "maint.lock")]
+    )
+
+    assert rc == 2
+    assert records == []
