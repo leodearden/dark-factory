@@ -92,6 +92,8 @@ _RECORD_SHAPES = {
         ),
         False,
     ),
+    'note_to_file_flag_alone': (_esc('esc-4764-8', note_to_file=True), False),
+    'note_to_file_class_alone': (_esc('esc-4764-9', resolution_class=NOTE_TO_FILE_CLASS), False),
 }
 
 
@@ -105,7 +107,7 @@ def _is_ruling(record: Escalation) -> bool:
 
 class TestRulingResolution:
     @pytest.mark.parametrize(('record', 'expected'), list(_RECORD_SHAPES.values()), ids=list(_RECORD_SHAPES))
-    def test_only_a_resolved_record_with_resolution_text_is_a_ruling(self, record, expected):
+    def test_a_ruling_is_a_resolved_record_with_text_not_closed_at_filing(self, record, expected):
         assert _is_ruling(record) is expected
 
     @pytest.mark.parametrize(('record', 'expected'), list(_RECORD_SHAPES.values()), ids=list(_RECORD_SHAPES))

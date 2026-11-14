@@ -1,8 +1,9 @@
 """Turn a task's resolved escalation records into the rulings an agent is briefed with.
 
 A ruling is an escalation filed on the task that someone resolved with text; a
-record closed as it was filed (a note to file, an eval-lane containment, a
-terminal-task auto-close) is not one, because no one ruled on it.  A ruling
+record closed as it was filed
+(``escalation/src/escalation/models.py::closed_at_filing``) is not one, because
+no one ruled on it.  A ruling
 binds every later agent on the task (task 4764).  A resumed agent learns its
 resolutions from ``orchestrator/resume_resolution.py`` instead, which shares
 :func:`ruling_resolution` so both paths agree on what counts as one.  Order is imposed
