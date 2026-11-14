@@ -261,3 +261,24 @@ class TestPlanFilesNotTouchedReason:
             f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: real.py, stale.py. '
             f'{_UNWRITTEN_CLAUSE}{_STALE_CLAUSE}{_RENAME_CLAUSE}'
         )
+
+
+class TestPlanFilesTouchedResultInvariant:
+    """``dropped_by_rebase`` is a subset of ``not_touched`` and disjoint from
+    ``missing_from_tree``: a value breaking that would render without its
+    dropped clause, so construction refuses it, naming the offending keys."""
+
+    def test_a_dropped_entry_the_gate_did_not_fail_is_refused(self) -> None:
+        with pytest.raises(ValueError, match=r"not in not_touched: \['index\.html'\]"):
+            PlanFilesTouchedResult(
+                not_touched=['real.py'],
+                dropped_by_rebase={'index.html': (_DROPPED,)},
+            )
+
+    def test_a_dropped_entry_missing_from_the_tree_is_refused(self) -> None:
+        with pytest.raises(ValueError, match=r"in missing_from_tree: \['index\.html'\]"):
+            PlanFilesTouchedResult(
+                not_touched=['index.html'],
+                missing_from_tree=['index.html'],
+                dropped_by_rebase={'index.html': (_DROPPED,)},
+            )

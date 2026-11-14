@@ -687,8 +687,8 @@ class TestSubmitToMergeQueueCrossRepo:
         self._assert_cross_repo(outcome, events, narrow, mark_blocked)
 
 
-def _wire_plan_files_gate(wf, monkeypatch, results):
-    """Stub the plan-files gate with *results*; return its call recorder, the event store and the _mark_blocked mock."""
+def _wire_plan_files_gate(wf, monkeypatch, results, *, narrowed=False):
+    """Stub the plan-files gate with *results* and the architect narrowing pass with *narrowed*; return the gate's call recorder, the event store and the _mark_blocked mock."""
     check_seq = _CheckSequence(results)
     monkeypatch.setattr(
         'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -702,7 +702,7 @@ def _wire_plan_files_gate(wf, monkeypatch, results):
     events = _RecordingEventStore()
     wf.event_store = events
 
-    wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    wf._try_narrow_plan = AsyncMock(return_value=narrowed)  # type: ignore[method-assign]
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
     return check_seq, events, mark_blocked
@@ -835,14 +835,20 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
     (the 3490 cache-buster bump), so the gate's ``base..HEAD`` read sees the
     file untouched.  The gate is handed the branch, attributes the entry to
     the dropped commit, and the block reason says so instead of claiming
-    "Implementation has not delivered".  Routing is unchanged.
+    "Implementation has not delivered".  Routing is unchanged.  When the
+    architect narrowing pass reports a narrowed plan, the gate runs a second
+    time, and that re-check is handed the branch too.
     """
 
     _SHA = 'c2e8f8c14d' + '0' * 30
     _SUBJECT = 'chore(3490): bump the redux cache-buster uniformly, 43 -> 44'
 
+    @pytest.mark.parametrize(
+        ('narrowed', 'gate_calls'), [(False, 1), (True, 2)],
+        ids=['no-narrowing', 'post-narrowing-recheck'],
+    )
     async def test_dropped_entry_is_attributed_with_routing_unchanged(
-        self, tmp_path: Path, monkeypatch,
+        self, tmp_path: Path, monkeypatch, narrowed: bool, gate_calls: int,
     ):
         from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
 
@@ -854,7 +860,9 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
                 DroppedCommit(sha=self._SHA, subject=self._SUBJECT, paths=('index.html',)),
             )},
         )
-        check_seq, events, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
+        check_seq, events, mark_blocked = _wire_plan_files_gate(
+            wf, monkeypatch, [result, result], narrowed=narrowed,
+        )
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -864,14 +872,14 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
         assert reason.startswith(PLAN_FILES_NOT_TOUCHED_REASON_PREFIX)
         assert 'c2e8f8c14d00' in reason
         assert self._SUBJECT in reason
+        assert 'dropped by a rebase' in reason
         assert 'Implementation has not delivered' not in reason
         assert outcome == WorkflowOutcome.BLOCKED
         assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
         assert kwargs.get('escalate_to_human') is True
-        assert check_seq.call_kwargs, 'the gate was never called'
         assert [kw.get('branch') for kw in check_seq.call_kwargs] == [
             f'{wf.config.git.branch_prefix}2656',
-        ] * len(check_seq.call_kwargs)
+        ] * gate_calls
 
 
 _PASSING_VERIFY_RESULT = VerifyResult(

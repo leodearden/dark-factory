@@ -365,9 +365,12 @@ class PlanFilesTouchedResult:
 
     Attributes:
         not_touched: Plan-file entries that the branch's history did NOT
-            touch.  Non-empty means the architect declared work that the
-            branch never actually delivered.  Empty list means every plan
-            entry is covered by some commit on the branch.
+            touch, so the gate fails when it is non-empty.  Empty list means
+            every plan entry is covered by some commit on the branch.  Why an
+            entry is untouched is told by the fields below: a stale path
+            (``missing_from_tree``) or a change a rebase dropped
+            (``dropped_by_rebase``) is not under-delivery; an entry in
+            neither is.
         missing_from_tree: Declared entries that do NOT exist in the branch
             tree at ``branch_head`` and for which no rename resolved.
             ALWAYS a subset of ``not_touched`` (a stale entry is reported in
@@ -392,16 +395,28 @@ class PlanFilesTouchedResult:
         dropped_by_rebase: Declared entry → the commits a rebase dropped
             from the branch that wrote it, keyed by the ORIGINAL declared
             string like ``resolved_renames``.  ALWAYS a subset of
-            ``not_touched`` and disjoint from ``missing_from_tree``.  A key
-            means the branch DID write a change to that entry and a later
-            rebase dropped it because the rebase target already carried the
-            change (task 4669) — not under-delivery.
+            ``not_touched`` and disjoint from ``missing_from_tree``, which
+            construction enforces.  A key means the branch DID write a change
+            to that entry and a later rebase dropped it because the rebase
+            target already carried the change (task 4669) — not
+            under-delivery.
     """
 
     not_touched: list[str] = field(default_factory=list)
     missing_from_tree: list[str] = field(default_factory=list)
     resolved_renames: dict[str, str] = field(default_factory=dict)
     dropped_by_rebase: dict[str, tuple[DroppedCommit, ...]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        dropped = set(self.dropped_by_rebase)
+        not_untouched = sorted(dropped - set(self.not_touched))
+        missing = sorted(dropped & set(self.missing_from_tree))
+        if not_untouched or missing:
+            raise ValueError(
+                'dropped_by_rebase must be a subset of not_touched and disjoint '
+                f'from missing_from_tree; not in not_touched: {not_untouched}, '
+                f'in missing_from_tree: {missing}'
+            )
 
 
 DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
