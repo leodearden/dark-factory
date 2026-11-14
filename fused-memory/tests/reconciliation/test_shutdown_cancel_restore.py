@@ -1,6 +1,7 @@
 """A cancellation between a run's drain and its journal row re-buffers that run's
 events, and a cancellation during a failed chunk's restore does not suppress its
-escalation (task 6695)."""
+escalation (task 6695). A cancellation after the run row but before the stages
+ends that run failed and re-buffers its events (task 9655)."""
 from __future__ import annotations
 
 import asyncio
@@ -15,11 +16,17 @@ import pytest
 import pytest_asyncio
 from escalation.queue import EscalationQueue
 
-from fused_memory.models.reconciliation import EventSource, EventType, ReconciliationEvent
+from fused_memory.models.reconciliation import (
+    EventSource,
+    EventType,
+    ReconciliationEvent,
+    RunStatus,
+)
 from fused_memory.reconciliation.harness import BacklogIterator
 from reconciliation.harness_fixtures import make_harness_config, open_harness
 
 PROJECT_ID = 'test-project'
+RUN_ID = 'run-cancelled-before-its-stages'
 
 
 @pytest.fixture
@@ -142,3 +149,48 @@ async def test_backlog_chunk_failure_escalates_even_when_a_cancel_lands_during_i
     assert task.cancelled()
     assert [e for e in escalation_queue.get_pending() if e.category == 'recon_backlog_overflow']
     assert await harness.buffer.count_buffered(PROJECT_ID) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('owner', 'blocked'), [
+    ('journal', 'get_recent_runs'),
+    ('taskmaster', 'get_tasks'),
+    ('taskmaster', 'get_statuses_fresh'),
+])
+async def test_run_full_cycle_cancel_during_the_pre_stage_reads_ends_the_run_failed_and_rebuffers_its_events(
+    harness, monkeypatch, owner, blocked,
+):
+    await _push_events(harness, 2)
+    entered = _block_first_call(monkeypatch, getattr(harness, owner), blocked)
+
+    task = await _cancel_once_entered(
+        harness.run_full_cycle(PROJECT_ID, 'unit-test', run_id=RUN_ID), entered,
+    )
+
+    assert task.cancelled()
+    run = await harness.journal.get_run(RUN_ID)
+    assert run is not None
+    assert run.status == RunStatus.failed
+    assert run.stage_reports['_error']['error_type'] == 'CancelledError'
+    assert run.stage_reports['_error']['failed_stage'] is None
+    assert await harness.buffer.count_buffered(PROJECT_ID) == 2
+    assert harness.recon_busy_snapshot() == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_in_its_pre_stage_reads_is_reported_busy_with_no_stage(harness, monkeypatch):
+    entered = _block_first_call(monkeypatch, harness.taskmaster, 'get_tasks')
+    task = asyncio.create_task(harness.run_full_cycle(PROJECT_ID, 'unit-test', run_id=RUN_ID))
+    try:
+        entered_wait = asyncio.ensure_future(entered.wait())
+        await asyncio.wait({entered_wait, task}, return_when=asyncio.FIRST_COMPLETED)
+        entered_wait.cancel()
+        assert entered.is_set(), f'the blocked call was never reached; task: {task!r}'
+
+        assert [(e['run_id'], e['stage']) for e in harness.recon_busy_snapshot()] == [
+            (RUN_ID, None),
+        ]
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
