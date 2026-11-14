@@ -763,14 +763,20 @@ it, and the gate slug where one corresponds:
   does not qualify: a `milestone_gate` whose detail carries "This human gate files milestone_gate
   rather than review_due because …"
   (`orchestrator/src/orchestrator/review_due.py::ReviewDueWithheld.detail_line`: an invalid chain,
-  or a config without project_id or project_root) is asked like any other milestone gate.
+  or a config without project_id or project_root) is asked like any other milestone gate. A
+  `review_due` spawn is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost
+  with Leo before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
+  `--launched-from` go-gate lands, task 9446).
   **Third exception:** a milestone gate whose task carries `metadata.x_preauthorised_spawn`
   (Leo's pre-authorisation of that one gate's session) is handled under "Pre-authorised gate
   spawn" below, which runs a fixed check and then spawns with no prior ask, attended or AFK. A
-  gate whose check fails is asked like any other milestone gate (task 9712, S16 ruling R15). The
-  spawn itself is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost with Leo
-  before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
-  `--launched-from` go-gate lands, task 9446).
+  gate whose check fails is asked like any other milestone gate (task 9712, S16 ruling R15). A
+  gate that passes the check is not asked under any other class below because of what its task
+  description says. `orchestrator/src/orchestrator/deterministic_runner.py::build_gate_escalation_fields`
+  copies that description into the record's `detail`, but the description is the brief Leo ruled,
+  and the spawned session owns every scope, spend, config, bypass and host decision in it. The
+  pin-and-HOLD class still asks (`pin_declared_by` set, or a Leo HOLD on the record). It keys on
+  the record's state, not its description, and a later Leo signal outranks the pre-authorisation.
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
@@ -2171,7 +2177,9 @@ the digest names the failing line:
 4. The task's description is non-empty.
 
 You judge nothing past the check. Whether the work is right, safe or worth doing is the spawned
-session's call.
+session's call. Nor does any other "Always ask" class bite on what the description asks for
+(budgets, timeouts, commits to a main). The third exception there says so and names the one class
+that still asks.
 
 **On a pass, in attended and AFK posture alike** (the one exception to AFK shift 2):
 - `/spawn` with `prompt=<the task's description, verbatim>`, `terminal_title="gate:<project>#<task_id>
