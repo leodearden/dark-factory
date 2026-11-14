@@ -14,8 +14,8 @@
 # literal against it. Rationale: OPERATIONS.md §"Legibility trickle health
 # probe (04:30)".
 #
-# Bound by: the delayed-milestone predicates task 10045 files once this
-# script is on main. Task 10045 replaces this with the filed ids.
+# Bound by: the one-shot delayed-milestone predicates task 10103
+# (dark_factory) and task 10104 (reify), filed by task 6902.
 set -euo pipefail
 
 if [ $# -ne 2 ]; then
