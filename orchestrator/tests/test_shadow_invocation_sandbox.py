@@ -8,7 +8,6 @@ Only the spawn itself is faked.
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,7 +16,8 @@ import pytest
 import pytest_asyncio
 from _git_fixtures import seed_repo
 from _workflow_helpers import FakeBriefing, FakeScheduler, _make_git_ops, fixed_prompt
-from shared.cli_invoke import AgentResult, SubprocessResult
+from shared.cli_invoke import AgentResult
+from shared.testing_cli_runner import RecordingRunner, canned_claude_result, pin_claude_binary
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invocation_scope import invocation_scope
@@ -57,12 +57,8 @@ def landlock_host(monkeypatch, tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def pinned_claude(monkeypatch, tmp_path: Path) -> str:
-    exec_file = tmp_path / 'claude'
-    exec_file.write_text('#!/bin/sh\nexit 0\n')
-    exec_file.chmod(0o755)
-    monkeypatch.setenv('CLAUDE_BINARY', str(exec_file))
-    return str(exec_file)
+def pinned_claude(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+    return pin_claude_binary(monkeypatch, tmp_path)
 
 
 @pytest_asyncio.fixture
@@ -117,26 +113,12 @@ async def _dispatched_kwargs(
 
 async def _spawned_argv(kwargs: dict[str, Any]) -> list[str]:
     """Run the REAL ``invoke_agent`` on *kwargs*; return the argv it would spawn."""
-    captured: list[list[str]] = []
+    runner = RecordingRunner(canned_claude_result())
 
-    async def fake_runner(
-        cmd: list[str], cwd: Path, env: dict[str, str], *,
-        wrap_argv: Any = None, **kw: Any,
-    ) -> SubprocessResult:
-        captured.append(wrap_argv(cmd) if wrap_argv else list(cmd))
-        return SubprocessResult(
-            stdout=json.dumps({
-                'result': 'ok', 'is_error': False, 'subtype': 'success',
-                'cost_usd': 0.01, 'duration_ms': 100, 'num_turns': 1,
-                'session_id': 'test-session',
-            }),
-            stderr='', returncode=0, duration_ms=100, timed_out=False,
-        )
+    await invoke_agent(**kwargs, runner=runner)
 
-    await invoke_agent(**kwargs, runner=fake_runner)
-
-    assert len(captured) == 1, f'expected one spawn, got {captured!r}'
-    return captured[0]
+    assert len(runner.calls) == 1, f'expected one spawn, got {runner.calls!r}'
+    return runner.calls[0].wrapped_cmd()
 
 
 @pytest.mark.asyncio

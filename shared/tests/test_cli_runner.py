@@ -29,6 +29,13 @@ from shared.cli_invoke import (
     run_cli_subprocess,
 )
 from shared.proc_group import pid_running, process_group_terminated
+from shared.testing_cli_runner import (
+    CANNED_CLAUDE_OUTPUT,
+    CANNED_CLAUDE_SESSION,
+    RecordingRunner,
+    canned_claude_result,
+    pin_claude_binary,
+)
 from shared.testing_fake_claude import install_fake_claude_cli
 
 _STATE_WAIT_SECS = 10.0
@@ -248,43 +255,12 @@ def test_subprocess_result_is_frozen() -> None:
 
 @pytest.fixture
 def pinned_claude(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
-    exec_file = tmp_path / 'claude'
-    exec_file.write_text('#!/bin/sh\nexit 0\n')
-    exec_file.chmod(0o755)
-    monkeypatch.setenv('CLAUDE_BINARY', str(exec_file))
-    return str(exec_file)
-
-
-def _canned_claude_result(**overrides: Any) -> SubprocessResult:
-    stdout = json.dumps({
-        'result': 'canned-output',
-        'is_error': False,
-        'subtype': 'success',
-        'num_turns': 1,
-        'session_id': 'canned-session',
-    })
-    fields: dict[str, Any] = {
-        'stdout': stdout, 'stderr': '', 'returncode': 0, 'duration_ms': 100,
-    }
-    fields.update(overrides)
-    return SubprocessResult(**fields)
-
-
-class _RecordingRunner:
-    def __init__(self, result: SubprocessResult) -> None:
-        self.result = result
-        self.calls: list[tuple[list[str], Path, dict[str, str], dict[str, Any]]] = []
-
-    async def __call__(
-        self, cmd: list[str], cwd: Path, env: dict[str, str], **kwargs: Any,
-    ) -> SubprocessResult:
-        self.calls.append((list(cmd), cwd, dict(env), kwargs))
-        return self.result
+    return pin_claude_binary(monkeypatch, tmp_path)
 
 
 class TestInvokeClaudeAgentRunnerSeam:
     async def _invoke(
-        self, tmp_path: Path, runner: _RecordingRunner, **overrides: Any,
+        self, tmp_path: Path, runner: RecordingRunner, **overrides: Any,
     ):
         kwargs: dict[str, Any] = {
             'prompt': 'p',
@@ -304,16 +280,16 @@ class TestInvokeClaudeAgentRunnerSeam:
     async def test_the_runner_receives_the_unwrapped_argv_and_the_spawn_contract(
         self, tmp_path: Path, pinned_claude: str,
     ) -> None:
-        runner = _RecordingRunner(_canned_claude_result())
+        runner = RecordingRunner(canned_claude_result())
 
         def wrap(argv: list[str]) -> list[str]:
             return ['SANDBOX', *argv]
 
         result = await self._invoke(tmp_path, runner, sandbox_wrap=wrap)
 
-        assert len(runner.calls) == 1
-        cmd, _cwd, _env, kw = runner.calls[0]
-        assert cmd[0] == pinned_claude
+        [spawn] = runner.calls
+        kw = spawn.kw
+        assert spawn.cmd[0] == pinned_claude
         assert kw['wrap_argv'] is wrap
         assert kw['backend'] == 'claude'
         assert kw['stdin_data'] == b'p'
@@ -322,24 +298,24 @@ class TestInvokeClaudeAgentRunnerSeam:
             session_id='s1', config_dir=tmp_path, startup_grace_secs=7.0,
             working_idle_secs=60.0, absolute_cap_secs=600.0,
         )
-        assert result.output == 'canned-output'
-        assert result.session_id == 'canned-session'
+        assert result.output == CANNED_CLAUDE_OUTPUT
+        assert result.session_id == CANNED_CLAUDE_SESSION
 
     async def test_resume_session_id_is_the_watched_transcript(
         self, tmp_path: Path, pinned_claude: str,
     ) -> None:
-        runner = _RecordingRunner(_canned_claude_result())
+        runner = RecordingRunner(canned_claude_result())
 
         await self._invoke(tmp_path, runner, resume_session_id='r1')
 
-        _cmd, _cwd, _env, kw = runner.calls[0]
-        assert kw['transcript'].session_id == 'r1'
-        assert kw['wrap_argv'] is None
+        [spawn] = runner.calls
+        assert spawn.kw['transcript'].session_id == 'r1'
+        assert spawn.kw['wrap_argv'] is None
 
     async def test_a_timed_out_runner_result_reaches_the_agent_result(
         self, tmp_path: Path, pinned_claude: str,
     ) -> None:
-        runner = _RecordingRunner(_canned_claude_result(timed_out=True))
+        runner = RecordingRunner(dataclasses.replace(canned_claude_result(), timed_out=True))
 
         result = await self._invoke(tmp_path, runner)
 

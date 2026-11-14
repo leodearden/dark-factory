@@ -7,22 +7,20 @@ about any specific sandbox backend.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from shared.cli_invoke import (
     AgentResult,
-    SubprocessResult,
     invoke_claude_agent,
     invoke_with_cap_retry,
 )
+from shared.testing_cli_runner import RecordingRunner, canned_claude_result, pin_claude_binary
 
 
 @pytest.fixture
-def pinned_claude(monkeypatch, tmp_path: Path) -> str:
+def pinned_claude(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     """Pin CLAUDE_BINARY at a real executable and yield its absolute path.
 
     build_claude_argv now resolves argv[0] to an absolute path rather than
@@ -30,33 +28,7 @@ def pinned_claude(monkeypatch, tmp_path: Path) -> str:
     a deterministic value that does not depend on whether the CLI happens to
     be on the CI PATH.
     """
-    exec_file = tmp_path / 'claude'
-    exec_file.write_text('#!/bin/sh\nexit 0\n')
-    exec_file.chmod(0o755)
-    monkeypatch.setenv('CLAUDE_BINARY', str(exec_file))
-    return str(exec_file)
-
-
-def _make_subprocess_result(**overrides: Any) -> SubprocessResult:
-    """Build a minimal SubprocessResult that parse_claude_output can parse."""
-    stdout = json.dumps({
-        'result': 'ok',
-        'is_error': False,
-        'subtype': 'success',
-        'cost_usd': 0.01,
-        'duration_ms': 100,
-        'num_turns': 1,
-        'session_id': 'test-session',
-    })
-    defaults: dict[str, Any] = {
-        'stdout': stdout,
-        'stderr': '',
-        'returncode': 0,
-        'duration_ms': 100,
-        'timed_out': False,
-    }
-    defaults.update(overrides)
-    return SubprocessResult(**defaults)
+    return pin_claude_binary(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
@@ -69,11 +41,7 @@ async def test_sandbox_wrap_reaches_the_runner_as_wrap_argv(
     test_cli_runner.py), so _invoke_claude must hand it over untouched rather
     than pre-wrapping the claude argv itself.
     """
-    captured: list[tuple[list[str], dict[str, Any]]] = []
-
-    async def fake_runner(cmd: list[str], cwd: Path, env: dict, **kwargs: Any) -> SubprocessResult:
-        captured.append((list(cmd), kwargs))
-        return _make_subprocess_result()
+    runner = RecordingRunner(canned_claude_result())
 
     def wrap(cmd: list[str]) -> list[str]:
         return ['WRAP', *cmd]
@@ -83,13 +51,12 @@ async def test_sandbox_wrap_reaches_the_runner_as_wrap_argv(
         system_prompt='sys',
         cwd=tmp_path,
         sandbox_wrap=wrap,
-        runner=fake_runner,
+        runner=runner,
     )
 
-    assert len(captured) == 1, 'Expected exactly one runner invocation'
-    argv, kwargs = captured[0]
-    assert argv[0] == pinned_claude, f'Expected the unwrapped claude argv; got {argv[:3]}'
-    assert kwargs['wrap_argv'] is wrap
+    [spawn] = runner.calls
+    assert spawn.cmd[0] == pinned_claude, f'Expected the unwrapped claude argv; got {spawn.cmd[:3]}'
+    assert spawn.kw['wrap_argv'] is wrap
 
 
 @pytest.mark.asyncio
@@ -102,25 +69,20 @@ async def test_sandbox_wrap_none_reaches_the_runner_as_none(
     confirming no accidental transformation — in particular that NO sandbox
     wrapper was prepended.
     """
-    captured: list[tuple[list[str], dict[str, Any]]] = []
-
-    async def fake_runner(cmd: list[str], cwd: Path, env: dict, **kwargs: Any) -> SubprocessResult:
-        captured.append((list(cmd), kwargs))
-        return _make_subprocess_result()
+    runner = RecordingRunner(canned_claude_result())
 
     await invoke_claude_agent(
         prompt='hello',
         system_prompt='sys',
         cwd=tmp_path,
-        runner=fake_runner,
+        runner=runner,
     )
 
-    assert len(captured) == 1
-    argv, kwargs = captured[0]
-    assert argv[0] == pinned_claude, (
-        f'Expected unchanged argv to start with the claude binary; got {argv[:3]}'
+    [spawn] = runner.calls
+    assert spawn.cmd[0] == pinned_claude, (
+        f'Expected unchanged argv to start with the claude binary; got {spawn.cmd[:3]}'
     )
-    assert kwargs['wrap_argv'] is None
+    assert spawn.kw['wrap_argv'] is None
 
 
 # ── invoke_with_cap_retry forwarding tests ────────────────────────────────────
