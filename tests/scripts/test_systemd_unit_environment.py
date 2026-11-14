@@ -154,3 +154,81 @@ def test_read_process_environ_returns_the_environment_a_process_was_spawned_with
     pid = live_process(env)
 
     assert sue.read_process_environ(pid) == env
+
+
+def test_a_unit_with_no_main_pid_is_not_running_and_proc_is_never_read(
+    busctl_world: WriteWorld, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    busctl_world(
+        _world(
+            {
+                'Environment': ['PATH=/pinned/bin'],
+                'MainPID': 0,
+                'ExecMainStartTimestamp': START_MICROSECONDS,
+            }
+        )
+    )
+    empty_proc = tmp_path / 'empty-proc'
+    empty_proc.mkdir()
+
+    report = sue.inspect_unit(UNIT, proc_root=empty_proc).variable('PATH')
+
+    assert report.verdict is sue.Verdict.NOT_RUNNING
+    assert report.live_value is None
+    assert report.restart_value == '/pinned/bin'
+
+    assert sue.main([UNIT]) == 0
+    stdout = capsys.readouterr().out
+    block = _variable_block(stdout, 'PATH')
+    assert MANAGER_PATH_VALUE in block
+    assert '/pinned/bin' in block
+    assert 'NOT_RUNNING' in block
+    assert 'pid' not in stdout
+    assert '2023-11-14' not in stdout
+
+
+@pytest.mark.parametrize(
+    ('unmodelled', 'named'),
+    [
+        ({'EnvironmentFiles': [['/etc/example.env', False]]}, '/etc/example.env'),
+        ({'PassEnvironment': ['PATH']}, 'PassEnvironment=PATH'),
+        ({'UnsetEnvironment': ['PATH']}, 'UnsetEnvironment=PATH'),
+    ],
+    ids=['EnvironmentFile', 'PassEnvironment', 'UnsetEnvironment'],
+)
+def test_unmodelled_environment_inputs_make_every_variable_indeterminate(
+    busctl_world: WriteWorld,
+    live_process: SpawnLive,
+    capsys: pytest.CaptureFixture[str],
+    unmodelled: dict[str, object],
+    named: str,
+) -> None:
+    pid = live_process({'PATH': '/pinned/bin', 'LANG': 'C.UTF-8'})
+    busctl_world(
+        _world({'Environment': ['PATH=/pinned/bin'], 'MainPID': pid, **unmodelled})
+    )
+
+    env = sue.inspect_unit(UNIT)
+
+    for name, live_value in (('PATH', '/pinned/bin'), ('LANG', 'C.UTF-8')):
+        report = env.variable(name)
+        assert report.restart_value is None, name
+        assert report.verdict is sue.Verdict.INDETERMINATE, name
+        assert report.live_value == live_value, name
+
+    assert sue.main([UNIT, '--var', 'PATH', '--var', 'LANG']) == 0
+    stdout = capsys.readouterr().out
+    assert named in stdout
+    assert 'INDETERMINATE' in _variable_block(stdout, 'PATH')
+    assert 'INDETERMINATE' in _variable_block(stdout, 'LANG')
+
+
+def test_not_running_is_decided_before_unmodelled_inputs(busctl_world: WriteWorld) -> None:
+    busctl_world(
+        _world({'MainPID': 0, 'EnvironmentFiles': [['/etc/example.env', False]]})
+    )
+
+    report = sue.inspect_unit(UNIT).variable('PATH')
+
+    assert report.verdict is sue.Verdict.NOT_RUNNING
+    assert report.restart_value is None
