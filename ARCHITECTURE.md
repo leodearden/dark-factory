@@ -501,9 +501,10 @@ what decides whether its row stays `in-progress` or lands in `blocked`:
   steward_max_timeouts_per_escalation` windows for a steward that keeps
   invoking its agent — bounded by the steward's own attempt ceilings, which is
   the property that makes it INV-7 `holds-owned-and-bounded`-legal. A record
-  that is born-at-L2 (severity `critical`/`urgent`) or at `level ≥ 2`
+  that is born-at-L2 (severity `critical`/`urgent`) or a non-info record at
+  `level ≥ 2` (the predicate is `escalation/src/escalation/pins.py::needs_human`)
   short-circuits the wait immediately: the orchestrator does not hold a slot
-  waiting on a human. This now covers **every** phase, MERGE entry included —
+  waiting on a human. An info L2 never short-circuits it. This now covers **every** phase, MERGE entry included —
   `_handle_merge_gate_escalations`
   (`orchestrator/src/orchestrator/workflow.py`) replaced the old
   steward-less bail, which returned `ESCALATED` with no steward, no wait and no
@@ -512,10 +513,39 @@ what decides whether its row stays `in-progress` or lands in `blocked`:
 - **(b) Blocked exit.** When the wait concludes without resolution — idle-window
   expiry, steward re-escalation, or a gating record still open on the
   single-shot re-check — `_mark_blocked` parks the row `blocked` and frees the
-  slot. The open escalation record then *is* the ownership token and the wake
+  slot. The block reason names the hand-off that fired: 'Steward re-escalated
+  to human' only when this wait's steward filed the hand-off
+  (`orchestrator/src/orchestrator/workflow.py::_StewardReescalated`), otherwise
+  'Gated by open L2 <ids>; no steward applicable' (`_NoStewardApplicable`,
+  which also lists the L1 ids when an L1 hand-off ended the wait). The open
+  escalation record then *is* the ownership token and the wake
   edge: resolving it re-pends the task (§6). The gate predicate itself
   (`_is_gating_escalation`) is untouched stop-the-line either way — nothing
-  merges past an open gating record.
+  merges past an open gating record. An info record is never a gating record
+  at any level, because the predicate consults `needs_human`, so a green,
+  reviewed branch whose only open records are info merges.
+
+**Info notes have a consumer chain, not a gate.** An `escalate_info` record
+(severity `info`) never moves the workflow to `ESCALATED`, never gates, never
+short-circuits the wait, and never vetoes recovery: the recovery sites read
+`classify_pins`, where info is non-pinning (§3.7). Its consumers, in order:
+
+1. The comprehensive reviewer. It is briefed with its own task's open
+   agent-filed notes and returns a `note_dispositions` list in its verdict,
+   which `TaskWorkflow._apply_note_dispositions` applies through
+   `orchestrator/src/orchestrator/escalation_router.py::apply_reviewer_disposition`.
+2. A steward that is already running for a blocking record.
+3. The info-L0 router, run as the `disposition_info_l0s` entry of
+   `TaskWorkflow._on_terminal_cleanups` — after `stop_steward`, before
+   `release_lane` — on DONE, MERGE_DEFERRED, BLOCKED/ESCALATED and CANCELLED
+   exits. A requeued (or plan-only) exit leaves its notes pending for the
+   next incarnation's reviewer, and the orphan reaper backstops them (§6).
+
+The post-merge success tail starts a steward only for a pending blocking L0
+(`TaskWorkflow._pending_steward_l0s`). The decision table is
+`escalation/src/escalation/disposition.py::route_info_l0`, and the rationale
+is [plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md)
+D1–D3 and D7.
 
 Which exit status each outcome must write is specified normatively in
 [docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md) §4
