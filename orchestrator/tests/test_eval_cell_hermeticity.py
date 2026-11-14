@@ -17,22 +17,28 @@ from typing import NamedTuple
 
 import pytest
 from escalation.queue import EscalationQueue
-from orchestrator.evals.hermeticity import EvalHermeticityError, WorkflowStores
 from shared.cost_store import CostStore
 from shared.project_layout import escalation_queue_dir, runs_db
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.hermeticity import EvalHermeticityError, WorkflowStores
 from orchestrator.evals.runner import _cell_workflow, build_eval_orch_config
 from orchestrator.event_store import EventStore
 from orchestrator.workflow import TaskWorkflow
 
-# The real production object for each store, rooted at a project's own paths.
-_PRODUCTION_STORES: dict[str, Callable[[Path], object]] = {
-    'escalation_queue': lambda proj: EscalationQueue(escalation_queue_dir(proj)),
-    'steward_factory': lambda proj: lambda worktree, config_dir: None,
-    'event_store': lambda proj: EventStore(runs_db(proj), run_id='r'),
-    'cost_store': lambda proj: CostStore(runs_db(proj)),
+# Each field holding its real production object, rooted at a project's own paths.
+_PRODUCTION_STORES: dict[str, Callable[[Path], WorkflowStores]] = {
+    'escalation_queue': lambda proj: WorkflowStores(
+        escalation_queue=EscalationQueue(escalation_queue_dir(proj)),
+    ),
+    'steward_factory': lambda proj: WorkflowStores(
+        steward_factory=lambda worktree, config_dir: None,
+    ),
+    'event_store': lambda proj: WorkflowStores(
+        event_store=EventStore(runs_db(proj), run_id='r'),
+    ),
+    'cost_store': lambda proj: WorkflowStores(cost_store=CostStore(runs_db(proj))),
 }
 
 
@@ -69,10 +75,11 @@ def _build(cell: _Cell, **stores: WorkflowStores) -> TaskWorkflow:
 
 @pytest.mark.parametrize('field', list(_PRODUCTION_STORES))
 def test_each_production_store_handed_to_the_cell_is_refused(cell: _Cell, field: str) -> None:
-    store = _PRODUCTION_STORES[field](cell.project_root)
+    stores = _PRODUCTION_STORES[field](cell.project_root)
+    store = getattr(stores, field)
 
     with pytest.raises(EvalHermeticityError) as refused:
-        _build(cell, stores=WorkflowStores(**{field: store}))
+        _build(cell, stores=stores)
 
     assert refused.value.field == field
     assert field in str(refused.value)

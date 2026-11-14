@@ -62,6 +62,7 @@ from .eval_gate import (
     campaign_usage_gate,
     owned_usage_gate,
 )
+from .hermeticity import NO_STORES, WorkflowStores, refuse_production_stores
 from .metrics import (
     EvalMetrics,
     RoleUnderTest,
@@ -608,11 +609,15 @@ def _cell_workflow(
     *,
     replay_framed: bool,
     usage_gate: UsageGate | None,
+    stores: WorkflowStores = NO_STORES,
 ) -> TaskWorkflow:
     """The real TaskWorkflow for *task*, run in *worktree* against the eval stubs.
 
-    ``initial_plan=None`` makes the workflow's architect plan live.
+    ``initial_plan=None`` makes the workflow's architect plan live. Handed
+    *stores* are refused with ``EvalHermeticityError`` before anything is
+    built, so the cell writes no production state (C11).
     """
+    refuse_production_stores(stores)
     task_id = task['id']
     modules = task.get('modules', [])
     assignment = TaskAssignment(
@@ -637,6 +642,10 @@ def _cell_workflow(
         mcp=eval_mcp_lifecycle(orch_config),
         initial_plan=initial_plan,
         usage_gate=usage_gate,
+        escalation_queue=stores.escalation_queue,
+        steward_factory=stores.steward_factory,
+        event_store=stores.event_store,
+        cost_store=stores.cost_store,
     )
     workflow.worktree = worktree
     return workflow
