@@ -127,7 +127,9 @@ module_overrides:
 # docs/ also holds machine-read and tool-written files (docs/legibility/
 # census-state.json, confusion-codebook.yaml, the PRD capability manifests); an
 # exact module_overrides entry beats this rule, so one `<key>: 1` line there pins
-# any of them back.
+# any of them back, but only against requests for that file itself: a request for
+# a directory above it (docs/legibility, docs) still matches the prefix and takes
+# unlimited holders.
 # skills/ is deliberately outside it (agent instructions; no ruling).
 # Same red tier as module_overrides: takes effect at the next restart.
 unlimited_holder_locks:
