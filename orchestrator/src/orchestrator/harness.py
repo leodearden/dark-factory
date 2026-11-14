@@ -5758,6 +5758,7 @@ class Harness:
                 self._escalation_queue,
                 self._resolve_task_worktree,
                 heartbeat_ttl=DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+                merge_requests=getattr(self, '_merge_inflight_registry', None),
             )
             self._ground_truth = existing
         return existing
