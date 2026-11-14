@@ -23,6 +23,7 @@ from orchestrator.verify import (
 from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV, CacheMode
 
 AUDIT_COMMAND = 'verify-cache-audit'
+DEFAULT_LOG_DIR = '.df-verify-cache-audit'
 
 # pytest.ExitCode.OK and pytest.ExitCode.TESTS_FAILED; named here so pytest is not imported.
 PYTEST_OK = 0

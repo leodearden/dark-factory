@@ -451,6 +451,30 @@ def verify_cache_status_cmd(config_path: Path | None):
         click.echo(line)
 
 
+@verify_cache_group.command('audit-run')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Its project_root is the tree audited.')
+@click.option('--log-dir', type=click.Path(path_type=Path), default=None,
+              help='Where each module\'s raw output is written '
+                   '(default: <project_root>/.df-verify-cache-audit).')
+def verify_cache_audit_run_cmd(config_path: Path | None, log_dir: Path | None):
+    """Run every module's test leg uncached, printing failures as <module>::<node id>.
+
+    The offline lane's verify-cache-audit command (plans/verify-result-cache-prd.md § Audit).
+    """
+    from orchestrator.verify_cache.audit_run import DEFAULT_LOG_DIR, run_audit
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    tree = Path(config.project_root)
+    sys.exit(asyncio.run(run_audit(tree, config, log_dir or tree / DEFAULT_LOG_DIR)))
+
+
 @main.command('probe-models')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None,

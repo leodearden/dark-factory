@@ -1731,6 +1731,14 @@ git:
       command: "pytest -m warm_lane_bash"
       cwd: "orchestrator"
       fix_task_priority: "high"
+    # The verify-result cache audit (plans/verify-result-cache-prd.md § Audit, task 5655).
+    # PROJECT_ROOT points the head's own config at the lane worktree, so the
+    # audited module set is the head's. DF_VERIFY_CACHE=off forces both roles'
+    # cache modes off (A3). Its red handler is verify_cache/audit_hook.py.
+    - name: verify-cache-audit
+      command: 'DF_VERIFY_CACHE=off PROJECT_ROOT="$PWD" uv run --project orchestrator orchestrator verify-cache audit-run --config dark-factory-orchestrator.yaml'
+      cwd: "."
+      fix_task_priority: "high"
 
 # Variable-depth speculative verify placement (task 2359) — ACTIVATE the deep
 # probe (operator decision, 2026-07-19). probe_fraction=0.5: half of second-slot
