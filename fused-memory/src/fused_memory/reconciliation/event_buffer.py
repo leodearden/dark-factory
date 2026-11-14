@@ -645,8 +645,12 @@ class EventBuffer:
     async def drain_oldest_chunk(
         self, project_id: str, limit: int,
         before: datetime | None = None,
+        run_id: str | None = None,
     ) -> list[ReconciliationEvent]:
         """Drain the oldest `limit` buffered events for a project.
+
+        Stamps the drained rows like ``drain`` does: ``drained_by_run_id`` and
+        ``drained_by_instance_id``.
 
         Args:
             before: If set, only drain events with timestamp < this value.
@@ -675,8 +679,9 @@ class EventBuffer:
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             await db.execute(
-                f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
-                ids,
+                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?, "
+                f"drained_by_instance_id = ? WHERE id IN ({placeholders})",
+                [run_id, self.instance_id, *ids],
             )
 
         events = []
@@ -818,24 +823,23 @@ class EventBuffer:
         Callers that need the exact-match-only contract (e.g. one caller's
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
+
+        A restored row loses both drain stamps, so a stamp only ever names the
+        drain a row is currently in (task 9655).
         """
-        if include_unattributed:
-            async with self._require_access().write() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained' "
-                    "AND (drained_by_run_id = ? OR drained_by_run_id IS NULL)",
-                    (project_id, run_id),
-                )
-                count = cursor.rowcount
-        else:
-            async with self._require_access().write() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained' AND drained_by_run_id = ?",
-                    (project_id, run_id),
-                )
-                count = cursor.rowcount
+        run_match = (
+            '(drained_by_run_id = ? OR drained_by_run_id IS NULL)'
+            if include_unattributed
+            else 'drained_by_run_id = ?'
+        )
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                "UPDATE event_buffer SET status = 'buffered', "
+                "drained_by_run_id = NULL, drained_by_instance_id = NULL "
+                f"WHERE project_id = ? AND status = 'drained' AND {run_match}",
+                (project_id, run_id),
+            )
+            count = cursor.rowcount
         if count:
             logger.info(f'Restored {count} drained events to buffered for {project_id}')
         return count

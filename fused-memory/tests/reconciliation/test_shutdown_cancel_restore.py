@@ -23,6 +23,7 @@ from fused_memory.models.reconciliation import (
     RunStatus,
 )
 from fused_memory.reconciliation.harness import BacklogIterator
+from reconciliation.blocked_calls import block_first_call, wait_until_entered
 from reconciliation.harness_fixtures import make_harness_config, open_harness
 
 PROJECT_ID = 'test-project'
@@ -58,31 +59,11 @@ async def _push_events(harness, count: int) -> None:
         ))
 
 
-def _block_first_call(monkeypatch: pytest.MonkeyPatch, obj: object, name: str) -> asyncio.Event:
-    """Make the first call of ``obj.<name>`` set the returned event and never return."""
-    original = getattr(obj, name)
-    entered = asyncio.Event()
-
-    async def blocking_first_call(*args, **kwargs):
-        if not entered.is_set():
-            entered.set()
-            await asyncio.Event().wait()
-        return await original(*args, **kwargs)
-
-    monkeypatch.setattr(obj, name, blocking_first_call)
-    return entered
-
-
 async def _cancel_once_entered(
     coro: Coroutine[Any, Any, None], entered: asyncio.Event,
 ) -> asyncio.Task[None]:
     task = asyncio.create_task(coro)
-    entered_wait = asyncio.ensure_future(entered.wait())
-    try:
-        await asyncio.wait({entered_wait, task}, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        entered_wait.cancel()
-    assert entered.is_set(), f'the blocked call was never reached; task: {task!r}'
+    await wait_until_entered(entered, task)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
@@ -94,7 +75,7 @@ async def test_project_loop_shutdown_cancel_before_the_run_row_restores_the_drai
     harness, monkeypatch,
 ):
     await _push_events(harness, 2)
-    entered = _block_first_call(monkeypatch, harness.journal, 'start_run')
+    entered = block_first_call(monkeypatch, harness.journal, 'start_run')
 
     task = await _cancel_once_entered(harness._project_loop(PROJECT_ID), entered)
 
@@ -109,7 +90,7 @@ async def test_backlog_iterator_shutdown_cancel_before_the_run_row_restores_the_
     harness, monkeypatch, blocked,
 ):
     await _push_events(harness, 3)
-    entered = _block_first_call(monkeypatch, harness.journal, blocked)
+    entered = block_first_call(monkeypatch, harness.journal, blocked)
     iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
 
     task = await _cancel_once_entered(iterator.run(PROJECT_ID), entered)
@@ -161,7 +142,7 @@ async def test_run_full_cycle_cancel_during_the_pre_stage_reads_ends_the_run_fai
     harness, monkeypatch, owner, blocked,
 ):
     await _push_events(harness, 2)
-    entered = _block_first_call(monkeypatch, getattr(harness, owner), blocked)
+    entered = block_first_call(monkeypatch, getattr(harness, owner), blocked)
 
     task = await _cancel_once_entered(
         harness.run_full_cycle(PROJECT_ID, 'unit-test', run_id=RUN_ID), entered,
@@ -179,13 +160,10 @@ async def test_run_full_cycle_cancel_during_the_pre_stage_reads_ends_the_run_fai
 
 @pytest.mark.asyncio
 async def test_a_run_in_its_pre_stage_reads_is_reported_busy_with_no_stage(harness, monkeypatch):
-    entered = _block_first_call(monkeypatch, harness.taskmaster, 'get_tasks')
+    entered = block_first_call(monkeypatch, harness.taskmaster, 'get_tasks')
     task = asyncio.create_task(harness.run_full_cycle(PROJECT_ID, 'unit-test', run_id=RUN_ID))
     try:
-        entered_wait = asyncio.ensure_future(entered.wait())
-        await asyncio.wait({entered_wait, task}, return_when=asyncio.FIRST_COMPLETED)
-        entered_wait.cancel()
-        assert entered.is_set(), f'the blocked call was never reached; task: {task!r}'
+        await wait_until_entered(entered, task)
 
         assert [(e['run_id'], e['stage']) for e in harness.recon_busy_snapshot()] == [
             (RUN_ID, None),

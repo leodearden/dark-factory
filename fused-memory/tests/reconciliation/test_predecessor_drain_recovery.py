@@ -36,6 +36,7 @@ from fused_memory.reconciliation.predecessor_drain_recovery import (
     RecoveredDrain,
     recover_predecessor_drains,
 )
+from reconciliation.blocked_calls import block_first_call, wait_until_entered
 from reconciliation.harness_fixtures import (
     make_harness,
     make_harness_config,
@@ -48,6 +49,7 @@ PROJECT_P = 'project-p'
 PROJECT_Q = 'project-q'
 DEAD_INSTANCE = 'dead-predecessor'
 KILLED_RUN_ID = 'run-killed-before-start-run'
+UNREADABLE_RUN_ID = 'run-a-row-that-fails-to-read'
 
 
 @dataclass(frozen=True)
@@ -97,21 +99,6 @@ async def _dead_predecessor_drains_two_events(stores: _Stores, *, holding_its_lo
     assert await stores.dead.drain_by_ids(PROJECT_P, [e1, e2], run_id=KILLED_RUN_ID) == 2
 
 
-def _block_first_call(monkeypatch: pytest.MonkeyPatch, obj: object, name: str) -> asyncio.Event:
-    """Make the first call of ``obj.<name>`` set the returned event and never return."""
-    original = getattr(obj, name)
-    entered = asyncio.Event()
-
-    async def blocking_first_call(*args, **kwargs):
-        if not entered.is_set():
-            entered.set()
-            await asyncio.Event().wait()
-        return await original(*args, **kwargs)
-
-    monkeypatch.setattr(obj, name, blocking_first_call)
-    return entered
-
-
 @pytest.mark.asyncio
 async def test_drained_runs_of_other_instances_names_each_run_with_the_instance_that_drained_it(
     stores,
@@ -132,6 +119,20 @@ async def test_drained_runs_of_other_instances_names_each_run_with_the_instance_
     await stores.live.restore_drained(PROJECT_P, run_id='run-dead-chunk')
 
     assert await stores.live.drained_runs_of_other_instances() == []
+
+
+@pytest.mark.asyncio
+async def test_drain_oldest_chunk_names_its_own_drain_on_a_row_an_earlier_drain_restored(stores):
+    e1, e2 = await _push_events(stores.live, PROJECT_P, 2)
+    await stores.dead.drain_by_ids(PROJECT_P, [e1, e2], run_id='run-restored')
+    await stores.dead.restore_drained(PROJECT_P, run_id='run-restored')
+
+    await stores.live.drain_oldest_chunk(PROJECT_P, limit=10, run_id='run-live-chunk')
+
+    assert await stores.live.drained_runs_of_other_instances() == []
+    assert await stores.dead.drained_runs_of_other_instances() == [
+        DrainedRun(PROJECT_P, 'run-live-chunk', 'live'),
+    ]
 
 
 @pytest.mark.asyncio
@@ -238,19 +239,51 @@ async def test_run_loop_recovers_a_dead_predecessors_runless_drain_before_its_fi
     harness.drain()
     monkeypatch.setattr(harness, '_start_escalation_server', AsyncMock())
     monkeypatch.setattr(harness, '_stop_escalation_server', AsyncMock())
-    first_reaper_tick = _block_first_call(monkeypatch, harness.journal, 'get_stale_runs')
+    first_reaper_tick = block_first_call(monkeypatch, harness.journal, 'get_stale_runs')
 
     loop_task = asyncio.create_task(harness.run_loop())
-    tick_wait = asyncio.ensure_future(first_reaper_tick.wait())
     try:
-        await asyncio.wait({tick_wait, loop_task}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
-        assert first_reaper_tick.is_set(), f'run_loop never reached its reaper; task: {loop_task!r}'
+        await wait_until_entered(first_reaper_tick, loop_task)
 
         assert await stores.live.count_buffered(PROJECT_P) == 2
         assert await stores.live.get_lock_holder_instance_id(PROJECT_P) is None
         memory_service.add_memory.assert_awaited()
     finally:
-        tick_wait.cancel()
         loop_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await loop_task
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_drains_recovers_the_later_drains_when_one_fails(
+    stores, monkeypatch, caplog,
+):
+    caplog.set_level(
+        logging.WARNING, logger='fused_memory.reconciliation.predecessor_drain_recovery',
+    )
+    await _dead_predecessor_drains_two_events(stores, holding_its_lock=False)
+    [e3] = await _push_events(stores.live, PROJECT_P, 1)
+    await stores.dead.drain_by_ids(PROJECT_P, [e3], run_id=UNREADABLE_RUN_ID)
+    assert [d.run_id for d in await stores.live.drained_runs_of_other_instances()] == [
+        UNREADABLE_RUN_ID, KILLED_RUN_ID,
+    ]
+    read_run = stores.journal.get_run
+
+    async def get_run_failing_for_one_row(run_id: str) -> ReconciliationRun | None:
+        if run_id == UNREADABLE_RUN_ID:
+            raise ValueError('run row does not parse')
+        return await read_run(run_id)
+
+    monkeypatch.setattr(stores.journal, 'get_run', get_run_failing_for_one_row)
+
+    recovered = await recover_predecessor_drains(stores.journal, stores.live)
+
+    assert [r.drained.run_id for r in recovered] == [KILLED_RUN_ID]
+    assert await stores.live.count_buffered(PROJECT_P) == 2
+    assert [
+        r for r in caplog.records
+        if r.name == 'fused_memory.reconciliation.predecessor_drain_recovery'
+        and r.levelno == logging.WARNING
+        and r.getMessage() == 'reconciliation.predecessor_drain_recovery_failed'
+        and getattr(r, 'run_id', None) == UNREADABLE_RUN_ID
+    ], caplog.records

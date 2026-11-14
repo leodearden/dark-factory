@@ -3917,8 +3917,8 @@ class ReconciliationHarness:
             await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
 
             # Async judge review. Fire-and-forget: it outlives this cycle and
-            # is intentionally NOT tracked by _active_runs / recon_busy (which
-            # scopes to the stage pipeline only — see recon_busy_snapshot).
+            # is intentionally NOT tracked by _active_runs / recon_busy (whose
+            # scope is defined at recon_busy_snapshot).
             # Stage reports are already persisted above, so a cycle-aware
             # restart cancelling an in-flight judge here is an accepted
             # trade-off (task 2703 δ) — made non-lossy by the durable
