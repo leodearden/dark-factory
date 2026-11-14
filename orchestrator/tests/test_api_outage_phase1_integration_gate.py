@@ -16,12 +16,14 @@ from _api_outage_harness import (
     BurstLedger,
     DispatchRecord,
     incident_529_result,
+    reify_4429_wedge_result,
     run_incident_burst,
+    sigkill_wedge_result,
 )
 from shared.cli_invoke import AgentFailureKind, classify_agent_failure, is_zero_output_timeout
 
 from orchestrator.scheduler import is_transient_api_requeue
-from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow import ZERO_OUTPUT_HANG_REASON, WorkflowOutcome
 
 _API_ERROR_MARKER = 'agent API error: HTTP 529'
 
@@ -32,6 +34,7 @@ async def test_incident_burst_rows_1_to_5_hold_in_one_harness_run(tmp_path, monk
 
     _assert_burst_premises(ledger)
     _assert_row_1(ledger)
+    _assert_rows_2_and_3(ledger)
     _assert_row_4(ledger)
     _assert_row_5(ledger)
 
@@ -102,6 +105,43 @@ def _assert_row_1(ledger: BurstLedger) -> None:
         assert ledger.escalations_by_task[tid] == (), (
             f'row 1: task {tid} filed escalations: {ledger.escalations_by_task[tid]}'
         )
+
+
+def _assert_rows_2_and_3(ledger: BurstLedger) -> None:
+    wedges = {
+        'row 2': (ledger.cast.sigkill_wedge, sigkill_wedge_result()),
+        'row 3': (ledger.cast.reify_wedge, reify_4429_wedge_result()),
+    }
+    for row, (tid, shape) in wedges.items():
+        where = f'{row}: wedge control {tid}'
+        classified = classify_agent_failure(shape)
+        assert classified.kind == AgentFailureKind.TIMED_OUT, (
+            f'{where}: premise — a no-status zero-output kill classifies TIMED_OUT, got {classified.kind!r}'
+        )
+        assert is_zero_output_timeout(shape), f'{where}: premise — the shape is a zero-output timeout'
+        dispatches = ledger.dispatches_of(tid)
+        assert len(dispatches) == 1, f'{where}: {len(dispatches)} dispatches'
+        record = dispatches[0]
+        assert record.cli_calls == 2, (
+            f'{where}: {record.cli_calls} CLI calls — the wedge breaker trips at the default threshold of 2'
+        )
+        report = record.report
+        assert report.outcome == WorkflowOutcome.BLOCKED, f'{where}: outcome {report.outcome!r}'
+        assert report.block_category == 'infra_issue', f'{where}: category {report.block_category!r}'
+        assert ZERO_OUTPUT_HANG_REASON in report.block_reason, f'{where}: reason {report.block_reason!r}'
+        assert report.api_error_status is None, f'{where}: api_error_status {report.api_error_status}'
+        assert 'blocked' in ledger.status_writes[tid], f'{where}: never written blocked'
+        categories = {e.category for e in ledger.escalations_by_task[tid]}
+        assert 'infra_issue' in categories, f'{where}: no infra_issue escalation, got {categories}'
+
+    after_b = ledger.after_phase_b
+    wedge_ids = {ledger.cast.sigkill_wedge, ledger.cast.reify_wedge}
+    blocked = {tid for tid, writes in ledger.status_writes.items() if 'blocked' in writes}
+    assert blocked == wedge_ids, f'rows 2/3: blocked writes went to {sorted(blocked)}'
+    assert after_b.parked_live_count == len(wedge_ids), (
+        f'rows 2/3: the park-stop deque holds {after_b.parked_live_count} tasks, expected the two wedges'
+    )
+    assert after_b.paused is False, 'rows 2/3: two blocks are under the park-stop threshold yet paused'
 
 
 _TRANSIENT_ENVELOPES = (30.0, 60.0, 120.0, 240.0, 480.0)
