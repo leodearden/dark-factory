@@ -113,7 +113,7 @@ async def _run_capturing_restart_plan(
 
 def _self_target_task(task_id: str, own_unit: str) -> dict:
     return _task(task_id, {
-        'script': 'scripts/restart.sh',
+        'script': RELATIVE_SCRIPT,
         'timeout_secs': 10,
         'target_unit': own_unit,
     })
@@ -236,7 +236,7 @@ class TestBeforeDoneRunsUnderConfiguredProjectRoot:
 
         assert outcome == WorkflowOutcome.DONE
         assert plan.cwd == project_root.resolve()
-        assert plan.script == project_root.resolve() / 'scripts/restart.sh'
+        assert plan.script == project_root.resolve() / RELATIVE_SCRIPT
 
     async def test_explicit_cwd_is_honoured_while_script_resolves_under_project_root(
         self, tmp_path: Path, project_root: Path, elsewhere: Path, marker: Path,
@@ -288,6 +288,7 @@ class TestNoConfiguredProjectRoot:
         self, shape: str, elsewhere: Path, queue: EscalationQueue,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        _install_script(elsewhere)
         own_unit = 'orchestrator-self.service'
         task = _self_target_task('6470', own_unit)
         runner = DeterministicRunner(
@@ -301,7 +302,7 @@ class TestNoConfiguredProjectRoot:
 
         assert outcome == WorkflowOutcome.DONE
         assert plan.cwd == elsewhere.resolve()
-        assert plan.script == elsewhere.resolve() / 'scripts/restart.sh'
+        assert plan.script == elsewhere.resolve() / RELATIVE_SCRIPT
         _assert_warned_no_project_root(caplog)
 
 
