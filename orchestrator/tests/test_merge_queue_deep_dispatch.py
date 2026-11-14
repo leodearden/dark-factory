@@ -175,6 +175,43 @@ class TestSelectChainDepth:
         assert select_chain_depth(1, 2, 1) is None
 
 
+class TestMayChain:
+    """``may_chain(speculative=, frontier_depth=)``: the D5 eligibility rule.
+
+    ``plans/merge-lane-policy-prd.md`` D5: a dispatch may chain when its item
+    is speculative, or when nothing else is in the verify frontier.  Reached
+    as a module attribute so a missing symbol fails this class alone.
+    """
+
+    @pytest.mark.parametrize(
+        ('speculative', 'frontier_depth', 'expected'),
+        [
+            (True, 0, True),
+            (True, 3, True),
+            (True, None, True),
+            (False, 0, True),
+            (False, 1, False),
+            (False, 2, False),
+            (False, None, False),
+        ],
+        ids=[
+            'speculative-alone',
+            'speculative-beside-three',
+            'speculative-unknown-depth',
+            'head-alone-in-the-frontier',
+            'head-beside-one',
+            'head-beside-two',
+            'head-unknown-depth-never-licensed',
+        ],
+    )
+    def test_the_d5_rule(
+        self, speculative: bool, frontier_depth: int | None, expected: bool,
+    ) -> None:
+        assert merge_queue.may_chain(
+            speculative=speculative, frontier_depth=frontier_depth,
+        ) is expected
+
+
 class TestNextHalvingState:
     """``next_halving_state(passed, dispatched_depth) -> int | None`` (PRD dec. 5).
 
