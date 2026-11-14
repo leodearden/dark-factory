@@ -84,7 +84,8 @@ class RootCensus:
     ``files_per_row`` how many each footprint names. ``deps_per_100_rows`` is
     the dependency density. ``parked``, ``skipped`` and ``pinned`` count the
     pending tasks the scheduler parks, skips and pins; ``recovery_events``
-    counts the sweep events its last hour holds.
+    counts the sweep events its last hour holds. ``prds`` is how many distinct
+    PRDs the root's PRD-naming rows spread across.
     """
 
     label: str
@@ -104,6 +105,7 @@ class RootCensus:
     claimed_terminal: int = 0
     merges: int = 0
     trains: int = 0
+    prds: int = 1
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,12 @@ class FleetCensus:
     ``?project=dark-factory&window=all``): 3,736 landings, each a point on
     14 metric series, across 338 modules. Only that root is budgeted.
 
+    The PRD population was measured live on 2026-11-14 (590,357 bytes at
+    /prds, every PRD-holding root fresh): dark-factory 119 PRDs, reify 110,
+    solar-challenge-platform 37, solar-challenge 23, scoping-intake 2. The
+    fleet spreads each root's PRD-naming rows across that many PRDs and
+    serves about 481,000 bytes; it seeds no blocker or followup links.
+
     Re-grow this census, rather than loosening a budget, whenever a budget
     raised for real growth would otherwise trip the sweep's slack rule.
     """
@@ -197,7 +205,7 @@ CENSUS = FleetCensus(
             files_per_row=5, modules=2792, deps_per_100_rows=25,
             parked=5, skipped=4, pinned=17, recovery_events=1,
             pending_escalations=12, resolved_escalations=1968,
-            completed_hours=1555, claimed_terminal=40, merges=600, trains=50,
+            completed_hours=1555, claimed_terminal=40, merges=600, trains=50, prds=119,
         ),
         RootCensus(
             'reify',
@@ -205,7 +213,7 @@ CENSUS = FleetCensus(
             {TaskStatus.DONE: 6076, TaskStatus.CANCELLED: 772},
             files_per_row=5, modules=3775, deps_per_100_rows=131, parked=4, skipped=4,
             pending_escalations=4, resolved_escalations=8658,
-            completed_hours=2123, claimed_terminal=37, merges=600, trains=4,
+            completed_hours=2123, claimed_terminal=37, merges=600, trains=4, prds=110,
         ),
         RootCensus(
             'solar-challenge-platform',
@@ -213,7 +221,7 @@ CENSUS = FleetCensus(
             {TaskStatus.DONE: 715, TaskStatus.CANCELLED: 94},
             files_per_row=8, modules=1255, deps_per_100_rows=247,
             pending_escalations=31, resolved_escalations=1380,
-            completed_hours=529, merges=400,
+            completed_hours=529, merges=400, prds=37,
         ),
         RootCensus(
             'solar-challenge',
@@ -221,7 +229,7 @@ CENSUS = FleetCensus(
             {TaskStatus.DONE: 658, TaskStatus.CANCELLED: 133},
             files_per_row=8, modules=354, deps_per_100_rows=270, recovery_events=6,
             pending_escalations=8, resolved_escalations=633,
-            completed_hours=397, merges=400,
+            completed_hours=397, merges=400, prds=23,
         ),
         RootCensus(
             'scoping-intake',
@@ -229,7 +237,7 @@ CENSUS = FleetCensus(
             {TaskStatus.DONE: 50, TaskStatus.CANCELLED: 3},
             files_per_row=5, modules=88, deps_per_100_rows=181,
             pending_escalations=0, resolved_escalations=67,
-            completed_hours=32, merges=51,
+            completed_hours=32, merges=51, prds=2,
         ),
         RootCensus(
             'know-live',
@@ -386,7 +394,9 @@ class _TreeBuilder:
         self._pool = [_module_path(i, fleet.file_path_len) for i in range(root.modules)]
         self._terminal_total = sum(root.terminal.values())
         self._description = text('fleet task description', fleet.description_len)
-        self._prd = text('plans/fleet', fleet.prd_path_len - len('.md')) + '.md'
+        self._prds = [
+            text(f'plans/fleet-{i}', fleet.prd_path_len - len('.md')) + '.md' for i in range(root.prds)
+        ]
         self._notes = text('fleet task notes', fleet.metadata_extra_len)
         self._dep_count = 0
 
@@ -413,19 +423,19 @@ class _TreeBuilder:
                 task_id, status,
                 files=self._files(index),
                 dependencies=self._dependencies(index),
-                prd=index % 25 < self._fleet.prd_rows_per_25,
+                prd=self._prds[index % len(self._prds)] if index % 25 < self._fleet.prd_rows_per_25 else None,
                 external=index % self._fleet.external_dep_every == 0,
             )
 
     def _row(
         self, task_id: int, status: TaskStatus, *,
-        files: list[str], dependencies: list[int], prd: bool = False, external: bool = False,
+        files: list[str], dependencies: list[int], prd: str | None = None, external: bool = False,
     ) -> dict[str, Any]:
         # 'notes' stands for every metadata key no row shaper reads; escalation
         # cards embed the whole metadata, so its size is theirs.
         metadata: dict[str, Any] = {'files': files, 'notes': self._notes}
         if prd:
-            metadata['prd'] = self._prd
+            metadata['prd'] = prd
         if external:
             metadata['external_deps'] = [f'fleet-external:{task_id}']
         row: dict[str, Any] = {

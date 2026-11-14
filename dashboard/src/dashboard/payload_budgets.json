@@ -319,9 +319,9 @@
       ],
       "history": [
         {
-          "budget_bytes": 150000,
+          "budget_bytes": 740000,
           "task": "5824",
-          "reason": "Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 113,632 bytes with no query. Twelve projects; the route landed on main after the 2026-10-15 measurements and reached this table when task 5824's branch merged main."
+          "reason": "Measured 2026-11-14 08:12Z against the live dashboard (127.0.0.1:8080): 590,357 bytes with no query, every PRD-holding project's PRD_VIEW Datum fresh (autotrade, mission-control and market-predictor unknown for want of tasks or a runs.db, not in flight). 333 PRDs across twelve projects: dark-factory 119, reify 110, solar-challenge-platform 37, solar-challenge 23. PRD_VIEW 96%, PRD_CONTENTION 4%. The route landed on main after the 2026-10-15 measurements and reached this table when task 5824's branch merged main."
         }
       ]
     },
