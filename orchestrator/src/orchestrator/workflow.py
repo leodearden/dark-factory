@@ -146,7 +146,7 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
-from orchestrator.merge_lane.gates import declaration_coverage
+from orchestrator.merge_lane.gates import PlanFilesTouchedResult, declaration_coverage
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
@@ -157,6 +157,7 @@ from orchestrator.merge_lane.landing_evidence import (
 )
 from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.unmeasured_delivery import diagnose_unmeasured_delivery
 from orchestrator.merger_failure import merger_failure_report
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.plan_descope import (
@@ -12339,6 +12340,28 @@ class TaskWorkflow:
             )
         return None
 
+    async def _block_if_delivery_unmeasured(
+        self, check: PlanFilesTouchedResult, branch: str, *, merge_phase: bool,
+    ) -> WorkflowOutcome | None:
+        """Block with the remedy when *check*'s not-touched entries were never measured."""
+        from orchestrator.merge_lane.worker import OutcomeKind, _emit_merge_attempt
+
+        assert self.worktree is not None
+        finding = await diagnose_unmeasured_delivery(
+            check, self.worktree, self.git_ops, branch=branch, task_id=self.task_id,
+        )
+        if finding is None:
+            return None
+        _emit_merge_attempt(
+            self.event_store, self.task_id, OutcomeKind.plan_files_unmeasured,
+        )
+        return await self._mark_blocked(
+            finding.block_reason(),
+            merge_phase=merge_phase,
+            category='plan_delivery_unmeasured',
+            suggested_action=finding.suggested_action,
+        )
+
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
         *, merge_phase: bool = False,
@@ -12382,7 +12405,10 @@ class TaskWorkflow:
         # steward) is allowed to mediate, and only to drop genuinely
         # unneeded entries.  Adding new files is rejected by the helper's
         # subset check.  The gate's re-check is the source of truth for
-        # pass/fail.
+        # pass/fail.  A failing range is diagnosed before any not-delivered
+        # conclusion, and before narrowing, because a range that never
+        # measured the task's own work proves nothing; see
+        # merge_lane/unmeasured_delivery.py.
         if (
             self._task_files
             and self._base_commit is not None
@@ -12430,6 +12456,9 @@ class TaskWorkflow:
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
             if rc == 0 and branch_head.strip():
+                canonical_branch = (
+                    f'{self.config.git.branch_prefix}{branch_name.split("/")[-1]}'
+                )
                 own_base = await self._own_work_base()
                 check = await _check_plan_files_touched_in_branch(
                     list(self._task_files),
@@ -12440,6 +12469,11 @@ class TaskWorkflow:
                 )
                 narrowing_succeeded = False
                 if check.not_touched:
+                    unmeasured = await self._block_if_delivery_unmeasured(
+                        check, canonical_branch, merge_phase=merge_phase,
+                    )
+                    if unmeasured is not None:
+                        return unmeasured
                     # ALREADY-LANDED carve-out (task 3539).  Sited INSIDE the
                     # already-failing arm and BEFORE the narrowing pass — not
                     # alongside the cross-repo check at the top of the block —
@@ -12529,10 +12563,7 @@ class TaskWorkflow:
                         # correct for a prefixed caller too, instead of
                         # silently producing `task/task/<id>` and failing
                         # closed on a marker that is really there.
-                        branch=(
-                            f'{self.config.git.branch_prefix}'
-                            f'{branch_name.split("/")[-1]}'
-                        ),
+                        branch=canonical_branch,
                     )
                     if already_landed is not None:
                         _emit_merge_attempt(
@@ -12579,6 +12610,12 @@ class TaskWorkflow:
                             )
                             if not check.not_touched:
                                 narrowing_succeeded = True
+                            else:
+                                unmeasured = await self._block_if_delivery_unmeasured(
+                                    check, canonical_branch, merge_phase=merge_phase,
+                                )
+                                if unmeasured is not None:
+                                    return unmeasured
                 if check.not_touched:
                     # Task 3110 — the message is CLASS-SCOPED, because the
                     # gate's two failure classes are different failures.

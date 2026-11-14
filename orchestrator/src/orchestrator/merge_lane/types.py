@@ -1616,6 +1616,7 @@ class OutcomeKind(StrEnum):
     plan_files_narrowed = 'plan_files_narrowed'
     plan_files_cross_repo = 'plan_files_cross_repo'
     plan_files_already_landed = 'plan_files_already_landed'
+    plan_files_unmeasured = 'plan_files_unmeasured'
     cas_retry = 'cas_retry'
     gate_retry = 'gate_retry'
     post_merge_generation_chained = 'post_merge_generation_chained'
