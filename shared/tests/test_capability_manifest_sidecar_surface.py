@@ -21,6 +21,9 @@ from shared.capability_manifest import (
     sidecar_path,
     tracked_sidecar_paths,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class TestSidecarFor:
