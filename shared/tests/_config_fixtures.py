@@ -25,7 +25,3 @@ ROW_KNOBS = tuple(Row.model_fields)
 class Sub(BaseModel):
     alpha: int = 1
     beta: str = 'b'
-
-
-def assign_item(container, key, value) -> None:
-    container[key] = value

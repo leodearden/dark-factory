@@ -1,10 +1,11 @@
 """Tests for shared.config_reload: leaf iteration, diff and apply between two configs of one class."""
 
 import json
+from collections.abc import Mapping, MutableMapping
 from typing import Annotated, Self
 
 import pytest
-from _config_fixtures import ROW_KNOBS, Role, Row, Sub, assign_item
+from _config_fixtures import ROW_KNOBS, Role, Row, Sub
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -206,8 +207,9 @@ def test_unchanged_counts_the_equal_leaves():
 
 def test_the_diff_maps_are_read_only():
     diff = _diff(OrchestratorShaped(), OrchestratorShaped(max_slots=8))
-    with pytest.raises(TypeError):
-        assign_item(diff.restart_required, 'max_slots', Change(4, 9))
+    for bucket in (diff.applied_candidates, diff.restart_required):
+        assert isinstance(bucket, Mapping)
+        assert not isinstance(bucket, MutableMapping)
 
 
 def test_diffing_two_classes_is_a_type_error_naming_both():

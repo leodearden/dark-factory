@@ -1,11 +1,11 @@
 """Tests for shared.config_fields: tiers and spellings derived from declared field markers."""
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Annotated
 
 import pytest
-from _config_fixtures import ROW_KNOBS, Role, Row, Sub, assign_item
+from _config_fixtures import ROW_KNOBS, Role, Row, Sub
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from shared.config_fields import (
@@ -246,8 +246,9 @@ def test_several_table_markers_on_one_field_union():
 
 
 def test_the_spelling_map_is_read_only():
-    with pytest.raises(TypeError):
-        assign_item(legacy_spellings(ScalarSpelled), 'another', 'admission.slots')
+    spellings = legacy_spellings(ScalarSpelled)
+    assert isinstance(spellings, Mapping)
+    assert not isinstance(spellings, MutableMapping)
 
 
 class DoublyClaimed(BaseModel):
