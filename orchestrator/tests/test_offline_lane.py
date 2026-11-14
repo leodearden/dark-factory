@@ -22,10 +22,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import shlex
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -52,6 +53,7 @@ from orchestrator.offline_lane_pass import ConfirmSeam
 from orchestrator.offline_lane_records import (
     LEGACY_INFRA_COMMAND,
     LEGACY_NUMERIC_COMMAND,
+    RECORD_RETENTION,
     Leg,
     PassRecord,
     Phase,
@@ -1521,8 +1523,9 @@ async def test_a_pass_record_older_than_the_retention_survives_while_a_held_epis
     (task_id,) = client.tasks
     client.set_status(task_id, 'in-progress')
 
-    for _ in range(15):
-        clock.advance(hours=23)
+    cadence_hours = 23
+    for _ in range(math.ceil(RECORD_RETENTION / timedelta(hours=cadence_hours))):
+        clock.advance(hours=cadence_hours)
         await _drive_one_pass(worker, 'q')
 
     assert worker.records.load_pass('q', counted_pass_id) is not None
