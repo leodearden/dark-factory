@@ -271,10 +271,10 @@ class TestBuildScopeSnapshotMetadata:
         return build_scope_snapshot_metadata(**kwargs)
 
     def test_returns_canonical_payload(self):
+        from fused_memory.reconciliation.flag_identity import content_fingerprint
         from fused_memory.reconciliation.scope_freshness import (
             CONSOLIDATED_SCOPE_KIND,
             SCOPE_FRESHNESS_SOURCE,
-            _content_fingerprint,
         )
 
         metadata = self._build()
@@ -287,7 +287,7 @@ class TestBuildScopeSnapshotMetadata:
         assert metadata['subject_task_id'] == '2405'
         assert metadata['subject_status'] == 'pending'
         assert metadata['subject_updated_at'] == '2026-07-10T10:00:00Z'
-        assert metadata['subject_description_fingerprint'] == _content_fingerprint(
+        assert metadata['subject_description_fingerprint'] == content_fingerprint(
             'Some description text.',
         )
         assert metadata['run_id'] == 'run-1'

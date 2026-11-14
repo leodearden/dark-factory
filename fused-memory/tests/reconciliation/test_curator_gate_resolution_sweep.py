@@ -39,7 +39,7 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     extract_open_gate_task_ids,
     sweep_resolved_curator_gates,
 )
-from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+from fused_memory.reconciliation.flag_identity import compute_flag_signature
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
 

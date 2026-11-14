@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import inspect
 import json
 import logging
@@ -29,6 +28,13 @@ from fused_memory.models.reconciliation import (
     StageId,
 )
 from fused_memory.reconciliation import citation_repair
+from fused_memory.reconciliation.flag_identity import (
+    description_digest,
+    normalize_description,
+    parse_flag_subject,
+    recon_signature_task_id,
+    signature_field,
+)
 from fused_memory.services.memory_service import MemoryNotFoundError
 from fused_memory.utils.clip_disclosure import clip_text
 from fused_memory.utils.validation import is_full_uuid
@@ -38,96 +44,6 @@ logger = logging.getLogger(__name__)
 # The stage vocabulary the production factory passes as ``known_stages``;
 # ``StageId`` is its single source, so a new pipeline stage is accepted as-is.
 KNOWN_RECON_STAGES: frozenset[str] = frozenset(s.value for s in StageId)
-
-
-def _normalize_description(description: str) -> str:
-    """Collapse whitespace and casefold for description dedup."""
-    return ' '.join(description.split()).casefold()
-
-
-def _description_hash(description: str) -> str:
-    """SHA-256 hex digest of the normalized description."""
-    return hashlib.sha256(_normalize_description(description).encode('utf-8')).hexdigest()
-
-
-def _canonical_sig_field(value: Any) -> str | None:
-    """Coerce an in-run dedup signature field (task_id or flag_type) to ``str``.
-
-    Mirrors ``reconciliation.flag_dedup.compute_flag_signature``'s str-coercion,
-    which exists because "integer task_id is common in LLM output" — without
-    it, ``(1976, ft) != ('1976', ft)`` and two calls describing the same
-    logical (task_id, flag_type) produce distinct dedup keys (task-1979 /
-    run 9542fa10).  Re-implemented locally rather than imported because
-    server/ must not import from the reconciliation package — see
-    ``_normalize_description`` above for the same local-copy convention.
-
-    ``None`` is preserved as ``None`` (never coerced to the string ``'None'``)
-    so the ``(None, None)`` null-null desc-hash sentinel and partial-None
-    signature routing in :meth:`ReconReportState.add_finding` are unaffected.
-    """
-    return None if value is None else str(value)
-
-
-def _split_task_id_parts(value: str) -> set[str]:
-    """Return the set of individual task-id parts within *value*.
-
-    ``value`` is a (possibly comma-joined) canonical task_id string, e.g.
-    ``'5040,5149'`` -> ``{'5040', '5149'}`` and ``'5040'`` -> ``{'5040'}``.
-    Each part is stripped of surrounding whitespace; empty parts (from
-    leading/trailing/doubled commas) are dropped.
-
-    Used both by :func:`_canonicalize_task_id_string` (dedup-signature
-    normalization, task-2432 bullet 4) and by the entity-scoped cite_task
-    fold's subset-membership eligibility gate (task-2432 bullets 1b/2/3).
-    """
-    return {p.strip() for p in value.split(',') if p.strip()}
-
-
-def _task_id_part_sort_key(part: str) -> tuple[int, Any]:
-    """Sort key for a single task-id part: numeric parts by int value (and
-    ordered before non-numeric parts), non-numeric parts lexically.
-
-    A stable, deterministic ordering is all that's required for dedup
-    purposes — the exact numeric-before-lexical grouping is not itself load
-    -bearing, only that two calls describing the same set of parts always
-    sort to the same joined string.
-    """
-    try:
-        return (0, int(part))
-    except ValueError:
-        return (1, part)
-
-
-def _canonicalize_task_id_string(value: str) -> str:
-    """Canonicalize a top-level ``task_id`` string for dedup-signature purposes.
-
-    Splits *value* on ``','``, strips whitespace from each part, drops empty
-    parts, sorts (numeric parts by int value, non-numeric parts lexically —
-    see :func:`_task_id_part_sort_key`), dedupes, and rejoins with ``','``.
-    A single-value input canonicalizes to itself (e.g. ``'5040'`` ->
-    ``'5040'``); an input with no non-empty parts (e.g. ``''``) is returned
-    unchanged.
-
-    This ensures a comma-joined task_id whose components are reordered (or
-    duplicated) between two ``add_finding`` calls collapses onto the same
-    dedup signature (task-2432 bullet 4).
-
-    Both this helper and ``reconciliation.flag_dedup.compute_flag_signature``'s
-    ``cited_tasks`` union produce a sorted, comma-joined string, but the two
-    sort orders are independent, not mirrored: this one is numeric-aware (see
-    :func:`_task_id_part_sort_key`), while ``flag_dedup``'s is plain
-    lexicographic. Each subsystem is internally consistent among its own
-    callers and neither ever compares its signature against the other's — the
-    in-run (server) and cross-cycle (reconciliation) dedup layers run at
-    different boundaries and each recomputes its own signature fresh — so the
-    differing order is intentional, not a bug. Do not assume the two strings
-    are interchangeable if a future caller ever bridges server/ and
-    reconciliation/.
-    """
-    parts = _split_task_id_parts(value)
-    if not parts:
-        return value
-    return ','.join(sorted(parts, key=_task_id_part_sort_key))
 
 
 # ---------------------------------------------------------------------------
@@ -1412,7 +1328,8 @@ class ReconReportState:
         ``(task_id, None)`` row.
 
         A comma-joined ``task_id`` (e.g. ``'5040,5149'``) is canonicalized
-        via :func:`_canonicalize_task_id_string` (task-2432 bullet 4) BEFORE
+        via :func:`~fused_memory.reconciliation.flag_identity.recon_signature_task_id`
+        (task-2432 bullet 4) BEFORE
         the dedup signature is computed and BEFORE it is stored on the
         resulting ``_Finding`` — split/stripped/deduped/sorted and rejoined,
         so two calls describing the same set of task ids in a different
@@ -1583,16 +1500,14 @@ class ReconReportState:
         # In-run dedup: two separate namespaces.
         # (1) Signature path: (task_id, flag_type) != (None, None) — O(1) lookup in
         #     _run_sig_index, scoped to this run_id across ALL stages.  Each field
-        #     is canonicalized via _canonical_sig_field so an int task_id (common
+        #     is canonicalized via signature_field so an int task_id (common
         #     in LLM output) and the equivalent str task_id collapse to one key.
         # (2) Null-null path: both are None — dedup by normalized description hash
         #     in _run_desc_index so identical informational observations collapse.
         # The two namespaces are kept separate so a null-null finding with description
         # 'd' never collides with a real-signature finding that shares description 'd'.
-        c_task_id = _canonical_sig_field(task_id)
-        if c_task_id is not None:
-            c_task_id = _canonicalize_task_id_string(c_task_id)
-        c_flag_type = _canonical_sig_field(flag_type)
+        c_task_id = recon_signature_task_id(parse_flag_subject(task_id))
+        c_flag_type = signature_field(flag_type)
 
         # Flag-type inheritance (task-2318): a re-raise that omits flag_type
         # for an already-flagged task_id must not fork into its own (task_id,
@@ -1635,8 +1550,8 @@ class ReconReportState:
             # each blank informational finding allocates independently.  The empty
             # string is not a meaningful dedup key (two observations with no text
             # are not the same observation).
-            if _normalize_description(description):
-                desc_hash = _description_hash(description)
+            if normalize_description(description):
+                desc_hash = description_digest(description)
                 existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
                 if existing_id is not None:
                     return _duplicate_finding_error(
@@ -2299,8 +2214,8 @@ class ReconReportState:
         if sig != (None, None):
             self._run_sig_index.get(run_id, {}).pop(sig, None)
             owning_entry._signature_to_finding.pop(sig, None)
-        elif _normalize_description(finding.description):
-            desc_hash = _description_hash(finding.description)
+        elif normalize_description(finding.description):
+            desc_hash = description_digest(finding.description)
             self._run_desc_index.get(run_id, {}).pop(desc_hash, None)
             owning_entry._deschash_to_finding.pop(desc_hash, None)
 
@@ -2322,7 +2237,7 @@ class ReconReportState:
         # only an established anchor (whose citation is already recorded)
         # clears its derived sig here.
         if finding.flag_type is not None and finding.cited_tasks:
-            derived_sig = (_canonical_sig_field(finding.cited_tasks[0]['task_id']), finding.flag_type)
+            derived_sig = (signature_field(finding.cited_tasks[0]['task_id']), finding.flag_type)
             run_sig_index = self._run_sig_index.get(run_id, {})
             if run_sig_index.get(derived_sig) == finding.finding_id:
                 run_sig_index.pop(derived_sig, None)
@@ -2392,7 +2307,8 @@ class ReconReportState:
         Reads ``cited_tasks[0]`` — the same slot :meth:`_purge_finding` uses
         to reconstruct the derived sig it must clear — so registration,
         cleanup and this guard all agree on which citation owns the key.
-        Comparison runs through :func:`_canonical_sig_field`, the coercion
+        Comparison runs through
+        :func:`~fused_memory.reconciliation.flag_identity.signature_field`, the coercion
         the index itself uses, so an int-vs-str ``task_id`` (common in LLM
         output) cannot make a genuine pin look like a different task.
         """
@@ -2403,7 +2319,7 @@ class ReconReportState:
         if not anchor.cited_tasks:
             return None
         primary = anchor.cited_tasks[0]
-        if _canonical_sig_field(primary['task_id']) != c_cited_task_id:
+        if signature_field(primary['task_id']) != c_cited_task_id:
             return None
         return primary['project_id']
 
@@ -2734,7 +2650,8 @@ class ReconReportState:
            signature — every null-flag_type citation of the same task would
            collide), and only when ``finding.task_id is None`` or this
            citation's task_id (canonicalized) is a MEMBER of
-           ``finding.task_id``'s comma-split parts (:func:`_split_task_id_parts`)
+           ``finding.task_id``'s components
+           (:func:`~fused_memory.reconciliation.flag_identity.parse_flag_subject`)
            — a single-value top-level task_id is a singleton part set, so
            this subsumes the equality case. A None, a foreign-single, a
            local-single, and a comma-joined top-level task_id therefore all
@@ -2849,13 +2766,13 @@ class ReconReportState:
             else None
         )
 
-        c_cited_task_id = _canonical_sig_field(task_id)
+        c_cited_task_id = signature_field(task_id)
         entity_fold_eligible = (
             not finding.cited_tasks
             and finding.flag_type is not None
             and (
                 finding.task_id is None
-                or c_cited_task_id in _split_task_id_parts(finding.task_id)
+                or c_cited_task_id in parse_flag_subject(finding.task_id).components
             )
         )
         # Same rationale as cited_task_key above: compute unconditionally,

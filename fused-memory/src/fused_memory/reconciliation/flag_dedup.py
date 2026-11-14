@@ -32,8 +32,8 @@ Ledger-backed marker UPSERT (task 2227)
 ----------------------------------------
 ``dedup_flags`` is the entry point.  For each flag with a computable
 signature — ``(task_id, flag_type)`` via ``compute_marker_signature``, which
-falls back to ``compute_content_fingerprint_signature`` for null-task_id
-flags lacking ``cited_tasks`` — the corresponding ``stage1_flag_marker``
+falls back to ``flag_identity.py::compute_content_fingerprint_signature``
+for null-task_id flags lacking ``cited_tasks`` — the corresponding ``stage1_flag_marker``
 row is looked up via ``get_by_identity(project_id, 'stage1_flag_marker',
 task_id, flag_type, run_id='')``.  Note ``run_id=''`` in the identity: the
 dedup identity is ``(task_id, flag_type)`` only, so the *current*
@@ -60,8 +60,9 @@ LLM-authored citation must never reach the resolver — not a payload write.
 **Invariant (task 4712):** no INPUT to :func:`compute_marker_signature` may be
 persisted in the marker payload as durable cross-cycle state.
 :func:`compute_marker_signature` folds every ``cited_tasks`` entry's
-``task_id`` into the row's own key (see :func:`compute_flag_signature`'s
-"cited_tasks union" section below), so a value derived from citations is
+``task_id`` into the row's own key (see
+``flag_identity.py::compute_flag_signature``'s "cited_tasks union"
+section), so a value derived from citations is
 unconditionally stored in a row keyed by itself — reachable only when a
 LATER cycle happens to present the IDENTICAL citation set, in which case
 that cycle's own citation already resolves the gate and the anchor adds
@@ -128,7 +129,7 @@ emitted (sprawl), each independently bounded by the ledger's
 self-refreshing 14-day TTL and reaped by ``ReconLedgerStore.gc()`` once it
 stops recurring — elevated row count within a rolling 14-day window, not
 unbounded growth.  The direction that would fix the sprawl itself is
-de-folding ``cited_tasks`` from :func:`compute_flag_signature` and replacing
+de-folding ``cited_tasks`` from ``flag_identity.py::compute_flag_signature`` and replacing
 task-2432's collision protection (see that function's docstring) with some
 other discriminator; that is a fleet-wide re-key across ~40 call sites and
 was declined by task 4712 as disproportionate to a feature that had never
@@ -307,15 +308,9 @@ because the ledger is absent.
 
 Public API
 ----------
-- ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
-- ``compute_marker_signature(flag, *, project_id)`` — cheap, sync, no I/O;
-  the ``stage1_flag_marker`` ledger identity of *flag* in *project_id*.
-- ``compute_content_fingerprint_signature(flag)`` — cheap, sync, no I/O;
-  fallback signature for null-task_id flags lacking ``cited_tasks``.
-- ``canonical_flag_type_family(flag_type)`` — cheap, sync, no I/O;
-  canonicalizes a flag_type into a case/separator/whitespace/word-order
-  -insensitive family key (task 2503), used by ``filter_suppressed`` and
-  ``write_suppression_record``'s pre-write coverage check.
+Flag identity (signatures, the content fingerprint, marker-key validation and
+flag_type families) lives in :mod:`fused_memory.reconciliation.flag_identity`.
+
 - ``filter_suppressed(memory_service, project_id, flags)`` — async, one
   indexed ``recon_ledger`` query; drops suppressed flags (by exact match or
   flag_type family match, task 2503) before signature dedup.
@@ -338,34 +333,39 @@ Public API
 - ``acknowledge_resolved_flags(memory_service, project_id, run_id,
   resolved_flags, *, mode, log)`` — async, de-dupes signatures and fans out
   to ``acknowledge_flag_marker``; best-effort; returns the summed count.
-- ``is_content_fingerprint_task_id(tid)`` — cheap, sync, no I/O; the fp:-only
-  gate used to scope Gap 1/2 enrichment and sweep behaviour to fingerprint
-  markers (task-2047).
 """
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from functools import cached_property, partial
+from functools import partial
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
 from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation.flag_identity import (
+    FlagTypeFamily,
+    canonical_flag_type_family,
+    compute_marker_signature,
+    extract_flag_uuids,
+    is_content_fingerprint_task_id,
+    is_valid_marker_task_id,
+    normalize_description,
+    parse_flag_subject,
+)
 from fused_memory.reconciliation.flag_record_contract import (
     STAGE1_FLAG_MARKER_KIND,
     STAGE1_FLAG_SUPPRESSION_KIND,
     canonical_flag_types,
     normalize_flag_record_metadata,
 )
-from fused_memory.reconciliation.flag_shape import contains_any_casefolded
-from fused_memory.reconciliation.flag_task_ids import task_id_components
+from fused_memory.reconciliation.flag_shape import collect_str_values, contains_any_casefolded
 from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import (
     ReconLedgerRecord,
@@ -387,7 +387,6 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_WRITTEN_STAT_KEY,
 )
 from fused_memory.utils.async_utils import gather_collect
-from fused_memory.utils.validation import validate_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -462,134 +461,6 @@ def _decompose_suppression_task_id(tid: str) -> list[str]:
     if not tid:
         return []
     return [p.strip() for p in tid.split(',') if p.strip()]
-
-
-#: Splits on runs of non-alphanumeric characters for flag_type family
-#: tokenization (task 2503) -- underscore, hyphen, and whitespace are all
-#: treated as separators, mirroring the tokenization style of the module's
-#: existing normalization helpers (see :func:`_significant_terms`).
-#:
-#: A DEDICATED constant rather than a reused splitter: although structurally
-#: identical to the never-tracked-systemic-pattern feature's _TERM_SPLIT_RE,
-#: coupling the suppression-family key to that unrelated splitter would let a
-#: future edit to _TERM_SPLIT_RE silently alter suppression matching. The
-#: module already keeps per-feature regex constants dedicated (_CONTENT_FP_RE,
-#: _COUNT_GROUP_RE, _INCORRECT_WORD_RE, _TERM_SPLIT_RE); this follows the same
-#: convention.
-_FLAG_TYPE_TOKEN_SPLIT_RE: re.Pattern[str] = re.compile(r'[^a-z0-9]+')
-
-
-def canonical_flag_type_family(flag_type: str) -> str:
-    """Return a canonical "family" key for *flag_type* (task 2503).
-
-    Collapses four normalization axes onto one deterministic key so a
-    reworded/reordered flag_type for the SAME underlying finding is
-    recognized as a match by :func:`filter_suppressed` and
-    ``write_suppression_record``'s pre-write coverage check: case
-    (``'Missing_Deliverable'``), separator (``'-'``/``'_'``/``' '``),
-    whitespace, and word-order (``'deliverable_missing'`` ==
-    ``'missing_deliverable'``).
-
-    Algorithm: casefold *flag_type*, split on runs of non-alphanumeric
-    characters (:data:`_FLAG_TYPE_TOKEN_SPLIT_RE`), drop empty tokens, then
-    join ``sorted(set(tokens))`` with ``'_'``. Empty/whitespace/
-    all-separator input (or input that yields zero tokens) returns ``''``.
-
-    Deliberately does NOT stem, synonym-map, or tolerate an added/removed
-    word -- only case/separator/whitespace/word-order variants collapse to
-    the same family. Wider tolerance would risk false-positive
-    over-suppression: the scoped-suppression PRD documents a
-    genuinely-recurring finding (``live_workflow_recurrence_counter_needed``)
-    hidden for 6+ cycles by an over-broad suppression record.
-    Under-suppression here only costs one extra companion record, which the
-    pre-write coverage check still catches for reorder/case/separator
-    variants of an already-covered flag_type.
-
-    Note the specific mechanism the word-order axis accepts: two flag_types
-    that merely share the same TOKEN MULTISET (e.g. ``'user_missing'`` and
-    ``'missing_user'``) collapse to the same family even if they describe
-    different findings -- see :func:`filter_suppressed`'s "ACCEPTED RISK"
-    docstring paragraph for the reviewed rationale and the audit-log
-    mitigation it emits on such a collision.
-
-    Idempotent: the output is already lowercase, separator-free, and
-    ``'_'``-joined in sorted order, so re-applying this function to its own
-    output is a no-op.
-
-    Pure, sync, no I/O.
-    """
-    tokens = _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold())
-    return '_'.join(sorted({t for t in tokens if t}))
-
-
-@dataclass(frozen=True)
-class FlagTypeFamily:
-    """The ``flag_type`` spellings of one Stage-1 finding that a filter acts on.
-
-    ``flag_type`` is LLM-authored with no committed schema entry, so a filter
-    keyed on it goes silently inert whenever Stage 1 coins a new spelling.
-    :meth:`matches` tolerates what :func:`canonical_flag_type_family`
-    collapses, and :meth:`log_drift` makes the rest observable.
-
-    ``name`` labels the family in the drift log; ``spellings`` are the
-    measured ones; a ``flag_type`` whose casefolded text contains any one of
-    the ``drift_tokens`` is probably meant for this family.  A non-empty
-    ``unseen_spelling_tokens`` also admits a never-observed spelling whose
-    tokens include all of them.
-    """
-
-    name: str
-    spellings: frozenset[str]
-    drift_tokens: frozenset[str]
-    unseen_spelling_tokens: frozenset[str] = frozenset()
-
-    def __post_init__(self) -> None:
-        tokens = self.drift_tokens
-        if (
-            not isinstance(tokens, frozenset)
-            or not tokens
-            or any(not t or t != t.casefold() for t in tokens)
-        ):
-            raise ValueError(
-                f'FlagTypeFamily {self.name!r}: drift_tokens must be a non-empty frozenset '
-                f'of non-empty casefolded substrings, got {tokens!r}'
-            )
-
-    @cached_property
-    def _canonical_spellings(self) -> frozenset[str]:
-        return frozenset(canonical_flag_type_family(s) for s in self.spellings)
-
-    def matches(self, flag_type: Any) -> bool:
-        """True iff *flag_type* is a spelling of this family; ``False`` for any non-``str``."""
-        if not isinstance(flag_type, str) or not flag_type:
-            return False
-        if canonical_flag_type_family(flag_type) in self._canonical_spellings:
-            return True
-        tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
-        return bool(self.unseen_spelling_tokens) and self.unseen_spelling_tokens <= tokens
-
-    def _probably_meant_for_family(self, flag_type: str) -> bool:
-        folded = flag_type.casefold()
-        return any(token in folded for token in self.drift_tokens)
-
-    def log_drift(self, flags: list[dict[str, Any]], *, log_event: str) -> None:
-        """Log as *log_event* each ``flag_type`` carrying a drift token that does not match."""
-        unmatched = [
-            ft
-            for flag in flags
-            if isinstance(ft := flag.get('flag_type'), str)
-            and self._probably_meant_for_family(ft)
-            and not self.matches(ft)
-        ]
-        if unmatched:
-            logger.info(
-                '%s family=%s unmatched_flag_types=%s known_types=%s '
-                '— add the spelling to that FlagTypeFamily if drift confirmed',
-                log_event,
-                self.name,
-                unmatched,
-                sorted(self.spellings),
-            )
 
 
 #: ``(project_id, task_id, family)`` keys for which :func:`filter_suppressed`
@@ -831,72 +702,6 @@ async def filter_suppressed(
 # (b) gating on whether its flag_type belongs to the decision's grounds→token
 # family. See filter_entity_standing_decisions (step-4/6) for the composition.
 # --------------------------------------------------------------------------- #
-
-#: Canonical 8-4-4-4-12 hex UUID, anchored on word boundaries so a UUID is only
-#: extracted when it stands alone (not as a substring of a longer alnum run). A
-#: DEDICATED constant rather than a reused splitter, mirroring the module's
-#: per-feature regex convention (_CONTENT_FP_RE, _FLAG_TYPE_TOKEN_SPLIT_RE, ...).
-_UUID_RE: re.Pattern[str] = re.compile(
-    r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
-    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
-)
-
-
-def _extract_uuids(text: str) -> set[str]:
-    """Return the set of lowercased canonical UUIDs appearing in *text*.
-
-    Case-insensitive extraction normalized to lowercase, so upper- and
-    lower-case spellings of the same UUID (and repeats) collapse to a single
-    distinct value. Text with no UUID (including empty/``None``-coerced) yields
-    an empty set. Pure, sync, no I/O.
-    """
-    if not text:
-        return set()
-    return {m.lower() for m in _UUID_RE.findall(text)}
-
-
-def _collect_str_values(value: Any, out: list[str]) -> None:
-    """Recursively append every ``str`` VALUE reachable in *value* to *out*.
-
-    Descends dicts (values only, not keys), lists, and tuples; every other
-    scalar type (int, float, bool, None, ...) is ignored rather than
-    stringified. Pure, sync, no I/O.
-    """
-    if isinstance(value, str):
-        out.append(value)
-    elif isinstance(value, dict):
-        for v in value.values():
-            _collect_str_values(v, out)
-    elif isinstance(value, (list, tuple)):
-        for v in value:
-            _collect_str_values(v, out)
-    # Any other type (int/float/bool/None/...) is intentionally ignored: only
-    # LLM-authored free text can carry a cited UUID, and stringifying a numeric
-    # or structured value could mint spurious tokens.
-
-
-def _flag_text_blob(flag: dict[str, Any]) -> str:
-    """Return every ``str`` value in *flag* (recursively), space-joined.
-
-    FALLBACK match is exactly the stamps-omitted path, so a cited UUID may
-    appear in any free-text field (``description``/``summary``/nested
-    ``evidence``/list items). Collecting all string values finds it wherever
-    the LLM placed it while ignoring structured/numeric noise. Pure, sync, no
-    I/O.
-    """
-    parts: list[str] = []
-    _collect_str_values(flag, parts)
-    return ' '.join(parts)
-
-
-def extract_flag_uuids(flag: dict[str, Any]) -> set[str]:
-    """Every UUID *flag* names in any ``str`` value, lowercased.
-
-    Structured and free-text fields alike, at any nesting depth; non-``str``
-    values are ignored.  Pure, sync, no I/O.
-    """
-    return _extract_uuids(_flag_text_blob(flag))
-
 
 def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
     """Return True iff *flag_type* belongs to *grounds*' bound token family.
@@ -1469,7 +1274,7 @@ async def dedup_flags(
       (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.  When it
       returns None the flag is returned unchanged — no I/O performed.
     - If a signature is computable, the resulting ``task_id`` (``tid``) is
-      validated by ``_is_valid_marker_task_id``.  This guard accepts numeric
+      validated by ``is_valid_marker_task_id``.  This guard accepts numeric
       keys, comma-joined lists of integers or ``'<project>:<digits>'``
       components, and canonical ``fp:+32-hex`` content-fingerprint keys
       (task-1670 Option A); it rejects only genuinely-invalid tids (empty
@@ -1565,7 +1370,7 @@ async def dedup_flags(
       marker payload (task 4712).  The accepted consequence for the CITATION
       producer: a carried-forward finding whose LLM output re-emits NO
       citation on a given cycle keys to a DIFFERENT row (see
-      :func:`compute_flag_signature`'s cited_tasks union), so that cycle is a
+      ``flag_identity.py::compute_flag_signature``'s cited_tasks union), so that cycle is a
       MISS and the finding is RE-ASSERTED rather than suppressed.  Citation-
       driven suppression is reliable exactly when the LLM keeps re-citing the
       same fix task — the common case for a still-open remediation.  The
@@ -1654,17 +1459,18 @@ async def dedup_flags(
             continue
         tid, ftype = sig
         # Guard: skip search + write for genuinely-invalid tids.
-        # Canonical fp:+32-hex keys produced by compute_content_fingerprint_signature
+        # Canonical fp:+32-hex keys produced by
+        # flag_identity.py::compute_content_fingerprint_signature
         # PASS this guard (task-1670 Option A): they are Stage-1-internal dedup
         # artifacts that are safe to persist because Stage 2's _query_stage2_flags
         # processes only flag_for_stage2=True records and never touches stage1_flag_marker
         # rows regardless of task_id format.  Only truly-invalid tids (empty string,
         # malformed fp: variants, non-numeric/non-fp: strings) are rejected here and
         # logged at DEBUG (not a brownout signal, just an unexpected key shape).
-        if not _is_valid_marker_task_id(tid):
+        if not is_valid_marker_task_id(tid):
             logger.debug(
                 'flag_dedup: skipping stage1 dedup for invalid task_id %r'
-                ' (flag_type %s) — rejected by _is_valid_marker_task_id',
+                ' (flag_type %s) — rejected by is_valid_marker_task_id',
                 tid, ftype,
             )
             result.append(flag)
@@ -1851,7 +1657,7 @@ async def dedup_flags(
                 #
                 # THE CITATION IS A LOCAL VALUE.  It must not be assigned to
                 # flag['cited_tasks'] and must not enter `payload`:
-                # compute_flag_signature already read cited_tasks at the top of
+                # compute_marker_signature already read cited_tasks at the top of
                 # this loop and folds them into the marker row KEY, so
                 # enriching the flag would RELOCATE the row; the gate is
                 # HIT-only, so the first relocated cycle would be a MISS, and
@@ -2019,7 +1825,7 @@ def _canonicalize_suppression_task_id(task_id: int | str) -> str:
         # Composite fallback: a comma-joined list of numeric ids (e.g. a
         # cross-project signature like '2405,540,544'). Mirrors the
         # numeric/comma-joined validation convention in
-        # _is_valid_marker_task_id. Only reached when the single-id int()
+        # is_valid_marker_task_id. Only reached when the single-id int()
         # fast-path above fails.
         components = [c.strip() for c in task_id.split(',')] if isinstance(task_id, str) else []
         if len(components) >= 2 and all(c.isdigit() for c in components):
@@ -2356,314 +2162,6 @@ async def write_suppression_record(
             exc_info=True,
         )
         return AddMemoryResponse(memory_ids=[])
-
-
-def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
-    """Return a (task_id_str, flag_type_str) signature for *flag*, or ``None``.
-
-    This is the project-agnostic in-run signature; a flag's ledger identity is
-    :func:`compute_marker_signature`.
-
-    Both ``task_id`` and ``flag_type`` must be present (i.e. not ``None``) for
-    a signature to be computed.  Values are coerced to ``str`` so that an
-    integer task_id (common in LLM output) and a string task_id compare equal.
-    Falsy-but-valid values like ``task_id=0`` or ``flag_type=''`` are accepted
-    — only ``None`` (absent key) triggers a ``None`` return.
-
-    **cited_tasks union (task-2432 bullets 3/4; supersedes the PRD γ §9.3
-    fallback):** whenever ``cited_tasks`` is a non-empty list, the task
-    component is the *sorted set* of the UNION of {the top-level
-    ``task_id``'s comma-split parts, if it is set} ∪ {every ``task_id`` value
-    in ``cited_tasks``}, comma-joined — using the same plain ``sorted(str(...))``
-    convention as before (lexicographic, not numeric-aware). This collapses a
-    shape mismatch between calls that describe the same task set differently:
-    a null top-level task_id (the original fallback case), a single value
-    equal to one of the cited tasks, or an already comma-joined top-level
-    value all produce the SAME signature once cited_tasks agrees. It also
-    prevents two findings that share only some of their cited tasks from
-    colliding (reviewer finding dedup_correctness). When ``cited_tasks`` is
-    absent (or not a non-empty list), the top-level ``task_id`` passes
-    through UNCHANGED — single, comma-joined, or ``None`` — so this path
-    stays exactly as before for callers that never set cited_tasks. Callers
-    that need precise single-task dedup should always set the top-level
-    ``task_id`` explicitly.
-
-    **Sort-order independence (reviewer finding consistency):** the union's
-    comma-join above uses a plain lexicographic ``sorted()``, which is *not*
-    the same ordering as ``recon_report._canonicalize_task_id_string``'s
-    numeric-aware sort (that helper sorts numeric parts by ``int`` value).
-    The two conventions are deliberately independent: each subsystem is
-    internally consistent among its own callers, and a signature computed
-    here is never compared against a canonicalized string from
-    ``recon_report`` — the in-run (server) and cross-cycle (reconciliation)
-    dedup layers run at different boundaries and each recomputes its own
-    signature fresh rather than persisting and cross-comparing. So the
-    differing order is not a correctness bug, only a reminder not to assume
-    the two are interchangeable if a future caller ever bridges them.
-
-    **Upgrade-boundary note (reviewer finding backward_compatibility):**
-    widening this union to apply whenever ``cited_tasks`` is non-empty
-    (rather than only when the top-level ``task_id`` is ``None``) changes
-    the signature for any pre-existing finding that had BOTH a set top-level
-    ``task_id`` and ``cited_tasks`` — e.g. ``task_id='5040', cited=[5040]``
-    and ``task_id='5040', cited=[5040, 5149]`` used to collapse to the same
-    signature and are now distinct. A ledger suppression marker written
-    under the old signature will therefore miss once immediately after
-    deploy; this is self-healing (the very next cycle writes suppression
-    under the new signature), so no marker migration or dual-key lookup is
-    required.
-
-    **Payload-persistence hazard (task 4712):** because this union folds every
-    ``cited_tasks`` entry's ``task_id`` into the task component, any value
-    *derived from* ``cited_tasks`` is unconditionally stored in a row keyed by
-    itself, and so can never be persisted as durable CROSS-CYCLE state in that
-    row's own payload — a later cycle presenting a different citation set
-    keys to a *different* row and can never read it back.  Measured:
-    ``compute_flag_signature({'task_id': 598, 'flag_type': ft, 'cited_tasks':
-    [{'project_id': 'dark_factory', 'task_id': '3839'}]})`` returns
-    ``('3839,598', ft)`` while the citation-less ``compute_flag_signature({
-    'task_id': 598, 'flag_type': ft})`` returns ``('598', ft)`` — two
-    different rows for one logical flag.  This is why :func:`dedup_flags` no
-    longer persists ``cited_tasks`` in the marker payload; see the module
-    docstring's invariant for the general rule this instance falls out of.
-
-    Returns ``None`` for flags without enough signal to deduplicate — these are
-    passed through unchanged by :func:`dedup_flags`.
-    """
-    return _task_union_signature(flag, home_project_id=None)
-
-
-def compute_marker_signature(
-    flag: dict[str, Any], *, project_id: str
-) -> tuple[str, str] | None:
-    """Return *flag*'s ``stage1_flag_marker`` ledger identity in *project_id*, or ``None``.
-
-    The task component is :func:`compute_flag_signature`'s union, except that
-    a cited task from a project other than *project_id* contributes
-    ``'<project>:<task_id>'``.  Every bare id names a task of the row's own
-    ``project_id``.  Both halves are stripped, and a foreign citation whose
-    qualified component :func:`_is_valid_marker_task_id` would reject
-    contributes its bare id, as before.  A flag with no task anchor falls back
-    to :func:`compute_content_fingerprint_signature`.
-    """
-    return (
-        _task_union_signature(flag, home_project_id=project_id)
-        or compute_content_fingerprint_signature(flag)
-    )
-
-
-def _task_union_signature(
-    flag: dict[str, Any], *, home_project_id: str | None
-) -> tuple[str, str] | None:
-    task_id = flag.get('task_id')
-
-    # cited_tasks union (task-2432): whenever cited_tasks is present, the
-    # task component is the sorted union of the top-level task_id's
-    # comma-split parts (if any) and every cited task_id — not just consulted
-    # when the top-level task_id is absent, so a SET top-level task_id no
-    # longer produces a different signature than a None or comma-joined one
-    # naming the same task set.  flag_type is still required at the top level.
-    cited_tasks = flag.get('cited_tasks')
-    if cited_tasks and isinstance(cited_tasks, list):
-        task_id_parts: set[str] = set()
-        if task_id is not None:
-            task_id_parts.update(part.strip() for part in str(task_id).split(',') if part.strip())
-        task_id_parts.update(
-            _cited_task_component(c, home_project_id)
-            for c in cited_tasks
-            if isinstance(c, dict) and c.get('task_id') is not None
-        )
-        if task_id_parts:
-            task_id = ','.join(sorted(task_id_parts))
-
-    flag_type = flag.get('flag_type')
-    if task_id is None or flag_type is None:
-        return None
-    return (str(task_id), str(flag_type))
-
-
-def _cited_task_component(cited: dict[str, Any], home_project_id: str | None) -> str:
-    bare = str(cited['task_id'])
-    cited_project = cited.get('project_id')
-    if home_project_id is None or not isinstance(cited_project, str):
-        return bare
-    project = cited_project.strip()
-    if not project or project == home_project_id:
-        return bare
-    qualified = f'{project}:{bare.strip()}'
-    if _is_valid_marker_task_component(qualified):
-        return qualified
-    return bare
-
-
-# --------------------------------------------------------------------------- #
-# Content-fingerprint helpers (task-1654 Fix 2)
-# --------------------------------------------------------------------------- #
-
-#: Sentinel flag_type used in the content-fingerprint (fp:…) signature when
-#: the flag's own flag_type is None.  A stable string avoids a None value
-#: breaking str-coercion in ledger identity columns / marker metadata writes.
-#: Do NOT change without a marker migration — existing markers keyed by this
-#: sentinel must remain findable by the new value.
-_CONTENT_FP_FLAG_TYPE: str = '__content_fp__'
-
-
-def _normalize_content_description(description: str) -> str:
-    """Casefold + collapse internal whitespace (mirrors recon_report._normalize_description).
-
-    A local copy avoids a server<-reconciliation import that would invert the
-    package layering.  Both normalizers must stay aligned — if recon_report's
-    implementation changes, update this one too.
-    """
-    return ' '.join(description.split()).casefold()
-
-
-#: Prefix emitted by :func:`_content_fingerprint`.  Used as a single source of
-#: truth so :func:`_is_valid_marker_task_id` and :func:`_content_fingerprint`
-#: cannot drift apart silently.
-_CONTENT_FP_PREFIX: str = 'fp:'
-
-#: Number of hex characters kept from SHA-256 hexdigest (``digest[:32]``).
-#: 128 bits of SHA-256 provides sufficient collision resistance for a dedup key
-#: over recon findings.  Must match :func:`_content_fingerprint`'s slice length.
-_CONTENT_FP_HEXLEN: int = 32
-
-#: Compiled regex that matches ONLY canonical content-fingerprint marker keys:
-#: ``fp:`` followed by exactly :data:`_CONTENT_FP_HEXLEN` lowercase hex digits.
-#: Uppercase hex is excluded because :func:`hashlib.sha256().hexdigest` always
-#: returns lowercase; accepting uppercase would widen the accept-set beyond what
-#: the emitter can produce and introduce false positives.
-_CONTENT_FP_RE: re.Pattern[str] = re.compile(
-    rf'{re.escape(_CONTENT_FP_PREFIX)}[0-9a-f]{{{_CONTENT_FP_HEXLEN}}}\Z'
-)
-
-
-def _is_valid_marker_task_id(tid: str) -> bool:
-    """Return True iff *tid* is a valid stage1_flag_marker key.
-
-    Accepts:
-    - A canonical content-fingerprint key: ``'fp:'`` followed by exactly
-      :data:`_CONTENT_FP_HEXLEN` (32) lowercase hex digits, e.g.
-      ``'fp:9216e85ac497b68d93043b64684eb049'``.  This is the ONLY shape
-      emitted by :func:`_content_fingerprint`; the regex :data:`_CONTENT_FP_RE`
-      enforces the exact length and character set so accept-pattern and
-      emit-pattern cannot drift independently.
-    - A bare non-negative integer string (e.g. ``'42'``, ``'0'``).
-    - A comma-joined list of non-negative integers (e.g. ``'12,15'``), which is
-      the shape produced by :func:`compute_flag_signature`'s ``cited_tasks``
-      fallback for multi-task findings.
-    - Any of those components written ``'<project>:<digits>'`` (e.g.
-      ``'12,reify:650'``), the foreign cited id :func:`compute_marker_signature`
-      emits; the project half must pass ``validate_project_id``.
-
-    Rejects:
-    - Falsy / empty input.
-    - Malformed fp: forms: ``'fp:'`` (no hex), too-short or too-long hex bodies,
-      uppercase hex, non-hex characters in the body.
-    - Any component that is neither a non-negative integer nor
-      ``'<project>:<digits>'`` after strip.
-    - Trailing/leading commas that yield empty components (e.g. ``'12,'``).
-
-    The check lives here, not beside
-    ``shared/src/shared/task_submit.py::looks_like_task_id``, because every
-    shape it accepts beyond a bare id (comma-joined keys, ``fp:`` keys,
-    ``'<project>:<digits>'`` components) belongs to the marker format alone.
-
-    Pure, sync, no I/O.
-    """
-    if not tid:
-        return False
-    # Canonical content-fingerprint branch: fp: + exactly 32 lowercase hex chars.
-    if _CONTENT_FP_RE.fullmatch(tid):
-        return True
-    return all(_is_valid_marker_task_component(part.strip()) for part in tid.split(','))
-
-
-def _is_valid_marker_task_component(component: str) -> bool:
-    project, separator, task_id = component.partition(':')
-    if not separator:
-        return component.isdigit()
-    return task_id.isdigit() and validate_project_id(project) is None
-
-
-def is_content_fingerprint_task_id(tid: str) -> bool:
-    """Return True iff *tid* is a canonical content-fingerprint marker key.
-
-    This is the fp:-ONLY gate: ``'fp:'`` followed by exactly
-    :data:`_CONTENT_FP_HEXLEN` (32) lowercase hex digits — the single shape
-    emitted by :func:`_content_fingerprint`.  Unlike
-    :func:`_is_valid_marker_task_id` (which ALSO accepts bare numeric and
-    comma-joined tids as valid marker keys), this helper rejects every shape
-    other than the canonical fp: key, including otherwise-valid numeric and
-    comma-joined marker keys.
-
-    Public (no leading underscore) because it is imported by
-    ``task_knowledge_sync`` (task-2047 Gap 2) to scope the cross-cycle
-    fingerprint-marker sweep to fp:-keyed markers only, leaving numeric
-    markers on the existing 14-day age-only GC.
-
-    Pure, sync, no I/O.
-    """
-    return bool(tid) and bool(_CONTENT_FP_RE.fullmatch(tid))
-
-
-def _content_fingerprint(description: str) -> str:
-    """SHA-256 hex (first :data:`_CONTENT_FP_HEXLEN` chars) of the normalised description.
-
-    Output format: :data:`_CONTENT_FP_PREFIX` + ``digest[:_CONTENT_FP_HEXLEN]``.
-    Deterministic across processes and PYTHONHASHSEED (unlike builtin hash()).
-    Truncation to :data:`_CONTENT_FP_HEXLEN` hex chars (128 bits of SHA-256) is
-    sufficient collision resistance for a dedup key over recon findings.
-
-    The emitted key is always accepted by :func:`_is_valid_marker_task_id` (the
-    anti-drift invariant tested by ``TestIsValidMarkerTaskId.test_accepts_anti_drift_roundtrip``).
-    """
-    digest = hashlib.sha256(
-        _normalize_content_description(description).encode('utf-8')
-    ).hexdigest()
-    return f'{_CONTENT_FP_PREFIX}{digest[:_CONTENT_FP_HEXLEN]}'
-
-
-def compute_content_fingerprint_signature(
-    flag: dict[str, Any],
-) -> tuple[str, str] | None:
-    """Return a content-fingerprint (fp:<hex>, flag_type_or_sentinel) or None.
-
-    Activated ONLY when ALL of the following hold:
-    - ``task_id`` is None (no top-level task anchor)
-    - ``cited_tasks`` yields no task_id values (empty list, absent, or all None)
-    - The normalized ``description`` is non-blank
-
-    Returns None when any condition fails so callers can fall through to
-    ``compute_flag_signature`` (which handles the cited_tasks path) or pass
-    the flag through unchanged (when both helpers return None).
-
-    When ``flag_type`` is None, the sentinel :data:`_CONTENT_FP_FLAG_TYPE` is
-    used so the 2-tuple shape is preserved for marker write/match in
-    ``dedup_flags``.
-
-    Pure, sync, no I/O — safe to call from any context.
-    """
-    # Condition 1: top-level task_id must be None.
-    if flag.get('task_id') is not None:
-        return None
-
-    # Condition 2: no usable task_id in cited_tasks.
-    cited_tasks = flag.get('cited_tasks')
-    if cited_tasks and isinstance(cited_tasks, list) and any(
-        isinstance(c, dict) and c.get('task_id') is not None
-        for c in cited_tasks
-    ):
-        return None
-
-    # Condition 3: non-blank normalized description.
-    description = flag.get('description') or ''
-    if not _normalize_content_description(description):
-        return None
-
-    fp = _content_fingerprint(description)
-    ftype = flag.get('flag_type') or _CONTENT_FP_FLAG_TYPE
-    return (fp, str(ftype))
 
 
 # --------------------------------------------------------------------------- #
@@ -3351,7 +2849,7 @@ def _titles_corroborate(cited_title: object, live_title: object) -> bool:
     """True iff a cited title and a live task title name the SAME task.
 
     Both sides are truncated to :data:`_MAX_CITED_TASK_STR_CHARS` and then
-    normalised with :func:`_normalize_content_description` (casefold +
+    normalised with :func:`normalize_description` (casefold +
     whitespace-collapse) before comparison.
 
     **Truncating BOTH sides is the point** (task 4864).  ``_sanitize_cited_tasks``
@@ -3377,10 +2875,10 @@ def _titles_corroborate(cited_title: object, live_title: object) -> bool:
     """
     if not isinstance(cited_title, str) or not isinstance(live_title, str):
         return False
-    normalized_cited = _normalize_content_description(
+    normalized_cited = normalize_description(
         cited_title[:_MAX_CITED_TASK_STR_CHARS]
     )
-    normalized_live = _normalize_content_description(
+    normalized_live = normalize_description(
         live_title[:_MAX_CITED_TASK_STR_CHARS]
     )
     if not normalized_cited or not normalized_live:
@@ -4530,7 +4028,7 @@ async def _discover_foreign_fix_task_citations(
     ever emitted such a citation, so the gate landed, was enabled, and stayed
     inert.  Stage 1's context is its own project's task tree, so the model has
     nothing to cite from; and enriching the marker from Stage 2 (option (a))
-    is defeated outright, because :func:`compute_flag_signature` folds cited
+    is defeated outright, because :func:`compute_marker_signature` folds cited
     task ids into the marker row's own KEY, so an enriched row RELOCATES
     rather than annotates (task 4712's invariant).
 
@@ -4543,7 +4041,7 @@ async def _discover_foreign_fix_task_citations(
     **The returned citations are an in-memory GATE INPUT ONLY.**  They must be
     passed straight to :func:`_resolve_live_cross_project_fix_task` and MUST
     NEVER be written back onto the flag (``flag['cited_tasks']``) or into the
-    marker payload.  ``compute_flag_signature`` runs BEFORE the gate and reads
+    marker payload.  ``compute_marker_signature`` runs BEFORE the gate and reads
     ``cited_tasks``, so mutating the flag would move the marker to a different
     row; since the gate is HIT-only, the first enriched cycle would become a
     MISS, and because discovery matches against a live backlog that changes
@@ -4959,7 +4457,7 @@ async def acknowledge_flag_marker(
     acknowledgement, so the Mem0-era delete-vs-tag distinction no longer
     applies.
 
-    Guards: an invalid *task_id* (per :func:`_is_valid_marker_task_id`), an
+    Guards: an invalid *task_id* (per :func:`is_valid_marker_task_id`), an
     absent ``memory_service.recon_ledger`` (ledger disabled/not wired), or no
     matching row all short-circuit to a no-op ``0`` — the last case in
     particular means ``mark_addressed`` is never called against an identity
@@ -4996,7 +4494,7 @@ async def acknowledge_flag_marker(
     tid = str(task_id)
     ftype = str(flag_type)
 
-    if not _is_valid_marker_task_id(tid):
+    if not is_valid_marker_task_id(tid):
         log.debug(
             'acknowledge_flag_marker: skipping invalid task_id %r flag_type %s',
             tid, ftype,
@@ -5662,7 +5160,7 @@ def _flag_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
     """Return every task id *flag* points at, in resolution order (task 3476).
 
     Two channels, top-level first, each value decomposed by
-    :func:`~fused_memory.reconciliation.flag_task_ids.task_id_components`:
+    :func:`~fused_memory.reconciliation.flag_identity.parse_flag_subject`:
 
     1. ``flag['task_id']``.
     2. ``flag['cited_tasks'][].task_id``, non-dict entries skipped.
@@ -5671,7 +5169,7 @@ def _flag_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
 
     NOT :func:`_decompose_suppression_task_id`: that helper's contract reserves
     comma-decomposition for suppression LEDGER rows and states that a flag's
-    own task_id is never split by it.  ``task_id_components`` is the separate
+    own task_id is never split by it.  ``parse_flag_subject`` is the separate
     splitter for a flag's own task_id.
 
     Total over malformed LLM-authored input.  Results are deduped ACROSS both
@@ -5684,7 +5182,7 @@ def _flag_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
     cited_tasks = flag.get('cited_tasks')
     if isinstance(cited_tasks, list):
         raws.extend(entry.get('task_id') for entry in cited_tasks if isinstance(entry, dict))
-    return list(dict.fromkeys(tid for raw in raws for tid in task_id_components(raw)))
+    return list(dict.fromkeys(tid for raw in raws for tid in parse_flag_subject(raw).components))
 
 
 @dataclass(frozen=True)
@@ -5924,9 +5422,7 @@ PREMATURE_WIDENING_CAVEAT_FAMILY = FlagTypeFamily(
 
 def _task_metadata_text(record: dict[str, Any]) -> str:
     """Every ``str`` value under *record*'s ``metadata``, newline-joined (``''`` if none)."""
-    parts: list[str] = []
-    _collect_str_values(record.get('metadata'), parts)
-    return '\n'.join(parts)
+    return '\n'.join(collect_str_values(record.get('metadata')))
 
 
 _ALREADY_RECORDED_CAVEAT_GATE = _TaskTextAccountingGate(
