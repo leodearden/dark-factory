@@ -829,9 +829,9 @@ const SNAPSHOT_UNPLACED = {
   reason: 'the instrument refused it: schema_version 7 is not a schema this instrument reads',
 };
 const INSTRUMENT_MARKER = qualityMarker({
-  id: `instrument:${SNAPSHOT_SHAS[1]}`, ordinal: 3, kind: 'instrument',
+  id: `instrument:${SNAPSHOT_NIGHTLY.id}`, ordinal: 3, kind: 'instrument',
   label: 'instrument params changed: instrument (unknown), python_version (unknown)',
-  ref: SNAPSHOT_SHAS[1], source: { type: 'instrument' },
+  ref: SNAPSHOT_SHAS[1], source: { type: 'instrument', point: SNAPSHOT_NIGHTLY.id },
 });
 const NEWEST_DIFF_TEXT = 'params differ: none\n\n| member | src lines |\n|---|---|\n| zeta | 3400 -> 3410 |\n';
 const BASELINE_DIFF_REASON = "the series' first point has no earlier snapshot to diff against";

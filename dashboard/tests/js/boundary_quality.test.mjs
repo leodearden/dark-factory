@@ -187,6 +187,18 @@ test('quality #20: a served snapshot series charts its baseline and instrument m
   }
 });
 
+test('quality #20: a baseline and a nightly file at one commit place the instrument mark at the nightly’s column', async () => {
+  const landed = await landQuality('quality_snapshots_same_commit');
+  const snapshots = landed.datum('QUALITY_SNAPSHOTS');
+  assert.equal(snapshots.state, 'fresh', snapshots.reason);
+  const { points } = snapshots.value;
+  const { markers } = landed.datum('QUALITY_MARKERS').value;
+
+  assert.equal(points[0].as_of_sha, points[1].as_of_sha);
+  const marks = landed.view.snapshotMarks(points, markers);
+  assert.deepEqual(marks.map(mark => [mark.kind, mark.fraction]), [['baseline', 0], ['instrument', 0.5]]);
+});
+
 test('quality #20: a root holding neither snapshot home lands an unknown snapshot series saying no snapshot yet', async () => {
   const landed = await landQuality('quality_no_snapshot');
   const reading = landed.datumView(landed.datum('QUALITY_SNAPSHOTS'), { now: RECEIVED_AT });

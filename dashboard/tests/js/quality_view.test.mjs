@@ -402,7 +402,9 @@ test('an unserved marker stream draws the alarms alone', () => {
 });
 
 test('an instrument marker is not drawn on a landing-axis chart: it annotates the snapshot series', () => {
-  const instrument = qualityMarker({ id: 'instrument:abc', ordinal: 13, kind: 'instrument', ref: 'abc', source: { type: 'instrument' } });
+  const instrument = qualityMarker({
+    id: 'instrument:abc', ordinal: 13, kind: 'instrument', ref: 'abc', source: { type: 'instrument', point: 'abc' },
+  });
   const marks = qualityMarks({
     axis: GAPPED_AXIS, markers: [FLIP, instrument], alarms: [], beforeAfter: [], metricId: 'rejected', kind: 'rate',
   });
@@ -485,8 +487,8 @@ test('each snapshot series holds the points’ served values verbatim, unknown a
 
 test('a baseline mark sits at each baseline point’s column, an instrument marker at its point’s', () => {
   const instrument = qualityMarker({
-    id: `instrument:${SHA_2}`, ordinal: null, kind: 'instrument', label: 'instrument params changed: instrument (unknown)',
-    ref: SHA_2, source: { type: 'instrument' },
+    id: `instrument:${NIGHTLY_2.id}`, ordinal: null, kind: 'instrument', label: 'instrument params changed: instrument (unknown)',
+    ref: SHA_2, source: { type: 'instrument', point: NIGHTLY_2.id },
   });
 
   assert.deepEqual(snapshotMarks(POINTS, [instrument]), [
@@ -495,15 +497,19 @@ test('a baseline mark sits at each baseline point’s column, an instrument mark
   ]);
 });
 
-test('an instrument marker sits at the first point at its sha, and one at no served sha is dropped', () => {
+test('an instrument marker sits at its own point’s column, past a baseline at the same commit, and one naming no served point is dropped', () => {
   const nightlyAtBaseline = qualitySnapshotPoint({ id: 'nightly-1', asOfSha: SHA_1, committedAt: BASELINE.committed_at });
   const points = [BASELINE, nightlyAtBaseline, NIGHTLY_2];
-  const atBaseline = qualityMarker({ id: `instrument:${SHA_1}`, ordinal: null, kind: 'instrument', ref: SHA_1 });
-  const unserved = qualityMarker({ id: 'instrument:9999', ordinal: null, kind: 'instrument', ref: '9'.repeat(40) });
+  const atNightly = qualityMarker({
+    id: 'instrument:nightly-1', ordinal: null, kind: 'instrument', ref: SHA_1, source: { type: 'instrument', point: 'nightly-1' },
+  });
+  const unserved = qualityMarker({
+    id: 'instrument:gone', ordinal: null, kind: 'instrument', ref: SHA_2, source: { type: 'instrument', point: 'gone' },
+  });
 
-  const instrumentMarks = snapshotMarks(points, [atBaseline, unserved]).filter(mark => mark.kind === 'instrument');
+  const instrumentMarks = snapshotMarks(points, [atNightly, unserved]).filter(mark => mark.kind === 'instrument');
 
-  assert.deepEqual(instrumentMarks.map(mark => [mark.key, mark.fraction]), [[atBaseline.id, 0]]);
+  assert.deepEqual(instrumentMarks.map(mark => [mark.key, mark.fraction, mark.ref]), [[atNightly.id, 0.5, SHA_1]]);
 });
 
 test('only instrument markers are drawn on the snapshot charts', () => {
