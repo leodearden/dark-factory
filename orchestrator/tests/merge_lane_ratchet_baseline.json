@@ -1606,7 +1606,7 @@
     "orchestrator/tests/test_recut_ruling_gitops.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_remove_merge_worktree_guarded.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_repend_state_machine.py": {"patch_targets": [], "private_reads": 59},
-    "orchestrator/tests/test_restart_durable_guards.py": {"patch_targets": [], "private_reads": 66},
+    "orchestrator/tests/test_restart_durable_guards.py": {"patch_targets": [], "private_reads": 48},
     "orchestrator/tests/test_restart_recut_dispatch.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_restart_recut_e2e.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_resumed_run_not_discarded.py": {"patch_targets": [], "private_reads": 3},

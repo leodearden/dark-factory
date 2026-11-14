@@ -709,7 +709,7 @@ def _spy_on_guard_writes(monkeypatch) -> list:
 
 
 class TestResurrectionAnchorSurvivesRedeploy:
-    """``_update_age_anchors`` is driven directly, so the assertion is about
+    """``Scheduler.age_anchors`` is driven directly, so the assertion is about
     the anchor and nothing else."""
 
     def test_a_resurrected_task_does_not_re_acquire_its_age_bonus(self, guard_clock):
@@ -718,32 +718,32 @@ class TestResurrectionAnchorSurvivesRedeploy:
         queue over genuinely-old pending tasks once per redeploy, and its
         victims are the starvation watchdog's own."""
         first = _scheduler()
-        first._update_age_anchors([_task('100', pending_since=_FILED)], _MAX_ID)
-        first._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
+        first.age_anchors.observe([_task('100', pending_since=_FILED)], _MAX_ID)
+        first.age_anchors.observe([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
+        redeployed.age_anchors.observe([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
-        assert redeployed._compute_age('100', _MAX_ID) == 0
+        assert redeployed.age_anchors.age('100', _MAX_ID) == 0
 
     def test_a_genuinely_old_pending_task_keeps_its_age(self, guard_clock):
         """The property the fix must not break."""
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('200')], _MAX_ID)
+        redeployed.age_anchors.observe([_task('200')], _MAX_ID)
 
-        assert redeployed._compute_age('200', _MAX_ID) == _MAX_ID - 200
+        assert redeployed.age_anchors.age('200', _MAX_ID) == _MAX_ID - 200
 
     def test_a_non_numeric_id_anchors_to_max_id_either_way(self, guard_clock):
         """Pins the third branch across the change."""
         first = _scheduler()
-        first._update_age_anchors([_task('epic-a', status='cancelled')], _MAX_ID)
+        first.age_anchors.observe([_task('epic-a', status='cancelled')], _MAX_ID)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('epic-a')], _MAX_ID)
-        redeployed._update_age_anchors([_task('epic-b')], _MAX_ID)
+        redeployed.age_anchors.observe([_task('epic-a')], _MAX_ID)
+        redeployed.age_anchors.observe([_task('epic-b')], _MAX_ID)
 
-        assert redeployed._compute_age('epic-a', _MAX_ID) == 0
-        assert redeployed._compute_age('epic-b', _MAX_ID) == 0
+        assert redeployed.age_anchors.age('epic-a', _MAX_ID) == 0
+        assert redeployed.age_anchors.age('epic-b', _MAX_ID) == 0
 
     @pytest.mark.asyncio
     async def test_a_cold_start_writes_once_and_a_steady_state_tick_not_at_all(
@@ -768,7 +768,7 @@ class TestResurrectionAnchorSurvivesRedeploy:
         scheduler = _scheduler()
 
         writes = _spy_on_guard_writes(monkeypatch)
-        scheduler._update_age_anchors(cold_start, _MAX_ID)
+        scheduler.age_anchors.observe(cold_start, _MAX_ID)
 
         assert len(writes) == 1, (
             f'a cold start of {len(cold_start)} observations must be one write,'
@@ -776,7 +776,7 @@ class TestResurrectionAnchorSurvivesRedeploy:
         )
 
         writes.clear()
-        scheduler._update_age_anchors(cold_start, _MAX_ID)
+        scheduler.age_anchors.observe(cold_start, _MAX_ID)
 
         assert writes == [], 'a re-observation of an unchanged observation must be silent'
 
@@ -794,8 +794,8 @@ class TestResurrectionAnchorSurvivesRedeploy:
         guard_clock[0] = _T0 + timedelta(days=31)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
-        assert redeployed._compute_age('100', _MAX_ID) == _MAX_ID - 100
+        redeployed.age_anchors.observe([_task('100', pending_since=_REOPENED)], _MAX_ID)
+        assert redeployed.age_anchors.age('100', _MAX_ID) == _MAX_ID - 100
 
     @pytest.mark.asyncio
     async def test_any_write_within_the_ttl_keeps_an_in_fetch_record_alive(self, guard_clock):
@@ -818,12 +818,17 @@ class TestStaleSweepRecordingSurvivesRedeploy:
     """``_phase_stale_sweep`` is the other write site and must be covered too."""
 
     async def test_a_swept_anchor_is_restored_after_a_restart(self, guard_clock):
+        """The day-20 tick's observation writes nothing, so only the sweep's
+        departure refreshes '300''s day-0 record past its day-30 expiry."""
         first = _scheduler()
-        first._pending_anchor['300'] = 5
+        first.age_anchors.observe([_task('300', pending_since=_FILED), _task('99')], _MAX_ID)
+        first.age_anchors.observe([_task('300', pending_since=_REOPENED), _task('99')], 1000)
+        guard_clock[0] = _T0 + timedelta(days=20)
         await _tick(first, [_task('99')])
+        guard_clock[0] = _T0 + timedelta(days=40)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('300')], _MAX_ID)
-        assert redeployed._compute_age('300', _MAX_ID) == _MAX_ID - 5, (
+        redeployed.age_anchors.observe([_task('300', pending_since=_REOPENED)], _MAX_ID)
+        assert redeployed.age_anchors.age('300', _MAX_ID) == _MAX_ID - 1000, (
             'absence from the fetch is not a cancellation (D3)'
         )
