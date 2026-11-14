@@ -9,6 +9,7 @@ suite instead of a scoped subset.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,17 @@ from orchestrator.config import (
     apply_reload,
     load_config,
 )
+from orchestrator.verify_cache import keys, policy, registry
 from orchestrator.verify_cache.modes import CacheMode
+from orchestrator.verify_evidence import Leg, UnitTier
+
+_FORCE_OFF = 'DF_VERIFY_CACHE'
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_force_off(monkeypatch):
+    """The audit lane runs this suite under DF_VERIFY_CACHE=off; these tests own the variable."""
+    monkeypatch.delenv(_FORCE_OFF, raising=False)
 
 
 def _project(tmp_path: Path, top_level: dict) -> Path:
@@ -61,6 +72,50 @@ class TestModeFor:
     def test_a_mode_outside_the_vocabulary_is_rejected(self):
         with pytest.raises(ValidationError):
             VerifyCacheConfig.model_validate({'task_mode': 'maybe'})
+
+
+_BOTH_ON = VerifyCacheConfig(task_mode=CacheMode.ON, merge_mode=CacheMode.ON)
+
+
+class TestEnvForcesOff:
+    @pytest.mark.parametrize('value', ['off', 'OFF', ' off '])
+    def test_off_forces_both_roles_off(self, monkeypatch, value):
+        monkeypatch.setenv(_FORCE_OFF, value)
+
+        assert _BOTH_ON.mode_for('task') is CacheMode.OFF
+        assert _BOTH_ON.mode_for('merge') is CacheMode.OFF
+
+    def test_unset_keeps_the_configured_modes(self):
+        assert _BOTH_ON.mode_for('task') is CacheMode.ON
+        assert _BOTH_ON.mode_for('merge') is CacheMode.ON
+
+    @pytest.mark.parametrize('value', ['', 'on', 'log', 'bogus'])
+    def test_any_other_value_can_never_turn_the_cache_on(self, monkeypatch, value):
+        monkeypatch.setenv(_FORCE_OFF, value)
+
+        assert _BOTH_ON.mode_for('task') is CacheMode.ON
+        assert _BOTH_ON.mode_for('merge') is CacheMode.ON
+        assert VerifyCacheConfig().mode_for('merge') is CacheMode.OFF
+
+    def test_the_decision_point_neither_replays_nor_records(self, monkeypatch):
+        now = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
+        key = keys.UnitKey.of('module:alpha:test', UnitTier.MODULE, 's', (('spec', 's'),))
+        entry = registry.Entry(
+            entry_id=1, unit_id=key.unit_id, key=key.key, tier=key.tier, spec_hash=key.spec_hash,
+            inputs=key.inputs, evidence_event_id=7, run_id='r1', sha='abc', recorded_at=now,
+        )
+        view = registry.RegistryView({(key.unit_id, key.key): entry}, registry.PolicyState())
+        clean_green = policy.LegResult(
+            leg=Leg.TEST, rc=0, timed_out=False, trivial=False, flake_suppressed=False,
+            junit_tests=3, collected=3, never_cache=False,
+        )
+        assert policy.decide(_BOTH_ON, 'merge', key, view, never_cache=False, now=now).decision is policy.Decision.HIT
+
+        monkeypatch.setenv(_FORCE_OFF, 'off')
+
+        decision = policy.decide(_BOTH_ON, 'merge', key, view, never_cache=False, now=now)
+        assert decision.decision is policy.Decision.MISS
+        assert policy.admissible(_BOTH_ON, 'merge', clean_green).admitted is False
 
 
 def test_each_role_mode_is_its_own_reload_leaf():
