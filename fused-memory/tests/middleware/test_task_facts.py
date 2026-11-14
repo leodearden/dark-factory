@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from _out_of_band_task_writes import write_task_out_of_band
+from _task_facts_rows import task_facts_rows
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -105,13 +106,6 @@ def _found(ref: TaskRef, status: str, title: str, *,
 
 def _provenance(kind: str, commit: str) -> str:
     return json.dumps({'done_provenance': {'kind': kind, 'commit': commit}})
-
-
-def _row(status: object, title: str = 'Scripted') -> dict[str, object]:
-    return {
-        'status': status, 'title': title, 'dependencies': [],
-        'done_provenance_kind': None, 'done_provenance_commit': None,
-    }
 
 
 # ── 1. FOUND ───────────────────────────────────────────────────────────
@@ -303,14 +297,14 @@ async def test_a_non_mapping_reply_could_not_check_that_project(store: Store):
 async def test_a_row_without_a_str_status_could_not_check_that_ref_only(store: Store):
     broken, sound = TaskRef(ALPHA, '7'), TaskRef(ALPHA, '8')
     reader = RecordingReader(scripted={
-        store.known_projects[ALPHA]: {'7': _row(None), '8': _row('pending', 'Sound')},
+        store.known_projects[ALPHA]: task_facts_rows({'7': None, '8': 'pending'}),
     })
 
     facts = await store.read([broken, sound], reader=reader)
 
     assert facts[broken].lookup is Lookup.COULD_NOT_CHECK
     assert facts[broken].reason == 'task store returned no usable status'
-    assert facts[sound] == _found(sound, 'pending', 'Sound')
+    assert facts[sound] == _found(sound, 'pending', 'Task 8')
 
 
 # ── 9. An unconfigured interceptor ─────────────────────────────────────
