@@ -85,11 +85,6 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # collision — only the level can.  It is level-1-ONLY, so a level-0 record is
 # invisible to every one of them by construction:
 #
-#   - `orchestrator/harness.py::Harness._block_and_escalate_external_dep`, and
-#     its siblings `::Harness._block_and_escalate_cross_repo` and
-#     `::Harness._block_and_escalate_substrate_flip`, each of which SUPPRESSES
-#     its own human-facing L1 and downgrades to a WARNING log when one is
-#     already open;
 #   - `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`, which
 #     raises `_StewardReescalated` and diverts the workflow on the strength of
 #     an open L1;
@@ -115,11 +110,14 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # deliberately NOT in it, and were re-measured rather than assumed: the
 # sentinel filers (`_ARCHIVAL_STORM_SENTINEL`, `_SCHEDULER_PAUSE_SENTINEL`, the
 # `main-sweep-<sha12>` tip sweep, ...) key on SYNTHETIC ids that no real task id
-# can collide with, and the CATEGORIZED reads in `orchestrator/workflow.py`
-# pass their own `category=`, which `FINDING_TASK_ESCALATION_CATEGORY` never
-# matches.  Keep this list in `path::symbol` form (CLAUDE.md) — an earlier
-# revision carried bare line pins and two of them had already drifted onto
-# unrelated statements.  A passive observation must not start
+# can collide with, and the CATEGORIZED reads in `orchestrator/workflow.py` and
+# `orchestrator/harness.py` pass their own `category=`, which
+# `FINDING_TASK_ESCALATION_CATEGORY` never matches.  Those include
+# `orchestrator/harness.py::Harness._file_harness_l1`, through which the
+# external-dep, cross-repo and substrate-flip dispatch gates (and the re-cut
+# gate) file category-scoped since task 7170.  Keep this list in
+# `path::symbol` form (CLAUDE.md) — an earlier revision carried bare line pins
+# and two of them had already drifted onto unrelated statements.  A passive observation must not start
 # gating dispatch as a side effect of a PLUMBING change, and level 0 is the
 # only spelling that guarantees it — pinned executably by
 # `test_routed_record_is_invisible_to_the_orchestrator_l1_guards`.
