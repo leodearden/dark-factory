@@ -8,11 +8,12 @@ values were pinned from main's
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 
 import pytest
-from polarity_fixture_repo import init_git_repo
+from polarity_fixture_repo import commit_all, init_git_repo, run_git
 
 from shared.capability_manifest import (
     SIDECAR_SUFFIX,
@@ -71,16 +72,16 @@ class TestSidecarFor:
         assert sidecar_path('plans/x-prd.md').endswith(SIDECAR_SUFFIX)
 
 
+_TWO_TRACKED_SIDECARS = {
+    'plans/b-prd.capability-manifest.yaml': 'schema_version: 1\n',
+    'docs/prds/a-prd.capability-manifest.yaml': 'schema_version: 1\n',
+    'plans/b-prd.md': '# b\n',
+}
+
+
 class TestTrackedSidecarPaths:
     def test_lists_only_the_tracked_sidecars_sorted(self, tmp_path):
-        root = init_git_repo(
-            tmp_path / 'repo',
-            {
-                'plans/b-prd.capability-manifest.yaml': 'schema_version: 1\n',
-                'docs/prds/a-prd.capability-manifest.yaml': 'schema_version: 1\n',
-                'plans/b-prd.md': '# b\n',
-            },
-        )
+        root = init_git_repo(tmp_path / 'repo', _TWO_TRACKED_SIDECARS)
         (root / 'plans' / 'c-prd.capability-manifest.yaml').write_text(
             'schema_version: 1\n', encoding='utf-8'
         )
@@ -88,6 +89,38 @@ class TestTrackedSidecarPaths:
             'docs/prds/a-prd.capability-manifest.yaml',
             'plans/b-prd.capability-manifest.yaml',
         ]
+
+    def test_paths_are_relative_to_a_subdirectory_root(self, tmp_path):
+        root = init_git_repo(tmp_path / 'repo', _TWO_TRACKED_SIDECARS)
+        assert tracked_sidecar_paths(root / 'plans') == ['b-prd.capability-manifest.yaml']
+
+    def test_an_unmerged_sidecar_is_listed_once(self, tmp_path):
+        sidecar = 'plans/b-prd.capability-manifest.yaml'
+        root = init_git_repo(tmp_path / 'repo', {sidecar: 'schema_version: 1\n'})
+        run_git(root, 'checkout', '-q', '-b', 'side')
+        (root / sidecar).write_text('schema_version: 2\n', encoding='utf-8')
+        commit_all(root, 'edit the sidecar on side')
+        run_git(root, 'checkout', '-q', 'main')
+        (root / sidecar).write_text('schema_version: 3\n', encoding='utf-8')
+        commit_all(root, 'edit the sidecar on main')
+        subprocess.run(['git', '-C', str(root), 'merge', 'side'], capture_output=True, check=False)
+        assert run_git(root, 'ls-files', '-z', '--', sidecar).stdout.split('\0').count(sidecar) == 3
+        assert tracked_sidecar_paths(root) == [sidecar]
+
+    def test_a_carriage_return_in_a_tracked_name_survives_verbatim(self, tmp_path):
+        sidecar = 'plans/b\rx-prd.capability-manifest.yaml'
+        root = init_git_repo(tmp_path / 'repo', {sidecar: 'schema_version: 1\n'})
+        assert tracked_sidecar_paths(root) == [sidecar]
+
+    def test_a_non_utf8_tracked_name_raises_naming_the_root(self, tmp_path):
+        root = init_git_repo(tmp_path / 'repo', _TWO_TRACKED_SIDECARS)
+        non_utf8 = os.fsdecode(b'a\xff-prd.capability-manifest.yaml')
+        (root / 'plans' / non_utf8).write_text('schema_version: 1\n', encoding='utf-8')
+        commit_all(root, 'track a sidecar whose name is not UTF-8')
+        with pytest.raises(ManifestDiscoveryUnavailable) as excinfo:
+            tracked_sidecar_paths(root)
+        assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+        assert str(root) in str(excinfo.value)
 
     def test_a_non_checkout_raises_naming_the_root(self, tmp_path):
         with pytest.raises(ManifestDiscoveryUnavailable) as excinfo:

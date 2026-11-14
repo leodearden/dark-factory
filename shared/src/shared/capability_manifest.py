@@ -96,24 +96,27 @@ def tracked_sidecar_paths(project_root: str | os.PathLike[str], *, timeout: floa
     """Sorted root-relative paths of every git-TRACKED sidecar under *project_root*.
 
     Raises :class:`ManifestDiscoveryUnavailable` when git cannot be run, times
-    out, or exits non-zero.
+    out, exits non-zero, or lists a path that is not UTF-8.
     """
     root = os.fspath(project_root)
     try:
         completed = subprocess.run(
             ['git', '-C', root, 'ls-files', '-z', '--', f'*{SIDECAR_SUFFIX}'],
             capture_output=True,
-            encoding='utf-8',
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ManifestDiscoveryUnavailable(f'could not run git ls-files in {root}: {exc}') from exc
     if completed.returncode != 0:
+        stderr = completed.stderr.decode('utf-8', errors='replace').strip()
         raise ManifestDiscoveryUnavailable(
-            f'git ls-files failed in {root} (rc={completed.returncode}): '
-            f'{completed.stderr.strip() or "no stderr"}'
+            f'git ls-files failed in {root} (rc={completed.returncode}): {stderr or "no stderr"}'
         )
-    return sorted({p for p in completed.stdout.split('\0') if p})
+    try:
+        listing = completed.stdout.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise ManifestDiscoveryUnavailable(f'git ls-files in {root} listed a non-UTF-8 path: {exc}') from exc
+    return sorted({p for p in listing.split('\0') if p})
 
 
 def _check_kind_conditional_fields(
