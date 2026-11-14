@@ -575,9 +575,9 @@ class ReconciliationJournal:
             return None
         return _row_to_run(row)
 
-    #: No longer a ``RunStatus`` member (task 7876); kept only so
-    #: ``_stage_reports_are_settled`` reads pre-5514 rows under task 3731's
-    #: contract (``plans/stage3-ledger-presence-prd.md``).
+    #: No longer a ``RunStatus`` member; kept only for
+    #: ``_stage_reports_are_settled`` under task 3731's contract
+    #: (``plans/stage3-ledger-presence-prd.md``). Removal tracked by task 10047.
     _LEGACY_INTERRUPTED_STATUS = 'interrupted'
 
     #: Run statuses at which ``runs.stage_reports`` is known to have been
