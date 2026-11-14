@@ -242,7 +242,7 @@ def verdict(token, narration, *, rc):
 
 
 try:
-    from _merge_queue_landing import LandingNotConfirmed, land_files
+    from _merge_queue_landing import LandingNotConfirmed, land_files, reclaim_retained_deploys
     from dashboard.config import discover_root_escalation_url
 except ImportError as exc:
     from _config_reload_gate import transport_not_importable_remedy
@@ -260,6 +260,11 @@ if port is None:
 
 files = {rel: (Path(census_root) / rel).read_bytes() for rel in changed}
 try:
+    in_flight = reclaim_retained_deploys(repo, label, port=str(port))
+    if in_flight:
+        verdict("skipped:landing-in-flight",
+                f"an earlier night's landing may still land ({', '.join(in_flight)}); skipping "
+                f"tonight's so the two cannot conflict on the append-only history", rc=0)
     landing = land_files(
         repo, files, base, port=str(port), label=label, message=message,
         timeout_secs=os.environ.get("CENSUS_LANDING_TIMEOUT_SECS") or None,
