@@ -101,6 +101,9 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'a predicate over recorded argv; the probe it intercepts runs in the tmp git_repo fixture'
     ),
     'orchestrator/tests/test_merge_gates_rename_family.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_lane_lease_at_verdict.py': (
+        'GitOps over the tmp_path git_repo fixture'
+    ),
     'orchestrator/tests/test_merge_lane_ratchet_commit_gate.py': (
         '_Repo.seeded builds its repo under tmp_path'
     ),
