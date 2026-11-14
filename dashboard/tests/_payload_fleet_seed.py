@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from _runs_db_fixture import EVENTS_DDL, TASK_RESULTS_DDL
 from escalation.archive import archive_dir_for_date
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -110,27 +111,11 @@ def seed_resolved_history(queue_dir: Path, shape: EscalationShape, count: int, *
         (archive / f'{record.id}.json').write_text(record.to_json())
 
 
-_TASK_RESULTS_DDL = """\
-CREATE TABLE IF NOT EXISTS task_results (
-    run_id              TEXT NOT NULL,
-    task_id             TEXT NOT NULL,
-    project_id          TEXT NOT NULL,
-    title               TEXT,
-    outcome             TEXT NOT NULL,
-    cost_usd            REAL DEFAULT 0.0,
-    duration_ms         INTEGER DEFAULT 0,
-    agent_invocations   INTEGER DEFAULT 0,
-    execute_iterations  INTEGER DEFAULT 0,
-    verify_attempts     INTEGER DEFAULT 0,
-    review_cycles       INTEGER DEFAULT 0,
-    steward_cost_usd    REAL DEFAULT 0.0,
-    steward_invocations INTEGER DEFAULT 0,
-    completed_at        TEXT,
-    PRIMARY KEY (run_id, task_id)
-);
-"""
-"""The columns the dashboard reads of the orchestrator's ledger
-(orchestrator/src/orchestrator/run_store.py::_SCHEMA); the dashboard does not depend on that package."""
+_TASK_RESULT_COLUMNS = (
+    'run_id', 'task_id', 'project_id', 'title', 'outcome', 'cost_usd', 'duration_ms',
+    'agent_invocations', 'execute_iterations', 'verify_attempts', 'review_cycles',
+    'steward_cost_usd', 'steward_invocations', 'completed_at',
+)
 
 
 def seed_task_results(runs_db: Path, project_id: str, completed_hours: int, *, now: datetime) -> None:
@@ -149,25 +134,13 @@ def seed_task_results(runs_db: Path, project_id: str, completed_hours: int, *, n
         for hour in range(1, completed_hours + 1)
     ]
     with closing(sqlite3.connect(runs_db)) as conn, conn:
-        conn.executescript(_TASK_RESULTS_DDL)
-        conn.executemany(f'INSERT INTO task_results VALUES ({", ".join("?" * 14)})', rows)
+        conn.executescript(TASK_RESULTS_DDL)
+        conn.executemany(
+            f'INSERT INTO task_results ({", ".join(_TASK_RESULT_COLUMNS)}) '
+            f'VALUES ({", ".join("?" * len(_TASK_RESULT_COLUMNS))})',
+            rows,
+        )
 
-
-_EVENTS_DDL = """\
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL,
-    duration_ms INTEGER
-);
-"""
-"""The orchestrator's event ledger (orchestrator/src/orchestrator/event_store.py::_SCHEMA), without its indexes."""
 
 _MERGE_OUTCOMES = ('done', 'done', 'done', 'conflict', 'blocked', 'cas_retry')
 
@@ -203,7 +176,7 @@ def seed_merge_events(
         for n in range(trains)
     ]
     with closing(sqlite3.connect(runs_db)) as conn, conn:
-        conn.executescript(_EVENTS_DDL)
+        conn.executescript(EVENTS_DDL)
         conn.executemany(
             'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, data, duration_ms) '
             'VALUES (?, ?, ?, ?, ?, ?, ?)',

@@ -57,6 +57,7 @@ from _payload_fleet_seed import (
     text,
 )
 from _quality_rows import NO_COST, NO_OUTCOMES, history, write_quality_db
+from _runs_db_fixture import runs_db_path
 from _served_reads import forget_served_reads
 from _tasks_db_fixture import task_row, write_tasks_db
 from fastapi.testclient import TestClient
@@ -802,7 +803,7 @@ def _seed_ledgers_and_stores(
     paths = [config.project_root, *config.known_project_roots]
     for index, (root, path) in enumerate(zip(fleet.roots, paths, strict=True)):
         rows = substrate.tree(root.label).rows
-        runs_db = path / 'data' / 'orchestrator' / 'runs.db'
+        runs_db = runs_db_path(path)
         project_id = normalize_project_id(root.label)
         seed_task_results(runs_db, project_id, root.completed_hours, now=now)
         if root.orchestrator_running:
