@@ -39,7 +39,6 @@ from fused_memory.models.reconciliation import ReconciliationEvent
 from fused_memory.reconciliation.flag_dedup import (
     EntityStandingSuppressionResult,
     acknowledge_resolved_flags,
-    compute_marker_signature,
     dedup_flags,
     filter_accounted_cluster_growth_flags,
     filter_already_recorded_caveat_flags,
@@ -51,6 +50,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_style_only_authorship_flags,
     filter_terminal_metadata_flags,
 )
+from fused_memory.reconciliation.flag_identity import compute_marker_signature
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     extract_human_gated_task_ids,
     normalize_gate_owned_suggested_actions,

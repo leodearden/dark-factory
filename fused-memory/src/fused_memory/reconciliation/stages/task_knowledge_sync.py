@@ -47,14 +47,16 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_citations
 from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
-    _content_fingerprint,
-    _normalize_content_description,
     acknowledge_resolved_flags,
-    compute_flag_signature,
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
     filter_snapshot_stat_edge_findings,
+)
+from fused_memory.reconciliation.flag_identity import (
+    compute_flag_signature,
+    content_fingerprint,
+    normalize_description,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
 from fused_memory.reconciliation.known_projects_section import render_known_projects_section
@@ -4892,16 +4894,12 @@ def _flag_content_fingerprint(item: dict) -> str | None:
     polled recon_report_systemic finding (keyed on ``description``).
 
     Deliberately NOT a call site of
-    :func:`~fused_memory.reconciliation.flag_dedup.compute_content_fingerprint_signature`:
+    :func:`~fused_memory.reconciliation.flag_identity.compute_content_fingerprint_signature`:
     that helper is gated on ``task_id``/``cited_tasks`` being absent and
     returns a ``(fp, flag_type)`` tuple for marker write/match in
     ``dedup_flags``, whereas this helper is ungated (any item with non-blank
     text qualifies, regardless of task_id) and returns the bare ``fp`` for a
-    same-cycle payload-assembly join. Both delegate to the same underlying
-    :func:`~fused_memory.reconciliation.flag_dedup._content_fingerprint` /
-    :func:`~fused_memory.reconciliation.flag_dedup._normalize_content_description`
-    primitives — if that normalization contract ever changes, cross-check
-    both call sites so the two dedup keys don't silently drift apart.
+    same-cycle payload-assembly join.
 
     Text is read as ``item.get('content') or item.get('description') or ''``
     so either field name resolves to the same fingerprint for identical text
@@ -4914,9 +4912,7 @@ def _flag_content_fingerprint(item: dict) -> str | None:
     Pure, sync, no I/O.
     """
     text = str(item.get('content') or item.get('description') or '')
-    if not _normalize_content_description(text):
-        return None
-    return _content_fingerprint(text)
+    return content_fingerprint(text) if normalize_description(text) else None
 
 
 def _format_flagged(

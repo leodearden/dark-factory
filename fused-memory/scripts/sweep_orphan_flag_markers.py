@@ -219,7 +219,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+from fused_memory.reconciliation.flag_identity import is_content_fingerprint_task_id
 from fused_memory.reconciliation.mem0_tombstone import (
     is_foreign_kind_record,
     is_protected_audit_record,

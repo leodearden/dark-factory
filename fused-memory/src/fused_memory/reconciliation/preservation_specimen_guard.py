@@ -51,7 +51,7 @@ side), so a suppression row for ``'3105'`` still does not match a finding
 carrying ``'3105,4223'``.  Inheriting that gap would leave this guard blind
 to the specimen inside every composite that names it.  This guard and
 ``flag_dedup._flag_candidate_task_ids`` both decompose a flag's own task_id
-through the one shared splitter, ``flag_task_ids.task_id_components``.
+through the one shared parser, ``flag_identity.parse_flag_subject``.
 
 Seeing a specimen is not licence to drop the finding.  A composite is dropped
 only when EVERY component corroborates: ``'3105,4223'`` claims something about
@@ -62,8 +62,8 @@ evidence beside the reset request.
 
 LEAF CONTRACT.  This module imports only from
 ``standing_decision_constants`` (for the one genuinely shared fact, the
-``investigation_outcome`` mem0 kind), ``flag_task_ids`` (the shared flag
-task-id splitter), ``flag_shape`` (the leaf ``contains_any_casefolded``
+``investigation_outcome`` mem0 kind), ``flag_identity`` (the shared flag
+task-id parser), ``flag_shape`` (the leaf ``contains_any_casefolded``
 matcher), ``services.memory_service`` (for the canonical raw-payload content
 extractor), ``shared.task_statuses`` (the closed status vocabulary) and,
 optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
@@ -95,8 +95,8 @@ from typing import Any
 
 from shared.task_statuses import TaskStatus
 
+from fused_memory.reconciliation.flag_identity import parse_flag_subject
 from fused_memory.reconciliation.flag_shape import contains_any_casefolded
-from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
 )
@@ -409,7 +409,7 @@ def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
     """The usable component ids of *flag*'s OWN task_id, in order, deduped; ``()`` when none.
 
     Decomposed by
-    :func:`~fused_memory.reconciliation.flag_task_ids.task_id_components` and
+    :func:`~fused_memory.reconciliation.flag_identity.parse_flag_subject` and
     screened per component by :func:`_is_usable_task_id`.  Why decomposition is
     required at all is the module docstring's COMPOSITE TASK IDS paragraph.
 
@@ -419,7 +419,8 @@ def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
 
     Pure, sync, no I/O.
     """
-    return tuple(c for c in task_id_components(flag.get('task_id')) if _is_usable_task_id(c))
+    components = parse_flag_subject(flag.get('task_id')).components
+    return tuple(c for c in components if _is_usable_task_id(c))
 
 
 

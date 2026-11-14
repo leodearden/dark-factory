@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 import pytest
+
 from fused_memory.reconciliation.flag_identity import (
     CONTENT_FP_FLAG_TYPE,
     CONTENT_FP_HEXLEN,
@@ -26,7 +27,6 @@ from fused_memory.reconciliation.flag_identity import (
     recon_signature_task_id,
     signature_field,
 )
-
 from fused_memory.reconciliation.scope_freshness import (
     build_scope_snapshot_metadata,
     snapshot_is_fresh,

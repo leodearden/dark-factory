@@ -18,8 +18,8 @@ absent too, and would keep every flag.  The cycle whose buffer held that
 deletion does see it, and keeps any flag naming it; the Stage-1 prompt tells
 the LLM to report such an id in a flag of its own.
 
-This module imports only downward (flag_dedup, recon_self_model, the event
-model); none of those may import it back.
+This module imports only downward (flag_identity, recon_self_model, the
+event model); none of those may import it back.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from fused_memory.models.reconciliation import EventType, ReconciliationEvent
-from fused_memory.reconciliation.flag_dedup import FlagTypeFamily, extract_flag_uuids
+from fused_memory.reconciliation.flag_identity import FlagTypeFamily, extract_flag_uuids
 from fused_memory.reconciliation.recon_self_model import MEM0_TOMBSTONE_DELETERS
 
 logger = logging.getLogger(__name__)

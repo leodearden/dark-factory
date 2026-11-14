@@ -2,8 +2,8 @@
 
 A LEAF: it imports nothing from ``fused_memory``, so a module that only needs
 to match a token family against a flag's text depends on this rather than on
-the module that does flag dedup.  A flag's task ids are read through the
-sibling leaf ``flag_task_ids``.
+the module that does flag dedup.  A flag's task ids are read through
+``flag_identity.parse_flag_subject``.
 
 Every function is total over malformed input — a wrong type or an empty value
 yields an empty or ``False`` answer, never an exception.  Pure, sync, no I/O.

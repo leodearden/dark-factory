@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+from fused_memory.reconciliation.flag_identity import compute_flag_signature
 
 
 class TestComputeFlagSignatureFallback:
