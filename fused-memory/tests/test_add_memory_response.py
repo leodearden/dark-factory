@@ -69,7 +69,9 @@ class TestStoresQueued:
     )
     def test_a_store_reported_in_two_lists_is_rejected(self, first, second) -> None:
         with pytest.raises(pydantic.ValidationError) as excinfo:
-            AddMemoryResponse(**{first: [SourceStore.graphiti], second: [SourceStore.graphiti]})
+            AddMemoryResponse.model_validate(
+                {first: [SourceStore.graphiti], second: [SourceStore.graphiti]}
+            )
         text = str(excinfo.value)
         assert 'graphiti' in text
         assert first in text
