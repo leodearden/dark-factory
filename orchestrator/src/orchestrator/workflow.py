@@ -738,6 +738,9 @@ logger = logging.getLogger(__name__)
 # at the BLOCKED route in _execute_verify_review_loop (task 1739).
 ZERO_OUTPUT_HANG_REASON = 'infra: zero-output CLI hang (consecutive fresh-invocation timeouts)'
 
+# Bound, in characters, on each output tail a zero-output evidence JSON keeps.
+_ZERO_OUTPUT_EVIDENCE_TAIL_CHARS = 4000
+
 # Reason string used when the progress-resume churn circuit breaker trips:
 # config.max_progress_resume_iterations ceiling-kill+resume cycles of a
 # productive (transcript_turns>0) session accumulated without the task ever
@@ -9486,7 +9489,7 @@ class TaskWorkflow:
                             f'consecutive_zero_output={consecutive_zero_output} '
                             f'at_iteration_cap=True '
                             f'iteration={self.metrics.execute_iterations} '
-                            f'evidence: .task/zero_output_evidence-iter*.json'
+                            f'evidence: {self.artifacts.zero_output_evidence_glob()}'
                         ),
                     }
                 elif consecutive_progress_timeouts > 0:
@@ -9676,7 +9679,7 @@ class TaskWorkflow:
                             f'iteration={self.metrics.execute_iterations} '
                             f'duration_ms={result.duration_ms} '
                             f'subtype={result.subtype!r} '
-                            f'evidence: .task/zero_output_evidence-iter*.json'
+                            f'evidence: {self.artifacts.zero_output_evidence_glob()}'
                         ),
                     }
                     self._preserve_config_dir = True
@@ -9935,13 +9938,14 @@ class TaskWorkflow:
         self._archive_then_cleanup_config_dir()
 
     def _capture_zero_output_evidence(self, result: AgentResult, iteration: int) -> None:
-        """Persist forensic evidence for a zero-output CLI timeout to .task/.
+        """Persist forensic evidence for a zero-output CLI timeout.
 
-        Called on EVERY zero-output timeout in ``_execute_iterations`` (before
-        the threshold check) so both sub-threshold and tripping occurrences
-        are captured.  Writes to the task root, which outlives the per-task
-        ``TaskConfigDir`` cleanup and the BLOCKED worktree (not GC'd since the
-        task is not DONE).
+        Called on EVERY zero-output timeout in ``_execute_iterations``,
+        including the 5xx-attributed one that requeues, before any breaker
+        check.  Writes to ``self.artifacts.zero_output_evidence_path``, which
+        lies under the TASK root (``TaskArtifacts.task_root_for``) outside the
+        worktree, so it survives ``TaskConfigDir`` cleanup and worktree reset
+        or reuse.
 
         Best-effort: any I/O failure is caught and logged rather than
         propagated — evidence capture must never crash the iteration loop.
@@ -9969,7 +9973,9 @@ class TaskWorkflow:
                 'turns': result.turns,
                 'cost_usd': result.cost_usd,
                 'subtype': result.subtype,
-                'stderr_tail': (result.stderr or '')[-4000:],
+                'api_error_status': result.api_error_status,
+                'output_tail': (result.output or '')[-_ZERO_OUTPUT_EVIDENCE_TAIL_CHARS:],
+                'stderr_tail': (result.stderr or '')[-_ZERO_OUTPUT_EVIDENCE_TAIL_CHARS:],
                 'proc_tree': result.proc_tree,
                 'config_dir': config_dir_str,
                 'config_dir_listing': config_dir_listing,
