@@ -1013,25 +1013,6 @@ def _block_verdict(owner: str | None = 'dark_factory', paths: tuple[str, ...] = 
     )
 
 
-def _seed_open_l1(queue, task_id: str, category: str):
-    """Submit one pending level-1 escalation of *category* for *task_id*; return it."""
-    from escalation.models import Escalation
-
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role='orchestrator-scheduler',
-        severity='blocking',
-        category=category,
-        summary='an earlier unrelated L1',
-        detail='',
-        suggested_action='manual_intervention',
-        level=1,
-    )
-    queue.submit(esc)
-    return esc
-
-
 class TestBlockAndEscalateCrossRepo:
     """Unit tests for ``Harness._block_and_escalate_cross_repo``.
 
@@ -1223,24 +1204,34 @@ class TestBlockAndEscalateCrossRepo:
     async def test_open_l1_of_another_category_does_not_suppress(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
-        """An open L1 for an unrelated cause must not hide this gate's root cause."""
+        """The substrate-flip gate's open L1 must not hide this gate's root cause."""
         from escalation.queue import EscalationQueue
+
+        from orchestrator.substrate_gate import FLIP, SubstrateVerdict
 
         h = _make_harness(tmp_path)
         esc_queue = EscalationQueue(tmp_path / 'esc')
         h._escalation_queue = esc_queue
-        seeded = _seed_open_l1(esc_queue, '44', 'design_concern')
+        flip = SubstrateVerdict(
+            verdict=FLIP,
+            exit_code=1,
+            checker_argv=['run_check', 'probes/foo.json'],
+            probe_set='probes/foo.json',
+            reason='PASS→FAIL flip detected',
+        )
+        await h._block_and_escalate_substrate_flip('44', verdict=flip)
         caplog.set_level(logging.WARNING, logger='orchestrator.harness')
 
         await h._block_and_escalate_cross_repo('44', verdict=_block_verdict())
 
         pending_l1s = [e for e in esc_queue.get_pending() if e.task_id == '44' and e.level == 1]
-        filed = [e for e in pending_l1s if e.category == 'scope_violation']
-        assert len(filed) == 1, f'Expected one scope_violation L1 for task 44; got {pending_l1s!r}'
-        assert filed[0].summary.startswith('CROSS_REPO_MISFILE'), filed[0].summary
-        assert seeded.id in {e.id for e in pending_l1s}, 'the seeded L1 must stay pending'
+        by_category = {e.category: e for e in pending_l1s}
+        assert len(pending_l1s) == 2, f'Expected one L1 per gate for task 44; got {pending_l1s!r}'
+        assert by_category['design_concern'].summary.startswith('SUBSTRATE_FLIP')
+        filed = by_category['scope_violation']
+        assert filed.summary.startswith('CROSS_REPO_MISFILE'), filed.summary
         assert any(
-            filed[0].id in r.getMessage() and 'CROSS_REPO_MISFILE' in r.getMessage()
+            filed.id in r.getMessage() and 'CROSS_REPO_MISFILE' in r.getMessage()
             for r in caplog.records if r.levelno == logging.WARNING
         ), 'the filed-L1 log line must name the escalation and the gate'
 

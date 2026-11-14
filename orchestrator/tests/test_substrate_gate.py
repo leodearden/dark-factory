@@ -537,25 +537,6 @@ def _skip_verdict():
     )
 
 
-def _seed_open_l1(queue, task_id: str, category: str):
-    """Submit one pending level-1 escalation of *category* for *task_id*; return it."""
-    from escalation.models import Escalation
-
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role='orchestrator-scheduler',
-        severity='blocking',
-        category=category,
-        summary='an earlier unrelated L1',
-        detail='',
-        suggested_action='manual_intervention',
-        level=1,
-    )
-    queue.submit(esc)
-    return esc
-
-
 class TestRunSubstrateGate:
     """Unit tests for ``Harness._run_substrate_gate``."""
 
@@ -814,13 +795,16 @@ class TestBlockAndEscalateSubstrateFlip:
         h._escalation_queue = esc_queue
         return h, esc_queue
 
+    @staticmethod
+    async def _block_flip(h, task_id: str) -> None:
+        await h._block_and_escalate_substrate_flip(task_id, verdict=_flip_verdict())
+
     @pytest.mark.asyncio
     async def test_sets_task_blocked(self, tmp_path: Path):
         """set_task_status('blocked') is called with the task_id."""
         h, _ = self._harness_with_queue(tmp_path)
 
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('99', verdict=verdict)
+        await self._block_flip(h, '99')
 
         h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')  # type: ignore[attr-defined]
 
@@ -829,8 +813,7 @@ class TestBlockAndEscalateSubstrateFlip:
         """Files exactly one L1 with category='design_concern' and severity='blocking'."""
         h, esc_queue = self._harness_with_queue(tmp_path)
 
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('77', verdict=verdict)
+        await self._block_flip(h, '77')
 
         pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == '77' and e.level == 1]
@@ -844,9 +827,8 @@ class TestBlockAndEscalateSubstrateFlip:
         """Second call with open L1 is suppressed (no duplicate filed)."""
         h, esc_queue = self._harness_with_queue(tmp_path)
 
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('55', verdict=verdict)
-        await h._block_and_escalate_substrate_flip('55', verdict=verdict)
+        await self._block_flip(h, '55')
+        await self._block_flip(h, '55')
 
         pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == '55' and e.level == 1]
@@ -854,17 +836,26 @@ class TestBlockAndEscalateSubstrateFlip:
 
     @pytest.mark.asyncio
     async def test_open_l1_of_another_category_does_not_suppress(self, tmp_path: Path):
-        """An open L1 for an unrelated cause must not hide the flip's root cause."""
-        h, esc_queue = self._harness_with_queue(tmp_path)
-        seeded = _seed_open_l1(esc_queue, '45', 'scope_violation')
+        """The cross-repo gate's open L1 must not hide the flip's root cause."""
+        from orchestrator.cross_repo_gate import BLOCK, CrossRepoVerdict
 
-        await h._block_and_escalate_substrate_flip('45', verdict=_flip_verdict())
+        h, esc_queue = self._harness_with_queue(tmp_path)
+        misfile = CrossRepoVerdict(
+            verdict=BLOCK,
+            owner_project='dark_factory',
+            signals=('cross_repo_marker', 'all_files_foreign'),
+            foreign_paths=('/home/leo/src/dark-factory/orchestrator/src/x.py',),
+            reason='all 1 declared metadata.files entries resolve outside project_root',
+        )
+        await h._block_and_escalate_cross_repo('45', verdict=misfile)
+
+        await self._block_flip(h, '45')
 
         pending_l1s = [e for e in esc_queue.get_pending() if e.task_id == '45' and e.level == 1]
-        filed = [e for e in pending_l1s if e.category == 'design_concern']
-        assert len(filed) == 1, f'Expected one design_concern L1 for task 45; got {pending_l1s!r}'
-        assert filed[0].summary.startswith('SUBSTRATE_FLIP'), filed[0].summary
-        assert seeded.id in {e.id for e in pending_l1s}, 'the seeded L1 must stay pending'
+        by_category = {e.category: e for e in pending_l1s}
+        assert len(pending_l1s) == 2, f'Expected one L1 per gate for task 45; got {pending_l1s!r}'
+        assert by_category['scope_violation'].summary.startswith('CROSS_REPO_MISFILE')
+        assert by_category['design_concern'].summary.startswith('SUBSTRATE_FLIP')
 
     @pytest.mark.asyncio
     async def test_noop_when_no_escalation_queue(self, tmp_path: Path):
@@ -872,9 +863,8 @@ class TestBlockAndEscalateSubstrateFlip:
         h = _make_harness(tmp_path)
         h._escalation_queue = None  # bare-harness scenario
 
-        verdict = _flip_verdict()
         # Should not raise
-        await h._block_and_escalate_substrate_flip('33', verdict=verdict)
+        await self._block_flip(h, '33')
 
         # set_task_status is still called (blocking the task is unconditional)
         h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')  # type: ignore[attr-defined]
