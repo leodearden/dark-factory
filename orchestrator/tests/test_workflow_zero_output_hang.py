@@ -865,6 +865,7 @@ class TestZeroOutputEvidenceCarriesServerErrorCause:
 
 def _with_dual_root_artifacts(wf: TaskWorkflow) -> TaskArtifacts:
     """Swap the harness's single-root artifacts for the production dual-root shape."""
+    assert wf.worktree is not None
     artifacts = TaskArtifacts.for_task(wf.worktree, wf.task_id)
     artifacts.task_root.mkdir(parents=True, exist_ok=True)
     wf.artifacts = artifacts
