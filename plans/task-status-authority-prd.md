@@ -167,9 +167,11 @@ Clearing on entry to TERMINAL is enforced at the fused-memory choke point and ow
 `docs/prds/claimant-invariant-enforcement.md` (C4-E2): `TaskInterceptor._apply_status_transition`
 writes both columns NULL in the same UPDATE as a terminal status, unless the caller supplies a
 non-NULL claimant (`fused-memory/src/fused_memory/middleware/task_interceptor.py::_status_write_claimant_kwargs`).
-The legal caller-side clears (C4-E3) are the unconditional clear in the `finally` of
-`orchestrator/src/orchestrator/harness.py::Harness._run_slot`, which runs before the slot lease is
-released; the force-release backstop's `Harness._clear_claimant_bounded`; and
+The legal caller-side clears (C4-E3) are the outcome-independent clear in the `finally` of
+`orchestrator/src/orchestrator/harness.py::Harness._run_slot`, which runs only while that slot is
+still the registered owner (`Harness._owns_slot`) and before the slot lease is released; the
+force-release backstop's `Harness._clear_claimant_bounded`, which clears a force-released slot
+instead; and
 `orchestrator/src/orchestrator/scheduler.py::Scheduler.clear_claim_then_set_status`, which clears a
 dead claimant before a non-terminal flip (task 4621). D4 and C4 remain the origin contract for the
 columns.*
