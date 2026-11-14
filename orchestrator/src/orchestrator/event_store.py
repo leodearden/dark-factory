@@ -226,6 +226,10 @@ class EventType(StrEnum):
     # the verify ran on that host) and base_relation (what the merge was built
     # on); vocabulary in orchestrator/src/orchestrator/merge_verify_facts.py,
     # rationale in plans/merge-lane-policy-prd.md D10.
+    # PLUS chain_request_ids / chain_task_ids (task 9908): the requests the
+    # verify covers as built, dispatching one first; absent where unknown
+    # (trains, shadow and solo-attribution verifies). Built by
+    # orchestrator/src/orchestrator/merge_pool_facts.py::with_chain_members.
     merge_verify = 'merge_verify'
     # The merge lane cancelled a still-running merge verify (task 8523).
     # task_id-keyed, phase='merge'; emitted by
@@ -324,8 +328,13 @@ class EventType(StrEnum):
     verify_env_divergence = 'verify_env_divergence'
     # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
     # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
+    # PLUS the merge-pool facts of task 9908, always present and null when
+    # unknown: orchestrator/src/orchestrator/merge_pool_facts.py::queued_request_fields.
     merge_queued = 'merge_queued'
     # data.queue_depth = remaining depth AFTER removal (excludes the dequeued item)
+    # PLUS the pick record of task 9908 (absent if recording failed): the
+    # picked request's id, lane, tier and pin and what still waited, from
+    # orchestrator/src/orchestrator/merge_pool_facts.py::PickRecords.
     merge_dequeued = 'merge_dequeued'
     merge_coalesced = 'merge_coalesced'
     # Periodic queue-depth heartbeat: emitted while items wait in the pipeline.

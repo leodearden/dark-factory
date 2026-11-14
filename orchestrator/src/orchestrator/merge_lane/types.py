@@ -994,6 +994,12 @@ class MergeRequest:
     recovered request's workflow died with the process. Read only on single
     requests; a GroupMergeRequest is never a coalesce candidate."""
 
+    @property
+    def first_enqueued_at(self) -> float:
+        """When this request's lineage was first submitted, else when this request was:
+        the age the picker orders footprint conflicts by, and the one the lane records."""
+        return self.merge_first_enqueued_at if self.merge_first_enqueued_at is not None else self.enqueued_at
+
 
 @dataclass(frozen=True)
 class LaneMetadataWrite:
@@ -1526,6 +1532,8 @@ class ChainResult:
     lane: Path | None = None
     lane_warm: bool = False
     build_ms: int | None = None
+    link_request_ids: tuple[str, ...] = ()
+    """The ``request_id`` of each link, parallel to ``links``."""
 
     @property
     def depth(self) -> int:

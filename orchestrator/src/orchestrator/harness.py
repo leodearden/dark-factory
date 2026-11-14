@@ -257,6 +257,7 @@ from orchestrator.task_ground_truth import (
     report_pins_recovery,
     report_would_duplicate_a_handoff,
 )
+from orchestrator.task_priority import TaskPriority
 from orchestrator.task_runtime import TaskRuntimeState, build_task_runtime_snapshot
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
@@ -10733,6 +10734,7 @@ class Harness:
                 cost_store=self.cost_store,
                 cancel_event=cancel_event,
                 task_verify=self._task_verify_dispatcher,
+                task_priority=self._task_priority,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
                 # ε (task 3733): the harness IS the sink — it owns the streak,
@@ -12448,6 +12450,7 @@ class Harness:
             runner_quarantine=self._runner_quarantine,
             host_holder_reader=self._host_pool.holders,
             on_host_readmitted=self._note_verify_host_readmitted,
+            task_priority=self._task_priority,
         )
         # Manage every remote host from the start, so a task-path bench before
         # the first merge lands on a tracked host (task 6670).  Without a
@@ -12539,6 +12542,11 @@ class Harness:
                 'Benching unavailable remote verify host %r on the merge lane raised; '
                 'the task verify goes on without the bench', name,
             )
+
+    def _task_priority(self, task_id: str) -> TaskPriority:
+        """The live scheduler's effective tier and pin for *task_id*, read through
+        ``self.scheduler`` on every call (task 9908)."""
+        return self.scheduler.task_priority(task_id)
 
     def _note_verify_host_readmitted(self, name: str) -> None:
         """The merge lane's readmission hook: re-offer *name* to the task pool's waiters."""
