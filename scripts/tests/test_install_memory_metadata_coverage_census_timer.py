@@ -352,16 +352,23 @@ def test_service_pins_the_boot_catch_up_path():
     assert '/usr/bin' in directories, directories
 
 
-# land_file can return up to ~190 s plus its git teardown past its ceiling
-# (scripts/_merge_queue_landing.py::land_files); OPERATIONS.md §12 budgets 300.
+# land_files can return up to ~190 s plus its git teardown past its ceiling
+# (scripts/_merge_queue_landing.py::land_files); OPERATIONS.md §5's
+# deploy-landing paragraph budgets 300.
 _LANDING_OVERRUN_SECS = 300
+# Everything before the landing's ceiling starts: the reclaim, the generation
+# worktree, the census and the rehearsal. Whole runs took 38-64 s on
+# 2026-11-10..14 (the unit's journal), so an hour is ample.
+_MEASURE_BUDGET_SECS = 3600
 _SECONDS_PER_DAY = 86400
 
 
 def test_a_nights_landing_is_bounded_so_the_next_elapse_finds_the_unit_inactive():
     """A Type=oneshot has no start timeout by default and systemd never starts
     a second instance while one is activating, so this bound is what keeps one
-    night's landing from swallowing the next night's run."""
+    night's landing from swallowing the next night's run. The landing's
+    ceiling starts only once the night has measured, so TimeoutStartSec must
+    hold the measuring too, or a slow-queue night is stopped mid-wait."""
     service = _directives(SERVICE_NAME)
     ceilings = [v.removeprefix('CENSUS_LANDING_TIMEOUT_SECS=')
                 for v in _values(service, 'Service', 'Environment')
@@ -371,7 +378,8 @@ def test_a_nights_landing_is_bounded_so_the_next_elapse_finds_the_unit_inactive(
     assert start_timeout.isdigit(), start_timeout
     (delay,) = _values(_directives(TIMER_NAME), 'Timer', 'RandomizedDelaySec')
 
-    assert int(ceilings[0]) + _LANDING_OVERRUN_SECS <= int(start_timeout)
+    assert (_MEASURE_BUDGET_SECS + int(ceilings[0]) + _LANDING_OVERRUN_SECS
+            <= int(start_timeout))
     assert int(start_timeout) + int(delay) < _SECONDS_PER_DAY
 
 
