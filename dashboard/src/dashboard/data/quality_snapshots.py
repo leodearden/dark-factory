@@ -18,15 +18,17 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, fields
-from datetime import datetime
+from dataclasses import asdict, dataclass, field, fields
+from datetime import UTC, datetime
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 from shared.project_id import fold_project_token
 from shared.quality_series.git_lines import GitObjectMissing, GitTimeout, git_output
 
+from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum
 from dashboard.data.quality_markers import SnapshotIdentity
 from dashboard.data.quality_root_tick import FACTORY_REPO
 
@@ -391,6 +393,15 @@ def pair_key(previous_identity: str, current_identity: str, summariser: str) -> 
     return hashlib.sha256(json.dumps([previous_identity, current_identity, summariser]).encode()).hexdigest()[:32]
 
 
+def point_order(committed_at: datetime, baseline: bool, point_id: str) -> tuple[datetime, bool, str]:
+    """The series' order: by commit time, a baseline before a nightly file at the same commit, then id."""
+    return committed_at, not baseline, point_id
+
+
+def _utc_iso(at: datetime) -> str:
+    return at.astimezone(UTC).isoformat()
+
+
 @dataclass(frozen=True)
 class PointDiff:
     """A point's diff against the point before it; no previous point and no pair key for the first."""
@@ -399,6 +410,9 @@ class PointDiff:
     pair_key: str | None
     state: DiffState
     reason: str | None = None
+
+    def to_wire(self) -> dict[str, object]:
+        return {'previous_id': self.previous_id, 'state': self.state.value, 'reason': self.reason}
 
 
 @dataclass(frozen=True)
@@ -415,6 +429,34 @@ class ScannedPoint(FileState):
             params=self.summary.params, unknown_params=self.summary.unknown_params,
         )
 
+    def to_wire(self) -> dict[str, object]:
+        """The Contract's SnapshotPoint; member cells as the instrument's texts only, and no domain row."""
+        summary = self.summary
+        return {
+            'id': self.point_id,
+            'file': str(self.file),
+            'baseline': self.baseline,
+            'as_of_sha': summary.as_of_sha,
+            'committed_at': _utc_iso(self.committed_at),
+            'run_id': summary.run_id,
+            'params': dict(summary.params),
+            'unknown_params': sorted(summary.unknown_params),
+            'complete': summary.complete,
+            'members': {
+                'columns': [column.header for column in summary.columns],
+                'rows': [
+                    {'member': row.member, 'pseudo': row.pseudo, 'cells': [cell.text for cell in row.cells]}
+                    for row in summary.members
+                ],
+            },
+            'h14': asdict(summary.h14),
+            'cycles': asdict(summary.cycles),
+            'deferred_imports': summary.deferred_imports,
+            'cycle_closing_imports': summary.cycle_closing_imports,
+            'private_patch_targets': summary.private_patch_targets,
+            'diff': self.diff.to_wire(),
+        }
+
 
 @dataclass(frozen=True)
 class UnplacedFile(FileState):
@@ -423,6 +465,9 @@ class UnplacedFile(FileState):
 
     reason: str
     summary: SnapshotSummary | None = None
+
+    def to_wire(self) -> dict[str, object]:
+        return {'id': self.point_id, 'file': str(self.file), 'baseline': self.baseline, 'reason': self.reason}
 
 
 @dataclass(frozen=True)
@@ -450,6 +495,8 @@ class RootScan:
     new_diffs: Mapping[str, ComputedDiff]
     pending_summaries: int
     pending_diffs: int
+    baseline_home: Path
+    nightly_home: Path
 
 
 @dataclass(frozen=True)
@@ -500,7 +547,7 @@ class _Placed:
         return cache_identity(self.summary, self.state.digest)
 
     def order(self) -> tuple[datetime, bool, str]:
-        return self.committed_at, not self.state.baseline, self.state.point_id
+        return point_order(self.committed_at, self.state.baseline, self.state.point_id)
 
 
 def _past(deadline: float) -> bool:
@@ -646,4 +693,100 @@ def scan_root(
         new_diffs=differ.new_diffs,
         pending_summaries=summariser.pending + placements.count(None),
         pending_diffs=differ.pending,
+        baseline_home=root / BASELINE_HOME,
+        nightly_home=nightly_dir / fold_project_token(project_id),
     )
+
+
+
+# ---------------------------------------------------------------------------
+# The stored series and the QUALITY_SNAPSHOTS datum; the request path only reads these.
+
+
+@dataclass(frozen=True)
+class SnapshotSeries:
+    """Every placed point in point_order, every unplaced file with its reason, and what is pending."""
+
+    points: tuple[ScannedPoint, ...]
+    unplaced: tuple[UnplacedFile, ...]
+    pending_summaries: int
+    pending_diffs: int
+
+    def __post_init__(self) -> None:
+        for before, after in pairwise(self.points):
+            if point_order(before.committed_at, before.baseline, before.point_id) >= point_order(
+                after.committed_at, after.baseline, after.point_id
+            ):
+                raise ValueError(
+                    'snapshot points must be in (committed_at, baseline first, point_id) order: '
+                    f'{before.point_id} ({_utc_iso(before.committed_at)}) comes before '
+                    f'{after.point_id} ({_utc_iso(after.committed_at)})'
+                )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'points': [point.to_wire() for point in self.points],
+            'unplaced': [file.to_wire() for file in self.unplaced],
+            'pending': {'summaries': self.pending_summaries, 'diffs': self.pending_diffs},
+        }
+
+
+@dataclass(frozen=True)
+class StoredScan:
+    """The newest successful scan of a project's two homes."""
+
+    series: SnapshotSeries
+    scanned_at: datetime
+    baseline_home: Path
+    nightly_home: Path
+
+
+@dataclass(frozen=True)
+class StoredSnapshots:
+    """A project's newest successful scan, if any, and its newest attempt."""
+
+    scan: StoredScan | None
+    attempted_at: datetime
+    failure: str | None
+
+
+@dataclass(frozen=True)
+class StoredDiff:
+    """One point's diff as stored: its state, the point it is against, and the text when ready."""
+
+    state: DiffState
+    previous_id: str | None
+    text: str | None
+    reason: str | None
+
+
+def _no_snapshot_reason(scan: StoredScan) -> str:
+    return (f'no snapshot yet: neither {scan.baseline_home}/ nor {scan.nightly_home}/ holds a '
+            f'snapshot file (scanned at {_utc_iso(scan.scanned_at)})')
+
+
+def _newer_failure(stored: StoredSnapshots, scan: StoredScan) -> str | None:
+    if stored.failure is None or stored.attempted_at <= scan.scanned_at:
+        return None
+    return (f'the newest snapshot scan (at {_utc_iso(stored.attempted_at)}) failed: {stored.failure}; '
+            f'serving the scan of {_utc_iso(scan.scanned_at)}')
+
+
+def snapshot_datum(
+    project_id: str, stored: StoredSnapshots | None, *, now: datetime, freshness_bound_seconds: int,
+) -> Datum[SnapshotSeries]:
+    """QUALITY_SNAPSHOTS for one project, as of its newest successful scan."""
+    if stored is None:
+        return unknown_datum(f'the snapshot homes of {project_id} have not been scanned yet', freshness_bound_seconds)
+    scan = stored.scan
+    if scan is None:
+        return unknown_datum(f'the snapshot scan of {project_id} failed: {stored.failure}', freshness_bound_seconds)
+    series = scan.series
+    if not (series.points or series.unplaced or series.pending_summaries):
+        return unknown_datum(_no_snapshot_reason(scan), freshness_bound_seconds)
+    stale = _newer_failure(stored, scan)
+    if stale is None and series.pending_summaries:
+        stale = f'{series.pending_summaries} snapshot files not yet summarised'
+    if stale is not None:
+        return Datum(series, scan.scanned_at, DatumState.STALE, stale, freshness_bound_seconds)
+    return aged_at(Datum(series, scan.scanned_at, DatumState.FRESH, None, freshness_bound_seconds), now)

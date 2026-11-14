@@ -1,8 +1,8 @@
 """quality.db's single home: its schema, the LandingRow codec over ``landings``, value-or-gap
-samples, and each project's stored marker derivation.
+samples, each project's stored marker derivation, and each project's stored snapshot scan.
 
-Design: plans/quality-dashboard-prd.md decision 14, §Contract "Per-landing row" and §Contract
-"Markers".
+Design: plans/quality-dashboard-prd.md decision 14, §Contract "Per-landing row", §Contract
+"Markers" and decision 20 (snapshots).
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import aiosqlite
@@ -45,8 +46,23 @@ from dashboard.data.quality_markers import (
     RoutingFold,
     RoutingStep,
     RuleSpan,
+    SnapshotIdentity,
     SourceLayer,
     StoredMarkerState,
+)
+from dashboard.data.quality_snapshots import (
+    DiffState,
+    PointDiff,
+    RootScan,
+    ScannedPoint,
+    SettledDiff,
+    SnapshotCache,
+    SnapshotSeries,
+    SnapshotSummary,
+    StoredDiff,
+    StoredScan,
+    StoredSnapshots,
+    UnplacedFile,
 )
 
 __all__ = [
@@ -62,10 +78,16 @@ __all__ = [
     'read_marker_state',
     'read_routing_fold',
     'read_samples',
+    'read_snapshot_cache',
+    'read_snapshot_diff',
+    'read_snapshot_identities',
+    'read_snapshot_state',
     'record_marker_failure',
+    'record_snapshot_failure',
     'stored_cursor',
     'upsert_landing_rows',
     'write_marker_state',
+    'write_snapshot_scan',
 ]
 
 _MARKERS_DERIVED_DDL = """\
@@ -193,6 +215,42 @@ CREATE TABLE IF NOT EXISTS sample_state (
     late_claims             INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sample_state_project_ts ON sample_state(project_id, ts);
+
+CREATE TABLE IF NOT EXISTS snapshot_points (
+    project_id       TEXT    NOT NULL,
+    point_id         TEXT    NOT NULL,
+    baseline         INTEGER NOT NULL,
+    file             TEXT    NOT NULL,
+    size             INTEGER NOT NULL,
+    mtime_ns         INTEGER NOT NULL,
+    digest           TEXT    NOT NULL,
+    summariser       TEXT    NOT NULL,
+    summary          TEXT,
+    committed_at     TEXT,
+    unplaced_reason  TEXT,
+    previous_id      TEXT,
+    pair_key         TEXT,
+    PRIMARY KEY (project_id, point_id)
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_diffs (
+    pair_key     TEXT    PRIMARY KEY,
+    state        TEXT    NOT NULL,
+    text         TEXT,
+    reason       TEXT,
+    computed_at  TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_scans (
+    project_id         TEXT    PRIMARY KEY,
+    scanned_at         TEXT,
+    attempted_at       TEXT    NOT NULL,
+    failure            TEXT,
+    pending_summaries  INTEGER,
+    pending_diffs      INTEGER,
+    baseline_home      TEXT,
+    nightly_home       TEXT
+);
 """ + _MARKERS_DERIVED_DDL
 
 
@@ -792,3 +850,173 @@ async def read_marker_state(
         refreshed_at=parse_utc(state['refreshed_at']),
     )
     return StoredMarkerState(derived=derived, attempted_at=attempted_at, failure=failure)
+
+
+
+# ---------------------------------------------------------------------------
+# Snapshot scans: one row per snapshot file (placed or not), the diffs by pair key, and each
+# project's newest scan and attempt. A point's diff state is read back from its pair key.
+
+_POINT_COLUMNS = (
+    'point_id', 'baseline', 'file', 'size', 'mtime_ns', 'digest', 'summariser', 'summary',
+    'committed_at', 'unplaced_reason', 'previous_id', 'pair_key',
+)
+_INSERT_POINT_SQL = (
+    f'INSERT INTO snapshot_points (project_id, {", ".join(_POINT_COLUMNS)}) '
+    f'VALUES ({", ".join("?" for _ in ("project_id", *_POINT_COLUMNS))})'
+)
+_SELECT_POINTS_SQL = (
+    f'SELECT {", ".join(f"p.{column}" for column in _POINT_COLUMNS)}, d.state, d.reason '
+    'FROM snapshot_points p LEFT JOIN snapshot_diffs d ON d.pair_key = p.pair_key '
+    'WHERE p.project_id = ? ORDER BY p.committed_at, p.baseline DESC, p.point_id'
+)
+_SCAN_COLUMNS = (
+    'scanned_at', 'attempted_at', 'failure', 'pending_summaries', 'pending_diffs', 'baseline_home',
+    'nightly_home',
+)
+_UPSERT_SCAN_SQL = (
+    f'INSERT INTO snapshot_scans (project_id, {", ".join(_SCAN_COLUMNS)}) '
+    f'VALUES ({", ".join("?" for _ in ("project_id", *_SCAN_COLUMNS))}) '
+    'ON CONFLICT(project_id) DO UPDATE SET '
+    + ', '.join(f'{column} = excluded.{column}' for column in _SCAN_COLUMNS)
+)
+_SELECT_SCAN_SQL = f'SELECT {", ".join(_SCAN_COLUMNS)} FROM snapshot_scans WHERE project_id = ?'
+_PRUNE_DIFFS_SQL = (
+    'DELETE FROM snapshot_diffs WHERE pair_key NOT IN '
+    '(SELECT pair_key FROM snapshot_points WHERE pair_key IS NOT NULL)'
+)
+
+
+def _encode_point(project_id: str, reading: ScannedPoint | UnplacedFile) -> tuple[object, ...]:
+    summary = None if reading.summary is None else reading.summary.document
+    if isinstance(reading, ScannedPoint):
+        placed: tuple[object, ...] = (_utc_text(reading.committed_at), None, reading.diff.previous_id,
+                                      reading.diff.pair_key)
+    else:
+        placed = (None, reading.reason, None, None)
+    return (project_id, reading.point_id, int(reading.baseline), str(reading.file), reading.size,
+            reading.mtime_ns, reading.digest, reading.summariser, summary, *placed)
+
+
+def _stored_diff_state(record: Mapping[str, Any]) -> PointDiff:
+    if record['pair_key'] is None:
+        return PointDiff(None, None, DiffState.FIRST)
+    state = DiffState.PENDING if record['diff_state'] is None else DiffState(record['diff_state'])
+    return PointDiff(record['previous_id'], record['pair_key'], state, record['diff_reason'])
+
+
+def _decode_point(record: Iterable[Any]) -> ScannedPoint | UnplacedFile:
+    row: dict[str, Any] = dict(zip((*_POINT_COLUMNS, 'diff_state', 'diff_reason'), record, strict=True))
+    summary = None if row['summary'] is None else SnapshotSummary.from_document(row['summary'])
+    state = {
+        'point_id': row['point_id'], 'file': Path(row['file']), 'baseline': bool(row['baseline']),
+        'size': row['size'], 'mtime_ns': row['mtime_ns'], 'digest': row['digest'],
+        'summariser': row['summariser'],
+    }
+    if row['committed_at'] is None or summary is None:
+        return UnplacedFile(**state, reason=row['unplaced_reason'], summary=summary)
+    return ScannedPoint(**state, summary=summary, committed_at=parse_utc(row['committed_at']),
+                        diff=_stored_diff_state(row))
+
+
+async def write_snapshot_scan(
+    conn: aiosqlite.Connection, project_id: str, scan: RootScan, scanned_at: datetime,
+) -> None:
+    """Replace the project's stored scan with *scan*; the caller commits.
+
+    Clears any recorded failure, since this scan is the newest attempt, and drops every stored diff
+    no project's point refers to any more.
+    """
+    readings = [_encode_point(project_id, reading) for reading in (*scan.points, *scan.unplaced)]
+    await conn.execute('DELETE FROM snapshot_points WHERE project_id = ?', (project_id,))
+    await conn.executemany(_INSERT_POINT_SQL, readings)
+    await conn.executemany(
+        'INSERT OR REPLACE INTO snapshot_diffs (pair_key, state, text, reason, computed_at) '
+        'VALUES (?, ?, ?, ?, ?)',
+        [(key, diff.state.value, diff.text, diff.reason, _utc_text(scanned_at))
+         for key, diff in scan.new_diffs.items()],
+    )
+    await conn.execute(_PRUNE_DIFFS_SQL)
+    await conn.execute(_UPSERT_SCAN_SQL, (
+        project_id, _utc_text(scanned_at), _utc_text(scanned_at), None, scan.pending_summaries,
+        scan.pending_diffs, str(scan.baseline_home), str(scan.nightly_home),
+    ))
+
+
+async def record_snapshot_failure(
+    conn: aiosqlite.Connection, project_id: str, attempted_at: datetime, failure: str,
+) -> None:
+    """Record a failed snapshot scan, keeping the newest good scan; the caller commits."""
+    await conn.execute(
+        'INSERT INTO snapshot_scans (project_id, attempted_at, failure) VALUES (?, ?, ?) '
+        'ON CONFLICT(project_id) DO UPDATE SET '
+        'attempted_at = excluded.attempted_at, failure = excluded.failure',
+        (project_id, _utc_text(attempted_at), failure),
+    )
+
+
+async def _snapshot_readings(conn: aiosqlite.Connection, project_id: str) -> list[ScannedPoint | UnplacedFile]:
+    return [_decode_point(record) for record in await _fetch(conn, _SELECT_POINTS_SQL, project_id)]
+
+
+async def read_snapshot_cache(conn: aiosqlite.Connection, project_id: str) -> SnapshotCache:
+    """What the project's next scan may reuse: its stored readings and their settled diffs."""
+    readings = await _snapshot_readings(conn, project_id)
+    return SnapshotCache(
+        {reading.point_id: reading for reading in readings},
+        {
+            reading.diff.pair_key: SettledDiff(reading.diff.state, reading.diff.reason)
+            for reading in readings
+            if isinstance(reading, ScannedPoint) and reading.diff.pair_key is not None
+            and reading.diff.state in (DiffState.READY, DiffState.FAILED)
+        },
+    )
+
+
+def _stored_scan(scan: Mapping[str, Any], readings: Iterable[ScannedPoint | UnplacedFile]) -> StoredScan:
+    readings = list(readings)
+    series = SnapshotSeries(
+        points=tuple(reading for reading in readings if isinstance(reading, ScannedPoint)),
+        unplaced=tuple(reading for reading in readings if isinstance(reading, UnplacedFile)),
+        pending_summaries=scan['pending_summaries'],
+        pending_diffs=scan['pending_diffs'],
+    )
+    return StoredScan(series, parse_utc(scan['scanned_at']), Path(scan['baseline_home']),
+                      Path(scan['nightly_home']))
+
+
+async def read_snapshot_state(conn: aiosqlite.Connection, project_id: str) -> StoredSnapshots | None:
+    """The project's newest good scan and newest attempt; None if it has never been scanned."""
+    async with _one_snapshot(conn):
+        found = await _fetch(conn, _SELECT_SCAN_SQL, project_id)
+        if not found:
+            return None
+        scan: dict[str, Any] = dict(zip(_SCAN_COLUMNS, found[0], strict=True))
+        readings = await _snapshot_readings(conn, project_id) if scan['scanned_at'] is not None else []
+    stored = None if scan['scanned_at'] is None else _stored_scan(scan, readings)
+    return StoredSnapshots(stored, parse_utc(scan['attempted_at']), scan['failure'])
+
+
+async def read_snapshot_diff(conn: aiosqlite.Connection, project_id: str, point_id: str) -> StoredDiff | None:
+    """One placed point's diff, with the instrument's text when ready; None for no such point."""
+    async with conn.execute(
+        'SELECT p.previous_id, p.pair_key, d.state, d.text, d.reason FROM snapshot_points p '
+        'LEFT JOIN snapshot_diffs d ON d.pair_key = p.pair_key '
+        'WHERE p.project_id = ? AND p.point_id = ? AND p.committed_at IS NOT NULL',
+        (project_id, point_id),
+    ) as cursor:
+        found = await cursor.fetchone()
+    if found is None:
+        return None
+    previous_id, pair, state, text, reason = found
+    if pair is None:
+        return StoredDiff(DiffState.FIRST, None, None, None)
+    return StoredDiff(DiffState.PENDING if state is None else DiffState(state), previous_id, text, reason)
+
+
+async def read_snapshot_identities(conn: aiosqlite.Connection, project_id: str) -> list[SnapshotIdentity]:
+    """The instrument identity of each placed point, in point order, for the marker derivation."""
+    return [
+        reading.identity() for reading in await _snapshot_readings(conn, project_id)
+        if isinstance(reading, ScannedPoint)
+    ]

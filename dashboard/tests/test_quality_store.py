@@ -171,6 +171,7 @@ def test_quality_db_sits_beside_the_other_sampler_stores(tmp_path: Path) -> None
 QUALITY_TABLES = {
     'landings', 'late_events', 'sample_state',
     'markers_derived', 'routing_steps', 'routing_rules', 'marker_state',
+    'snapshot_points', 'snapshot_diffs', 'snapshot_scans',
 }
 
 
