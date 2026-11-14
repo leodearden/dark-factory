@@ -16,6 +16,7 @@ from orchestrator.offline_lane_records import EndedBy, classify_exit
 from orchestrator.verify import (
     FailureKind,
     PytestFailure,
+    _provision_main_tip_worktree,
     _resolve_verify_env,
     _target_subprocess_env,
     parse_pytest_failures,
@@ -30,6 +31,10 @@ PYTEST_OK = 0
 PYTEST_TESTS_FAILED = 1
 
 _NODE_SEPARATOR = '::'
+
+# The verify-cache-audit lane command sets these only so the runner's config load resolves
+# dark-factory-orchestrator.yaml's project_root to the lane tree; the gate's children never carry them.
+RUNNER_ONLY_ENV = ('PROJECT_ROOT',)
 
 
 @dataclass(frozen=True)
@@ -85,7 +90,11 @@ def audit_modules(config: OrchestratorConfig) -> tuple[ModuleConfig, ...]:
 def module_env(config: OrchestratorConfig, mc: ModuleConfig, tree: Path) -> dict[str, str]:
     """*mc*'s child environment as the merge gate builds it, with the verify cache forced off."""
     extra = {**_resolve_verify_env(config, mc, role='merge'), VERIFY_CACHE_ENV: CacheMode.OFF.value}
-    return _target_subprocess_env(extra, worktree=tree)
+    env = _target_subprocess_env(extra, worktree=tree)
+    for name in RUNNER_ONLY_ENV:
+        if name not in extra:
+            env.pop(name, None)
+    return env
 
 
 def module_timeout(config: OrchestratorConfig, mc: ModuleConfig) -> float:
@@ -154,9 +163,19 @@ def _inert(text: str) -> str:
 async def run_audit(tree: Path, config: OrchestratorConfig, log_dir: Path) -> int:
     """Run every audit module on *tree* in turn, print the report, and return 0 iff every module exited 0.
 
-    A tree with no module to audit is a failure, never a vacuous green.
+    The tree is first provisioned as the merge gate provisions its own
+    (verify.py::_provision_main_tip_worktree); a failed provision is a non-zero exit naming
+    no test, so the lane reads it as Unconfirmable. A tree with no module to audit is a
+    failure, never a vacuous green.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
+    if not await _provision_main_tip_worktree(tree, config, role='merge'):
+        print(
+            f'# verify_cold_preprovision_command failed in {tree}; no module ran '
+            '(see the orchestrator log for its output tail)',
+            flush=True,
+        )
+        return 1
     started = time.monotonic()
     runs = [
         await run_module(tree, mc, module_env(config, mc, tree), module_timeout(config, mc), log_dir)

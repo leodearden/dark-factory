@@ -7353,7 +7353,7 @@ async def _preprovision_shared_venv(
     *,
     verify_env: dict[str, str],
     timeout: float,
-) -> None:
+) -> bool:
     """Synchronously populate the shared ``.venv`` before the test/lint/type gather.
 
     On a COLD verify worktree the shared ``.venv`` is populated only as a SIDE
@@ -7369,10 +7369,13 @@ async def _preprovision_shared_venv(
     through ``_run_cmd`` so it inherits the ghost-venv isolation scrub from
     ``_target_subprocess_env`` (the TARGET's ``uv`` resolves the TARGET's
     ``.venv``) with no new isolation code.
+
+    Returns False only when this call ran the command and it exited non-zero or
+    timed out; an empty knob, a coalesced or recently-done skip, and rc 0 are True.
     """
     cmd = config.verify_cold_preprovision_command
     if not cmd:
-        return
+        return True
     key = str(worktree.resolve())
     # Fast path: recently provisioned for this worktree — skip without taking the
     # lock (the common case once a worktree's first cold verify has run).  TTL'd
@@ -7380,7 +7383,7 @@ async def _preprovision_shared_venv(
     # skipping on a stale "done" key.
     done_at = _PREPROVISION_DONE.get(key)
     if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
-        return
+        return True
     # Get-or-create the per-worktree lock.  Synchronous (no await between the get
     # and the set) → atomic under asyncio, so no separate guard lock is needed.
     lock = _PREPROVISION_LOCKS.get(key)
@@ -7393,7 +7396,7 @@ async def _preprovision_shared_venv(
         # (freshness re-checked against the TTL, as in the fast path).
         done_at = _PREPROVISION_DONE.get(key)
         if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
-            return
+            return True
         logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
         started = time.monotonic()
         rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
@@ -7425,6 +7428,7 @@ async def _preprovision_shared_venv(
         # prune stale entries so the guard stays bounded across many worktrees.
         _PREPROVISION_DONE[key] = time.monotonic()
         _prune_preprovision_guard()
+        return rc == 0
 
 
 async def _provision_main_tip_worktree(
@@ -7432,16 +7436,16 @@ async def _provision_main_tip_worktree(
     config: OrchestratorConfig,
     *,
     role: Literal['merge', 'task', 'background'],
-) -> None:
+) -> bool:
     """Provision a throwaway main-tip worktree the way the merge gate provisions its own.
 
     Goes through ``_preprovision_shared_venv`` (same coalescing and fail-open
     policy), with *role*'s verify env and in the warm timeout tier its verify legs
     use. Such a worktree has no ``.task/``, so ``run_verification``'s ``is_cold``
     gate never provisions it; without this, an environment-only failure on a
-    green main reads as red (task 6917).
+    green main reads as red (task 6917). Returns ``_preprovision_shared_venv``'s result.
     """
-    await _preprovision_shared_venv(
+    return await _preprovision_shared_venv(
         worktree, config,
         verify_env=_resolve_verify_env(config, None, role=role),
         timeout=_resolve_verify_timeout(config, None, is_cold=False),
