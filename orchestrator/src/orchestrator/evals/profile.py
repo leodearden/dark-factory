@@ -65,20 +65,41 @@ inventory this closes):
     workflow (``evals/architect_eval.py::architect_eval_mcp_scope``, the judges in
     ``evals/judge.py``, the assessors in ``evals/compare.py``) scope
     themselves directly.
+  - ``transcript_archive.root`` (S1 λ1, C11 of
+    plans/review-all-s1-one-escalation-filing-entry-point-prd.md): production
+    archives every agent session under
+    ``project_root/data/orchestrator/agent-transcripts``. An eval cell's go
+    under ``eval_worktree_root(project_root)/agent-transcripts`` instead, so
+    the production archive never gains a fixture-id directory.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from orchestrator.config import OrchestratorConfig, _iter_leaves
 from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
 
+from .snapshots import eval_worktree_root
+
+
+@dataclass(frozen=True)
+class UnderEvalRoot:
+    """A profile value naming a path under the eval worktree root of the config's project."""
+
+    relative: str
+
+    def resolve(self, project_root: Path | str) -> str:
+        return str(eval_worktree_root(project_root) / self.relative)
+
+
 # The ONLY documented divergences from a fresh load_config() — dotted leaf
 # paths matching orchestrator.config._iter_leaves's output 1:1 (e.g.
 # 'unblock_auto.enabled'), so the parity tripwire can assert
 # `_changed_leaf_paths(...) == set(EVAL_PROFILE)` verbatim.
-EVAL_PROFILE: dict[str, bool | str] = {
+EVAL_PROFILE: dict[str, bool | str | UnderEvalRoot] = {
     'rebase_before_verify': False,     # D3 — no mid-eval rebase onto live main
     'inter_iteration_rebase': False,   # D3 — same
     'unblock_auto.enabled': False,     # D4 — no unmetered $5 dry-run per block
@@ -86,13 +107,23 @@ EVAL_PROFILE: dict[str, bool | str] = {
     'simple_task_enabled': False,      # fixtures route through the full path deterministically
     'fused_memory.url': FM_NULL_SENTINEL_URL,  # D8 — non-routable null sentinel; single-sourced from fm_retry so the McpSession transport fails fast on it
     'strict_mcp_config': True,         # task 4757 — eval agents never ambient-merge the live .mcp.json
+    'transcript_archive.root': UnderEvalRoot('agent-transcripts'),  # S1 λ1 / C11 — the archive leaves project_root
 }
+
+
+def resolved_eval_profile(base: OrchestratorConfig) -> dict[str, bool | str]:
+    """EVAL_PROFILE's values for *base*: each ``UnderEvalRoot`` resolved against its project root."""
+    return {
+        path: value.resolve(base.project_root) if isinstance(value, UnderEvalRoot) else value
+        for path, value in EVAL_PROFILE.items()
+    }
 
 
 def resolve_eval_profile_update(base: OrchestratorConfig) -> dict[str, Any]:
     """Resolve EVAL_PROFILE into a ``base.model_copy(update=...)``-ready dict.
 
-    Flat (undotted) keys pass straight through. A dotted key is split on its
+    Values come from ``resolved_eval_profile(base)``. Flat (undotted) keys pass
+    straight through. A dotted key is split on its
     first ``.``, grouped by its head, and applied as
     ``update[head] = getattr(base, head).model_copy(update={leaf: value})`` —
     a real nested-submodel copy that preserves every sibling leaf from
@@ -105,7 +136,7 @@ def resolve_eval_profile_update(base: OrchestratorConfig) -> dict[str, Any]:
     update: dict[str, Any] = {}
     submodel_updates: dict[str, dict[str, Any]] = {}
 
-    for path, value in EVAL_PROFILE.items():
+    for path, value in resolved_eval_profile(base).items():
         if '.' in path:
             head, leaf = path.split('.', 1)
             submodel_updates.setdefault(head, {})[leaf] = value

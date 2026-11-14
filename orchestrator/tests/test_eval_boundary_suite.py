@@ -111,7 +111,7 @@ from orchestrator.evals import profile as _profile
 from orchestrator.evals import runner as _runner
 from orchestrator.evals import snapshots as _snapshots
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.profile import EVAL_PROFILE
+from orchestrator.evals.profile import EVAL_PROFILE, resolved_eval_profile
 from orchestrator.evals.runner import (
     RecordingMemorySink,
     _build_eval_scheduler,
@@ -265,9 +265,12 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
     constructs ``OrchestratorConfig`` directly). Two halves:
 
     (1) Parity — the divergence report's key set equals ``set(EVAL_PROFILE)``
-        and every eval-side value equals the documented profile value (incl.
-        the D8 ``fused_memory.url`` null sentinel); each base-side value
-        genuinely differs, so no leaf is a vacuous no-op.
+        and every eval-side value equals the documented profile value resolved
+        for this base (incl. the D8 ``fused_memory.url`` null sentinel); each
+        base-side value genuinely differs, so no leaf is a vacuous no-op. The
+        report lists ``transcript_archive.root``, and its eval value lies under
+        ``eval_worktree_root(base.project_root)`` (S1 boundary row 27), an
+        oracle independent of the resolver.
     (2) Tripwire — a leaked non-profile field (``max_amendment_rounds``, which
         ``EVAL_PROFILE`` never touches) makes the report NAME the offender and
         its key set no longer equal ``set(EVAL_PROFILE)`` — the RED signal B1
@@ -275,8 +278,8 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
 
     Exactness holds by construction: ``apply_eval_profile`` is a
     ``model_copy(update=)`` that changes exactly the profile leaves, and β
-    proves all 7 differ from their code defaults, so the divergence is
-    precisely the 7 documented keys — never more (a leak) or fewer (a no-op).
+    proves all 8 differ from their code defaults, so the divergence is
+    precisely the 8 documented keys — never more (a leak) or fewer (a no-op).
     """
     base = _load_default_config(tmp_path)
 
@@ -284,7 +287,7 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
 
     # (1) Parity: exact key-set match against the documented profile.
     assert set(divergence) == set(EVAL_PROFILE)
-    for leaf, expected_eval in EVAL_PROFILE.items():
+    for leaf, expected_eval in resolved_eval_profile(base).items():
         base_value, eval_value = divergence[leaf]
         assert eval_value == expected_eval, (
             f'{leaf}: eval-side {eval_value!r} != documented {expected_eval!r}'
@@ -292,6 +295,11 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
         assert base_value != expected_eval, (
             f'{leaf}: base already equals its profile value — vacuous divergence'
         )
+    assert 'transcript_archive.root' in divergence
+    _base_root, eval_root = divergence['transcript_archive.root']
+    assert Path(eval_root).is_relative_to(
+        _snapshots.eval_worktree_root(base.project_root),
+    )
 
     # (2) Tripwire: an undocumented leak trips the parity check and is named.
     # eval_profile_divergence computes apply_eval_profile(base) vs base, so we
@@ -960,6 +968,7 @@ async def test_b11_eval_cell_writes_no_production_state(
     assert isinstance(outcome, SubmitFailed)
     assert 'EvalStubRefusal' in outcome.reason
 
+    assert workflow.mcp is not None
     assert workflow.mcp.url == FM_NULL_SENTINEL_URL
     assert set(memory_round_trips) <= {FM_NULL_SENTINEL_URL}, memory_round_trips
 
@@ -1009,7 +1018,7 @@ def test_capstone_one_fixture_through_eval_framework(tmp_path: Path) -> None:
     # B1 — the base's documented divergence surface is exactly EVAL_PROFILE.
     divergence = _profile.eval_profile_divergence(base)
     assert set(divergence) == set(EVAL_PROFILE)
-    for leaf, expected_eval in EVAL_PROFILE.items():
+    for leaf, expected_eval in resolved_eval_profile(base).items():
         _base_value, eval_value = divergence[leaf]
         assert eval_value == expected_eval
 
