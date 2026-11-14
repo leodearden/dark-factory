@@ -864,6 +864,60 @@ Queue**, **Costs**, **Burndown**, **Escalations**, and **Analytics**
 whole fleet at a glance — reach for direct MCP reads (below) when you need
 a specific answer right now.
 
+### Claimant-invariant gauge
+
+`GET http://127.0.0.1:8080/api/v2/dashboard/invariants` returns one record
+per root on the dashboard's roster, read directly and read-only from that
+root's `tasks.db`. The record shape is
+`dashboard/src/dashboard/data/root_invariants.py::RootInvariants.to_wire`,
+with `terminal_tier`, `hygiene_tier` and `chains` sections, and the
+per-project chip in the **Tasks** tab renders it. The contract is E-1 of
+`docs/prds/claimant-invariant-detection.md`.
+
+**Blind is never clean.** A `status: blind` root makes no count claim (its
+tier sections are absent), and its `error` names the cause: `tasks.db` not
+found, could not be opened read-only, a scan error, or `scanned 0 rows`. A
+curl or HTTP failure means there is no reading at all. Neither is ever a
+zero (detection PRD D-2).
+
+**What to act on.** A nonzero `terminal_tier.unledgered_count`, or a blind
+root. Ledgered rows are sanctioned C4-E2 exceptions and need nothing;
+neither does the hygiene tier. The digest to read, what counts as a
+finding, and how to triage and file one are stated once, in
+`skills/_shared/reading-the-invariants-gauge.md` — read them there.
+
+To look at the rows behind a finding, run the ζ census from the main
+checkout:
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --project fused-memory python scripts/clear_leaked_claimants.py --project-root <root> --json
+```
+
+The default dry run is read-only and never dials MCP. `--apply` writes
+claimants (`--repair-hygiene` adds the hygiene tier). Exit 3 means nothing
+was read. Run the script directly, never via `python -m`.
+
+**The mint-time tripwire.** A `set_task_claimant` write that stamps a
+claimant onto a terminal row logs an ERROR whose discriminator is
+`claimant_stamped_on_terminal`. Find it in the fused-memory journal with a
+bounded window (`--grep` reads every line the unit logged in it, so a wide
+window is slow):
+
+```bash
+journalctl --user -u fused-memory --since -1h --no-pager -o cat --grep claimant_stamped_on_terminal
+```
+
+Exit 1 means no matching line, which is an answer, not a failure. The stamp
+is journal-only and retention is short; the gauge and the census stay
+authoritative.
+
+**The re-arm trigger.** There is deliberately no unattended alarm. Any
+post-ζ observation of a nonzero unledgered terminal tier mandates filing
+ε.2's escalation-grade alarm, whose shape is pre-chosen in detection PRD
+D-7. The recorded downgrade is C4-E7 of
+`docs/prds/claimant-invariant-enforcement.md`.
+
 ### Useful MCP reads
 
 These are read-only and safe to call at any time from an interactive
