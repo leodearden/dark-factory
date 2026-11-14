@@ -6316,12 +6316,11 @@ async def _run_cmd(
     # progress dots stay in stdio buffers and never reach our streaming loop,
     # so a hanging subprocess produces an opaque ``Command timed out after …``
     # cause hint with no actionable signal.
-    # Build the target subprocess env via the venv-isolation scrub so the
-    # TARGET's `uv` resolves the TARGET's .venv, never dark-factory/.venv (the
-    # 2026-05-29 ghost-venv coupling).  The scrub strips the orchestrator's
-    # venv/uv activation vars + the venv bin dir from PATH, sets
-    # PYTHONUNBUFFERED, and reapplies the caller overlay (`env`) LAST so reify's
-    # RUSTC_WRAPPER/CARGO_*/jobserver vars and DF_VERIFY_ROLE always win.
+    # Build the target subprocess env through
+    # orchestrator/src/orchestrator/verify.py::_target_subprocess_env, the one
+    # home of what that env scrubs, injects and overlays, so the TARGET's `uv`
+    # resolves the TARGET's .venv, never dark-factory/.venv (the 2026-05-29
+    # ghost-venv coupling), and the caller overlay (`env`) still wins.
     # `cwd` doubles as the ruff-cache anchor (task 3922): <cwd>/.ruff_cache
     # terminates ruff's cache walk-up at the subprocess cwd instead of letting it
     # escape into the parent checkout's shared .ruff_cache.  Both spawn branches
