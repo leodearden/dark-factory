@@ -1,9 +1,10 @@
 """Escalation queue layout: archive subdirectory naming and terminal status names.
 
-The one stdlib-only home of where a resolved escalation record is archived
+The stdlib-only statement, for readers outside the ``escalation`` package, of
+where a resolved escalation record is archived
 (``<queue_dir>/archive/<YYYY-MM-DD>/``) and of the spellings of the terminal
 escalation statuses, so a process that holds no queue can read the layout
-without importing the ``escalation`` package.
+without importing that package.
 """
 
 from __future__ import annotations

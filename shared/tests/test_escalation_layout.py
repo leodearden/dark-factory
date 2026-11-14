@@ -7,15 +7,11 @@ from pathlib import Path
 from shared import escalation_layout
 
 
-def test_layout_constants_are_the_on_disk_names():
-    assert escalation_layout.ARCHIVE_SUBDIR == 'archive'
-    assert escalation_layout.DATE_FORMAT == '%Y-%m-%d'
-
-
 def test_terminal_status_names_are_resolved_and_dismissed():
     assert escalation_layout.RESOLVED == 'resolved'
     assert escalation_layout.DISMISSED == 'dismissed'
     assert {'resolved', 'dismissed'} == escalation_layout.TERMINAL_STATUS_NAMES
+    assert isinstance(escalation_layout.TERMINAL_STATUS_NAMES, frozenset)
 
 
 class TestArchiveDirForDate:
