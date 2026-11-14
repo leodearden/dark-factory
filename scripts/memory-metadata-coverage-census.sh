@@ -242,6 +242,7 @@ def verdict(token, narration, *, rc):
 
 
 try:
+    import _checkout as _checkout
     from _merge_queue_landing import LandingNotConfirmed, land_files, reclaim_retained_deploys
     from dashboard.config import discover_root_escalation_url
 except ImportError as exc:
