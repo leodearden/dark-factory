@@ -720,7 +720,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         Fed K = 3 it would compute per_host = ceil(3/2) = 2 and the second
         local verify, the task-5326 leak shape, would go unreported.
         """
-        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+        from _recording_event_store import _RecordingEventStore
 
         rec = _RecordingEventStore()
         worker = self._two_host_worker(git_ops, rec)
