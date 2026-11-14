@@ -4488,7 +4488,7 @@ and retiring this timer is the cheaper shape and is the preferred follow-up.
 
 | File | Role |
 |---|---|
-| `scripts/memory-metadata-coverage-census.sh` | Wrapper: census, rehearse, then commit |
+| `scripts/memory-metadata-coverage-census.sh` | Wrapper: census, rehearse, then land through the merge queue |
 | `scripts/memory-metadata-coverage-census.service` | `Type=oneshot` around the wrapper |
 | `scripts/memory-metadata-coverage-census.timer` | `OnCalendar=*-*-* 05:00:00` |
 | `scripts/install-memory-metadata-coverage-census-timer.sh` | Installer |
@@ -4512,7 +4512,7 @@ run, so ~470 KiB once the retention window is full** — the bound the cap
 buys, worth knowing before reading the per-night figure below, because the
 file is rewritten whole every night rather than appended to in place.
 
-**What committing all three nightly costs, stated rather than assumed.** The
+**What landing all three nightly costs, stated rather than assumed.** The
 two report artifacts are full rewrites every run (measured: JSON 1.04 MiB /
 markdown 223 KiB raw; 90 KiB / 47 KiB zlib-compressed, which is what git
 stores loose), against 5.2 KiB for the history *today* — the history is
@@ -4526,15 +4526,17 @@ not an oversight: the JSON is a **cited, read** artifact —
 `fused-memory/scripts/memory_eval_retrieval_probe.py`
 (`DEFAULT_CENSUS_PATH`) reads it from the repo, so a snapshot that is
 only regenerated on demand would be silently stale for whoever reads it
-next. Not committing them is worse still: the wrapper regenerates them in
-the machine-operated `project_root` checkout regardless, so skipping the
-commit leaves that checkout carrying an uncommitted diff every morning. If
-the growth ever needs bounding, the `ARTIFACTS` array in the wrapper is the
-single place that decides which paths are committed — change it there, and
-update this paragraph.
+next. Each drift night also costs **one full-gate merge**: the landing takes
+the normal lane unverified, so it pays the project's whole merge gate (no
+docs gate exists until task 5411 lands; `land_files` special-cases nothing,
+so the census inherits one through that module when it does). If the growth
+or the gate cost ever needs bounding, the `ARTIFACTS` array in the wrapper
+is the single place that decides which paths are landed — change it there,
+and update this paragraph.
 
 **The regen command** — what the report's own `regen` line reproduces, and
-the exact invocation the wrapper makes:
+the invocation the wrapper makes, on the generation worktree's own copy of
+the script (below), so the report's recorded paths stay repo-relative:
 
 ```bash
 uv run --frozen --project fused-memory python \
@@ -4546,31 +4548,73 @@ regeneration diffs as content drift and never as a rendering-width change.
 For an **ad-hoc look that must not enter the trend**, add `--no-history`:
 the committed series belongs to the nightly run.
 
-**The job commits its own artifacts.** All three land in the `project_root`
-checkout — the census resolves them from its own `__file__`, so they go
-there regardless of cwd — and that checkout is machine-operated (the merge
-worker, the startup reconciler and git hooks act on it directly). Leaving
-them dirty every morning would not be untidiness but **data loss**: the
-history file is append-only and *is* the trend, so an uncommitted append
-that the merge worker's advance path resets away takes that night's row with
-it, permanently and with no error anywhere. The wrapper therefore closes
-with a scoped `git commit --only <the three paths>` — never a bare `git
-commit` (it would sweep up a concurrent process's staged work), never `git
-add -A`, never `git stash`. Same seam the 03:00 legibility job already uses
-for `docs/legibility/census-state.json`.
+**The job lands its artifacts through the merge queue.** The history file
+is append-only and *is* the trend, so a night's row has to reach main. It
+must get there without writing the machine-operated `project_root`
+checkout: uncommitted state at a landed path there makes the lane refuse to
+advance main, which halts the whole queue (`wip_overlap`).
 
-Like both other steps it is **best-effort**: a failed commit is narrated and
-never propagated, and a night whose corpus did not drift is a no-op rather
-than a failure. For an ad-hoc run that must leave the checkout alone, set
-`CENSUS_COMMIT=0` (pairs with the census's own `--no-history`).
+- The census measures a **generation worktree**, a detached `git worktree
+  add` of main's tip under a scratch directory, running that worktree's own
+  copy of the script under `project_root`'s uv project. The census writes
+  its artifacts beside its own file, so `project_root`'s working tree is
+  never written. The worktree is removed on exit.
+- The artifacts that changed there are landed by
+  `scripts/_merge_queue_landing.py::land_files` as one commit,
+  `chore(census): nightly canonical/topic coverage census <UTC date>`, on a
+  unique `task/deploy-memory-metadata-census-<UTC stamp>` branch, through
+  one **normal-lane**, unverified merge request. There is no carrier task:
+  the deploy branch is both the request's task id and its branch.
+- The run **waits** for its landing to settle, confirmed by git, before it
+  exits. The request is named on stderr as soon as the queue accepts it.
+  `CENSUS_LANDING_TIMEOUT_SECS` (72000 in the unit) bounds the wait, and
+  `TimeoutStartSec=82800` bounds the run, measuring included, so the next
+  05:00 finds the oneshot inactive. A stop (a unit stop, or that timeout)
+  cancels the request first and ends the run 143.
+- **One census request at a time.** Before main's tip is taken, the wrapper
+  calls `scripts/_merge_queue_landing.py::reclaim_retained_deploys`. A
+  census deploy an earlier run *retained* (its cancel refused, or the
+  orchestrator down at a stop) is torn down once main carries it or the
+  queue reports it settled, so a row that lands just then is under
+  tonight's rather than in conflict with it. One that may still land makes
+  the night `skipped:landing-in-flight`: it measures and lands nothing, so
+  two requests never conflict on the append. A worktree of such a branch
+  that the landing did not make is never force-removed; stderr names it.
+
+Like both other steps it is **best-effort**: a refused or failed landing is
+narrated and never propagated. A night that cannot land, because the queue
+cannot be asked or an earlier landing may still land, measures nothing
+(`census=skipped`). A night with no retained deploy whose corpus did not
+drift asks the queue nothing. `CENSUS_COMMIT=0` skips the reclaim, measures
+and rehearses in the generation worktree but lands nothing, and its
+artifacts are discarded with the worktree. For an **ad-hoc look**, run the
+regen command above directly, with `--no-history`.
 
 **Reading the output.** Every line is prefixed
 `memory-metadata-coverage-census:` and the run ends with one summary line
 carrying all three steps' exit codes:
 
 ```
-memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 commit-step=committed)
+memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 commit-step=landed:mr-…)
 ```
+
+| `commit-step=` | Meaning |
+|---|---|
+| `landed:<request id>` | Landed on main; the deploy branch when the queue named no request id |
+| `skipped:no-drift` | Nothing changed; no queue call was made |
+| `skipped:disabled` | `CENSUS_COMMIT=0` |
+| `skipped:landing-in-flight` | An earlier night's census deploy may still land (stderr names it); `census=skipped` |
+| `skipped:not-a-git-repo` | `$REPO` is inside no checkout; measured in place |
+| `refused:repo-not-toplevel` | `$REPO` is not its checkout's root; `census=skipped` |
+| `refused:no-escalation-port` | `$REPO/dark-factory-orchestrator.yaml` names no `escalation.port`; `census=skipped` |
+| `failed:generation-worktree` | No main, or the worktree could not be added; `census=skipped` |
+| `failed:<tag>` | `land_files` refused, or the reclaim before measuring failed (then `census=skipped`); `<tag>` is a `scripts/_merge_queue_landing.py::LandingFailure` value (`not_landed`, `timed_out`, `checkout_dirty`, …) |
+| `failed:no-verdict` | A landing step printed no token |
+
+A landing is confirmed by its request: `merge_status` on the id answers
+`done` and its `merge_finalized` event carries `state: done`, while
+`git log --first-parent main` shows a `Merge
+task/deploy-memory-metadata-census-… into main` commit.
 
 ```bash
 journalctl --user -u memory-metadata-coverage-census.service -n 100
@@ -4585,10 +4629,21 @@ fell short. The wrapper always exits 0 for the reason the whole §12 family
 shares: a recurring `oneshot` that can fail enters systemd `failed` state
 and stays there, silently ending the trend. A red run is found by reading
 the summary line, not the unit state — and a `commit=` other than 0, narrated
-as `commit-step=refused:*` or `commit-step=failed`, is the one worth acting
-on, since it means the regenerated artifacts are sitting uncommitted in a
-checkout other processes operate on. `scripts/memory-metadata-coverage-census.sh`
-is the source of the full `commit-step=` token vocabulary.
+as `commit-step=refused:*` or `commit-step=failed:*`, is the one worth acting
+on. Almost always that night's row did not reach main; two tags differ.
+`failed:checkout_not_synced` means the row DID land, and only
+`project_root`'s copy of the artifacts lags main's. `failed:timed_out` or
+`failed:interrupted` whose stderr says the deploy was kept may still land;
+the next night's reclaim reports it in flight, or tears it down.
+`scripts/memory-metadata-coverage-census.sh` is the source of the full
+`commit-step=` token vocabulary.
+
+**A census deploy reported in flight for several nights** is one the queue
+still answers live, or one it cannot be reached about. Ask the queue with
+`merge_status(branch="deploy-memory-metadata-census-<stamp>")` (the branch
+stderr names, without `task/`). If it is not going to land, cancel it with
+`merge_cancel(request_id=…)`. The next night's reclaim then tears the
+branch and worktree down and lands.
 
 **Is it producing readings?** One command answers it, and it is the runbook
 predicate of verify gate task **5864**:
@@ -4614,9 +4669,9 @@ own.
 
 It reads `$REPO/plans/memory-metadata-coverage-history.json` with the
 wrapper's own `REPO` default, so **run it with `REPO` unset**. The service
-sets no `REPO`, so every nightly run writes the main checkout's file; pointed
-at a task worktree, the probe reads that worktree's older committed copy and
-reports a false `STALE HISTORY ROW`.
+sets no `REPO`, so every nightly landing reaches the main checkout's file;
+pointed at a task worktree, the probe reads that worktree's older committed
+copy and reports a false `STALE HISTORY ROW`.
 
 **Why it reads the history row, not just the unit state.** The wrapper
 always exits 0, so systemd reports `Result=success` for every night that
@@ -4625,14 +4680,13 @@ routine incomplete-coverage exit above, where the row *is* appended, and
 also the exit of a census that aborted before appending anything
 (`CensusScanIncomplete`, an unreadable history file, a backend fault). Only
 the newest row's age tells those apart, so a stale row behind a healthy unit
-means the census is aborting; look for `ABORT` in the journal. What the probe
-does **not** see is commit health: the row is appended to the working-tree
-file before the commit step, and the merge worker's advance
-(`orchestrator/src/orchestrator/git_ops.py::GitOps.advance_main`) re-applies
-uncommitted `project_root` edits rather than resetting them, so a refused or
-failed commit still leaves a fresh row on disk. Commit health is read from
-`commit-step=` on the summary line. This paragraph is the single home of the
-argument; the probe's docstring points here.
+means the census is aborting; look for `ABORT` in the journal. The probe
+now sees landing health too: the row reaches `project_root`'s file only
+through the landing (the census writes the generation worktree's copy), so
+a landing that fails or is skipped night after night also surfaces as
+`STALE HISTORY ROW` once the window passes. `commit-step=` on the summary
+line names which. This paragraph is the single home of the argument; the
+probe's docstring points here.
 
 **The rehearsal is never `--apply`.** Committing bulk `canonical: true`
 stamps stays an operator decision, run by hand after reading the rehearsal:

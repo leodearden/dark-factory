@@ -137,10 +137,10 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'scripts/tests/test_flip_reify_gate_exclude_heavy.py': (
         'every call runs in the fake reify repo under tmp_path'
     ),
-    'scripts/tests/test_install_memory_metadata_coverage_census_timer.py': (
+    'scripts/tests/test_legibility_nightly.py': _SEEDS_ITS_OWN_REPO,
+    'scripts/tests/test_memory_metadata_coverage_census_wrapper.py': (
         'every call runs in a fake, decoy or outer repo under tmp_path'
     ),
-    'scripts/tests/test_legibility_nightly.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_deep_set_cap.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_pytest_n_ab_switch.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_merge_queue_landing.py': _SEEDS_ITS_OWN_REPO,
