@@ -161,6 +161,19 @@ the pending→in-progress dispatch write (workflow.py:1510 region, carrying the 
 must fail-safe if the column is absent** (a routine orchestrator restart ahead of the fm deploy must not
 error) — feature-detect / guarded write.
 
+*D4 amended 2026-11-14 (task 4897) — "set NULL at release" no longer describes the clearing
+mechanism, and `scheduler.release` clears nothing: `Scheduler.release` writes no claimant column.
+Clearing on entry to TERMINAL is enforced at the fused-memory choke point and owned by
+`docs/prds/claimant-invariant-enforcement.md` (C4-E2): `TaskInterceptor._apply_status_transition`
+writes both columns NULL in the same UPDATE as a terminal status, unless the caller supplies a
+non-NULL claimant (`fused-memory/src/fused_memory/middleware/task_interceptor.py::_status_write_claimant_kwargs`).
+The legal caller-side clears (C4-E3) are the unconditional clear in the `finally` of
+`orchestrator/src/orchestrator/harness.py::Harness._run_slot`, which runs before the slot lease is
+released; the force-release backstop's `Harness._clear_claimant_bounded`; and
+`orchestrator/src/orchestrator/scheduler.py::Scheduler.clear_claim_then_set_status`, which clears a
+dead claimant before a non-terminal flip (task 4621). D4 and C4 remain the origin contract for the
+columns.*
+
 **D5 — actor_class is derived, coarse, and fails safe-open.** `derive_actor_class(agent_id)` maps the
 existing `agent_id`/client-name prefixes: `recon-stage-*→RECONCILIATION`,
 `orchestrator-deterministic→DETERMINISTIC`, `orchestrator*/harness*/steward*→ORCHESTRATOR`,
@@ -238,6 +251,10 @@ HUMAN, safe-open).
 Schema v2 (`claimant_run_id`, `heartbeat_at`); backend accessors; `is_stranded()` in `shared`
 (D4). Orchestrator stamps at dispatch, refreshes, clears at release; writes fail-safe if the column is
 absent.
+*Amended 2026-11-14 (task 4897) — `docs/prds/claimant-invariant-enforcement.md` (C4-E1–C4-E7) owns
+the clearing invariant `status ∈ TERMINAL ⇒ claimant_run_id IS NULL` and its terminal-entry clear.
+C4 remains the origin contract for the columns; "clears at release" is one legal clear among
+several — see D4's 2026-11-14 amendment.*
 
 ### C5 — Table B: `escalation/action_effects.py` + `resolve_issue`
 `ACTION_EFFECTS[(action, level_class, category)] → TaskEffect(target_status, workflow_disposition)`
@@ -295,6 +312,12 @@ Each row faces **both** sides of a seam; postconditions assert through product r
 | C3 | header levels narrow but cannot widen | identity ceiling `{0,1}` + header `0,1,2` | still denied L2 |
 | C4 | `promote_to_l2` gated | identity ∉ PROMOTE_ALLOWED | `level_forbidden`; header-less caller → allowed |
 | D1 | escalation ID uniqueness under the counter | rapid submits + archive present | ids strictly increasing, no collision, no directory rescan dependence |
+
+*A5 amended 2026-11-14 (task 4897) — release is not the only clear. Terminal-entry clearing at the
+fused-memory choke point is the enforcing rule (`docs/prds/claimant-invariant-enforcement.md`
+C4-E2), and slot release remains a legal caller-side clear (C4-E3); see D4's 2026-11-14 amendment.
+After the terminal write only `claimant_run_id` is guaranteed NULL: the heartbeat loop may re-stamp
+`heartbeat_at` for up to one interval, as that PRD's C4-E1 narrowing and its B15 row record.*
 
 *D1 amended 2026-07-31 — see "Amendment (2026-07-31)" below.*
 
