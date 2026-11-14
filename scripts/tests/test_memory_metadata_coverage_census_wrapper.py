@@ -1099,18 +1099,18 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
     run under the same recording shim, which land_files inherits on PATH.
     """
     scenarios = (
-        # (label, _git_repo_harness kwargs, what the census writes,
+        # (label, whether main tracks the artifacts, what the census writes,
         #  expected commit-step,
         #  git-argv substrings that scenario's OWN run must contain)
-        ('already-tracked artifacts', {}, _REGENERATED, 'landed:mr-deploy0001',
+        ('already-tracked artifacts', True, _REGENERATED, 'landed:mr-deploy0001',
          ('worktree add --detach', ' add -- ')),
-        ('first-ever run, untracked', {'tracked': False}, _REGENERATED,
+        ('first-ever run, untracked', False, _REGENERATED,
          'landed:mr-deploy0001', ('worktree add --detach', ' add -- ')),
-        ('a quiet night with no drift', {}, None, 'skipped:no-drift',
+        ('a quiet night with no drift', True, None, 'skipped:no-drift',
          ('worktree add --detach',)),
     )
-    for label, kwargs, census_writes, expected_step, expect_substrings in scenarios:
-        repo = _git_repo_harness(tmp_path / label.split()[0], **kwargs)
+    for label, tracked, census_writes, expected_step, expect_substrings in scenarios:
+        repo = _git_repo_harness(tmp_path / label.split()[0], tracked=tracked)
         env, _ = _wrapper_harness(tmp_path, record_git=True, census_writes=census_writes)
         env['REPO'] = str(repo)
         with _census_queue(repo):
