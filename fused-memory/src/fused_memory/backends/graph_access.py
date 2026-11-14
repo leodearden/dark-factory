@@ -11,6 +11,7 @@ can adopt it without loading the driver.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -45,19 +46,13 @@ _COMPACT_FLAG = '--compact'
 
 
 class RawGraph(Protocol):
-    """What falkordb's ``AsyncGraph`` provides, and what the raw test doubles stand in for.
+    """falkordb's ``AsyncGraph`` call shape: each call returns an awaitable, which the handle budgets."""
 
-    Each call returns an awaitable at runtime. The methods are declared
-    returning ``Any`` because graphiti_core annotates the driver's graph as
-    falkordb's synchronous ``Graph``, although its asyncio connection hands
-    out an ``AsyncGraph``.
-    """
+    def query(self, q: str, params: dict[str, Any] | None = None) -> Awaitable[Any]: ...
 
-    def query(self, q: str, params: dict[str, Any] | None = None) -> Any: ...
+    def ro_query(self, q: str, params: dict[str, Any] | None = None) -> Awaitable[Any]: ...
 
-    def ro_query(self, q: str, params: dict[str, Any] | None = None) -> Any: ...
-
-    def execute_command(self, *args: Any) -> Any: ...
+    def execute_command(self, *args: Any) -> Awaitable[Any]: ...
 
 
 class GraphHandle(Protocol):
@@ -137,7 +132,13 @@ def _raw_args(cypher: str, params: dict[str, Any] | None) -> tuple[Any, ...]:
 
 
 class FalkorGraphAccess(GraphAccess):
-    """The production provider: each group's graph from the driver's one connection."""
+    """The production provider: each group's graph from the driver's one connection.
+
+    graphiti_core annotates ``FalkorDriver._get_graph`` as returning falkordb's
+    synchronous ``Graph``, although the asyncio connection returns an
+    ``AsyncGraph``; task 9189 resolves the graph through
+    ``driver.client.select_graph`` instead and drops the suppression below.
+    """
 
     __slots__ = ('_driver', '_read_budget_s', '_write_budget_s')
 
@@ -150,7 +151,7 @@ class FalkorGraphAccess(GraphAccess):
 
     def graph(self, group_id: str) -> GraphHandle:
         return BudgetedGraph(
-            self._driver._get_graph(group_id),
+            self._driver._get_graph(group_id),  # pyright: ignore[reportArgumentType]  # debt: task 9189
             name=group_id,
             read_budget_s=self._read_budget_s,
             write_budget_s=self._write_budget_s,

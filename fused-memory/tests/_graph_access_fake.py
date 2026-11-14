@@ -61,11 +61,11 @@ async def wait_forever(*_args: Any, **_kwargs: Any) -> None:
 class HangingRawGraph:
     """A raw falkordb-shaped graph whose every call waits forever."""
 
-    def query(self, *args: Any) -> Any:
-        return wait_forever(*args)
+    async def query(self, *_args: Any) -> None:
+        await wait_forever()
 
-    def ro_query(self, *args: Any) -> Any:
-        return wait_forever(*args)
+    async def ro_query(self, *_args: Any) -> None:
+        await wait_forever()
 
-    def execute_command(self, *args: Any) -> Any:
-        return wait_forever(*args)
+    async def execute_command(self, *_args: Any) -> None:
+        await wait_forever()
