@@ -30,6 +30,7 @@ from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_submit import is_ticket_id, looks_like_task_id
+from shared.uuid_prefix import strip_uuid_prefix_override
 from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
 from fused_memory.backends.defect_records import (
@@ -3427,7 +3428,10 @@ def create_mcp_server(
         # for _causation_id/source and never forwards it to the store, so the
         # write-time flag cannot reach persistence by this path. Kept so a future
         # metadata pass-through cannot silently start persisting it.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -3846,7 +3850,10 @@ def create_mcp_server(
         # DF 3083 is the closed predecessor. Only the override STRIP remains a
         # tool-body responsibility, because the guard forwards allow_mcp_markup
         # UNCHANGED to a tool that declares `metadata`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         if (
             category == 'temporal_facts'
             and isinstance(agent_id, str)
@@ -4458,7 +4465,10 @@ def create_mcp_server(
         # the single point where the caller's `metadata` becomes persisted
         # state: stripping here cannot be bypassed by a later edit that adds
         # another persistence path off `cleaned_meta`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
         result = await memory_service.add_system_record(
             content=content,
@@ -6355,7 +6365,10 @@ def create_mcp_server(
         # the single point where the caller's `metadata` becomes persisted
         # state: stripping here cannot be bypassed by a later edit that adds
         # another persistence path off `cleaned_meta`.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
 
         # (3) CITATION PRE-FLIGHT over the whole delete set — the same gate
@@ -9533,7 +9546,10 @@ def create_mcp_server(
         # because the guard forwards allow_mcp_markup UNCHANGED to a tool that
         # declares `metadata` — deleting this line would persist a write-time
         # control flag into the task metadata vocabulary.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
 
         # Lock-charter guard γ: reject directory strings in metadata.files
         # before forwarding to the interceptor. Covers both the normal curator
@@ -10664,7 +10680,10 @@ def create_mcp_server(
         # matching submit_task call site above. Same reason as there: the text
         # reaches the description parser DF 3083 proved mis-parses silently. Only
         # the override STRIP remains a tool-body responsibility.
+        # The uuid-prefix guard forwards allow_uuid_prefix the same way, so it
+        # is stripped here too.
         metadata = strip_markup_override(metadata)
+        metadata = strip_uuid_prefix_override(metadata)
 
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
