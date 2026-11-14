@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 from escalation.models import Escalation, ReviewDueState
 from shared.before_done_paths import (
     BeforeDonePaths,
+    BeforeDonePathsRefused,
     FactoryRootUnresolved,
     resolve_before_done_paths,
 )
@@ -2224,6 +2225,11 @@ class DeterministicRunner:
           arm shares one category, so each carries deliberately distinct
           summary/detail wording — that text is the only thing telling a human
           which guard fired.
+        - Any other ``shared.before_done_paths.BeforeDonePathsRefused`` (a
+          record that arrived through ``update_task`` with a non-string cwd or
+          a ``script_root`` it may not use, task 9116) -> likewise an INFRA
+          fault: the check was never run.  Summary "Predicate before_done
+          refused (check not run)"; the detail names the refused field.
         - CARRIER SPLIT (task 4678 / r3, PRD R-D6 + C-5): for a task carrying
           ``metadata.recurrence`` — one link of a recurring chain — EVERY
           no-verdict arm above files ``milestone_check_failed`` instead of
@@ -2370,6 +2376,15 @@ class DeterministicRunner:
                     f'Set {DARK_FACTORY_ROOT_ENV} for the orchestrator process to the '
                     'dark-factory checkout.',
                 ]),
+                category=no_verdict_category,
+            )
+        except BeforeDonePathsRefused as exc:
+            # The record names no script location, so the check never ran.
+            # After the FactoryRootUnresolved arm: that subclass has its own.
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate before_done refused (check not run)',
+                detail='\n'.join([description, str(exc)]),
                 category=no_verdict_category,
             )
         except Exception as exc:
@@ -2736,7 +2751,8 @@ class DeterministicRunner:
     ) -> tuple[int, str] | WorkflowOutcome:
         """Run a ``before_done`` deploy script under the Layer-B outer
         wall-clock guard, mapping an outer-guard timeout / the default
-        runner's own inner per-script timeout (``ScriptTimeout``) /
+        runner's own inner per-script timeout (``ScriptTimeout``) / a
+        refused before_done record (``BeforeDonePathsRefused``) /
         an unexpected error / a non-zero exit to an already-filed born-at-L2
         ``infra_issue`` + ``BLOCKED``.
 
@@ -2796,6 +2812,19 @@ class DeterministicRunner:
                     f'({exc.summary_phrase}, no target_unit)'
                 ),
                 detail=inner_timeout_detail,
+                metadata=metadata,
+            )
+        except BeforeDonePathsRefused as exc:
+            refusal_detail = '\n'.join([
+                description,
+                note,
+                f'before_done was refused, so the deploy script was NOT run: {exc}',
+                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Deploy refused before_done (no target_unit)',
+                detail=refusal_detail,
                 metadata=metadata,
             )
         except Exception as exc:
@@ -3617,6 +3646,20 @@ class DeterministicRunner:
                         task_id=task_id,
                         summary=f'Self-restart scheduling failed: {target_unit}',
                     )
+                except BeforeDonePathsRefused as exc:
+                    refusal_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Transient unit: {transient_unit}',
+                        f'before_done was refused, so the restart was NOT scheduled: {exc}',
+                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Self-restart refused before_done: {target_unit}',
+                        detail=refusal_detail,
+                        metadata=metadata,
+                    )
                 except Exception as exc:
                     return await _completion_failure(exc)
 
@@ -3889,9 +3932,8 @@ class DeterministicRunner:
                     baseline_main_pid=baseline.get('MainPID', 0),
                     inspect_timeout_secs=self._inspect_timeout_secs,
                 )
-                paths = self._before_done_paths(before_done)
-
                 try:
+                    paths = self._before_done_paths(before_done)
                     plan = RestartPlan(
                         script=paths.script,
                         args=list(before_done.get('args') or []),

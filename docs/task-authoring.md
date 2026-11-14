@@ -1177,8 +1177,10 @@ filing calls themselves live in `skills/_shared/filing-the-trigger-chain.md`.
 The no-verdict row covers every way a run produces no exit code — the outer
 wall-clock guard, the script overrunning its own `before_done.timeout_secs`,
 a `script_root='factory'` whose factory root does not resolve at run time
-(summary "Predicate script root unresolvable"), and an unexpected error in the
-runner seam. Only a **non-zero exit** other than a declared re-arm `75` — a
+(summary "Predicate script root unresolvable"), a stored `before_done` record
+the runner refuses (a non-string `cwd`, or a `script_root` the record may not
+use, reaching it through `update_task`; summary "Predicate before_done refused
+(check not run)"), and an unexpected error in the runner seam. Only a **non-zero exit** other than a declared re-arm `75` — a
 real verdict — stamps `gate_escalated_at` and thereby latches the task into
 the resume/resolve-to-done path.
 
