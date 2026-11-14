@@ -13,10 +13,13 @@ Exit codes. The deterministic runner reads only the code:
   ``milestone_check_failed`` whose detail carries this output.
 * 2: the instrument failed and nothing measured over. The dashboard was
   unreachable, a request timed out or answered non-200, a request was not
-  reached before the run deadline, or the table could not be read.
+  reached before the run deadline, the table could not be read, or the
+  checker itself raised.
 
 An instrument failure is never reported as an overage. A measured overage
-stays exit 1 even beside a failure, because it is a verdict either way.
+stays exit 1 even beside a request that failed, because it is a verdict
+either way. When the checker itself raises, the run's verdicts are lost with
+it, so that run is exit 2 whatever it had measured.
 
 Output, in order: one line per request in table order; then each overage's
 largest leaf fields, worst last; then ONE compact JSON summary line of at
@@ -39,6 +42,7 @@ import argparse
 import asyncio
 import json
 import sys
+import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,10 +272,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         table = load_budget_table(args.table)
+        report = asyncio.run(_check_live(args.base_url, table, args.timeout, args.run_deadline))
     except PayloadBudgetTableError as exc:
         print(f'payload_check: {exc}', file=sys.stderr)
         return 2
-    report = asyncio.run(_check_live(args.base_url, table, args.timeout, args.run_deadline))
+    except Exception as exc:
+        # The interpreter would exit 1 here, which is the overage code.
+        traceback.print_exc()
+        print(f'payload_check: instrument failure, nothing judged: {type(exc).__name__}: {exc}', file=sys.stderr)
+        return 2
     print('\n'.join(report.lines))
     return report.exit_code
 

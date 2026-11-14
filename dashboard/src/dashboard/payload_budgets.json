@@ -1,7 +1,7 @@
 {
   "_README": [
     "A budget is the most wire bytes one REQUEST (path plus query) may serve. Request identity is (path, query), so one route may carry several entries.",
-    "Two enforcement points read this table: the pre-merge fleet sweep (dashboard/tests/test_payload_budget_sweep.py) and the live predicate (dashboard/payload_check.py, run daily by the dashboard-payload-budgets recurrence chain).",
+    "Two enforcement points read this table: the pre-merge fleet sweep (dashboard/tests/test_payload_budget_sweep.py) and the live predicate (dashboard/src/dashboard/payload_check.py, run daily by the dashboard-payload-budgets recurrence chain).",
     "history is APPEND-ONLY. The effective budget is the last entry. To raise or lower a budget, APPEND {budget_bytes, task, reason}; never edit, reorder or delete a recorded entry. The base-relative test in dashboard/tests/test_payload_budgets.py refuses it.",
     "Headroom convention for a new number over a fresh live measurement m: round max(1.25*m, m + 16384) up to 2 significant figures.",
     "Slack rule (payload_budgets.MAX_SLACK_RATIO, payload_budgets.SLACK_FLOOR_BYTES): the sweep fails when a budget exceeds max(MAX_SLACK_RATIO * measured, measured + SLACK_FLOOR_BYTES), so a real shrink must be recorded as a lowered entry and a fixture that stops reaching its data turns red.",

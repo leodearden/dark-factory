@@ -384,6 +384,20 @@ def test_main_bounds_each_request_and_the_run_over_a_real_stalled_socket(tmp_pat
     assert any("the run's 0.8 s deadline" in line for line in out.splitlines()), out
 
 
+def test_an_exception_the_checker_does_not_anticipate_exits_2_naming_it(tmp_path, capsys):
+    """httpx.InvalidURL is not an httpx.HTTPError, so no request-level cause catches it."""
+    table = tmp_path / 'payload_budgets.json'
+    table.write_text(json.dumps(_table_document(*TABLE_ENTRIES)))
+
+    code = main(['--base-url', 'http://[::1', '--timeout', '1', '--run-deadline', '2', '--table', str(table)])
+
+    captured = capsys.readouterr()
+    assert code == 2, captured.out + captured.err
+    last = captured.err.rstrip().splitlines()[-1]
+    assert 'instrument failure' in last and 'InvalidURL' in last, captured.err
+    assert 'against a budget of' not in captured.out + captured.err
+
+
 @pytest.mark.parametrize('content', [None, '{"schema_version": 1, "endpoints": []}'], ids=['missing', 'malformed'])
 def test_an_unreadable_table_exits_2(tmp_path, capsys, content):
     table = tmp_path / 'payload_budgets.json'

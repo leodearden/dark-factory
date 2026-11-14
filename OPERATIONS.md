@@ -889,20 +889,22 @@ There are two enforcement points:
    `dashboard/src/dashboard/payload_check.py`, measures the running
    dashboard. Exit codes: 0 means within budget; 1 means over budget; 2
    means the instrument failed (unreachable, timeout, non-200, a request not
-   reached before the run deadline, unreadable table). It runs daily as the
-   `dashboard-payload-budgets` recurrence chain. The fixture sweep cannot
-   see organic growth from more tasks existing; this check is what sees it.
+   reached before the run deadline, unreadable table, or the checker itself
+   raised). It runs daily as the `dashboard-payload-budgets` recurrence
+   chain. The fixture sweep cannot see organic growth from more tasks
+   existing; this check is what sees it.
 
 **Reading a failed link.** A link that exits non-zero files a born-at-L2
 `milestone_check_failed`. The checker prints one line per request, then each
 overage with its largest leaf fields and the task and reason behind the
 current budget, worst overage last, then a JSON summary. The detail keeps
 only the last 2,000 characters of that output. So what reliably survives is
-the summary, which names every over-budget request and the worst ratio, and
-usually the worst overage just above it. One overage runs to 1,100-1,400
-characters, so the per-request lines and every other overage are usually
-cut. For the full report, run `scripts/check_dashboard_payload_budgets.sh`
-by hand. The remedy is one of:
+the summary and usually the worst overage just above it. The summary names
+the worst ratio and the over-budget requests, as many as fit its
+`dashboard/src/dashboard/payload_check.py::SUMMARY_MAX_CHARS` cap, then
+`+N more`. One overage runs to 1,100-1,400 characters, so the per-request
+lines and every other overage are usually cut. For the full report, run
+`scripts/check_dashboard_payload_budgets.sh` by hand. The remedy is one of:
 
 - shrink the payload; or
 - merge a raise appended to that request's history, naming your task and

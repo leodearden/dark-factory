@@ -4,7 +4,7 @@ A budget is the most wire bytes one REQUEST, a GET path plus its query, may
 serve. The table is package data, ``payload_budgets.json`` beside this module,
 and two enforcement points read it: the pre-merge fleet sweep
 (``dashboard/tests/test_payload_budget_sweep.py``) and the live predicate
-(``dashboard/payload_check.py``).
+(``dashboard/src/dashboard/payload_check.py``).
 
 This module is pure. It reads the table and nothing else: no network, and no
 import of the app.
