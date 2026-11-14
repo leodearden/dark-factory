@@ -166,6 +166,63 @@ class TestHarnessExternalDepBlockWiring:
             category='dependency_discovered',
         )
 
+    @staticmethod
+    def _real_queue_harness(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
+        harness = _make_harness(tmp_path)
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+        return harness, queue
+
+    @staticmethod
+    async def _block_cancelled(harness: Harness) -> None:
+        callback = harness.scheduler._callbacks.on_external_dep_block
+        assert callback is not None
+        await callback(
+            '42',
+            summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
+            detail='dep dark_factory:5 is cancelled',
+            category='dependency_discovered',
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_files_a_new_root_cause_past_an_open_l1_of_another_category(
+        self, tmp_path: Path,
+    ) -> None:
+        """The scheduler's resolver-degraded infra_issue L1 must not hide a cancelled dep."""
+        harness, queue = self._real_queue_harness(tmp_path)
+        degraded = Escalation(
+            id=queue.make_id('42'),
+            task_id='42',
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category='infra_issue',
+            summary='EXTERNAL_DEP_RESOLVER_DEGRADED: task 42 — resolver unreachable',
+            detail='',
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        queue.submit(degraded)
+
+        await self._block_cancelled(harness)
+
+        pending_l1s = queue.get_by_task('42', status='pending', level=1)
+        filed = [e for e in pending_l1s if e.category == 'dependency_discovered']
+        assert len(filed) == 1, f'Expected one dependency_discovered L1; got {pending_l1s!r}'
+        assert 'EXTERNAL_DEP_CANCELLED' in filed[0].summary, filed[0].summary
+        assert degraded.id in {e.id for e in pending_l1s}, 'the infra_issue L1 must stay pending'
+
+    @pytest.mark.asyncio
+    async def test_callback_still_deduplicates_within_its_category(self, tmp_path: Path) -> None:
+        """A repeat block for the same category files no second L1 (real queue, real dedupe)."""
+        harness, queue = self._real_queue_harness(tmp_path)
+
+        await self._block_cancelled(harness)
+        await self._block_cancelled(harness)
+
+        pending_l1s = queue.get_by_task('42', status='pending', level=1)
+        assert len(pending_l1s) == 1, f'Expected exactly 1 L1 after dedup; got {pending_l1s!r}'
+
 
 # ---------------------------------------------------------------------------
 # TestHarnessDeliveredCheckBlockWiring (task 2583 — step-13 RED / step-14 GREEN)
@@ -178,8 +235,8 @@ class TestHarnessDeliveredCheckBlockWiring:
     Mirrors TestHarnessExternalDepBlockWiring, but the filed escalation is
     BORN AT L2 (severity='critical', level=2, agent_role=
     'orchestrator-scheduler' — a harness-sentinel role) instead of L1, and
-    dedupe is scoped to level=2 + agent_role rather than the broad
-    has_open_l1.
+    dedupe is scoped to level=2 + agent_role rather than has_open_l1,
+    which reads only L1s.
     """
 
     _SUMMARY = (
@@ -293,9 +350,8 @@ class TestHarnessDeliveredCheckBlockWiring:
             f'(expected exactly 1)'
         )
         assert verified == [owner], 'the deduped call must not read the owner sidecar'
-        # Dedupe must be scoped to level=2 + agent_role — NOT the broad
-        # has_open_l1 the external-dep filer uses (that would mask/be masked
-        # by an unrelated open L1/L2 for the same task).
+        # Dedupe must be scoped to level=2 + agent_role — not has_open_l1,
+        # which reads only L1s and so cannot see the born-at-L2 record.
         mock_queue.get_by_task.assert_any_call(
             '42', status='pending', level=2, agent_role='orchestrator-scheduler'
         )
