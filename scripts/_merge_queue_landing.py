@@ -40,9 +40,11 @@ merge gate; nothing is special-cased for docs.
 
 The change is committed on a short-lived `task/deploy-<label>-<UTC stamp>`
 branch, in a worktree outside the target checkout, submitted through
-merge_request, and polled by the request's own handle until it settles. The
-landing is then confirmed by git: the deploy commit is on main, and the
-target checkout's copy of every landed path is main's.
+merge_request, and polled by the request's own handle until it settles. A
+request left to poll is named on stderr as soon as the queue accepts it, so
+a run killed mid-wait still leaves its id in the log. The landing is then
+confirmed by git: the deploy commit is on main, and the target checkout's
+copy of every landed path is main's.
 
 The deploy branch is torn down once its request can no longer land. A request
 still in flight when the deadline passes, or when SIGTERM/SIGINT arrives, is
@@ -55,7 +57,8 @@ request it names is waited for like any other.
 A caller that lands on a cadence calls `reclaim_retained_deploys` first. A
 deploy an earlier run retained is torn down once it can no longer land, and
 one that still may is returned, so the caller can skip rather than stack a
-second request beside it.
+second request beside it. A worktree holding such a deploy's branch that
+this module did not place is never force-removed.
 
 The calling heredoc's side of the contract (argv-only inputs, the script's
 directory on sys.path, the checkout venv's interpreter) is
@@ -232,9 +235,23 @@ def reclaim_retained_deploys(repo: str, label: str, *, port: str,
             if reply is None or _may_still_land(reply.get("state")):
                 kept.append(branch)
                 continue
-        worktree = _worktree_of(checkout, branch)
-        _tear_down(checkout, branch, worktree=worktree, scratch=_deploy_scratch_of(worktree))
+        _reclaim(checkout, branch)
     return tuple(kept)
+
+
+def _reclaim(repo: Path, branch: str) -> None:
+    """Tear down the deploy *branch*, which can no longer land. A worktree
+    with it checked out that _DeployBranch.create did not place, such as an
+    operator's inspection checkout, may hold work: it is left and named, and
+    git then refuses to delete the branch it holds, which _tear_down
+    reports."""
+    worktree = _worktree_of(repo, branch)
+    scratch = _deploy_scratch_of(worktree)
+    placed = worktree if scratch is not None else None
+    if placed is None and worktree is not None and worktree.exists():
+        print(f"{_LOG_PREFIX} leaving {worktree}, which has {branch} checked out but is not a "
+              f"deploy worktree; remove it to let {branch} be reclaimed", file=sys.stderr)
+    _tear_down(repo, branch, worktree=placed, scratch=scratch)
 
 
 def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: _Deadline,
@@ -250,6 +267,9 @@ def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: 
         if not _submit_pending(submitted, target, deploy):
             return _confirmed(target, deploy, submitted)
         pending = _Pending.submitted(submitted, deploy)
+        print(f"{_LOG_PREFIX} merge_request answered {submitted['status']} for {deploy.branch} "
+              f"(request_id={submitted.get('request_id')}); waiting for it to settle",
+              file=sys.stderr)
     return _confirmed(target, deploy,
                       _poll_until_landed(queue, target, deploy, pending, deadline, stop))
 

@@ -39,6 +39,7 @@ from merge_queue_fakes import (
     assert_target_checkout_clean,
     deploy_tmpdir_env,
 )
+from retained_deploy_fakes import CANCEL_REFUSED_WHILE_LANDING, branch_exists, retained_deploy
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -460,14 +461,6 @@ def test_a_ceiling_passed_during_the_submit_cancels_without_a_poll(repo, scratch
     assert queue.calls_to("merge_status") == []
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     _assert_untouched(repo, before, scratch)
-
-
-CANCEL_REFUSED_WHILE_LANDING = {
-    "cancelled": False,
-    "state": "finalizing",
-    "reason": "Request is landing (its CAS is in progress)",
-    "code": "finalize_window",
-}
 
 
 def test_a_cancel_refused_while_live_keeps_the_deploy_branch(repo, scratch):
@@ -1033,6 +1026,27 @@ def test_teardown_tolerates_a_lane_that_already_removed_the_deploy_branch(repo, 
     _assert_left_nothing_behind(repo, scratch)
 
 
+def test_a_submitted_request_is_named_before_the_wait_for_it(repo, scratch, capsys):
+    """A run killed while it waits reports no outcome, so the request it left
+    in the queue must already be named."""
+    queue = FakeMergeQueue(repo, states=["verifying", "done"])
+    handlers = queue.handlers()
+    logged_by_the_first_poll = []
+    handlers["merge_status"] = _acting_after(
+        handlers["merge_status"], lambda: logged_by_the_first_poll.append(capsys.readouterr().err),
+        when=lambda reply: not logged_by_the_first_poll,
+    )
+
+    with FakeEscalationMcp(tool_handlers=handlers) as server:
+        landing = land_file(
+            str(repo), CONFIG, _main(repo), EDITED,
+            port=str(server.port), label=LABEL, message=MESSAGE,
+        )
+
+    (err,) = logged_by_the_first_poll
+    assert landing.branch in err and f"request_id={queue.request_id}" in err, err
+
+
 def test_a_teardown_git_refuses_keeps_the_landing(repo, scratch, capsys):
     """The knob is on main: a deploy branch git will not remove is reported,
     not raised over the landing."""
@@ -1057,12 +1071,8 @@ def test_a_teardown_git_refuses_keeps_the_landing(repo, scratch, capsys):
 # ---------------------------------------------------------------------------
 
 def _retained_deploy(repo):
-    """The (branch, worktree) land_file kept for a request still live at a
-    passed ceiling whose cancel the queue refused."""
-    queue = FakeMergeQueue(repo, states=["verifying"], cancel_reply=CANCEL_REFUSED_WHILE_LANDING)
-    _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
-    (submitted,) = queue.calls_to("merge_request")
-    return f"task/{submitted['branch']}", pathlib.Path(submitted["worktree"])
+    """The (branch, worktree) a landing of EDITED as CONFIG kept in *repo*."""
+    return retained_deploy(repo, {CONFIG: EDITED}, label=LABEL)
 
 
 def _reclaim(repo, answers=None, *, label=LABEL):
@@ -1080,12 +1090,6 @@ def _bare(branch):
     return branch.removeprefix("task/")
 
 
-def _branch_exists(repo, branch):
-    return subprocess.run(
-        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-    ).returncode == 0
-
-
 def test_a_repo_without_a_retained_deploy_reclaims_nothing_and_asks_nothing(repo, scratch):
     kept, calls = _reclaim(repo)
 
@@ -1101,7 +1105,7 @@ def test_a_retained_deploy_still_live_is_kept_and_reported(repo, scratch):
     assert kept == (branch,)
     assert calls == [("merge_status", {"branch": _bare(branch)})]
     assert worktree.is_dir(), "a deploy that may still land lost its worktree"
-    assert _branch_exists(repo, branch)
+    assert branch_exists(repo, branch)
 
 
 @pytest.mark.parametrize("settled", ["abandoned", "conflict"])
@@ -1135,7 +1139,7 @@ def test_a_retained_deploy_whose_poll_is_dropped_is_kept(repo, scratch):
 
     assert kept == (branch,)
     assert worktree.is_dir()
-    assert _branch_exists(repo, branch)
+    assert branch_exists(repo, branch)
 
 
 def test_a_deploy_of_another_label_sharing_the_prefix_is_left_alone(repo, scratch, tmp_path):
@@ -1149,7 +1153,7 @@ def test_a_deploy_of_another_label_sharing_the_prefix_is_left_alone(repo, scratc
     assert kept == ()
     assert calls == []
     assert worktree.is_dir()
-    assert _branch_exists(repo, other)
+    assert branch_exists(repo, other)
 
 
 def test_a_settled_retained_deploy_whose_worktree_vanished_loses_its_branch(repo, scratch):
@@ -1161,9 +1165,29 @@ def test_a_settled_retained_deploy_whose_worktree_vanished_loses_its_branch(repo
     kept, _ = _reclaim(repo, {_bare(branch): ["abandoned"]})
 
     assert kept == ()
-    assert not _branch_exists(repo, branch)
+    assert not branch_exists(repo, branch)
     assert str(worktree) not in git(repo, "worktree", "list", "--porcelain")
     _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_settled_deploy_checked_out_where_no_landing_put_it_is_left_alone(
+        repo, scratch, tmp_path, capsys):
+    """An operator inspecting a deploy branch in a checkout of their own may
+    have work there, which a forced removal would discard."""
+    branch, worktree = _retained_deploy(repo)
+    git(repo, "worktree", "remove", "--force", str(worktree))
+    inspection = tmp_path / "inspection"
+    git(repo, "worktree", "add", "-q", str(inspection), branch)
+    notes = inspection / "notes.txt"
+    notes.write_text("an operator's uncommitted notes\n")
+
+    kept, _ = _reclaim(repo, {_bare(branch): ["abandoned"]})
+
+    assert kept == ()
+    assert notes.read_text() == "an operator's uncommitted notes\n"
+    assert branch_exists(repo, branch)
+    err = capsys.readouterr().err
+    assert f"leaving {inspection}" in err and branch in err, err
 
 
 class _SignalStandIn:
