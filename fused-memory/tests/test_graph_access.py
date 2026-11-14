@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
-from _graph_access_fake import HangingRawGraph, wait_forever
+from _graph_access_fake import HangingRawGraph, wait_forever, with_backend_budgets
 from _import_closure import SRC, modules_loaded_by_importing
 from pydantic import ValidationError
 
@@ -164,6 +164,21 @@ class TestFalkorGraphAccess:
             await _guarded(self._access(driver).list_graphs())
 
         assert str(raised.value) == f'Graphiti list_graphs timed out after {_READ_S}s'
+
+
+class TestTheEgressHoldsOnlyItsDeclaredState:
+    @pytest.mark.parametrize('build', [
+        pytest.param(lambda: _budgeted(MagicMock()), id='BudgetedGraph'),
+        pytest.param(
+            lambda: FalkorGraphAccess(MagicMock(), read_budget_s=_READ_S, write_budget_s=_WRITE_S),
+            id='FalkorGraphAccess',
+        ),
+    ])
+    def test_an_undeclared_attribute_cannot_be_set(self, build):
+        attribute = 'undeclared'
+
+        with pytest.raises(AttributeError):
+            setattr(build(), attribute, 1)
 
 
 class TestPagedRoQuery:
@@ -327,15 +342,6 @@ _PAGED_CYPHER_METHODS = [
 ]
 
 
-def _tiny_budget_config(config):
-    return config.model_copy(update={
-        'queue': config.queue.model_copy(update={
-            'backend_read_timeout_seconds': _READ_S,
-            'backend_write_timeout_seconds': _WRITE_S,
-        }),
-    })
-
-
 class ReadsNothingWritesHang:
     """A raw graph whose reads find nothing and whose writes wait forever."""
 
@@ -361,7 +367,9 @@ class TestEveryBackendCypherMethodIsBudgeted:
     ):
         driver = make_graph_driver({'g': HangingRawGraph()})
         driver.client.list_graphs = AsyncMock(return_value=['g'])
-        backend = make_backend(_tiny_budget_config(mock_config), driver=driver)
+        backend = make_backend(
+            with_backend_budgets(mock_config, read_s=_READ_S, write_s=_WRITE_S), driver=driver,
+        )
 
         with pytest.raises(TimeoutError) as raised:
             await _guarded(call(backend))
@@ -373,7 +381,9 @@ class TestEveryBackendCypherMethodIsBudgeted:
         self, mock_config, make_backend, make_graph_driver,
     ):
         driver = make_graph_driver({'g': ReadsNothingWritesHang()})
-        backend = make_backend(_tiny_budget_config(mock_config), driver=driver)
+        backend = make_backend(
+            with_backend_budgets(mock_config, read_s=_READ_S, write_s=_WRITE_S), driver=driver,
+        )
 
         with pytest.raises(TimeoutError) as raised:
             await _guarded(backend.ensure_entity_node('Alice', group_id='g'))
@@ -384,8 +394,15 @@ class TestEveryBackendCypherMethodIsBudgeted:
 class TestTheConnectionHasASocketTimeout:
     """The FalkorDB connection itself is bounded, beyond every named budget."""
 
-    def test_the_default_socket_timeout_outlasts_the_default_budgets(self):
-        FusedMemoryConfig()
+    def test_the_code_default_socket_timeout_outlasts_both_code_default_budgets(
+        self, code_default_config,
+    ):
+        config = FusedMemoryConfig()
+
+        assert config.graphiti.falkordb.socket_timeout_seconds > max(
+            config.queue.backend_read_timeout_seconds,
+            config.queue.backend_write_timeout_seconds,
+        )
 
     @pytest.mark.parametrize('budget_field', [
         'backend_read_timeout_seconds', 'backend_write_timeout_seconds',

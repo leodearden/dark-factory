@@ -1207,8 +1207,8 @@ class GraphitiBackend:
         The registry is required because the derived one names real project graphs.
         The backend takes ownership: ``close()`` releases the driver and sub-clients.
 
-        An injected *graph_access* serves every raw Cypher call; graphiti_core
-        calls still run over *driver*.
+        An injected *graph_access* serves every raw Cypher call until ``close()``;
+        graphiti_core calls still run over *driver*.
         """
         backend = cls(config, registered_graph_ids=registered_graph_ids)
         backend._attach(
@@ -5550,6 +5550,7 @@ class GraphitiBackend:
         await close_wrapped_sdk_clients(self._sdk_client_wrappers())
         self.client = None
         self._driver = None
+        self._graph_access = None
         # Per-group clients each hold a driver that aliases an entry already
         # closed above via the _cloned_drivers loop (or self._driver itself), so
         # Graphiti.close() is never called: it would double-close the single

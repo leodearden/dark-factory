@@ -58,6 +58,8 @@ class RawGraph(Protocol):
 class GraphHandle(Protocol):
     """One group's graph, every call budgeted and named by its ``op``."""
 
+    __slots__ = ()
+
     @property
     def name(self) -> str: ...
 
@@ -76,6 +78,8 @@ class GraphHandle(Protocol):
 
 class GraphAccess(Protocol):
     """Resolves a group id to its budgeted graph."""
+
+    __slots__ = ()
 
     def graph(self, group_id: str) -> GraphHandle: ...
 

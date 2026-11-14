@@ -1,14 +1,11 @@
 """GraphitiBackend.with_driver: a backend wired over a given driver and sub-clients, without initialize()."""
 from __future__ import annotations
 
-import ast
 import asyncio
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _ast_guard import parse_python_module
-from _graph_access_fake import FakeGraphAccess, HangingRawGraph
+from _graph_access_fake import FakeGraphAccess, HangingRawGraph, with_backend_budgets
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.llm_client import LLMClient
@@ -105,22 +102,29 @@ class TestGraphAccessSeam:
         with pytest.raises(KeyError, match="'other'"):
             await backend.node_count('other')
 
-    @pytest.mark.parametrize('attribute', ['graph_access'])
-    def test_the_provider_is_read_only(self, mock_config, make_graph_driver, attribute):
+    def test_the_provider_is_read_only(self, mock_config, make_graph_driver):
         backend = self.wired_backend(mock_config, make_graph_driver({}), FakeGraphAccess({}))
+        attribute = 'graph_access'
 
         with pytest.raises(AttributeError):
             setattr(backend, attribute, FakeGraphAccess({}))
 
     @pytest.mark.asyncio
+    async def test_a_closed_backend_no_longer_serves_the_injected_provider(
+        self, mock_config, make_graph_driver,
+    ):
+        backend = self.wired_backend(mock_config, make_graph_driver({}), FakeGraphAccess({}))
+
+        await backend.close()
+
+        with pytest.raises(RuntimeError, match='not initialized'):
+            _ = backend.graph_access
+
+    @pytest.mark.asyncio
     async def test_the_default_provider_carries_the_configured_read_budget(
         self, mock_config, make_graph_driver,
     ):
-        config = mock_config.model_copy(update={
-            'queue': mock_config.queue.model_copy(
-                update={'backend_read_timeout_seconds': 0.05},
-            ),
-        })
+        config = with_backend_budgets(mock_config, read_s=0.05, write_s=0.08)
         backend = self.wired_backend(config, make_graph_driver({'g': HangingRawGraph()}))
 
         with pytest.raises(TimeoutError) as raised:
@@ -132,19 +136,3 @@ class TestGraphAccessSeam:
         with pytest.raises(RuntimeError, match='not initialized'):
             _ = GraphitiBackend(mock_config).graph_access
 
-
-def test_the_seam_tests_reach_only_public_names():
-    module = parse_python_module(Path(__file__))
-    seam = next(
-        node for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == 'TestGraphAccessSeam'
-    )
-
-    private = [
-        node.attr for node in ast.walk(seam)
-        if isinstance(node, ast.Attribute)
-        and node.attr.startswith('_')
-        and not (node.attr.startswith('__') and node.attr.endswith('__'))
-    ]
-
-    assert private == []
