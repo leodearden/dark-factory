@@ -281,7 +281,11 @@ class TestEveryHarnessEscalationStatesItsLevel:
 
     def test_every_escalation_construction_passes_level(self) -> None:
         calls = _filing_call_sites(_HARNESS_SRC_PATH, frozenset({'Escalation'}))
-        assert calls, f'{_HARNESS_SRC_PATH.name}: found no Escalation(...) construction'
+        assert len(calls) >= 29, (
+            f'{_HARNESS_SRC_PATH.name}: expected >=29 Escalation(...) constructions, '
+            f'found {len(calls)} — if they moved to another module, scan that '
+            f'module here too, or this tripwire silently covers less.'
+        )
 
         implicit = [
             node.lineno for node in calls
