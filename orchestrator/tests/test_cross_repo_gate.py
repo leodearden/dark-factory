@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator import cross_repo_gate as gate
+
 # Sentinel: distinguishes "metadata key absent" from "metadata is None".
 _UNSET = object()
 
@@ -1323,6 +1325,12 @@ class TestRunCrossRepoGate:
         assert 'registry exploded' in verdict.reason, (
             f'the synthesized verdict must name the exception; got {verdict.reason!r}'
         )
+        assert 'RuntimeError' in verdict.reason, (
+            f'an empty exception message must still name what crashed; got {verdict.reason!r}'
+        )
+        assert verdict.signals == (gate.SIGNAL_CLASSIFY_ERROR,)
+        assert verdict.owner_project is None
+        assert verdict.foreign_paths == ()
 
     @pytest.mark.asyncio
     async def test_passes_config_project_root(self, tmp_path: Path):
@@ -1384,6 +1392,121 @@ class TestRunCrossRepoGate:
         message = ' '.join(r.getMessage() for r in caplog.records)
         assert '4242' in message, f'gate must log the task id; got {message!r}'
         assert 'allow' in message.lower(), f'gate must log the verdict; got {message!r}'
+
+
+class TestClassifyErrorEscalation:
+    """Task 4161: the classifier-crash fail-closed path, end to end.
+
+    Drives ``_run_cross_repo_gate`` into the REAL ``_block_and_escalate_cross_repo``
+    and a REAL ``EscalationQueue``.  Only the public ``classify_cross_repo`` is
+    patched to raise: it is documented never to raise, so patching it is the one
+    honest way to reach the except branch.  The L1 that crash files must claim
+    nothing the crash did not establish, and must not advise a refile.
+    """
+
+    @pytest.mark.asyncio
+    async def test_classifier_crash_l1_claims_nothing_was_established(
+        self, tmp_path: Path, caplog,
+    ):
+        from escalation.queue import EscalationQueue
+
+        caplog.set_level(logging.WARNING)
+        h = _make_harness(tmp_path)
+        set_status = AsyncMock()
+        h.scheduler.set_task_status = set_status
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+        # Files declared on purpose: a '(none declared)' line would be visibly false.
+        assignment = _make_assignment(
+            task_id='4161', cross_repo=True,
+            files=['orchestrator/src/orchestrator/harness.py'],
+        )
+
+        boom = RuntimeError('registry exploded')
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo', side_effect=boom):
+            allowed = await h._run_cross_repo_gate(assignment)
+
+        assert allowed is False
+        set_status.assert_awaited_once_with('4161', 'blocked')
+        l1s = [e for e in esc_queue.get_pending() if e.task_id == '4161' and e.level == 1]
+        assert len(l1s) == 1, f'Expected exactly 1 L1 for task 4161; got {l1s!r}'
+
+        summary = l1s[0].summary
+        assert 'CROSS_REPO_UNVERIFIED' in summary, summary
+        assert 'MISFILE' not in summary, summary
+        assert 'owned by' not in summary.lower(), summary
+        assert 'outside' not in summary.lower(), summary
+        assert 'nothing' in summary.lower(), summary
+        assert 'established' in summary.lower(), summary
+
+        detail = l1s[0].detail
+        assert 'registry exploded' in detail, detail
+        assert gate.SIGNAL_CLASSIFY_ERROR in detail, detail
+        assert '(none declared)' not in detail, detail
+        assert 'nothing in the task metadata named it' not in detail, detail
+        assert 'judged outside project_root' not in detail, detail
+        assert 'not evidence' in detail.lower(), detail
+        assert 'do not refile' in detail.lower(), detail
+        assert 'unblock' in detail.lower(), detail
+
+        crash_logs = [r for r in caplog.records if r.exc_info and r.exc_info[1] is boom]
+        assert len(crash_logs) == 1, f'the crash traceback must be logged once; got {crash_logs!r}'
+        logged = crash_logs[0].getMessage()
+        searched_for = logged[: logged.index('4161') + len('4161')]
+        assert f'"{searched_for}"' in detail, (
+            f'the L1 must quote the logged line {logged!r} it tells the operator to find; '
+            f'got {detail!r}'
+        )
+
+    @pytest.mark.parametrize(
+        ('verdict', 'claim'),
+        [
+            pytest.param(
+                gate.CrossRepoVerdict(
+                    verdict=gate.BLOCK, owner_project='dark_factory',
+                    signals=(gate.SIGNAL_MARKER,), foreign_paths=(),
+                    reason="metadata.cross_repo is set ('dark_factory')",
+                ),
+                'owned by dark_factory',
+                id='owner-named',
+            ),
+            pytest.param(
+                gate.CrossRepoVerdict(
+                    verdict=gate.BLOCK, owner_project=None,
+                    signals=(gate.SIGNAL_MARKER,), foreign_paths=(),
+                    reason='metadata.cross_repo is set (True)',
+                ),
+                'owner unresolved',
+                id='marker-only',
+            ),
+            pytest.param(
+                gate.CrossRepoVerdict(
+                    verdict=gate.BLOCK, owner_project=None,
+                    signals=(gate.SIGNAL_ALL_FILES_FOREIGN,),
+                    foreign_paths=('/elsewhere/x.py',),
+                    reason='all 1 declared metadata.files entries are absolute paths '
+                           'resolving outside project_root',
+                ),
+                'outside',
+                id='containment-only',
+            ),
+        ],
+    )
+    def test_misfile_verdicts_keep_their_own_misfile_claim(self, verdict, claim: str):
+        """The crash rendering is reserved for the classify_error signal."""
+        text = gate.block_escalation_text('9', verdict)
+
+        assert text.summary.startswith('CROSS_REPO_MISFILE: task 9 '), text.summary
+        assert claim in text.summary, text.summary
+        assert 'Paths judged outside project_root' in text.detail, text.detail
+
+    @pytest.mark.parametrize(
+        'verdict',
+        [pytest.param(_allow_verdict(), id='allow'), pytest.param(_skip_verdict(), id='skip')],
+    )
+    def test_a_non_block_verdict_is_refused(self, verdict):
+        with pytest.raises(ValueError, match='requires a BLOCK verdict'):
+            gate.block_escalation_text('9', verdict)
 
 
 # ---------------------------------------------------------------------------
