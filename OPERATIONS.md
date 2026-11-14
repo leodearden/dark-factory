@@ -875,7 +875,7 @@ per-project chip in the **Tasks** tab renders it. The contract is E-1 of
 `docs/prds/claimant-invariant-detection.md`.
 
 **Blind is never clean.** A `status: blind` root makes no count claim (its
-tier sections are absent), and its `error` names the cause: `tasks.db` not
+tier sections are `null`), and its `error` names the cause: `tasks.db` not
 found, could not be opened read-only, a scan error, or `scanned 0 rows`. A
 curl or HTTP failure means there is no reading at all. Neither is ever a
 zero (detection PRD D-2).
@@ -894,9 +894,16 @@ cd /home/leo/src/dark-factory
 uv run --project fused-memory python scripts/clear_leaked_claimants.py --project-root <root> --json
 ```
 
-The default dry run is read-only and never dials MCP. `--apply` writes
-claimants (`--repair-hygiene` adds the hygiene tier). Exit 3 means nothing
-was read. Run the script directly, never via `python -m`.
+The default dry run is read-only and never dials MCP. `--apply` clears the
+terminal tier's claimants through `set_task_claimant` (`--repair-hygiene`
+adds the hygiene tier). Exit 3 means nothing was read. Run the script
+directly, never via `python -m`.
+
+The census reports the raw terminal tier, ledgered rows included: unlike
+the gauge, it does not separate sanctioned C4-E2 exceptions. Before you
+treat a census terminal row as unledgered, or run `--apply`, check it
+against the gauge's `ledgered` flag or the row's
+`metadata.claimant_exception`.
 
 **The mint-time tripwire.** A `set_task_claimant` write that stamps a
 claimant onto a terminal row logs an ERROR whose discriminator is
@@ -913,9 +920,10 @@ is journal-only and retention is short; the gauge and the census stay
 authoritative.
 
 **The re-arm trigger.** There is deliberately no unattended alarm. Any
-post-ζ observation of a nonzero unledgered terminal tier mandates filing
-ε.2's escalation-grade alarm, whose shape is pre-chosen in detection PRD
-D-7. The recorded downgrade is C4-E7 of
+observation, after ζ's repair has cleared the pre-existing residue, of a
+nonzero unledgered terminal tier mandates that the observer file ε.2, the
+escalation-grade alarm, at observation time. Its shape is pre-chosen in
+detection PRD D-7. The recorded downgrade is C4-E7 of
 `docs/prds/claimant-invariant-enforcement.md`.
 
 ### Useful MCP reads

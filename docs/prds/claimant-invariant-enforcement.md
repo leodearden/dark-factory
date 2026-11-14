@@ -545,12 +545,17 @@ invocation model, the discriminator, the closer analysis, and the re-arm control
   - (ii) The C4-E2 ledger (d3; see C4-E2's 2026-11-14 amendment), plus the
     `claimant_stamped_on_terminal` ERROR tripwire in `SqliteTaskBackend.set_task_claimant`
     (d4, task 4674).
-  - (iii) The ζ census on demand, `scripts/clear_leaked_claimants.py` (task 4625).
+  - (iii) The ζ census on demand, `scripts/clear_leaked_claimants.py` (task 4625). It reports
+    the raw C4-E1 terminal tier with ledgered rows included: `classify_tier` applies
+    `violates_terminal_claimant_invariant` alone, so the ledger layer of detection PRD D-5 reached
+    the gauge but not the census. Before reading a census terminal row as unledgered, or before `--apply`, check
+    it against the gauge's `ledgered` flag or the row's `metadata.claimant_exception`.
   - (iv) The watcher-rotation consumption step in both watcher skills' Main Loop (d2, landed via
     task 4894), whose single statement is `skills/_shared/reading-the-invariants-gauge.md`.
-- **Named re-arm trigger.** Any post-ζ observation of a nonzero *unledgered* terminal tier — via
-  gauge, census or watcher rotation — mandates building the escalation-grade alarm ε.2. The
-  observer files it at observation time.
+- **Named re-arm trigger.** Any observation, after ζ's repair has cleared the pre-existing
+  residue, of a nonzero *unledgered* terminal tier — via gauge, census cross-checked as in (iii),
+  or watcher rotation — mandates that the observer file ε.2, the escalation-grade alarm, at
+  observation time.
 - **ε.2's shape is pre-chosen** in detection PRD D-7: a deterministic-task record class, a
   deny-listed category, `root_cause` dedup, and resolution on positive evidence only.
 - **Never alarmable:** hygiene-tier rows and ledgered rows.
