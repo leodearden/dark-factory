@@ -9,7 +9,7 @@ reports breaches.  Contract: plans/review-all-s13-recon-sweeps-flag-identity-and
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Generic, Protocol, TypeVar
@@ -49,6 +49,7 @@ class EntryRecord(Protocol):
 
 
 EntryT = TypeVar('EntryT', bound=EntryRecord)
+KeyT = TypeVar('KeyT', bound=Hashable)
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,36 @@ def _derive_keys(
     return FindingKeys(signature, desc_hash, cited_task, derived_signature)
 
 
+class _KeyMap(dict[KeyT, str]):
+    """One kind of dedup key, mapped to the finding_id that owns it."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+
+
+@dataclass(frozen=True)
+class _KeySlot(Generic[KeyT]):
+    """One of a finding's keys, the map it lives in, and whether the finding
+    must own it.  A live finding need not own its derived signature: that key
+    is projectless, so it has one owner per run and the first registrant wins."""
+
+    index: _KeyMap[KeyT]
+    key: KeyT | None
+    required: bool
+
+    def names(self, finding_id: str) -> bool:
+        return self.key is not None and self.index.get(self.key) == finding_id
+
+    def claim(self, finding_id: str) -> None:
+        if self.key is not None:
+            self.index.setdefault(self.key, finding_id)
+
+    def release(self, finding_id: str) -> None:
+        if self.key is not None and self.index.get(self.key) == finding_id:
+            del self.index[self.key]
+
+
 class RunFindingIndex(Generic[EntryT]):
     """The session (which stages are registered, resident and active) and the
     dedup maps of one run.  Keys have one owner each: the first registrant wins
@@ -122,9 +153,9 @@ class RunFindingIndex(Generic[EntryT]):
         self._resident: dict[str, EntryT] = {}
         self._resident_view: Mapping[str, EntryT] = MappingProxyType(self._resident)
         self._active_stage: str | None = None
-        self._by_signature: dict[Signature, str] = {}
-        self._by_desc: dict[str, str] = {}
-        self._by_cited_task: dict[str, str] = {}
+        self._by_signature: _KeyMap[Signature] = _KeyMap('signature')
+        self._by_desc: _KeyMap[str] = _KeyMap('desc')
+        self._by_cited_task: _KeyMap[str] = _KeyMap('cited-task')
         self._owners: dict[str, EntryT] = {}
 
     @property
@@ -225,9 +256,8 @@ class RunFindingIndex(Generic[EntryT]):
                 f'to stage {entry.stage!r}; stage {owner.stage!r} owns it'
             )
         keys = self.keys_for(finding)
-        for _name, index, key, _required in self._keys_by_map(keys):
-            if key is not None:
-                index.setdefault(key, finding.finding_id)
+        for slot in self._slots(keys):
+            slot.claim(finding.finding_id)
         return keys
 
     def register_citation(self, finding: FindingRecord) -> None:
@@ -249,9 +279,8 @@ class RunFindingIndex(Generic[EntryT]):
     def unregister(self, finding: FindingRecord) -> None:
         if finding.finding_id not in self._owners:
             return
-        for _name, index, key, _required in self._keys_by_map(self.keys_for(finding)):
-            if key is not None and index.get(key) == finding.finding_id:
-                del index[key]
+        for slot in self._slots(self.keys_for(finding)):
+            slot.release(finding.finding_id)
         del self._owners[finding.finding_id]
 
     def _require_held(self, finding: FindingRecord, entry: EntryT, operation: str) -> None:
@@ -261,24 +290,17 @@ class RunFindingIndex(Generic[EntryT]):
                 f'which stage {entry.stage!r} does not hold'
             )
 
-    def _named_maps(self) -> tuple[tuple[str, dict[Any, str]], ...]:
-        return (
-            ('signature', self._by_signature),
-            ('desc', self._by_desc),
-            ('cited-task', self._by_cited_task),
-        )
+    def _maps(self) -> tuple[_KeyMap[Signature], _KeyMap[str], _KeyMap[str]]:
+        return (self._by_signature, self._by_desc, self._by_cited_task)
 
-    def _keys_by_map(self, keys: FindingKeys) -> tuple[tuple[str, dict[Any, str], Any, bool], ...]:
-        """``(name, map, key, required)`` per kind of *keys*.
-
-        A live finding need not own its derived signature: that key is
-        projectless, so it has one owner per run and the first registrant wins.
-        """
+    def _slots(
+        self, keys: FindingKeys
+    ) -> tuple[_KeySlot[Signature], _KeySlot[Signature], _KeySlot[str], _KeySlot[str]]:
         return (
-            ('signature', self._by_signature, keys.signature, True),
-            ('derived signature', self._by_signature, keys.derived_signature, False),
-            ('desc', self._by_desc, keys.desc_hash, True),
-            ('cited-task', self._by_cited_task, keys.cited_task, True),
+            _KeySlot(self._by_signature, keys.signature, required=True),
+            _KeySlot(self._by_signature, keys.derived_signature, required=False),
+            _KeySlot(self._by_desc, keys.desc_hash, required=True),
+            _KeySlot(self._by_cited_task, keys.cited_task, required=True),
         )
 
     # -- lookups ----------------------------------------------------------
@@ -328,7 +350,7 @@ class RunFindingIndex(Generic[EntryT]):
         for fid in held:
             self._owners.setdefault(fid, entry)
 
-        def adopt(index: dict[Any, str], persisted_keys: Mapping[Any, str]) -> None:
+        def adopt(index: _KeyMap[KeyT], persisted_keys: Mapping[KeyT, str]) -> None:
             for key, fid in persisted_keys.items():
                 if fid in held:
                     index.setdefault(key, fid)
@@ -378,16 +400,15 @@ class RunFindingIndex(Generic[EntryT]):
                 )
 
     def _key_breaches(self, derived: Mapping[str, FindingKeys]) -> Iterator[str]:
-        for name, index in self._named_maps():
+        for index in self._maps():
             for key, fid in index.items():
                 if fid not in derived:
-                    yield f'{name} key {key!r} names {fid!r}, which no reachable entry holds'
+                    yield f'{index.name} key {key!r} names {fid!r}, which no reachable entry holds'
                 elif not any(
-                    owned is index and owned_key == key
-                    for _n, owned, owned_key, _r in self._keys_by_map(derived[fid])
+                    slot.index is index and slot.key == key for slot in self._slots(derived[fid])
                 ):
-                    yield f'stale {name} key {key!r} names {fid!r}'
+                    yield f'stale {index.name} key {key!r} names {fid!r}'
         for fid, keys in derived.items():
-            for name, index, key, required in self._keys_by_map(keys):
-                if required and key is not None and index.get(key) != fid:
-                    yield f'{name} key {key!r} of finding {fid!r} is missing'
+            for slot in self._slots(keys):
+                if slot.required and slot.key is not None and not slot.names(fid):
+                    yield f'{slot.index.name} key {slot.key!r} of finding {fid!r} is missing'
