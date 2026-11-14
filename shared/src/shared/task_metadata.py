@@ -245,7 +245,7 @@ def script_root_kind_conflict(script_root: str, kind: str) -> str | None:
 
     The single statement of the predicate-only rule for factory-rooted scripts,
     called by ``BeforeDone``, the fused-memory submit guard and
-    ``shared.before_done_paths.resolve_script_base``.
+    ``shared.before_done_paths.resolve_before_done_paths``.
     """
     if script_root == 'factory' and kind != 'predicate':
         return (

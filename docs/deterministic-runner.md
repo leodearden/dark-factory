@@ -284,7 +284,8 @@ Phase γ **predicate** sub-path (`before_done['kind'] == 'predicate'`):
   `orchestrator/src/orchestrator/before_done_script.py::ScriptTimeout` class
   docstring for the full rationale.
 - Outer-guard timeout, an unresolvable factory script root
-  (`FactoryRootUnresolved`, task 6386) or an unexpected `run_fn` error
+  (`shared/src/shared/before_done_paths.py::FactoryRootUnresolved`, task
+  6386) or an unexpected `run_fn` error
   (likewise no verdict — an infra fault, not a check failure): file
   born-at-L2 `infra_issue` and block — again NO `gate_escalated_at`
   stamp, so the check is simply re-attempted on the next dispatch.  The

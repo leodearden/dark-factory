@@ -4,9 +4,9 @@ Contract: ``docs/task-authoring.md`` §5. Lives in ``shared`` so the run-time
 executor (``orchestrator/src/orchestrator/deterministic_runner.py``) and the
 submit-time check
 (``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
-read one definition: both take the script path from
-``resolve_before_done_paths``, with the base chosen by ``resolve_script_base``,
-and both refuse a non-string cwd through ``before_done_cwd``.
+read one definition: each makes one call to ``resolve_before_done_paths`` and
+maps the ``BeforeDonePathsRefused`` subclasses it raises to its own
+diagnostics.
 """
 
 from __future__ import annotations
@@ -22,10 +22,11 @@ from shared.task_metadata import script_root_kind_conflict
 @dataclass(frozen=True)
 class BeforeDonePaths:
     script: Path
+    script_base: Path
     cwd: Path
 
     def __post_init__(self) -> None:
-        for field in ('script', 'cwd'):
+        for field in ('script', 'script_base', 'cwd'):
             value = getattr(self, field)
             if not value.is_absolute():
                 raise ValueError(
@@ -33,24 +34,37 @@ class BeforeDonePaths:
                 )
 
 
-class ScriptRootRefused(ValueError):
+class BeforeDonePathsRefused(ValueError):
+    """before_done names no script location this process can resolve."""
+
+
+class ScriptRootRefused(BeforeDonePathsRefused):
     """``before_done.script_root`` names no base this record may use: an unknown
     value, or ``'factory'`` on a non-predicate."""
 
 
-def resolve_script_base(
+class CwdRefused(BeforeDonePathsRefused):
+    """``before_done.cwd`` is present but not a string path."""
+
+
+class FactoryRootUnresolved(BeforeDonePathsRefused):
+    """``before_done.script_root='factory'`` but the resolver found no
+    dark-factory root. The message names no process; each caller adds its own
+    remedy."""
+
+    def __init__(self, script: str) -> None:
+        self.script = script
+        super().__init__(
+            "before_done.script_root='factory' but the dark-factory root could not "
+            f'be resolved, so script {script!r} cannot be located.',
+        )
+
+
+def _script_base(
     before_done: Mapping[str, Any],
     project_root: Path,
     factory_root_resolver: Callable[[], Path | None],
-) -> Path | None:
-    """The directory ``before_done['script']`` resolves under.
-
-    ``project_root`` for ``script_root='project'`` (the default). For
-    ``'factory'``, whatever ``factory_root_resolver()`` returns: the
-    dark-factory root, or ``None`` when it finds none. The resolver runs only
-    for ``'factory'``, and only once ``script_root_kind_conflict`` admits the
-    pairing; otherwise this raises ``ScriptRootRefused``.
-    """
+) -> Path:
     script_root = before_done.get('script_root', 'project')
     if script_root == 'project':
         return project_root
@@ -61,19 +75,13 @@ def resolve_script_base(
     conflict = script_root_kind_conflict(script_root, before_done.get('kind') or 'deploy')
     if conflict is not None:
         raise ScriptRootRefused(f'before_done.{conflict}')
-    return factory_root_resolver()
+    factory_root = factory_root_resolver()
+    if factory_root is None:
+        raise FactoryRootUnresolved(before_done['script'])
+    return factory_root
 
 
-class CwdRefused(ValueError):
-    """``before_done.cwd`` is present but not a string path."""
-
-
-def before_done_cwd(before_done: Mapping[str, Any]) -> str | None:
-    """``before_done['cwd']``: a string path, or ``None`` when absent.
-
-    The single statement of the cwd type rule, enforced by the submit guard and
-    by ``resolve_before_done_paths``; any other value raises ``CwdRefused``.
-    """
+def _before_done_cwd(before_done: Mapping[str, Any]) -> str | None:
     cwd = before_done.get('cwd')
     if cwd is not None and not isinstance(cwd, str):
         raise CwdRefused(
@@ -83,14 +91,27 @@ def before_done_cwd(before_done: Mapping[str, Any]) -> str | None:
 
 
 def resolve_before_done_paths(
-    before_done: Mapping[str, Any], project_root: Path, *, script_base: Path | None = None,
+    before_done: Mapping[str, Any],
+    project_root: Path,
+    factory_root_resolver: Callable[[], Path | None],
 ) -> BeforeDonePaths:
-    """``script`` joins ``script_base`` (``project_root`` when omitted) even when
-    ``cwd`` is set: the file the submit guard validated is the file that runs.
-    ``cwd`` always joins ``project_root``."""
-    base = script_base if script_base is not None else project_root
-    cwd = before_done_cwd(before_done)
+    """The script, its base and the cwd a ``before_done`` record names.
+
+    The base is ``project_root`` for ``script_root='project'`` (the default)
+    and ``factory_root_resolver()`` for ``'factory'``; the resolver runs only
+    once ``script_root_kind_conflict`` admits that pairing. ``script`` joins
+    the base even when ``cwd`` is set, so the file the submit guard validated
+    is the file that runs; ``cwd`` always joins ``project_root``.
+
+    Raises ``BeforeDonePathsRefused``, checking in this order:
+    ``CwdRefused`` for a non-string cwd, ``ScriptRootRefused`` for a base the
+    record may not use, ``FactoryRootUnresolved`` when the resolver finds no
+    dark-factory root.
+    """
+    cwd = _before_done_cwd(before_done)
+    base = _script_base(before_done, project_root, factory_root_resolver)
     return BeforeDonePaths(
         script=base / before_done['script'],
+        script_base=base,
         cwd=project_root / cwd if cwd else project_root,
     )

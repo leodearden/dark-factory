@@ -82,10 +82,9 @@ from typing import Any, assert_never, get_args
 from pydantic import ValidationError
 from shared.before_done_paths import (
     CwdRefused,
+    FactoryRootUnresolved,
     ScriptRootRefused,
-    before_done_cwd,
     resolve_before_done_paths,
-    resolve_script_base,
 )
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
@@ -641,7 +640,9 @@ def _validate_before_done(
         )
 
     try:
-        before_done_cwd(before_done)
+        paths = resolve_before_done_paths(
+            before_done, Path(project_root).resolve(), factory_root_resolver,
+        )
     except CwdRefused as exc:
         return _validation_error(
             str(exc),
@@ -650,9 +651,6 @@ def _validate_before_done(
                 'directory path; a relative cwd joins project_root.'
             ),
         )
-
-    try:
-        base = resolve_script_base(before_done, Path(project_root), factory_root_resolver)
     except ScriptRootRefused as exc:
         return _validation_error(
             str(exc),
@@ -661,21 +659,17 @@ def _validate_before_done(
                 "script_root='factory' together with kind='predicate'."
             ),
         )
-    if base is None:
+    except FactoryRootUnresolved as exc:
         return _validation_error(
-            "before_done.script_root='factory' but the dark-factory root could not "
-            "be resolved, so the script cannot be located.",
+            str(exc),
             hint=(
                 f'Set {DARK_FACTORY_ROOT_ENV} for the fused-memory process to the '
                 "dark-factory checkout, or use script_root='project'."
             ),
         )
     where = _SCRIPT_BASE_NAMES[before_done.get('script_root', 'project')]
-    script_base = base.resolve()
-    script_path = resolve_before_done_paths(
-        before_done, Path(project_root).resolve(), script_base=script_base,
-    ).script
-    err = _validate_script_under(script, script_path, script_base, where)
+    script_base = paths.script_base.resolve()
+    err = _validate_script_under(script, paths.script, script_base, where)
     if err is not None:
         return err
 

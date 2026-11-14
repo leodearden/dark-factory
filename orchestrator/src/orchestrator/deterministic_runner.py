@@ -31,8 +31,8 @@ from typing import TYPE_CHECKING
 from escalation.models import Escalation, ReviewDueState
 from shared.before_done_paths import (
     BeforeDonePaths,
+    FactoryRootUnresolved,
     resolve_before_done_paths,
-    resolve_script_base,
 )
 from shared.milestone_rearm import rearmed_milestone
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
@@ -314,23 +314,6 @@ def _configured_project_root(scheduler) -> Path | None:
         if text and text != 'None':
             return Path(text)
     return None
-
-
-class FactoryRootUnresolved(RuntimeError):
-    """before_done.script_root='factory' but ``resolve_dark_factory_root()``
-    found no dark-factory checkout.
-
-    ``_run_predicate`` files it through a dedicated no-verdict arm, never as a
-    verdict.
-    """
-
-    def __init__(self, script: str) -> None:
-        super().__init__(
-            f"before_done.script_root='factory' but the dark-factory tooling root is "
-            f'unresolvable, so script {script!r} cannot be located; set '
-            f'{DARK_FACTORY_ROOT_ENV} for the orchestrator process to the '
-            f'dark-factory checkout'
-        )
 
 
 def _snippet_project_root(scheduler) -> str:
@@ -864,7 +847,8 @@ class DeterministicRunner:
             the dark-factory root a ``before_done.script_root='factory'``
             script resolves under.  Defaults to
             ``shared.repo_paths.resolve_dark_factory_root``; consulted only for
-            such scripts.  ``None`` raises ``FactoryRootUnresolved``.
+            such scripts.  ``None`` raises
+            ``shared.before_done_paths.FactoryRootUnresolved``.
         predicate_recheck_stall_cap: How many consecutive exit-75 "not yet"
             verdicts a re-arming predicate may return before the runner files
             ``milestone_check_stalled`` (PRD completion-driven-triggers C1).
@@ -936,18 +920,9 @@ class DeterministicRunner:
                 'resolving before_done paths against the process cwd %s',
                 root,
             )
-        project_root = root.resolve()
         return resolve_before_done_paths(
-            before_done,
-            project_root,
-            script_base=self._script_base(before_done, project_root),
+            before_done, root.resolve(), self._factory_root_resolver,
         )
-
-    def _script_base(self, before_done: dict, project_root: Path) -> Path:
-        base = resolve_script_base(before_done, project_root, self._factory_root_resolver)
-        if base is None:
-            raise FactoryRootUnresolved(before_done['script'])
-        return base
 
     async def _default_schedule_detached_restart(
         self,
@@ -2239,7 +2214,8 @@ class DeterministicRunner:
           (next bullet but one): its non-carrier text asserts "deliberately not
           milestone_check_failed", which would contradict a carrier's own
           category.
-        - Outer-guard timeout / ``FactoryRootUnresolved`` (task 6386) /
+        - Outer-guard timeout /
+          ``shared.before_done_paths.FactoryRootUnresolved`` (task 6386) /
           unexpected error -> likewise an INFRA fault (no verdict was
           produced): born-at-L2 escalation + blocked (re-attempted on the next
           dispatch, no ``gate_escalated_at`` stamp).  The outer
@@ -2388,7 +2364,12 @@ class DeterministicRunner:
             return await self._file_infra_issue_and_block(
                 task_id,
                 summary='Predicate script root unresolvable',
-                detail='\n'.join([description, str(exc)]),
+                detail='\n'.join([
+                    description,
+                    str(exc),
+                    f'Set {DARK_FACTORY_ROOT_ENV} for the orchestrator process to the '
+                    'dark-factory checkout.',
+                ]),
                 category=no_verdict_category,
             )
         except Exception as exc:
