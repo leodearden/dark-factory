@@ -3237,6 +3237,7 @@ missing `LoadState` detector).
 | 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
 | 05:30 | Cross-project return brief (Fable prepare + render) | `return-brief.timer` |
 | 06:00 | INV-12 owner sweep | `exception-owner-sweep.timer` |
+| Sun 06:30 (weekly) | Duplicate-cluster report (detector per category, report + regrowth diff; files nothing) | `fused-memory-duplicate-audit.timer` |
 
 All timers carry `Persistent=true` (a night missed to a sleeping laptop is
 caught up on next boot/login rather than silently skipped) and
@@ -3247,7 +3248,9 @@ for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-02
 02:15 one; the sections below for the 02:30, 03:00, 03:15, 03:45, 04:00 and 05:00 ones,
 [Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one, and
 [The owner sweep timer (06:00) and its age](#the-owner-sweep-timer-0600-and-its-age) in §12a
-for the 06:00 one.
+for the 06:00 one, and
+[Weekly duplicate-cluster report (Sun 06:30)](#weekly-duplicate-cluster-report-sun-0630)
+for the weekly one.
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
 trickle health probe (see below). The nightly reify closure-staleness sweep and
@@ -4278,6 +4281,148 @@ so list dark-factory too.
 **The apply half is agent work, not timer work.** Leo's answers are applied
 by a watcher session, following `skills/escalation-watcher/SKILL.md`,
 "Sitting preparer (`prepare-sitting` mode)".
+
+### Weekly duplicate-cluster report (Sun 06:30)
+
+**What it does.** Measures, once a week, how fast duplicate Mem0 clusters
+regrow. It files nothing. For each project in
+`fused-memory/config/duplicate-audit.yaml`, the report script runs the
+detector (`fused-memory/scripts/audit_duplicate_memories.py`) once per
+category as a read-only subprocess, with `--no-metrics` and never `--apply`.
+It saves each stdout plan, builds one report from them, and diffs that report
+against the project's previous one. Because of `--no-metrics`, the e6 metric
+series keeps the memory-eval runner's `e6-corpus-health` producer as its only
+writer. Runs are long. In the 2026-08-11 T0 runs one project took about 75 to
+90 minutes, so `detector_timeout_secs` bounds one category run, not the job.
+
+| File | Role |
+|---|---|
+| `scripts/fused-memory-duplicate-audit.sh` | Wrapper: service env, then `uv run --no-sync` of the report script |
+| `scripts/fused-memory-duplicate-audit.service` | `Type=oneshot` around the wrapper |
+| `scripts/fused-memory-duplicate-audit.timer` | `OnCalendar=Sun *-*-* 06:30:00` |
+| `scripts/install-duplicate-audit-timer.sh` | Installer |
+| `fused-memory/scripts/duplicate_cluster_report.py` | The report: detector runs, cluster inventory, regrowth diff |
+| `fused-memory/config/duplicate-audit.yaml` | Projects, categories, `scan_limit`, timeouts, cadence and the recall caveat. `cadence.on_calendar` must equal the timer's `OnCalendar`, and a test pins that |
+
+**Artifacts** live under
+`fused-memory/data/duplicate-cluster-reports/<project>/`. That directory is
+gitignored, like the rest of `fused-memory/data/`, so it exists only in the
+checkout that ran the job:
+
+- `plan-<STAMP>-<category>.json`: the detector's stdout plan for one
+  category, verbatim;
+- `plan-<STAMP>-<category>.stderr.log`: that category's detector stderr,
+  written as the detector runs and kept for a failed category too. `tail -f`
+  it to follow a run in progress: the journal gets a category's stderr only
+  once that category finishes;
+- `report-<STAMP>.json`: the cluster inventory, child rankings, scan
+  coverage, the regrowth diff and `failed_categories`;
+- `summary-<STAMP>.txt`: the readable digest, which is also printed to the
+  journal.
+
+**What the report is for.** It measures regrowth. Re-emissions are
+near-verbatim, and the detector catches those. The report is
+`authoritative: false`. **Gate filing from it is blocked**: the detector's
+paraphrase recall is far below what enumerating a gate's members needs.
+Task 4916 owns that wiring and the precondition it waits on. The measured
+numbers are `recall_caveat` in `duplicate-audit.yaml`, and every report
+carries a copy. Read them there.
+
+**Reading the diff.** Each cluster carries a `cluster_key` and a `lineage`
+status: `baseline`, `new`, `unchanged`, `grew`, `shrank` or `split`. A key is
+inherited by member overlap within one category. Members a cluster gained
+are split by `created_at` against the previous run stamp. `re_emitted`
+members were written since that run, and that is the regrowth. `preexisting`
+members are older: newly detected, or moved in from another cluster. That is
+not regrowth. `unknown` members have no `created_at`. A naive `created_at` is
+read as UTC. `rate_per_day` is re-emitted members per elapsed day.
+`regrowth.previous_overdue` is true when the previous report is more than
+twice `cadence.resweep_interval_days` old.
+
+`regrowth.by_category` gives each category its own totals. The headline
+totals leave out `regrowth.excluded_categories`, the categories the previous
+report did not sweep. Every cluster there would otherwise count as `new`, for
+example in the week after that category's detector run failed.
+
+Each entry in the report's `categories` carries `incomparable_reasons`. An
+empty list means this run and the previous one compare like with like for
+that category. A reason discloses a difference; the diff is still computed.
+
+| Reason | Meaning |
+|---|---|
+| `previous_missing_category` | The previous report did not sweep this category. Every category of a project's first report has it |
+| `coverage_unknown` | One of the two runs recorded no scan coverage. This holds for every category of the first diff against the T0 seed, whose plans predate scan coverage |
+| `scan_truncated` | A run hit `scan_limit`, so its counts are floors |
+| `scan_limit_changed` | The two runs scanned at different limits |
+| `lexical_threshold_changed` / `ann_cutoff_changed` | The detector clustered at a different cutoff |
+
+`observations_and_summaries` held more than 5000 records in both projects at
+the 2026-08-11 T0 run, so at `scan_limit: 5000` its cluster counts are floors
+and it reports `scan_truncated`. Compare its deltas only between runs at the same limit.
+
+Each `child_rankings` row names its `category`. Its `previous_count` and
+`delta` are null unless the previous report counted children in that
+category, that is, unless its `categories` entry has `child_counts_known:
+true`. A category that failed or was absent last run is excluded, and so is
+one swept from a T0 legacy plan. A null means unknown, not zero. A row's
+category ties it to that category's `incomparable_reasons`.
+
+**Exit status.**
+
+- 0: every report was written, and every detector run succeeded.
+- 1: a partial report or a failed write. A detector run could not start,
+  exited non-zero, timed out, printed non-JSON, or its stderr log or plan
+  could not be written. The report is still written, and it lists that
+  category under `failed_categories` with a stderr tail. Its `error_type` is
+  one of `stderr_log_failed`, `spawn_failed`, `timed_out`, `detector_exit`,
+  `bad_plan_output` or `plan_write_failed`, and `exception_type` names the OS
+  error behind a log, spawn or plan-write failure. Exit 1 also covers a
+  report that could not be written. It also covers a previous report that
+  cannot be read as a report: that is checked before the project's sweep, so
+  that project is skipped with an `ABORT:` line naming the file, and the
+  other projects still run.
+- 2: bad input or config, such as an invalid `duplicate-audit.yaml`, a
+  malformed `--run-stamp`, an unconfigured `--project-id`, or a `--plan`
+  file that is missing or not JSON.
+
+Nothing is filed on any status, so the unit state and the journal are the
+only signal.
+
+```bash
+journalctl --user -u fused-memory-duplicate-audit.service -n 100
+systemctl --user list-timers fused-memory-duplicate-audit.timer
+```
+
+**One-time T0 seeding.** Seed each project's history with the 2026-08-11
+baseline before the first scheduled run, so that first weekly report diffs
+against it. `--plan` mode builds a report from saved plans with no store
+access. The baseline plans exist only in the main checkout (gitignored):
+
+```bash
+B=/home/leo/src/dark-factory/fused-memory/data/memory-evals/duplicate-cluster-baseline-20260811
+for p in dark_factory reify; do
+  /home/leo/src/dark-factory/scripts/fused-memory-duplicate-audit.sh \
+    --project-id "$p" --run-stamp 20260811T120000Z \
+    --plan "$B/audit_${p}_procedural_knowledge_20260811.stdout.json" \
+    --plan "$B/audit_${p}_preferences_and_norms_20260811.stdout.json" \
+    --plan "$B/audit_${p}_observations_and_summaries_20260811.stdout.json"
+done
+```
+
+Each project then has one `report-20260811T120000Z.json`. The dark_factory
+one lists 145 clusters, the count measured on 2026-08-11.
+
+**Install.** The installer starts nothing, so the first run happens on
+schedule, after the seed:
+
+```bash
+scripts/install-duplicate-audit-timer.sh
+```
+
+The ladder row above is a host claim. An agent cannot run the installer (see
+"The nightly ladder"), so the job is installed only once
+`systemctl --user list-timers --all` lists
+`fused-memory-duplicate-audit.timer`.
 
 ---
 

@@ -1,0 +1,1392 @@
+"""The weekly duplicate-cluster report (task 3136).
+
+``scripts/duplicate_cluster_report.py`` runs the detector once per (project,
+category), builds a report from the detector's stdout plans and diffs it
+against that project's previous report. These tests drive its public
+functions and its CLI. Plans come from the REAL detector's
+``build_sweep_plan`` over synthetic records, loaded by path, so the
+detector-to-report contract is exercised end to end rather than restated in a
+fixture that could drift from it.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import re
+import sys
+from pathlib import Path
+
+import pydantic
+import pytest
+import yaml
+from _fm_helpers import load_script_module
+
+_FM_ROOT = Path(__file__).resolve().parent.parent
+REPORT_SCRIPT = _FM_ROOT / 'scripts' / 'duplicate_cluster_report.py'
+DETECTOR_SCRIPT = _FM_ROOT / 'scripts' / 'audit_duplicate_memories.py'
+COMMITTED_CONFIG = _FM_ROOT / 'config' / 'duplicate-audit.yaml'
+
+report = load_script_module(REPORT_SCRIPT, mod_name='duplicate_cluster_report')
+detector = load_script_module(DETECTOR_SCRIPT, mod_name='audit_duplicate_memories')
+
+
+def _committed_yaml() -> dict:
+    return yaml.safe_load(COMMITTED_CONFIG.read_text(encoding='utf-8'))
+
+
+def _write_yaml(tmp_path: Path, data: dict, name: str = 'duplicate-audit.yaml') -> Path:
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding='utf-8')
+    return path
+
+
+class TestCommittedConfig:
+    def test_the_committed_yaml_loads_into_a_frozen_config(self) -> None:
+        config = report.load_config(COMMITTED_CONFIG)
+
+        assert isinstance(config, report.DuplicateAuditConfig)
+        with pytest.raises(pydantic.ValidationError):
+            config.scan_limit = 1
+
+    def test_it_sweeps_both_projects_over_the_detectors_own_categories(self) -> None:
+        config = report.load_config(COMMITTED_CONFIG)
+
+        assert config.projects == ('dark_factory', 'reify')
+        assert config.categories == tuple(detector.ALL_CATEGORIES)
+        assert config.scan_limit > 0
+        assert config.detector_timeout_secs > 0
+
+    def test_cycle_summaries_are_declared_machine_written(self) -> None:
+        assert 'cycle_summary' in report.load_config(COMMITTED_CONFIG).machine_written_kinds
+
+
+def _without(data: dict, key: str) -> dict:
+    return {k: v for k, v in data.items() if k != key}
+
+
+def _with(data: dict, **changes: object) -> dict:
+    return {**data, **changes}
+
+
+def _with_cadence(data: dict, **changes: object) -> dict:
+    return {**data, 'cadence': {**data['cadence'], **changes}}
+
+
+def _with_fitness(data: dict, **changes: object) -> dict:
+    caveat = data['recall_caveat']
+    return {**data, 'recall_caveat': {**caveat, 'fitness': {**caveat['fitness'], **changes}}}
+
+
+_BAD_CONFIGS = {
+    'missing_key': lambda d: _without(d, 'scan_limit'),
+    'unknown_key': lambda d: _with(d, gate_cap=3),
+    'empty_projects': lambda d: _with(d, projects=[]),
+    'duplicate_projects': lambda d: _with(d, projects=['dark_factory', 'dark_factory']),
+    'empty_categories': lambda d: _with(d, categories=[]),
+    'duplicate_categories': lambda d: _with(
+        d, categories=['procedural_knowledge', 'procedural_knowledge'],
+    ),
+    'zero_scan_limit': lambda d: _with(d, scan_limit=0),
+    'zero_detector_timeout': lambda d: _with(d, detector_timeout_secs=0),
+    'zero_resweep_interval': lambda d: _with_cadence(d, resweep_interval_days=0),
+    'fitness_outside_its_vocabulary': lambda d: _with_fitness(d, gate_filing='maybe'),
+}
+
+
+class TestConfigRejections:
+    @pytest.mark.parametrize('case', sorted(_BAD_CONFIGS))
+    def test_an_invalid_declaration_names_the_file(self, tmp_path: Path, case: str) -> None:
+        path = _write_yaml(tmp_path, _BAD_CONFIGS[case](_committed_yaml()))
+
+        with pytest.raises(report.DuplicateAuditConfigError, match=str(path)):
+            report.load_config(path)
+
+    def test_an_unreadable_path_names_the_file(self, tmp_path: Path) -> None:
+        path = tmp_path / 'absent.yaml'
+
+        with pytest.raises(report.DuplicateAuditConfigError, match=str(path)):
+            report.load_config(path)
+
+    def test_malformed_yaml_names_the_file(self, tmp_path: Path) -> None:
+        path = tmp_path / 'broken.yaml'
+        path.write_text('projects: [dark_factory\n', encoding='utf-8')
+
+        with pytest.raises(report.DuplicateAuditConfigError, match=str(path)):
+            report.load_config(path)
+
+
+# ---------------------------------------------------------------------------
+# Plans: produced by the real detector over synthetic near-verbatim records
+# ---------------------------------------------------------------------------
+
+_PK = 'procedural_knowledge'
+_PN = 'preferences_and_norms'
+_OS = 'observations_and_summaries'
+_STAMP = '20261115T063000Z'
+
+# Two sentence families. Rewrites within a family are near-verbatim (pairwise
+# SequenceMatcher ratio >= 0.95), across families about 0.23, so the lexical
+# path at its production threshold clusters each family and never the two.
+_FAMILIES = {
+    'venv': (
+        "Each git worktree keeps its own local virtualenv, so a uv sync inside "
+        "the worktree never touches the main checkout's environment{}."
+    ),
+    'stash': (
+        "Never run git stash in any dark-factory checkout because the stash ref "
+        "is shared by every worktree and the merge worker{}."
+    ),
+}
+_SUFFIXES = ('', ' at all', ' ever', ' today', ' here', ' again', ' now', ' too', ' still')
+
+
+def _rec(record_id: str, family: str, rewrite: int, created_at: str | None = None,
+         *, category: str = _PK, **metadata: object) -> dict:
+    return {
+        'id': record_id,
+        'content': _FAMILIES[family].format(_SUFFIXES[rewrite]),
+        'created_at': created_at,
+        'category': category,
+        'metadata': dict(metadata),
+    }
+
+
+def _plan(records: list[dict], category: str = _PK, *, scanned: int | None = None,
+          truncated: int = 0, scan_limit: int = 5000, threshold: float = 0.85,
+          **kwargs: object) -> dict:
+    coverage = {category: {
+        'scanned': len(records) if scanned is None else scanned,
+        'truncated': truncated,
+        'scan_limit': scan_limit,
+    }}
+    return detector.build_sweep_plan(
+        records, threshold, categories=(category,), scan_coverage=coverage, **kwargs,
+    )
+
+
+def _legacy_plan(category: str, groups: list[dict], *, ann_cutoff: float = 0.8868,
+                 threshold: float = 0.85, carved: list[dict] | None = None) -> dict:
+    """The T0 baseline's shape: no members, scan_coverage, child_counts or retained_carveout."""
+    return {
+        'near_duplicate_groups': [
+            {
+                'member_ids': list(g['member_ids']),
+                'survivor_id': g['member_ids'][0],
+                'category': category,
+                'found_by': ['ann'],
+                'ann_max_score': 0.91,
+                'lexical_max_ratio': 0.4,
+                'delete_candidate_ids': list(g['member_ids'][1:]),
+            }
+            for g in groups
+        ],
+        'threshold': threshold,
+        'ann_threshold_by_category': {category: ann_cutoff},
+        'topic_carveout_groups': carved or [],
+    }
+
+
+@pytest.fixture(scope='module')
+def config():
+    return report.load_config(COMMITTED_CONFIG)
+
+
+def _build(config, plans, previous=None, *, stamp=_STAMP, project_id='dark_factory'):
+    return report.build_report(project_id, stamp, plans, config=config, previous=previous)
+
+
+def _project(entry: dict, keys: dict | set) -> dict:
+    """*entry* cut down to *keys*, so an inventory assertion ignores the diff's fields."""
+    return {k: entry[k] for k in keys if k in entry}
+
+
+def _cluster_by_member(rep: dict, member_id: str) -> dict:
+    (cluster,) = [c for c in rep['clusters'] if member_id in c['member_ids']]
+    return cluster
+
+
+class TestReportIdentity:
+    def test_the_top_level_identifies_the_run_and_disclaims_authority(self, config) -> None:
+        rep = _build(config, [('plan-pk.json', _plan([]))])
+
+        assert rep['schema_version'] == 1
+        assert rep['project_id'] == 'dark_factory'
+        assert rep['run_stamp'] == _STAMP
+        assert rep['detector'] == 'fused-memory/scripts/audit_duplicate_memories.py'
+        assert rep['authoritative'] is False
+        assert rep['recall_caveat'] == config.recall_caveat.model_dump(mode='json')
+        assert rep['cadence'] == config.cadence.model_dump(mode='json')
+
+
+class TestClusterInventory:
+    def test_every_group_of_every_plan_becomes_one_cluster_entry(self, config) -> None:
+        pk = _plan([
+            _rec('a1', 'venv', 0, '2026-01-01T00:00:00+00:00'),
+            _rec('a2', 'venv', 1, '2026-01-02T00:00:00+00:00'),
+            _rec('b1', 'stash', 0, '2026-01-01T00:00:00+00:00'),
+            _rec('b2', 'stash', 1, '2026-01-02T00:00:00+00:00'),
+            _rec('b3', 'stash', 2, '2026-01-03T00:00:00+00:00'),
+        ])
+        pn = _plan([
+            _rec('c1', 'venv', 0, '2026-01-01T00:00:00+00:00', category=_PN),
+            _rec('c2', 'venv', 1, '2026-01-02T00:00:00+00:00', category=_PN),
+        ], _PN)
+
+        rep = _build(config, [('pk.json', pk), ('pn.json', pn)])
+
+        groups = pk['near_duplicate_groups'] + pn['near_duplicate_groups']
+        assert len(rep['clusters']) == len(groups) == 3
+        for group in groups:
+            cluster = _cluster_by_member(rep, group['member_ids'][0])
+            assert cluster['category'] == group['category']
+            assert cluster['size'] == len(group['member_ids'])
+            for key in ('member_ids', 'survivor_id', 'found_by', 'ann_max_score',
+                        'lexical_max_ratio', 'delete_candidate_ids', 'retained_members'):
+                assert cluster[key] == group[key], key
+
+    def test_member_facts_give_topics_canonical_presence_and_machine_authorship(
+        self, config,
+    ) -> None:
+        pk = _plan([
+            _rec('a1', 'venv', 0, '2026-01-01T00:00:00+00:00', topic='venv', canonical=True),
+            _rec('a2', 'venv', 1, '2026-01-02T00:00:00+00:00', topic='uv'),
+            _rec('a3', 'venv', 2, '2026-01-03T00:00:00+00:00', topic='venv'),
+            _rec('b1', 'stash', 0, '2026-01-01T00:00:00+00:00', kind='cycle_summary'),
+            _rec('b2', 'stash', 1, '2026-01-02T00:00:00+00:00', kind='cycle_summary'),
+        ])
+
+        rep = _build(config, [('pk.json', pk)])
+
+        stamped = _cluster_by_member(rep, 'a1')
+        assert stamped['topics'] == ['uv', 'venv']
+        assert stamped['canonical_present'] is True
+        assert stamped['machine_written'] is False
+        summaries = _cluster_by_member(rep, 'b1')
+        assert summaries['topics'] == []
+        assert summaries['canonical_present'] is False
+        assert summaries['machine_written'] is True
+
+    def test_one_agent_written_member_makes_a_cluster_not_machine_written(
+        self, config,
+    ) -> None:
+        pk = _plan([
+            _rec('b1', 'stash', 0, '2026-01-01T00:00:00+00:00', kind='cycle_summary'),
+            _rec('b2', 'stash', 1, '2026-01-02T00:00:00+00:00'),
+        ])
+        assert _build(config, [('pk.json', pk)])['clusters'][0]['machine_written'] is False
+
+    def test_a_legacy_plan_reports_unknown_member_facts(self, config) -> None:
+        legacy = _legacy_plan(_OS, [{'member_ids': ['x1', 'x2', 'x3']}])
+
+        (cluster,) = _build(config, [('t0-os.json', legacy)])['clusters']
+
+        assert cluster['size'] == 3
+        assert cluster['retained_members'] == []
+        assert cluster['topics'] == []
+        assert cluster['canonical_present'] is None
+        assert cluster['machine_written'] is None
+
+
+class TestCategoryCoverage:
+    def test_each_swept_category_records_its_coverage_cutoffs_and_source(
+        self, config,
+    ) -> None:
+        pk = _plan(
+            [_rec('a1', 'venv', 0), _rec('a2', 'venv', 1)],
+            scanned=5000, truncated=1, ann_threshold_by_category={_PK: 0.839},
+        )
+        legacy = _legacy_plan(_OS, [{'member_ids': ['x1', 'x2']}], ann_cutoff=0.8868)
+
+        categories = _build(config, [('pk.json', pk), ('t0-os.json', legacy)])['categories']
+
+        expected_pk = {
+            'scan_coverage': {'scanned': 5000, 'truncated': 1, 'scan_limit': 5000},
+            'coverage_known': True,
+            'lexical_threshold': 0.85,
+            'ann_cutoff': 0.839,
+            'source': 'pk.json',
+            'child_counts_known': True,
+        }
+        expected_os = {
+            'scan_coverage': None,
+            'coverage_known': False,
+            'lexical_threshold': 0.85,
+            'ann_cutoff': 0.8868,
+            'source': 't0-os.json',
+            'child_counts_known': False,
+        }
+        assert _project(categories[_PK], expected_pk) == expected_pk
+        assert _project(categories[_OS], expected_os) == expected_os
+
+    def test_a_swept_category_without_clusters_is_still_listed(self, config) -> None:
+        rep = _build(config, [('pn.json', _plan([], _PN))])
+
+        assert rep['clusters'] == []
+        assert rep['categories'][_PN]['coverage_known'] is True
+        assert rep['categories'][_PN]['ann_cutoff'] is None
+
+    def test_two_plans_sweeping_one_category_are_refused_naming_both(self, config) -> None:
+        with pytest.raises(report.DuplicatePlanCategoryError) as caught:
+            _build(config, [('first.json', _plan([])), ('second.json', _plan([]))])
+
+        assert 'first.json' in str(caught.value)
+        assert 'second.json' in str(caught.value)
+
+
+class TestCarveoutTotals:
+    def test_topic_carveouts_concatenate_and_retained_counts_sum(self, config) -> None:
+        pk = _plan([
+            _rec('a1', 'venv', 0, '2026-01-01T00:00:00+00:00'),
+            _rec('a2', 'venv', 1, '2026-01-02T00:00:00+00:00', topic='venv'),
+            _rec('b1', 'stash', 0, '2026-01-01T00:00:00+00:00', topic='stash'),
+            _rec('b2', 'stash', 1, '2026-01-02T00:00:00+00:00', topic='stash'),
+        ])
+        pn = _plan([
+            _rec('c1', 'venv', 0, '2026-01-01T00:00:00+00:00', category=_PN),
+            _rec('c2', 'venv', 1, '2026-01-02T00:00:00+00:00', category=_PN, parent_id='c1'),
+        ], _PN)
+        carved = [{'member_ids': ['x1', 'x2'], 'category': _OS, 'topic': 'old'}]
+        legacy = _legacy_plan(_OS, [], carved=carved)
+
+        rep = _build(config, [('pk.json', pk), ('pn.json', pn), ('t0-os.json', legacy)])
+
+        assert rep['topic_carveout_groups'] == (
+            pk['topic_carveout_groups'] + pn['topic_carveout_groups'] + carved
+        )
+        assert len(rep['topic_carveout_groups']) == 2
+        assert rep['retained_carveout'] == {'topic_stamped': 1, 'child_record': 1}
+
+
+class TestChildRankings:
+    def test_children_are_ranked_per_kind_across_plans(self, config) -> None:
+        pk = _plan([
+            _rec('p', 'venv', 0, '2026-01-01T00:00:00+00:00'),
+            _rec('s1', 'venv', 1, parent_id='p', kind='sighting'),
+            _rec('s2', 'venv', 2, parent_id='p', kind='sighting'),
+            _rec('s3', 'stash', 0, parent_id='q', kind='sighting'),
+            _rec('m1', 'stash', 1, parent_id='q', kind='amendment'),
+        ])
+        pn = _plan([
+            _rec('s4', 'venv', 0, category=_PN, parent_id='q', kind='sighting'),
+            _rec('s5', 'venv', 1, category=_PN, parent_id='q', kind='sighting'),
+            _rec('s6', 'stash', 0, category=_PN, parent_id='r', kind='sighting'),
+        ], _PN)
+
+        rep = _build(config, [('pk.json', pk), ('pn.json', pn)])
+
+        rankings = {
+            kind: [_project(row, {'parent_id', 'category', 'count'}) for row in rows]
+            for kind, rows in rep['child_rankings'].items()
+        }
+        assert 'child_counts_known' not in rep
+        assert rankings['sighting'] == [
+            {'parent_id': 'p', 'category': _PK, 'count': 2},
+            {'parent_id': 'q', 'category': _PN, 'count': 2},
+            {'parent_id': 'q', 'category': _PK, 'count': 1},
+            {'parent_id': 'r', 'category': _PN, 'count': 1},
+        ]
+        assert rankings['amendment'] == [{'parent_id': 'q', 'category': _PK, 'count': 1}]
+
+    def test_a_legacy_plan_makes_the_child_counts_unknown(self, config) -> None:
+        rep = _build(config, [
+            ('pk.json', _plan([])),
+            ('t0-os.json', _legacy_plan(_OS, [{'member_ids': ['x1', 'x2']}])),
+        ])
+
+        assert rep['categories'][_OS]['child_counts_known'] is False
+        assert rep['categories'][_PK]['child_counts_known'] is True
+        assert rep['child_rankings'] == {}
+
+
+# ---------------------------------------------------------------------------
+# The consecutive-run regrowth diff (task 3136 amendment D)
+# ---------------------------------------------------------------------------
+
+_PREV = '20261108T063000Z'
+_CUR = '20261115T063000Z'
+_BEFORE_PREV = '2026-11-01T00:00:00+00:00'
+_AFTER_PREV = '2026-11-10T00:00:00+00:00'
+
+
+def _family(ids: list[str], family: str = 'venv', created_at: str = _BEFORE_PREV,
+            *, category: str = _PK) -> list[dict]:
+    return [_rec(i, family, n, created_at, category=category) for n, i in enumerate(ids)]
+
+
+def _runs(config, prev_records, cur_records, *, prev_stamp=_PREV, cur_stamp=_CUR,
+          prev_plan_kwargs=None, cur_plan_kwargs=None):
+    prev = _build(config, [('prev.json', _plan(prev_records, **(prev_plan_kwargs or {})))],
+                  stamp=prev_stamp)
+    cur = _build(config, [('cur.json', _plan(cur_records, **(cur_plan_kwargs or {})))],
+                 previous=prev, stamp=cur_stamp)
+    return prev, cur
+
+
+class TestBaselineLineage:
+    def test_without_a_previous_report_every_cluster_is_a_baseline(self, config) -> None:
+        rep = _build(config, [('pk.json', _plan(
+            _family(['b', 'a']) + _family(['d', 'c'], 'stash'),
+        ))])
+
+        assert [c['lineage']['status'] for c in rep['clusters']] == ['baseline', 'baseline']
+        assert [c['cluster_key'] for c in rep['clusters']] == ['a', 'c']
+        assert rep['regrowth']['previous_run_stamp'] is None
+
+
+class TestMatchedLineage:
+    def test_an_unchanged_cluster_keeps_the_key_it_was_born_with(self, config) -> None:
+        prev = _build(config, [('prev.json', _plan(_family(['a', 'b'])))], stamp=_PREV)
+        prev['clusters'][0]['cluster_key'] = 'born-key'
+
+        cur = _build(config, [('cur.json', _plan(_family(['a', 'b'])))],
+                     previous=prev, stamp=_CUR)
+
+        (cluster,) = cur['clusters']
+        assert cluster['cluster_key'] == 'born-key'
+        assert cluster['lineage']['status'] == 'unchanged'
+        assert cluster['lineage']['overlapped_previous_keys'] == ['born-key']
+        assert cluster['lineage']['size_delta'] == 0
+        assert cur['regrowth']['unchanged'] == 1
+
+    def test_a_grown_cluster_splits_its_added_members_by_age(self, config) -> None:
+        _prev, cur = _runs(config, _family(['a', 'b']), [
+            *_family(['a', 'b']),
+            _rec('c', 'venv', 2, _AFTER_PREV),
+            _rec('d', 'venv', 3, _BEFORE_PREV),
+            _rec('e', 'venv', 4, None),
+        ])
+
+        (cluster,) = cur['clusters']
+        lineage = cluster['lineage']
+        assert cluster['cluster_key'] == 'a'
+        assert lineage['status'] == 'grew'
+        assert lineage['previous_key'] == 'a'
+        assert lineage['added_member_ids'] == ['c', 'd', 'e']
+        assert lineage['size_delta'] == 3
+        assert lineage['added_by_age'] == {'re_emitted': 1, 'preexisting': 1, 'unknown': 1}
+        assert lineage['rate_per_day'] == pytest.approx(1 / 7)
+        regrowth = cur['regrowth']
+        assert regrowth['grew'] == 1
+        assert regrowth['re_emitted_members'] == 1
+        assert regrowth['elapsed_days'] == pytest.approx(7.0)
+        assert regrowth['previous_run_stamp'] == _PREV
+
+    def test_the_rate_is_none_when_no_time_has_elapsed(self, config) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b']),
+            [*_family(['a', 'b']), _rec('c', 'venv', 2, _AFTER_PREV)],
+            cur_stamp=_PREV,
+        )
+
+        assert cur['clusters'][0]['lineage']['rate_per_day'] is None
+        assert cur['regrowth']['rate_per_day'] is None
+
+    def test_a_shrunk_cluster_lists_its_departed_members(self, config) -> None:
+        _prev, cur = _runs(config, _family(['a', 'b', 'c']), _family(['a', 'b']))
+
+        lineage = cur['clusters'][0]['lineage']
+        assert lineage['status'] == 'shrank'
+        assert lineage['departed_member_ids'] == ['c']
+        assert lineage['size_delta'] == -1
+        assert cur['regrowth']['shrank'] == 1
+
+
+class TestAppearedAndDissolved:
+    def test_a_cluster_overlapping_nothing_is_new_with_a_fresh_key(self, config) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b']),
+            _family(['a', 'b']) + _family(['y', 'x'], 'stash', _AFTER_PREV),
+        )
+
+        fresh = _cluster_by_member(cur, 'x')
+        assert fresh['lineage']['status'] == 'new'
+        assert fresh['cluster_key'] == 'x'
+        assert fresh['lineage']['added_by_age']['re_emitted'] == 2
+        assert cur['regrowth']['appeared'] == 1
+
+    def test_a_previous_cluster_overlapped_by_nothing_has_dissolved(self, config) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b']) + _family(['c', 'd', 'e'], 'stash'),
+            _family(['a', 'b']),
+        )
+
+        assert cur['regrowth']['dissolved'] == [
+            {'cluster_key': 'c', 'category': _PK, 'size': 3},
+        ]
+
+    def test_an_unswept_category_dissolves_nothing(self, config) -> None:
+        prev = _build(config, [
+            ('prev-pk.json', _plan(_family(['a', 'b']))),
+            ('prev-pn.json', _plan(_family(['c', 'd'], category=_PN), _PN)),
+        ], stamp=_PREV)
+
+        cur = _build(config, [('cur-pk.json', _plan(_family(['a', 'b'])))],
+                     previous=prev, stamp=_CUR)
+
+        assert cur['regrowth']['dissolved'] == []
+
+
+class TestMergeAndSplit:
+    def test_a_merged_cluster_inherits_the_larger_overlap(self, config) -> None:
+        prev = _family(['a', 'b', 'c']) + _family(['d', 'e'], 'stash')
+        _prev, cur = _runs(config, prev, _family(['a', 'b', 'c', 'd', 'e']))
+
+        (cluster,) = cur['clusters']
+        assert cluster['cluster_key'] == 'a'
+        assert cluster['lineage']['overlapped_previous_keys'] == ['a', 'd']
+        assert cur['regrowth']['dissolved'] == []
+
+    def test_an_overlap_tie_goes_to_the_lower_previous_key(self, config) -> None:
+        prev = _family(['c', 'd']) + _family(['a', 'b'], 'stash')
+        _prev, cur = _runs(config, prev, _family(['a', 'b', 'c', 'd']))
+
+        assert cur['clusters'][0]['cluster_key'] == 'a'
+
+    def test_a_split_keeps_the_key_on_the_larger_piece(self, config) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b', 'c', 'd', 'e']),
+            _family(['a', 'b', 'c']) + _family(['d', 'e'], 'stash'),
+        )
+
+        larger, smaller = _cluster_by_member(cur, 'a'), _cluster_by_member(cur, 'd')
+        assert larger['cluster_key'] == 'a'
+        assert smaller['lineage']['split_from'] == 'a'
+        assert smaller['cluster_key'] != 'a'
+
+    def test_keys_stay_unique_when_a_split_piece_holds_the_old_key_member(
+        self, config,
+    ) -> None:
+        _prev, cur = _runs(
+            config, _family(['a', 'b', 'c']),
+            _family(['b', 'c']) + _family(['a', 'z'], 'stash'),
+        )
+
+        keys = [c['cluster_key'] for c in cur['clusters']]
+        assert _cluster_by_member(cur, 'b')['cluster_key'] == 'a'
+        assert len(set(keys)) == len(keys)
+
+    def test_matching_never_crosses_categories(self, config) -> None:
+        prev = _build(config, [('prev.json', _plan(_family(['a', 'b'])))], stamp=_PREV)
+
+        cur = _build(config, [
+            ('cur-pk.json', _plan([])),
+            ('cur-pn.json', _plan(_family(['a', 'b'], category=_PN), _PN)),
+        ], previous=prev, stamp=_CUR)
+
+        assert cur['clusters'][0]['lineage']['status'] == 'new'
+        assert cur['regrowth']['dissolved'] == [
+            {'cluster_key': 'a', 'category': _PK, 'size': 2},
+        ]
+
+
+class TestComparability:
+    def _reasons(self, config, prev_kwargs=None, cur_kwargs=None, prev_plans=None):
+        prev = _build(config, prev_plans or [
+            ('prev.json', _plan(_family(['a', 'b']), **(prev_kwargs or {}))),
+        ], stamp=_PREV)
+        cur = _build(config, [
+            ('cur.json', _plan(_family(['a', 'b']), **(cur_kwargs or {}))),
+        ], previous=prev, stamp=_CUR)
+        return cur['categories'][_PK]['incomparable_reasons'], cur
+
+    def test_matching_runs_are_comparable(self, config) -> None:
+        assert self._reasons(config)[0] == []
+
+    @pytest.mark.parametrize(('prev_kwargs', 'cur_kwargs', 'reason'), [
+        ({}, {'truncated': 1}, 'scan_truncated'),
+        ({'truncated': 1}, {}, 'scan_truncated'),
+        ({'scan_limit': 5000}, {'scan_limit': 4000}, 'scan_limit_changed'),
+        ({'threshold': 0.85}, {'threshold': 0.8}, 'lexical_threshold_changed'),
+        ({'ann_threshold_by_category': {_PK: 0.839}},
+         {'ann_threshold_by_category': {_PK: 0.85}}, 'ann_cutoff_changed'),
+    ])
+    def test_each_changed_condition_is_disclosed(
+        self, config, prev_kwargs, cur_kwargs, reason,
+    ) -> None:
+        assert self._reasons(config, prev_kwargs, cur_kwargs)[0] == [reason]
+
+    def test_a_legacy_previous_run_makes_coverage_unknown(self, config) -> None:
+        legacy = _legacy_plan(_PK, [{'member_ids': ['a', 'b']}], ann_cutoff=0.839)
+
+        reasons, _cur = self._reasons(
+            config, cur_kwargs={'ann_threshold_by_category': {_PK: 0.839}},
+            prev_plans=[('t0-pk.json', legacy)],
+        )
+
+        assert reasons == ['coverage_unknown']
+
+    def test_a_category_the_previous_run_lacks_is_disclosed(self, config) -> None:
+        prev = _build(config, [('prev.json', _plan(_family(['a', 'b'])))], stamp=_PREV)
+        cur = _build(config, [
+            ('cur-pk.json', _plan(_family(['a', 'b']))),
+            ('cur-pn.json', _plan(_family(['c', 'd'], category=_PN), _PN)),
+        ], previous=prev, stamp=_CUR)
+
+        assert cur['categories'][_PN]['incomparable_reasons'] == ['previous_missing_category']
+        assert cur['categories'][_PK]['incomparable_reasons'] == []
+
+    def test_reasons_are_sorted_and_the_diff_is_still_computed(self, config) -> None:
+        reasons, cur = self._reasons(
+            config, cur_kwargs={'truncated': 1, 'scan_limit': 4000, 'threshold': 0.8},
+        )
+
+        assert reasons == sorted(reasons) == [
+            'lexical_threshold_changed', 'scan_limit_changed', 'scan_truncated',
+        ]
+        assert cur['clusters'][0]['lineage']['status'] == 'unchanged'
+
+
+class TestRegrowthByCategory:
+    def _after_a_failed_category(self, config):
+        prev = report.build_report(
+            'dark_factory', _PREV, [('prev-pk.json', _plan(_family(['a', 'b'])))],
+            config=config, failed_categories=[_FAILED_PN],
+        )
+        return _build(config, [
+            ('cur-pk.json', _plan([*_family(['a', 'b']), _rec('c', 'venv', 2, _AFTER_PREV)])),
+            ('cur-pn.json', _plan(
+                _family(['x', 'y'], created_at=_AFTER_PREV, category=_PN)
+                + _family(['p', 'q'], 'stash', category=_PN),
+                _PN,
+            )),
+        ], previous=prev, stamp=_CUR)
+
+    def test_each_swept_category_has_its_own_totals(self, config) -> None:
+        by_category = self._after_a_failed_category(config)['regrowth']['by_category']
+
+        assert set(by_category) == {_PK, _PN}
+        assert by_category[_PK]['grew'] == 1
+        assert by_category[_PK]['re_emitted_members'] == 1
+        assert by_category[_PN]['appeared'] == 2
+        assert by_category[_PN]['re_emitted_members'] == 2
+        assert by_category[_PN]['rate_per_day'] == pytest.approx(2 / 7)
+
+    def test_a_category_the_previous_report_did_not_sweep_is_left_out_of_the_headline(
+        self, config, tmp_path: Path,
+    ) -> None:
+        cur = self._after_a_failed_category(config)
+        regrowth = cur['regrowth']
+
+        assert regrowth['excluded_categories'] == [_PN]
+        assert regrowth['appeared'] == 0
+        assert regrowth['grew'] == 1
+        assert regrowth['re_emitted_members'] == 1
+        assert regrowth['rate_per_day'] == pytest.approx(1 / 7)
+        _json, summary = report.write_report(tmp_path, 'dark_factory', _CUR, cur)
+        (line,) = [ln for ln in summary.read_text().splitlines() if ln.startswith('regrowth:')]
+        assert f'excludes {_PN}' in line
+
+    def test_a_baseline_excludes_every_category_without_saying_so(
+        self, config, tmp_path: Path,
+    ) -> None:
+        rep = _build(config, [('pk.json', _plan(_family(['a', 'b'])))])
+
+        assert rep['regrowth']['excluded_categories'] == [_PK]
+        _json, summary = report.write_report(tmp_path, 'dark_factory', _STAMP, rep)
+        assert 'excludes' not in summary.read_text()
+
+
+class TestOverdueAndChildDeltas:
+    def test_a_previous_report_older_than_twice_the_cadence_is_overdue(self, config) -> None:
+        _prev, late = _runs(config, _family(['a', 'b']), _family(['a', 'b']),
+                            prev_stamp='20261018T063000Z')
+        _prev, on_time = _runs(config, _family(['a', 'b']), _family(['a', 'b']))
+
+        assert late['regrowth']['previous_overdue'] is True
+        assert on_time['regrowth']['previous_overdue'] is False
+
+    def test_each_child_ranking_row_carries_its_previous_count_and_delta(
+        self, config,
+    ) -> None:
+        _prev, cur = _runs(
+            config,
+            [_rec('p', 'venv', 0, _BEFORE_PREV),
+             _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting')],
+            [_rec('p', 'venv', 0, _BEFORE_PREV),
+             _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting'),
+             _rec('s2', 'venv', 2, _AFTER_PREV, parent_id='p', kind='sighting'),
+             _rec('s3', 'stash', 0, _AFTER_PREV, parent_id='q', kind='sighting')],
+        )
+
+        assert cur['child_rankings']['sighting'] == [
+            {'parent_id': 'p', 'category': _PK, 'count': 2, 'previous_count': 1, 'delta': 1},
+            {'parent_id': 'q', 'category': _PK, 'count': 1, 'previous_count': 0, 'delta': 1},
+        ]
+
+
+_FAILED_PN = report.DetectorFailure(_PN, report.FailureKind.TIMED_OUT, None, 'slow')
+
+
+def _deltas(rep: dict, kind: str = 'sighting') -> list[dict]:
+    keys = {'parent_id', 'category', 'previous_count', 'delta'}
+    return [_project(row, keys) for row in rep['child_rankings'][kind]]
+
+
+class TestChildDeltasAreCategoryAware:
+    @pytest.mark.parametrize('prev_failed', [[_FAILED_PN], []],
+                             ids=['detector-failed', 'newly-configured'])
+    def test_a_category_the_previous_run_did_not_count_has_unknown_deltas(
+        self, config, prev_failed,
+    ) -> None:
+        pk_before = [
+            _rec('p', 'venv', 0, _BEFORE_PREV),
+            _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting'),
+        ]
+        prev = report.build_report(
+            'dark_factory', _PREV, [('pk.json', _plan(pk_before))],
+            config=config, failed_categories=prev_failed,
+        )
+        pk_now = [
+            *pk_before,
+            _rec('s2', 'venv', 2, _AFTER_PREV, parent_id='p', kind='sighting'),
+            _rec('s3', 'stash', 0, _AFTER_PREV, parent_id='q', kind='sighting'),
+        ]
+        pn_now = [_rec('s4', 'venv', 0, _AFTER_PREV, category=_PN, parent_id='r',
+                       kind='sighting')]
+        cur = _build(config, [('pk.json', _plan(pk_now)), ('pn.json', _plan(pn_now, _PN))],
+                     previous=prev, stamp=_CUR)
+
+        assert _deltas(cur) == [
+            {'parent_id': 'p', 'category': _PK, 'previous_count': 1, 'delta': 1},
+            {'parent_id': 'q', 'category': _PK, 'previous_count': 0, 'delta': 1},
+            {'parent_id': 'r', 'category': _PN, 'previous_count': None, 'delta': None},
+        ]
+
+    def test_a_previous_report_with_no_plans_makes_every_delta_unknown(self, config) -> None:
+        prev = report.build_report(
+            'dark_factory', _PREV, [], config=config,
+            failed_categories=[dataclasses.replace(_FAILED_PN, category=_PK), _FAILED_PN],
+        )
+        pk_now = [
+            _rec('p', 'venv', 0, _BEFORE_PREV),
+            _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting'),
+            _rec('s2', 'stash', 0, _AFTER_PREV, parent_id='q', kind='sighting'),
+        ]
+        cur = _build(config, [('pk.json', _plan(pk_now))], previous=prev, stamp=_CUR)
+
+        rows = _deltas(cur)
+        assert [row['parent_id'] for row in rows] == ['p', 'q']
+        assert all(row['previous_count'] is None and row['delta'] is None for row in rows)
+
+    def test_a_category_previously_swept_from_a_legacy_plan_has_unknown_deltas(
+        self, config,
+    ) -> None:
+        pk = _plan([
+            _rec('p', 'venv', 0, _BEFORE_PREV),
+            _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting'),
+        ])
+        legacy = _legacy_plan(_OS, [{'member_ids': ['x1', 'x2']}])
+        prev = _build(config, [('pk.json', pk), ('t0-os.json', legacy)], stamp=_PREV)
+        os_now = _plan([
+            _rec('o', 'stash', 0, _BEFORE_PREV, category=_OS),
+            _rec('o1', 'stash', 1, _AFTER_PREV, category=_OS, parent_id='o',
+                 kind='sighting'),
+        ], _OS)
+        cur = _build(config, [('pk.json', pk), ('os.json', os_now)], previous=prev, stamp=_CUR)
+
+        assert prev['categories'][_OS]['child_counts_known'] is False
+        assert _deltas(cur) == [
+            {'parent_id': 'o', 'category': _OS, 'previous_count': None, 'delta': None},
+            {'parent_id': 'p', 'category': _PK, 'previous_count': 1, 'delta': 0},
+        ]
+
+
+class TestWarmLaneShape:
+    def test_an_unstamped_cluster_grows_beside_a_stamped_canonical_singleton(
+        self, config,
+    ) -> None:
+        canonical = _rec('w', 'stash', 0, _BEFORE_PREV, topic='warm-lane', canonical=True)
+        old = [f'r{n}' for n in range(7)]
+        _prev, cur = _runs(
+            config,
+            [canonical, *_family(old)],
+            [canonical, *_family(old),
+             _rec('r7', 'venv', 7, _AFTER_PREV), _rec('r8', 'venv', 8, _AFTER_PREV)],
+        )
+
+        (cluster,) = cur['clusters']
+        assert 'w' not in cluster['member_ids']
+        assert cluster['topics'] == []
+        assert cluster['size'] == 9
+        assert cluster['lineage']['status'] == 'grew'
+        assert cluster['lineage']['added_member_ids'] == ['r7', 'r8']
+        assert cluster['lineage']['added_by_age']['re_emitted'] == 2
+        assert cur['regrowth']['re_emitted_members'] == 2
+
+
+# ---------------------------------------------------------------------------
+# Artifacts and the store-free --plan CLI mode
+# ---------------------------------------------------------------------------
+
+_FAILED_OS = report.DetectorFailure(_OS, report.FailureKind.TIMED_OUT, None, 'slow')
+
+
+def _grown_report(config) -> dict:
+    prev = _build(config, [('prev.json', _plan(_family(['a', 'b'])))], stamp=_PREV)
+    return report.build_report(
+        'dark_factory', _CUR,
+        [('cur.json', _plan(
+            [*_family(['a', 'b']), _rec('c', 'venv', 2, _AFTER_PREV)], truncated=1,
+        ))],
+        config=config, previous=prev, failed_categories=[_FAILED_OS],
+    )
+
+
+class TestWriteReport:
+    def test_the_report_and_its_summary_land_under_the_project(
+        self, config, tmp_path: Path,
+    ) -> None:
+        rep = _grown_report(config)
+
+        json_path, summary_path = report.write_report(tmp_path, 'dark_factory', _CUR, rep)
+
+        assert json_path == tmp_path / 'dark_factory' / f'report-{_CUR}.json'
+        assert summary_path == tmp_path / 'dark_factory' / f'summary-{_CUR}.txt'
+        text = json_path.read_text(encoding='utf-8')
+        assert text.endswith('\n')
+        assert json.loads(text) == json.loads(json.dumps(rep))
+        assert text == json.dumps(rep, indent=2, sort_keys=True) + '\n'
+
+    def test_the_summary_states_fitness_coverage_regrowth_and_failures(
+        self, config, tmp_path: Path,
+    ) -> None:
+        _json_path, summary_path = report.write_report(
+            tmp_path, 'dark_factory', _CUR, _grown_report(config),
+        )
+        summary = summary_path.read_text(encoding='utf-8')
+        caveat = config.recall_caveat
+
+        assert 'dark_factory' in summary
+        assert _CUR in summary
+        assert (
+            f'regrowth measurement: {caveat.fitness.regrowth_measurement}; '
+            f'gate filing: {caveat.fitness.gate_filing} (task {caveat.gate_filing_owner_task})'
+        ) in summary
+        (pk_line,) = [line for line in summary.splitlines() if line.strip().startswith(_PK)]
+        assert '1 cluster' in pk_line
+        assert 'scan_truncated' in pk_line
+        assert 'grew 1' in summary
+        assert 're-emitted members 1' in summary
+        (top_line,) = [line for line in summary.splitlines() if '+1 added' in line]
+        assert top_line.split()[0] == 'a'
+        (failed_line,) = [line for line in summary.splitlines() if line.strip().startswith(_OS)]
+        assert report.FailureKind.TIMED_OUT.value in failed_line
+
+
+def _report_file(root: Path, project: str, stamp: str, content: str) -> Path:
+    path = root / project / f'report-{stamp}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding='utf-8')
+    return path
+
+
+def _saved_report(config, root: Path, project: str, stamp: str,
+                  project_id: str | None = None) -> Path:
+    built = _build(config, [('pk.json', _plan(_family(['a', 'b'])))],
+                   stamp=_PREV, project_id=project_id or project)
+    return _report_file(root, project, stamp, json.dumps(built))
+
+
+def _break_a_cluster(rep: dict) -> dict:
+    return {**rep, 'clusters': [{**rep['clusters'][0], 'member_ids': 'a,b'}]}
+
+
+def _break_coverage(rep: dict) -> dict:
+    entry = {**rep['categories'][_PK], 'scan_coverage': None}
+    return {**rep, 'categories': {_PK: entry}}
+
+
+_CORRUPT_REPORTS = {
+    'not_json': lambda _rep: '{not json',
+    'a_json_list': lambda _rep: '[]',
+    'no_clusters': lambda rep: json.dumps(_without(rep, 'clusters')),
+    'no_categories': lambda rep: json.dumps(_without(rep, 'categories')),
+    'no_child_rankings': lambda rep: json.dumps(_without(rep, 'child_rankings')),
+    'member_ids_not_a_list': lambda rep: json.dumps(_break_a_cluster(rep)),
+    'coverage_known_without_coverage': lambda rep: json.dumps(_break_coverage(rep)),
+    'malformed_run_stamp': lambda rep: json.dumps({**rep, 'run_stamp': '2026-11-08'}),
+}
+
+
+def _corrupt_report(config, root: Path, project: str, stamp: str, case: str) -> Path:
+    built = _build(config, [('pk.json', _plan(_family(['a', 'b'])))],
+                   stamp=_PREV, project_id=project)
+    return _report_file(root, project, stamp, _CORRUPT_REPORTS[case](built))
+
+
+class TestFindPreviousReport:
+    def test_the_latest_report_strictly_before_the_stamp_is_returned(
+        self, config, tmp_path: Path,
+    ) -> None:
+        for stamp in ('20261101T000000Z', '20261108T000000Z', '20261115T000000Z'):
+            _saved_report(config, tmp_path, 'p', stamp)
+
+        found = report.find_previous_report(tmp_path, 'p', '20261115T000000Z')
+
+        assert found is not None
+        stamp, prior = found
+        assert stamp == '20261108T000000Z'
+        assert prior['project_id'] == 'p'
+
+    def test_malformed_names_and_other_projects_are_ignored(
+        self, config, tmp_path: Path,
+    ) -> None:
+        _saved_report(config, tmp_path, 'p', '20261101T000000Z')
+        _report_file(tmp_path, 'p', '2026-11-10T00:00:00Z', '{not json')
+        _saved_report(config, tmp_path, 'p', '20261112T000000Z', project_id='q')
+
+        found = report.find_previous_report(tmp_path, 'p', '20261115T000000Z')
+
+        assert found is not None
+        assert found[0] == '20261101T000000Z'
+
+    def test_no_earlier_report_is_none(self, config, tmp_path: Path) -> None:
+        _saved_report(config, tmp_path, 'p', '20261115T000000Z')
+        assert report.find_previous_report(tmp_path, 'p', '20261115T000000Z') is None
+        assert report.find_previous_report(tmp_path, 'absent', '20261115T000000Z') is None
+
+    @pytest.mark.parametrize('case', sorted(_CORRUPT_REPORTS))
+    def test_a_report_the_diff_cannot_read_is_refused_naming_it(
+        self, config, tmp_path: Path, case: str,
+    ) -> None:
+        _saved_report(config, tmp_path, 'p', '20261101T000000Z')
+        bad = _corrupt_report(config, tmp_path, 'p', '20261108T000000Z', case)
+
+        with pytest.raises(report.PreviousReportError, match=re.escape(str(bad))):
+            report.find_previous_report(tmp_path, 'p', '20261115T000000Z')
+
+
+def _dump(path: Path, data: object) -> Path:
+    path.write_text(json.dumps(data), encoding='utf-8')
+    return path
+
+
+@pytest.fixture
+def config_path(tmp_path: Path) -> Path:
+    return _write_yaml(tmp_path, _committed_yaml(), name='config.yaml')
+
+
+class TestPlanModeCli:
+    def _argv(self, config_path: Path, out_root: Path, *plans: Path,
+              stamp: str = '20260811T120000Z', project_id: str | None = 'p') -> list[str]:
+        argv = ['--config', str(config_path), '--out-root', str(out_root), '--run-stamp', stamp]
+        if project_id is not None:
+            argv += ['--project-id', project_id]
+        for plan in plans:
+            argv += ['--plan', str(plan)]
+        return argv
+
+    def test_a_report_is_built_from_saved_plans_and_the_next_one_diffs_against_it(
+        self, config_path: Path, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'reports'
+        first = [
+            _dump(tmp_path / 'pk-1.json', _plan(_family(['a', 'b']))),
+            _dump(tmp_path / 'pn-1.json', _plan([], _PN)),
+        ]
+        second = [
+            _dump(tmp_path / 'pk-2.json', _plan(_family(['a', 'b', 'c']))),
+            _dump(tmp_path / 'pn-2.json', _plan([], _PN)),
+        ]
+
+        assert report.main(self._argv(config_path, out_root, *first)) == report.EXIT_OK
+        assert report.main(self._argv(
+            config_path, out_root, *second, stamp='20260818T120000Z',
+        )) == report.EXIT_OK
+
+        rep = json.loads((out_root / 'p' / 'report-20260818T120000Z.json').read_text())
+        assert rep['regrowth']['previous_run_stamp'] == '20260811T120000Z'
+        assert rep['categories'][_PK]['source'] == str(second[0])
+        assert rep['categories'][_PN]['source'] == str(second[1])
+        assert rep['clusters'][0]['lineage']['status'] == 'grew'
+        assert rep['failed_categories'] == []
+        assert (out_root / 'p' / 'summary-20260818T120000Z.txt').exists()
+
+    def test_a_missing_plan_file_is_bad_input_naming_it(
+        self, config_path: Path, tmp_path: Path, caplog,
+    ) -> None:
+        missing = tmp_path / 'absent.json'
+
+        code = report.main(self._argv(config_path, tmp_path / 'out', missing))
+
+        assert code == report.EXIT_BAD_INPUT == 2
+        assert str(missing) in caplog.text
+
+    def test_a_plan_that_is_not_json_is_bad_input_naming_it(
+        self, config_path: Path, tmp_path: Path, caplog,
+    ) -> None:
+        broken = tmp_path / 'broken.json'
+        broken.write_text('{not json', encoding='utf-8')
+
+        assert report.main(self._argv(config_path, tmp_path / 'out', broken)) == 2
+        assert str(broken) in caplog.text
+
+    def test_two_plans_sweeping_one_category_are_bad_input(
+        self, config_path: Path, tmp_path: Path,
+    ) -> None:
+        plans = [_dump(tmp_path / f'pk-{n}.json', _plan([])) for n in (1, 2)]
+        assert report.main(self._argv(config_path, tmp_path / 'out', *plans)) == 2
+
+    def test_a_malformed_run_stamp_is_bad_input(self, config_path: Path, tmp_path: Path) -> None:
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+        code = report.main(self._argv(
+            config_path, tmp_path / 'out', plan, stamp='2026-08-11T12:00:00Z',
+        ))
+        assert code == 2
+
+    def test_a_config_error_is_bad_input(self, tmp_path: Path, caplog) -> None:
+        bad = _write_yaml(tmp_path, _without(_committed_yaml(), 'projects'), name='bad.yaml')
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+
+        assert report.main(self._argv(bad, tmp_path / 'out', plan)) == 2
+        assert str(bad) in caplog.text
+
+    def test_plans_without_a_project_are_bad_input(
+        self, config_path: Path, tmp_path: Path,
+    ) -> None:
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+        code = report.main(self._argv(config_path, tmp_path / 'out', plan, project_id=None))
+        assert code == 2
+
+    def test_an_unwritable_out_root_aborts_the_run_without_a_traceback(
+        self, config_path: Path, tmp_path: Path, caplog, capsys,
+    ) -> None:
+        not_a_dir = tmp_path / 'regular-file'
+        not_a_dir.write_text('', encoding='utf-8')
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+
+        code = report.main(self._argv(config_path, not_a_dir, plan))
+
+        assert code == report.EXIT_RUN_FAILED == 1
+        assert 'ABORT: cannot write the report' in caplog.text
+        assert 'Traceback' not in caplog.text + capsys.readouterr().err
+
+    @pytest.mark.parametrize('case', ['not_json', 'a_json_list', 'no_clusters'])
+    def test_a_previous_report_the_diff_cannot_read_aborts_naming_it(
+        self, config, config_path: Path, tmp_path: Path, caplog, capsys, case: str,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        bad = _corrupt_report(config, out_root, 'p', '20260804T120000Z', case)
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+
+        code = report.main(self._argv(config_path, out_root, plan))
+
+        assert code == report.EXIT_RUN_FAILED
+        assert 'ABORT:' in caplog.text
+        assert str(bad) in caplog.text
+        assert 'Traceback' not in caplog.text + capsys.readouterr().err
+        assert not report.report_path(out_root, 'p', '20260811T120000Z').exists()
+
+
+# ---------------------------------------------------------------------------
+# Scheduled mode: one detector subprocess per (project, category)
+# ---------------------------------------------------------------------------
+
+_FAKE_DETECTOR_SOURCE = '''
+import json
+import sys
+import time
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+control = json.loads((here / 'control.json').read_text(encoding='utf-8'))
+argv = sys.argv[1:]
+with open(here / 'calls.jsonl', 'a', encoding='utf-8') as log:
+    log.write(json.dumps(argv) + '\\n')
+target = argv[argv.index('--project-id') + 1] + '/' + argv[argv.index('--categories') + 1]
+sys.stderr.write('fake detector ' + target + '\\n')
+behaviour = control['behaviour'].get(target, 'ok')
+if behaviour == 'exit':
+    sys.stderr.write('boom\\n')
+    sys.exit(3)
+if behaviour == 'sleep':
+    time.sleep(60)
+if behaviour == 'garbage':
+    print('this is not a plan')
+    sys.exit(0)
+print(json.dumps(control['plans'][target]))
+'''
+
+
+class _FakeDetector:
+    """A detector stand-in run as a real subprocess; it records each argv it is given."""
+
+    def __init__(self, root: Path, config) -> None:
+        self.root = root
+        self.script = root / 'fake_detector.py'
+        self.script.write_text(_FAKE_DETECTOR_SOURCE, encoding='utf-8')
+        self.argv = (sys.executable, str(self.script))
+        self.plans = {
+            f'{project}/{category}': _plan(
+                _family([f'{project}-{category}-a', f'{project}-{category}-b'],
+                        category=category),
+                category,
+            )
+            for project in config.projects
+            for category in config.categories
+        }
+        self.behave({})
+
+    def behave(self, behaviour: dict[str, str]) -> None:
+        (self.root / 'control.json').write_text(
+            json.dumps({'plans': self.plans, 'behaviour': behaviour}), encoding='utf-8',
+        )
+
+    def calls(self) -> list[list[str]]:
+        log = self.root / 'calls.jsonl'
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+
+
+@pytest.fixture
+def fake_detector(tmp_path: Path, config) -> _FakeDetector:
+    root = tmp_path / 'fake'
+    root.mkdir()
+    return _FakeDetector(root, config)
+
+
+def _schedule(config, fake: _FakeDetector, out_root: Path, *, stamp: str = _CUR,
+              projects=None) -> int:
+    return report.run_scheduled(
+        config, out_root=out_root, stamp=stamp,
+        projects=tuple(config.projects if projects is None else projects),
+        detector_argv=fake.argv,
+    )
+
+
+class TestScheduledInvocations:
+    def test_the_detector_runs_once_per_project_and_category_in_config_order(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        assert _schedule(config, fake_detector, tmp_path / 'out') == report.EXIT_OK
+
+        expected = [
+            ['--project-id', project, '--categories', category,
+             '--scan-limit', str(config.scan_limit), '--no-metrics']
+            for project in config.projects
+            for category in config.categories
+        ]
+        assert fake_detector.calls() == expected
+        assert not any('--apply' in call for call in fake_detector.calls())
+
+    def test_each_plan_is_persisted_and_named_as_its_categorys_source(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        _schedule(config, fake_detector, out_root)
+
+        for project in config.projects:
+            rep = json.loads(report.report_path(out_root, project, _CUR).read_text())
+            assert set(rep['categories']) == set(config.categories)
+            for category in config.categories:
+                plan_path = out_root / project / f'plan-{_CUR}-{category}.json'
+                assert json.loads(plan_path.read_text()) == json.loads(
+                    json.dumps(fake_detector.plans[f'{project}/{category}']),
+                )
+                assert rep['categories'][category]['source'] == str(plan_path)
+
+    def test_the_detectors_stderr_is_relayed(
+        self, config, fake_detector, tmp_path: Path, capsys,
+    ) -> None:
+        _schedule(config, fake_detector, tmp_path / 'out', projects=['dark_factory'])
+        assert f'fake detector dark_factory/{_PK}' in capsys.readouterr().err
+
+    def test_each_categorys_stderr_is_kept_beside_its_plan(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        _schedule(config, fake_detector, out_root, projects=['dark_factory'])
+
+        for category in config.categories:
+            log = report.stderr_log_path(out_root, 'dark_factory', _CUR, category)
+            assert log.parent == report.plan_path(out_root, 'dark_factory', _CUR, category).parent
+            assert log.read_text(encoding='utf-8') == f'fake detector dark_factory/{category}\n'
+
+
+class TestDetectorCommandContract:
+    @pytest.mark.parametrize('category', detector.ALL_CATEGORIES)
+    def test_the_real_detector_parses_the_command_as_a_read_only_metrics_free_run(
+        self, config, category: str,
+    ) -> None:
+        argv = report.detector_command((), 'reify', category, config)
+
+        args = detector.build_parser().parse_args(argv)
+
+        assert args.project_id == 'reify'
+        assert args.categories == [category]
+        assert args.scan_limit == config.scan_limit
+        assert args.no_metrics is True
+        assert args.apply is False
+
+    def test_each_project_report_diffs_against_its_own_previous_report(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        _schedule(config, fake_detector, out_root, stamp=_PREV)
+        _schedule(config, fake_detector, out_root, stamp=_CUR)
+
+        for project in config.projects:
+            rep = json.loads(report.report_path(out_root, project, _CUR).read_text())
+            assert rep['project_id'] == project
+            assert rep['regrowth']['previous_run_stamp'] == _PREV
+            assert {c['lineage']['status'] for c in rep['clusters']} == {'unchanged'}
+
+
+class TestScheduledFailures:
+    @pytest.mark.parametrize(('behaviour', 'error_type', 'exit_code', 'tail'), [
+        ('exit', report.FailureKind.DETECTOR_EXIT, 3, 'boom'),
+        ('sleep', report.FailureKind.TIMED_OUT, None, 'fake detector'),
+        ('garbage', report.FailureKind.BAD_PLAN_OUTPUT, 0, 'fake detector'),
+    ])
+    def test_a_failed_category_is_listed_and_the_rest_is_still_reported(
+        self, config, fake_detector, tmp_path: Path, behaviour, error_type, exit_code, tail,
+    ) -> None:
+        bounded = config.model_copy(update={'detector_timeout_secs': 10})
+        fake_detector.behave({f'dark_factory/{_PN}': behaviour})
+        out_root = tmp_path / 'out'
+
+        code = _schedule(bounded, fake_detector, out_root)
+
+        assert code == report.EXIT_RUN_FAILED
+        rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
+        (failure,) = rep['failed_categories']
+        assert set(failure) == {
+            'category', 'error_type', 'exit_code', 'stderr_tail', 'exception_type',
+        }
+        assert failure['category'] == _PN
+        assert failure['error_type'] == error_type.value
+        assert failure['exception_type'] is None
+        assert failure['exit_code'] == exit_code
+        assert tail in failure['stderr_tail']
+        assert _PN not in rep['categories']
+        assert set(rep['categories']) == {_PK, _OS}
+        assert not (out_root / 'dark_factory' / f'plan-{_CUR}-{_PN}.json').exists()
+        other = json.loads(report.report_path(out_root, 'reify', _CUR).read_text())
+        assert other['failed_categories'] == []
+
+    def test_a_timed_out_category_keeps_its_stderr_log(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        bounded = config.model_copy(update={'detector_timeout_secs': 10})
+        fake_detector.behave({f'dark_factory/{_PN}': 'sleep'})
+        out_root = tmp_path / 'out'
+
+        _schedule(bounded, fake_detector, out_root, projects=['dark_factory'])
+
+        log = report.stderr_log_path(out_root, 'dark_factory', _CUR, _PN)
+        assert f'fake detector dark_factory/{_PN}' in log.read_text(encoding='utf-8')
+
+    def test_a_detector_that_cannot_start_names_its_os_error(
+        self, config, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        absent = tmp_path / 'no-such-detector'
+
+        code = report.run_scheduled(config, out_root=out_root, stamp=_CUR,
+                                    projects=('dark_factory',), detector_argv=(str(absent),))
+
+        assert code == report.EXIT_RUN_FAILED
+        rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
+        assert [f['category'] for f in rep['failed_categories']] == list(config.categories)
+        for failure in rep['failed_categories']:
+            assert failure['error_type'] == report.FailureKind.SPAWN_FAILED.value
+            assert failure['exception_type'] == 'FileNotFoundError'
+            assert f'could not start {absent}' in failure['stderr_tail']
+
+    def test_a_plan_that_cannot_be_persisted_is_a_failed_category(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        blocked = report.plan_path(out_root, 'dark_factory', _CUR, _PN)
+        blocked.mkdir(parents=True)
+
+        code = _schedule(config, fake_detector, out_root, projects=['dark_factory'])
+
+        assert code == report.EXIT_RUN_FAILED
+        rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
+        (failure,) = rep['failed_categories']
+        assert failure['category'] == _PN
+        assert failure['error_type'] == report.FailureKind.PLAN_WRITE_FAILED.value
+        assert failure['exit_code'] == 0
+        assert failure['exception_type'] == 'IsADirectoryError'
+        assert str(blocked) in failure['stderr_tail']
+        assert set(rep['categories']) == {_PK, _OS}
+
+    def test_a_category_whose_stderr_log_cannot_open_is_never_run(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        report.stderr_log_path(out_root, 'dark_factory', _CUR, _PN).mkdir(parents=True)
+
+        code = _schedule(config, fake_detector, out_root, projects=['dark_factory'])
+
+        assert code == report.EXIT_RUN_FAILED
+        assert [call[3] for call in fake_detector.calls()] == [_PK, _OS]
+        rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
+        (failure,) = rep['failed_categories']
+        assert failure['error_type'] == report.FailureKind.STDERR_LOG_FAILED.value
+        assert failure['exception_type'] == 'IsADirectoryError'
+
+    def test_a_bad_previous_report_skips_its_project_before_any_sweep(
+        self, config, fake_detector, tmp_path: Path, caplog,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        bad = _corrupt_report(config, out_root, 'dark_factory', _PREV, 'no_clusters')
+
+        code = _schedule(config, fake_detector, out_root)
+
+        assert code == report.EXIT_RUN_FAILED
+        assert {call[1] for call in fake_detector.calls()} == {'reify'}
+        assert 'ABORT:' in caplog.text
+        assert str(bad) in caplog.text
+        assert not report.report_path(out_root, 'dark_factory', _CUR).exists()
+        assert report.report_path(out_root, 'reify', _CUR).exists()
+
+
+class TestScheduledThroughMain:
+    def _spy(self, monkeypatch) -> list[dict]:
+        calls: list[dict] = []
+
+        def _record(config, **kwargs):
+            calls.append(kwargs)
+            return report.EXIT_OK
+
+        monkeypatch.setattr(report, 'run_scheduled', _record)
+        return calls
+
+    def test_without_plans_every_configured_project_runs(
+        self, config_path: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        calls = self._spy(monkeypatch)
+
+        code = report.main(['--config', str(config_path), '--out-root', str(tmp_path),
+                            '--run-stamp', _CUR])
+
+        assert code == report.EXIT_OK
+        (call,) = calls
+        assert call['projects'] == ('dark_factory', 'reify')
+        assert call['stamp'] == _CUR
+        assert call['out_root'] == tmp_path
+
+    def test_a_project_id_restricts_the_run_to_that_project(
+        self, config_path: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        calls = self._spy(monkeypatch)
+
+        report.main(['--config', str(config_path), '--out-root', str(tmp_path),
+                     '--project-id', 'reify'])
+
+        assert calls[0]['projects'] == ('reify',)
+
+    def test_an_unconfigured_project_is_bad_input_before_any_run(
+        self, config_path: Path, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        calls = self._spy(monkeypatch)
+
+        code = report.main(['--config', str(config_path), '--out-root', str(tmp_path),
+                            '--project-id', 'elsewhere'])
+
+        assert code == report.EXIT_BAD_INPUT
+        assert calls == []
+        assert 'elsewhere' in caplog.text

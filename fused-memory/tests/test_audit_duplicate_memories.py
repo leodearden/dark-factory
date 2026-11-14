@@ -47,7 +47,7 @@ _MAX_LEXICAL_RATIO_MEMBERS = _mod._MAX_LEXICAL_RATIO_MEMBERS
 partition_topic_carveout = _mod.partition_topic_carveout
 fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
-_ALL_CATEGORIES = _mod._ALL_CATEGORIES
+_ALL_CATEGORIES = _mod.ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 _classify_liveness_snapshot = _mod._classify_liveness_snapshot
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
@@ -73,7 +73,7 @@ _EVAL_ID = _mod._EVAL_ID
 _GLOBAL_SCOPE = _mod._GLOBAL_SCOPE
 emit_metrics_artifact = _mod.emit_metrics_artifact
 details_artifact_path = _mod.details_artifact_path
-_build_parser = _mod._build_parser
+_build_parser = _mod.build_parser
 _run = _mod._run
 
 
@@ -2014,23 +2014,27 @@ class TestBuildSweepPlanTopicCarveout:
         assert set(carved['member_ids']) == {'m1', 'm2'}
         assert carved['topic'] == 'venv'
 
-    def test_differing_topics_still_yield_delete_candidates(self):
+    def test_differing_topics_are_reported_but_no_member_is_deletable(self):
         memories = [
             _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
             _topic_memory('m2', _VENV_GOTCHA_B, 'rustfmt'),
         ]
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
         assert plan['clusters_total'] == 1
-        assert len(plan['delete_candidates']) == 1
+        (group,) = plan['near_duplicate_groups']
+        assert set(group['member_ids']) == {'m1', 'm2'}
+        assert plan['delete_candidates'] == []
+        assert group['survivor_id'] == 'm1'
+        assert group['retained_members'] == [{'id': 'm2', 'reason': 'topic_stamped'}]
         assert plan['topic_carveout_clusters'] == 0
 
-    def test_partially_missing_topic_still_yields_delete_candidates(self):
+    def test_partially_missing_topic_makes_only_the_unstamped_member_deletable(self):
         memories = [
             _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
             _topic_memory('m2', _VENV_GOTCHA_B, None),
         ]
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
-        assert len(plan['delete_candidates']) == 1
+        assert plan['delete_candidates'] == ['m2']
         assert plan['topic_carveout_clusters'] == 0
 
     def test_carveout_applies_to_all_three_categories(self):
@@ -4818,6 +4822,22 @@ class TestRunWiring:
         await _run(await self._parse(tmp_path))
         assert _FakeMemoryService.instances[-1].closed is True
 
+    async def test_the_printed_plan_carries_each_categorys_scan_coverage(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Task 3136's report reads coverage off stdout, not off the metrics."""
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', _VENV_GOTCHA_A), _raw('m2', _DISTRACTOR)]},
+        )
+        await _run(await self._parse(
+            tmp_path, '--categories', _PK, '--scan-limit', '2',
+        ))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['scan_coverage'] == {
+            _PK: {'scanned': 2, 'truncated': 1, 'scan_limit': 2},
+        }
+
 
 # ---------------------------------------------------------------------------
 # Liveness-snapshot recurrence fixtures (task 3098)
@@ -6208,6 +6228,10 @@ _LIVENESS_PLAN_KEYS = frozenset({
 # stays attributable to the task that caused it.
 _PER_CATEGORY_PLAN_KEYS = frozenset({'ann_threshold_by_category'})
 
+# Task 3136: the retention counts, child counts and scan coverage the weekly
+# duplicate-cluster report reads beside the clusters.
+_REPORT_FEED_PLAN_KEYS = frozenset({'retained_carveout', 'child_counts', 'scan_coverage'})
+
 
 class TestBuildSweepPlanLivenessRecurrences:
     """The third class reaches the plan -- and never reaches a delete."""
@@ -6276,6 +6300,7 @@ class TestBuildSweepPlanLivenessRecurrences:
 
         assert set(plan) == (
             _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS | _PER_CATEGORY_PLAN_KEYS
+            | _REPORT_FEED_PLAN_KEYS
         )
         assert plan['ann_threshold_by_category'] == {}, (
             'a caller that ran no ANN path reports an empty map, not a null'
