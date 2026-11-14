@@ -23,16 +23,18 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _merge_queue_landing import LandingNotConfirmed, land_files
 from config_reload_script_fakes import FakeEscalationMcp
 from merge_queue_fakes import FakeMergeQueue, assert_target_checkout_clean
+from retained_deploy_fakes import branch_exists, retained_deploy
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -893,17 +895,19 @@ def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path, monkeypatc
                 scene, landing_repo, census_writes=_REGENERATED)
 
     no_drift_repo = _git_repo_harness(tmp_path / 'no-drift')
-    scenarios['skipped:no-drift'], _ = _run_wrapper_in_git_repo(
-        tmp_path / 'no-drift', no_drift_repo)
+    with _census_queue(no_drift_repo):
+        scenarios['skipped:no-drift'], _ = _run_wrapper_in_git_repo(
+            tmp_path / 'no-drift', no_drift_repo)
 
     no_main_repo = _git_repo_harness(tmp_path / 'no-main', initial_branch='trunk')
-    scenarios['failed:generation-worktree'], _ = _run_wrapper_in_git_repo(
-        tmp_path / 'no-main', no_main_repo)
+    with _census_queue(no_main_repo):
+        scenarios['failed:generation-worktree'], _ = _run_wrapper_in_git_repo(
+            tmp_path / 'no-main', no_main_repo)
 
     in_flight = tmp_path / 'in-flight'
     in_flight_repo = _git_repo_harness(in_flight)
     retained, _ = _retained_census_deploy(in_flight, in_flight_repo, monkeypatch)
-    with _census_queue(in_flight_repo, states={retained.removeprefix('task/'): ['verifying']}):
+    with _census_queue(in_flight_repo, states={_bare(retained): ['verifying']}):
         scenarios['skipped:landing-in-flight'], _ = _run_wrapper_in_git_repo(
             in_flight, in_flight_repo, census_writes=_REGENERATED)
 
@@ -1397,9 +1401,10 @@ def test_a_checkout_without_main_runs_no_census(tmp_path):
     """No main means no tip to measure, and measuring in place instead would
     write the very checkout the worktree exists to keep clean."""
     repo = _git_repo_harness(tmp_path, initial_branch='trunk')
-    before = _git(repo, 'log', '--pretty=%H').stdout
 
-    result, calls = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+    with _census_queue(repo):
+        before = _git(repo, 'log', '--pretty=%H').stdout
+        result, calls = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
 
     assert result.returncode == 0, _diag(result)
     assert [c['who'] for c in calls] == ['STAMP'], calls
@@ -1412,64 +1417,55 @@ def test_a_checkout_without_main_runs_no_census(tmp_path):
 
 # ── one census request at a time: the history file is append-only ───────────
 #
-# A night whose deploy an earlier run RETAINED (its cancel refused, or the
-# orchestrator down at a stop) skips rather than stacking a second request
-# that would conflict on the append; a retained deploy that can no longer
-# land is reclaimed and the night lands as usual.
+# Before main's tip is taken, the wrapper asks the queue about every census
+# deploy an earlier run RETAINED (its cancel refused, or the orchestrator down
+# at a stop). One that may still land makes the night skip, measuring and
+# landing nothing, rather than stack a second request that would conflict on
+# the append; one that can no longer land is reclaimed and the night lands as
+# usual, on a main that already carries it.
 
 _CENSUS_LABEL = 'memory-metadata-census'
-_CANCEL_REFUSED_WHILE_LANDING = {
-    'cancelled': False,
-    'state': 'finalizing',
-    'reason': 'Request is landing (its CAS is in progress)',
-    'code': 'finalize_window',
-}
 
 
 def _retained_census_deploy(tmp_path, repo, monkeypatch):
     """The (branch, worktree) land_files kept for an earlier night's census
-    request, still live at a passed ceiling with its cancel refused."""
+    request, its scratch in the run's TMPDIR as that night would leave it."""
     scratch = _scratch_dir(tmp_path)
     scratch.mkdir(exist_ok=True)
     monkeypatch.setattr(tempfile, 'tempdir', str(scratch))
-    queue = FakeMergeQueue(repo, states=['verifying'], cancel_reply=_CANCEL_REFUSED_WHILE_LANDING)
-    with FakeEscalationMcp(tool_handlers=queue.handlers()) as server, \
-            pytest.raises(LandingNotConfirmed):
-        land_files(str(repo), {_HISTORY: b'{"an earlier night": true}\n'}, _main(repo),
-                   port=str(server.port), label=_CENSUS_LABEL,
-                   message='chore(census): an earlier night', timeout_secs=0.001)
-    (submitted,) = queue.calls_to('merge_request')
-    return f'task/{submitted["branch"]}', Path(submitted['worktree'])
+    return retained_deploy(repo, {_HISTORY: b'{"an earlier night": true}\n'},
+                           label=_CENSUS_LABEL, message='chore(census): an earlier night')
 
 
-def _branch_exists(repo, branch):
-    return _git(repo, 'show-ref', '--verify', '--quiet', f'refs/heads/{branch}').returncode == 0
+def _bare(branch):
+    return branch.removeprefix('task/')
 
 
 def test_a_retained_deploy_still_in_flight_skips_the_night(tmp_path, monkeypatch):
     repo = _git_repo_harness(tmp_path)
     branch, worktree = _retained_census_deploy(tmp_path, repo, monkeypatch)
-    bare = branch.removeprefix('task/')
 
-    with _census_queue(repo, states={bare: ['verifying']}) as (queue, _):
+    with _census_queue(repo, states={_bare(branch): ['verifying']}) as (queue, _):
         before = _main(repo)
-        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+        result, calls = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
 
     assert result.returncode == 0, _diag(result)
-    assert 'commit=0 commit-step=skipped:landing-in-flight)' in _done_line(result.stdout), (
-        _diag(result))
+    line = _done_line(result.stdout)
+    assert 'census=skipped ' in line, _diag(result)
+    assert 'commit=0 commit-step=skipped:landing-in-flight)' in line, _diag(result)
+    assert [c['who'] for c in calls] == ['STAMP'], calls
     assert branch in result.stderr, _diag(result)
     assert queue.calls_to('merge_request') == []
-    assert _branch_exists(repo, branch) and worktree.is_dir()
+    assert branch_exists(repo, branch) and worktree.is_dir()
+    assert _worktree_paths(repo) == [str(repo), str(worktree)], _worktree_paths(repo)
     assert _main(repo) == before
 
 
 def test_a_retained_deploy_that_settled_is_reclaimed_and_the_night_lands(tmp_path, monkeypatch):
     repo = _git_repo_harness(tmp_path)
     branch, worktree = _retained_census_deploy(tmp_path, repo, monkeypatch)
-    bare = branch.removeprefix('task/')
 
-    with _census_queue(repo, states={bare: ['abandoned'],
+    with _census_queue(repo, states={_bare(branch): ['abandoned'],
                                      FakeMergeQueue.REQUEST_ID: ['verifying', 'done']}) as (
             queue, _):
         result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
@@ -1477,4 +1473,121 @@ def test_a_retained_deploy_that_settled_is_reclaimed_and_the_night_lands(tmp_pat
     assert _commit_step(result) == 'landed:mr-deploy0001', _diag(result)
     assert len(queue.calls_to('merge_request')) == 1
     assert not worktree.exists()
+    _assert_left_nothing_behind(tmp_path, repo)
+
+
+def test_an_earlier_night_landing_while_it_is_asked_about_is_under_tonights_row(
+        tmp_path, monkeypatch):
+    """The night measures the main its reclaim leaves, so an earlier row that
+    lands just then is the base of tonight's, not a conflict with it."""
+    repo = _git_repo_harness(tmp_path)
+    branch, _ = _retained_census_deploy(tmp_path, repo, monkeypatch)
+    queue = FakeMergeQueue(repo, states=['verifying', 'done'])
+    handlers = queue.handlers()
+    answer_status = handlers['merge_status']
+    earlier_landing = []
+
+    def the_earlier_night_lands_as_it_is_asked_about(arguments):
+        if arguments.get('branch') != _bare(branch):
+            return answer_status(arguments)
+        merged = _git(repo, 'merge', '--no-ff', '-q', '-m', f'Merge {branch} into main', branch)
+        assert merged.returncode == 0, merged.stderr
+        earlier_landing.append(_main(repo))
+        return {'request_id': 'mr-earlier-night', 'state': 'done'}
+
+    handlers['merge_status'] = the_earlier_night_lands_as_it_is_asked_about
+    with FakeEscalationMcp(tool_handlers=handlers) as server:
+        _commit_orchestrator_config(repo, server.port)
+        result, calls = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+
+    assert _commit_step(result) == 'landed:mr-deploy0001', _diag(result)
+    (landed_before_measuring,) = earlier_landing
+    assert _census_call(calls)['head'] == landed_before_measuring, calls
+    assert _git(repo, 'rev-parse', 'main^1').stdout.strip() == landed_before_measuring
+    _assert_left_nothing_behind(tmp_path, repo)
+
+
+# ── a stop, and a landing step that cannot answer ───────────────────────────
+
+def test_a_stop_while_the_landing_waits_cancels_it_and_leaves_nothing_behind(tmp_path):
+    """A unit stop signals the whole cgroup: the landing cancels its request,
+    the wrapper's EXIT trap removes the generation worktree, and the run ends
+    143, not 0."""
+    repo = _git_repo_harness(tmp_path)
+    env, _ = _wrapper_harness(tmp_path, census_writes=_REGENERATED)
+    env['REPO'] = str(repo)
+    with _census_queue(repo, states=['verifying']) as (queue, _):
+        wrapper = subprocess.Popen(
+            [BASH, str(WRAPPER)], env=env, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 60
+            while (not queue.calls_to('merge_status') and wrapper.poll() is None
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
+            assert queue.calls_to('merge_status'), 'the landing never started waiting'
+            os.killpg(wrapper.pid, signal.SIGTERM)
+            stdout, stderr = wrapper.communicate(timeout=60)
+        finally:
+            if wrapper.poll() is None:
+                os.killpg(wrapper.pid, signal.SIGKILL)
+                wrapper.wait()
+
+    assert wrapper.returncode == 143, f'rc={wrapper.returncode} stdout={stdout!r} stderr={stderr!r}'
+    assert queue.calls_to('merge_cancel') == [{'request_id': queue.request_id}], stderr
+    assert 'done (' not in stdout, stdout
+    _assert_left_nothing_behind(tmp_path, repo)
+
+
+def _wrapper_copy_without_a_venv(tmp_path, *beside):
+    """A byte copy of the wrapper, its uv resolver and the *beside* script
+    modules, in a scripts dir with no ../.venv, so its landing heredoc runs
+    whichever python3 PATH names."""
+    scripts = tmp_path / 'copied-checkout' / 'scripts'
+    (scripts / 'lib').mkdir(parents=True)
+    for rel in (WRAPPER.name, 'lib/resolve_uv.sh', *beside):
+        shutil.copy2(TEMPLATES_DIR / rel, scripts / rel)
+    return scripts / WRAPPER.name
+
+
+def _run_copied_wrapper(tmp_path, wrapper, python3_body):
+    """*wrapper* on a real clean $REPO, with a `python3` running
+    *python3_body* first on PATH."""
+    repo = _git_repo_harness(tmp_path)
+    env, state_path = _wrapper_harness(tmp_path, census_writes=_REGENERATED)
+    env['REPO'] = str(repo)
+    python3 = _wrapper_bin_dir(tmp_path) / 'python3'
+    python3.write_text(f'#!{BASH}\n{python3_body}\n')
+    python3.chmod(0o755)
+    result = subprocess.run([BASH, str(wrapper)], env=env, capture_output=True, text=True,
+                            timeout=120)
+    return result, json.loads(state_path.read_text()), repo
+
+
+def test_a_landing_step_that_dies_without_answering_is_failed_no_verdict(tmp_path):
+    wrapper = _wrapper_copy_without_a_venv(tmp_path)
+
+    result, calls, repo = _run_copied_wrapper(tmp_path, wrapper, 'exit 1')
+
+    assert result.returncode == 0, _diag(result)
+    line = _done_line(result.stdout)
+    assert 'census=skipped ' in line, _diag(result)
+    assert 'commit=1 commit-step=failed:no-verdict)' in line, _diag(result)
+    assert [c['who'] for c in calls] == ['STAMP'], calls
+    _assert_left_nothing_behind(tmp_path, repo)
+
+
+def test_a_landing_step_that_cannot_import_its_transport_says_so(tmp_path):
+    """The venvless fallback interpreter is the one a missing checkout venv
+    leaves: an import it cannot make is named, not a traceback."""
+    wrapper = _wrapper_copy_without_a_venv(tmp_path, '_config_reload_gate.py')
+
+    result, calls, repo = _run_copied_wrapper(tmp_path, wrapper, f'exec {sys.executable} "$@"')
+
+    assert result.returncode == 0, _diag(result)
+    line = _done_line(result.stdout)
+    assert 'census=skipped ' in line, _diag(result)
+    assert 'commit=1 commit-step=failed:transport_not_importable)' in line, _diag(result)
+    assert [c['who'] for c in calls] == ['STAMP'], calls
     _assert_left_nothing_behind(tmp_path, repo)

@@ -23,7 +23,9 @@
 #
 # Then a third, non-measuring step LANDS what the census regenerated on main
 # through the target's own merge queue, waiting for that landing to settle.
-# The census measures a detached generation worktree of main's tip, so the
+# Whether an earlier night's landing may still land is asked BEFORE anything
+# is measured, and such a night measures and lands nothing. The census
+# measures a detached generation worktree of main's tip, so the
 # machine-operated project_root checkout is never written; why, and how to
 # read each outcome, is OPERATIONS.md §12.
 #
@@ -46,15 +48,16 @@
 # routine outcome, not a fault. Propagating it would wedge the timer on the
 # first churny night and quietly end the trend -- while the artifacts, which
 # carry the evidence of the shortfall, were written anyway. Both exit codes are
-# narrated instead, so exiting 0 never means the failure is invisible. A stop
-# signal (a unit stop, TimeoutStartSec) ends the run with 143 or 130 once the
-# landing in flight has cancelled its request.
+# narrated instead, so exiting 0 never means the failure is invisible.
 #
-# The ONE exception is a refusal to START: when the shared uv resolver cannot
+# TWO EXITS ARE NOT 0. A refusal to START: when the shared uv resolver cannot
 # be loaded or uv cannot be resolved, the wrapper exits 127 (the code a bare
 # missing uv gives) before either half runs. That is a configuration fault
 # that would fail every night identically with nothing measured, so a failed
-# unit is the signal it needs. Once the halves run, the wrapper exits 0.
+# unit is the signal it needs. And a STOP: SIGTERM (a unit stop, or
+# TimeoutStartSec) or SIGINT ends the run 143 or 130, once the step in the
+# foreground has returned -- for the landing, once it has cancelled its
+# request.
 #
 # RUNS UNDER THE SERVICE ENV (sourced .env + CONFIG_PATH / PROJECT_ROOT /
 # FALKORDB_URI roots) and under `uv run` so `fused_memory.*` imports resolve --
@@ -83,12 +86,12 @@ set -uo pipefail
 
 # ── AMBIENT GIT REDIRECTION IS NEUTRALISED BEFORE ANY GIT RUNS ──────────────
 #
-# Every git call below is spelled `git -C "$REPO" <verb>`, which READS as "act
-# on $REPO" but is not: `-C` only changes directory, while GIT_DIR and its
-# siblings SKIP repository discovery outright. An ambient GIT_DIR therefore
-# redirects every call site -- the generation worktree's and the landing's
-# included -- into a repository this script was never told about, with both
-# $REPO and -C inert. Measured 2026-08-31: that is how a test run of
+# Every git call this wrapper makes, and every one the landing makes for it,
+# names its directory with `git -C <dir>`, which READS as "act on <dir>" but
+# is not: `-C` only changes directory, while GIT_DIR and its siblings SKIP
+# repository discovery outright. An ambient GIT_DIR therefore redirects every
+# call site -- the generation worktree's and the landing's included -- into a
+# repository this script was never told about, with both $REPO and -C inert. Measured 2026-08-31: that is how a test run of
 # scripts/tests/test_install_memory_metadata_coverage_census_timer.py committed
 # placeholder content onto main in the live project_root checkout and rewrote
 # its .git/config identity, despite every path in that harness being pinned to
@@ -149,7 +152,8 @@ ARTIFACTS=(
 # tip, running that worktree's own copy of the census, so no checkout's working
 # tree is written but the generation worktree's (OPERATIONS.md §12). A $REPO
 # inside no checkout runs in place. A $REPO inside a checkout that is not its
-# root, or whose generation worktree cannot be prepared, is not measured.
+# root, or whose generation worktree cannot be prepared, is not measured; nor
+# is a night that cannot land (below).
 #
 # The EXIT trap removes the generation worktree. TERM and INT exit through it
 # only once the foreground step returns (scripts/lib/deploy_main_copy.sh
@@ -165,11 +169,145 @@ trap remove_generation_worktree EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 
+# ── THE LANDING STEPS ───────────────────────────────────────────────────────
+#
+# Both run one heredoc, in one of two modes, through
+# scripts/_merge_queue_landing.py; inputs are argv only. Its EXIT STATUS names
+# the outcome, and is what this script branches on; its last stdout line is
+# what that outcome carries:
+#
+#   reclaim  0                     the night may land: the escalation port
+#            RECLAIM_IN_FLIGHT_RC  an earlier night's census landing may still
+#                                  land: skipped:landing-in-flight
+#            any other             it may not: the commit-step token saying why
+#   land     0                     landed:<request id, or the deploy branch>
+#            any other             the commit-step token saying why not
+#
+# A heredoc that prints nothing is failed:no-verdict. OPERATIONS.md §12
+# tabulates what each token means.
+SCRIPT_DIR=$(cd "$_self_dir" && pwd)
+PY="$SCRIPT_DIR/../.venv/bin/python3"
+[ -x "$PY" ] || PY=python3
+LANDING_LABEL=memory-metadata-census
+RECLAIM_IN_FLIGHT_RC=3
+
+landing_heredoc() {
+    "$PY" - "$@" <<'LAND_PY'
+import os
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+mode, script_dir, repo, label, *mode_args = sys.argv[1:]
+sys.path.insert(0, script_dir)
+FAILED = 1
+
+
+def answer(line, narration, *, rc):
+    print(f"memory-metadata-coverage-census: {narration}", file=sys.stderr, flush=True)
+    print(line, flush=True)
+    sys.exit(rc)
+
+
+try:
+    import _checkout as _checkout
+    from _merge_queue_landing import LandingNotConfirmed, land_files, reclaim_retained_deploys
+    from dashboard.config import discover_root_escalation_url
+except ImportError as exc:
+    from _config_reload_gate import transport_not_importable_remedy
+    answer("failed:transport_not_importable", transport_not_importable_remedy(exc), rc=FAILED)
+
+
+def reclaim(in_flight_rc):
+    url = discover_root_escalation_url(Path(repo))
+    try:
+        port = urlsplit(url).port if url else None
+    except ValueError:
+        port = None
+    if port is None:
+        answer("refused:no-escalation-port",
+               f"{repo}'s orchestrator config names no escalation port ({url}), so there is no "
+               f"merge queue to land through", rc=FAILED)
+    in_flight = reclaim_retained_deploys(repo, label, port=str(port))
+    if in_flight:
+        answer("skipped:landing-in-flight",
+               f"an earlier night's landing may still land ({', '.join(in_flight)}); not "
+               f"measuring or landing tonight, so the two cannot conflict on the append-only "
+               f"history", rc=int(in_flight_rc))
+    print(port, flush=True)
+
+
+def land(port, base, census_root, message, *changed):
+    files = {rel: (Path(census_root) / rel).read_bytes() for rel in changed}
+    landing = land_files(
+        repo, files, base, port=port, label=label, message=message,
+        timeout_secs=os.environ.get("CENSUS_LANDING_TIMEOUT_SECS") or None,
+    )
+    answer(f"landed:{landing.request_id or landing.branch}",
+           f"landed {landing.branch} request_id={landing.request_id} as {landing.landed_as}", rc=0)
+
+
+try:
+    {"reclaim": reclaim, "land": land}[mode](*mode_args)
+except LandingNotConfirmed as exc:
+    answer(f"failed:{exc.failure.value}", exc.detail, rc=FAILED)
+LAND_PY
+}
+
+# Runs the landing heredoc with ARGS, its stdout to FILE; sets step_rc and
+# step_answer (its last stdout line).
+run_landing_step() {
+    local file="$1"
+    shift
+    landing_heredoc "$@" > "$file"
+    step_rc=$?
+    local lines=()
+    mapfile -t lines < "$file"
+    step_answer=""
+    [ "${#lines[@]}" -gt 0 ] && step_answer="${lines[-1]}"
+    if [ -z "$step_answer" ]; then
+        step_answer="failed:no-verdict"
+        step_rc=1
+    fi
+}
+
+# ── WHETHER TONIGHT MEASURES, AND WHETHER IT MAY LAND ───────────────────────
+#
+# Decided before anything is measured. `land_precondition` is the commit-step
+# token of a night that will not land, and `land_precondition_rc` its
+# commit= value. The reclaim runs BEFORE main's tip is taken: only this job
+# makes census deploys and the oneshot cannot overlap itself, so once it has
+# answered, no earlier deploy can land under tonight's base.
+census_commit="${CENSUS_COMMIT:-1}"
 census_root=""
-land_refusal=""
+land_precondition=""
+land_precondition_rc=0
+port=""
+
+no_generation_worktree() {
+    echo "memory-metadata-coverage-census: could not prepare a generation worktree of" \
+         "$REPO's main ($1); not measuring in place instead" >&2
+    land_precondition="failed:generation-worktree"
+    land_precondition_rc=1
+}
+
+# Sets $port and returns 0 when the night may land; otherwise sets the
+# precondition from the reclaim's answer and returns 1.
+reclaim_earlier_landings() {
+    run_landing_step "$gen_scratch/reclaim-answer" reclaim "$SCRIPT_DIR" "$REPO" \
+        "$LANDING_LABEL" "$RECLAIM_IN_FLIGHT_RC"
+    case "$step_rc" in
+        0) port="$step_answer"; return 0 ;;
+        "$RECLAIM_IN_FLIGHT_RC") land_precondition_rc=0 ;;
+        *) land_precondition_rc=1 ;;
+    esac
+    land_precondition="$step_answer"
+    return 1
+}
+
 if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     census_root="$REPO"
-    land_refusal="skipped:not-a-git-repo"
+    land_precondition="skipped:not-a-git-repo"
 elif ! repo_toplevel=$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null) || \
      [ "$(cd "$REPO" 2>/dev/null && pwd -P)" != "$(cd "$repo_toplevel" 2>/dev/null && pwd -P)" ]; then
     # FAIL CLOSED. The repository git resolves for $REPO is not $REPO itself:
@@ -180,13 +318,15 @@ elif ! repo_toplevel=$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null) || 
     echo "memory-metadata-coverage-census: REFUSING to measure or land — \$REPO ($REPO)" \
          "is not the root of the repository git resolves for it" \
          "(${repo_toplevel:-<none>})" >&2
-    land_refusal="refused:repo-not-toplevel"
+    land_precondition="refused:repo-not-toplevel"
+    land_precondition_rc=1
+elif ! gen_scratch=$(mktemp -d); then
+    no_generation_worktree "no scratch directory for it"
+elif [ "$census_commit" = 1 ] && ! reclaim_earlier_landings; then
+    : # the reclaim's answer is the precondition
 elif ! BASE=$(git -C "$REPO" rev-parse --verify --quiet 'main^{commit}') || \
-     ! gen_scratch=$(mktemp -d) || \
      ! git -C "$REPO" worktree add --detach --quiet "$gen_scratch/tree" "$BASE" >&2; then
-    echo "memory-metadata-coverage-census: could not prepare a generation worktree of" \
-         "$REPO's main (${BASE:-no main branch}); not measuring in place instead" >&2
-    land_refusal="failed:generation-worktree"
+    no_generation_worktree "${BASE:-no main branch}"
 else
     census_root="$gen_scratch/tree"
 fi
@@ -201,7 +341,7 @@ if [ -n "$census_root" ]; then
     fi
 else
     census_rc=skipped
-    echo "memory-metadata-coverage-census: census skipped ($land_refusal)" >&2
+    echo "memory-metadata-coverage-census: census skipped ($land_precondition)" >&2
 fi
 
 echo "memory-metadata-coverage-census: rehearsing the retro topic/canonical stamp (DRY RUN)"
@@ -217,75 +357,17 @@ fi
 # changed artifacts, read from the generation worktree, on a unique deploy
 # branch, through one normal-lane request on $REPO's own merge queue, waited
 # for and confirmed by git. `commit_step` names the outcome in ONE stable
-# token on the done(...) line (the vocabulary is OPERATIONS.md §12's); the
-# heredoc prints it as its last stdout line. `commit_rc` says whether the
-# landing step failed.
-SCRIPT_DIR=$(cd "$_self_dir" && pwd)
-PY="$SCRIPT_DIR/../.venv/bin/python3"
-[ -x "$PY" ] || PY=python3
-
-land_artifacts() {
-    "$PY" - "$@" <<'LAND_PY'
-import os
-import sys
-from pathlib import Path
-from urllib.parse import urlsplit
-
-script_dir, repo, base, census_root, label, message, *changed = sys.argv[1:]
-sys.path.insert(0, script_dir)
-
-
-def verdict(token, narration, *, rc):
-    print(f"memory-metadata-coverage-census: {narration}", file=sys.stderr, flush=True)
-    print(token, flush=True)
-    sys.exit(rc)
-
-
-try:
-    import _checkout as _checkout
-    from _merge_queue_landing import LandingNotConfirmed, land_files, reclaim_retained_deploys
-    from dashboard.config import discover_root_escalation_url
-except ImportError as exc:
-    from _config_reload_gate import transport_not_importable_remedy
-    verdict("failed:transport_not_importable", transport_not_importable_remedy(exc), rc=1)
-
-url = discover_root_escalation_url(Path(repo))
-try:
-    port = urlsplit(url).port if url else None
-except ValueError:
-    port = None
-if port is None:
-    verdict("refused:no-escalation-port",
-            f"{repo}'s orchestrator config names no escalation port ({url}), so there is no "
-            f"merge queue to land through", rc=1)
-
-files = {rel: (Path(census_root) / rel).read_bytes() for rel in changed}
-try:
-    in_flight = reclaim_retained_deploys(repo, label, port=str(port))
-    if in_flight:
-        verdict("skipped:landing-in-flight",
-                f"an earlier night's landing may still land ({', '.join(in_flight)}); skipping "
-                f"tonight's so the two cannot conflict on the append-only history", rc=0)
-    landing = land_files(
-        repo, files, base, port=str(port), label=label, message=message,
-        timeout_secs=os.environ.get("CENSUS_LANDING_TIMEOUT_SECS") or None,
-    )
-except LandingNotConfirmed as exc:
-    verdict(f"failed:{exc.failure.value}", exc.detail, rc=1)
-verdict(f"landed:{landing.request_id or landing.branch}",
-        f"landed {landing.branch} request_id={landing.request_id} as {landing.landed_as}", rc=0)
-LAND_PY
-}
-
+# token on the done(...) line; `commit_rc` says whether the landing step
+# failed.
 commit_rc=0
-if [ "${CENSUS_COMMIT:-1}" != "1" ]; then
+if [ "$census_commit" != "1" ]; then
     commit_step="skipped:disabled"
     echo "memory-metadata-coverage-census: CENSUS_COMMIT=0 — measured and" \
          "rehearsed; landing nothing"
-elif [ -n "$land_refusal" ]; then
-    commit_step="$land_refusal"
-    case "$land_refusal" in skipped:*) ;; *) commit_rc=1 ;; esac
-    echo "memory-metadata-coverage-census: not landing the artifacts ($land_refusal)" >&2
+elif [ -n "$land_precondition" ]; then
+    commit_step="$land_precondition"
+    commit_rc="$land_precondition_rc"
+    echo "memory-metadata-coverage-census: not landing the artifacts ($land_precondition)" >&2
 else
     changed=()
     for rel in "${ARTIFACTS[@]}"; do
@@ -296,16 +378,12 @@ else
         commit_step="skipped:no-drift"
         echo "memory-metadata-coverage-census: artifacts unchanged — nothing to land"
     else
-        verdict_file="$gen_scratch/landing-verdict"
-        land_artifacts "$SCRIPT_DIR" "$REPO" "$BASE" "$census_root" memory-metadata-census \
+        run_landing_step "$gen_scratch/landing-answer" land "$SCRIPT_DIR" "$REPO" \
+            "$LANDING_LABEL" "$port" "$BASE" "$census_root" \
             "chore(census): nightly canonical/topic coverage census $(date -u +%Y-%m-%d)" \
-            "${changed[@]}" > "$verdict_file"
-        commit_rc=$?
-        mapfile -t verdict_lines < "$verdict_file"
-        commit_step="failed:no-verdict"
-        [ "${#verdict_lines[@]}" -gt 0 ] && [ -n "${verdict_lines[-1]}" ] &&
-            commit_step="${verdict_lines[-1]}"
-        [ "$commit_step" = "failed:no-verdict" ] && commit_rc=1
+            "${changed[@]}"
+        commit_step="$step_answer"
+        [ "$step_rc" -eq 0 ] || commit_rc=1
     fi
 fi
 
@@ -316,8 +394,8 @@ fi
 # is exactly what made "declined" and "landed" ambiguous in the journal before
 # this field existed.
 echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc commit=$commit_rc commit-step=$commit_step)"
-# Always 0 once the halves have run (the pre-flight 127 is the header's one
-# exception) — a recurring systemd oneshot that exits non-zero enters `failed`
+# Always 0 once the halves have run (the header names the two exits that are
+# not) — a recurring systemd oneshot that exits non-zero enters `failed`
 # state and STAYS there, silently ending the append-only trend this job
 # exists to build (see the header, and scripts/fused-memory-flag-marker-sweep.sh).
 # That is a strictly worse outcome than the one missed nightly row a refusal

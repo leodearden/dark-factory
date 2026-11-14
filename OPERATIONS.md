@@ -4251,24 +4251,29 @@ advance main, which halts the whole queue (`wip_overlap`).
   one **normal-lane**, unverified merge request. There is no carrier task:
   the deploy branch is both the request's task id and its branch.
 - The run **waits** for its landing to settle, confirmed by git, before it
-  exits. `CENSUS_LANDING_TIMEOUT_SECS` (72000 in the unit) bounds the wait,
-  and `TimeoutStartSec=82800` bounds the run, so the next 05:00 finds the
-  oneshot inactive. A stop (a unit stop, or that timeout) cancels the
-  request first and ends the run 143.
-- **One census request at a time.** Before landing, the wrapper calls
-  `scripts/_merge_queue_landing.py::reclaim_retained_deploys`. A census
-  deploy an earlier run *retained* (its cancel refused, or the orchestrator
-  down at a stop) is torn down once main carries it or the queue reports it
-  settled. One that may still land makes the night
-  `skipped:landing-in-flight`, so two requests never conflict on the
-  append.
+  exits. The request is named on stderr as soon as the queue accepts it.
+  `CENSUS_LANDING_TIMEOUT_SECS` (72000 in the unit) bounds the wait, and
+  `TimeoutStartSec=82800` bounds the run, measuring included, so the next
+  05:00 finds the oneshot inactive. A stop (a unit stop, or that timeout)
+  cancels the request first and ends the run 143.
+- **One census request at a time.** Before main's tip is taken, the wrapper
+  calls `scripts/_merge_queue_landing.py::reclaim_retained_deploys`. A
+  census deploy an earlier run *retained* (its cancel refused, or the
+  orchestrator down at a stop) is torn down once main carries it or the
+  queue reports it settled, so a row that lands just then is under
+  tonight's rather than in conflict with it. One that may still land makes
+  the night `skipped:landing-in-flight`: it measures and lands nothing, so
+  two requests never conflict on the append. A worktree of such a branch
+  that the landing did not make is never force-removed; stderr names it.
 
 Like both other steps it is **best-effort**: a refused or failed landing is
-narrated and never propagated, and a night whose corpus did not drift asks
-the queue nothing. `CENSUS_COMMIT=0` measures and rehearses in the
-generation worktree but lands nothing, and its artifacts are discarded with
-the worktree. For an **ad-hoc look**, run the regen command above directly,
-with `--no-history`.
+narrated and never propagated. A night that cannot land, because the queue
+cannot be asked or an earlier landing may still land, measures nothing
+(`census=skipped`). A night with no retained deploy whose corpus did not
+drift asks the queue nothing. `CENSUS_COMMIT=0` skips the reclaim, measures
+and rehearses in the generation worktree but lands nothing, and its
+artifacts are discarded with the worktree. For an **ad-hoc look**, run the
+regen command above directly, with `--no-history`.
 
 **Reading the output.** Every line is prefixed
 `memory-metadata-coverage-census:` and the run ends with one summary line
@@ -4283,13 +4288,13 @@ memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 commit-step=lan
 | `landed:<request id>` | Landed on main; the deploy branch when the queue named no request id |
 | `skipped:no-drift` | Nothing changed; no queue call was made |
 | `skipped:disabled` | `CENSUS_COMMIT=0` |
-| `skipped:landing-in-flight` | An earlier night's census deploy may still land (stderr names it) |
+| `skipped:landing-in-flight` | An earlier night's census deploy may still land (stderr names it); `census=skipped` |
 | `skipped:not-a-git-repo` | `$REPO` is inside no checkout; measured in place |
 | `refused:repo-not-toplevel` | `$REPO` is not its checkout's root; `census=skipped` |
-| `refused:no-escalation-port` | `$REPO/dark-factory-orchestrator.yaml` names no `escalation.port` |
+| `refused:no-escalation-port` | `$REPO/dark-factory-orchestrator.yaml` names no `escalation.port`; `census=skipped` |
 | `failed:generation-worktree` | No main, or the worktree could not be added; `census=skipped` |
-| `failed:<tag>` | `land_files` refused; `<tag>` is a `scripts/_merge_queue_landing.py::LandingFailure` value (`not_landed`, `timed_out`, `checkout_dirty`, …) |
-| `failed:no-verdict` | The landing step printed no token |
+| `failed:<tag>` | `land_files` refused, or the reclaim before measuring failed (then `census=skipped`); `<tag>` is a `scripts/_merge_queue_landing.py::LandingFailure` value (`not_landed`, `timed_out`, `checkout_dirty`, …) |
+| `failed:no-verdict` | A landing step printed no token |
 
 A landing is confirmed by its request: `merge_status` on the id answers
 `done` and its `merge_finalized` event carries `state: done`, while
@@ -4310,7 +4315,11 @@ shares: a recurring `oneshot` that can fail enters systemd `failed` state
 and stays there, silently ending the trend. A red run is found by reading
 the summary line, not the unit state — and a `commit=` other than 0, narrated
 as `commit-step=refused:*` or `commit-step=failed:*`, is the one worth acting
-on, since that night's row did not reach main.
+on. Almost always that night's row did not reach main; two tags differ.
+`failed:checkout_not_synced` means the row DID land, and only
+`project_root`'s copy of the artifacts lags main's. `failed:timed_out` or
+`failed:interrupted` whose stderr says the deploy was kept may still land;
+the next night's reclaim reports it in flight, or tears it down.
 `scripts/memory-metadata-coverage-census.sh` is the source of the full
 `commit-step=` token vocabulary.
 
