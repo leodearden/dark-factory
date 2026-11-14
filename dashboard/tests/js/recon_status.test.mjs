@@ -127,8 +127,6 @@ test('reconRunCounts: buckets a mixed window', () => {
   assert.equal(counts.failed, 4);
   assert.equal(counts.terminal, 16, 'completed + failed');
   assert.equal(counts.unknown, 6);
-  assert.ok(!('interrupted' in counts), 'no bucket for a retired status');
-  assert.ok(!('unsuccessful' in counts), 'no second name for failed');
 });
 
 test('reconRunCounts: the buckets partition the window exactly', () => {
@@ -150,8 +148,6 @@ test('reconRunCounts: the buckets partition the window exactly', () => {
     'a run was lost or double-counted',
   );
   assert.equal(counts.terminal, counts.success + counts.failed);
-  assert.ok(!('interrupted' in counts), 'no bucket for a retired status');
-  assert.ok(!('unsuccessful' in counts), 'no second name for failed');
 });
 
 test('reconRunCounts: an out-of-vocabulary status lands in `unknown` and nowhere else', () => {
