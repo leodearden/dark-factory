@@ -792,3 +792,71 @@ class TestCaptureZeroOutputEvidenceEnriched:
                 f'Expected each last_records entry to have a "message" key '
                 f'(real nested CLI schema); got keys {list(rec.keys())!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# Task 3319 (PRD ε): the evidence JSON names a provider-outage cause
+# ---------------------------------------------------------------------------
+
+_PROVIDER_529_ERROR = (
+    'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+)
+
+
+def _server_error_zero_output_result() -> AgentResult:
+    """The 2026-07-29 incident shape: a watchdog-killed run whose flushed
+    result JSON carried a 529, with the provider's error at the END of output."""
+    return AgentResult(
+        success=False,
+        output='x' * 10_000 + _PROVIDER_529_ERROR,
+        timed_out=True,
+        turns=0,
+        cost_usd=0.0,
+        duration_ms=120_000,
+        transcript_turns=0,
+        api_error_status=529,
+    )
+
+
+class TestZeroOutputEvidenceCarriesServerErrorCause:
+    """Evidence from a 5xx zero-output run is self-describing: it carries the
+    HTTP status and the tail of the CLI output that holds the provider error."""
+
+    def test_evidence_records_api_error_status_and_output_tail(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+        result = _server_error_zero_output_result()
+
+        wf._capture_zero_output_evidence(result, 1)  # type: ignore[attr-defined]
+
+        data = json.loads(wf.artifacts.zero_output_evidence_path(1).read_text())
+        assert data['api_error_status'] == 529
+        assert data['output_tail'].endswith(_PROVIDER_529_ERROR)
+        assert len(data['output_tail']) < len(result.output)
+
+    def test_wedge_evidence_records_null_api_error_status(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+
+        wf._capture_zero_output_evidence(_zero_output_agent_result(), 1)  # type: ignore[attr-defined]
+
+        data = json.loads(wf.artifacts.zero_output_evidence_path(1).read_text())
+        assert 'api_error_status' in data
+        assert data['api_error_status'] is None
+
+    @pytest.mark.asyncio
+    async def test_server_error_requeue_writes_evidence_with_status(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        _stub_iteration_helpers(wf, _server_error_zero_output_result())
+        wf.scheduler.set_task_status = AsyncMock()  # type: ignore[method-assign]
+        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert wf.artifacts is not None
+        evidence_path = wf.artifacts.zero_output_evidence_path(1)
+        assert evidence_path.exists()
+        data = json.loads(evidence_path.read_text())
+        assert data['api_error_status'] == 529
+        assert 'overloaded_error' in data['output_tail']
