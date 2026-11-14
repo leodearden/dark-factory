@@ -2052,19 +2052,14 @@ class _DeepScene:
         """Drive ONE full dispatch round through ``_dispatch_item``.
 
         Returns the recorded ``_run_inflight_verify`` kwargs for the round
-        (plus ``'result'``).  Releases the host lease, any worktree the
-        ordinary (non-chain) arm hands back, and the chain reservation a
-        passing tip hands to finalize (task 7720), so the next round starts
-        from the same resource state — which is what makes the ROUND SEQUENCE,
-        and not a slowly-leaking fixture, the thing under test.
+        (plus ``'result'``), after :meth:`release_round`.
         """
         self._round_no += 1
-        worker = self.worker
         item = _make_item(
             _make_req('101', '101', self.config, self.repo), self.head,
             _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}'),
         )
-        entry = await worker._dispatch_item(item)
+        entry = await self.worker._dispatch_item(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -2072,16 +2067,26 @@ class _DeepScene:
         rec = self.calls[-1]
         rec['item'] = item
         rec['round'] = self._round_no
+        await self.release_round(entry)
+        return rec
+
+    async def release_round(self, entry) -> None:
+        """Hand back what the round that just verified *entry* holds.
+
+        The host lease, the chain reservation a passing tip keeps for finalize
+        (task 7720), and any worktree the ordinary (non-chain) arm hands to
+        ``_finalize_inflight``.  The scene stops short of finalize (γ lands
+        nothing), so the next round starts from the same resource state —
+        which is what makes the ROUND SEQUENCE, and not a slowly-leaking
+        fixture, the thing under test.
+        """
+        worker = self.worker
         if entry.lease is not None:
             await worker._host_allocator.release(entry.lease)
-        worker._chain_reservations.release(item.request.request_id)
-        vr = rec['result']
+        worker._chain_reservations.release(entry.item.request.request_id)
+        vr = self.calls[-1]['result']
         if vr.merge_wt is not None:
-            # The ordinary arm hands its verified worktree to _finalize_inflight;
-            # this scene stops short of finalize (γ lands nothing), so return it
-            # here or the pool starves the next round.
             await worker._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
-        return rec
 
 
 async def _make_deep_scene(
@@ -2339,15 +2344,8 @@ class TestDeepDispatchRoundsIntegration:
         entry = await scene.worker._dispatch_item(head_item)
         assert entry is not None and entry.verify_task is not None
         await entry.verify_task
-        await scene.worker._host_allocator.release(entry.lease)
-        # As round_ does: the scene stops short of finalize, so a chained head
-        # hands its links back here or the speculative rounds find none.
-        scene.worker._chain_reservations.release(head_item.request.request_id)
-        _vr = scene.calls[-1]['result']
-        if _vr.merge_wt is not None:
-            await scene.worker._release_or_cleanup(
-                _vr.merge_wt, spec_warm=_vr.spec_warm,
-            )
+        # A chained head's links go back too, or the speculative rounds find none.
+        await scene.release_round(entry)
 
         # slot 2: deep (6) → halved (3) → floor (no chain).  The fake runner
         # always passes, so drive the halving by hand rather than by verdict —

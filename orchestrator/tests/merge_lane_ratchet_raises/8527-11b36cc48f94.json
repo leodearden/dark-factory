@@ -1,0 +1,24 @@
+{
+  "task_id": "8527",
+  "reason": "Merge-lane policy epsilon (plans/merge-lane-policy-prd.md D5): a head alone in the verify frontier may chain. Net-additive policy, not a failed refactor. worker.py cognitive +1 is the new pure predicate may_chain (cognitive 1: 'speculative or frontier_depth == 0'), which guard 1 of _deep_chain_placement (8 -> 8) and the d=1 floor reset arm of _run_inflight_verify (95 -> 95, now keyed on the dispatch-time depth) both call, so one rule decides both (SPOT). _holds_lookahead (1 -> 1) drops its speculative term so the merger holds its look-ahead for every item while chain_cap > 0; otherwise a chained head would skip a follower the merger already popped and break delta's contiguous-prefix walk. Adoption now declines for a non-speculative tip through the extracted _head_inside_tip (new, cognitive 5); _adopt_head_on_tip_authority falls 16 -> 11, so the extraction is cognitive-neutral (5 + 11 = 16). test_merge_queue_deep_landing.py private_reads 85 -> 86: the new test_a_non_speculative_tip_adopts_nothing_ahead_of_it calls _adopt_head_on_tip_authority directly, the private seam TestHeadCancelOnAdoption already drives. test_merge_queue_deep_dispatch.py falls 138 -> 137 (its new direct _deep_chain_placement call is offset by folding the head round's resource release into _DeepScene.release_round), so total:private_reads holds at 6479.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1968,
+      "current": 1969
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_deep_landing.py",
+      "baseline": 85,
+      "current": 86
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5238,
+      "current": 5239
+    }
+  ]
+}
