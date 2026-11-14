@@ -63,8 +63,9 @@ zeroes it, including for the counter that speaks about the OTHER leg.
 
 Its two counters therefore gate on per-leg evidence instead, each column
 populated only by its own leg's success: ``memory_ids`` (extended only after
-``mem0.add`` returns) for ``memories_added``, and ``'graphiti' in stores``
-(appended only after ``durable_queue.enqueue`` returns) for
+``mem0.add`` returns) for ``memories_added``, and ``'graphiti' in
+stores_queued`` (appended only after ``durable_queue.enqueue`` returns; rows
+journaled before task 9147 carried it in the legacy ``stores`` list) for
 ``graphiti_writes_queued``. Because the evidence exists only where that leg
 succeeded, reading it instead of ``success`` cannot over-count — the gate
 could only ever have suppressed a true positive — and a both-legs-failed row,
@@ -106,7 +107,7 @@ _OP_TO_STAT: dict[str, str] = {
 # VIRTUAL keys derived from op state rather than mapped 1:1 in _OP_TO_STAT:
 #
 #   'graphiti_writes_queued' — the residual of add_memory ops where memory_ids
-#       is empty but stores includes graphiti.
+#       is empty but stores_queued (legacy rows: stores) includes graphiti.
 #   'writes_dead_lettered'   — ops the durable queue drove to its dead-letter
 #       state (terminal_status == 'dead').
 #
@@ -224,7 +225,7 @@ def _count_add_memory(op: dict) -> bool:
 
     Mem0 may dedup a write and return an empty ``memory_ids`` list. Only ops
     where ``memory_ids`` is a non-empty list count toward ``memories_added``.
-    Graphiti-only async-enqueued writes (``memory_ids=[]``, ``stores=['graphiti']``)
+    Graphiti-only async-enqueued writes (``memory_ids=[]``, ``stores_queued=['graphiti']``)
     are tracked separately under ``graphiti_writes_queued`` via ``_count_graphiti_queued``.
     An op that reached neither store with a returned ID is a no-op here.
 
@@ -283,10 +284,12 @@ def _count_graphiti_queued(op: dict) -> bool:
 
     Graphiti writes are enqueued asynchronously and return no ``memory_ids``
     inline. An op counts as a graphiti-only enqueue iff ``memory_ids`` is empty
-    (so it was not counted toward ``memories_added``) and
-    ``stores``/``stores_written`` contains ``'graphiti'``. These are tallied
-    separately under ``graphiti_writes_queued`` rather than ``memories_added``
-    to avoid inflating the memories count.
+    (so it was not counted toward ``memories_added``) and its queued-store list
+    contains ``'graphiti'``. That list is ``stores_queued`` when the row carries
+    the key; rows journaled before task 9147, when add_memory reported its
+    Graphiti leg as written, carry it in the legacy ``stores``/``stores_written``
+    list instead. These are tallied separately under ``graphiti_writes_queued``
+    rather than ``memories_added`` to avoid inflating the memories count.
 
     That evidence is per-leg, which is why ``write_ops.success`` is NOT also
     consulted — the mirror of the rule in ``_count_add_memory``. The reasoning
@@ -294,13 +297,13 @@ def _count_graphiti_queued(op: dict) -> bool:
     ``services/memory_service.py::MemoryService.add_memory`` itself; the other
     two ``add_memory`` producers are single-leg MEM0 writes that can never
     reach this branch, since a Mem0-only result never puts ``'graphiti'`` in
-    ``stores``. That is why no ``source`` carve-out is needed here, unlike in
+    either list. That is why no ``source`` carve-out is needed here, unlike in
     ``_count_add_memory``.
     ``services/memory_service.py::MemoryService.add_memory`` appends
-    ``'graphiti'`` to ``stores`` only AFTER ``durable_queue.enqueue`` returns,
+    ``'graphiti'`` to ``stores_queued`` only AFTER ``durable_queue.enqueue`` returns,
     so its presence is standalone proof the enqueue was accepted and the write
     is durably persisted in the queue. The dropped ``success`` gate was
-    therefore redundant when the ENQUEUE failed (``stores`` never gains
+    therefore redundant when the ENQUEUE failed (the list never gains
     ``'graphiti'``, so the evidence gate already rejects the row) and actively
     wrong when the MEM0 leg failed (``success`` is the AND across both legs, so
     it zeroed a queued write it says nothing about).
@@ -315,8 +318,11 @@ def _count_graphiti_queued(op: dict) -> bool:
     if isinstance(memory_ids, list) and memory_ids:
         # Non-empty IDs: this op is a memories_added, not a graphiti enqueue.
         return False
-    stores = rs.get('stores') or rs.get('stores_written')
-    return bool(isinstance(stores, list) and 'graphiti' in stores)
+    if 'stores_queued' in rs:
+        queued = rs['stores_queued']
+    else:
+        queued = rs.get('stores') or rs.get('stores_written')
+    return bool(isinstance(queued, list) and 'graphiti' in queued)
 
 
 def derive_stage_stats(ops: list[dict], stage_agent_id: str) -> dict[str, int]:
