@@ -15,7 +15,7 @@ def test_layout_constants_are_the_on_disk_names():
 def test_terminal_status_names_are_resolved_and_dismissed():
     assert escalation_layout.RESOLVED == 'resolved'
     assert escalation_layout.DISMISSED == 'dismissed'
-    assert escalation_layout.TERMINAL_STATUS_NAMES == {'resolved', 'dismissed'}
+    assert {'resolved', 'dismissed'} == escalation_layout.TERMINAL_STATUS_NAMES
 
 
 class TestArchiveDirForDate:
