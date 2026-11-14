@@ -102,6 +102,7 @@ from fused_memory.middleware.routing_intent_guard import (
     routing_intent_warning,
 )
 from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
+from fused_memory.middleware.task_facts import Lookup, TaskFactsReader, TaskRef, read_task_facts
 from fused_memory.middleware.task_interceptor import (
     TicketStoreNotConfiguredError,
     interceptor_write_succeeded,
@@ -1420,6 +1421,7 @@ def create_mcp_server(
         # collection prefix applies to the next resolution.
         return id_resolver or IdResolver.for_memory_service(memory_service)
     _taskmaster_configured = task_interceptor is not None
+    _task_facts_reader: TaskFactsReader | None = task_interceptor
 
     async def _backlog_gate(project_id: str) -> dict | None:
         """WP-D: reject memory writes when the per-project backlog is over the
@@ -2187,30 +2189,11 @@ def create_mcp_server(
         """Guard 4: refuse to mint a node for a task the registry does not have.
 
         Returns an ``EntityMintUnknownTask`` refusal dict, or ``None`` to
-        proceed.
-
-        THE THREE-VALUED ANSWER, which is why this shares
-        ``_batched_task_statuses`` with ``_claim_task_statuses`` rather than
-        reusing that function directly:
-
-        * ref PRESENT in the resolved map -> the task exists; proceed.
-        * ref ACKNOWLEDGED but not resolved -> the registry returned the key
-          with a non-``str`` value, so the task EXISTS and only its status is
-          unusable. Proceed: ``get_statuses`` omits unknown ids entirely and
-          coerces even a NULL status to ``'unknown'``, so PRESENCE is the
-          existence signal and the value's type is not. Reading this gap as
-          "no such task" would refuse a mint for a task that is really there —
-          the one input where the filter ``resolved`` shares with
-          ``_claim_task_statuses`` would give this caller the wrong answer.
-        * project CONSULTED but the ref absent ENTIRELY -> the registry
-          ANSWERED, and the answer was "no such task". Refuse: minting a node
-          for a task that does not exist creates exactly the orphan this gate
-          exists to prevent, and nothing sweeps orphan minted nodes.
-        * project NOT consulted -> unresolvable (no taskmaster, the referent's
-          project unregistered, or a raising read). Log a structured WARNING and
-          PROCEED. Refusing here would make the tool unusable on any deployment
-          without the task registry, which is a far worse failure than the
-          occasional unverified mint.
+        proceed, by the referent's ``Lookup``: FOUND proceeds; NO_SUCH_TASK
+        refuses, because the store answered and a node for a task that does not
+        exist is an orphan nothing sweeps; COULD_NOT_CHECK logs a WARNING and
+        proceeds, because an unreachable registry must not make this tool
+        unusable.
 
         The adjudicating project is the REFERENT's own
         (``referent.project_id or project_id``), never the writer's: reading the
@@ -2222,22 +2205,11 @@ def create_mcp_server(
         ref = str(getattr(referent, 'number', '') or '')
         if not ref:
             return None
-        resolved, consulted, acknowledged = await _batched_task_statuses(
-            {claimed_project: [ref]},
-            log_prefix=f'entity_mint (writer_project={project_id!r})',
-        )
-        if (claimed_project, ref) in resolved:
-            return None
-        if (claimed_project, ref) in acknowledged:
-            logger.warning(
-                'entity_mint: the task registry acknowledged task %r in project '
-                '%r but returned a non-str status for it; the task EXISTS, so '
-                'the mint proceeds — a present key is the existence signal and '
-                'the status value is not. writer_project=%r',
-                ref, claimed_project, project_id,
-            )
-            return None
-        if claimed_project in consulted:
+        task_ref = TaskRef(claimed_project, ref)
+        facts = (await read_task_facts(
+            [task_ref], reader=_task_facts_reader, known_projects=_kp,
+        ))[task_ref]
+        if facts.lookup is Lookup.NO_SUCH_TASK:
             return {
                 'status': 'refused',
                 'error': (
@@ -2251,14 +2223,14 @@ def create_mcp_server(
                 'project_id': claimed_project,
                 'ref': ref,
             }
-        logger.warning(
-            'entity_mint: could not verify task %r in project %r against the '
-            'task registry (taskmaster_configured=%s, registered=%s); minting '
-            'anyway rather than refusing, because an unreachable registry must '
-            'not make this tool unusable. writer_project=%r',
-            ref, claimed_project, _taskmaster_configured,
-            _kp.get(claimed_project) is not None, project_id,
-        )
+        if facts.lookup is Lookup.COULD_NOT_CHECK:
+            logger.warning(
+                'entity_mint: could not verify task %r in project %r against the '
+                'task registry (%s); minting anyway rather than refusing, because '
+                'an unreachable registry must not make this tool unusable. '
+                'writer_project=%r',
+                ref, claimed_project, facts.reason, project_id,
+            )
         return None
 
     async def _claim_ticket_rows(claims: list[Any]) -> dict[str, Any]:
