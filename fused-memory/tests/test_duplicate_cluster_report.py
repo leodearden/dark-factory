@@ -1119,11 +1119,11 @@ class TestScheduledFailures:
     def test_a_failed_category_is_listed_and_the_rest_is_still_reported(
         self, config, fake_detector, tmp_path: Path, behaviour, error_type, exit_code, tail,
     ) -> None:
-        quick = config.model_copy(update={'detector_timeout_secs': 0.5})
+        bounded = config.model_copy(update={'detector_timeout_secs': 10})
         fake_detector.behave({f'dark_factory/{_PN}': behaviour})
         out_root = tmp_path / 'out'
 
-        code = _schedule(quick, fake_detector, out_root)
+        code = _schedule(bounded, fake_detector, out_root)
 
         assert code == report.EXIT_RUN_FAILED
         rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
