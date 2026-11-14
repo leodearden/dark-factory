@@ -41,9 +41,11 @@ echoed keys below land in that dict.
 Keys the installer declares in *echoed_meta_keys* are also folded into the
 result proper, because the agent's client renders ``structuredContent`` and
 drops ``_meta`` (``plans/uuid-prefix-resolution-prd.md`` §11 Q1). A key lands
-only where it is absent, and in ``structuredContent`` only when the tool's
-``outputSchema`` still accepts the folded value: the mcp ``ClientSession``
-raises on a ``structuredContent`` that fails it.
+only where it is absent, and only when the tool's ``outputSchema`` still
+accepts the folded ``structuredContent``: the mcp ``ClientSession`` raises on
+one that fails it. The JSON text block gets exactly the keys
+``structuredContent`` accepted, so the two stay one serialisation; a tool with
+no structured content has only the text block to fold into.
 
 ## Order and containment
 
@@ -58,7 +60,9 @@ containment, so every member is contained here: anything but
 logged, the member's argument edits are rolled back, and the call continues to
 the REST of the chain (fail OPEN — a check that crashed checked nothing, but
 the checks inside it still run). After the member forwarded, the exception is
-re-raised, because re-dispatching would double a write.
+re-raised, because re-dispatching would double a write. Only the link whose
+member raised logs it: an exception that came up out of a member's
+``call_next`` passes the outer links silently.
 """
 
 from __future__ import annotations
@@ -170,11 +174,16 @@ def _contained(member: Middleware, call_next: _CallNext, *, label: str) -> _Call
     async def link(context: _ShimContext) -> Any:
         snapshot = dict(context.message.arguments)
         forwarded = False
+        escaped_from_inside: BaseException | None = None
 
         async def forward(forwarded_context: _ShimContext) -> Any:
-            nonlocal forwarded
+            nonlocal forwarded, escaped_from_inside
             forwarded = True
-            return await call_next(forwarded_context)
+            try:
+                return await call_next(forwarded_context)
+            except BaseException as exc:
+                escaped_from_inside = exc
+                raise
 
         try:
             # ``cast`` here is the whole nominal cost of the adaptation:
@@ -183,7 +192,9 @@ def _contained(member: Middleware, call_next: _CallNext, *, label: str) -> _Call
             return await member.on_call_tool(cast(Any, context), cast(Any, forward))
         except (asyncio.CancelledError, ToolError):
             raise
-        except BaseException:
+        except BaseException as exc:
+            if exc is escaped_from_inside:
+                raise
             name = context.message.name
             if forwarded:
                 logger.exception(
@@ -213,19 +224,19 @@ def _accepts(schema: dict[str, Any] | None, instance: dict[str, Any]) -> bool:
     return True
 
 
-def _fold_structured(
+def _accepted_echoes(
     structured: dict[str, Any] | None,
     echoes: dict[str, Any],
     output_schema: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
+    """The *echoes* that may join the result: all of them without *structured*, else the absent keys its schema still accepts."""
     if structured is None:
-        return None
-    folded = dict(structured)
+        return dict(echoes)
+    accepted: dict[str, Any] = {}
     for key, value in echoes.items():
-        candidate = {**folded, key: value}
-        if key not in folded and _accepts(output_schema, candidate):
-            folded = candidate
-    return folded
+        if key not in structured and _accepts(output_schema, {**structured, **accepted, key: value}):
+            accepted[key] = value
+    return accepted
 
 
 def _fold_text(content: list[Any], echoes: dict[str, Any]) -> list[Any]:
@@ -272,9 +283,11 @@ def _deliver_member_result(
             label, sorted(meta), name, type(dispatched.raw).__name__,
         )
         return dispatched.raw
+    structured = result.structured_content
+    accepted = _accepted_echoes(structured, echoes, output_schema)
     return types.CallToolResult(
-        content=_fold_text(list(result.content), echoes),
-        structuredContent=_fold_structured(result.structured_content, echoes, output_schema),
+        content=_fold_text(list(result.content), accepted),
+        structuredContent=None if structured is None else {**structured, **accepted},
         isError=dispatched.is_error if dispatched is not None else False,
         _meta=meta or None,
     )

@@ -9,6 +9,10 @@ shape the bundled dispatcher produces:
   refuses a dict-valued key, like fused-memory's ``get_external_statuses``.
 * ``bare`` (``-> dict``): a bare content list, no output schema.
 
+Two more tools produce the dispatcher's remaining raw values: ``escapes``
+raises ``SystemExit``, which only the safe wrapper turns into a value (its
+error dict), and ``fails`` returns its own ``CallToolResult`` with ``isError``.
+
 Wire assertions go through a real in-memory ``ClientSession``, which also runs
 the client's own ``outputSchema`` validation. Members use public fastmcp names
 only.
@@ -28,9 +32,11 @@ from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import CallToolResult, TextContent
 
+from fused_memory.server.main import _install_safe_tool_wrapper
 from fused_memory.server.tool_middleware_bridge import install_tool_middleware
 
 _SENTINEL = '_toy_chain_installed'
+_BRIDGE_LOGGER = 'fused_memory.server.tool_middleware_bridge'
 _TOOLS = ('any_values', 'str_values', 'bare')
 _PROBE = {'k': 1}
 
@@ -65,6 +71,14 @@ def _toy_server(tools: _ToyTools) -> FastMCP:
     @server.tool()
     def bare(note: str = '') -> dict:
         return tools.record('bare', note, {'note': note})
+
+    @server.tool()
+    def escapes() -> dict[str, Any]:
+        raise SystemExit('escaped the tool body')
+
+    @server.tool()
+    def fails() -> CallToolResult:
+        return CallToolResult(content=[TextContent(type='text', text='refused')], isError=True)
 
     return server
 
@@ -115,6 +129,15 @@ class _RaisesAfterForwarding(Middleware):
     async def on_call_tool(self, context, call_next):
         await call_next(context)
         raise RuntimeError('defect after the call was forwarded')
+
+
+class _AnswersWithoutForwarding(Middleware):
+    async def on_call_tool(self, context, call_next):
+        return ToolResult(
+            content=[TextContent(type='text', text=json.dumps({'note': 'answered'}))],
+            structured_content={'note': 'answered'},
+            meta={'probe': _PROBE},
+        )
 
 
 def _install(server: FastMCP, members: tuple[Middleware, ...], **kwargs: Any) -> None:
@@ -237,6 +260,18 @@ class TestPerMemberContainment:
         assert tools.runs == [('bare', 'x')]
 
     @pytest.mark.asyncio
+    async def test_only_the_link_whose_member_raised_logs_it(self, caplog):
+        server = _toy_server(_ToyTools())
+        _install(server, (_PassThrough(), _PassThrough(), _RaisesAfterForwarding()))
+
+        with caplog.at_level('ERROR', logger=_BRIDGE_LOGGER), pytest.raises(RuntimeError):
+            await server._tool_manager.call_tool('bare', {'note': 'x'})
+
+        errors = [record.getMessage() for record in caplog.records if record.name == _BRIDGE_LOGGER]
+        assert len(errors) == 1
+        assert '_RaisesAfterForwarding raised AFTER forwarding' in errors[0]
+
+    @pytest.mark.asyncio
     async def test_cancellation_propagates(self):
         tools = _ToyTools()
         server = _toy_server(tools)
@@ -275,7 +310,7 @@ class TestTheEchoFold:
         assert _single_text_json(result) == {'note': 'x', 'nested': {'n': 1}, 'probe': _PROBE}
 
     @pytest.mark.asyncio
-    async def test_a_schema_that_refuses_the_key_keeps_structured_content_unfolded(self):
+    async def test_a_schema_that_refuses_the_key_keeps_both_representations_unfolded(self):
         server = _toy_server(_ToyTools())
         _install(server, (_MetaAdder(probe=_PROBE),), echoed_meta_keys=frozenset({'probe'}))
 
@@ -283,7 +318,18 @@ class TestTheEchoFold:
 
         assert result.isError is False
         assert result.structuredContent == {'note': 'x'}
+        assert _single_text_json(result) == {'note': 'x'}
         assert result.meta == {'probe': _PROBE}
+
+    @pytest.mark.asyncio
+    async def test_a_tool_without_structured_content_gets_the_key_in_its_text_block(self):
+        server = _toy_server(_ToyTools())
+        _install(server, (_MetaAdder(probe=_PROBE),), echoed_meta_keys=frozenset({'probe'}))
+
+        result = await _wire(server, 'bare', {'note': 'x'})
+
+        assert result.structuredContent is None
+        assert _single_text_json(result) == {'note': 'x', 'probe': _PROBE}
 
     @pytest.mark.asyncio
     async def test_a_key_the_tool_already_returned_is_not_overwritten(self):
@@ -327,3 +373,46 @@ class TestTheEchoFold:
         assert 'private' not in wire.structuredContent
         assert 'private' not in _single_text_json(wire)
         assert 'private' not in in_process
+
+
+class TestResultsTheMemberMetaMeetsOutsideTheToolsOutput:
+    @pytest.mark.asyncio
+    async def test_the_safe_wrappers_error_dict_arrives_and_the_dropped_meta_is_logged(self, caplog):
+        server = _toy_server(_ToyTools())
+        _install_safe_tool_wrapper(server)
+        _install(server, (_MetaAdder(probe=_PROBE),), echoed_meta_keys=frozenset({'probe'}))
+
+        with caplog.at_level('WARNING', logger=_BRIDGE_LOGGER):
+            result = await server._tool_manager.call_tool('escapes', {}, convert_result=True)
+
+        assert result == {'error': 'escaped the tool body', 'error_type': 'SystemExit'}
+        [warning] = [
+            record.getMessage() for record in caplog.records
+            if record.name == _BRIDGE_LOGGER and record.levelname == 'WARNING'
+        ]
+        assert "['probe']" in warning and 'escapes' in warning
+
+    @pytest.mark.asyncio
+    async def test_a_member_answering_without_forwarding_reaches_the_client(self):
+        tools = _ToyTools()
+        server = _toy_server(tools)
+        _install(server, (_AnswersWithoutForwarding(),))
+
+        result = await _wire(server, 'any_values', {'note': 'x'})
+
+        assert tools.runs == []
+        assert result.isError is False
+        assert result.structuredContent == {'note': 'answered'}
+        assert result.meta == {'probe': _PROBE}
+
+    @pytest.mark.asyncio
+    async def test_a_tools_own_is_error_survives_the_members_meta(self):
+        server = _toy_server(_ToyTools())
+        _install(server, (_MetaAdder(probe=_PROBE),))
+
+        result = await _wire(server, 'fails', {})
+
+        assert result.isError is True
+        assert result.meta == {'probe': _PROBE}
+        [block] = result.content
+        assert isinstance(block, TextContent) and block.text == 'refused'
