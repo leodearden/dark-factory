@@ -146,6 +146,8 @@ class TestApply:
         assert response.evicted == {KA.key: 1}
         assert response.counted == ((KA.unit_id, KA.key, seeded.entry_alpha.entry_id),)
         assert response.policy.streak == 1
+        assert response.policy.streak == len(response.streak_leaks)
+        assert [leak.identity for leak in response.streak_leaks] == list(response.counted)
         assert not response.policy.is_disabled(seeded.now)
         assert (response.newly_disabled, response.l2_required) == (False, False)
 
@@ -168,6 +170,7 @@ class TestApply:
         assert state.reason and 'module:alpha:test' in state.reason and 'module:beta:test' in state.reason
         assert {record.unit_id for record in _records(state)} == {'module:alpha:test', 'module:beta:test'}
         assert (response.newly_disabled, response.l2_required) == (True, True)
+        assert response.policy.streak == len(response.streak_leaks) == 2
         view = asyncio.run(seeded.registry.view([KG]))
         for role in ('task', 'merge'):
             decision = policy.decide(_BOTH_ON, role, KG, view, never_cache=False, now=now)
@@ -181,6 +184,33 @@ class TestApply:
 
         assert response.policy.streak == 1
         assert response.policy.disabled_until is None
+        assert [record.unit_id for record in _records(seeded.policy())] == ['module:alpha:test', 'module:beta:test']
+
+    def test_a_leak_redelivered_after_the_window_never_counts_again(self, seeded):
+        seeded.leak(HEAD, ALPHA_NODE)
+        seeded.advance(timedelta(days=8))
+
+        redelivered = seeded.leak(HEAD, ALPHA_NODE)
+
+        assert redelivered.counted == ()
+        assert redelivered.policy.streak == 0
+        [alpha] = _records(seeded.policy())
+        assert (alpha.unit_id, alpha.detected_at) == ('module:alpha:test', T0)
+
+        beta = seeded.leak(HEAD, BETA_NODE)
+
+        assert beta.policy.streak == 1
+        assert not beta.policy.is_disabled(seeded.now)
+        assert beta.newly_disabled is False
+
+    def test_an_aged_record_is_kept_while_its_landing_still_replays_it_and_dropped_once_pruned(self, seeded):
+        seeded.leak(HEAD, ALPHA_NODE)
+        seeded.advance(timedelta(days=8))
+        asyncio.run(seeded.registry.prune(entries_recorded_before=T0 - timedelta(days=1), consumed_before=seeded.now))
+        seeded.fresh_leak_source(KB, LATER_HEAD)
+
+        seeded.leak(LATER_HEAD, BETA_NODE)
+
         assert [record.unit_id for record in _records(seeded.policy())] == ['module:beta:test']
 
     def test_two_distinct_leaks_in_one_verdict_disable_at_once(self, seeded):
@@ -209,7 +239,7 @@ class TestApply:
 
         state = seeded.policy()
         assert state.disabled_until is None
-        assert len(state.leaks) < registry.MIN_DISABLING_LEAKS
+        assert state.streak == 1
         assert (after.newly_disabled, after.l2_required) == (False, False)
 
 
@@ -227,6 +257,19 @@ class TestEnable:
         assert seeded.leak(HEAD, ALPHA_NODE).policy.streak == 0
         seeded.fresh_leak_source(KA, LATER_HEAD)
         assert seeded.leak(LATER_HEAD, ALPHA_NODE).policy.streak == 1
+
+    def test_enable_holds_past_the_leak_window(self, seeded):
+        seeded.leak(HEAD, ALPHA_NODE, BETA_NODE)
+        now = seeded.advance(timedelta(days=8))
+        assert seeded.policy().is_disabled(now)
+        asyncio.run(audit.enable(seeded.registry, 'fixed the key', now))
+
+        response = seeded.leak(HEAD, ALPHA_NODE, BETA_NODE)
+
+        assert response.policy.streak == 0
+        assert not response.policy.is_disabled(seeded.now)
+        assert response.l2_required is False
+        assert response.counted == ()
 
     @pytest.mark.parametrize('reason', ['', '   '])
     def test_a_blank_reason_is_refused(self, seeded, reason):
@@ -328,6 +371,22 @@ class TestAuditHook:
         for named in ('module:alpha:test', 'module:beta:test', HEAD, LATER_HEAD, KA.key, KB.key):
             assert named in told, told
         assert 'orchestrator verify-cache enable' in told, told
+
+    def test_the_blocker_names_only_the_leaks_the_streak_counts(self, hooked):
+        earlier_head = 'c0' * 20
+        hooked.seeded.consume(earlier_head, hooked.seeded.entry_gamma)
+        hooked.call(_reproduced(GAMMA_NODE), head=earlier_head)
+        hooked.seeded.advance(timedelta(days=8))
+
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+
+        [blocker] = hooked.pending()
+        assert 'module:alpha:test' in blocker.summary and 'module:beta:test' in blocker.summary, blocker.summary
+        assert 'module:gamma:test' not in blocker.summary, blocker.summary
+        [gamma_line] = [line for line in blocker.detail.splitlines() if 'module:gamma:test' in line]
+        assert gamma_line.endswith(' (not counting toward the streak)'), gamma_line
+        counting = [line for line in blocker.detail.splitlines() if 'module:alpha:test' in line or 'module:beta:test' in line]
+        assert counting and not [line for line in counting if 'not counting' in line], blocker.detail
 
     def test_a_disabled_cache_files_no_second_blocker_until_the_first_is_resolved(self, hooked):
         hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
