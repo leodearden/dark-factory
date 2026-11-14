@@ -116,7 +116,7 @@ from test_merge_queue_concurrent_verify import (
     _make_branch_with_file,
 )
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane, WaiterRecord
@@ -411,6 +411,10 @@ class TestScenario1SpeculativeCascade:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """N fails permanently (local, parked); N+1 (remote) survives via cascade."""
+        # Deep chains off (task 8527): under the operational yaml's chain_cap the
+        # head, alone in the verify frontier, would chain the follower into one
+        # tip verify, and this cascade needs the follower verifying on its own.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         head_gate = asyncio.Event()
         follower_release = asyncio.Event()
         follower_entered = asyncio.Event()
@@ -1097,6 +1101,10 @@ class TestB8MidPipelineCensus:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """Two-item cascade sampled mid-verify, then drained to quiescence."""
+        # Deep chains off (task 8527): under the operational yaml's chain_cap the
+        # head, alone in the verify frontier, would chain the follower into one
+        # tip verify, and this cascade needs the follower verifying on its own.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         head_gate = asyncio.Event()
         follower_release = asyncio.Event()
         follower_entered = asyncio.Event()

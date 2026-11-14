@@ -528,30 +528,55 @@ class TestDeepChainPlacementGate:
         assert lanes == []
         assert scans == [], 'cap=0 must short-circuit BEFORE the O(n) queue scan'
 
-    async def test_non_speculative_item_is_never_chained(self, git_repo, monkeypatch):
-        """Slot 1 — the head trust anchor — is unchanged by contract, at ANY cap.
-
-        Its tree is merged onto REAL main; chaining onto it would make the one
-        verify the pipeline trusts for landing a cumulative tree instead.
-        """
+    async def _head_fixture(
+        self, git_repo: Path, monkeypatch,
+    ) -> tuple[SpeculativeMergeWorker, RealMergeItem, list[dict], list[str], list[int]]:
+        """A chain_cap=6 worker, five buffered requests and a NON-speculative head, all spied."""
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo, chain_cap=6)
         worker = _make_worker(git_ops)
         worker._intake.replace_lane('normal', [
             _make_req(str(300 + i), str(300 + i), config, git_repo) for i in range(5)
         ])
-        built = _spy_build_chain(monkeypatch)
-        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
-        scans = _spy_chain_snapshot(worker, monkeypatch)
         head_item = _make_item(
             _make_req('101', '101', config, git_repo), 'beef' * 10, git_repo,
             speculative=False,
         )
+        return (
+            worker, head_item,
+            _spy_build_chain(monkeypatch),
+            _count_spec_lane_acquires(git_ops, monkeypatch),
+            _spy_chain_snapshot(worker, monkeypatch),
+        )
+
+    async def test_non_speculative_item_beside_another_frontier_entry_is_not_chained(
+        self, git_repo, monkeypatch,
+    ):
+        """A head with another entry in the verify frontier declines before the scan (PRD D5).
+
+        The head is merged onto REAL main; anything landing ahead of it would
+        leave a chain built on it stale.
+        """
+        worker, head_item, built, lanes, scans = await self._head_fixture(git_repo, monkeypatch)
+        _seed_frontier(worker, 1)
 
         assert await worker._deep_chain_placement(head_item) is None
         assert built == []
         assert lanes == []
-        assert scans == [], 'the slot-1 guard must precede the queue scan too'
+        assert scans == [], 'the guard 1 decline must precede the queue scan too'
+
+    async def test_non_speculative_item_alone_in_the_frontier_chains(
+        self, git_repo, monkeypatch,
+    ):
+        """A head alone in the verify frontier reaches the build, seeded at its own commit (PRD D5)."""
+        worker, head_item, built, _lanes, scans = await self._head_fixture(git_repo, monkeypatch)
+
+        await worker._deep_chain_placement(head_item)
+
+        assert len(built) == 1, 'a head alone in the frontier must reach build_chain'
+        assert built[0]['head_merge_commit'] == head_item.merge_result.merge_commit
+        assert (built[0]['cap'], built[0]['target_depth']) == (5, 5)
+        assert scans == [5]
 
     async def test_queue_shorter_than_two_declines(self, git_repo, monkeypatch):
         """An empty unfrozen suffix means ``queue_len == 1`` — nothing to chain ONTO.
@@ -2272,12 +2297,12 @@ class TestDeepDispatchRoundsIntegration:
         verify, a deep tip verify, a halved tip verify and a floor verify —
         and requires the field present, integral and truthful on all of them.
 
-        Parameterised over the verify frontier, and the expected list is the
-        SAME at both: ``chain_items`` is in CHAIN-ITEM units and is
-        deliberately frontier-INDEPENDENT.  At ``frontier=0`` the list was
-        already this, so the parameterisation is what converts a vacuous pass
-        into a real pin — a frontier-derived emitter would produce
-        ``[1, 8, 5, 3]`` at ``frontier=2`` and fail here.
+        Parameterised over the verify frontier.  The three speculative rounds
+        expect the SAME list at both: ``chain_items`` is in CHAIN-ITEM units
+        and is deliberately frontier-INDEPENDENT, so a frontier-derived emitter
+        would produce ``[8, 5, 3]`` at ``frontier=2`` and fail here.  The head
+        round is where the frontier DOES matter, by policy: PRD D5 chains a
+        head only when it is alone in the frontier (boundary row 9).
         """
         from orchestrator.verify_runner import HostLease
 
@@ -2290,7 +2315,8 @@ class TestDeepDispatchRoundsIntegration:
             allocator=_StubRemoteAllocator(lease), frontier=frontier,
         )
 
-        # slot 1 (the trust anchor) — never chained, so a flat 1.
+        # slot 1 (the head): PRD D5 chains it only when it is alone in the verify
+        # frontier, so it is deep at frontier-0 and a flat 1 at frontier-2.
         #
         # base_sha is REAL MAIN, deliberately: a slot-1 item is merged onto
         # main, and a stale base would fire _dispatch_item's Mechanism-2
@@ -2307,6 +2333,9 @@ class TestDeepDispatchRoundsIntegration:
         assert entry is not None and entry.verify_task is not None
         await entry.verify_task
         await scene.worker._host_allocator.release(entry.lease)
+        # As round_ does: the scene stops short of finalize, so a chained head
+        # hands its links back here or the speculative rounds find none.
+        scene.worker._chain_reservations.release(head_item.request.request_id)
         _vr = scene.calls[-1]['result']
         if _vr.merge_wt is not None:
             await scene.worker._release_or_cleanup(
@@ -2327,8 +2356,16 @@ class TestDeepDispatchRoundsIntegration:
             assert not isinstance(ev['data']['chain_items'], bool)
             assert ev['data']['chain_items'] >= 1
 
-        assert [e['data']['chain_items'] for e in events] == [1, 6, 3, 1]
-        deep_events = [e for e in events if e['data']['chain_items'] >= 2]
+        head_event, *speculative_events = events
+        assert head_event['data']['speculative'] is False
+        if frontier == 0:
+            assert head_event['data']['chain_items'] >= 2, (
+                'boundary row 9: a head alone in the frontier verifies a chain'
+            )
+        else:
+            assert head_event['data']['chain_items'] == 1
+        assert [e['data']['chain_items'] for e in speculative_events] == [6, 3, 1]
+        deep_events = [e for e in speculative_events if e['data']['chain_items'] >= 2]
         assert len(deep_events) == 2, 'η1 must be able to SEE a deep verify'
 
     async def test_non_chain_speculative_dispatch_emits_one_at_any_frontier(
