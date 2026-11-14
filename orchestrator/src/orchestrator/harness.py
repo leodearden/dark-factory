@@ -65,7 +65,7 @@ from shared.transcript_archive import (
     set_archival_failure_hook,
 )
 
-from orchestrator import delivered_check_owner, recovery_pins, recut_ruling
+from orchestrator import cross_repo_gate, delivered_check_owner, recovery_pins, recut_ruling
 from orchestrator import digest as digest_mod
 from orchestrator.agent_session_reaper import (
     ReapTally,
@@ -9425,8 +9425,6 @@ class Harness:
 
         from escalation.models import Escalation  # noqa: PLC0415
 
-        from orchestrator import cross_repo_gate  # noqa: PLC0415
-
         text = cross_repo_gate.block_escalation_text(task_id, verdict)
         esc = Escalation(
             id=self._escalation_queue.make_id(task_id),
@@ -9665,8 +9663,6 @@ class Harness:
             False  — BLOCK (task blocked + L1 filed inside the gate; caller must
                      arm the requeue cooldown and skip workflow construction).
         """
-        from orchestrator import cross_repo_gate  # noqa: PLC0415
-
         task_id = assignment.task_id
 
         try:
@@ -10592,8 +10588,6 @@ class Harness:
             # It admits PRESENT-BUT-UNREADABLE metadata for the same reason, so
             # the gate's loud SKIP is actually reachable from here rather than
             # being a guarantee the dispatch path quietly withholds.
-            from orchestrator import cross_repo_gate  # noqa: PLC0415
-
             if cross_repo_gate.carries_cross_repo_signal(assignment.task) and not await self._run_cross_repo_gate(assignment):
                 # Foreign-owned: task is already blocked + escalated inside the
                 # gate.  Return a BLOCKED report so the caller (and
