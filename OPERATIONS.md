@@ -3706,9 +3706,16 @@ It is done when `systemctl --user list-timers --all` lists
 `OnFailure=` handler files one `infra_issue` info escalation, task id
 `quality-snapshot-<project_id>`, on the dark_factory escalation server. A
 handler that could not post shows as a failed
-`quality-snapshot-alarm@<project_id>.service`. The residual is the same as for
-the other §12 jobs: a timer that stops firing pages no one, so check
-`systemctl --user list-timers 'quality-snapshot@*'`.
+`quality-snapshot-alarm@<project_id>.service`.
+
+**What is not watched.** A timer that stops firing pages no one: the alarm
+covers only a run that fires and fails. No liveness predicate watches this
+timer yet, which departs from the ladder rule above. Its deploy, task 9986, is
+an operational human gate rather than a deterministic `before_done` task,
+because `submit_task` refuses a `before_done` script that is not yet on main,
+and 9986's morning-after check runs once. The predicate is a follow-up filed
+from task 8464, modelled on `scripts/legibility/check_trickle_liveness.sh`.
+Until it lands, check `systemctl --user list-timers 'quality-snapshot@*'`.
 
 **Run now.** `systemctl --user start quality-snapshot@<project_id>.service`.
 
