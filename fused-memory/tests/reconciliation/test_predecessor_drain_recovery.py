@@ -8,6 +8,7 @@ hard-killed instance: it drains and then simply closes.
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -18,14 +19,26 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 
-from fused_memory.models.reconciliation import EventSource, EventType, ReconciliationEvent
+from fused_memory.models.reconciliation import (
+    EventSource,
+    EventType,
+    ReconciliationEvent,
+    ReconciliationRun,
+    RunStatus,
+    RunType,
+)
 from fused_memory.reconciliation.event_buffer import DrainedRun, EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.predecessor_drain_recovery import (
+    RecoveredDrain,
+    recover_predecessor_drains,
+)
 from reconciliation.harness_fixtures import open_event_buffer, open_journal
 
 PROJECT_P = 'project-p'
 PROJECT_Q = 'project-q'
 DEAD_INSTANCE = 'dead-predecessor'
+KILLED_RUN_ID = 'run-killed-before-start-run'
 
 
 @dataclass(frozen=True)
@@ -67,6 +80,14 @@ async def _push_events(buffer: EventBuffer, project_id: str, count: int) -> list
     return ids
 
 
+async def _dead_predecessor_drains_two_events(stores: _Stores, *, holding_its_lock: bool) -> None:
+    """The dead instance drains a chunk and is killed before it writes the run row."""
+    if holding_its_lock:
+        assert await stores.dead.mark_run_active(PROJECT_P)
+    e1, e2 = await _push_events(stores.live, PROJECT_P, 2)
+    assert await stores.dead.drain_by_ids(PROJECT_P, [e1, e2], run_id=KILLED_RUN_ID) == 2
+
+
 @pytest.mark.asyncio
 async def test_drained_runs_of_other_instances_names_each_run_with_the_instance_that_drained_it(
     stores,
@@ -87,3 +108,87 @@ async def test_drained_runs_of_other_instances_names_each_run_with_the_instance_
     await stores.live.restore_drained(PROJECT_P, run_id='run-dead-chunk')
 
     assert await stores.live.drained_runs_of_other_instances() == []
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_drains_rebuffers_a_dead_predecessors_runless_drain_and_releases_its_lock(
+    stores, caplog,
+):
+    caplog.set_level(
+        logging.INFO, logger='fused_memory.reconciliation.predecessor_drain_recovery',
+    )
+    await _dead_predecessor_drains_two_events(stores, holding_its_lock=True)
+
+    recovered = await recover_predecessor_drains(stores.journal, stores.live)
+
+    assert recovered == [RecoveredDrain(
+        drained=DrainedRun(PROJECT_P, KILLED_RUN_ID, DEAD_INSTANCE),
+        restored=2,
+        lock_released=True,
+    )]
+    assert await stores.live.count_buffered(PROJECT_P) == 2
+    assert await stores.live.get_lock_holder_instance_id(PROJECT_P) is None
+    assert [
+        r for r in caplog.records
+        if r.name == 'fused_memory.reconciliation.predecessor_drain_recovery'
+        and r.levelno == logging.INFO
+        and r.getMessage() == 'reconciliation.predecessor_drain_recovered'
+    ], caplog.records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('run_status', [RunStatus.running, RunStatus.completed])
+async def test_recover_predecessor_drains_leaves_a_drain_whose_run_has_a_journal_row(
+    stores, run_status,
+):
+    await _dead_predecessor_drains_two_events(stores, holding_its_lock=True)
+    await stores.journal.start_run(ReconciliationRun(
+        id=KILLED_RUN_ID,
+        project_id=PROJECT_P,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.running,
+        instance_id=DEAD_INSTANCE,
+    ))
+    if run_status is RunStatus.completed:
+        await stores.journal.complete_run(KILLED_RUN_ID, 'completed')
+
+    assert await recover_predecessor_drains(stores.journal, stores.live) == []
+    assert await stores.live.count_buffered(PROJECT_P) == 0
+    assert await stores.live.get_lock_holder_instance_id(PROJECT_P) == DEAD_INSTANCE
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_drains_rebuffers_but_keeps_a_lock_another_instance_holds(
+    stores,
+):
+    await _dead_predecessor_drains_two_events(stores, holding_its_lock=False)
+    async with open_event_buffer(stores.db_path, instance_id='third-instance') as third:
+        assert await third.mark_run_active(PROJECT_P)
+
+        [recovered] = await recover_predecessor_drains(stores.journal, stores.live)
+
+    assert (recovered.restored, recovered.lock_released) == (2, False)
+    assert await stores.live.get_lock_holder_instance_id(PROJECT_P) == 'third-instance'
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_drains_rebuffers_when_no_lock_is_held(stores):
+    await _dead_predecessor_drains_two_events(stores, holding_its_lock=False)
+
+    [recovered] = await recover_predecessor_drains(stores.journal, stores.live)
+
+    assert (recovered.restored, recovered.lock_released) == (2, False)
+    assert await stores.live.count_buffered(PROJECT_P) == 2
+
+
+@pytest.mark.asyncio
+async def test_recover_predecessor_drains_never_touches_the_callers_own_drain(stores):
+    assert await stores.live.mark_run_active(PROJECT_P)
+    await _push_events(stores.live, PROJECT_P, 2)
+    await stores.live.drain(PROJECT_P, run_id='run-live-in-flight')
+
+    assert await recover_predecessor_drains(stores.journal, stores.live) == []
+    assert await stores.live.count_buffered(PROJECT_P) == 0
+    assert await stores.live.get_lock_holder_instance_id(PROJECT_P) == stores.live.instance_id
