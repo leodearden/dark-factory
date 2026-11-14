@@ -23,10 +23,13 @@ _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 
 Records every invocation (minus `--user`) into a JSON state file at
 $FAKE_SYSTEMCTL_STATE, and answers `show -p FIELD1,FIELD2,...  <unit>`
-(also accepts a repeated `-p FIELD` / `--property=FIELD`) from that
-file's "fields" mapping -- a requested field absent from "fields" answers
-as an empty string, mirroring real systemd's behavior for a unit that has
-never run.
+(or `--property=FIELD1,...`; only the last such flag counts) from that
+file's "fields" mapping. A requested field absent from "fields" answers
+as an empty string. Real systemd answers a never-run unit differently:
+Result=success and ExecMainStatus=0, with only ExecMainExitTimestamp
+empty -- the shape the never-ran guard's comment in
+scripts/legibility/check_trickle_health_liveness.sh records -- so a
+never-ran fixture must spell that shape out rather than omit fields.
 """
 import json
 import os

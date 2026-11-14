@@ -142,6 +142,7 @@ def test_an_unparseable_timestamp_is_not_alive(tmp_path):
     assert run.result.returncode != 0, (
         f'stdout={run.result.stdout!r} stderr={run.result.stderr!r}'
     )
+    assert 'could not parse' in run.result.stderr
 
 
 def test_a_wrong_argument_count_is_a_usage_error(tmp_path):
