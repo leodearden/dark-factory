@@ -31,6 +31,7 @@ from fused_memory.reconciliation.scope_freshness import (
     build_scope_snapshot_metadata,
     snapshot_is_fresh,
 )
+from fused_memory.server.recon_report import ReconReportState
 
 _FT = 'stale_metadata'
 
@@ -510,9 +511,7 @@ class TestReconReportStoresTheGoldenForms:
     """recon_report's stored forms, read only through ReconReportState's public seams."""
 
     @staticmethod
-    def _state() -> Any:
-        from fused_memory.server.recon_report import ReconReportState
-
+    def _state() -> ReconReportState:
         state = ReconReportState(
             ttl_seconds=300, clock=lambda: 0.0, task_interceptor=_AnyTaskInterceptor(),
         )
@@ -521,11 +520,19 @@ class TestReconReportStoresTheGoldenForms:
         return state
 
     @staticmethod
-    def _add(state: Any, *, task_id: Any, flag_type: Any, description: str = 'd') -> dict[str, Any]:
+    def _add(
+        state: ReconReportState,
+        *,
+        task_id: str | int | None,
+        flag_type: str | None,
+        description: str = 'd',
+    ) -> dict[str, Any]:
         return state.add_finding(
             run_id='r1', severity='moderate', category='memory_stale',
             description=description, suggested_action='a', actionable=True,
-            task_id=task_id, flag_type=flag_type,
+            # The int is the input under test: the golden form is pinned for int task ids that reach the boundary.
+            task_id=task_id,  # pyright: ignore[reportArgumentType]
+            flag_type=flag_type,
         )
 
     @pytest.mark.parametrize(('task_id', 'flag_type', 'recon_task_id'), _RECON_ROWS)
@@ -571,7 +578,11 @@ class TestReconReportStoresTheGoldenForms:
     async def test_an_int_citation_of_a_composite_member_anchors_the_entity_fold(self):
         state = self._state()
         composite = self._add(state, task_id='5040,5149', flag_type='X')
-        cited = await state.cite_task('r1', composite['finding_id'], 'dark_factory', 5149)
+        cited = await state.cite_task(
+            'r1', composite['finding_id'], 'dark_factory',
+            # The int is the input under test: the golden form is pinned for int task ids that reach the boundary.
+            5149,  # pyright: ignore[reportArgumentType]
+        )
         assert 'error' not in cited, cited
 
         later = self._add(state, task_id=None, flag_type='X', description='worded differently')
