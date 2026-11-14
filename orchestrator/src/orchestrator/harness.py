@@ -182,6 +182,7 @@ from orchestrator.pause_policy import (
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.quarantine_provenance import QuarantineOutcome
+from orchestrator.recovered_merge_owner import RecoveredMergeOwner
 from orchestrator.recovery_emission import (
     STREAK_CHARGING_SITES,
     LeaveReason,
@@ -13602,6 +13603,12 @@ class Harness:
         ``run()`` can thread the recovered requests' branches into
         :meth:`_reap_orphaned_merge_worktrees` (task 2060) — a recovered
         in-flight worktree is re-adopted rather than reaped.
+
+        No workflow awaits a recovered request, so each one's outcome is
+        adopted by
+        ``orchestrator/src/orchestrator/recovered_merge_owner.py::RecoveredMergeOwner``
+        (task 7277): a landing drives the landed-outbox done-write, and a
+        durable failure blocks the task and files an L1.
         """
         report = await recover_pending_merges(
             self._merge_store,
@@ -13615,6 +13622,12 @@ class Harness:
             enqueue_merge_request=enqueue_merge_request,
             select_recovery_winner=select_recovery_winner,
         )
+        RecoveredMergeOwner(
+            tasks=self.scheduler,
+            escalations=self._escalation_queue,
+            reconcile_landed=self._landed_dispatch_gate,
+            event_store=self.event_store,
+        ).adopt(report.get('requests', []), schedule=self._schedule_coro_threadsafe)
         logger.info(
             '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
             'journal_corrupt=%s',
