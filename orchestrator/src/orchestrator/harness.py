@@ -8835,10 +8835,16 @@ class Harness:
         open notice already exists (pending, level=0, this role), this is a
         no-op.  Best-effort: any submit failure is swallowed and logged.
 
-        **Routing note:** ``severity='info', level=0``.  Level-0 INFO is
-        surfaced via the steward's pending-escalation view and external
-        monitors/dashboards/webhooks; it does NOT auto-promote and does NOT
-        additionally halt the scheduler (the watchdog's own latch already did).
+        **Routing note:** ``severity='info', level=0``, against a sentinel
+        task no steward serves.  Once older than ``orphan_l0_timeout_secs``
+        the orphan L0 reaper hands it to the info-L0 router, which closes it
+        as status-info and lists it on that class's aggregate L1, because
+        ``_WARM_BASE_HARD_DOWN_ROLE`` is in
+        ``escalation.classify.INFO_L0_MECHANICAL_ROLES``.  With
+        ``info_l0_router_enabled`` off the reaper promotes it to L1 instead.
+        Filing it never halts the scheduler; the watchdog's own latch already
+        halted dispatch.
+        See orchestrator/tests/test_info_l0_router_harness.py::TestHarnessSentinelNoticesAreRoutedNotLeftPending.
         """
         if not self._escalation_queue:
             return
@@ -8968,7 +8974,7 @@ class Harness:
     def _file_no_landings_info_escalation(self, trip: BreakerTrip) -> None:
         """File a non-blocking INFO escalation for the no-landings circuit-breaker.
 
-        Mirrors ``_file_starvation_info`` (pure operator-signal INFO, level=0)
+        Mirrors ``_file_starvation_info`` (pure operator-signal INFO)
         and uses the ``_NO_LANDINGS_SENTINEL`` sentinel task_id (mirroring
         ``_SCHEDULER_PAUSE_SENTINEL``) so the escalation is global / not tied
         to a specific task.
@@ -8977,12 +8983,18 @@ class Harness:
         agent_role=``orchestrator-no-landings-breaker``), this is a no-op.
         Best-effort: any submit failure is swallowed and logged.
 
-        **Routing note:** ``severity='info', level=0``.  Level-0 INFO is
-        surfaced via the steward's pending-escalation view and external monitors/
-        dashboards/webhooks.  Does NOT auto-promote and does NOT additionally
-        halt the scheduler (``force_halt_scheduler`` already handles the halt;
-        ``file_escalation=False`` was passed there to avoid the auto-watcher
-        resolving the scheduler-pause L1 and silently undoing the halt).
+        **Routing note:** ``severity='info', level=0``, against a sentinel
+        task no steward serves.  Once older than ``orphan_l0_timeout_secs``
+        the orphan L0 reaper hands it to the info-L0 router, which closes it
+        as status-info and lists it on that class's aggregate L1, because
+        ``orchestrator-no-landings-breaker`` is in
+        ``escalation.classify.INFO_L0_MECHANICAL_ROLES``.  With
+        ``info_l0_router_enabled`` off the reaper promotes it to L1 instead.
+        Filing it never halts the scheduler (``force_halt_scheduler`` already
+        handles the halt; ``file_escalation=False`` was passed there to avoid
+        the auto-watcher resolving the scheduler-pause L1 and silently undoing
+        the halt).
+        See orchestrator/tests/test_info_l0_router_harness.py::TestHarnessSentinelNoticesAreRoutedNotLeftPending.
         """
         if not self._escalation_queue:
             return
