@@ -1,4 +1,4 @@
-"""Where a deterministic task's before_done script runs (tasks 6464, 6386, 6557, 9116).
+"""Where a deterministic task's before_done script runs (tasks 6464, 6386, 6557, 9116, 5312).
 
 Pure-function tests for ``resolve_before_done_paths``, the single entry point
 both the run-time executor and the fused-memory submit guard call: a relative
@@ -8,6 +8,9 @@ is a ``BeforeDonePathsRefused``. A stored record can reach the executor through
 ``update_task``, whose ``BeforeDone`` write boundary only warns, so the
 resolver refuses a malformed record itself rather than failing in the path
 join.
+
+``require_runnable_script`` is the one rule both callers apply to the resolved
+script: it exists and this process may execute it. These tests use real files.
 """
 
 from __future__ import annotations
@@ -21,9 +24,13 @@ from shared.before_done_paths import (
     BeforeDonePathsRefused,
     CwdRefused,
     FactoryRootUnresolved,
+    ScriptMissing,
+    ScriptNotExecutable,
     ScriptRefused,
     ScriptRoot,
     ScriptRootRefused,
+    ScriptUnrunnable,
+    require_runnable_script,
     resolve_before_done_paths,
 )
 
@@ -272,3 +279,39 @@ class TestBeforeDonePathsInvariant:
 
         assert f'BeforeDonePaths.{field} ' in str(excinfo.value)
         assert str(offending) in str(excinfo.value)
+
+
+class TestRequireRunnableScript:
+    def test_executable_file_is_accepted(self, tmp_path: Path) -> None:
+        script = tmp_path / 'deploy.sh'
+        script.write_text('#!/bin/sh\nexit 0\n')
+        script.chmod(0o755)
+
+        assert require_runnable_script(script) is None
+
+    def test_absent_path_is_missing_naming_the_path(self, tmp_path: Path) -> None:
+        script = tmp_path / 'scripts' / 'deploy.sh'
+
+        with pytest.raises(ScriptMissing) as excinfo:
+            require_runnable_script(script)
+
+        assert str(script) in str(excinfo.value)
+
+    def test_file_without_execute_bit_is_not_executable_naming_the_path(
+        self, tmp_path: Path,
+    ) -> None:
+        script = tmp_path / 'deploy.sh'
+        script.write_text('#!/bin/sh\nexit 0\n')
+        script.chmod(0o644)
+
+        with pytest.raises(ScriptNotExecutable) as excinfo:
+            require_runnable_script(script)
+
+        assert str(script) in str(excinfo.value)
+
+    @pytest.mark.parametrize('refusal', [ScriptMissing, ScriptNotExecutable])
+    def test_every_unrunnable_refusal_is_a_before_done_paths_refusal(
+        self, refusal: type[ScriptUnrunnable],
+    ) -> None:
+        assert issubclass(refusal, ScriptUnrunnable)
+        assert issubclass(ScriptUnrunnable, BeforeDonePathsRefused)
