@@ -64,6 +64,7 @@ PURE_STDLIB_LEAVES = (
     'branch_names',
     'cli_boundary',
     'config_dir',
+    'escalation_layout',
     'eval_lane',
     'git_async',
     'governed_exceptions',
