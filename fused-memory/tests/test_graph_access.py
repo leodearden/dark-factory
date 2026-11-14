@@ -396,7 +396,7 @@ class TestTheConnectionHasASocketTimeout:
                 graphiti=GraphitiBackendConfig(
                     falkordb=FalkorDBProviderConfig(socket_timeout_seconds=130.0),
                 ),
-                queue=QueueConfig(**{budget_field: 300.0}),
+                queue=QueueConfig.model_validate({budget_field: 300.0}),
             )
 
         message = str(raised.value)
