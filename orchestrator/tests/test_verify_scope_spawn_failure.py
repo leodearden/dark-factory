@@ -1,7 +1,12 @@
 """A verify leg whose systemd-run scope never started is host infra, not a branch fault.
 
-Pinned from the classifier, through the public ``run_verification`` spawn path,
-to the merge lane's bounded retry and transient-infra hold.
+"Never started" is a structural fact: ``verify.py::_run_cmd`` returns
+``ScopeLaunchRefused`` when its launcher exited without exec'ing the command
+(``scope_launch_handshake.py``), and ``verify.py::classify_leg`` reads it. The
+launcher's refusal TEXT is no evidence, since a command that did start can print
+it too. Pinned from the classifier, through the public ``run_verification`` spawn
+path (fake and real launchers), to the merge lane's bounded retry and
+transient-infra hold.
 
 Fixtures are kept MODULE-LOCAL (not conftest.py): a conftest.py edit widens the
 merge-time verify (see test_verify_scope_cpu_weight.py's docstring).
@@ -13,6 +18,7 @@ import json
 import os
 import shlex
 import stat
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -35,7 +41,7 @@ from orchestrator.verify import (
     classify_leg,
     run_verification,
 )
-from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES, FailureCategory
+from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import ChainSegment, ToolKind
 
@@ -54,58 +60,12 @@ _SAMPLES = [
 _ALL_REFUSALS = [*_SAMPLES, pytest.param(_UNOBSERVED_REFUSAL, id='unobserved-reason')]
 
 
-class TestClassifiesScopeSpawnFailureAsEnvTransient:
+class TestRefusalTextIsNotEvidence:
 
     @pytest.mark.parametrize('tool', list(ToolKind))
     @pytest.mark.parametrize('sample', _SAMPLES)
-    def test_sole_refusal_is_env_transient_for_every_tool(self, sample, tool):
-        result = classify_failure(tool, 1, sample, False)
-        assert result == FailureCategory.ENV_TRANSIENT
-        assert result in INFRA_TRANSIENT_CATEGORIES
-
-    @pytest.mark.parametrize('sample', _SAMPLES)
-    def test_refusal_without_trailing_newline_is_env_transient(self, sample):
-        assert classify_failure(
-            ToolKind.PYTEST, 1, sample.rstrip('\n'), False,
-        ) == FailureCategory.ENV_TRANSIENT
-
-    def test_scope_unit_refusal_is_env_transient_whatever_the_reason(self):
-        output = 'Failed to start transient scope unit: Connection reset by peer\n'
-        assert classify_failure(ToolKind.OPAQUE, 1, output, False) == FailureCategory.ENV_TRANSIENT
-
-
-class TestCommandThatRanKeepsItsOwnVerdict:
-
-    def test_refusal_followed_by_test_verdict_is_test_failure(self):
-        output = _SCOPE_START_REFUSED + 'FAILED tests/test_x.py::test_y - AssertionError\n'
-        assert classify_failure(ToolKind.PYTEST, 1, output, False) == FailureCategory.TEST_FAILURE
-
-    def test_refusal_after_real_output_is_not_infra(self):
-        output = (
-            '============================= test session starts ==============================\n'
-            + _SCOPE_START_REFUSED
-        )
-        assert classify_failure(
-            ToolKind.PYTEST, 1, output, False,
-        ) == FailureCategory.UNKNOWN_TEST_FAILURE
-
-    def test_refusal_quoted_in_assertion_diff_is_not_infra(self):
-        output = 'E       ' + _SCOPE_START_REFUSED
-        assert classify_failure(
-            ToolKind.PYTEST, 1, output, False,
-        ) == FailureCategory.UNKNOWN_TEST_FAILURE
-
-    def test_bus_connect_refusal_with_unobserved_reason_is_not_infra(self):
-        output = 'Failed to connect to bus: Permission denied\n'
-        assert classify_failure(
-            ToolKind.OPAQUE, 1, output, False,
-        ) == FailureCategory.UNKNOWN_TEST_FAILURE
-
-    def test_bare_errno_text_is_not_infra(self):
-        output = 'OSError: [Errno 107] Transport endpoint is not connected\n'
-        assert classify_failure(
-            ToolKind.OPAQUE, 1, output, False,
-        ) == FailureCategory.UNKNOWN_TEST_FAILURE
+    def test_sole_refusal_text_is_not_env_transient(self, sample, tool):
+        assert classify_failure(tool, 1, sample, False) != FailureCategory.ENV_TRANSIENT
 
 
 class TestRefusedLaunchIsDecidedByStructure:
@@ -263,7 +223,11 @@ async def _verify_test_leg_only(
 class TestStartedScopeKeepsItsOwnVerdict:
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('test_command', ['exit 1', 'if then fi'], ids=['red', 'syntax-error'])
+    @pytest.mark.parametrize(
+        'test_command',
+        ['exit 1', 'if then fi', f"printf '%s' {shlex.quote(_BUS_CONNECT_REFUSED)}; exit 1"],
+        ids=['red', 'syntax-error', 'prints-a-refusal'],
+    )
     async def test_red_command_in_a_started_scope_is_not_env_transient(
         self, worktree, test_command,
     ):
@@ -349,6 +313,42 @@ class TestSegmentedLegWithOneLaunchRefused:
         )
         assert result.passed is False
         assert result.category != FailureCategory.ENV_TRANSIENT, result.summary
+
+
+def _systemd_user_available() -> bool:
+    """True iff a usable ``systemd --user`` manager can create a transient scope."""
+    try:
+        r = subprocess.run(
+            ['systemd-run', '--user', '--scope', '--collect', 'true'],
+            capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _systemd_user_available(),
+    reason='systemd --user manager unavailable (CI/session degraded)',
+)
+@pytest.mark.usefixtures('code_default_config')
+class TestRealLauncher:
+
+    @pytest.mark.asyncio
+    async def test_started_scope_keeps_its_own_verdict(self, worktree):
+        result = await _verify_test_leg_only(worktree, 'exit 3')
+        assert result.passed is False
+        assert result.category != FailureCategory.ENV_TRANSIENT, result.summary
+
+    @pytest.mark.asyncio
+    async def test_launch_refused_for_want_of_a_bus_is_env_transient(
+        self, worktree, monkeypatch,
+    ):
+        monkeypatch.setenv('DBUS_SESSION_BUS_ADDRESS', 'unix:path=/nonexistent-7339/bus')
+        monkeypatch.setenv('XDG_RUNTIME_DIR', '/nonexistent-7339')
+        result = await _verify_test_leg_only(worktree, 'exit 3')
+        assert result.passed is False
+        assert result.category == FailureCategory.ENV_TRANSIENT, result.summary
 
 
 def _make_git_ops() -> MagicMock:
