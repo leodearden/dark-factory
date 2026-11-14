@@ -25,7 +25,8 @@ not granted; sandboxed agents run with rerere off instead
 (``orchestrator/src/orchestrator/agents/sandbox_git_config.py``).
 ``compute_write_set`` is a PURE derivation —
 no filesystem side effects (no makedirs); existence/creation remains the
-backend's job.
+backend's job. ``WriteSet.is_foreign_task_meta`` is the query plan-tools uses
+to flag a plan step naming another task's ``.task-meta`` (task 4825).
 """
 from __future__ import annotations
 
@@ -97,6 +98,19 @@ class WriteSet:
         joined = '\n'.join(str(p) for p in self.writable_paths())
         return hashlib.sha256(joined.encode('utf-8')).hexdigest()
 
+    def is_foreign_task_meta(self, path: Path) -> bool:
+        """Rows 2 and 2b are a dispatch's only ``.task-meta`` grants, so any
+        other path inside the ``.task-meta`` base is another lane's or task's
+        and unwritable here."""
+        resolved = path.resolve()
+        base = self.task_meta.parent
+        return (
+            resolved.is_relative_to(base)
+            and resolved != base
+            and not resolved.is_relative_to(self.task_meta)
+            and not resolved.is_relative_to(self.task_root)
+        )
+
 
 _GITDIR_PREFIX = 'gitdir:'
 
@@ -152,6 +166,25 @@ def compute_write_set(
     ``home`` defaults to ``Path.home()``; tests should inject a hermetic
     tmp dir.
     """
+    return _derive_write_set(
+        worktree,
+        task_root if task_root is not None
+        else TaskArtifacts.task_root_for(worktree.parent, task_id),
+        home,
+    )
+
+
+def write_set_of(artifacts: TaskArtifacts, *, home: Path | None = None) -> WriteSet:
+    """The write set of the dispatch owning *artifacts*: its worktree, with
+    its ``task_root`` as row 2b.
+
+    Raises ``ValueError``, like ``compute_write_set``, on a worktree with no
+    linked-worktree ``.git``.
+    """
+    return _derive_write_set(artifacts.worktree, artifacts.task_root, home)
+
+
+def _derive_write_set(worktree: Path, task_root: Path, home: Path | None) -> WriteSet:
     home = home or Path.home()
 
     admindir = _parse_gitdir(worktree)
@@ -165,10 +198,7 @@ def compute_write_set(
         # to the real directory landlock enforces on — see
         # TestTaskMetaSymlinkResolution in test_write_set.py.
         task_meta=TaskArtifacts.meta_root_for(worktree.parent, worktree.name).resolve(),
-        task_root=(
-            task_root if task_root is not None
-            else TaskArtifacts.task_root_for(worktree.parent, task_id)
-        ).resolve(),
+        task_root=task_root.resolve(),
         git_objects=(main_git / 'objects').resolve(),
         git_task_refs=(main_git / 'refs' / 'heads' / 'task').resolve(),
         git_task_reflogs=(main_git / 'logs' / 'refs' / 'heads' / 'task').resolve(),
