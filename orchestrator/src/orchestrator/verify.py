@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
+from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
 from orchestrator import verify_evidence, verify_plan
@@ -5413,7 +5414,9 @@ def _target_subprocess_env(
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
-    vars (``shared.python_env.without_python_env_selection``), minus the orchestrator's ``ORCH_*``
+    vars (``shared.python_env.without_python_env_selection``), minus the Claude
+    OAuth account pool (``shared/src/shared/secret_env.py::without_account_pool``),
+    minus the orchestrator's ``ORCH_*``
     control-plane namespace (``_ORCH_ENV_PREFIX`` — so an ambient, leaked
     ``ORCH_CONFIG_PATH`` can't make a snapshot-era test load the production
     config; task 2957), and minus the venv ``bin`` dir on PATH, so the target's
@@ -5442,7 +5445,7 @@ def _target_subprocess_env(
     """
     env = {
         k: v
-        for k, v in without_python_env_selection(os.environ).items()
+        for k, v in without_account_pool(without_python_env_selection(os.environ)).items()
         if not k.startswith(_ORCH_ENV_PREFIX)
     }
     env['PYTHONUNBUFFERED'] = '1'
