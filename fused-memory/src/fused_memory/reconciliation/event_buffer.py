@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     payload TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'buffered',
     drained_by_run_id TEXT,
-    coalesce_key TEXT
+    coalesce_key TEXT,
+    drained_by_instance_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eb_project_status ON event_buffer(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_eb_agent_timestamp ON event_buffer(agent_id, timestamp)
@@ -133,6 +134,14 @@ class _PushOutcome(StrEnum):
 class _PushResult(NamedTuple):
     outcome: _PushOutcome
     fold_count: int = 1
+
+
+class DrainedRun(NamedTuple):
+    """One run's drained events, named by the instance that drained them."""
+
+    project_id: str
+    run_id: str
+    instance_id: str
 
 
 _UNFOLDED_PUSH_LOG_LINE = {
@@ -255,6 +264,14 @@ class EventBuffer:
                 ' ON event_buffer(project_id, coalesce_key, status)'
                 ' WHERE coalesce_key IS NOT NULL'
             )
+
+            # Add drained_by_instance_id if missing (task 9655): names the
+            # instance whose lock a drain ran under, so a startup sweep can
+            # recover a dead predecessor's run-less drains.
+            if await add_column_if_missing(db, 'event_buffer', 'drained_by_instance_id', 'TEXT'):
+                logger.info(
+                    'EventBuffer: migrated event_buffer — added drained_by_instance_id column'
+                )
 
             # Drop the now-redundant single-column project index.  idx_dw_project_claimed
             # (project_id, claimed_at) is a strict superset; keeping both wastes write
@@ -607,9 +624,9 @@ class EventBuffer:
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             await db.execute(
-                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ? "
-                f"WHERE id IN ({placeholders})",
-                [run_id, *ids],
+                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?, "
+                f"drained_by_instance_id = ? WHERE id IN ({placeholders})",
+                [run_id, self.instance_id, *ids],
             )
 
         events = []
@@ -762,10 +779,11 @@ class EventBuffer:
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             cursor = await db.execute(
-                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?
+                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?,
+                        drained_by_instance_id = ?
                     WHERE project_id = ? AND id IN ({placeholders})
                       AND status = 'buffered'""",
-                [run_id, project_id, *ids],
+                [run_id, self.instance_id, project_id, *ids],
             )
             rowcount = cursor.rowcount
         return rowcount
@@ -821,6 +839,27 @@ class EventBuffer:
         if count:
             logger.info(f'Restored {count} drained events to buffered for {project_id}')
         return count
+
+    async def drained_runs_of_other_instances(self) -> list[DrainedRun]:
+        """Each run with rows still drained under another instance's drain."""
+        rows = await self._require_access().read_all(
+            """SELECT DISTINCT project_id, drained_by_run_id, drained_by_instance_id
+               FROM event_buffer
+               WHERE status = 'drained'
+                 AND drained_by_run_id IS NOT NULL
+                 AND drained_by_instance_id IS NOT NULL
+                 AND drained_by_instance_id != ?
+               ORDER BY project_id, drained_by_run_id""",
+            (self.instance_id,),
+        )
+        return [
+            DrainedRun(
+                project_id=row['project_id'],
+                run_id=row['drained_by_run_id'],
+                instance_id=row['drained_by_instance_id'],
+            )
+            for row in rows
+        ]
 
     async def mark_drained_run_id(
         self, project_id: str, event_ids: list[str], run_id: str,
