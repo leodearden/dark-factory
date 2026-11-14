@@ -2113,6 +2113,23 @@ oblige every future task write quoting this section to set the override,
 which is precisely the loop this section exists to break. For the full
 picture see `docs/mcp-toolcall-xml-leak.md` §4, "The boundary rejection".
 
+### `allow_uuid_prefix`: a write-time flag, not a metadata key
+
+`metadata={'allow_uuid_prefix': True}` (a literal `True` only) is the
+sanctioned move for a write that **deliberately quotes a bare truncated
+uuid**, such as a correction record citing a bad citation verbatim: the
+uuid-prefix boundary guard then forwards the call without resolving or
+expanding the prefix. It is honoured only on tools that declare
+`metadata`, and it is stripped before persistence exactly as
+`allow_mcp_markup` is, so it never lands in stored metadata. It is
+**never** the remedy for an `ambiguous_uuid_prefix` rejection: that
+rejection means the prefix names more than one record, so put the full
+uuid you meant into the rejection's `original_call` and resubmit that. The
+guard's policy is stated once, in `plans/uuid-prefix-resolution-prd.md`
+§4 C3 (**Override.**), and the strip lives in
+`shared/src/shared/uuid_prefix.py::strip_uuid_prefix_override`; neither is
+restated here.
+
 ### Promoting a convention
 
 A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
