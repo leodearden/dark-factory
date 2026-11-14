@@ -16,30 +16,23 @@ import fcntl
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 import shared_repo_git_maintenance as maintenance
 from committed_git_repo import committed_repo
+from git_repo_probe import git as _git
+from git_repo_probe import loose_count as _loose_count
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NICED_GIT = ["-n", "19", "ionice", "-c3", "git"]
-
-
-def _git(repo: Path, *args: str) -> str:
-    """``git -C <repo> <args>`` stdout; raises on a non-zero exit."""
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=True,
-    ).stdout
 
 
 def _repo_with_loose_objects(root: Path) -> Path:
@@ -57,14 +50,6 @@ def _commit_file(repo: Path, name: str, text: str) -> str:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "--no-verify", "-m", name)
     return _git(repo, "rev-parse", "HEAD").strip()
-
-
-def _loose_count(repo: Path) -> int:
-    for line in _git(repo, "count-objects", "-v").splitlines():
-        key, _, value = line.partition(":")
-        if key == "count":
-            return int(value)
-    raise AssertionError(f"count-objects -v printed no count for {repo}")
 
 
 def _commit_graph(repo: Path) -> Path:
@@ -175,7 +160,7 @@ def test_ambient_git_redirection_is_inert(tmp_path, capsys, monkeypatch):
     assert _loose_count(target) == 0
 
 
-def test_runs_both_git_commands_niced_and_idle_io(tmp_path, capsys, monkeypatch):
+def test_runs_every_git_command_niced_and_idle_io(tmp_path, capsys, monkeypatch):
     real_nice = shutil.which("nice")
     assert real_nice is not None
     calls = tmp_path / "nice-calls.jsonl"
@@ -197,10 +182,15 @@ def test_runs_both_git_commands_niced_and_idle_io(tmp_path, capsys, monkeypatch)
     _run(capsys, _hermetic_argv(tmp_path, repo))
 
     recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert len(recorded) == 2
-    assert all(argv[: len(NICED_GIT)] == NICED_GIT for argv in recorded)
-    assert recorded[0][-4:] == ["repack", "-d", "-q", "-n"]
-    assert recorded[1][-3:] == ["commit-graph", "write", "--reachable"]
+    assert all(argv[: len(NICED_GIT)] == NICED_GIT for argv in recorded), recorded
+    git_args = [argv[len(NICED_GIT) + 2:] for argv in recorded]
+    assert git_args == [
+        ["rev-parse", "--show-toplevel", "--absolute-git-dir"],
+        ["count-objects", "-v"],
+        ["repack", "-d", "-q", "-n"],
+        ["commit-graph", "write", "--reachable"],
+        ["count-objects", "-v"],
+    ]
 
 
 def _unwritable_pack_dir(repo: Path) -> Path:
@@ -226,7 +216,7 @@ def test_repos_run_one_at_a_time_in_order_and_a_failure_does_not_stop_the_run(tm
         str(root.resolve()) for root in (repo_a, repo_b, missing, repo_c)
     ]
     assert [record["outcome"] for record in records] == [
-        "maintained", "failed", "not-a-repo", "maintained",
+        "maintained", "failed", "unresolved", "maintained",
     ]
     assert records[1]["repack_rc"] != 0
     assert records[1]["commit_graph_rc"] is None
@@ -239,23 +229,95 @@ def test_never_walks_up_into_an_enclosing_repo(tmp_path, capsys):
     subdir.mkdir()
     loose = _loose_count(enclosing)
 
-    _rc, records, _err = _run(capsys, _hermetic_argv(tmp_path, subdir))
+    rc, records, _err = _run(capsys, _hermetic_argv(tmp_path, subdir))
 
     assert [record["outcome"] for record in records] == ["not-a-repo"]
+    assert rc == 1
     assert _loose_count(enclosing) == loose
     assert not _commit_graph(enclosing).exists()
 
 
-@pytest.mark.parametrize("marker", ["gc.pid", "objects/maintenance.lock"])
-def test_a_busy_repo_is_left_alone(tmp_path, capsys, marker):
+def test_a_root_git_cannot_resolve_is_loud_not_skipped(tmp_path, capsys, monkeypatch):
+    """git missing from PATH must not read as a silent not-a-repo with exit 0."""
     repo = _repo_with_loose_objects(tmp_path / "repo")
-    (Path(_git(repo, "rev-parse", "--absolute-git-dir").strip()) / marker).write_text("", encoding="utf-8")
+    loose = _loose_count(repo)
+    no_git = tmp_path / "no-git-bin"
+    no_git.mkdir()
+    for tool in ("nice", "ionice"):
+        found = shutil.which(tool)
+        assert found is not None
+        (no_git / tool).symlink_to(found)
+    monkeypatch.setenv("PATH", str(no_git))
+
+    rc, records, _err = _run(capsys, _hermetic_argv(tmp_path, repo))
+
+    monkeypatch.undo()
+    assert [record["outcome"] for record in records] == ["unresolved"]
+    assert rc == 1
+    assert _loose_count(repo) == loose
+
+
+def _dead_pid() -> int:
+    proc = subprocess.Popen(["true"])
+    proc.wait(timeout=60)
+    return proc.pid
+
+
+def _write_marker(repo: Path, marker: str, template: str, *, age_secs: float = 0) -> None:
+    """*template* may name ``{own_pid}``, ``{dead_pid}`` and ``{host}`` (this host)."""
+    text = template.format(own_pid=os.getpid(), dead_pid=_dead_pid(), host=socket.gethostname())
+    path = Path(_git(repo, "rev-parse", "--absolute-git-dir").strip()) / marker
+    path.write_text(text, encoding="utf-8")
+    then = time.time() - age_secs
+    os.utime(path, (then, then))
+
+
+_THIRTEEN_HOURS = 13 * 3600
+
+
+@pytest.mark.parametrize(
+    ("marker", "text"),
+    [
+        ("gc.pid", "{own_pid} {host}"),
+        ("gc.pid", "4242 some-other-host"),
+        ("objects/maintenance.lock", ""),
+    ],
+    ids=["gc-running-here", "gc-on-another-host", "maintenance-lock"],
+)
+def test_a_repo_a_live_gc_holds_is_left_alone(tmp_path, capsys, marker, text):
+    repo = _repo_with_loose_objects(tmp_path / "repo")
+    _write_marker(repo, marker, text)
     loose = _loose_count(repo)
 
-    _rc, records, _err = _run(capsys, _hermetic_argv(tmp_path, repo))
+    rc, records, _err = _run(capsys, _hermetic_argv(tmp_path, repo))
 
     assert [record["outcome"] for record in records] == ["busy"]
+    assert rc == 0
     assert _loose_count(repo) == loose
+
+
+@pytest.mark.parametrize(
+    ("marker", "text", "age_secs"),
+    [
+        ("gc.pid", "{dead_pid} {host}", 0),
+        ("gc.pid", "{own_pid} {host}", _THIRTEEN_HOURS),
+        ("gc.pid", "", 0),
+        ("objects/maintenance.lock", "", _THIRTEEN_HOURS),
+    ],
+    ids=["gc-pid-dead", "gc-pid-older-than-12h", "gc-pid-unparseable", "maintenance-lock-older-than-12h"],
+)
+def test_a_stale_busy_marker_does_not_turn_maintenance_off(tmp_path, capsys, marker, text, age_secs):
+    """git gc's own rule (builtin/gc.c, lock_repo_for_gc): a marker left by a crash
+    must not skip the repo every night with exit 0."""
+    repo = _repo_with_loose_objects(tmp_path / "repo")
+    _write_marker(repo, marker, text, age_secs=age_secs)
+
+    rc, records, err = _run(capsys, _hermetic_argv(tmp_path, repo))
+
+    assert [record["outcome"] for record in records] == ["maintained"]
+    assert rc == 0
+    assert _loose_count(repo) == 0
+    assert marker.rpartition("/")[2] in err
 
 
 def test_never_two_runs_at_once(tmp_path, capsys):
@@ -291,6 +353,19 @@ def test_the_default_roster_is_every_root_an_orchestrator_unit_runs(tmp_path, ca
     assert [(record["root"], record["outcome"]) for record in records] == [
         (str(repo.resolve()), "maintained")
     ]
+
+
+def test_the_default_lock_is_one_file_per_user_whatever_the_environment(monkeypatch):
+    """A cron job or `sudo -u` shell lacking the timer's XDG_RUNTIME_DIR must still
+    meet the timer on the same lock."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent/runtime")
+    monkeypatch.setenv("TMPDIR", "/nonexistent/tmp")
+    with_env = maintenance.default_lock_path()
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    monkeypatch.delenv("TMPDIR")
+
+    assert maintenance.default_lock_path() == with_env
+    assert str(os.getuid()) in str(with_env)
 
 
 def test_an_empty_roster_is_loud(tmp_path, capsys):

@@ -71,19 +71,35 @@ write-set, so the deploy is task 8087. The units carry the same names as the
 2026-11-01 hand install, so the installer replaces it in place; after that
 `~/bin/shared-repo-git-maintenance.sh` is no longer referenced.
 
-**What it runs.** Per repo, both commands niced:
+**What it runs.** Per repo:
 
 ```bash
 nice -n 19 ionice -c3 git repack -d -q -n \
   && nice -n 19 ionice -c3 git commit-graph write --reachable
 ```
 
-Repos are maintained one at a time, under a host-wide flock
-(`$XDG_RUNTIME_DIR/shared-repo-git-maintenance.lock`); a run that finds the
-lock held does nothing and exits 0. A root is skipped as `not-a-repo` unless it
-is itself a repository's top level, so git discovery can never walk up into an
-enclosing repo. It is skipped as `busy` while `gc.pid` or
-`objects/maintenance.lock` sits in its git dir.
+Every git call the job makes runs under the same `nice -n 19 ionice -c3`,
+including the `rev-parse` and the `count-objects -v` walks around the repack.
+
+Repos are maintained one at a time, under a per-user flock. Its path comes from
+the uid alone, never from the environment, so the timer, a cron job and a
+`sudo -u leo` shell all use the same file: `/run/user/<uid>/shared-repo-git-maintenance.lock`,
+or `/tmp/<uid>-shared-repo-git-maintenance.lock` on a host with no runtime dir
+for the user. A run that finds the lock held does nothing and exits 0.
+
+Each root first gets one of these outcomes:
+
+- `unresolved`: git could not resolve the root at all. It is missing, sits in
+  no repository, is refused as dubious ownership, or git itself is absent.
+  git's stderr, relayed above the record, says which.
+- `not-a-repo`: the root resolves, but inside an enclosing repository. It is
+  skipped, so git discovery can never walk up into that repo and repack it.
+- `busy`: a live gc or `git maintenance` run holds the repo, and it is left
+  alone. Liveness follows git gc's own rule (`builtin/gc.c::lock_repo_for_gc`).
+  A `gc.pid` or `objects/maintenance.lock` older than 12 h is stale. So is a
+  `gc.pid` that does not parse, or one naming a pid that is dead on this host.
+  A stale marker is logged and the repo is maintained anyway, so a crashed
+  by-hand gc cannot switch maintenance off for good.
 
 **The roster.** Every root an installed `orchestrator-*.service` runs, read by
 `scripts/orchestrator_projects.py::targets_from_args`. Those are exactly the
@@ -96,10 +112,12 @@ run.
 shows one JSON record per repo (`root`, `outcome`, `loose_before`,
 `loose_after`, `repack_rc`, `commit_graph_rc`, `seconds`), then
 `shared-repo-git-maintenance: done (maintenance=<rc>)`. The wrapper always
-exits 0; `<rc>` is the job's own code: 0 nothing failed (or another run held
-the lock), 1 some repo failed (its record says `failed`), 2 the roster was
-empty. A repo that reads `busy` every night has a leftover `gc.pid` or
-`objects/maintenance.lock`; remove it once no gc or maintenance run is live.
+exits 0; `<rc>` is the job's own code:
+
+- 0: every repo was `maintained` or `busy`, or another run held the lock.
+- 1: some repo was not maintained. Its record says `failed`, `unresolved` or
+  `not-a-repo`.
+- 2: the roster was empty.
 
 ### What the timer may and may not run
 
