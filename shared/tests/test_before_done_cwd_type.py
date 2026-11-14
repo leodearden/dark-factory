@@ -13,7 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from shared.before_done_paths import CwdRefused, before_done_cwd, resolve_before_done_paths
+from shared.before_done_paths import (
+    BeforeDonePathsRefused,
+    CwdRefused,
+    resolve_before_done_paths,
+)
 
 ROOT = Path('/srv/project')
 NON_STRING_CWDS = pytest.mark.parametrize(
@@ -23,25 +27,44 @@ NON_STRING_CWDS = pytest.mark.parametrize(
 )
 
 
+def _never_consulted() -> Path | None:
+    raise AssertionError('the factory root resolver must not run here')
+
+
 @NON_STRING_CWDS
 def test_resolver_refuses_non_string_cwd_naming_field_and_type(cwd: object) -> None:
     with pytest.raises(CwdRefused) as excinfo:
-        resolve_before_done_paths({'script': 'deploy.sh', 'cwd': cwd}, ROOT)
+        resolve_before_done_paths({'script': 'deploy.sh', 'cwd': cwd}, ROOT, _never_consulted)
 
     assert 'before_done.cwd' in str(excinfo.value)
     assert repr(type(cwd).__name__) in str(excinfo.value)
 
 
 @NON_STRING_CWDS
-def test_cwd_refusal_is_a_value_error(cwd: object) -> None:
-    with pytest.raises(ValueError):
-        before_done_cwd({'cwd': cwd})
+def test_cwd_refusal_is_a_before_done_paths_refused_value_error(cwd: object) -> None:
+    with pytest.raises(CwdRefused) as excinfo:
+        resolve_before_done_paths({'script': 'deploy.sh', 'cwd': cwd}, ROOT, _never_consulted)
+
+    assert isinstance(excinfo.value, BeforeDonePathsRefused)
+    assert isinstance(excinfo.value, ValueError)
 
 
-@pytest.mark.parametrize('cwd', [None, '', 'sub/dir', '/srv/elsewhere'])
-def test_string_or_absent_cwd_is_returned_unchanged(cwd: str | None) -> None:
-    assert before_done_cwd({'cwd': cwd}) == cwd
+@pytest.mark.parametrize(
+    ('cwd', 'resolved'),
+    [
+        (None, ROOT),
+        ('', ROOT),
+        ('sub/dir', ROOT / 'sub/dir'),
+        ('/srv/elsewhere', Path('/srv/elsewhere')),
+    ],
+)
+def test_string_or_absent_cwd_resolves(cwd: str | None, resolved: Path) -> None:
+    paths = resolve_before_done_paths({'script': 'deploy.sh', 'cwd': cwd}, ROOT, _never_consulted)
+
+    assert paths.cwd == resolved
 
 
-def test_missing_cwd_key_is_none() -> None:
-    assert before_done_cwd({'script': 'deploy.sh'}) is None
+def test_missing_cwd_key_resolves_to_project_root() -> None:
+    paths = resolve_before_done_paths({'script': 'deploy.sh'}, ROOT, _never_consulted)
+
+    assert paths.cwd == ROOT
