@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _external_submit_producers import EXTERNAL_SUBMIT_PRODUCERS
 from _filing_tools import call_blocker, call_info, call_promote
 
 from escalation.categories import (
@@ -45,13 +46,11 @@ _AGENT_INSTRUCTED = (
 )
 
 
-# Categories filed through ``escalation submit`` by producers in other
-# repositories, which the census cannot walk. Each entry names its producer.
-_EXTERNAL_PRODUCERS = (
-    pytest.param(
-        'validation_lane_red',
-        id='solar-challenge-platform:src/solar_challenge_platform/ci/cadence_alert.py::CATEGORY',
-    ),
+# Categories that producers in other repositories file through ``escalation
+# submit``, which the census cannot walk. Derived from those producers' whole
+# calls in _external_submit_producers.py, which test_submit_cli.py runs.
+_EXTERNAL_PRODUCERS = tuple(
+    pytest.param(p.category, id=p.locator) for p in EXTERNAL_SUBMIT_PRODUCERS
 )
 
 
