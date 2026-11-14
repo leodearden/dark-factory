@@ -888,10 +888,10 @@ There are two enforcement points:
 2. **Live**: `scripts/check_dashboard_payload_budgets.sh`, a launcher for
    `dashboard/src/dashboard/payload_check.py`, measures the running
    dashboard. Exit codes: 0 means within budget; 1 means over budget; 2
-   means the instrument failed (unreachable, timeout, non-200, unreadable
-   table). It runs daily as the `dashboard-payload-budgets` recurrence
-   chain. The fixture sweep cannot see organic growth from more tasks
-   existing; this check is what sees it.
+   means the instrument failed (unreachable, timeout, non-200, a request not
+   reached before the run deadline, unreadable table). It runs daily as the
+   `dashboard-payload-budgets` recurrence chain. The fixture sweep cannot
+   see organic growth from more tasks existing; this check is what sees it.
 
 **Reading a failed link.** A link that exits non-zero files a born-at-L2
 `milestone_check_failed`. The checker prints one line per request, then each
@@ -918,17 +918,22 @@ exist yet. Task 5835 records the seed id here. The link's metadata:
 ```
 task_kind:   deterministic
 milestone:   {mode: dated, at: <first run>}
-before_done: {kind: predicate, script: scripts/check_dashboard_payload_budgets.sh, timeout_secs: 2400}
+before_done: {kind: predicate, script: scripts/check_dashboard_payload_budgets.sh, timeout_secs: <payload_check.py::PREDICATE_TIMEOUT_SECS>}
 recurrence:  {key: dashboard-payload-budgets, interval_secs: 86400}
 ```
 
-`timeout_secs` covers the worst case. The checker's `--timeout`, 60 s by
-default, is a wall-clock deadline per request, checked as each chunk of the
-body arrives, and it also caps each network operation. So a request that
-stalls a read just as its deadline passes ends within twice the timeout, and
-17 requests run one at a time at that bound take 2,040 s. With a shorter
-budget, a dashboard that stalls on every request becomes a no-verdict timeout
-instead of exit 2. Minting renews the chain every interval. See
+The checker bounds itself. Each request is bounded end to end, connect to
+last byte, by `--timeout` (60 s by default). The whole run is bounded by
+`--run-deadline`, whose default,
+`dashboard/src/dashboard/payload_check.py::RUN_DEADLINE_SECONDS`, is
+`PREDICATE_TIMEOUT_SECS` less a margin for start-up and one overage
+breakdown. A request not reached before the run deadline is NOT MEASURED,
+exit 2. So a stalled dashboard ends in the checker's own exit 2, never a
+no-verdict `ScriptTimeout`, however many requests the table holds. Seed the
+link with exactly
+`dashboard/src/dashboard/payload_check.py::PREDICATE_TIMEOUT_SECS` as
+merged: a smaller `timeout_secs` re-opens the no-verdict case. Minting renews
+the chain every interval. See
 `docs/task-authoring.md` §6 for the predicate contract and §6.1 for
 recurring chains.
 
