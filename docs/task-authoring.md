@@ -1001,7 +1001,10 @@ open (quiescence guard — no re-dispatch, no churn).
 
 - `before_done.target_unit` equals this orchestrator's own unit → detached
   `systemd-run --user` with `--on-failure` (done = `scheduled`; the
-  dispatching orchestrator is **not** killed).
+  dispatching orchestrator is **not** killed). The script is re-checked for
+  existence and the executable bit before the unit is registered; an
+  unrunnable script blocks the task instead of marking it `scheduled`
+  (`docs/deterministic-runner.md` §2).
 - `before_done.target_unit` differs from own unit (or is `None`) →
   blocking subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify
   against a pre-run baseline (done = `deployed-and-verified`).
