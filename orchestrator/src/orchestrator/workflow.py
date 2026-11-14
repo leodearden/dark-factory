@@ -13680,13 +13680,13 @@ class TaskWorkflow:
     async def _reverify_one_member(
         self,
         member: dict,
-        predecessor_ref: str | None,
+        upstream: str | None,
     ) -> SoloVerifyResult:
         """Un-stack a member's own delta onto main and verify it in isolation.
 
-        1. Call ``git_ops.materialize_member_solo(member_id, predecessor_ref)``
+        1. Call ``git_ops.materialize_member_solo(member_id, upstream)``
            to create an isolated worktree carrying only this member's commits.
-        2. If there is no *predecessor_ref* (its own delta cannot be told
+        2. If there is no *upstream* (its own delta cannot be told
            apart; nothing is materialized) or the un-stack fails (returns
            None — rebase conflict), return a failed result with
            reason='unstackable'.
@@ -13699,8 +13699,8 @@ class TaskWorkflow:
         )
 
         member_id = str(member.get('id', ''))
-        solo_wt_info = None if predecessor_ref is None else (
-            await self.git_ops.materialize_member_solo(member_id, predecessor_ref)
+        solo_wt_info = None if upstream is None else (
+            await self.git_ops.materialize_member_solo(member_id, upstream)
         )
         if solo_wt_info is None:
             return SoloVerifyResult(
@@ -13767,7 +13767,7 @@ class TaskWorkflow:
           and neither does a failed revert.
         """
         # Sort members by their metadata train 'order' (root→tip) so that the
-        # predecessor_ref computation is correct regardless of caller-side ordering.
+        # _solo_upstream computation is correct regardless of caller-side ordering.
         # tasks_by_train normally returns them sorted, but attributing the right
         # delta to each member depends on strict stacking order — a silently
         # mis-ordered list would rebase against the wrong predecessor, either
@@ -13785,7 +13785,7 @@ class TaskWorkflow:
             self.task_id, train_id, len(members),
         )
 
-        # Collect per-member solo verify results (root→tip; N verifies total).
+        # Collect per-member solo verify results (root→tip; at most N verifies).
         solo_results: list[SoloVerifyResult] = []
         for i, member in enumerate(members):
             solo = await self._reverify_one_member(

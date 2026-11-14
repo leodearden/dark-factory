@@ -10645,8 +10645,8 @@ class GitOps:
         (``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``);
         then the newest of those.  Read-only, unlike
         :meth:`unstack_from_unlanded_base`, so a successor stacked on the
-        branch still finds its own commits above it.  None when a git read
-        fails.
+        branch still finds its own commits above it.  None when the foreign
+        prefix cannot be inspected; an unreadable record or tip answers main.
         """
         main = self.config.main_branch
         base = await self._stack_ledger().base_of(full_branch)

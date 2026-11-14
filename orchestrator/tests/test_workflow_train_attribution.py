@@ -634,6 +634,12 @@ class TestSomeFailAttribution:
         assert solo_calls == expected_solo_calls, (
             f'Expected solo verifies root→tip {expected_solo_calls!r}, got {solo_calls!r}'
         )
+        set_status_calls = [
+            tuple(c.args[:2]) for c in f.scheduler.set_task_status.await_args_list
+        ]
+        assert ('101', 'blocked') in set_status_calls, (
+            f'Expected the anchor blocked as an offender, calls: {set_status_calls}'
+        )
 
 
 # ---------------------------------------------------------------------------
