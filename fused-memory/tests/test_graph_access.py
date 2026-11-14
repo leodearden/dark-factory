@@ -427,8 +427,7 @@ class TestTheConnectionHasASocketTimeout:
             host=FALKOR_HOST, port=FALKOR_PORT, socket_timeout=12.5,
         )
         try:
-            pool = driver.client.connection.connection_pool
-            assert pool.connection_kwargs['socket_timeout'] == 12.5
+            assert driver.client.connection.get_connection_kwargs()['socket_timeout'] == 12.5
         finally:
             await driver.client.aclose()
 

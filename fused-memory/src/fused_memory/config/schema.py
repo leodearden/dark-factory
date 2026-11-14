@@ -359,6 +359,14 @@ class FalkorDBProviderConfig(BaseModel):
     # group_id at request time.  Kept for backward-compat with existing configs.
     database: str | None = None
     expected_graph_timeout_ms: int = 30000
+    socket_timeout_seconds: float = Field(
+        default=130.0,
+        description=(
+            'Socket timeout of the FalkorDB connection. Kept above '
+            'queue.backend_write_timeout_seconds, so a slow write fails on its '
+            'named budget rather than on a socket error.'
+        ),
+    )
 
 
 class GraphitiBackendConfig(BaseModel):

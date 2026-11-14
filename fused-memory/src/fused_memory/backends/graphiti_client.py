@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict, TypeVar, cast
 from urllib.parse import urlparse
 
+from falkordb.asyncio import FalkorDB
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
@@ -935,6 +936,22 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     search_interface = FalkorEdgeSearch()
     graph_operations_interface = FalkorGraphOperations()
 
+    def __init__(
+        self,
+        *,
+        host: str = 'localhost',
+        port: int = 6379,
+        password: str | None = None,
+        socket_timeout: float | None = None,
+        falkor_db: FalkorDB | None = None,
+        database: str = 'default_db',
+    ):
+        if falkor_db is None:
+            falkor_db = FalkorDB(
+                host=host, port=port, password=password, socket_timeout=socket_timeout,
+            )
+        super().__init__(falkor_db=falkor_db, database=database)
+
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
 
@@ -979,7 +996,7 @@ class _MultiTenantFalkorDriver(FalkorDriver):
         validate_group_ids(group_ids)
         return build_query(self.sanitize(query), group_ids, max_query_length)
 
-    def clone(self, database: str) -> 'GraphDriver':
+    def clone(self, database: str) -> '_MultiTenantFalkorDriver':
         if database == self._database:
             return self
         cloned = _MultiTenantFalkorDriver(falkor_db=self.client, database=database)
@@ -1514,6 +1531,7 @@ class GraphitiBackend:
             host=host,
             port=port,
             password=falkor_cfg.password,
+            socket_timeout=falkor_cfg.socket_timeout_seconds,
         )
 
         # --- Cross-encoder (reranker) ---
