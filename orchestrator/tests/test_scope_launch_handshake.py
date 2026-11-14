@@ -101,6 +101,17 @@ class TestLauncherThatNeverExecs:
                 holder.wait()
 
 
+class TestLauncherThatDropsThePipe:
+    def test_command_never_runs_so_the_verdict_stays_true(self) -> None:
+        with ScopeLaunchHandshake() as handshake:
+            (writer,) = handshake.pass_fds
+            drops_the_pipe = ('/bin/bash', '-c', f'exec {writer}>&-; exec "$@"', 'sh')
+            proc = _run(handshake, [*drops_the_pipe, '/bin/bash', '-c', handshake.payload('echo ran')])
+            assert 'ran' not in proc.stdout
+            assert proc.returncode == 1
+            assert handshake.launcher_exited_before_exec() is True
+
+
 class TestLifecycle:
     def test_close_is_idempotent_and_leaks_no_fd(self) -> None:
         before = _open_fds()

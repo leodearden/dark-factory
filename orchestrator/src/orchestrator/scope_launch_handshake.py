@@ -1,11 +1,13 @@
 """Proof that a launcher such as ``systemd-run --scope`` exec'd the bash payload it was handed.
 
-The payload's first line writes one byte to an inherited pipe and closes it;
-the command follows on its own line. ``bash -c`` runs line 1 before parsing
-line 2, so even a syntax error in the command cannot suppress the byte (see
-``orchestrator/tests/test_scope_launch_handshake.py``). EOF with no byte once
-the launcher has exited therefore proves the payload never started; a byte, or
-a writer still open, proves nothing either way. Measured on systemd 255:
+The payload's first line writes one byte to an inherited pipe and closes it,
+or exits without running the command when the byte cannot be written (a
+launcher that dropped the fd); the command follows on its own line. ``bash -c``
+runs line 1 before parsing line 2, so even a syntax error in the command cannot
+suppress the byte (see ``orchestrator/tests/test_scope_launch_handshake.py``).
+EOF with no byte once the launcher has exited therefore proves the command
+never started; a byte, or a writer still open, proves nothing either way.
+Measured on systemd 255:
 ``systemd-run --user --scope`` keeps an fd passed through ``pass_fds`` open
 across its exec, and a launch it refuses exits with the pipe at EOF.
 """
@@ -28,7 +30,7 @@ class ScopeLaunchHandshake:
         return (self._writer,)
 
     def payload(self, cmd: str) -> str:
-        return f'printf . >&{self._writer}; exec {self._writer}>&-\n{cmd}'
+        return f'printf . >&{self._writer} || exit 1; exec {self._writer}>&-\n{cmd}'
 
     def release_writer(self) -> None:
         if self._writer_open:
