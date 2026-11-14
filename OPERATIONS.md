@@ -668,12 +668,19 @@ loginctl enable-linger leo
 
 #### Enabling an instance
 
-From the checkout root:
+From inside the main checkout (`/home/leo/src/dark-factory`), never a task
+worktree: the render writes the checkout it runs in into the unit's
+`WorkingDirectory`, and the unit runs that tree's `.venv`.
 
 ```bash
-# render client-feed@.service (the arguments setup-host.sh §7a passes); enables nothing:
-python3 scripts/render_systemd_unit.py --unit client-feed --template scripts/client-feed.service.template \
-  --repo-root "$PWD" --uv-path "$(command -v uv)" --output ~/.config/systemd/user/client-feed@.service \
+# render client-feed@.service with the arguments setup-host.sh §7a passes; enables nothing.
+# Writes nothing if uv is not on PATH (an empty --uv-path renders an ExecStart systemd rejects):
+command -v uv >/dev/null || { echo 'uv is not on PATH' >&2; false; } \
+  && repo="$(git rev-parse --show-toplevel)" \
+  && python3 "$repo/scripts/render_systemd_unit.py" --unit client-feed \
+       --template "$repo/scripts/client-feed.service.template" \
+       --repo-root "$repo" --uv-path "$(command -v uv)" \
+       --output ~/.config/systemd/user/client-feed@.service \
   && systemctl --user daemon-reload
 # install the policy (above), then publish one pass; a refusal prints on stderr and exits 1:
 uv run --no-sync --project client-feed client-feed snapshot --config ~/.config/client-feed/<name>.yaml
