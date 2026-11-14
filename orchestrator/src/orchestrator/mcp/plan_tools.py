@@ -106,7 +106,7 @@ from shared.toolcall_markup import detect_for, repair
 
 from orchestrator import plan_descope, quarantine_provenance
 from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
+from orchestrator.mcp import foreign_task_meta, markup_journal, markup_sink, plan_markup_stamp
 from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest, pending_scope_paths
 
 logger = logging.getLogger(__name__)
@@ -1189,16 +1189,20 @@ def _add_plan_step(
             markup_facts,
         )
 
-    plan.setdefault('steps', []).append({
+    step = {
         'id': step_id,
         'type': step_type,
         'description': description,
         'status': 'pending',
         'commit': None,
-    })
+    }
+    plan.setdefault('steps', []).append(step)
     artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs(
-        {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
+        foreign_task_meta.annotate(
+            {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
+            foreign_task_meta.step_findings(artifacts, [step]),
+        ),
         markup_facts,
     )
 
@@ -1225,15 +1229,22 @@ def _add_prerequisite(
             markup_facts,
         )
 
-    plan.setdefault('prerequisites', []).append({
+    prerequisite = {
         'id': prereq_id,
         'description': description,
         'status': 'pending',
         'commit': None,
         'tests': [],
-    })
+    }
+    plan.setdefault('prerequisites', []).append(prerequisite)
     artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
-    return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
+    return _with_markup_repairs(
+        foreign_task_meta.annotate(
+            {'status': 'ok', 'prereq_id': prereq_id},
+            foreign_task_meta.step_findings(artifacts, [prerequisite]),
+        ),
+        markup_facts,
+    )
 
 
 @_plan_mutation
@@ -1684,7 +1695,11 @@ def _replace_plan_step(
                 item['description'] = description
                 artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
                 return _with_markup_repairs(
-                    {'status': 'ok', 'replaced': step_id}, markup_facts
+                    foreign_task_meta.annotate(
+                        {'status': 'ok', 'replaced': step_id},
+                        foreign_task_meta.step_findings(artifacts, [item]),
+                    ),
+                    markup_facts,
                 )
 
     return _with_markup_repairs(
@@ -1728,6 +1743,9 @@ def _confirm_plan(
     # what this session has REFUSED) and neither should be able to suppress
     # the other.
     rejections = plan_markup_stamp.session_summary(plan)
+    findings = foreign_task_meta.step_findings(
+        artifacts, [*(plan.get('prerequisites') or []), *(plan.get('steps') or [])],
+    ) if plan else {}
 
     def _respond(payload: dict[str, Any]) -> dict[str, Any]:
         """The ONE place that decides what a confirm_plan response carries.
@@ -1741,7 +1759,7 @@ def _confirm_plan(
         """
         if rejections is not None:
             payload['markup_rejections'] = rejections
-        return _with_markup_repairs(payload, markup_facts)
+        return _with_markup_repairs(foreign_task_meta.annotate(payload, findings), markup_facts)
 
     if not plan:
         return _respond({'status': 'error', 'message': 'No plan exists.'})
@@ -2457,6 +2475,9 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     ) -> dict[str, Any]:
         """Add a TDD step to the plan. Steps execute in the order added.
 
+        The response may carry ``foreign_task_meta``, naming
+        paths in the description that no lane of this task can write.
+
         Args:
             step_id: Unique step ID (e.g. "step-1", "step-2").
             step_type: One of ``STEP_TYPES``: "test" or "impl". Anything else
@@ -2476,6 +2497,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """Add a prerequisite to the plan. Prerequisites run before TDD steps.
 
         Use for setup work like config files, fixtures, etc.
+        The response may carry ``foreign_task_meta``, naming
+        paths in the description that no lane of this task can write.
 
         Args:
             prereq_id: Unique prerequisite ID (e.g. "pre-1").
@@ -2729,6 +2752,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         Preserves the step's position, status, and commit fields.
         Use during plan revalidation when a step needs revision due
         to changes on main. Cannot replace steps with status "done".
+        The response may carry ``foreign_task_meta``, naming
+        paths in the description that no lane of this task can write.
 
         Args:
             step_id: The step ID to replace (e.g. "step-2").
