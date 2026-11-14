@@ -25,10 +25,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _merge_queue_landing import LandingNotConfirmed, land_files
 from config_reload_script_fakes import FakeEscalationMcp
 from merge_queue_fakes import FakeMergeQueue, assert_target_checkout_clean
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -861,15 +863,15 @@ def _parse_commit_step(line):
     return token or None
 
 
-def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
-    """Of the seven commit-step outcomes driven here, FOUR narrate `commit=0`
+def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path, monkeypatch):
+    """Of the eight commit-step outcomes driven here, FIVE narrate `commit=0`
     on the final done(...) line -- which reads as success while nothing
     landed. In an unattended nightly whose journal is its only readable
     surface, "declined" and "landed" being indistinguishable in the
     summary line is exactly the silent-degradation shape CLAUDE.md's
     loud-over-silent norm warns about.
 
-    Drives the REAL wrapper into all seven branches with the harnesses already
+    Drives the REAL wrapper into all eight branches with the harnesses already
     established in this file (INV-10 `guards-exercise-behaviour`: no
     source-text scanning) and asserts every done(...) line carries a
     `commit-step=<token>` field EQUAL TO the token that branch is contracted
@@ -897,6 +899,13 @@ def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
     no_main_repo = _git_repo_harness(tmp_path / 'no-main', initial_branch='trunk')
     scenarios['failed:generation-worktree'], _ = _run_wrapper_in_git_repo(
         tmp_path / 'no-main', no_main_repo)
+
+    in_flight = tmp_path / 'in-flight'
+    in_flight_repo = _git_repo_harness(in_flight)
+    retained, _ = _retained_census_deploy(in_flight, in_flight_repo, monkeypatch)
+    with _census_queue(in_flight_repo, states={retained.removeprefix('task/'): ['verifying']}):
+        scenarios['skipped:landing-in-flight'], _ = _run_wrapper_in_git_repo(
+            in_flight, in_flight_repo, census_writes=_REGENERATED)
 
     # _wrapper_harness builds `<dir>/wbin` without `parents=True`, so (unlike
     # the _git_repo_harness-backed scenarios above, whose own `parents=True`
@@ -1399,3 +1408,73 @@ def test_a_checkout_without_main_runs_no_census(tmp_path):
     assert _commit_step(result) == 'failed:generation-worktree', _diag(result)
     assert _git(repo, 'status', '--porcelain', '--untracked-files=all').stdout == ''
     assert _git(repo, 'log', '--pretty=%H').stdout == before
+
+
+# ── one census request at a time: the history file is append-only ───────────
+#
+# A night whose deploy an earlier run RETAINED (its cancel refused, or the
+# orchestrator down at a stop) skips rather than stacking a second request
+# that would conflict on the append; a retained deploy that can no longer
+# land is reclaimed and the night lands as usual.
+
+_CENSUS_LABEL = 'memory-metadata-census'
+_CANCEL_REFUSED_WHILE_LANDING = {
+    'cancelled': False,
+    'state': 'finalizing',
+    'reason': 'Request is landing (its CAS is in progress)',
+    'code': 'finalize_window',
+}
+
+
+def _retained_census_deploy(tmp_path, repo, monkeypatch):
+    """The (branch, worktree) land_files kept for an earlier night's census
+    request, still live at a passed ceiling with its cancel refused."""
+    scratch = _scratch_dir(tmp_path)
+    scratch.mkdir(exist_ok=True)
+    monkeypatch.setattr(tempfile, 'tempdir', str(scratch))
+    queue = FakeMergeQueue(repo, states=['verifying'], cancel_reply=_CANCEL_REFUSED_WHILE_LANDING)
+    with FakeEscalationMcp(tool_handlers=queue.handlers()) as server, \
+            pytest.raises(LandingNotConfirmed):
+        land_files(str(repo), {_HISTORY: b'{"an earlier night": true}\n'}, _main(repo),
+                   port=str(server.port), label=_CENSUS_LABEL,
+                   message='chore(census): an earlier night', timeout_secs=0.001)
+    (submitted,) = queue.calls_to('merge_request')
+    return f'task/{submitted["branch"]}', Path(submitted['worktree'])
+
+
+def _branch_exists(repo, branch):
+    return _git(repo, 'show-ref', '--verify', '--quiet', f'refs/heads/{branch}').returncode == 0
+
+
+def test_a_retained_deploy_still_in_flight_skips_the_night(tmp_path, monkeypatch):
+    repo = _git_repo_harness(tmp_path)
+    branch, worktree = _retained_census_deploy(tmp_path, repo, monkeypatch)
+    bare = branch.removeprefix('task/')
+
+    with _census_queue(repo, states={bare: ['verifying']}) as (queue, _):
+        before = _main(repo)
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+
+    assert result.returncode == 0, _diag(result)
+    assert 'commit=0 commit-step=skipped:landing-in-flight)' in _done_line(result.stdout), (
+        _diag(result))
+    assert branch in result.stderr, _diag(result)
+    assert queue.calls_to('merge_request') == []
+    assert _branch_exists(repo, branch) and worktree.is_dir()
+    assert _main(repo) == before
+
+
+def test_a_retained_deploy_that_settled_is_reclaimed_and_the_night_lands(tmp_path, monkeypatch):
+    repo = _git_repo_harness(tmp_path)
+    branch, worktree = _retained_census_deploy(tmp_path, repo, monkeypatch)
+    bare = branch.removeprefix('task/')
+
+    with _census_queue(repo, states={bare: ['abandoned'],
+                                     FakeMergeQueue.REQUEST_ID: ['verifying', 'done']}) as (
+            queue, _):
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+
+    assert _commit_step(result) == 'landed:mr-deploy0001', _diag(result)
+    assert len(queue.calls_to('merge_request')) == 1
+    assert not worktree.exists()
+    _assert_left_nothing_behind(tmp_path, repo)
