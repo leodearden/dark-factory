@@ -2491,14 +2491,16 @@ rewriting a planned task's text, which no caller is told about. Contract:
 
 A frozen `plan.json` is not inert:
 `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._plan` picks its
-branch from the plan file. A plan with steps and a `_session_id` is
+branch from the plan file. A plan with steps, a `_session_id` and a
+resolvable revalidation base (`TaskWorkflow._revalidation_base`) is
 revalidated. A description or details amendment declines the Lever-B skip
 (previous subsection), but the revalidating architect is still handed the
 old plan to confirm, update or recreate. A metadata-only correction changes
 no fingerprint. So with `revalidation_skip_enabled`, no overlap with main's
 changes and `TaskWorkflow._can_skip_revalidation` passing, the orchestrator
 stamps `_revalidated_at` and proceeds without invoking the architect at all.
-Only an absent `plan.json` selects fresh planning.
+Moving `plan.json` out of the way is the reliable way to force fresh
+planning.
 
 No task lane can remove or rewrite another task's plan. The OS sandbox
 grants only `orchestrator/src/orchestrator/agents/write_set.py::WriteSet.writable_paths`,
@@ -2510,17 +2512,23 @@ therefore unimplementable (task 4822's step 5d; task 4825).
 plan-tools flags such a step when it is authored. The `add_plan_step`,
 `add_prerequisite`, `replace_plan_step` and `confirm_plan` responses carry
 `foreign_task_meta` (`{paths: {<step id>: [<path>]}, note}`) for any
-absolute path inside another lane's or task's `.task-meta` dir
+absolute, `~/` or worktree-relative `../` path inside another lane's or
+task's `.task-meta` dir
 (`WriteSet.is_foreign_task_meta`). The flag is advisory: prose cannot tell a
 read from a write, and reads are fine.
 
-The route: to make another task plan fresh, resolve an escalation for THAT
-task with `resolve_issue(action='restart', recut=True)` (task 5516;
-`escalation/src/escalation/server.py::resolve_issue`). Its next dispatch
-parks the branch, quarantines the worktree and moves `.task-meta` aside,
-deleting nothing, then cuts fresh from main and plans fresh. A task that
-needs this files `escalate_blocker` for it instead of scheduling the write
-as a step.
+The route: to make another task plan fresh, resolve an escalation whose
+`task_id` is THAT task's with `resolve_issue(action='restart', recut=True)`
+(task 5516; `escalation/src/escalation/server.py::resolve_issue`). Its next
+dispatch parks the branch, quarantines the worktree and moves `.task-meta`
+aside, deleting nothing, then cuts fresh from main and plans fresh.
+`resolve_issue` acts on the task its escalation names, so restart+recut on
+the requesting task's own escalation recuts the requesting task, not the
+target. A task that needs this files `escalate_blocker` for itself instead
+of scheduling the write as a step, with a `suggested_action` naming the
+target task id. The handler then resolves a pending escalation for the
+target, filing one with `escalate_blocker(task_id=<target id>)` first if
+there is none.
 
 ## 10. Rotating a long-running audit-trail task
 
