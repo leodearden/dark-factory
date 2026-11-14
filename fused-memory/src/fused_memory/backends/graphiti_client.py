@@ -61,7 +61,9 @@ from fused_memory.backends.graph_access import (
     STORE,
     FalkorGraphAccess,
     GraphAccess,
+    GraphHandle,
     OpBoundReader,
+    paged_ro_query,
 )
 from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
@@ -99,7 +101,6 @@ from fused_memory.backends.paged_read import RESULTSET_SIZE as _RESULTSET_SIZE
 from fused_memory.backends.paged_read import (
     census_count as _census_count,  # noqa: F401 - re-export; home is paged_read  # debt: task 9363
 )
-from fused_memory.backends.paged_read import paged_ro_query as _paged_ro_query
 from fused_memory.backends.recent_episodes import read_recent_group_episodes
 from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE, active_edge_filter
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
@@ -326,7 +327,7 @@ def _canonicalize_group_args(func):
     GraphitiBackend method taking a project group_id/group_ids must
     canonicalize those ARGUMENTS via α's ``canonicalize_project_id`` before
     the method body runs, so the FalkorDB graph KEY (``_driver_for`` /
-    ``_graph_for``), the node/edge ``group_id`` PROPERTY (graphiti_core's
+    ``graph_access.graph``), the node/edge ``group_id`` PROPERTY (graphiti_core's
     ``client.add_episode``), and any direct-Cypher ``$group_id`` FILTER
     always agree (RCA §4).
 
@@ -705,7 +706,7 @@ def apply_incompleteness_policy(
 ) -> None:
     """Apply the SPLIT incompleteness policy to an enumeration's PagedRead.
 
-    ONE implementation, shared by every caller of ``_paged_ro_query`` that
+    ONE implementation, shared by every caller of ``paged_ro_query`` that
     returns a plain collection (the two task-4340 back-compat shims and the
     task-4869 reads) AND by every consumer that calls an ``enumerate_*``
     method directly, because the policy is a single decision and not a
@@ -1329,10 +1330,9 @@ class GraphitiBackend:
         self._group_clients[group_id] = client
         return client
 
-    def _graph_for(self, group_id: str) -> Any:
-        """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
-        driver = self._require_driver()
-        return driver._get_graph(group_id)
+    def _graph_for(self, group_id: str) -> GraphHandle:
+        """Shim for the operator scripts until task 9183 moves them onto graph_access."""
+        return self.graph_access.graph(group_id)
 
     @_canonicalize_group_args
     def _identity_lock_for(self, group_id: str) -> asyncio.Lock:
@@ -1498,7 +1498,7 @@ class GraphitiBackend:
 
         # --- FalkorDB driver ---
         # The driver is created with a placeholder database.  Actual graph
-        # selection happens per-request via _driver_for() / _graph_for().
+        # selection happens per-request via _driver_for() / graph_access.graph().
         falkor_cfg = cfg.graphiti.falkordb
         if falkor_cfg.database is not None:
             logger.warning(
@@ -2218,7 +2218,7 @@ class GraphitiBackend:
         return all nodes with embeddings and filter client-side by parsing the
         raw vector text representation (``<v1, v2, ...>``).
 
-        PAGINATED (task 4869) through ``_paged_ro_query``, because the embedded
+        PAGINATED (task 4869) through ``paged_ro_query``, because the embedded
         population exceeds the server's result-set cap; incompleteness follows
         the shared ``apply_incompleteness_policy``.  Measured counts are in
         plans/falkordb-resultset-cap-audit.md.
@@ -2270,10 +2270,10 @@ class GraphitiBackend:
 
         The one body of the two stale-embedding reads, which differ only in the
         population paged (``page_template``/``census_cypher``, as for
-        ``_paged_ro_query``) and the ``method``/``noun`` they report under.
+        ``paged_ro_query``) and the ``method``/``noun`` they report under.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(graph, page_template, census_cypher)
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(graph, page_template, census_cypher, op=method)
         stale = [
             (row[0], row[1], dim)
             for row in _first_row_per_uuid(paged.rows, reader=method)
@@ -2343,9 +2343,10 @@ class GraphitiBackend:
         if not prefix:
             raise ValueError(f'{method} needs a non-empty prefix')
         upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph, page_template, census_cypher, params={'prefix': prefix, 'upper': upper},
+            op=method,
         )
         matches = [
             (row[0], row[1] or '')
@@ -2371,7 +2372,7 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
 
-        PAGINATED (task 4869) through ``_paged_ro_query``, because a window
+        PAGINATED (task 4869) through ``paged_ro_query``, because a window
         spanning more edges than the server's result-set cap was silently
         truncated; incompleteness follows the shared
         ``apply_incompleteness_policy``.  See
@@ -2388,13 +2389,14 @@ class GraphitiBackend:
         Raises:
             IncompleteEnumerationError: The read was structurally incomplete.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         params = {'start': start, 'end': end}
-        paged = await _paged_ro_query(
+        paged = await paged_ro_query(
             graph,
             _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE,
             _EDGES_IN_VALID_AT_WINDOW_CENSUS,
             params=params,
+            op='query_edges_by_time_range',
         )
         edges = [
             {
@@ -2623,19 +2625,20 @@ class GraphitiBackend:
         Args:
             group_id: Project graph to query.
             page_size: Rows per page. Must stay strictly below the server's
-                result-set cap — see _paged_ro_query.
+                result-set cap — see paged_ro_query.
 
         Returns:
             (grouped, paged) where *grouped* is the same dict
             get_all_valid_edges returns and *paged* is the PagedRead carrying
             ``complete``/``rows_seen``/``expected_rows``/``reason``.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph,
             _ALL_VALID_EDGES_PAGE_TEMPLATE,
             _ALL_VALID_EDGES_CENSUS,
             page_size=page_size,
+            op='enumerate_all_valid_edges',
         )
         return self._group_valid_edge_rows(
             paged.rows, reader='enumerate_all_valid_edges'
@@ -2675,13 +2678,14 @@ class GraphitiBackend:
                 'enumerate_valid_edges_mentioning needs a non-empty substring: '
                 f'an empty one matches every valid edge (got {substring!r})'
             )
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph,
             _VALID_EDGES_MENTIONING_PAGE_TEMPLATE,
             _VALID_EDGES_MENTIONING_CENSUS,
             params={'substring': substring},
             page_size=page_size,
+            op='enumerate_valid_edges_mentioning',
         )
         return self._group_valid_edge_rows(
             paged.rows, reader='enumerate_valid_edges_mentioning'
@@ -2754,7 +2758,7 @@ class GraphitiBackend:
         found this live in plans/falkordb-resultset-cap-audit.md (the single
         place they are recorded, so a re-measurement is a one-file edit); the
         ORDER BY and completeness rules that make paging safe are in
-        _paged_ro_query.
+        paged_ro_query.
 
         This is read_all_valid_edges_checked without the verdict.
         Incompleteness is handled by the shared apply_incompleteness_policy:
@@ -3611,7 +3615,7 @@ class GraphitiBackend:
         treat an empty result as "fall back to fuzzy search" and pick nodes[0] on a hit.
 
         Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
-        amendment), not just the graph key selected via _graph_for — task-2115's active
+        amendment), not just the graph key selected via graph_access — task-2115's active
         cross-graph leak can plant a misrouted foreign node (group_id property of
         ANOTHER project) physically inside this graph key, and this predicate keeps
         such a clone from ever surfacing here.
@@ -3684,7 +3688,7 @@ class GraphitiBackend:
         invariant rather than a convenience.
 
         Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
-        amendment), not just the graph key selected via _graph_for — task-2115's active
+        amendment), not just the graph key selected via graph_access — task-2115's active
         cross-graph leak can plant a misrouted foreign node (group_id property of
         ANOTHER project) physically inside this graph key, and this predicate keeps
         such a clone from ever being treated as a duplicate to collapse.
@@ -3782,7 +3786,7 @@ class GraphitiBackend:
         group_id property names ANOTHER project physically inside this graph
         key, and a caller collapsing duplicates must never see it.
 
-        Single un-paginated ro_query rather than _paged_ro_query, which needs a
+        Single un-paginated ro_query rather than paged_ro_query, which needs a
         total `ORDER BY n.uuid` for stable SKIP/LIMIT paging and so cannot
         carry the survivor-first ordering that makes rows[0] meaningful. A
         selective substring returns a handful of rows, so paging would buy
@@ -4549,7 +4553,7 @@ class GraphitiBackend:
         Args:
             group_id: Project graph to query.
             page_size: Rows per page. Must stay strictly below the server's
-                result-set cap — see _paged_ro_query.
+                result-set cap — see paged_ro_query.
 
         Rows are deduplicated on ``n.uuid`` across ALL pages — see
         ``_first_row_per_uuid`` for why paging makes that necessary where a
@@ -4562,12 +4566,13 @@ class GraphitiBackend:
             ``paged.rows_seen`` counts ROWS FETCHED, so it can exceed
             ``len(nodes)`` when a boundary row was re-emitted.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph,
             _ENTITY_NODES_PAGE_TEMPLATE,
             _ENTITY_NODES_CENSUS,
             page_size=page_size,
+            op='enumerate_entity_nodes',
         )
         # The consumers downstream rely on the dedup: detect_stale_with_edges
         # reports one stale entry per element and uses len(entities) as its
@@ -4595,13 +4600,14 @@ class GraphitiBackend:
         Returns:
             (rows, paged), *paged* being the read's PagedRead.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph,
             _RANKED_ENTITY_NODES_PAGE_TEMPLATE,
             _RANKED_ENTITY_NODES_CENSUS,
             params={'group_id': group_id},
             page_size=page_size,
+            op='enumerate_ranked_entity_nodes',
         )
         rows = [
             {
@@ -5138,7 +5144,7 @@ class GraphitiBackend:
         (``tests/_fm_falkor_live.await_index_operational``), never here.
 
         Decorated with ``@_canonicalize_group_args`` for correctness, not hygiene:
-        the writes resolve a FalkorDB graph KEY through ``_graph_for``, and the
+        the writes resolve a FalkorDB graph KEY through ``graph_access``, and the
         inner ``list_indices`` call being decorated does not cover that — the diff
         read and the writes resolve the key independently (PRD seam S4).
 
