@@ -5,7 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from escalation.models import Escalation, cascade_resolved_by
+from escalation.models import (
+    EVAL_LANE_CONTAINMENT_RESOLVER,
+    NOTE_TO_FILE_CLASS,
+    PRE_SUBMIT_CHECK_RESOLVER,
+    Escalation,
+    cascade_resolved_by,
+)
+from escalation.note_to_file import NOTE_TO_FILE_RESOLUTION, NOTE_TO_FILE_RESOLVER
 
 from orchestrator.escalation_rulings import (
     RULING_INSTRUCTIONS,
@@ -31,12 +38,15 @@ def _esc(
     resolved_by: str | None = 'interactive',
     resolution_action: str | None = 'resume',
     level: int = 0,
+    severity: str = 'blocking',
+    note_to_file: bool = False,
+    resolution_class: str | None = None,
 ) -> Escalation:
     return Escalation(
         id=esc_id,
         task_id='4764',
         agent_role='implementer',
-        severity='blocking',
+        severity=severity,
         category='design_concern',
         summary=summary,
         status=status,
@@ -45,6 +55,8 @@ def _esc(
         resolved_by=resolved_by,
         resolution_action=resolution_action,
         level=level,
+        note_to_file=note_to_file,
+        resolution_class=resolution_class,
     )
 
 
@@ -53,6 +65,33 @@ _RECORD_SHAPES = {
     'dismissed_with_text': (_esc('esc-4764-2', status='dismissed', resolution='router close'), False),
     'pending': (_esc('esc-4764-3', status='pending', resolution=None, resolved_at=None), False),
     'resolved_without_text': (_esc('esc-4764-4', resolution=None), False),
+    'note_to_file': (
+        _esc(
+            'esc-4764-5', severity='info', note_to_file=True, resolution_class=NOTE_TO_FILE_CLASS,
+            resolved_by=NOTE_TO_FILE_RESOLVER, resolution=NOTE_TO_FILE_RESOLUTION,
+            resolution_action='close_only',
+        ),
+        False,
+    ),
+    'eval_lane_contained': (
+        _esc(
+            'esc-4764-6', resolved_by=EVAL_LANE_CONTAINMENT_RESOLVER,
+            resolution=(
+                'contained: eval-lane artifact (fixture-task-id:df_task_2430_adv_plan); not a '
+                'production signal, the eval measurement is scored from the cell result artifacts'
+            ),
+            resolution_class='benign', resolution_action='close_only',
+        ),
+        False,
+    ),
+    'pre_submit_auto_closed': (
+        _esc(
+            'esc-4764-7', resolved_by=PRE_SUBMIT_CHECK_RESOLVER,
+            resolution='auto-resolved: task already terminal (status=done)',
+            resolution_class='benign',
+        ),
+        False,
+    ),
 }
 
 
