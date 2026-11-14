@@ -57,6 +57,7 @@ from fused_memory.backends.falkor_server_settings import (
     warn_on_shortfalls,
 )
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
+from fused_memory.backends.graph_access import FalkorGraphAccess, GraphAccess
 from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
@@ -1140,6 +1141,7 @@ class GraphitiBackend:
         )
         self.client: Graphiti | None = None
         self._driver: FalkorDriver | None = None
+        self._graph_access: GraphAccess | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         # First-write provisioning runs INSIDE the triggering write's own budget
@@ -1171,6 +1173,7 @@ class GraphitiBackend:
         llm_client: LLMClient | None = None,
         embedder: EmbedderClient | None = None,
         cross_encoder: CrossEncoderClient | None = None,
+        graph_access: GraphAccess | None = None,
     ) -> 'GraphitiBackend':
         """A backend over *driver* and the given sub-clients, wired without ``initialize()``.
 
@@ -1178,10 +1181,17 @@ class GraphitiBackend:
         base ``client`` is built: methods that need one raise until it is assigned.
         The registry is required because the derived one names real project graphs.
         The backend takes ownership: ``close()`` releases the driver and sub-clients.
+
+        An injected *graph_access* serves every raw Cypher call; graphiti_core
+        calls still run over *driver*.
         """
         backend = cls(config, registered_graph_ids=registered_graph_ids)
         backend._attach(
-            driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross_encoder,
+            driver,
+            llm_client=llm_client,
+            embedder=embedder,
+            cross_encoder=cross_encoder,
+            graph_access=graph_access,
         )
         return backend
 
@@ -1192,11 +1202,28 @@ class GraphitiBackend:
         llm_client: LLMClient | None,
         embedder: EmbedderClient | None,
         cross_encoder: CrossEncoderClient | None,
+        graph_access: GraphAccess | None,
     ) -> None:
         self._driver = driver
+        self._graph_access = graph_access
         self._llm_client = llm_client
         self._embedder = embedder
         self._cross_encoder = cross_encoder
+
+    @property
+    def graph_access(self) -> GraphAccess:
+        """The provider every raw Cypher call resolves its graph through.
+
+        The injected one, else a budgeted view over the CURRENT driver, so the
+        driver stays the one owner of the connection.
+        """
+        if self._graph_access is not None:
+            return self._graph_access
+        return FalkorGraphAccess(
+            self._require_driver(),
+            read_budget_s=self._read_timeout,
+            write_budget_s=self._write_timeout,
+        )
 
     @property
     def registered_graph_ids(self) -> frozenset[str]:
@@ -1510,7 +1537,11 @@ class GraphitiBackend:
         cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
         self._attach(
-            driver, llm_client=llm_client, embedder=embedder_client, cross_encoder=cross_encoder,
+            driver,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            cross_encoder=cross_encoder,
+            graph_access=None,
         )
         self.client = Graphiti(
             graph_driver=driver,
@@ -5458,8 +5489,8 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
         """
-        graph: Any = self._graph_for(graph_name)
-        result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
+        graph = self.graph_access.graph(graph_name)
+        result = await graph.ro_query('MATCH (n) RETURN count(n) as count', op='node_count')
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
