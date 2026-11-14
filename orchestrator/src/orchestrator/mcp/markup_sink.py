@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import enum
 import logging
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping
@@ -60,6 +61,30 @@ MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 #: The ERROR line for a record the queue could not take: why, what it cost
 #: (:func:`_loss_account`), and whose call it was.
 _LOSS_LOG_FORMAT = 'markup guard: %s, so %s (subject %r)'
+
+
+class LossCause(enum.StrEnum):
+    """Why a record the queue could not take was lost."""
+
+    ROOT_UNRESOLVED = 'project_root_unresolved'
+    QUEUE_UNOPENED = 'queue_unopened'
+    SUBMIT_FAILED = 'submit_failed'
+    SINK_FAILED = 'sink_failed'
+
+
+_LOSS_PROSE: Mapping[LossCause, str] = {
+    LossCause.ROOT_UNRESOLVED: 'the project root could not be resolved',
+    LossCause.QUEUE_UNOPENED: 'the escalation queue could not be opened',
+    LossCause.SUBMIT_FAILED: 'the escalation could not be submitted',
+    LossCause.SINK_FAILED: 'the escalation sink could not run',
+}
+
+#: The ``fact`` and ``outcome`` of the record a lost record is handed to the
+#: loss sink as. The outcome must stay disjoint from the middleware's
+#: ``OUTCOMES`` and from verdict-tools' ``IssueIntakeOutcome``: a journal line
+#: cut to its floor keys is told apart by ``outcome`` alone.
+MARKUP_RECORD_LOST_FACT = 'markup_record_lost'
+MARKUP_RECORD_LOST_OUTCOME = 'lost'
 
 #: The burst alarm's OWN category and level, because the middleware's storm
 #: record declares neither — unlike the residue record, which carries both and
@@ -682,11 +707,30 @@ def _loss_account(record: dict[str, Any]) -> str:
     )
 
 
+def _loss_fact(record: Mapping[str, Any], cause: LossCause) -> dict[str, Any]:
+    """The loss sink's record for *record*: what was lost and why, never the payload.
+
+    ``param`` is the journal's floor-key name for the record's ``field``, so a
+    line cut to its floor still names the tool and the parameter.
+    """
+    raw_value = record.get('raw_value')
+    return {
+        'fact': MARKUP_RECORD_LOST_FACT,
+        'outcome': MARKUP_RECORD_LOST_OUTCOME,
+        'cause': cause.value,
+        'error_type': record.get('error_type'),
+        'tool': record.get('tool'),
+        'param': record.get('field'),
+        'raw_value_chars': len(raw_value) if isinstance(raw_value, str) else None,
+    }
+
+
 def make_escalation_sink(
     *,
     worktree: Path,
     spec: MarkupSinkSpec,
     subject_task_id: Callable[[], str],
+    loss_sink: Callable[[dict[str, Any]], Awaitable[object]],
     resolve_root: Callable[[Path], Path | None] = resolve_project_root,
     open_channel: Callable[[Path], tuple[Any, Any] | None] = open_escalation_channel,
 ) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
@@ -707,13 +751,26 @@ def make_escalation_sink(
     worktree), before any root is resolved or queue opened, and answered with
     an INFO line and ``None`` — "nothing was preserved", which is true.
 
-    THE FLOOR IS THE QUEUE OR NOTHING, for every boundary on this sink. A
-    record the queue cannot take is logged once at ERROR and answered with
-    ``None``, which is what makes the middleware tell the caller — the one
+    THE PAYLOAD FLOOR IS THE QUEUE OR NOTHING, for every boundary on this
+    sink. A record the queue cannot take is logged once at ERROR and answered
+    with ``None``, which is what makes the middleware tell the caller — the one
     party still holding the payload — that nothing was preserved and to resend
     from its own copy. A worktree-local copy was tried and retired (task 4584):
     it died with the lane unread, while its filename bought the caller a false
     "preserved verbatim".
+
+    THE LOSS ITSELF IS DURABLE AND COUNTABLE (task 7128, INV-4). Every record
+    the queue could not take, of any kind and for any :class:`LossCause`, is
+    also handed to *loss_sink* as one ``MARKUP_RECORD_LOST_FACT`` record. On a
+    per-agent stdio site the ERROR line reaches no durable sink, so this record
+    is the only account of the loss. It names the kind, the cause, the tool,
+    the parameter and the payload's size, and never carries the payload. An
+    eval-lane record is deliberately not filed, which is not a loss, so it
+    reaches *loss_sink* not at all. Each site passes the markup journal it
+    already uses as its fact sink, the SAME instance: the middleware emits the
+    fact before it files, so that journal has already resolved its project
+    root when this sink's own resolution fails. A loss sink that fails is
+    logged at WARNING, because the loss already has its ERROR line.
 
     *subject_task_id* is a THUNK, not a value: the middleware cannot resolve
     the leaking task (``MarkupGuardMiddleware._identity`` reads its identity
@@ -749,11 +806,18 @@ def make_escalation_sink(
     project_root: Path | None = None
     channel: tuple[Any, Any] | None = None
 
-    def report_lost(record: dict[str, Any], why: str) -> None:
-        logger.error(_LOSS_LOG_FORMAT, why, _loss_account(record), _subject())
+    def report_lost(record: dict[str, Any], cause: LossCause) -> LossCause:
+        logger.error(
+            _LOSS_LOG_FORMAT, _LOSS_PROSE[cause], _loss_account(record), _subject(),
+        )
+        return cause
 
-    def file_record(record: dict[str, Any]) -> str | None:
-        """The blocking body, run on a worker thread."""
+    def file_record(record: dict[str, Any]) -> str | LossCause | None:
+        """The blocking body, run on a worker thread.
+
+        The queued id, the cause of a loss, or ``None`` for a record that was
+        deliberately not filed.
+        """
         nonlocal project_root, channel
         subject = _subject()
         eval_lane_reason = eval_lane_provenance(subject, worktree)
@@ -767,15 +831,13 @@ def make_escalation_sink(
         if project_root is None:
             project_root = resolve_root(worktree)
             if project_root is None:
-                report_lost(record, 'the project root could not be resolved')
-                return None
+                return report_lost(record, LossCause.ROOT_UNRESOLVED)
         if channel is None:
             # Memoised alongside project_root so a queue directory is opened
             # (and mkdir'd) once per server rather than once per record.
             channel = open_channel(project_root)
             if channel is None:
-                report_lost(record, 'the escalation queue could not be opened')
-                return None
+                return report_lost(record, LossCause.QUEUE_UNOPENED)
         escalation_cls, queue = channel
 
         error_type = record.get('error_type')
@@ -800,17 +862,17 @@ def make_escalation_sink(
             )
         except Exception:
             logger.error(
-                _LOSS_LOG_FORMAT, 'the escalation could not be submitted',
+                _LOSS_LOG_FORMAT, _LOSS_PROSE[LossCause.SUBMIT_FAILED],
                 _loss_account(record), subject, exc_info=True,
             )
-            return None
+            return LossCause.SUBMIT_FAILED
 
     def _subject() -> str:
         return resolve_subject(subject_task_id, worktree, what='record')
 
     async def sink(record: dict[str, Any]) -> str | None:
         try:
-            return await asyncio.to_thread(file_record, record)
+            filed = await asyncio.to_thread(file_record, record)
         except Exception:
             # ``file_record`` already contains every filing failure; this is the
             # floor under the thread hop itself, so the never-raises contract
@@ -819,6 +881,17 @@ def make_escalation_sink(
                 'markup guard: could not run the escalation sink for %r; the '
                 'refusal stands', record.get('error_type'),
             )
-            return None
+            filed = LossCause.SINK_FAILED
+        if not isinstance(filed, LossCause):
+            return filed
+        try:
+            await loss_sink(_loss_fact(record, filed))
+        except Exception:
+            logger.warning(
+                'markup guard: the loss of the %r record (%s) could not be '
+                'handed to the loss sink', record.get('error_type'), filed.value,
+                exc_info=True,
+            )
+        return None
 
     return sink

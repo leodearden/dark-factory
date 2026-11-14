@@ -34,6 +34,11 @@ bounded write. This journal answers "who leaked, from which tool, into which
 parameter, when" — the question the storm record asks a human to answer and
 gives them no way to.
 
+The file also receives the escalation sink's loss records (fact
+``markup_record_lost``, outcome ``lost``, task 7128): one line for each record
+the queue could not take, naming why and the payload's size. They are
+payload-free like every other line, so the rule above is unchanged.
+
 Shape inherited from ``markup_sink.make_escalation_sink``: never raises, does
 its blocking work under ``asyncio.to_thread``, memoizes successes only, returns
 a locator string or ``None``. The two injected channels on one boundary behave
