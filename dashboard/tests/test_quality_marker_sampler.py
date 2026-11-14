@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import closing, suppress
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 from _quality_fixture import GitRepo, append_events, build_quality_project, routing_decision
+from _quality_snapshots import snapshot_doc, write_snapshot
 from _runs_db_fixture import EventRow, write_runs_db
 from shared.project_id import project_id_for_root
 from shared.project_layout import runs_db
@@ -34,6 +36,7 @@ from dashboard.data.quality_markers import (
     MarkerKind,
     PromptCoverage,
     RoutingFold,
+    SourceType,
     StoredMarkerState,
     derived_markers,
     fold_routing_decisions,
@@ -43,7 +46,8 @@ from dashboard.data.quality_sampler import (
     QUALITY_PER_ROOT_BUDGET_SECONDS,
     QUALITY_SAMPLE_INTERVAL_SECONDS,
 )
-from dashboard.data.quality_store import read_marker_state
+from dashboard.data.quality_snapshots import BASELINE_HOME, RootScan, SnapshotCache, scan_root
+from dashboard.data.quality_store import read_marker_state, write_snapshot_scan
 from dashboard.loops import _quality_loop, _QualityStore
 
 T0 = datetime(2026, 10, 27, 13, 0, tzinfo=UTC)
@@ -467,3 +471,46 @@ async def test_the_quality_loop_stores_marker_state_within_its_first_tick(
     assert stored.failure is None, stored.failure
     assert stored.derived is not None
     assert [(m.kind, m.at) for m in stored.derived.markers] == [(MarkerKind.EFFORT, _at(5))]
+
+
+SNAPSHOT_TIMES = (datetime(2026, 10, 8, 12, tzinfo=UTC), datetime(2026, 11, 1, 3, tzinfo=UTC))
+
+
+def _snapshot_scan(path: Path, project_id: str, monkeypatch: pytest.MonkeyPatch) -> tuple[RootScan, str]:
+    """A schema-2 baseline then a schema-3 nightly snapshot, at commits dated SNAPSHOT_TIMES; and
+    the schema-3 snapshot's sha."""
+    repo = GitRepo(path / 'snapshot-repo')
+    _dated(monkeypatch, SNAPSHOT_TIMES[0].isoformat())
+    baseline_sha = repo.init()
+    _dated(monkeypatch, SNAPSHOT_TIMES[1].isoformat())
+    nightly_sha = repo.commit({'a.txt': 'two\n'}, 'two')
+    nightly = path / 'nightly'
+    write_snapshot(repo.root / BASELINE_HOME / 'baseline.json', snapshot_doc(2, as_of_sha=baseline_sha, run_id='r1'))
+    write_snapshot(nightly / project_id / f'{nightly_sha}.json', snapshot_doc(3, as_of_sha=nightly_sha, run_id='r2'))
+    scan = scan_root(repo.root, project_id, nightly, SnapshotCache.empty(), deadline=time.monotonic() + 120)
+    assert [point.committed_at for point in scan.points] == list(SNAPSHOT_TIMES)
+    return scan, nightly_sha
+
+
+async def test_stored_snapshots_reach_the_derivation_as_one_instrument_marker(
+    conn: aiosqlite.Connection, factory: Path, no_curated: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    landed = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
+    measured = build_quality_project(tmp_path / 'measured', first_landed_at=landed)
+    unmeasured = build_quality_project(tmp_path / 'unmeasured', first_landed_at=landed)
+    pid, other = project_id_for_root(measured.root), project_id_for_root(unmeasured.root)
+    scan, nightly_sha = _snapshot_scan(tmp_path / 'snapshots', pid, monkeypatch)
+    await write_snapshot_scan(conn, pid, scan, NOW)
+    await conn.commit()
+
+    await _tick(conn, [measured.root, unmeasured.root], factory, no_curated)
+
+    [instrument] = [m for m in (await _derived(conn, pid)).markers if m.kind is MarkerKind.INSTRUMENT]
+    assert (instrument.marker_id, instrument.at, instrument.ref) == (
+        f'instrument:{nightly_sha}', SNAPSHOT_TIMES[1], nightly_sha,
+    )
+    assert instrument.source.type is SourceType.INSTRUMENT
+    assert 'instrument (unknown)' in instrument.label
+    assert 'python_version (unknown)' in instrument.label
+    assert not [m for m in (await _derived(conn, other)).markers if m.kind is MarkerKind.INSTRUMENT]

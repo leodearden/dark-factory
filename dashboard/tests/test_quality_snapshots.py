@@ -6,18 +6,20 @@ instrument proves the fixtures (dashboard/tests/_quality_snapshots.py) as well a
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 import pytest
-from _quality_fixture import GitRepo
+from _quality_fixture import GitRepo, build_quality_project
 from _quality_snapshots import (
     DEFAULT_GRAPH,
     DEFAULT_MEMBERS,
@@ -30,7 +32,9 @@ from shared.quality_series.git_lines import GitObjectMissing
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import DatumState, validate_datum
+from dashboard.data.db import DbPool
 from dashboard.data.quality_marker_sampler import MARKER_PER_ROOT_BUDGET_SECONDS
+from dashboard.data.quality_markers import MarkerKind
 from dashboard.data.quality_sampler import (
     QUALITY_PER_ROOT_BUDGET_SECONDS,
     QUALITY_SAMPLE_INTERVAL_SECONDS,
@@ -58,6 +62,7 @@ from dashboard.data.quality_snapshots import (
     summarise,
 )
 from dashboard.data.quality_store import (
+    read_marker_state,
     read_snapshot_cache,
     read_snapshot_diff,
     read_snapshot_identities,
@@ -65,7 +70,7 @@ from dashboard.data.quality_store import (
     record_snapshot_failure,
     write_snapshot_scan,
 )
-from dashboard.loops import _QualityStore
+from dashboard.loops import _quality_loop, _QualityStore
 
 SHA_1 = '1' * 40
 SHA_2 = '2' * 40
@@ -719,3 +724,45 @@ class TestTheSnapshotTick:
         assert stored.attempted_at == later
         assert stored.failure is not None and stored.failure.startswith('FileNotFoundError: ')
         assert str(absent) in stored.failure
+
+
+async def test_the_quality_loop_scans_snapshots_before_it_derives_markers_on_its_first_pass(
+    tmp_path: Path,
+) -> None:
+    """Read through a DbPool connection of its own, as /api/v2/dashboard/quality reads it
+    (test_quality_marker_sampler.py::test_the_quality_loop_stores_marker_state_within_its_first_tick)."""
+    project = build_quality_project(tmp_path / 'dark_factory',
+                                    first_landed_at=datetime(2026, 11, 2, 9, 0, tzinfo=UTC))
+    config = DashboardConfig(project_root=project.root)
+    initial = GitRepo(project.root).git('rev-list', '--max-parents=0', 'HEAD')
+    write_snapshot(project.root / BASELINE_HOME / 'review-all-dark_factory-20261008.json',
+                   snapshot_doc(2, as_of_sha=initial, run_id='r1'))
+    write_snapshot(config.quality_metrics_dir / 'dark_factory' / f'{project.plain_sha}.json',
+                   snapshot_doc(3, as_of_sha=project.plain_sha, run_id='r2'))
+    path = tmp_path / 'quality.db'
+    store = _QualityStore(path)
+    await store.open()
+    pool = DbPool()
+    loop = asyncio.create_task(_quality_loop(store, config))
+    try:
+        reader = await pool.get(path)
+        assert reader is not None
+        async with asyncio.timeout(90):
+            while (markers := await read_marker_state(reader, 'dark_factory')) is None:
+                await asyncio.sleep(0.05)
+        snapshots = await read_snapshot_state(reader, 'dark_factory')
+    finally:
+        loop.cancel()
+        with suppress(asyncio.CancelledError):
+            await loop
+        try:
+            await pool.close_all()
+        finally:
+            await store.close()
+
+    assert snapshots is not None and snapshots.scan is not None, snapshots
+    assert [point.summary.as_of_sha for point in snapshots.scan.series.points] == [initial, project.plain_sha]
+    assert markers.failure is None and markers.derived is not None, markers.failure
+    assert [m.marker_id for m in markers.derived.markers if m.kind is MarkerKind.INSTRUMENT] == [
+        f'instrument:{project.plain_sha}',
+    ]
