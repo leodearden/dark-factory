@@ -438,9 +438,14 @@ class TestScenario1SpeculativeCascade:
             await _until(lambda: 'casc1-a' in verifier.verified, what="N's verify to enter")
             await asyncio.wait_for(follower_entered.wait(), timeout=_SETTLE_TIMEOUT)
 
+            # Only N's gate opens, so N+1's verify is still running on its
+            # remote host when the cascade reaches it. A verdict reached first
+            # would have freed that host already (task 8526).
             head_gate.set()
-            # Release N+1's gate too, so the (possibly still-running) gated
-            # task can unblock even if cancel() arrives slightly late.
+            await _until(
+                lambda: gated_remote.cancel_verify.called,
+                what="the cascade to cancel N+1's running remote verify",
+            )
             follower_release.set()
 
             outcome_a = await wait_responsive(

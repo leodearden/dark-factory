@@ -528,7 +528,9 @@ class TestDispatchDeadBaseRecheck:
         store = _LateArrivalFakeEventStore()
         worker = _make_worker(git_ops, event_store=store)
         worker._record_dead_base(_DEAD, killer=_KILLER)  # unrelated dead commit
-        worker._host_allocator = _fake_local_allocator()
+        allocator = _fake_local_allocator()
+        allocator.release = AsyncMock()  # the straggler's verdict frees its host
+        worker._host_allocator = allocator
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
         worker._remerge = AsyncMock()  # type: ignore[method-assign]
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
@@ -547,11 +549,12 @@ class TestDispatchDeadBaseRecheck:
         assert isinstance(item, RealMergeItem)
 
         entry = await worker._dispatch_item(item)
+        assert isinstance(entry, InflightEntry) and entry.verify_task is not None
+        await entry.verify_task
 
         worker._remerge.assert_not_awaited()             # intact chain → no remerge
         worker._run_inflight_verify.assert_called_once()  # verify launched normally
         assert store.speculative_events(EventType.verdict_voided) == []
-        assert entry is not None
 
 
 # ── Head-failure cascade dangling-successor-edge population (enforcement (c)) ──
