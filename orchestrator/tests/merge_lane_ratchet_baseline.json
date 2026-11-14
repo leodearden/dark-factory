@@ -1371,6 +1371,7 @@
     "orchestrator/tests/conftest.py::tree_pass": 0
   },
   "tests": {
+    "orchestrator/tests/_api_outage_harness.py": {"patch_targets": [], "private_reads": 6},
     "orchestrator/tests/_fill_drive_harness.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/_info_l0_router_fixtures.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/_lane_test_helpers.py": {"patch_targets": [], "private_reads": 0},
