@@ -13,19 +13,31 @@ Specimens are BUILT from ``shared.toolcall_markup``'s own constants by
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.types import CallToolResult, TextContent
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
+from shared.uuid_prefix_guard import (
+    FACT_UUID_PREFIX_DETECTED,
+    Candidate,
+    Resolution,
+    ResolverUnavailable,
+    UuidPrefixGuardMiddleware,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server import markup_guard
 from fused_memory.server.boundary_guards import boundary_guard_chain, install_boundary_guards
+from fused_memory.server.main import _install_tool_dispatch_guards
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.unknown_argument_guard import UnknownArgumentMiddleware
+from fused_memory.utils.validation import validate_full_uuid
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -101,3 +113,334 @@ class TestTheChainWithoutAPrefixResolver:
 
         assert _payload(exc_info)['error_type'] == 'mcp_markup_detected'
         mock_service.add_memory.assert_not_awaited()
+
+
+PREFIX = 'bff81530'
+FULL = 'bff81530-70e5-4ab6-939e-507299d1bcd2'
+SIBLING = 'bff81530-0000-4000-8000-000000000002'
+
+UNIQUE = Resolution('unique', (Candidate('mem0', FULL, 'the dead repair'),))
+AMBIGUOUS = Resolution('ambiguous', (
+    Candidate('mem0', FULL, 'a memory'),
+    Candidate('graphiti_node', SIBLING, 'a node'),
+))
+NONE = Resolution('none', ())
+
+_CITING = f'see {PREFIX} for the dead repair'
+
+#: The declared uuid-prefix exemptions on this server (D10), spelled out here
+#: rather than imported, so a silent edit to the declaration fails this pin.
+_EXPECTED_EXEMPT = frozenset({
+    'delete_memory', 'delete_episode', 'delete_entity', 'update_edge',
+    'reassign_edge', 'merge_entities', 'consolidate_memories', 'scan_memory_content',
+})
+
+_SUBSTITUTION = {
+    'field': 'content', 'path': ['content'], 'from': PREFIX, 'to': FULL, 'namespace': 'mem0',
+}
+
+
+class RecordingResolver:
+    """A ``PrefixResolver`` answering one scripted Resolution, or raising one outage."""
+
+    def __init__(
+        self, answer: Resolution = NONE, *, outage: ResolverUnavailable | None = None
+    ) -> None:
+        self.answer = answer
+        self.outage = outage
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(self, project_id: str, prefix: str) -> Resolution:
+        self.calls.append((project_id, prefix))
+        if self.outage is not None:
+            raise self.outage
+        return self.answer
+
+
+def _pass_through(mock_service: AsyncMock, method: str) -> None:
+    """Give *method*'s return value a real ``model_dump`` (tests/server/test_markup_tripwire_gate.py)."""
+    result = MagicMock()
+    result.model_dump.return_value = {'id': 'ok'}
+    getattr(mock_service, method).return_value = result
+
+
+def _memory_server(
+    resolver: RecordingResolver, *, known_projects: dict[str, str] | None = None
+) -> tuple[Any, AsyncMock]:
+    mock_service = AsyncMock()
+    _pass_through(mock_service, 'add_memory')
+    _pass_through(mock_service, 'add_episode')
+    server = create_mcp_server(mock_service)
+    install_boundary_guards(server, known_projects=known_projects, prefix_resolver=resolver)
+    return server, mock_service
+
+
+@pytest.fixture
+def task_server_for(monkeypatch):
+    """Build a task-tool server whose '/project' root needs no real checkout."""
+    monkeypatch.setattr('fused_memory.server.tools.resolve_main_checkout', lambda p: str(p))
+
+    def build(
+        resolver: RecordingResolver, *, known_projects: dict[str, str]
+    ) -> tuple[Any, AsyncMock]:
+        interceptor = AsyncMock()
+        interceptor.submit_task.return_value = {'ticket': 'tkt_x'}
+        interceptor.update_task.return_value = {'ok': True}
+        server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+        install_boundary_guards(server, known_projects=known_projects, prefix_resolver=resolver)
+        return server, interceptor
+
+    return build
+
+
+async def _wire(server: Any, tool: str, arguments: dict[str, Any]) -> CallToolResult:
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        return await session.call_tool(tool, arguments)
+
+
+def _text_json(result: CallToolResult) -> dict[str, Any]:
+    [block] = result.content
+    assert isinstance(block, TextContent)
+    return json.loads(block.text)
+
+
+def _repair(result: CallToolResult) -> dict[str, Any]:
+    assert result.meta is not None, 'the call returned no meta at all'
+    return result.meta['uuid_prefix_repair']
+
+
+def _prefix_facts(caplog: pytest.LogCaptureFixture) -> list[tuple[int, dict[str, Any]]]:
+    """Every ``uuid_prefix_detected`` line the fact sink logged, parsed whole."""
+    marker = f'{FACT_UUID_PREFIX_DETECTED} '
+    return [
+        (record.levelno, json.loads(record.getMessage()[len(marker):]))
+        for record in caplog.records
+        if record.name == 'fused_memory.server.boundary_guards'
+        and record.getMessage().startswith(marker)
+    ]
+
+
+def _add_memory_citing(content: str = _CITING) -> dict[str, Any]:
+    return {'project_id': 'reify', 'content': content, 'agent_id': _AGENT_ID}
+
+
+def _uuid_member(resolver: RecordingResolver) -> UuidPrefixGuardMiddleware:
+    member = boundary_guard_chain(known_projects=_KNOWN_PROJECTS, prefix_resolver=resolver)[-1]
+    assert isinstance(member, UuidPrefixGuardMiddleware)
+    return member
+
+
+class TestTheUuidPrefixMemberIsRegistered:
+    def test_it_is_third_after_markup_and_unknown_argument(self):
+        chain = boundary_guard_chain(
+            known_projects=_KNOWN_PROJECTS, prefix_resolver=RecordingResolver()
+        )
+
+        assert [type(member) for member in chain] == [
+            MarkupGuardMiddleware,
+            UnknownArgumentMiddleware,
+            UuidPrefixGuardMiddleware,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_its_declared_tool_classes_name_live_tools_only(self):
+        member = _uuid_member(RecordingResolver())
+        server = create_mcp_server(AsyncMock(), task_interceptor=AsyncMock())
+        live = {tool.name for tool in await server.list_tools()}
+
+        assert member.exempt_tools == _EXPECTED_EXEMPT
+        assert member.exempt_tools <= live
+        assert 'remove_edge' not in member.exempt_tools
+        assert 'remove_edge' not in live
+        assert member.forward_on_ambiguity_tools == frozenset({'update_task'})
+        assert member.forward_on_ambiguity_tools <= live
+
+
+class TestTheUuidPrefixMemberSitsInsideTheMarkupGuard:
+    @pytest.mark.asyncio
+    async def test_a_markup_leak_citing_a_prefix_is_refused_before_any_resolution(self):
+        resolver = RecordingResolver(UNIQUE)
+        server, mock_service = _memory_server(resolver)
+
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool(
+                'add_memory',
+                {
+                    'project_id': 'reify',
+                    'content': _leaked(_CITING, 'agent_id', _AGENT_ID),
+                },
+            )
+
+        assert _payload(exc_info)['error_type'] == 'mcp_markup_detected'
+        assert resolver.calls == []
+        mock_service.add_memory.assert_not_awaited()
+
+
+class TestAUniquePrefixIsExpanded:
+    @pytest.mark.asyncio
+    async def test_the_write_carries_the_full_id_and_the_caller_is_told(self, caplog):
+        caplog.set_level(logging.INFO, logger='fused_memory.server.boundary_guards')
+        resolver = RecordingResolver(UNIQUE)
+        server, mock_service = _memory_server(resolver)
+
+        result = await _wire(server, 'add_memory', _add_memory_citing())
+
+        assert resolver.calls == [('reify', PREFIX)]
+        mock_service.add_memory.assert_awaited_once()
+        assert FULL in mock_service.add_memory.await_args.kwargs['content']
+        report = _repair(result)
+        assert report['substitutions'] == [_SUBSTITUTION]
+        assert result.structuredContent is not None
+        assert result.structuredContent['uuid_prefix_repair'] == report
+        assert _text_json(result)['uuid_prefix_repair'] == report
+        facts = _prefix_facts(caplog)
+        assert [
+            (level, fact['outcome'], fact['agent_id'], fact['project'])
+            for level, fact in facts
+        ] == [(logging.INFO, 'expanded', _AGENT_ID, 'reify')]
+
+
+class TestAnAmbiguousPrefix:
+    @pytest.mark.asyncio
+    async def test_a_default_class_write_is_rejected_with_both_candidates(self):
+        resolver = RecordingResolver(AMBIGUOUS)
+        server, mock_service = _memory_server(resolver)
+        arguments = _add_memory_citing()
+
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool('add_memory', dict(arguments))
+
+        payload = _payload(exc_info)
+        assert payload['error_type'] == 'ambiguous_uuid_prefix'
+        assert {candidate['id'] for candidate in payload['candidates']} == {FULL, SIBLING}
+        assert payload['original_call'] == arguments
+        mock_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_task_creation_is_rejected_too(self, task_server_for):
+        server, interceptor = task_server_for(
+            RecordingResolver(AMBIGUOUS), known_projects={'scratch': _PROJECT_ROOT}
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool(
+                'submit_task',
+                {
+                    'project_root': _PROJECT_ROOT,
+                    'title': 'Follow the dead repair',
+                    'description': f'Repair cited as {PREFIX} in the review.',
+                },
+            )
+
+        assert _payload(exc_info)['error_type'] == 'ambiguous_uuid_prefix'
+        interceptor.submit_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_task_forwards_unchanged_scoped_through_its_project_root(
+        self, task_server_for
+    ):
+        """Erratum 7: update_task carries only a project_root, translated by the registry."""
+        resolver = RecordingResolver(AMBIGUOUS)
+        server, interceptor = task_server_for(
+            resolver, known_projects={'scratch': _PROJECT_ROOT}
+        )
+        description = f'Repair cited as {PREFIX} in the review.'
+
+        result = await _wire(
+            server,
+            'update_task',
+            {'id': '7', 'project_root': _PROJECT_ROOT, 'description': description},
+        )
+
+        assert resolver.calls == [('scratch', PREFIX)]
+        interceptor.update_task.assert_awaited_once()
+        assert interceptor.update_task.await_args.kwargs['description'] == description
+        [ambiguity] = _repair(result)['ambiguous']
+        assert {candidate['id'] for candidate in ambiguity['candidates']} == {FULL, SIBLING}
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_project_root_is_not_resolved_and_says_so(
+        self, task_server_for
+    ):
+        resolver = RecordingResolver(AMBIGUOUS)
+        server, _interceptor = task_server_for(
+            resolver, known_projects={'scratch': '/elsewhere'}
+        )
+
+        result = await _wire(
+            server,
+            'update_task',
+            {'id': '7', 'project_root': _PROJECT_ROOT, 'description': f'see {PREFIX}'},
+        )
+
+        assert resolver.calls == []
+        assert _repair(result) == {'resolver': 'no_project'}
+
+
+class TestAnUnmatchedTokenIsInert:
+    @pytest.mark.asyncio
+    async def test_nothing_is_changed_reported_or_logged(self, caplog):
+        caplog.set_level(logging.INFO, logger='fused_memory.server.boundary_guards')
+        server, mock_service = _memory_server(RecordingResolver(NONE))
+        content = 'merged after recon-3f2a9c1e ran on 20260904 without incident'
+
+        wire = await _wire(server, 'add_memory', _add_memory_citing(content))
+        in_process = await server._tool_manager.call_tool(
+            'add_memory', _add_memory_citing(content)
+        )
+
+        assert [call.kwargs['content'] for call in mock_service.add_memory.await_args_list] == [
+            content, content,
+        ]
+        assert wire.meta is None or 'uuid_prefix_repair' not in wire.meta
+        assert wire.structuredContent is not None
+        assert 'uuid_prefix_repair' not in wire.structuredContent
+        assert 'uuid_prefix_repair' not in in_process
+        assert _prefix_facts(caplog) == []
+
+
+class TestAnExemptToolIsNeverResolved:
+    @pytest.mark.asyncio
+    async def test_a_delete_by_prefix_meets_the_full_uuid_refusal(self):
+        resolver = RecordingResolver(UNIQUE)
+        server, mock_service = _memory_server(resolver)
+
+        result = await server._tool_manager.call_tool(
+            'delete_memory', {'store': 'mem0', 'memory_id': PREFIX, 'project_id': 'reify'}
+        )
+
+        assert resolver.calls == []
+        mock_service.delete_memory.assert_not_awaited()
+        assert result == validate_full_uuid(PREFIX, field_name='memory_id')
+
+
+class TestAResolverOutageForwardsUnchanged:
+    @pytest.mark.asyncio
+    async def test_the_write_lands_unexpanded_and_the_store_is_named(self):
+        server, mock_service = _memory_server(
+            RecordingResolver(outage=ResolverUnavailable('mem0'))
+        )
+
+        result = await _wire(server, 'add_memory', _add_memory_citing())
+
+        mock_service.add_memory.assert_awaited_once()
+        assert mock_service.add_memory.await_args.kwargs['content'] == _CITING
+        assert _repair(result) == {'resolver': 'unavailable', 'store': 'mem0', 'reason': 'unreachable'}
+
+
+class TestMainInstallsTheUuidMember:
+    @pytest.mark.asyncio
+    async def test_the_dispatch_guards_helper_expands_a_unique_prefix(self):
+        resolver = RecordingResolver(UNIQUE)
+        mock_service = AsyncMock()
+        _pass_through(mock_service, 'add_memory')
+        server = create_mcp_server(mock_service)
+
+        _install_tool_dispatch_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=resolver
+        )
+        result = await _wire(server, 'add_memory', _add_memory_citing())
+
+        assert getattr(server._tool_manager, '_fused_memory_safe_wrapped', False) is True
+        assert FULL in mock_service.add_memory.await_args.kwargs['content']
+        assert _repair(result)['substitutions'] == [_SUBSTITUTION]
