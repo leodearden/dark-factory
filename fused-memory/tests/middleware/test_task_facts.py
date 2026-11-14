@@ -274,10 +274,11 @@ async def test_a_raising_project_could_not_check_and_spares_the_others(store: St
 
     facts = await store.read([alpha, beta], reader=reader)
 
+    reason = facts[alpha].reason
     assert facts[alpha].lookup is Lookup.COULD_NOT_CHECK
-    assert facts[alpha].reason is not None
-    assert 'OSError' in facts[alpha].reason
-    assert 'disk unplugged' in facts[alpha].reason
+    assert reason is not None
+    assert 'OSError' in reason
+    assert 'disk unplugged' in reason
     assert facts[beta] == _found(beta, 'pending', 'Beta task')
 
 
@@ -322,9 +323,10 @@ async def test_an_unconfigured_interceptor_could_not_check(store: Store):
 
     facts = await store.read([ref], reader=bare)
 
+    reason = facts[ref].reason
     assert facts[ref].lookup is Lookup.COULD_NOT_CHECK
-    assert facts[ref].reason is not None
-    assert 'RuntimeError' in facts[ref].reason
+    assert reason is not None
+    assert 'RuntimeError' in reason
 
 
 # ── 10. Invariants ─────────────────────────────────────────────────────
