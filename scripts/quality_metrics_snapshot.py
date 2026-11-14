@@ -8,6 +8,7 @@ fields are plans/quality-dashboard-prd.md §Contract (Snapshot identity).
     --run-id RUN_ID --out PATH [--root DIR] [--diff PREVIOUS.json]   measure HEAD, write PATH
     --current SNAPSHOT.json --diff PREVIOUS.json                      diff two snapshots
     --summary SNAPSHOT.json                                           per-member table
+    --summary SNAPSHOT.json --json                                    the same table as one JSON object
     --params                                                          the params a measurement here records
 
 Exit 0 when done; exit 2 on an instrument failure, with the cause named on
@@ -891,9 +892,10 @@ def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class _GraphKind:
-    """One kind of import-graph entry, named by *label*."""
+    """One kind of import-graph entry, named by *label* in prose and by *slug* in --summary --json."""
 
     label: str
+    slug: str
     needs: tuple[str, ...]  # the import_graph lists it derives from; its entries are the first's
     key: Callable[[Any], tuple[Any, ...]]  # what --diff compares: never a line number
     render: Callable[[Any], str]  # a key, as --diff names it
@@ -918,20 +920,22 @@ def _deferred_rendered(key: tuple[str, tuple[str, ...]]) -> str:
 
 
 def _cycle_kind(label: str, name: str) -> _GraphKind:
-    return _GraphKind(label, (name,), lambda cycle: tuple(cycle), lambda key: ', '.join(key))
+    return _GraphKind(label, name, (name,), lambda cycle: tuple(cycle), lambda key: ', '.join(key))
 
 
 _GRAPH_KINDS: tuple[_GraphKind, ...] = (
-    _GraphKind('edge', ('edges',), lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
+    _GraphKind('edge', 'edges', ('edges',), lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
     _GraphKind(
         'reach-back',
+        'reach_backs',
         ('reach_back',),
         lambda entry: (entry['from'], entry['to'], tuple(entry['names'])),
         lambda key: f'{key[0]} -> {key[1]} ({", ".join(key[2])})',
     ),
-    _GraphKind('deferred import', ('deferred',), _deferred_key, _deferred_rendered),
+    _GraphKind('deferred import', 'deferred_imports', ('deferred',), _deferred_key, _deferred_rendered),
     _GraphKind(
         'cycle-closing deferred import',
+        'cycle_closing_imports',
         ('deferred', 'hidden_cycles'),
         _deferred_key,
         _deferred_rendered,
@@ -1281,63 +1285,94 @@ def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[
 # --summary: per-member counts and totals, members in name order.
 
 _Records = Sequence[Mapping[str, Any]]
+#: A cell's typed value: a count or total, or the (max, total) cognitive pair.
+_CellValue = int | tuple[int, int]
 
 
-def _sum_over(kind: str | None, value: Callable[[Mapping[str, Any]], int]) -> Callable[[_Records], str]:
+def _sum_over(kind: str | None, value: Callable[[Mapping[str, Any]], int]) -> Callable[[_Records], int]:
     """An aggregator summing *value* over the records of *kind* (every record when None)."""
 
-    def aggregate(records: _Records) -> str:
-        return str(sum(value(record) for record in records if kind in (None, record['kind'])))
+    def aggregate(records: _Records) -> int:
+        return sum(value(record) for record in records if kind in (None, record['kind']))
 
     return aggregate
 
 
-def _cognitive_pair(records: _Records) -> str:
+def _cognitive_pair(records: _Records) -> tuple[int, int]:
     src = [record for record in records if record['kind'] == _SRC]
     highest = max((record['cognitive_max'] for record in src), default=0)
-    return f'{highest} / {sum(record["cognitive_total"] for record in src)}'
+    return highest, sum(record['cognitive_total'] for record in src)
 
 
-#: Every column after member and pseudo, as (header, aggregator over file records).
-_SUMMARY_COLUMNS: tuple[tuple[str, Callable[[_Records], str]], ...] = (
-    ('src files', _sum_over(_SRC, lambda record: 1)),
-    ('src lines', _sum_over(_SRC, lambda record: record['lines'])),
-    ('src prose lines', _sum_over(_SRC, lambda record: record['prose_lines'])),
-    ('src cognitive max / total', _cognitive_pair),
-    ('tests files', _sum_over(_TESTS, lambda record: 1)),
-    ('tests lines', _sum_over(_TESTS, lambda record: record['lines'])),
-    ('tests cognitive total', _sum_over(_TESTS, lambda record: record['cognitive_total'])),
+def _cell_text(value: _CellValue) -> str:
+    """A cell as the markdown table prints it."""
+    if isinstance(value, tuple):
+        highest, total = value
+        return f'{highest} / {total}'
+    return str(value)
+
+
+#: Every column after member and pseudo, as (slug, header, aggregator over file records).
+_SUMMARY_COLUMNS: tuple[tuple[str, str, Callable[[_Records], _CellValue]], ...] = (
+    ('src_files', 'src files', _sum_over(_SRC, lambda record: 1)),
+    ('src_lines', 'src lines', _sum_over(_SRC, lambda record: record['lines'])),
+    ('src_prose_lines', 'src prose lines', _sum_over(_SRC, lambda record: record['prose_lines'])),
+    ('src_cognitive_max_total', 'src cognitive max / total', _cognitive_pair),
+    ('tests_files', 'tests files', _sum_over(_TESTS, lambda record: 1)),
+    ('tests_lines', 'tests lines', _sum_over(_TESTS, lambda record: record['lines'])),
+    ('tests_cognitive_total', 'tests cognitive total', _sum_over(_TESTS, lambda record: record['cognitive_total'])),
     (
+        'files_at_soft_ceiling',
         f'files >= {H14_SOFT_CEILING_LINES} lines',
         _sum_over(None, lambda record: record['lines'] >= H14_SOFT_CEILING_LINES),
     ),
     (
+        'files_at_alarm',
         f'files >= {H14_ALARM_LINES} lines',
         _sum_over(None, lambda record: record['lines'] >= H14_ALARM_LINES),
     ),
-    ('function-local imports', _sum_over(_SRC, lambda record: record['function_local_imports'])),
-    ('re-export names', _sum_over(_SRC, lambda record: len(record['reexport_names']))),
-    ('reach-back imports', _sum_over(_SRC, lambda record: record['reach_back_imports'])),
+    ('function_local_imports', 'function-local imports', _sum_over(_SRC, lambda record: record['function_local_imports'])),
+    ('reexport_names', 're-export names', _sum_over(_SRC, lambda record: len(record['reexport_names']))),
+    ('reach_back_imports', 'reach-back imports', _sum_over(_SRC, lambda record: record['reach_back_imports'])),
     (
+        'private_patch_targets',
         'private patch targets',
         _sum_over(_TESTS, lambda record: len(record['private_patch_targets'])),
     ),
-    ('private reads', _sum_over(_TESTS, lambda record: record['private_reads'])),
+    ('private_reads', 'private reads', _sum_over(_TESTS, lambda record: record['private_reads'])),
 )
+
+
+def _row_values(records: _Records) -> list[_CellValue]:
+    return [aggregate(records) for _slug, _header, aggregate in _SUMMARY_COLUMNS]
+
+
+def _member_rows(snapshot: Mapping[str, Any]) -> list[tuple[str, bool, list[_CellValue]]]:
+    """(member, pseudo, cell values) per member, in name order."""
+    by_member: dict[str, list[Mapping[str, Any]]] = {}
+    for record in snapshot['files'].values():
+        by_member.setdefault(record['member'], []).append(record)
+    pseudo = {member['name']: member['pseudo'] for member in snapshot['evidence']['members']}
+    return [(name, pseudo[name], _row_values(by_member.get(name, []))) for name in sorted(pseudo)]
 
 
 def _markdown_row(cells: Sequence[str]) -> str:
     return '| ' + ' | '.join(cells) + ' |'
 
 
-def _graph_line(snapshot: Mapping[str, Any]) -> str:
-    """The import graph's count of each kind; a kind its schema does not record is unknown, never zero."""
+def _graph_counts(snapshot: Mapping[str, Any]) -> dict[str, int | None]:
+    """The import graph's count of each kind by slug; a kind its schema does not record is None, never zero."""
     graph = snapshot['import_graph']
-    counts = [
-        f'{len(kind.entries(graph))} {kind.label}s' for kind in _GRAPH_KINDS if _records(snapshot, kind)
-    ]
-    unknown = [f'{kind.label}s' for kind in _GRAPH_KINDS if not _records(snapshot, kind)]
-    line = f'import graph: {", ".join(counts)}'
+    return {
+        kind.slug: len(kind.entries(graph)) if _records(snapshot, kind) else None for kind in _GRAPH_KINDS
+    }
+
+
+def _graph_line(snapshot: Mapping[str, Any]) -> str:
+    counts = _graph_counts(snapshot)
+    known = [f'{counts[kind.slug]} {kind.label}s' for kind in _GRAPH_KINDS if counts[kind.slug] is not None]
+    unknown = [f'{kind.label}s' for kind in _GRAPH_KINDS if counts[kind.slug] is None]
+    line = f'import graph: {", ".join(known)}'
     if unknown:
         line += f'; {", ".join(unknown)} unknown (schema {snapshot["schema_version"]})'
     return line
@@ -1359,17 +1394,12 @@ def _summary_header(snapshot: Mapping[str, Any]) -> list[str]:
 
 def summary_table(snapshot: Mapping[str, Any]) -> str:
     """Header lines, then one markdown row per member in name order and a (domain) row."""
-    records = list(snapshot['files'].values())
-    by_member: dict[str, list[Mapping[str, Any]]] = {}
-    for record in records:
-        by_member.setdefault(record['member'], []).append(record)
-    pseudo = {member['name']: member['pseudo'] for member in snapshot['evidence']['members']}
     rows = [
-        [name, json.dumps(pseudo[name]), *(cell(by_member.get(name, [])) for _h, cell in _SUMMARY_COLUMNS)]
-        for name in sorted(pseudo)
+        [name, json.dumps(pseudo), *map(_cell_text, values)]
+        for name, pseudo, values in _member_rows(snapshot)
     ]
-    rows.append(['(domain)', '', *(cell(records) for _h, cell in _SUMMARY_COLUMNS)])
-    headers = ['member', 'pseudo', *(header for header, _cell in _SUMMARY_COLUMNS)]
+    rows.append(['(domain)', '', *map(_cell_text, _row_values(list(snapshot['files'].values())))])
+    headers = ['member', 'pseudo', *(header for _slug, header, _aggregate in _SUMMARY_COLUMNS)]
     return '\n'.join([
         *_summary_header(snapshot),
         '',
@@ -1377,6 +1407,34 @@ def summary_table(snapshot: Mapping[str, Any]) -> str:
         '|' + '---|' * len(headers),
         *(_markdown_row(row) for row in rows),
     ])
+
+
+def _json_cells(values: Sequence[_CellValue]) -> list[dict[str, Any]]:
+    return [{'value': value, 'text': _cell_text(value)} for value in values]
+
+
+def summary_json(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """summary_table's figures as one JSON object: each cell its typed value and its markdown text."""
+    evidence = snapshot['evidence']
+    return {
+        'run_id': snapshot['run_id'],
+        'as_of_sha': snapshot['as_of_sha'],
+        'since': snapshot['since'],
+        'schema_version': snapshot['schema_version'],
+        'params': snapshot['params'],
+        'unknown_params': _unknown_params(snapshot),
+        'complete': evidence['complete'],
+        'measured_files': evidence['measured_files'],
+        'domain_files': evidence['domain_files'],
+        'unreadable': evidence['unreadable'],
+        'columns': [{'slug': slug, 'header': header} for slug, header, _aggregate in _SUMMARY_COLUMNS],
+        'members': [
+            {'member': name, 'pseudo': pseudo, 'cells': _json_cells(values)}
+            for name, pseudo, values in _member_rows(snapshot)
+        ],
+        'domain': {'cells': _json_cells(_row_values(list(snapshot['files'].values())))},
+        'import_graph': _graph_counts(snapshot),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1407,6 +1465,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--current', help='Diff this snapshot instead of measuring.')
     parser.add_argument('--summary', help='Print this snapshot as a per-member table.')
     parser.add_argument(
+        '--json',
+        action='store_true',
+        help='With --summary: print the table as one JSON object, each cell its typed value and its text.',
+    )
+    parser.add_argument(
         '--params',
         action='store_true',
         help='Print the params a measurement here would record, as one JSON line; measure nothing.',
@@ -1416,6 +1479,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _require_one_mode(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     measuring = (args.run_id, args.out, args.root) != (None, None, None)
+    if args.json and args.summary is None:
+        parser.error('--json is only for --summary')
     if args.params:
         if measuring or (args.diff, args.current, args.summary) != (None, None, None):
             parser.error('--params takes no other argument')
@@ -1477,7 +1542,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(measurement_params()))
             return 0
         if args.summary is not None:
-            print(summary_table(load_snapshot(Path(args.summary))))
+            summarised = load_snapshot(Path(args.summary))
+            print(json.dumps(summary_json(summarised), sort_keys=True) if args.json else summary_table(summarised))
             return 0
         if args.current is not None:
             return _compare(args)
