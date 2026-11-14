@@ -1008,6 +1008,10 @@ class ReconReportState:
         orphaning a hallucinated stage name used to cause); the residual
         remains in full only when ``known_stages is None``, and for an
         in-vocabulary name it is a genuine stage transition, not a stray call.
+
+        That fresh create displaces the evicted entry of the same stage (task
+        3988), whose row the new entry overwrites; its findings are purged
+        through :meth:`_purge_finding` and a WARNING gives their count.
         """
         idx = self._runs.get(run_id)
         if self._known_stages is not None and stage not in self._known_stages:
@@ -1083,7 +1087,18 @@ class ReconReportState:
         )
         if idx is None:
             idx = self._runs[run_id] = RunFindingIndex(run_id)
-        idx.install(entry)
+        displaced = idx.install(entry)
+        if displaced is not None:
+            logger.warning(
+                'recon_report: start_report run_id=%r stage=%r displaced the '
+                "stage's evicted entry and purged %d finding(s) its overwritten "
+                'row held',
+                run_id,
+                stage,
+                len(displaced.findings),
+            )
+            for finding in list(displaced.findings):
+                self._purge_finding(run_id, displaced, finding)
         idx.activate(stage)
         self._persist_run(run_id)
         return {'run_id': run_id, 'stage': stage, 'already_started': False}
