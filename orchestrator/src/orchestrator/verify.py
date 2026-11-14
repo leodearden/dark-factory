@@ -6579,6 +6579,14 @@ async def _run_cmd(
 _CHAIN_BUDGET_EXHAUSTED = 'chain wall-clock budget exhausted before this segment started'
 
 
+def _segments_red_only_from_scope_launch_refusal(segments: list[dict]) -> bool:
+    """Whether a segmented leg's every red is a refused scope launch: at least
+    one segment refused, and every other segment passed."""
+    return any(seg['scope_launch_refused'] for seg in segments) and all(
+        seg['scope_launch_refused'] or seg['status'] == 'passed' for seg in segments
+    )
+
+
 async def _run_segmented(
     segments: 'list[ChainSegment]',
     *,
@@ -6617,8 +6625,9 @@ async def _run_segmented(
       `infra_timeout`; see the loop's ``chain_broken`` guard and the comment on
       the return statement.
     * ``segments`` is one flat JSON-native dict per segment
-      (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason;
-      ``run_verification`` adds each segment's ``xdist`` at its call site),
+      (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason/
+      scope_launch_refused, the last True when *run_one* returned a
+      ``ScopeLaunchRefused``; ``run_verification`` adds each segment's ``xdist`` at its call site),
       which rides on ``CheckRun.segments`` into the persisted
       ``.task/verify/attempt-N[.<prefix>].summary.json`` (via ``to_dict`` ->
       ``_build_summary_payload``'s per-command entries) and into the aggregated
@@ -6665,16 +6674,18 @@ async def _run_segmented(
                 'timed_out': False,
                 'duration_secs': 0.0,
                 'skip_reason': _CHAIN_BUDGET_EXHAUSTED,
+                'scope_launch_refused': False,
             })
             blocks.append(_segment_output_block(results[-1], len(segments), ''))
             continue
         started = now()
-        rc, out, seg_timed_out = await run_one(
+        result = await run_one(
             segment.command,
             worktree / segment.cwd_rel,
             remaining,
             segment.label,
         )
+        rc, out, seg_timed_out = result
         duration = now() - started
         if seg_timed_out:
             status = 'timed_out'
@@ -6712,6 +6723,7 @@ async def _run_segmented(
             'timed_out': seg_timed_out,
             'duration_secs': duration,
             'skip_reason': None,
+            'scope_launch_refused': isinstance(result, ScopeLaunchRefused),
         })
         blocks.append(_segment_output_block(results[-1], len(segments), out))
 
@@ -8003,7 +8015,9 @@ async def run_verification(
                     {**seg, 'xdist': segment_xdist.get(seg['label'])}
                     for seg in segment_dicts
                 ]
-                scope_launch_refused = False
+                scope_launch_refused = _segments_red_only_from_scope_launch_refusal(
+                    segment_dicts,
+                )
             else:
                 segment_dicts = None
                 outcome = await _run_cmd(
