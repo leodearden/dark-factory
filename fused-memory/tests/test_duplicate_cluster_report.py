@@ -323,6 +323,7 @@ class TestCategoryCoverage:
             'lexical_threshold': 0.85,
             'ann_cutoff': 0.839,
             'source': 'pk.json',
+            'child_counts_known': True,
         }
         expected_os = {
             'scan_coverage': None,
@@ -330,6 +331,7 @@ class TestCategoryCoverage:
             'lexical_threshold': 0.85,
             'ann_cutoff': 0.8868,
             'source': 't0-os.json',
+            'child_counts_known': False,
         }
         assert _project(categories[_PK], expected_pk) == expected_pk
         assert _project(categories[_OS], expected_os) == expected_os
@@ -391,24 +393,26 @@ class TestChildRankings:
         rep = _build(config, [('pk.json', pk), ('pn.json', pn)])
 
         rankings = {
-            kind: [_project(row, {'parent_id', 'count'}) for row in rows]
+            kind: [_project(row, {'parent_id', 'category', 'count'}) for row in rows]
             for kind, rows in rep['child_rankings'].items()
         }
-        assert rep['child_counts_known'] is True
+        assert 'child_counts_known' not in rep
         assert rankings['sighting'] == [
-            {'parent_id': 'q', 'count': 3},
-            {'parent_id': 'p', 'count': 2},
-            {'parent_id': 'r', 'count': 1},
+            {'parent_id': 'p', 'category': _PK, 'count': 2},
+            {'parent_id': 'q', 'category': _PN, 'count': 2},
+            {'parent_id': 'q', 'category': _PK, 'count': 1},
+            {'parent_id': 'r', 'category': _PN, 'count': 1},
         ]
-        assert rankings['amendment'] == [{'parent_id': 'q', 'count': 1}]
+        assert rankings['amendment'] == [{'parent_id': 'q', 'category': _PK, 'count': 1}]
 
     def test_a_legacy_plan_makes_the_child_counts_unknown(self, config) -> None:
         rep = _build(config, [
             ('pk.json', _plan([])),
-            ('t0-os.json', _legacy_plan(_OS, [])),
+            ('t0-os.json', _legacy_plan(_OS, [{'member_ids': ['x1', 'x2']}])),
         ])
 
-        assert rep['child_counts_known'] is False
+        assert rep['categories'][_OS]['child_counts_known'] is False
+        assert rep['categories'][_PK]['child_counts_known'] is True
         assert rep['child_rankings'] == {}
 
 
@@ -672,8 +676,87 @@ class TestOverdueAndChildDeltas:
         )
 
         assert cur['child_rankings']['sighting'] == [
-            {'parent_id': 'p', 'count': 2, 'previous_count': 1, 'delta': 1},
-            {'parent_id': 'q', 'count': 1, 'previous_count': 0, 'delta': 1},
+            {'parent_id': 'p', 'category': _PK, 'count': 2, 'previous_count': 1, 'delta': 1},
+            {'parent_id': 'q', 'category': _PK, 'count': 1, 'previous_count': 0, 'delta': 1},
+        ]
+
+
+_FAILED_PN = {
+    'category': _PN, 'error_type': 'timeout', 'exit_code': None, 'stderr_tail': 'slow',
+}
+
+
+def _deltas(rep: dict, kind: str = 'sighting') -> list[dict]:
+    keys = {'parent_id', 'category', 'previous_count', 'delta'}
+    return [_project(row, keys) for row in rep['child_rankings'][kind]]
+
+
+class TestChildDeltasAreCategoryAware:
+    @pytest.mark.parametrize('prev_failed', [[_FAILED_PN], []],
+                             ids=['detector-failed', 'newly-configured'])
+    def test_a_category_the_previous_run_did_not_count_has_unknown_deltas(
+        self, config, prev_failed,
+    ) -> None:
+        pk_before = [
+            _rec('p', 'venv', 0, _BEFORE_PREV),
+            _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting'),
+        ]
+        prev = report.build_report(
+            'dark_factory', _PREV, [('pk.json', _plan(pk_before))],
+            config=config, failed_categories=prev_failed,
+        )
+        pk_now = [
+            *pk_before,
+            _rec('s2', 'venv', 2, _AFTER_PREV, parent_id='p', kind='sighting'),
+            _rec('s3', 'stash', 0, _AFTER_PREV, parent_id='q', kind='sighting'),
+        ]
+        pn_now = [_rec('s4', 'venv', 0, _AFTER_PREV, category=_PN, parent_id='r',
+                       kind='sighting')]
+        cur = _build(config, [('pk.json', _plan(pk_now)), ('pn.json', _plan(pn_now, _PN))],
+                     previous=prev, stamp=_CUR)
+
+        assert _deltas(cur) == [
+            {'parent_id': 'p', 'category': _PK, 'previous_count': 1, 'delta': 1},
+            {'parent_id': 'q', 'category': _PK, 'previous_count': 0, 'delta': 1},
+            {'parent_id': 'r', 'category': _PN, 'previous_count': None, 'delta': None},
+        ]
+
+    def test_a_previous_report_with_no_plans_makes_every_delta_unknown(self, config) -> None:
+        prev = report.build_report(
+            'dark_factory', _PREV, [], config=config,
+            failed_categories=[{**_FAILED_PN, 'category': _PK}, _FAILED_PN],
+        )
+        pk_now = [
+            _rec('p', 'venv', 0, _BEFORE_PREV),
+            _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting'),
+            _rec('s2', 'stash', 0, _AFTER_PREV, parent_id='q', kind='sighting'),
+        ]
+        cur = _build(config, [('pk.json', _plan(pk_now))], previous=prev, stamp=_CUR)
+
+        rows = _deltas(cur)
+        assert [row['parent_id'] for row in rows] == ['p', 'q']
+        assert all(row['previous_count'] is None and row['delta'] is None for row in rows)
+
+    def test_a_category_previously_swept_from_a_legacy_plan_has_unknown_deltas(
+        self, config,
+    ) -> None:
+        pk = _plan([
+            _rec('p', 'venv', 0, _BEFORE_PREV),
+            _rec('s1', 'venv', 1, _BEFORE_PREV, parent_id='p', kind='sighting'),
+        ])
+        legacy = _legacy_plan(_OS, [{'member_ids': ['x1', 'x2']}])
+        prev = _build(config, [('pk.json', pk), ('t0-os.json', legacy)], stamp=_PREV)
+        os_now = _plan([
+            _rec('o', 'stash', 0, _BEFORE_PREV, category=_OS),
+            _rec('o1', 'stash', 1, _AFTER_PREV, category=_OS, parent_id='o',
+                 kind='sighting'),
+        ], _OS)
+        cur = _build(config, [('pk.json', pk), ('os.json', os_now)], previous=prev, stamp=_CUR)
+
+        assert prev['categories'][_OS]['child_counts_known'] is False
+        assert _deltas(cur) == [
+            {'parent_id': 'o', 'category': _OS, 'previous_count': None, 'delta': None},
+            {'parent_id': 'p', 'category': _PK, 'previous_count': 1, 'delta': 0},
         ]
 
 
