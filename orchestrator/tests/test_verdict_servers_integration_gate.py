@@ -60,7 +60,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _workflow_helpers import (
@@ -74,7 +74,7 @@ from shared.cli_invoke import (
     _SCHEMA_OUTPUT_TOOL,
     AgentFailureKind,
     AgentResult,
-    _SubprocessResult,
+    SubprocessResult,
     invoke_claude_agent,
 )
 
@@ -987,7 +987,7 @@ class TestSharedMachineryIntact:
         """
         captured: list[list[str]] = []
 
-        async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> _SubprocessResult:
+        async def fake_runner(cmd: list[str], *args: Any, **kwargs: Any) -> SubprocessResult:
             captured.append(list(cmd))
             stdout = json.dumps({
                 'result': 'ok', 'is_error': False, 'subtype': 'success',
@@ -995,7 +995,7 @@ class TestSharedMachineryIntact:
                 'session_id': 'test-session',
                 'structured_output': {'summary': 'ok', 'findings': ['a', 'b']},
             })
-            return _SubprocessResult(
+            return SubprocessResult(
                 stdout=stdout, stderr='', returncode=0, duration_ms=100, timed_out=False,
             )
 
@@ -1008,14 +1008,14 @@ class TestSharedMachineryIntact:
             'required': ['summary', 'findings'],
         }
 
-        with patch('shared.cli_invoke._run_subprocess', side_effect=fake_run_subprocess):
-            result = await invoke_claude_agent(
-                prompt='hello', system_prompt='sys prompt', cwd=tmp_path,
-                model='opus', max_turns=20, max_budget_usd=3.0,
-                allowed_tools=['Read'], disallowed_tools=['*'],
-                mcp_config=None, output_schema=schema,
-                permission_mode='bypassPermissions',
-            )
+        result = await invoke_claude_agent(
+            prompt='hello', system_prompt='sys prompt', cwd=tmp_path,
+            model='opus', max_turns=20, max_budget_usd=3.0,
+            allowed_tools=['Read'], disallowed_tools=['*'],
+            mcp_config=None, output_schema=schema,
+            permission_mode='bypassPermissions',
+            runner=fake_runner,
+        )
 
         assert len(captured) == 1, f'expected exactly one subprocess invocation; got {captured!r}'
         argv = captured[0]

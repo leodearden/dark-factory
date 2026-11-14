@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from shared.cli_invoke import AgentResult, _SubprocessResult
+from shared.cli_invoke import AgentResult, SubprocessResult
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.agent_run_home import (
@@ -56,7 +56,7 @@ _MCP_TOOL = re.compile(r'mcp__(?P<server>[A-Za-z0-9_-]+?)__(?P<tool>[A-Za-z0-9_-
 _BASH_PATTERN = re.compile(r'Bash\((?P<pattern>.+)\)')
 
 CostOf = Callable[[int, int, int], float]
-SessionSpawn = Callable[[list[str], float], Awaitable[_SubprocessResult]]
+SessionSpawn = Callable[[list[str], float], Awaitable[SubprocessResult]]
 
 
 class MimoEndpointMissing(ValueError):
@@ -256,7 +256,7 @@ async def read_mimo_sessions(spawn: SessionSpawn) -> list[dict[str, Any]]:
     return exports
 
 
-def _decoded(result: _SubprocessResult) -> Any:
+def _decoded(result: SubprocessResult) -> Any:
     if result.returncode != 0:
         return None
     try:
@@ -293,7 +293,7 @@ class _Usage:
 
 
 def parse_mimo_sessions(
-    exports: Sequence[Mapping[str, Any]], run: _SubprocessResult, *, max_turns: int, cost_of: CostOf,
+    exports: Sequence[Mapping[str, Any]], run: SubprocessResult, *, max_turns: int, cost_of: CostOf,
 ) -> AgentResult:
     """Every ``mimo export`` document of one run home; *cost_of* prices (uncached input, output, cached input) tokens in dollars.
 
@@ -371,7 +371,7 @@ def _root_session(
 
 
 def _subtype(
-    run: _SubprocessResult,
+    run: SubprocessResult,
     root: Mapping[str, Any] | None,
     root_step_count: int,
     terminal_info: Mapping[str, Any],
@@ -386,7 +386,7 @@ def _subtype(
 
 
 def _failure_output(
-    run: _SubprocessResult,
+    run: SubprocessResult,
     subtype: str,
     text: str,
     terminal_info: Mapping[str, Any],
@@ -429,9 +429,9 @@ def _api_error_status(error: Mapping[str, Any] | None) -> int | None:
     return status if isinstance(status, int) else None
 
 
-def _exit_line(run: _SubprocessResult) -> str:
+def _exit_line(run: SubprocessResult) -> str:
     return f'mimo exited rc={run.returncode}' + (' (timed out)' if run.timed_out else '')
 
 
-def _unfinished(run: _SubprocessResult, terminal_info: Mapping[str, Any]) -> str:
+def _unfinished(run: SubprocessResult, terminal_info: Mapping[str, Any]) -> str:
     return f'{_exit_line(run)} with its last step finished {terminal_info.get("finish")!r}'

@@ -4,7 +4,7 @@ build byte-identical argv for identical inputs (task 2465 dedup).
 Drives both real code paths — shared.cli_invoke.invoke_claude_agent
 (non-sandbox) and orchestrator.agents.invoke._invoke_claude_with_sandbox
 (sandbox) — with the same inputs, capturing the argv each one hands to its
-respective ``_run_subprocess``. Both paths now route through the shared
+respective ``run_cli_subprocess``. Both paths now route through the shared
 ``shared/src/shared/cli_invoke.py::build_claude_argv`` helper (task 2465
 dedup), so this test is a standing regression guard against the two
 forks drifting apart again, not a pending RED. ``schema_with_wildcard_deny``
@@ -22,15 +22,15 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from shared.cli_invoke import _SubprocessResult, invoke_claude_agent
+from shared.cli_invoke import SubprocessResult, invoke_claude_agent
 
 from orchestrator.agents.invoke import _invoke_claude_with_sandbox
 
 _SANDBOX_SENTINEL_PREFIX = ['SANDBOX', '--']
 
 
-def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
-    """Build a minimal _SubprocessResult that _parse_claude_output can parse."""
+def _make_subprocess_result(**overrides: Any) -> SubprocessResult:
+    """Build a minimal SubprocessResult that parse_claude_output can parse."""
     stdout = json.dumps({
         'result': 'ok',
         'is_error': False,
@@ -48,7 +48,7 @@ def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
         'timed_out': False,
     }
     defaults.update(overrides)
-    return _SubprocessResult(**defaults)
+    return SubprocessResult(**defaults)
 
 
 def _normalize(cmd: list[str]) -> list[str]:
@@ -119,31 +119,31 @@ CASES: dict[str, dict[str, Any]] = {
 
 
 async def _drive_non_sandbox(inputs: dict[str, Any], cwd: Path) -> list[str]:
-    """Invoke the non-sandbox path and capture the argv handed to _run_subprocess."""
+    """Invoke the non-sandbox path and capture the argv handed to run_cli_subprocess."""
     captured: list[list[str]] = []
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> _SubprocessResult:
+    async def fake_runner(cmd: list[str], *args: Any, **kwargs: Any) -> SubprocessResult:
         captured.append(list(cmd))
         return _make_subprocess_result()
 
-    with patch('shared.cli_invoke._run_subprocess', side_effect=fake_run_subprocess):
-        await invoke_claude_agent(
-            prompt='hello',
-            system_prompt='sys prompt',
-            cwd=cwd,
-            **inputs,
-        )
+    await invoke_claude_agent(
+        prompt='hello',
+        system_prompt='sys prompt',
+        cwd=cwd,
+        runner=fake_runner,
+        **inputs,
+    )
 
     assert len(captured) == 1, f'expected exactly one subprocess invocation; got {captured!r}'
     return captured[0]
 
 
 async def _drive_sandbox(inputs: dict[str, Any], cwd: Path) -> list[str]:
-    """Invoke the sandbox path and capture the (unwrapped) argv handed to _run_subprocess."""
-    captured: list[list[str]] = []
+    """Invoke the sandbox path and capture the unwrapped argv handed to the runner."""
+    captured: list[tuple[list[str], list[str]]] = []
 
-    async def fake_run_subprocess(cmd: list[str], *args: Any, **kwargs: Any) -> _SubprocessResult:
-        captured.append(list(cmd))
+    async def fake_runner(cmd: list[str], *args: Any, **kwargs: Any) -> SubprocessResult:
+        captured.append((list(cmd), kwargs['wrap_argv'](list(cmd))))
         return _make_subprocess_result()
 
     def fake_wrap_command(
@@ -157,23 +157,22 @@ async def _drive_sandbox(inputs: dict[str, Any], cwd: Path) -> list[str]:
     with (
         patch('orchestrator.agents.sandbox_dispatch.resolve_active_backend', return_value='bwrap'),
         patch('orchestrator.agents.sandbox_dispatch.wrap_command', side_effect=fake_wrap_command),
-        patch('orchestrator.agents.invoke._run_subprocess', side_effect=fake_run_subprocess),
     ):
         await _invoke_claude_with_sandbox(
             prompt='hello',
             system_prompt='sys prompt',
             cwd=cwd,
             sandbox_modules=['shared'],
+            runner=fake_runner,
             **inputs,
         )
 
     assert len(captured) == 1, f'expected exactly one subprocess invocation; got {captured!r}'
-    argv = captured[0]
-    prefix_len = len(_SANDBOX_SENTINEL_PREFIX)
-    assert argv[:prefix_len] == _SANDBOX_SENTINEL_PREFIX, (
-        f'expected sandbox argv to start with sentinel wrap {_SANDBOX_SENTINEL_PREFIX!r}; got {argv[:prefix_len + 2]!r}'
+    argv, wrapped = captured[0]
+    assert wrapped == [*_SANDBOX_SENTINEL_PREFIX, *argv], (
+        f'expected the wrap to prepend the sentinel {_SANDBOX_SENTINEL_PREFIX!r}; got {wrapped[:4]!r}'
     )
-    return argv[prefix_len:]
+    return argv
 
 
 @pytest.mark.asyncio

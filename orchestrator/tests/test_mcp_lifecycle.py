@@ -281,6 +281,7 @@ class TestInvokeInjectsMcpStartupTimeout:
                 sandbox_modules=None,
                 effort=None,
                 env_overrides=None,
+                runner=AsyncMock(),
             )
 
         mock_agent.assert_awaited_once()
@@ -315,6 +316,7 @@ class TestInvokeInjectsMcpStartupTimeout:
                 sandbox_modules=None,
                 effort=None,
                 env_overrides={'FOO': 'bar'},
+                runner=AsyncMock(),
             )
 
         mock_agent.assert_awaited_once()
