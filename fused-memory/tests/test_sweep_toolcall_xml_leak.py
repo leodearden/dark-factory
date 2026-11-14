@@ -56,6 +56,7 @@ from _store_mutation_preflight_contract import (
 )
 
 from fused_memory.models import SourceStore
+from fused_memory.models.memory import render_add_memory_message
 from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
@@ -439,8 +440,9 @@ def _ok_response(**overrides) -> SimpleNamespace:
     fields = {
         'memory_ids': ['new-id'],
         'stores_written': [SourceStore.mem0],
+        'stores_queued': [],
         'category': None,
-        'message': "Memory queued for ['mem0']",
+        'message': render_add_memory_message(stores_written=[SourceStore.mem0]),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -946,7 +948,7 @@ class TestReaddPersistedPredicate:
         """The delete removed the mem0 copy; a re-add that landed only in
         Graphiti has not restored it."""
         ok, reason = _mod.readd_persisted(
-            _ok_response(stores_written=[SourceStore.graphiti])
+            _ok_response(stores_written=[], stores_queued=[SourceStore.graphiti])
         )
         assert ok is False
         assert 'mem0' in reason
@@ -1385,7 +1387,8 @@ class TestRunApplyVerifiesPersistence:
         service.add_memory = AsyncMock(
             return_value=_ok_response(
                 memory_ids=['graphiti-only-id'],
-                stores_written=[SourceStore.graphiti],
+                stores_written=[],
+                stores_queued=[SourceStore.graphiti],
             )
         )
 

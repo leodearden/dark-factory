@@ -34,7 +34,7 @@ from _mem0_intent_fixtures import seed_mem0_intent
 
 from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.models.memory import AddMemoryResponse, render_add_memory_message
 from fused_memory.reconciliation.prompts import (
     FLAG_FOR_STAGE2_MARKER_KIND,
     STAGE2_SUPPRESS_GUARD_KIND,
@@ -1383,7 +1383,9 @@ class TestAnAttachThatDidNotLandIsNotAcked:
     """
 
     @staticmethod
-    def _failed_response(message: str = 'Memory queued for [] [mem0_error: down]'):
+    def _failed_response(
+        message: str = render_add_memory_message(stores_written=[], mem0_error='down'),
+    ):
         """The shape a store-level failure really returns: no memory_ids."""
         result = MagicMock()
         result.memory_ids = []
@@ -1477,7 +1479,11 @@ def _pending_retry_response() -> AddMemoryResponse:
         stores_written=[],
         stores_pending_retry=[SourceStore.mem0],
         category=MemoryCategory.procedural_knowledge,
-        message='Memory queued for [] [mem0_pending_retry: rate_limited: RateLimitError: 429]',
+        message=render_add_memory_message(
+            stores_written=[],
+            stores_pending_retry=[SourceStore.mem0],
+            mem0_pending_retry='rate_limited: RateLimitError: 429',
+        ),
     )
 
 
