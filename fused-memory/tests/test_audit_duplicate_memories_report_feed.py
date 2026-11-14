@@ -227,10 +227,26 @@ class TestChildCounts:
         ], threshold=_THRESHOLD, categories=(_PK, _PN))
 
         assert plan['child_counts'] == [
-            {'parent_id': 'p', 'kind': 'sighting', 'count': 2},
-            {'parent_id': 'p', 'kind': 'amendment', 'count': 1},
-            {'parent_id': 'q', 'kind': 'sighting', 'count': 1},
-            {'parent_id': 'z', 'kind': None, 'count': 1},
+            {'parent_id': 'p', 'kind': 'sighting', 'category': _PK, 'count': 2},
+            {'parent_id': 'p', 'kind': 'amendment', 'category': _PK, 'count': 1},
+            {'parent_id': 'q', 'kind': 'sighting', 'category': _PK, 'count': 1},
+            {'parent_id': 'z', 'kind': None, 'category': _PN, 'count': 1},
+        ]
+
+    def test_one_parent_with_children_in_two_swept_categories_gets_one_row_per_category(
+        self,
+    ) -> None:
+        plan = build_sweep_plan([
+            _record('p', 0, '2026-01-01T00:00:00+00:00'),
+            _record('s1', 1, '2026-02-01T00:00:00+00:00', parent_id='p', kind='sighting'),
+            _record('s2', 2, '2026-03-01T00:00:00+00:00', parent_id='p', kind='sighting'),
+            _record('s3', 3, '2026-04-01T00:00:00+00:00', category=_PN,
+                    parent_id='p', kind='sighting'),
+        ], threshold=_THRESHOLD, categories=(_PK, _PN))
+
+        assert plan['child_counts'] == [
+            {'parent_id': 'p', 'kind': 'sighting', 'category': _PK, 'count': 2},
+            {'parent_id': 'p', 'kind': 'sighting', 'category': _PN, 'count': 1},
         ]
 
     def test_a_corpus_without_children_reports_an_empty_list(self) -> None:
