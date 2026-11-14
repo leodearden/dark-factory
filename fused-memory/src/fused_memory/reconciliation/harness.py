@@ -80,6 +80,7 @@ from fused_memory.reconciliation.overreach_flags import (
     fetch_overreach_flags,
 )
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
+from fused_memory.reconciliation.predecessor_drain_recovery import recover_predecessor_drains
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.scope_freshness import (
     ScopeFreshnessResult,
@@ -2239,6 +2240,13 @@ class ReconciliationHarness:
                 },
             )
 
+    async def _recover_predecessor_drains(self) -> None:
+        """One-shot startup pass (task 9655): re-buffer a dead predecessor's
+        run-less drains, replaying deferred writes wherever its lock was released."""
+        for recovered in await recover_predecessor_drains(self.journal, self.buffer):
+            if recovered.lock_released:
+                await self._replay_deferred_writes(ProjectId(recovered.drained.project_id))
+
     # ── Dead-owner suppression storm counter ─────────────────────────
 
     def _record_dead_owner_suppression(
@@ -2927,6 +2935,11 @@ class ReconciliationHarness:
             await self._recover_predecessor_runs()
         except Exception as e:
             logger.warning(f'_recover_predecessor_runs at startup failed: {e}')
+
+        try:
+            await self._recover_predecessor_drains()
+        except Exception as e:
+            logger.warning(f'_recover_predecessor_drains at startup failed: {e}')
 
         # One-shot: re-fire the judge for any run whose verdict a restart dropped
         # in the cycle-end→verdict-commit window (task 2708). The durable
