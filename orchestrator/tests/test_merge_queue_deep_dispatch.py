@@ -405,10 +405,10 @@ class TestChainHalvingWorkerState:
 # ═══════════════════════════════════════════════════════════════════════════
 # step-11: RED — the deep GATE, and the kill-switch byte-identity guarding it
 #
-# `_deep_chain_placement(item)` is the slot-2 policy hook: the deep twin of
+# `_deep_chain_placement(item)` is the deep policy hook: the deep twin of
 # `_probe_verify_placement` (merge_queue.py:11988), structured identically —
-# a slot-1 guard, then a HOISTED zero-cost kill-switch guard, then the pure
-# policy, then (step-14) the bounded git work.
+# an eligibility guard (PRD D5's `may_chain`), then a HOISTED zero-cost
+# kill-switch guard, then the pure policy, then (step-14) the bounded git work.
 #
 # Everything below asserts a NEGATIVE — the gate declines — so each test also
 # proves the decline COSTS NOTHING: no `build_chain`, no `_spec-` lane, and,
