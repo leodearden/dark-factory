@@ -18882,9 +18882,7 @@ class SpeculativeMergeWorker:
                 # the tip just made redundant.  See `_adopt_head_on_tip_authority` for which
                 # entry counts as the head, why the tip's verdict covers it,
                 # and the two lease axes the teardown must leave idle.
-                await self._adopt_head_on_tip_authority(
-                    req.request_id, req.task_id,
-                )
+                await self._adopt_head_on_tip_authority(item)
                 return InflightVerifyResult(
                     outcome=None,
                     merge_wt=item.merge_wt,
@@ -19042,18 +19040,32 @@ class SpeculativeMergeWorker:
         self._intake.request_redispatch(_remerged, front=True)
         return False
 
-    async def _adopt_head_on_tip_authority(
-        self, tip_req_id: str, tip_task_id: str,
-    ) -> InflightEntry | None:
+    def _head_inside_tip(self, tip: RealMergeItem) -> InflightEntry | None:
+        """The entry ahead of *tip* that *tip*'s tree contains, or None.
+
+        A non-speculative tip is built on main, so it is the head itself and
+        contains no entry ahead of it (``plans/merge-lane-policy-prd.md`` D5).
+        """
+        if not tip.speculative:
+            return None
+        head = self._finalizing_head_entry()
+        if head is None and self._inflight:
+            head = self._inflight[0]
+        if head is None or head.item.request.request_id == tip.request.request_id:
+            return None
+        return head
+
+    async def _adopt_head_on_tip_authority(self, tip: RealMergeItem) -> InflightEntry | None:
         """Claim the HEAD I0 for a green chain tip and tear its verify down
         (task 3186, PRD δ; decision #3).
 
-        WHY THE HEAD IS DELTA'S BUSINESS AT ALL.  ``_deep_chain_placement`` is
-        gated on ``item.speculative``, so slot 1's head is never chained — but
-        the speculative slot-2 item that IS chained was merged onto the head's
-        merge commit (the frozen-prefix tip), and the links were merged onto
-        that.  The tip tree the verify just passed therefore strictly CONTAINS
-        the head's tree.  Two consequences, and both are decision #3:
+        WHY THE HEAD IS DELTA'S BUSINESS AT ALL.  A speculative tip was merged
+        onto the head's merge commit (the frozen-prefix tip), and its links
+        onto that, so the tree the verify just passed strictly CONTAINS the
+        head's tree.  A non-speculative tip IS the head (PRD D5): it lands on
+        its own tip authority through the unchanged CAS walk, and there is
+        nothing ahead of it to cancel (:meth:`_head_inside_tip`).  For a
+        speculative tip, two consequences, and both are decision #3:
 
           * The head's own verdict is about a SUBSET the tip has better
             evidence for.  Waiting for it buys nothing; OBEYING it when it is
@@ -19079,9 +19091,9 @@ class SpeculativeMergeWorker:
              would silently skip the cancel there, leaving the finalize parked
              on a verdict it no longer needs.
 
-        Either way the TIP'S OWN entry is excluded explicitly: in production it
-        sits on ``_inflight`` behind the head, and reading it as "the head"
-        would have this coroutine cancel itself.
+        Either way :meth:`_head_inside_tip` excludes the TIP'S OWN entry: in
+        production it sits on ``_inflight`` behind the head, and reading it as
+        "the head" would have this coroutine cancel itself.
 
         THE TEARDOWN IS THE SANCTIONED PAIR, in the head-failure cascade's
         order: :meth:`_teardown_verify_task` (which owns the load-bearing
@@ -19116,12 +19128,8 @@ class SpeculativeMergeWorker:
         Returns the adopted entry, or ``None`` when there is no head to adopt
         (single-slot round, head already finalized, passthrough head).
         """
-        head = self._finalizing_head_entry()
-        if head is None and self._inflight:
-            candidate = self._inflight[0]
-            if candidate.item.request.request_id != tip_req_id:
-                head = candidate
-        if head is None or head.item.request.request_id == tip_req_id:
+        head = self._head_inside_tip(tip)
+        if head is None:
             return None
         if head.verify_task is None:
             # A passthrough / pre-established-PASS entry has no verify to
@@ -19129,6 +19137,7 @@ class SpeculativeMergeWorker:
             # decision #3 says nothing about it.
             return None
 
+        tip_task_id = tip.request.task_id
         head_task_id = head.item.request.task_id
         if head.verify_task.done() and head.item.request.result.done():
             # ── task 3186 (PRD δ), review fix #4: DELIVERED ≠ UNDECIDED ─────
