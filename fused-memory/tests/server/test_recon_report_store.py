@@ -1194,7 +1194,7 @@ class TestSupersedeAcrossEviction:
             store_b.close()
 
     def test_restarted_stage_shadowing_an_evicted_twin_persists_the_live_row(
-        self, tmp_path
+        self, tmp_path, caplog
     ):
         """A same-name stage restarted after eviction must persist the LIVE row.
 
@@ -1212,8 +1212,13 @@ class TestSupersedeAcrossEviction:
         Persisted state then diverged from memory and ``hydrate_from_store``
         resurrected the dead entry while dropping every finding the live stage
         had filed.
+
+        The twin's findings are purged when it is displaced: its row is about
+        to be overwritten, so keeping them resolvable in memory would only
+        last until the next restart.
         """
         import json
+        import logging
 
         from fused_memory.server.recon_report_store import ReconReportStore
 
@@ -1227,9 +1232,19 @@ class TestSupersedeAcrossEviction:
             self._evict_stage1(state, t, stage1_fid)
 
             # Stage 1 restarts under the same name, shadowing the evicted twin.
-            state.start_report(
-                run_id=self._RUN, stage=self._S1, project_id='dark_factory'
-            )
+            with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+                state.start_report(
+                    run_id=self._RUN, stage=self._S1, project_id='dark_factory'
+                )
+            (purge_record,) = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and 'purged 1 finding' in r.getMessage()
+            ]
+            assert self._RUN in purge_record.getMessage()
+            assert self._S1 in purge_record.getMessage()
+            assert state._resolve_finding(self._RUN, stage1_fid) is None
+            assert state.violations() == []
+
             restarted_fid = state.add_finding(
                 run_id=self._RUN, severity='moderate', category='memory_stale',
                 description='filed by the RESTARTED stage 1',
@@ -1256,6 +1271,17 @@ class TestSupersedeAcrossEviction:
             assert run_index is not None
             reachable = run_index.reachable_entries()
             assert len({(e.run_id, e.stage) for e in reachable}) == len(reachable)
+
+            # The twin's claim no longer blocks a re-filing of its signature.
+            refiled = state.add_finding(
+                run_id=self._RUN, severity='moderate', category='memory_stale',
+                description='mechanism X contradicts Y, re-filed', suggested_action='act',
+                actionable=True, task_id='999',
+                flag_type='memory_mechanism_contradiction',
+            )
+            assert set(refiled) == {'finding_id'}, refiled
+            assert refiled['finding_id'] != stage1_fid
+            assert state.violations() == []
         finally:
             store_a.close()
 
@@ -1267,6 +1293,61 @@ class TestSupersedeAcrossEviction:
             state_b.hydrate_from_store()
             assert state_b._resolve_finding(self._RUN, restarted_fid) is not None
             assert state_b._resolve_finding(self._RUN, stage1_fid) is None
+            assert state_b.violations() == []
+        finally:
+            store_b.close()
+
+    def test_displaced_twin_superseder_is_purged_and_its_target_unstamped(
+        self, tmp_path
+    ):
+        """A restarted stage displaces an evicted twin that held a superseder:
+        the purge repairs the target's pointer in memory and on its row, so a
+        restart hydrates the target live and actionable again."""
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store_a, t)
+            target_fid = self._stage1_files_and_completes(state)
+            superseder_fid = self._supersede(state, target_fid)['finding_id']
+            state.complete(self._RUN, 'stage2 summary')
+            state.start_report(
+                run_id=self._RUN, stage='integrity_check', project_id='dark_factory'
+            )
+            assert state.violations() == []
+
+            t[0] = 301.0
+            assert state.tick() == 2
+            assert state.violations() == []
+
+            state.start_report(
+                run_id=self._RUN, stage=self._S2, project_id='dark_factory'
+            )
+            assert state._resolve_finding(self._RUN, superseder_fid) is None
+            resolved = state._resolve_finding(self._RUN, target_fid)
+            assert resolved is not None
+            assert resolved[1].superseded_by is None
+            assert self._persisted_finding(store_a, target_fid)['superseded_by'] is None
+            assert state.violations() == []
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b, [0.0])
+            state_b.hydrate_from_store()
+            assert state_b.violations() == []
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [
+                i for i in report['flagged_items'] if i['finding_id'] == target_fid
+            ]
+            assert item['superseded_by'] is None
+            assert item['actionable'] is True
         finally:
             store_b.close()
 
