@@ -6350,8 +6350,6 @@ class BacklogIterator:
         )
 
         async with self._iteration_deadline(self.config.cycle_timeout_seconds):
-            watermark = await self.journal.get_watermark(project_id)
-
             chunk_num = 0
             start = self.time_provider()
             yielded = False
@@ -6387,7 +6385,7 @@ class BacklogIterator:
                     break
 
                 # Assemble token-budgeted payload
-                assembled = await assembler.assemble(peeked, watermark, project_id)
+                assembled = await assembler.assemble(peeked, project_id)
                 if not assembled.events:
                     break
 

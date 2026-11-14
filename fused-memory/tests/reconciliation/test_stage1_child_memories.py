@@ -100,7 +100,7 @@ async def _render_backlog_payload(memories: list[dict] | None = None) -> str:
         timestamp=datetime.now(UTC),
         payload={'content_preview': 'uv sync before pytest', 'category': 'procedural_knowledge'},
     )
-    ap = await assembler.assemble([event], Watermark(project_id='test_project'), 'test_project')
+    ap = await assembler.assemble([event], 'test_project')
     stage = make_consolidator()
     stage.assembled_payload = ap
     return await stage.assemble_payload(
