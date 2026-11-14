@@ -1323,6 +1323,11 @@ class TestRunCrossRepoGate:
         assert 'registry exploded' in verdict.reason, (
             f'the synthesized verdict must name the exception; got {verdict.reason!r}'
         )
+        from orchestrator import cross_repo_gate
+
+        assert verdict.signals == (cross_repo_gate.SIGNAL_CLASSIFY_ERROR,)
+        assert verdict.owner_project is None
+        assert verdict.foreign_paths == ()
 
     @pytest.mark.asyncio
     async def test_passes_config_project_root(self, tmp_path: Path):
@@ -1384,6 +1389,88 @@ class TestRunCrossRepoGate:
         message = ' '.join(r.getMessage() for r in caplog.records)
         assert '4242' in message, f'gate must log the task id; got {message!r}'
         assert 'allow' in message.lower(), f'gate must log the verdict; got {message!r}'
+
+
+class TestClassifyErrorEscalation:
+    """Task 4161: the classifier-crash fail-closed path, end to end.
+
+    Drives ``_run_cross_repo_gate`` into the REAL ``_block_and_escalate_cross_repo``
+    and a REAL ``EscalationQueue``.  Only the public ``classify_cross_repo`` is
+    patched to raise: it is documented never to raise, so patching it is the one
+    honest way to reach the except branch.  The L1 that crash files must claim
+    nothing the crash did not establish, and must not advise a refile.
+    """
+
+    @pytest.mark.asyncio
+    async def test_classifier_crash_l1_claims_nothing_was_established(self, tmp_path: Path):
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+        # Files declared on purpose: a '(none declared)' line would be visibly false.
+        assignment = _make_assignment(
+            task_id='4161', cross_repo=True,
+            files=['orchestrator/src/orchestrator/harness.py'],
+        )
+
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo',
+                   side_effect=RuntimeError('registry exploded')):
+            allowed = await h._run_cross_repo_gate(assignment)
+
+        assert allowed is False
+        h.scheduler.set_task_status.assert_awaited_once_with('4161', 'blocked')  # type: ignore[attr-defined]
+        l1s = [e for e in esc_queue.get_pending() if e.task_id == '4161' and e.level == 1]
+        assert len(l1s) == 1, f'Expected exactly 1 L1 for task 4161; got {l1s!r}'
+
+        summary = l1s[0].summary
+        assert 'CROSS_REPO_UNVERIFIED' in summary, summary
+        assert 'MISFILE' not in summary, summary
+        assert 'owned by' not in summary.lower(), summary
+        assert 'outside' not in summary.lower(), summary
+        assert 'could not run' in summary.lower(), summary
+        assert 'nothing about its paths was established' in summary.lower(), summary
+
+        detail = l1s[0].detail
+        assert 'registry exploded' in detail, detail
+        assert 'classify_error' in detail, detail
+        assert '(none declared)' not in detail, detail
+        assert 'nothing in the task metadata named it' not in detail, detail
+        assert 'judged outside project_root' not in detail, detail
+        assert 'not evidence' in detail.lower(), detail
+        assert 'do not refile' in detail.lower(), detail
+        assert 'unblock the task' in detail.lower(), detail
+
+    @pytest.mark.parametrize('shape', ['owner-named', 'marker-only', 'containment-only'])
+    def test_misfile_verdicts_keep_the_misfile_rendering(self, shape: str):
+        """The crash rendering is reserved for the classify_error signal."""
+        from orchestrator import cross_repo_gate as gate
+
+        verdicts = {
+            'owner-named': gate.CrossRepoVerdict(
+                verdict=gate.BLOCK, owner_project='dark_factory',
+                signals=(gate.SIGNAL_MARKER,), foreign_paths=(),
+                reason="metadata.cross_repo is set ('dark_factory')",
+            ),
+            'marker-only': gate.CrossRepoVerdict(
+                verdict=gate.BLOCK, owner_project=None,
+                signals=(gate.SIGNAL_MARKER,), foreign_paths=(),
+                reason='metadata.cross_repo is set (True)',
+            ),
+            'containment-only': gate.CrossRepoVerdict(
+                verdict=gate.BLOCK, owner_project=None,
+                signals=(gate.SIGNAL_ALL_FILES_FOREIGN,),
+                foreign_paths=('/elsewhere/x.py',),
+                reason='all 1 declared metadata.files entries are absolute paths '
+                       'resolving outside project_root',
+            ),
+        }
+
+        text = gate.block_escalation_text('9', verdicts[shape])
+
+        assert text.summary.startswith('CROSS_REPO_MISFILE: task 9 '), text.summary
+        assert 'Paths judged outside project_root' in text.detail, text.detail
+        assert 'CROSS_REPO_UNVERIFIED' not in text.summary, text.summary
 
 
 # ---------------------------------------------------------------------------
