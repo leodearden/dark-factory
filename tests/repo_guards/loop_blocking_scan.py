@@ -66,8 +66,8 @@ Deliberate limits (misses, not false alarms)
   idiom).  A nested helper is reached only when it is actually called.
 * ``fused-memory/tests/_ast_guard.py::imported_names_from`` is the house
   import-binding resolver, but ``fused-memory/tests`` is not on ``sys.path``
-  for a ``cd shared && pytest tests/`` run (only ``shared/tests``, ``shared/src``
-  and the repo root are -- see ``shared/tests/conftest.py``).  The ~20-line
+  for this module's run (``tests/repo_guards/conftest.py`` names what is).
+  The ~20-line
   binding map is therefore re-derived here rather than importing across
   packages, per task 4484's plan.
 

@@ -1,0 +1,39 @@
+# Module config for tests/repo_guards/ (task 5654).
+#
+# The home of guards whose SUBJECT is the committed tree outside their own
+# module: drift checks, parity pins and whole-first-party-tree gates moved out
+# of shared/tests, scripts/tests and tests/scripts. A member module's verify
+# cache key covers only that member, its closure and root blobs, so a guard
+# reading a sibling tree there could pass on a stale cached result. This module
+# is never cached, so every merge gate runs it in full.
+#
+# Placement is pinned from outside the module by
+# tests/scripts/test_repo_guards_module_placement.py.
+verify_cache: never
+
+# SERIAL, unlike tests/scripts: no `-n auto --dist loadgroup`. The
+# first_party_tree gates parse the whole tree once per session in
+# pytest_collection_finish, and every xdist worker collects every item, so each
+# worker would pay that parse (CONTRIBUTING.md §2).
+test_command: "uv run --project shared pytest tests/repo_guards/ --tb=short -q --timeout=300"
+lint_command: "uv run --project shared ruff check tests/repo_guards/ && python3 tests/scripts/raw_envelope_literal_guard.py tests/repo_guards"
+type_check_command: "uv run --project shared pyright tests/repo_guards/"
+
+# PER-MODULE VERIFY BUDGET. MEASUREMENT PROVENANCE: the VERBATIM test_command
+# above, run twice back to back on 2026-11-13 (task 5654, step-9 tree: every
+# guard the task moves in, 1033 tests):
+#   137.92s wall (94.15s in pytest), loadavg 70.71 -> 82.81
+#   165.09s wall (90.94s in pytest), loadavg 82.81 -> 45.89
+# W = 165.09, recorded in
+# tests/scripts/test_module_verify_budgets.py::MEASURED_MODULE_SUITE_WORST_SECS.
+# min_budget(W) is 300. Re-measure whenever guards move in or out.
+#
+# FAMILY-CEILING FLOOR (task 8402). Every test module here is a whole-tree
+# guard family member, whose per-test ceiling is
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+# A budget below W + that ceiling kills the leg before a member's backstop
+# fires, turning an attributable hang into a retried infra_timeout. So the
+# binding floor is min_leg_budget_for_family(W), above min_budget(W), and the
+# key below declares exactly that floor. Gated by
+# tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
+verify_command_timeout_secs: 1400

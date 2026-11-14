@@ -166,7 +166,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "followup_packing"
-          paths: ["shared/tests/test_declared_scope_readers.py"]
+          paths: ["tests/repo_guards/test_declared_scope_readers.py"]
           expect: present
       - name: "no-curator-or-interceptor-import"
         binding: "rejection-style (heuristic 13) — followup_packing.py imports nothing from the curator or interceptor"
@@ -256,7 +256,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "pack_sweep"
-          paths: ["shared/tests/test_declared_scope_readers.py"]
+          paths: ["tests/repo_guards/test_declared_scope_readers.py"]
           expect: present
       - name: "observe-boundary-rows"
         binding: "capability→producer — rows 1–5, 11–13, 21 in test_pack_sweep.py incl. the tasks.db row-hash invariant"

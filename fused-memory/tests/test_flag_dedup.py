@@ -12348,7 +12348,7 @@ class TestFilterAccountedClusterGrowthFlags:
         WARNING, not debug: a swallowed lookup error means the filter cannot
         tell whether the flag is accounted for, and a broad handler returning
         an empty value with no WARN+ log trips
-        shared/tests/test_silent_fallthrough_gate.py.
+        tests/repo_guards/test_silent_fallthrough_gate.py.
         """
         from fused_memory.reconciliation.flag_dedup import (
             filter_accounted_cluster_growth_flags,

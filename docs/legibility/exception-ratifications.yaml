@@ -76,7 +76,7 @@
     TaskConfigDir construction sites whose transcripts are deliberately not
     archived because they carry no signal worth keeping, namely the two UsageGate
     cap-probe dirs and the legibility SessionRunner dir (the UNARCHIVED_BY_DESIGN
-    rows of shared/tests/config_dir_archival_allowlist.py).
+    rows of tests/repo_guards/config_dir_archival_allowlist.py).
 
 - id: inv12-by-design-session-resume-reasons
   date: 2026-10-19

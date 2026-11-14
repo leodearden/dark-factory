@@ -257,7 +257,7 @@ _CODEX_RESET_ROLLOVER_GRACE = timedelta(minutes=10)
 # ETA.
 #
 # Single ownership is now mechanically enforced, by
-# shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership — a
+# tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership — a
 # re-fork here or a re-export elsewhere fails it. So this pair is no longer
 # the un-guarded exception to the string tables' TestSingleSourceOwnership
 # coverage (CAP_HIT_PREFIXES / CAP_CONFIRM_KEYWORDS / NEAR_CAP_PREFIXES /
@@ -556,7 +556,7 @@ def _extract_cap_message(text: str, prefix: str) -> str:
     TestSingleSourceOwnership, which only asserts the plain string-table
     constants are single-sourced here with no mirrored copies elsewhere;
     single ownership of this function is covered by
-    ``shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership``.
+    ``tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership``.
     """
     lower = text.lower()
     idx = lower.find(prefix.lower())

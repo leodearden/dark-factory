@@ -430,7 +430,7 @@ _ANY_OPENER_RE = re.compile(
 )
 
 # Structural bounds. repair() must be total for adversarial input WITHOUT a
-# blanket try/except (that is signature (b) of shared/tests/silent_fallthrough_scan.py
+# blanket try/except (that is signature (b) of tests/repo_guards/silent_fallthrough_scan.py
 # and would demand an allowlist entry), so the two unbounded loops are bounded
 # by construction instead. Both ceilings are far above any real call: no MCP
 # tool has 64 parameters, and a value carrying 64 qualifying closers is prose

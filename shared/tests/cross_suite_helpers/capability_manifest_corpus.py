@@ -2,12 +2,14 @@
 
 Test-support module — NOT production code; nothing under ``shared/src/``
 changes for this. Consumed by ``shared/tests/test_capability_manifest.py``'s
-``TestManifestCorpusDiscovery`` / ``TestCheckManifest`` /
-``TestCheckedInManifestCorpus``. Importable bare
+unit tests and by the checked-in corpus guard in
+``tests/repo_guards/test_checked_in_capability_manifests.py``. Importable bare
 (``from capability_manifest_corpus import ...``) because
-``shared/tests/conftest.py`` inserts this ``tests/`` directory onto
-``sys.path`` — the same mechanism ``silent_fallthrough_scan.py`` and
-``startup_completion_probe.py`` already rely on.
+``shared/tests/conftest.py`` and ``tests/repo_guards/conftest.py`` both insert
+this ``cross_suite_helpers/`` directory onto ``sys.path``, and both pyright
+tables list it in ``extraPaths``. The directory holds helpers only, no test
+module or conftest, so listing it claims no suite's names (see
+``tests/scripts/test_no_vestigial_import_pragmas.py::test_no_root_extrapaths_entry_holds_a_test_module_or_conftest``).
 
 Why ``git ls-files``, not ``Path.rglob``
 -----------------------------------------
@@ -41,12 +43,12 @@ from shared.capability_manifest import load_capability_manifest
 #: fused_memory.
 MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
-#: shared/tests/capability_manifest_corpus.py -> parents[0]=shared/tests,
-#: parents[1]=shared, parents[2]=repo root. Mirrors the resolution
-#: TestLoader::test_committed_exemplar_sidecar_validates already uses from
-#: this same tests/ directory, and fused-memory/tests/test_lock_charter_guard.py's
-#: _DF_REPO_ROOT; correct inside a worktree checkout too.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+#: shared/tests/cross_suite_helpers/capability_manifest_corpus.py ->
+#: parents[0]=shared/tests/cross_suite_helpers, parents[1]=shared/tests,
+#: parents[2]=shared, parents[3]=repo root. Mirrors
+#: fused-memory/tests/test_lock_charter_guard.py's _DF_REPO_ROOT; correct
+#: inside a worktree checkout too.
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class GitUnavailable(RuntimeError):
@@ -123,11 +125,11 @@ def discover_manifests(repo_root: Path = REPO_ROOT) -> list[Path] | None:
     non-zero, mirroring ``test_lock_charter_guard.py``'s ``_tracked_file_paths()``),
     a missing/unrunnable binary, or a wedge past the 30s timeout.
 
-    The collapse to ``None`` is deliberate *here* specifically:
-    ``test_capability_manifest.py`` calls this at *module import time*
+    The collapse to ``None`` is deliberate *here* specifically: the checked-in
+    corpus guard calls this at *module import time*
     (``_MANIFEST_PATHS = discover_manifests() or []``), so an escaping
     exception would take down collection of the entire test module, not just
-    the corpus-guard classes. Callers that run at test time instead — see
+    its corpus-sweep classes. Callers that run at test time instead — see
     :func:`committed_file_mode` — keep the distinction. Otherwise returns a
     sorted, duplicate-free list of absolute paths.
     """
@@ -147,7 +149,7 @@ def check_manifest(path: Path) -> str | None:
     adds the one thing it can't: WHICH of the many checked-in sidecars a given
     failure came from. A bare ``pydantic.ValidationError`` names a field path
     (e.g. ``tasks.3.capabilities.2.delivered_check.pattern``) but never the
-    file, so a caller sweeping many sidecars (``TestCheckedInManifestCorpus``)
+    file, so a caller sweeping many sidecars (the checked-in corpus guard)
     would otherwise get an unattributed error.
 
     Catches exactly ``yaml.YAMLError`` and ``pydantic.ValidationError`` and
@@ -171,6 +173,24 @@ def check_manifest(path: Path) -> str | None:
         detail = ' '.join(str(exc).split())
         return f'{display_path}: schema validation failed: {detail}'
     return None
+
+
+def missing_from_worktree_message(manifest_path: Path) -> str:
+    """Message for a sidecar ``git ls-files`` tracks but the working tree lacks.
+
+    ``git ls-files`` reports index entries, not working-tree entries: an
+    unstaged deletion (``rm sidecar.yaml`` without ``git rm``) or a
+    skip-worktree/sparse-checkout entry makes :func:`discover_manifests`
+    return a path that doesn't exist on disk. ``check_manifest`` letting
+    ``FileNotFoundError`` propagate is correct for a direct caller (see
+    ``TestCheckManifest.test_missing_file_propagates_file_not_found`` — a
+    missing file is a caller bug, not manifest drift) — but in a corpus
+    sweep, the "caller" is the guard itself, so a tracked-but-missing
+    file must fail loudly and name the file, not surface as an uncaught
+    traceback from this guard (code-review amendment, task 3362).
+    """
+    rel = manifest_path.relative_to(REPO_ROOT)
+    return f'{rel}: tracked in git but missing from the working tree'
 
 
 @dataclass(frozen=True)
@@ -205,21 +225,22 @@ def iter_script_checks(path: Path) -> list[ScriptCheckRef]:
     (``yaml.YAMLError``, ``pydantic.ValidationError``, ``OSError``). This is
     NOT a fail-soft, for two reasons:
 
-    1. No signal is lost. ``TestCheckedInManifestCorpus.
-       test_checked_in_manifest_validates`` already reports an unloadable
-       sidecar loudly, with a better field-path-attributed message, and a
+    1. No signal is lost. The checked-in corpus guard's per-sidecar
+       validation case already reports an unloadable sidecar loudly, with a
+       better field-path-attributed message, and a
        schema-invalid sidecar is a manifest-shape defect rather than a
        script-lifecycle one — re-reporting it here would misattribute it.
-    2. The swallow cannot hide a dropped target. ``TestCheckedInScriptCheckTargets``
-       layers three guards over it: non-vacuity (catches hiding *everything*),
+    2. The swallow cannot hide a dropped target. The corpus guard's
+       script-target sweep layers three guards over it: non-vacuity
+       (catches hiding *everything*),
        both-known-anchors (catches hiding either of today's two targets), and
        — because neither of those notices a *future* third target quietly
        falling out — a count guard that re-derives the expected number by
        regex over the sidecar TEXT, bypassing this loader entirely, and
        asserts equality (code-review amendment, task 3649).
 
-    The swallow is also load-bearing for collection: ``test_capability_manifest.py``
-    calls this at *module import time* (``_SCRIPT_CHECKS = [...]``) to feed
+    The swallow is also load-bearing for collection: the checked-in corpus
+    guard calls this at *module import time* (``_SCRIPT_CHECKS = [...]``) to feed
     ``@pytest.mark.parametrize``, so an escaping exception would take down
     collection of the entire test module — the same hazard
     :func:`discover_manifests`' docstring names.

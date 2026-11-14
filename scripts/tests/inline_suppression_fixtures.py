@@ -9,7 +9,7 @@ for that.
 A REAL GIT REPOSITORY, not a bare directory.  The scanner enumerates its corpus
 from ``git ls-files``, so trackedness is a property the fixtures must exercise
 rather than one the tests assert by reading the code — the same argument
-``scripts/tests/test_design_invariants_consistency.py::_write_scan_tree`` gives.
+``tests/repo_guards/test_design_invariants_consistency.py::_write_scan_tree`` gives.
 
 XDIST-SAFE.  The merge gate runs ``pytest … -n auto --dist loadgroup``, so every
 test built on these helpers keeps its mutable state inside ``tmp_path`` and

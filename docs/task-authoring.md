@@ -1673,7 +1673,7 @@ row, or null when it has none. It is never re-derived at plan refinement or at
 `done`. The only re-stamp is a curator combine (`basis='combine'`, task
 8415). An absent key, on a task filed before the stamp existed, means no
 information, never `undeclared`. The modules allowed to import it are pinned
-by `shared/tests/test_declared_scope_readers.py`
+by `tests/repo_guards/test_declared_scope_readers.py`
 (`plans/follow-up-filing-shape-prd.md` §3 decisions 6–8), and no verify,
 merge-lane, triage or routing path may read it: the same test fails if one of
 those modules names the key or anything `shared.declared_scope` exports.

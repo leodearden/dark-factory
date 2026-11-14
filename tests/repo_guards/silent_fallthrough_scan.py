@@ -21,13 +21,13 @@ Design:
 THIS MODULE IS THE ONE PLACE THE FIRST-PARTY TREE IS READ AND PARSED (task
 4520). ``parse_first_party_tree(repo_root)`` reads and ``ast.parse``s each
 enumerated file exactly once per session and memoizes the result; every gate
-module in ``shared/tests/`` walks those already-built ASTs READ-ONLY rather
+module in ``tests/repo_guards/`` walks those already-built ASTs READ-ONLY rather
 than growing its own scan. Before that consolidation two gates each did the
 whole thing privately — 461 files read twice, parsed three times, 922 parent
 maps where 24 sufficed — and because pytest-timeout arms its timer over the
 entire runtest protocol (``func_only=False``), the duplicated work was billed
 to whichever single test item happened to trigger the fixture: 23.68s of setup
-against a 60s budget. ``shared/tests/test_tree_scan_sharing.py`` pins the
+against a 60s budget. ``tests/repo_guards/test_tree_scan_sharing.py`` pins the
 contract and carries an anti-regrowth ratchet against a third private parse.
 
 Consumers must not mutate a shared ``ast.Module``: the trees are handed to
@@ -563,7 +563,7 @@ class ScopeRootsMissingError(RuntimeError):
             f"sub-directory. Every SCOPE_ROOTS entry is required, because a "
             f"skipped root is a green gate over less code; if a root was "
             f"renamed or removed, update SCOPE_ROOTS in "
-            f"shared/tests/silent_fallthrough_scan.py (see CONTRIBUTING.md §2, "
+            f"tests/repo_guards/silent_fallthrough_scan.py (see CONTRIBUTING.md §2, "
             f"'Where repo-wide gates live')."
         )
 

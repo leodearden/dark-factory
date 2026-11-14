@@ -61,13 +61,12 @@ this a nuisance ratchet reviewers learn to re-bless unread.  The hash is
 invariant under reindentation and edits above the site, and changes only when
 the call itself changes.
 
-DELETING A ROW IS PART OF THE FIX THAT REMOVES ITS SITE.  ``shared/tests`` is
-the FIRST segment of this repo's ``test_command``
-(``cd shared && uv run pytest tests/``), and
-``test_loop_blocking_gate.py::TestRatchet::test_no_stale_blessings`` fails on a
+DELETING A ROW IS PART OF THE FIX THAT REMOVES ITS SITE.  ``tests/repo_guards``
+is never cached (``verify_cache: never``), so every merge gate runs
+``test_loop_blocking_gate.py::TestRatchet::test_no_stale_blessings``, which fails on a
 blessing whose site is gone -- so a landed fix that leaves its row behind reds
 verify for every subsequent task in the repo until someone edits THIS file.
-A ``filed`` row's owning task need not otherwise be editing ``shared/tests``;
+A ``filed`` row's owning task need not otherwise be editing ``tests/repo_guards``;
 that coupling is written out in
 ``plans/inv8-caller-side-census-2026-09-03.md`` section 7.  The fix is always a
 deletion, never a re-bless.

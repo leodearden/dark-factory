@@ -9,9 +9,9 @@ survivor rather than a fresh hand-rolled copy.
 
 WHY IT LIVES HERE AND NOT IN A PACKAGE SUITE (task 3388).  ``CONTRIBUTING.md``
 §2, "Where repo-wide gates live", places a gate by what it reads: one that walks
-the shared ``first_party_tree`` parse lives in ``shared/tests``, and a sweep
+the shared ``first_party_tree`` parse lives in ``tests/repo_guards``, and a sweep
 that brings its own reader lives here.  This guard brings its own reader, and
-its ``_SRC_TREES`` is not ``shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS``:
+its ``_SRC_TREES`` is not ``tests/repo_guards/silent_fallthrough_scan.py::SCOPE_ROOTS``:
 it adds ``fused-memory/scripts`` and scans the test directories inside
 ``scripts``, which ``iter_first_party_files`` excludes.  So it cannot share
 that parse without changing what it detects.  It was born in
@@ -58,8 +58,9 @@ this file: all three commands there are directory-wide.
 
 SCOPE LIMIT, stated because a green run here must not be over-read: relocating
 this guard did NOT make ``shared/tests`` standalone-runnable, and was not meant
-to — ``shared/tests`` deliberately hosts the whole-tree source gates and
-presumes a full checkout (``CONTRIBUTING.md`` §2, "Where repo-wide gates live").
+to.  The whole-tree source gates now live in ``tests/repo_guards``
+(``CONTRIBUTING.md`` §2, "Where repo-wide gates live"), but other shared tests
+still read outside their package.
 """
 import ast
 import functools
@@ -1017,14 +1018,13 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
 
     (b) This test pins ONE file, not ``shared/tests`` as a whole.  It does NOT
     establish that shared's suite is standalone-runnable, and it is not meant
-    to: ``shared/tests`` deliberately hosts the whole-tree source gates, which
-    name sibling trees by design, and presumes a full checkout
-    (``CONTRIBUTING.md`` §2, "Where repo-wide gates live").
+    to: the whole-tree source gates, which name sibling trees by design, live
+    in ``tests/repo_guards`` (``CONTRIBUTING.md`` §2, "Where repo-wide gates
+    live"), but other shared tests still read outside their package.
 
     WHY THE NARROW FORM.  A walk of ``shared/tests/**/*.py`` asserting the
-    whole directory names no sibling tree would be red forever: the whole-tree
-    source gates that live there name sibling trees on purpose, and each is
-    load-bearing where it sits.  The fence's purpose is SPOT: the atomic-write
+    whole directory names no sibling tree would fence more than this guard's
+    one home.  The fence's purpose is SPOT: the atomic-write
     guard has one home, this module, so ``test_safe_io.py`` must not fork a
     second sweep.
     """
@@ -1049,7 +1049,7 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
         + '\nThe atomic-write anti-regrowth guard lives in '
         'tests/scripts/test_atomic_write_regrowth.py; extend it there rather than '
         'forking a second sweep into safe_io\'s unit suite. A new gate over the '
-        'shared first_party_tree parse belongs beside that fixture in shared/tests '
+        'shared first_party_tree parse belongs beside that fixture in tests/repo_guards '
         '(CONTRIBUTING.md §2, "Where repo-wide gates live"). If the '
         'literal is genuinely PROSE rather than a scan root, write it as prose: '
         'the predicate only flags a bare path with no whitespace in it.'

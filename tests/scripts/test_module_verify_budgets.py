@@ -300,6 +300,8 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'sampler': 22.49,
     'cockpit': 130.50,
     'client-feed': 7.88,
+    # Task 5654; the runs and their loadavg are in tests/repo_guards/orchestrator.yaml.
+    'tests/repo_guards': 165.09,
     # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
     # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing
     # regime's worst GREEN full-suite run.
@@ -446,6 +448,8 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'cockpit': 'cockpit/src/cockpit/__init__.py',
     'client-feed': 'client-feed/src/client_feed/__init__.py',
     'orchestrator': 'orchestrator/src/orchestrator/__init__.py',
+    # No production file lives under tests/, so this diff routes to the module's full suite.
+    'tests/repo_guards': 'tests/repo_guards/conftest.py',
 }
 
 
@@ -852,6 +856,7 @@ KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
         'orchestrator',
         'scripts',
         'tests/scripts',
+        'tests/repo_guards',
     }
 )
 

@@ -111,34 +111,42 @@ Other top-level dirs:
   `reference-transaction`, see §4-§5), install via `hooks/setup.sh`.
 
 **Where repo-wide gates live.** There are two homes, chosen by what the gate
-reads. `shared/tests/` hosts the whole-first-party-tree *source* gates: every
-gate that walks the Python tree through the session-scoped `first_party_tree`
-fixture (`shared/tests/conftest.py`), which parses
-`shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS` once per session, at
-collection time (`shared/tests/session_prebuild.py`). A new gate over that
-tree takes the fixture instead of growing a private parse;
-`shared/tests/test_tree_scan_sharing.py::TestNoRegrownWholeTreeParse`
-ratchets this. They do not live in `tests/scripts/` because two module
-configs collect that directory, `scripts/orchestrator.yaml` under `-n auto`:
-every xdist worker would pay the parse, whose CPU and resident-memory cost
-`silent_fallthrough_scan.py::parse_first_party_tree`'s docstring measures,
-and a full-breadth merge verify would pay it twice. `tests/scripts/` hosts the
-repo-level sweeps that bring their own reader — config, doc, systemd-unit and
-toolchain parity, and `tests/scripts/test_atomic_write_regrowth.py`, whose
-`_SRC_TREES` is not `SCOPE_ROOTS`.
+reads. `tests/repo_guards/` hosts every guard whose subject is the committed
+tree outside its own module: the whole-first-party-tree *source* gates, and the
+drift checks and parity pins that read a sibling tree. A workspace member's
+verify-cache key covers only that member, its closure and root-level blobs
+(`orchestrator/src/orchestrator/verify_cache/keys.py::unit_input_paths`), so
+such a guard inside a member suite could pass on a stale cached result. The
+module config declares `verify_cache: never` instead, so every merge gate runs
+it in full; `tests/scripts/test_repo_guards_module_placement.py` pins this
+placement from outside the module. At task role a leg runs only its own
+family, so a diff confined to one member does not run these gates
+(`docs/task-role-pytest-floor.md`).
 
-The consequence is accepted deliberately: `shared/tests/` is not a
-self-contained package suite. It presumes a full dark-factory checkout, and
-nothing runs it any other way, because `dark-factory-shared` is consumed only
-as a `{ workspace = true }` member. So these gates **hard-fail, never skip**,
-when a tree they scan is absent: `iter_first_party_files` raises
-`ScopeRootsMissingError` naming every missing root (pinned by
-`shared/tests/test_tree_scan_sharing.py::TestEveryScopeRootIsRequired`), and
-in the other direction
-`shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root`
+Every gate there that walks the Python tree takes the session-scoped
+`first_party_tree` fixture (`tests/repo_guards/conftest.py`), which parses
+`tests/repo_guards/silent_fallthrough_scan.py::SCOPE_ROOTS` once per session,
+at collection time (`tests/repo_guards/session_prebuild.py`). A new gate over
+that tree takes the fixture instead of growing a private parse;
+`tests/repo_guards/test_tree_scan_sharing.py::TestNoRegrownWholeTreeParse`
+ratchets this. The module's `test_command` is serial, with no `-n auto`: every
+xdist worker collects every item and would pay the parse, whose CPU and
+resident-memory cost `silent_fallthrough_scan.py::parse_first_party_tree`'s
+docstring measures. `tests/scripts/` hosts the repo-level sweeps that bring
+their own reader — config, doc, systemd-unit and toolchain parity, and
+`tests/scripts/test_atomic_write_regrowth.py`, whose `_SRC_TREES` is not
+`SCOPE_ROOTS`. Like `tests/repo_guards/`, it belongs to no workspace member.
+
+These gates presume a full dark-factory checkout, and nothing runs them any
+other way. So they **hard-fail, never skip**, when a tree they scan is absent:
+`iter_first_party_files` raises `ScopeRootsMissingError` naming every missing
+root (pinned by
+`tests/repo_guards/test_tree_scan_sharing.py::TestEveryScopeRootIsRequired`),
+and in the other direction
+`tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root`
 reds when a new `<pkg>/src` is missing from `SCOPE_ROOTS`. A skip is a green
 run over less code — the silent fallthrough the flagship gate exists to catch
-— so do not add one to make the suite standalone.
+— so do not add one.
 
 An allowlist keyed on a sibling's `(path, qualname)` goes red when you rename
 an allowlisted function in `orchestrator/` or `fused-memory/`. That follows
@@ -201,7 +209,7 @@ one prior attempt at a class-level citation guard (task 4240) burned
 $35.97 over 18 `recovery_vetoed` events without landing. Where a line
 number *is* load-bearing — a gate key, or guard prose an assertion pins —
 it gets fixed structurally instead; see task 1910's re-key of
-`shared/tests/silent_fallthrough_allowlist.py` to
+`tests/repo_guards/silent_fallthrough_allowlist.py` to
 `(relpath, qualname, content_hash)`, which notes that keys "omit `lineno`
 entirely".
 
@@ -516,7 +524,7 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
 it's the single normative copy; don't restate them elsewhere (a restatement
 here went stale once already — task 3802, and
-`scripts/tests/test_design_invariants_consistency.py` now fails if a copy
+`tests/repo_guards/test_design_invariants_consistency.py` now fails if a copy
 comes back; citing one invariant by name is still fine). If you're hand-writing a task (not going through
 `/prd`) for a nontrivial design change, walk it against the same checklist
 yourself before filing.

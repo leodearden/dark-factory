@@ -66,12 +66,11 @@ from loop_blocking_scan import (
     find_loop_blocking_sites_in_trees,
     site_key,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from silent_fallthrough_scan import (
     ParsedFile,
     reconcile_against_allowlist,
 )
-
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -1461,8 +1460,8 @@ class TestRatchet:
             'blessed sites that no longer exist -- delete these rows from '
             f'loop_blocking_allowlist.AUDITED_SITES: {stale}\n\n'
             'If you just landed a fix for one of these, THE DELETION IS PART '
-            'OF THAT FIX: shared/tests is the first segment of this repo\'s '
-            'test_command, so a stale row reds verify for every subsequent '
+            'OF THAT FIX: tests/repo_guards is never cached, so every merge '
+            'gate runs this check and a stale row reds verify for every subsequent '
             'task until the row goes. Delete, never re-bless -- a blessing for '
             'a site that no longer exists cannot describe anything. See '
             'plans/inv8-caller-side-census-2026-09-03.md section 7.'

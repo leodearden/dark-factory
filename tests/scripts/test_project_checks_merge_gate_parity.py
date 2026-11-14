@@ -45,22 +45,30 @@ MODULES = (
     ESCALATION,
     ORCHESTRATOR,
 )
+REPO_GUARDS = ModuleSpec('tests/repo_guards', None, None, 'uv run --project shared pytest tests/repo_guards/ -q', False)
+SCREEN_MODULES = (*MODULES, REPO_GUARDS)
 SCREEN_CHECK_ID = 'capability_manifest_script_targets'
 SCREEN_MANIFEST = yaml.safe_dump({
     'checks': [{
         'id': SCREEN_CHECK_ID,
-        'module': 'shared',
+        'module': REPO_GUARDS.prefix,
         'node_ids': [
-            'tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets::'
+            'tests/repo_guards/test_checked_in_capability_manifests.py::TestCheckedInScriptCheckTargets::'
             'test_target_exists_and_is_executable',
-            'tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets::'
+            'tests/repo_guards/test_checked_in_capability_manifests.py::TestCheckedInScriptCheckTargets::'
             'test_target_is_committed_executable',
         ],
     }],
 })
 CAPABILITY_TEST_COPIES = {
-    f'shared/tests/{name}': REPO_ROOT / 'shared' / 'tests' / name
-    for name in ('test_capability_manifest.py', 'capability_manifest_corpus.py')
+    rel: REPO_ROOT / rel
+    for rel in (
+        'tests/repo_guards/test_checked_in_capability_manifests.py',
+        'tests/repo_guards/conftest.py',
+        'tests/repo_guards/session_prebuild.py',
+        'tests/repo_guards/silent_fallthrough_scan.py',
+        'shared/tests/cross_suite_helpers/capability_manifest_corpus.py',
+    )
 }
 
 
@@ -124,7 +132,7 @@ def test_row_10_control_a_well_typed_module_file_lands(tmp_path: Path) -> None:
 
 
 def _screen_repo(tmp_path: Path) -> HookRepo:
-    return make_hook_repo(tmp_path, MODULES, screen_manifest=SCREEN_MANIFEST, copies=CAPABILITY_TEST_COPIES)
+    return make_hook_repo(tmp_path, SCREEN_MODULES, screen_manifest=SCREEN_MANIFEST, copies=CAPABILITY_TEST_COPIES)
 
 
 def test_row_11_a_tree_read_file_the_screen_rejects_is_refused(tmp_path: Path) -> None:
@@ -138,7 +146,7 @@ def test_row_11_a_tree_read_file_the_screen_rejects_is_refused(tmp_path: Path) -
     _assert_refused(repo, before, refused)
     assert _failure_line(f'screen:{SCREEN_CHECK_ID}').search(out), out
     assert re.search(
-        r'^FAILED \S*test_capability_manifest\.py::TestCheckedInScriptCheckTargets::'
+        r'^FAILED \S*test_checked_in_capability_manifests\.py::TestCheckedInScriptCheckTargets::'
         r'test_target_exists_and_is_executable\b',
         out,
         re.MULTILINE,

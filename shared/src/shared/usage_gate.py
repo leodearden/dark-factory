@@ -56,7 +56,7 @@ from shared.invocation_outcome import (
 # the sole owner of the bare _parse_resets_at name, so every other module
 # imports it under an explicit alias and a reader can tell at the call site
 # exactly which parser is running. Enforced by
-# shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership, which
+# tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership, which
 # fails any production call to the bare name outside the owning module — the
 # guard that keeps a fabricating fork from being re-introduced here.
 from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_strict

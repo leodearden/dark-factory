@@ -165,7 +165,7 @@ def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOU
     LOUD on failure, by design, and the distinction matters.  The in-suite
     copies of this call (``_reify_guard_vector`` in
     ``fused-memory/tests/test_lock_charter_guard.py`` and
-    ``shared/tests/test_locking.py``) hard-assert ``rc == 0`` for the same
+    ``tests/repo_guards/test_lock_charter_reify_parity.py``) hard-assert ``rc == 0`` for the same
     reason recorded there: measured 2026-08-09 on the live script, an
     unrecognised flag prints usage to stderr and exits 2, so a
     skip-on-any-non-zero would silently retire the comparison the moment reify

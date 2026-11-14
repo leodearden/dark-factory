@@ -1629,7 +1629,7 @@ class TestSubshellClauseIntegrity:
         recovered = render(serial_pytest(parse_config_command(ROOT_TEST_COMMAND)))
         segments = split_and_chain_segments(recovered)
         assert segments is not None
-        assert len(segments) == 9
+        assert len(segments) == 10
         for segment in segments:
             _assert_bash_parses(segment.command, what=f'segment {segment.label!r}')
 
@@ -3232,7 +3232,7 @@ class TestDescribeDroppedClauses:
         assert dropped[-1] == 'npx pyright'
 
     def test_root_test_command_fan_out(self):
-        """The live root ``test_command``: 18 segments, 2 retained, 16 dropped.
+        """The live root ``test_command``: 19 segments, 2 retained, 17 dropped.
 
         This is the regression case for review finding 2. Every dropped
         ``uv run pytest tests/ --timeout=300`` clause invokes pytest at an
@@ -3242,7 +3242,7 @@ class TestDescribeDroppedClauses:
         dropped, fan_out = describe_dropped_clauses(
             ROOT_TEST_COMMAND, 'cd shared && uv run pytest', 'pytest',
         )
-        assert len(dropped) == 16
+        assert len(dropped) == 17
         assert fan_out is True
 
     @pytest.mark.parametrize(
@@ -3330,15 +3330,16 @@ class TestSplitAndChainSegments:
     """
 
     def test_root_test_command_yields_one_segment_per_subproject(self):
-        """The committed fleet chain decomposes into its 9 runnable clauses.
+        """The committed fleet chain decomposes into its 10 runnable clauses.
 
-        Seven `cd <subproject> && pytest` pairs, the cockpit subshell, and the
-        `tests/scripts/` clause — the LAST one, and the one esc-3062-2 reports
-        never ran because an earlier subproject's red short-circuited the shell.
+        Seven `cd <subproject> && pytest` pairs, the cockpit subshell, the
+        `tests/scripts/` clause — the one esc-3062-2 reports never ran because
+        an earlier subproject's red short-circuited the shell — and the
+        `tests/repo_guards/` clause last.
         """
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert segments is not None
-        assert len(segments) == 9
+        assert len(segments) == 10
         assert [s.cwd_rel for s in segments] == [
             'shared',
             'escalation',
@@ -3347,6 +3348,7 @@ class TestSplitAndChainSegments:
             'dashboard',
             'sampler',
             'client-feed',
+            '.',
             '.',
             '.',
         ]
@@ -3396,8 +3398,8 @@ class TestSplitAndChainSegments:
     def test_labels_are_unique_and_filename_safe(self):
         """Labels become per-segment streamed-log filenames, so they must not collide.
 
-        Two segments share cwd `.` here (the cockpit subshell and
-        `tests/scripts/`), so the index suffix is what keeps
+        Three segments share cwd `.` here (the cockpit subshell,
+        `tests/scripts/` and `tests/repo_guards/`), so the index suffix is what keeps
         ``attempt-N.__fallback__.test.<label>.log`` distinct.
         """
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
@@ -3413,6 +3415,7 @@ class TestSplitAndChainSegments:
             'client-feed-7',
             'root-8',
             'root-9',
+            'root-10',
         ]
         assert len(set(labels)) == len(labels)
         for label in labels:
@@ -3690,7 +3693,7 @@ class TestSplitAndChainSegmentsRefuses:
         assert split_and_chain_segments(bad) is None
         good = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert good is not None
-        assert len(good) == 9
+        assert len(good) == 10
 
 
 class TestSplitAndChainSegmentsLiveConfigDrift:

@@ -19,10 +19,13 @@ from types import MappingProxyType
 from typing import NamedTuple
 
 import pytest
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from silent_fallthrough_scan import ParsedFile
 
 from shared import declared_scope
-from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _TARGET = 'shared.declared_scope'
 _TARGET_PACKAGE, _, _TARGET_NAME = _TARGET.rpartition('.')

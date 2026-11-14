@@ -208,6 +208,10 @@ unlimited_holder_locks:
 # accounting below for how this feeds verify_command_timeout_secs; the
 # combined-directories figure is recorded in project memory for task 3460
 # rather than duplicated here.
+# task 5654: the last segment runs tests/repo_guards/, the never-cached module
+# of repo-wide guards (tests/repo_guards/orchestrator.yaml), in its own
+# invocation. Folding it into the segment before would break that segment's
+# target-list coupling with scripts/orchestrator.yaml, described below.
 #
 # DEFENCE-IN-DEPTH ONLY: this whole chain is built by
 # ``_build_fallback_config``, which ``run_scoped_verification``
@@ -243,7 +247,7 @@ unlimited_holder_locks:
 # Do NOT re-close it here: this segment still never runs for a
 # scripts/** diff, so a change made here to fix a scripts/ coverage
 # question would be inert, and would read as a gate that is not one.
-test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd ../client-feed && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300"
+test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd ../client-feed && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300 && uv run --project shared pytest tests/repo_guards/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
 # this to a single touched file for root-level changes) emits a bare ``ruff
@@ -480,7 +484,7 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_shadow_ruling_doc_contract.py — reads
 #       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
 #       payload literals against the live parser (task 5374).
-#   scripts/tests/test_design_invariants_consistency.py — reads
+#   tests/repo_guards/test_design_invariants_consistency.py — reads
 #       skills/prd/references/gates.md live; its enumeration and citation
 #       scans walk the repo with no skills/ prune (task 4941).
 #   fused-memory/tests/test_referent_declaration_examples.py — reads the
@@ -705,8 +709,8 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # WHAT THEY BOUND. verify_command_timeout_secs is a PER-COMMAND budget
 # (skills/orchestrate/references/project-setup.md §"Per-subproject module
 # overrides"), and the fleet chain is ONE shell command, so this ceiling bounds
-# all nine suites together — eight `&&` segments, since tests/scripts/ and
-# scripts/tests/ share the last. It bounds nothing else: every discovered module
+# every suite in it together, tests/scripts/ and scripts/tests/ sharing one
+# segment. It bounds nothing else: every discovered module
 # config declares its own budget (MODULE_BUDGET_EXCLUSIONS is empty, and
 # tests/scripts/test_module_verify_budgets.py::
 # test_every_discovered_module_config_declares_its_own_verify_budget keeps it so).
@@ -723,7 +727,7 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #
 # WHY 7200 (Leo, 2026-09-12). The measured floor is
 # sum(MEASURED_FLEET_SEGMENT_SECS) in tests/scripts/test_fallback_verify_config.py:
-# six of the nine suites, each a representative green run, so a lower bound on
+# the measured subset of its suites, each a representative green run, so a lower bound on
 # the MEDIAN green chain and not a bound on any one run. Its orchestrator row is
 # derived from task 3353's census (tests/scripts/verify_budget_census_records.py::
 # ORCHESTRATOR_BUDGET_CENSUS); every other row carries dated provenance beside

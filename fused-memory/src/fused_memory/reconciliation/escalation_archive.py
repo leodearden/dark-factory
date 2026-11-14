@@ -15,14 +15,14 @@ is its one coroutine caller, and takes that hop.
 
 (2) THIS MODULE LIVES UNDER ``fused-memory/src/`` DELIBERATELY, not in the
 ``escalation`` package beside ``iter_all_escalation_paths`` where it would
-otherwise belong.  ``shared/tests/test_loop_blocking_gate.py`` sweeps only
+otherwise belong.  ``tests/repo_guards/test_loop_blocking_gate.py`` sweeps only
 ``_SCOPE_PREFIX = 'fused-memory/src/'``, and it finds a blocking call by
 following sync helpers across modules *that are in its sources dict*.  A helper
 under ``escalation/src/`` is invisible to it, so moving this file there would
 take the ``_escalate -> _finding_recently_resolved -> read_text`` reach out of
 the scanner's view and silently void the ten INV-8 ledger rows that record that
 defect as still-open and owned by task 5270 — coverage loss disguised as a fix.
-``shared/tests/test_loop_blocking_gate.py::TestScanHelperStaysInGateScope``
+``tests/repo_guards/test_loop_blocking_gate.py::TestScanHelperStaysInGateScope``
 enforces this rather than trusting the comment.
 """
 from __future__ import annotations

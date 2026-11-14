@@ -747,7 +747,7 @@ def durable_archive_path(
         # GC unlinking mid-lookup), or a non-coercible id from a caller bug.
         # Each of those is a real breakage an operator should see, so silence or
         # DEBUG here would be exactly the silent degradation design-invariants
-        # INV-2/INV-4 forbid — and shared/tests/test_silent_fallthrough_gate.py
+        # INV-2/INV-4 forbid — and tests/repo_guards/test_silent_fallthrough_gate.py
         # enforces that for new code (its baseline allowlist is a burn-down
         # ratchet for pre-existing sites like _resolve_transcript_path, not a
         # hatch new code may add to). Structured extra=, matching the shape
