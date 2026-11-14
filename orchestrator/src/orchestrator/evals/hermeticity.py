@@ -4,6 +4,7 @@ An eval cell runs a real ``TaskWorkflow`` against fixture worktrees. It is built
 with none of the collaborators through which a production workflow writes, and
 one handed to the cell factory is refused before any workflow exists
 (plans/review-all-s1-one-escalation-filing-entry-point-prd.md §Contracts C11).
+The built workflow is refused too if it holds a writer it was never handed.
 """
 
 from __future__ import annotations
@@ -11,11 +12,15 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from escalation.queue import EscalationQueue
 from shared.cost_store import CostStore
 
 from orchestrator.event_store import EventStore
+
+if TYPE_CHECKING:
+    from orchestrator.workflow import TaskWorkflow
 
 
 class EvalHermeticityError(ValueError):
@@ -53,3 +58,16 @@ def refuse_production_writers(writers: ProductionWriters) -> None:
         value = getattr(writers, field.name)
         if value is not None:
             raise EvalHermeticityError(field.name, value)
+
+
+def writers_held_by(workflow: TaskWorkflow) -> ProductionWriters:
+    """The production writers *workflow* holds publicly.
+
+    ``TaskWorkflow`` keeps its steward factory private, so that field reads as
+    None here; refusing the handed writers is what covers it.
+    """
+    return ProductionWriters(
+        escalation_queue=workflow.escalation_queue,
+        event_store=workflow.event_store,
+        cost_store=workflow.cost_store,
+    )

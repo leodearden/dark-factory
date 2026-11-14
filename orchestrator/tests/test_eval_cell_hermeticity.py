@@ -7,13 +7,14 @@ through which a ``TaskWorkflow`` writes production state (the escalation
 queue, and with it the filer the workflow derives from it; the steward
 factory; the event store; the cost store) with an ``EvalHermeticityError``
 that names the field and the offending object, before any workflow is built.
+It refuses the built workflow too, if it holds a writer it was never handed.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
 from escalation.queue import EscalationQueue
@@ -21,6 +22,7 @@ from shared.cost_store import CostStore
 from shared.project_layout import escalation_queue_dir, runs_db
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.evals import runner
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.hermeticity import EvalHermeticityError, ProductionWriters
 from orchestrator.evals.runner import _cell_workflow, build_eval_orch_config
@@ -109,3 +111,24 @@ def test_with_no_writers_the_cell_builds_as_today(
     assert workflow.event_store is None
     assert workflow.cost_store is None
     assert workflow.worktree == cell.worktree
+
+
+@pytest.mark.parametrize('field', ['escalation_queue', 'event_store', 'cost_store'])
+def test_a_built_workflow_holding_a_writer_it_was_not_handed_is_refused(
+    cell: _Cell, field: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = getattr(_PRODUCTION_WRITERS[field](cell.project_root), field)
+    real_build_workflow = runner.build_workflow
+
+    def build_defaulting_a_writer(**kwargs: Any) -> TaskWorkflow:
+        workflow = real_build_workflow(**kwargs)
+        setattr(workflow, field, writer)
+        return workflow
+
+    monkeypatch.setattr(runner, 'build_workflow', build_defaulting_a_writer)
+
+    with pytest.raises(EvalHermeticityError) as refused:
+        _build(cell)
+
+    assert refused.value.field == field
+    assert repr(writer) in str(refused.value)

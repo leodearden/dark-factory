@@ -62,7 +62,12 @@ from .eval_gate import (
     campaign_usage_gate,
     owned_usage_gate,
 )
-from .hermeticity import NO_PRODUCTION_WRITERS, ProductionWriters, refuse_production_writers
+from .hermeticity import (
+    NO_PRODUCTION_WRITERS,
+    ProductionWriters,
+    refuse_production_writers,
+    writers_held_by,
+)
 from .metrics import (
     EvalMetrics,
     RoleUnderTest,
@@ -615,7 +620,8 @@ def _cell_workflow(
 
     ``initial_plan=None`` makes the workflow's architect plan live. Handed
     *writers* are refused with ``EvalHermeticityError`` before anything is
-    built, so the cell writes no production state (C11).
+    built, and so is a built workflow holding one it was not handed, so the
+    cell writes no production state (C11).
     """
     refuse_production_writers(writers)
     task_id = task['id']
@@ -647,6 +653,8 @@ def _cell_workflow(
         event_store=writers.event_store,
         cost_store=writers.cost_store,
     )
+    if isinstance(workflow, TaskWorkflow):  # tests that patch build_workflow hand back a MagicMock
+        refuse_production_writers(writers_held_by(workflow))
     workflow.worktree = worktree
     return workflow
 
