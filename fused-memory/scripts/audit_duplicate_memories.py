@@ -1430,29 +1430,34 @@ def member_facts(record: dict) -> dict[str, Any]:
 def count_children(
     memories: Iterable[dict], categories: Iterable[str],
 ) -> list[dict[str, Any]]:
-    """Count the records in *categories* attached to each ``(parent_id, kind)``.
+    """Count the records in *categories* per ``(parent_id, kind, category)``.
 
     Every scanned record counts, clustered or not: after the write-triage
     flip a re-emission attaches as a sighting child, so its recurrence shows
     up here rather than as cluster growth. Kind-agnostic by design: the
     recorded ``metadata.kind`` is the key, so no kind vocabulary is imported.
-    Rows are sorted by ``(-count, str(parent_id), str(kind))``.
+    A row ``{parent_id, kind, category, count}`` names the child record's own
+    ``category``, so a consumer can tell which category's sweep counted it.
+    Rows are sorted by ``(-count, str(parent_id), str(kind), str(category))``.
     """
     swept = frozenset(categories)
-    counts: dict[tuple[Any, Any], int] = {}
+    counts: dict[tuple[Any, Any, Any], int] = {}
     for record in memories:
-        if record.get('category') not in swept:
+        category = record.get('category')
+        if category not in swept:
             continue
         metadata = record.get('metadata') or {}
         parent_id = metadata.get('parent_id')
         if parent_id:
-            key = (parent_id, metadata.get('kind'))
+            key = (parent_id, metadata.get('kind'), category)
             counts[key] = counts.get(key, 0) + 1
     rows = [
-        {'parent_id': parent_id, 'kind': kind, 'count': count}
-        for (parent_id, kind), count in counts.items()
+        {'parent_id': parent_id, 'kind': kind, 'category': category, 'count': count}
+        for (parent_id, kind, category), count in counts.items()
     ]
-    rows.sort(key=lambda r: (-r['count'], str(r['parent_id']), str(r['kind'])))
+    rows.sort(key=lambda r: (
+        -r['count'], str(r['parent_id']), str(r['kind']), str(r['category']),
+    ))
     return rows
 
 
