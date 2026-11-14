@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +23,7 @@ from _orch_helpers import (
     wire_live_status_from_get_task,
     wire_scheduler_liveness_mock,
 )
+from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
 
@@ -104,3 +106,58 @@ class TestRecoveredRequestOwnsItsTask:
         await harness._reconcile_stranded_in_progress()
 
         assert len(_pending_writes(scheduler_double)) == 1
+
+
+def _recovered_request() -> SimpleNamespace:
+    return SimpleNamespace(
+        task_id=_TID, request_id='mr-recovered', branch=SimpleNamespace(bare_id=_TID),
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+
+async def _recover(h: Harness, request: SimpleNamespace) -> None:
+    report = {
+        'recovered': 1, 'dropped': 0, 'coalesced': 0, 'requests': [request],
+        'journal_corrupt': False,
+    }
+    with patch('orchestrator.harness.recover_pending_merges', AsyncMock(return_value=report)):
+        await h._recover_pending_merges()
+
+
+async def _drain(h: Harness) -> None:
+    await asyncio.sleep(0)
+    await asyncio.gather(*h._background_tasks)
+
+
+@pytest.mark.asyncio
+class TestRecoveredRequestOutcomeHasAnOwner:
+    async def test_failed_recovered_request_blocks_the_task_with_an_l1(
+        self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
+    ) -> None:
+        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        request = _recovered_request()
+        await _recover(harness, request)
+
+        request.result.set_exception(RuntimeError('verify host lost'))
+        await _drain(harness)
+
+        scheduler_double.set_task_status.assert_any_await(_TID, 'blocked')
+        assert _pending_writes(scheduler_double) == []
+        [esc] = harness._escalation_queue.get_by_task(_TID, status='pending', level=1)
+        assert esc.category == 'merge_error'
+        assert esc.agent_role == 'harness-recovered-merge-owner'
+
+    async def test_landed_recovered_request_drives_the_landed_outbox_done_write(
+        self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
+    ) -> None:
+        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        landed_gate = AsyncMock(return_value=True)
+        harness._landed_dispatch_gate = landed_gate
+        request = _recovered_request()
+        await _recover(harness, request)
+
+        request.result.set_result(SimpleNamespace(status='done', merge_sha='a' * 40, reason=''))
+        await _drain(harness)
+
+        landed_gate.assert_awaited_once_with(_TID)
+        assert harness._escalation_queue.get_by_task(_TID, status='pending', level=1) == []
