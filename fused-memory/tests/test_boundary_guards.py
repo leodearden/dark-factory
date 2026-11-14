@@ -23,6 +23,7 @@ import pytest
 # AsyncMock leaves every `mem0_update` config leaf a Mock, which the fail-closed
 # authz resolver rejects (tests/test_markup_guard_fused_memory.py does the same).
 import test_consolidate_memories_tool as _consolidate
+from _id_resolver_fakes import FakeGraphiti, FakeMem0, RecordingTombstones
 from fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import CallToolResult, TextContent
@@ -40,8 +41,9 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from fused_memory.server import markup_guard
 from fused_memory.server.boundary_guards import boundary_guard_chain, install_boundary_guards
 from fused_memory.server.main import _install_tool_dispatch_guards
-from fused_memory.server.tools import create_mcp_server
+from fused_memory.server.tools import create_mcp_server, per_use_prefix_resolver
 from fused_memory.server.unknown_argument_guard import UnknownArgumentMiddleware
+from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import validate_full_uuid
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -446,9 +448,45 @@ class TestMainInstallsTheUuidMember:
         )
         result = await _wire(server, 'add_memory', _add_memory_citing())
 
-        assert getattr(server._tool_manager, '_fused_memory_safe_wrapped', False) is True
         assert FULL in mock_service.add_memory.await_args.kwargs['content']
         assert _repair(result)['substitutions'] == [_SUBSTITUTION]
+
+    @pytest.mark.asyncio
+    async def test_the_dispatch_guards_helper_contains_a_tool_body_escape(self):
+        mock_service = AsyncMock()
+        mock_service.add_memory.side_effect = SystemExit('escaped the tool body')
+        server = create_mcp_server(mock_service)
+
+        _install_tool_dispatch_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=RecordingResolver(UNIQUE)
+        )
+        result = await server._tool_manager.call_tool(
+            'add_memory', _add_memory_citing('a note citing nothing')
+        )
+
+        assert result == {'error': 'escaped the tool body', 'error_type': 'SystemExit'}
+
+    @pytest.mark.asyncio
+    async def test_the_production_resolver_reads_the_services_config_at_each_use(
+        self, mock_config, monkeypatch,
+    ):
+        """run_server's resolver is built per use, so a hot-reloaded collection prefix applies next call."""
+        mem0 = FakeMem0({FULL: {'data': 'the dead repair', 'user_id': 'reify'}})
+        service = MemoryService(mock_config)
+        monkeypatch.setattr(service, 'mem0', mem0)
+        monkeypatch.setattr(service, 'graphiti', FakeGraphiti())
+        monkeypatch.setattr(service, 'find_mem0_deletion_tombstones', RecordingTombstones())
+        resolve = per_use_prefix_resolver(service)
+        loaded_prefix = mock_config.mem0.collection_prefix
+
+        first = await resolve('reify', PREFIX)
+        monkeypatch.setattr(mock_config.mem0, 'collection_prefix', 'reloaded')
+        await resolve('reify', PREFIX)
+
+        assert [candidate.id for candidate in first.candidates] == [FULL]
+        assert [name for name, _ in mem0.scroll_calls] == [
+            f'{loaded_prefix}_reify', 'reloaded_reify',
+        ]
 
 
 _OVERRIDE = 'allow_uuid_prefix'
@@ -497,8 +535,13 @@ class TestTheUuidPrefixOverrideNeverReachesPersistence:
         _assert_stripped_and_kept(mock_service.add_memory.await_args.kwargs['metadata'])
 
     @pytest.mark.asyncio
-    async def test_add_episode_keeps_the_bare_prefix_and_persists_no_flag(self):
-        """add_episode forwards no metadata to its store at all; its strip is defensive."""
+    async def test_add_episode_keeps_the_bare_prefix_and_forwards_no_flag(self):
+        """A regression pin for a future metadata pass-through, NOT proof of add_episode's strip.
+
+        add_episode forwards no metadata to its service today, so the last
+        assertion held before the strip was written; it fails the day a change
+        starts forwarding metadata without stripping the flag.
+        """
         resolver = RecordingResolver(UNIQUE)
         server, mock_service = _memory_server(resolver)
 

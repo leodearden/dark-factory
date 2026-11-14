@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import uuid as uuid_mod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -31,7 +31,7 @@ from shared.task_statuses import ACTIVE
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_submit import is_ticket_id, looks_like_task_id
 from shared.uuid_prefix import strip_uuid_prefix_override
-from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
+from shared.uuid_prefix_guard import Namespace, PrefixResolver, Resolution, ResolverUnavailable
 
 from fused_memory.backends.defect_records import (
     DefectEventInvalid,
@@ -726,6 +726,26 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
 _AMBIGUOUS_UUID_PREFIX = 'ambiguous_uuid_prefix'
 
 
+def per_use_id_resolver(
+    memory_service: MemoryService, id_resolver: IdResolver | None = None,
+) -> Callable[[], IdResolver]:
+    """The ``IdResolver`` for the NEXT resolution: *id_resolver* when injected, else one built from *memory_service*.
+
+    Built per use: the resolver is stateless and its factory reads the
+    service's CURRENT config, so a hot reload of the Mem0 read timeout or
+    collection prefix applies to the next resolution.
+    """
+    return lambda: id_resolver or IdResolver.for_memory_service(memory_service)
+
+
+def per_use_prefix_resolver(
+    memory_service: MemoryService, id_resolver: IdResolver | None = None,
+) -> PrefixResolver:
+    """:func:`per_use_id_resolver`'s ``resolve_prefix``: the uuid-prefix guard's and /resolve-prefix's resolver."""
+    resolver = per_use_id_resolver(memory_service, id_resolver)
+    return lambda project_id, prefix: resolver().resolve_prefix(project_id, prefix)
+
+
 @dataclass(frozen=True)
 class _ResolvedId:
     """The prefix named exactly one live id in the tool's namespace: read *full_id*."""
@@ -1414,11 +1434,7 @@ def create_mcp_server(
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
 
-    def _resolver() -> IdResolver:
-        # Built per use: the resolver is stateless and its factory reads the
-        # service's CURRENT config, so a hot reload of the read timeout or
-        # collection prefix applies to the next resolution.
-        return id_resolver or IdResolver.for_memory_service(memory_service)
+    _resolver = per_use_id_resolver(memory_service, id_resolver)
     _taskmaster_configured = task_interceptor is not None
 
     async def _backlog_gate(project_id: str) -> dict | None:
@@ -1694,9 +1710,7 @@ def create_mcp_server(
 
     # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
     register_resolve_prefix_route(
-        mcp,
-        lambda project_id, prefix: _resolver().resolve_prefix(project_id, prefix),
-        known_projects=_kp,
+        mcp, per_use_prefix_resolver(memory_service, id_resolver), known_projects=_kp,
     )
 
     # ------------------------------------------------------------------

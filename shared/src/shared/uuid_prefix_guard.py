@@ -1096,11 +1096,14 @@ class UuidPrefixGuardMiddleware(Middleware):
     async def _forward(context, call_next, report: dict[str, Any]):
         """Let the call through and fold the report into ``meta``.
 
-        The report rides on ``meta`` and NEVER on ``structured_content`` or an
-        extra content block. Both alternatives are ruled out by measurement:
-        a middleware-authored ``structured_content`` fails the tool's own
-        output schema, and an appended content block corrupts any caller that
-        indexes ``content[0]``.
+        The report rides on ``meta``; this middleware NEVER writes it into
+        ``structured_content`` or an extra content block. Both alternatives are
+        ruled out by measurement: a middleware-authored ``structured_content``
+        fails the tool's own output schema, and an appended content block
+        corrupts any caller that indexes ``content[0]``. A host may still echo
+        the key into the result after checking that schema, as
+        ``fused-memory/src/fused_memory/server/tool_middleware_bridge.py::install_tool_middleware``
+        does.
 
         FOLDED into whatever meta came back rather than replacing it —
         ``call_next``'s result already carries ``{'fastmcp': {'wrap_result':

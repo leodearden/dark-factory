@@ -76,7 +76,8 @@ def _log_uuid_prefix_fact(fact: dict[str, Any]) -> None:
     """One ``uuid_prefix_detected`` line, as ``escalation/server.py::_emit_uuid_prefix_fact`` writes it.
 
     WARNING for the guard's fail-soft outcomes, INFO otherwise, so one grep
-    reads both servers' operator streams.
+    reads both servers' operator streams. A lock-step duplicate of that
+    emitter; task 9988 hoists one public emitter into ``shared.uuid_prefix_guard``.
     """
     level = logging.WARNING if fact.get('outcome') in STORM_COUNTED_OUTCOMES else logging.INFO
     logger.log(level, '%s %s', FACT_UUID_PREFIX_DETECTED, json.dumps(fact, sort_keys=True))
@@ -108,8 +109,8 @@ def boundary_guard_chain(
             exempt_tools=UUID_PREFIX_EXEMPT_TOOLS,
             forward_on_ambiguity_tools=UUID_PREFIX_FORWARD_ON_AMBIGUITY_TOOLS,
             # escalation_sink is unwired here: a burst still logs the storm
-            # escape's ERROR line and rides on the caller's response. Filing it
-            # into a queue is a filed follow-up of task 4643.
+            # escape's ERROR line and rides on the caller's response. Wiring it
+            # into a queue is task 9988.
             fact_sink=_log_uuid_prefix_fact,
         ),
     )
