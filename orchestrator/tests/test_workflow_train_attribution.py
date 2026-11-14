@@ -111,6 +111,7 @@ def _make(
     git_ops = MagicMock()
     git_ops.config.branch_prefix = 'task/'
     git_ops.config.main_branch = 'main'
+    git_ops.own_delta_upstream = AsyncMock(return_value='main')
     git_ops.advance_main = AsyncMock(return_value=AdvanceOutcome('advanced'))
     git_ops.cleanup_merge_worktree = AsyncMock()
 
@@ -597,29 +598,41 @@ class TestSomeFailAttribution:
             f'Expected WorkflowOutcome.DONE (tip passed), got {result!r}'
         )
 
-    async def test_exactly_n_solo_verifies(self) -> None:
-        """Exactly N=3 solo verifies are attempted (≤N+1 bound), root→tip.
+    @pytest.mark.parametrize(('anchor_upstream', 'expected_solo_calls'), [
+        ('main', [('101', 'main'), ('102', 'task/101'), ('103', 'task/102')]),
+        ('cut-101', [('101', 'cut-101'), ('102', 'task/101'), ('103', 'task/102')]),
+        (None, [('102', 'task/101'), ('103', 'task/102')]),
+    ])
+    async def test_solo_verifies_run_root_to_tip_above_each_members_upstream(
+        self, anchor_upstream: str | None, expected_solo_calls: list[tuple[str, str]],
+    ) -> None:
+        """At most N=3 solo verifies are attempted (≤N+1 bound), root→tip.
 
         Observed on the real per-member ``git_ops.materialize_member_solo``
         call rather than on a stubbed ``_reverify_one_member``: that call is
         the first thing each solo verify does, and returning ``None`` from it
-        is the production "un-stackable" verdict, so all three members become
-        failers without any solo verify actually running.  The predecessor refs
-        additionally pin the root→tip stacking order.
+        is the production "un-stackable" verdict, so every member becomes a
+        failer without any solo verify actually running.  A successor's ref is
+        its predecessor's branch; the anchor's is whatever
+        ``GitOps.own_delta_upstream`` answers (task 6300), so an anchor still
+        stacked on an unlanded base is cut above it, and a None answer makes
+        the anchor an un-stackable offender that is never materialized.
         """
         f = self._three_member_fixture()
         members = _train_members(train_id='T-bound', tip_id='103')
+        f.git_ops.own_delta_upstream = AsyncMock(return_value=anchor_upstream)
         f.git_ops.materialize_member_solo = AsyncMock(return_value=None)
         f.wf.event_store = MagicMock()
 
         tagged = _make_tagged_result()
         await f.wf._attribute_train_failure(tagged, 'T-bound', members)
 
+        f.git_ops.own_delta_upstream.assert_awaited_once_with('task/101')
         solo_calls = [
             tuple(c.args) for c in f.git_ops.materialize_member_solo.await_args_list
         ]
-        assert solo_calls == [('101', 'main'), ('102', 'task/101'), ('103', 'task/102')], (
-            f'Expected exactly 3 solo verifies root→tip, got {solo_calls!r}'
+        assert solo_calls == expected_solo_calls, (
+            f'Expected solo verifies root→tip {expected_solo_calls!r}, got {solo_calls!r}'
         )
 
 
