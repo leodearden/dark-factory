@@ -9489,7 +9489,7 @@ class TaskWorkflow:
                             f'consecutive_zero_output={consecutive_zero_output} '
                             f'at_iteration_cap=True '
                             f'iteration={self.metrics.execute_iterations} '
-                            f'evidence: .task/zero_output_evidence-iter*.json'
+                            f'evidence: {self.artifacts.zero_output_evidence_glob()}'
                         ),
                     }
                 elif consecutive_progress_timeouts > 0:
@@ -9679,7 +9679,7 @@ class TaskWorkflow:
                             f'iteration={self.metrics.execute_iterations} '
                             f'duration_ms={result.duration_ms} '
                             f'subtype={result.subtype!r} '
-                            f'evidence: .task/zero_output_evidence-iter*.json'
+                            f'evidence: {self.artifacts.zero_output_evidence_glob()}'
                         ),
                     }
                     self._preserve_config_dir = True

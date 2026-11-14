@@ -668,6 +668,7 @@ class ArtifactRoot(Enum):
 
 _REVIEW_ARCHIVE_FAMILY = 'reviews-<label>/'
 _ZERO_OUTPUT_EVIDENCE_FAMILY = 'zero_output_evidence-iter<n>.json'
+_ZERO_OUTPUT_EVIDENCE_NAME = 'zero_output_evidence-iter{}.json'
 
 ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'metadata.json': ArtifactRoot.LANE,
@@ -839,7 +840,11 @@ class TaskArtifacts:
         return self.review_archives_root / f'reviews-{label}'
 
     def zero_output_evidence_path(self, iteration: int) -> Path:
-        return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / f'zero_output_evidence-iter{iteration}.json'
+        return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / _ZERO_OUTPUT_EVIDENCE_NAME.format(iteration)
+
+    def zero_output_evidence_glob(self) -> str:
+        """Every iteration's ``zero_output_evidence_path``, as one glob, for operator-facing text."""
+        return str(self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / _ZERO_OUTPUT_EVIDENCE_NAME.format('*'))
 
     def read_title(self) -> str | None:
         """metadata.json's title, else plan.json's; None unless a non-blank str."""
