@@ -107,15 +107,26 @@ def test_a_stale_run_is_not_alive(tmp_path):
     )
 
 
-def test_a_unit_that_never_ran_is_not_alive(tmp_path):
+@pytest.mark.parametrize('timestamp', [
+    pytest.param('', id='empty'),
+    pytest.param('n/a', id='n/a'),
+])
+def test_a_unit_that_never_ran_is_not_alive(tmp_path, timestamp):
+    """The never-started shape the probe script's header names: a healthy
+    Result/ExecMainStatus pair with no exit timestamp."""
     run = _probe(
         tmp_path,
-        {'Result': '', 'ExecMainStatus': '', 'ExecMainExitTimestamp': ''},
+        {
+            'Result': 'success',
+            'ExecMainStatus': str(check_trickle_health.EXIT_HEALTHY),
+            'ExecMainExitTimestamp': timestamp,
+        },
     )
 
     assert run.result.returncode != 0, (
         f'stdout={run.result.stdout!r} stderr={run.result.stderr!r}'
     )
+    assert 'never run' in run.result.stderr
 
 
 def test_an_unparseable_timestamp_is_not_alive(tmp_path):
