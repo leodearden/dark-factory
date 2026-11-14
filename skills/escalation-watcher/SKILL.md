@@ -770,7 +770,9 @@ it, and the gate slug where one corresponds:
   **Third exception:** a milestone gate whose task carries `metadata.x_preauthorised_spawn`
   (Leo's pre-authorisation of that one gate's session) is handled under "Pre-authorised gate
   spawn" below, which runs a fixed check and then spawns with no prior ask, attended or AFK. A
-  gate whose check fails is asked like any other milestone gate (task 9712, S16 ruling R15). A
+  gate whose check fails is asked like any other milestone gate (Leo, 2026-11-12, S16 OQ-2,
+  residual R-5 2026-11-13: `plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-prd.md`
+  §"Rulings (sitting of 2026-11-12)"; task 9712). A
   gate that passes the check is not asked under any other class below because of what its task
   description says. `orchestrator/src/orchestrator/deterministic_runner.py::build_gate_escalation_fields`
   copies that description into the record's `detail`, but the description is the brief Leo ruled,
@@ -2172,12 +2174,14 @@ authorises nothing; only the key does (INV-11).
 has a line starting `x_preauthorised_spawn_launched:`, a session was already spawned for this
 escalation, by this watcher session or an earlier one, compacted or not. Any other `stamp_triage`
 writer replaces the whole note and can drop that line, so two independent sources count too: a
-session-registry record under `~/.claude/fleet/sessions/` whose `title` starts
-`gate:<project>#<task_id> `, live or terminal, or an In flight paragraph in the predecessor's
-handover naming this escalation. Any one of the three means spawned already. Never spawn again,
-whatever the check says; handle it under "After the spawn" below. This comes before the check so
-that durable records, not this session's memory, are what stop a second spawn: a compaction drops
-in-context state (see "AFK by silence" → "Measuring the silence").
+session-registry record under `~/.claude/fleet/sessions/` whose `escalation_id` field is this
+escalation's id, live or terminal (step 2 below stamps it), or an In flight paragraph in the
+predecessor's handover naming this escalation. Any one of the three means spawned already. Match
+the typed field, never the title: a title is per task, so a gate the runner re-files for the same
+task would read as spawned already. Never spawn again, whatever the check says; handle it under
+"After the spawn" below. This comes before the check so that durable records, not this session's
+memory, are what stop a second spawn: a compaction drops in-context state (see "AFK by silence" →
+"Measuring the silence").
 
 **The check.** Run it as code would; any failure means the gate is asked under "Always ask", and
 the digest names the failing line:
@@ -2195,8 +2199,10 @@ session's call. Nor does any other "Always ask" class bite on what the descripti
 that still asks.
 
 **On a pass, in attended and AFK posture alike** (the one exception to AFK shift 2), in this order:
-1. **Stamp the marker first.** Call `stamp_triage` on the record. Its `triage_note` is the existing
-   note with one line appended,
+1. **Stamp the marker first.** Call `stamp_triage(escalation_id=<id>,
+   triaged_by="escalation-watcher", triage_note=...)`, the identity this skill resolves with (see
+   "Two facts about attribution and timing"). Its `triage_note` is the existing note with one line
+   appended,
    `x_preauthorised_spawn_launched: {"at": "<date -u +%FT%TZ>", "terminal_title": "<the title in step 2>"}`,
    as one line of sorted JSON. `stamp_triage` replaces the whole note (see "CAUTION:
    `stamp_triage` REPLACES `triage_note`, it never appends"), so build it the way
@@ -2216,27 +2222,40 @@ that still asks.
    resolve_issue(action='resume'); otherwise leave it pending at your escape row)`. The
    description carries no handle on its own gate (it is filed before the escalation exists), and
    two pre-authorised gates can be pending at once, so without that line the session would have
-   to guess which one to resume.
+   to guess which one to resume. Set three variables explicitly on the spawn, since
+   `skills/spawn/SKILL.md` says callers must set them on every spawn:
+   `CLAUDE_SPAWN_ESCALATION_ID=<escalation_id>` and `CLAUDE_SPAWN_TASK_ID=<task_id>`, which stamp
+   the registry record's `escalation_id` and `task_id` fields that "Spawned already?" and "After
+   the spawn" find it by; and `CLAUDE_SPAWN_SELF_EXIT=1`, so the session ends itself once its work
+   is done (on the T3 lane that is `CLAUDE_SPAWN_T3_END=archive`).
 3. Append `<esc-id>` to the exclude-file, so the next scan does not re-fire on the pending gate.
 4. Record the spawn in the digest: `afk-digest.md` when AFK, the brief's Standing footer when
    attended. Name the escalation id, task id and `ruling_ref`. While the session runs, write no
-   "ask Leo" line and no DecisionRecord for it. In the sitting it is a `standing` owned by the
-   spawned session, with release predicate `escalation_closed`.
+   "ask Leo" line and no DecisionRecord for it. In the sitting it is a `standing` of kind `owned`
+   (`scripts/sitting/preparation.py::STANDING_KINDS`), owner the spawn's registry slug, release
+   predicate `escalation_closed` on this escalation's id.
 5. At a stop, name it in the handover's In flight section, as its own paragraph: escalation id,
    task id, the spawn's registry slug and its terminal title.
 
-**After the spawn.** While the session lives, nothing is asked. It has ended when its `/spawn`
-background task completes (in this session), or, for a record an earlier session marked, when its
-session-registry record reads a terminal status (`exited` or `failed-to-start`) or no longer
-exists. That record is the slug the handover names, else the record under
-`~/.claude/fleet/sessions/` whose `title` is the marker's `terminal_title`. If the gate is still
-pending once the session has ended, read its `result.md` (see "Joining a completed spawn: read
-`result.md`, don't explore"). `outcome: handed-off` means the gate is still owned: track the
-successor session named there as in flight (and in the handover's In flight section), and apply
-this paragraph again once that session has ended. Otherwise clear the standing first (re-record
-the item with `standing: null`, so it leaves the Standing footer), then ask Leo about the gate
-under "Always ask": a numbered brief line when attended; the digest plus a DecisionRecord via
-`write-decision` when AFK. Carry the session's
+**After the spawn.** Apply this each time the marked gate comes up in a drain. The session's
+record is the one under `~/.claude/fleet/sessions/` whose `escalation_id` is this escalation's
+id, else the slug the handover names, else the record whose `title` is the marker's
+`terminal_title`. The session has ended when any one of these holds:
+- its `/spawn` background task has completed (in this session);
+- its record reads a terminal status (`exited` or `failed-to-start`) or no longer exists;
+- its `result.md` carries a final outcome, anything but `in-progress`
+  (`orchestrator/src/orchestrator/session_registry.py::TERMINAL_RESULT_OUTCOMES`), even while its
+  process lives. `skills/review-all/scripts/program/watch_sessions.py::standing` names that state
+  `FINISHED_NOT_EXITED`. Self-exit acts only where its Stop hook is installed, and nobody types
+  `/exit` while AFK, so a finished session can sit idle in its window indefinitely.
+
+Until the session has ended, nothing is asked. If the gate is still pending once it has, read its
+`result.md` (see "Joining a completed spawn: read `result.md`, don't explore").
+`outcome: handed-off` means the gate is still owned: track the successor session named there as
+in flight (and in the handover's In flight section), and apply "After the spawn" again once that
+session has ended. Otherwise clear the standing first (re-record the item with `standing: null`, so it leaves
+the Standing footer), then ask Leo about the gate under "Always ask": a numbered brief line when
+attended; the digest plus a DecisionRecord via `write-decision` when AFK. Carry the session's
 stated escape reason (`action_needed`). An absent `result.md` says the session left no reason.
 Never spawn it again: a re-run is Leo's call.
 
