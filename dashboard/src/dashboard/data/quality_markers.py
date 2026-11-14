@@ -1036,20 +1036,38 @@ def model_version_markers(conn: sqlite3.Connection, project_id: str) -> SourceMa
 
 @dataclass(frozen=True)
 class SnapshotIdentity:
-    """Which instrument produced a quality-metrics snapshot: its sha, commit time and params."""
+    """Which instrument produced a quality-metrics snapshot: its sha, commit time and params.
+
+    ``unknown_params`` are the params keys the snapshot's schema does not record, as the
+    instrument's ``--summary --json`` reports them.
+    """
 
     as_of_sha: str
     committed_at: datetime
     params: Mapping[str, object]
+    unknown_params: frozenset[str] = frozenset()
+
+
+def _changed_params(before: SnapshotIdentity, after: SnapshotIdentity) -> list[str]:
+    """Each key differing or unknown on either side, sorted; an unknown key carries ' (unknown)'."""
+    unknown = before.unknown_params | after.unknown_params
+    keys = before.params.keys() | after.params.keys() | unknown
+    return [
+        f'{key} (unknown)' if key in unknown else key
+        for key in sorted(keys)
+        if key in unknown or before.params.get(key) != after.params.get(key)
+    ]
 
 
 def instrument_markers(project_id: str, snapshots: Iterable[SnapshotIdentity]) -> list[Marker]:
-    """A marker at each snapshot whose params differ from the previous snapshot's, naming the keys."""
+    """A marker exactly where the instrument's --diff against the predecessor opens 'params differ'.
+
+    Unknown never equals unknown, as in the instrument: a key unknown on either side is a change.
+    """
     ordered = sorted(snapshots, key=lambda snapshot: snapshot.committed_at)
     markers: list[Marker] = []
     for before, after in pairwise(ordered):
-        keys = sorted(key for key in before.params.keys() | after.params.keys()
-                      if before.params.get(key) != after.params.get(key))
+        keys = _changed_params(before, after)
         if keys:
             markers.append(Marker(
                 marker_id=f'instrument:{after.as_of_sha}', at=after.committed_at,
