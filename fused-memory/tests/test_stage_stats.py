@@ -194,41 +194,6 @@ def test_count_graphiti_queued_true_for_json_string_result_summary():
     assert _count_graphiti_queued(op) is True
 
 
-# Post-β rows (task 9147): add_memory journals its Graphiti leg in
-# 'stores_queued'; 'stores' holds only stores the write reached synchronously.
-
-
-def test_count_graphiti_queued_true_for_a_post_beta_graphiti_only_row():
-    rs = {'memory_ids': [], 'stores': [], 'stores_pending': [], 'stores_queued': ['graphiti']}
-    assert _count_graphiti_queued({'success': 1, 'result_summary': rs}) is True
-
-
-def test_count_graphiti_queued_true_for_a_post_beta_json_string_row():
-    rs = json.dumps(
-        {'memory_ids': [], 'stores': [], 'stores_pending': [], 'stores_queued': ['graphiti']}
-    )
-    assert _count_graphiti_queued({'success': 1, 'result_summary': rs}) is True
-
-
-def test_count_graphiti_queued_false_for_a_post_beta_mem0_only_row():
-    rs = {'memory_ids': [], 'stores': ['mem0'], 'stores_queued': []}
-    assert _count_graphiti_queued({'success': 1, 'result_summary': rs}) is False
-
-
-def test_count_graphiti_queued_false_for_a_post_beta_dual_write_row():
-    # Already counted as memories_added, as for a pre-β dual write.
-    rs = {'memory_ids': ['m1'], 'stores': ['mem0'], 'stores_queued': ['graphiti']}
-    assert _count_graphiti_queued({'success': 1, 'result_summary': rs}) is False
-
-
-def test_count_graphiti_queued_true_for_a_post_beta_row_whose_mem0_leg_is_pending():
-    rs = {
-        'memory_ids': [], 'stores': [], 'stores_pending': ['mem0'],
-        'stores_queued': ['graphiti'],
-    }
-    assert _count_graphiti_queued({'success': 0, 'result_summary': rs}) is True
-
-
 def test_op_to_stat_mapping_covers_core_memory_operations():
     """Guard against accidental deletions of key op-to-stat mappings."""
     for key in ('add_memory', 'delete_memory', 'update_edge', 'add_episode'):
@@ -855,6 +820,43 @@ async def test_derive_stage_stats_dead_post_beta_graphiti_only_row_is_dead_lette
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
     assert observed == _expected(writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_beta_json_string_row_counts_queued(journal):
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary=json.dumps({
+            'memory_ids': [], 'stores': [], 'stores_pending': [],
+            'stores_queued': ['graphiti'],
+        }),
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_beta_row_whose_mem0_leg_is_pending_counts_queued(
+    journal,
+):
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={
+            'memory_ids': [], 'stores': [], 'stores_pending': ['mem0'],
+            'stores_queued': ['graphiti'],
+        },
+        success=False,
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1)
 
 
 @pytest.mark.asyncio

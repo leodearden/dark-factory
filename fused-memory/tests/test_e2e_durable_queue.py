@@ -30,6 +30,7 @@ from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import Mem0WriteState, render_add_memory_message
 from fused_memory.reconciliation.stage_stats import derive_stage_stats
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.queued_writes import QueueOperation
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -1181,7 +1182,6 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
     ):
         """The claim the response makes, and the one the alarm says it made."""
         from fused_memory.models.enums import MemoryCategory
-        from fused_memory.services.queued_writes import QueueOperation
 
         svc, _journal = journaled_service
         svc.set_known_projects({'main': str(tmp_path)})
@@ -1204,7 +1204,8 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
             if SourceStore.graphiti in getattr(response, f)
         ]
         assert lists_holding_graphiti == ['stores_queued']
-        assert 'stores_queued' in _REPORTED_TO_CALLER[QueueOperation.ADD_MEMORY_GRAPHITI].text, (
+        claim = _REPORTED_TO_CALLER[QueueOperation.ADD_MEMORY_GRAPHITI].text
+        assert lists_holding_graphiti[0] in claim, (
             'the dead-letter alarm must name the claim the response actually made'
         )
 
