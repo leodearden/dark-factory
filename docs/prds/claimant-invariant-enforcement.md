@@ -548,7 +548,7 @@ invocation model, the discriminator, the closer analysis, and the re-arm control
   - (iii) The ζ census on demand, `scripts/clear_leaked_claimants.py` (task 4625). It reports
     the raw C4-E1 terminal tier with ledgered rows included: `classify_tier` applies
     `violates_terminal_claimant_invariant` alone, so the ledger layer of detection PRD D-5 reached
-    the gauge but not the census. Before reading a census terminal row as unledgered, or before `--apply`, check
+    the gauge but not the census (task 6777 owns adding it). Before reading a census terminal row as unledgered, or before `--apply`, check
     it against the gauge's `ledgered` flag or the row's `metadata.claimant_exception`.
   - (iv) The watcher-rotation consumption step in both watcher skills' Main Loop (d2, landed via
     task 4894), whose single statement is `skills/_shared/reading-the-invariants-gauge.md`.

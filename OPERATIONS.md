@@ -900,7 +900,8 @@ adds the hygiene tier). Exit 3 means nothing was read. Run the script
 directly, never via `python -m`.
 
 The census reports the raw terminal tier, ledgered rows included: unlike
-the gauge, it does not separate sanctioned C4-E2 exceptions. Before you
+the gauge, it does not separate sanctioned C4-E2 exceptions (task 6777
+owns adding that). Before you
 treat a census terminal row as unledgered, or run `--apply`, check it
 against the gauge's `ledgered` flag or the row's
 `metadata.claimant_exception`.
