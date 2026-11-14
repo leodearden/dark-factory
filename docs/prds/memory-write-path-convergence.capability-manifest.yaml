@@ -171,9 +171,12 @@ tasks:
   task_id: 3136
   title: 'Scheduled deterministic dedup report feeding gate filing'
   capabilities:
+  # 2026-11-14: PASS. Task 3136 delivered scripts/fused-memory-duplicate-audit.timer
+  # (weekly OnCalendar), its service, wrapper and installer. The D18 ruling above
+  # still governs the gate-filing capability below.
   - name: timer-unit-committed
     binding: capability→producer — systemd user timer per flag-marker-sweep precedent
-    verdict: FAIL
+    verdict: PASS
     delivered_check:
       kind: grep
       pattern: OnCalendar

@@ -15,6 +15,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Weekly duplicate-cluster report with a consecutive-run regrowth diff (task 3136)
+
+A new systemd user timer, `scripts/fused-memory-duplicate-audit.timer` (Sun 06:30),
+runs `fused-memory/scripts/duplicate_cluster_report.py`. That script runs the
+detector once per project and category, read-only, with `--no-metrics`. It saves each
+plan, writes `report-<STAMP>.json` and `summary-<STAMP>.txt` under
+`fused-memory/data/duplicate-cluster-reports/<project>/`, and diffs each report against
+that project's previous one. The diff covers cluster lineage by member overlap
+(`new`/`grew`/`shrank`/`split`/dissolved), splits added members into re-emitted and
+pre-existing, and lists per-category `incomparable_reasons`. The report is
+`authoritative: false` and files nothing. Gate filing stays blocked on the detector's
+recall and belongs to task 4916. `--plan` mode rebuilds a report from saved plans with
+no store access, which seeds the 2026-08-11 T0 baseline. Settings live in
+`fused-memory/config/duplicate-audit.yaml`, including the recall caveat every report
+carries. See OPERATIONS.md §12, "Weekly duplicate-cluster report (Sun 06:30)".
+
+The detector (`fused-memory/scripts/audit_duplicate_memories.py`) changes in two ways:
+
+- **Retention carve-out.** A cluster member carrying a non-empty `metadata.parent_id`
+  (`child_record`) or `metadata.topic` (`topic_stamped`) is never a delete candidate,
+  so `--apply` can no longer delete it. Such members are listed in the group's
+  `retained_member_ids`, and the plan's `retained_carveout` counts them. Before this, a
+  stamped member of a mixed or differing-topic cluster could be deleted.
+- **Report-feed fields.** The stdout plan gains per-group `members` facts (`id`,
+  `created_at`, `topic`, `canonical`, `parent_id`, `kind`), a plan-level `child_counts`
+  over every scanned child record, and `scan_coverage`. Existing keys keep their
+  meaning.
+
 #### `mem0.persist_history` keeps mem0's change history off the shared DB (task 6100)
 
 New restart-only leaf `Mem0BackendConfig.persist_history`. It defaults to True, and
