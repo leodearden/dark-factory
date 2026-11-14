@@ -10,12 +10,19 @@ that coercion, which clients rely on.
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+from _fm_git_repos import _init_git_repo
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
+from fused_memory.server.main import (
+    _install_recon_report_guards,
+    _install_tool_dispatch_guards,
+)
 from fused_memory.server.str_argument_passthrough import install_str_argument_passthrough
+from fused_memory.server.tools import create_mcp_server
 
 
 def _recording_server(received: dict[str, Any]) -> FastMCP:
@@ -100,3 +107,40 @@ async def test_without_the_passthrough_fastmcp_still_coerces_a_str_parameter():
 
     with pytest.raises(ToolError, match='Input should be a valid string'):
         await server._tool_manager.call_tool('echo', {'a': '{"a": 1}'})
+
+
+@pytest.mark.asyncio
+async def test_submit_task_on_the_primary_server_receives_json_looking_strings_verbatim(tmp_path):
+    _init_git_repo(tmp_path)
+    interceptor = AsyncMock()
+    interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+    _install_tool_dispatch_guards(server, known_projects={})
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {'project_root': str(tmp_path), 'title': 'null', 'description': 'd', 'details': '{"a": 1}'},
+    )
+
+    assert result == {'ticket': 'tkt_x'}
+    forwarded = interceptor.submit_task.await_args.kwargs
+    assert forwarded['title'] == 'null'
+    assert forwarded['details'] == '{"a": 1}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('sent', ['{"a": 1}', 'null'])
+async def test_the_recon_report_guard_chain_includes_the_passthrough(sent):
+    server = FastMCP('recon-report')
+    received: list[str | None] = []
+
+    @server.tool()
+    def report(flag_type: str | None = None) -> str:
+        received.append(flag_type)
+        return 'ok'
+
+    _install_recon_report_guards(server)
+
+    await server._tool_manager.call_tool('report', {'flag_type': sent})
+
+    assert received == [sent]
