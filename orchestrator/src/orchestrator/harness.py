@@ -8527,8 +8527,8 @@ class Harness:
 
         Wired as ``on_delivered_check_block`` in the ``SchedulerCallbacks``
         bundle passed to the Scheduler constructor, alongside
-        ``on_external_dep_block``. Structurally mirrors
-        ``_block_and_escalate_external_dep`` but files with
+        ``on_external_dep_block``. Mirrors the dispatch-gate policy in
+        ``_block_and_file_dispatch_gate_l1`` but files with
         ``severity='critical'`` and ``level=2`` explicitly — combined with
         ``agent_role='orchestrator-scheduler'`` (a harness-sentinel role,
         ``escalation/server.py`` ``_is_harness_sentinel_role``), the record
@@ -9356,7 +9356,10 @@ class Harness:
         """
         text = cross_repo_gate.block_escalation_text(task_id, verdict)
         await self._block_and_file_dispatch_gate_l1(
-            task_id, category='scope_violation', summary=text.summary, detail=text.detail,
+            task_id,
+            category=EscalationCategory.SCOPE_VIOLATION,
+            summary=text.summary,
+            detail=text.detail,
         )
 
     async def _block_and_escalate_substrate_flip(
@@ -9382,7 +9385,7 @@ class Harness:
             f'on current main — re-spec required before dispatch.'
         )
         await self._block_and_file_dispatch_gate_l1(
-            task_id, category='design_concern', summary=summary, detail=detail,
+            task_id, category=EscalationCategory.DESIGN_CONCERN, summary=summary, detail=detail,
         )
 
     async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
@@ -9416,7 +9419,7 @@ class Harness:
             ruling_id = result.ruling.ruling_id if result.ruling else 'unreadable'
             await self._block_and_file_dispatch_gate_l1(
                 task_id,
-                category='design_concern',
+                category=EscalationCategory.DESIGN_CONCERN,
                 summary=f'RECUT_RULING_REFUSED: task {task_id} ruling {ruling_id} cannot be honoured',
                 detail=(
                     f'{result.reason}\n'
@@ -9455,9 +9458,9 @@ class Harness:
             await self.scheduler.set_task_status(task_id, 'blocked')
         except Exception:
             logger.warning(
-                'Dispatch-gate block for task %s — set_task_status raised; '
-                'will still attempt to file escalation',
-                task_id, exc_info=True,
+                'Dispatch-gate block for task %s (%s) — set_task_status raised; '
+                'will still attempt to file escalation: %s',
+                task_id, category, summary, exc_info=True,
             )
         self._file_harness_l1(
             task_id, category=category, summary=summary, detail=detail,

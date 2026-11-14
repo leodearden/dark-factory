@@ -14,6 +14,7 @@ Asserts that:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -72,14 +73,27 @@ class TestHarnessExternalDepBlockWiring:
         return harness, queue
 
     @staticmethod
-    async def _block_cancelled(harness: Harness) -> None:
+    async def _block(harness: Harness, *, category: str, summary: str, detail: str) -> None:
         callback = harness.scheduler._callbacks.on_external_dep_block
         assert callback is not None
-        await callback(
-            '42',
+        await callback('42', summary=summary, detail=detail, category=category)
+
+    @classmethod
+    async def _block_cancelled(cls, harness: Harness) -> None:
+        await cls._block(
+            harness,
+            category='dependency_discovered',
             summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
             detail='dep dark_factory:5 is cancelled',
-            category='dependency_discovered',
+        )
+
+    @classmethod
+    async def _block_resolver_degraded(cls, harness: Harness) -> None:
+        await cls._block(
+            harness,
+            category='infra_issue',
+            summary='EXTERNAL_DEP_RESOLVER_DEGRADED: task 42 — resolver degraded for 3 ticks',
+            detail='the external-dep resolver failed for 3 consecutive ticks',
         )
 
     def test_callback_installed_after_construction(self, tmp_path: Path) -> None:
@@ -126,38 +140,6 @@ class TestHarnessExternalDepBlockWiring:
         )
 
     @pytest.mark.asyncio
-    async def test_callback_deduplicates_on_open_l1(self, tmp_path: Path) -> None:
-        """Second invocation with open L1 must NOT submit a duplicate escalation."""
-        harness = _make_harness(tmp_path)
-        mock_queue = _install_mock_escalation_queue(harness)
-        harness.scheduler.set_task_status = AsyncMock(return_value=True)
-
-        assert harness.scheduler._callbacks.on_external_dep_block is not None
-
-        # First call — no open L1 yet → submits
-        mock_queue.has_open_l1.return_value = False
-        await harness.scheduler._callbacks.on_external_dep_block(
-            '42',
-            summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
-            detail='detail',
-            category='dependency_discovered',
-        )
-
-        # Second call — L1 is now open → must NOT submit again
-        mock_queue.has_open_l1.return_value = True
-        await harness.scheduler._callbacks.on_external_dep_block(
-            '42',
-            summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
-            detail='detail',
-            category='dependency_discovered',
-        )
-
-        assert mock_queue.submit.call_count == 1, (
-            f'Should deduplicate: submit called {mock_queue.submit.call_count} times '
-            f'(expected exactly 1)'
-        )
-
-    @pytest.mark.asyncio
     async def test_callback_no_escalation_queue_is_safe(self, tmp_path: Path) -> None:
         """With no escalation queue installed, callback must not raise."""
         harness = _make_harness(tmp_path)
@@ -179,26 +161,15 @@ class TestHarnessExternalDepBlockWiring:
     ) -> None:
         """The scheduler's resolver-degraded infra_issue L1 must not hide a cancelled dep."""
         harness, queue = self._real_queue_harness(tmp_path)
-        degraded = Escalation(
-            id=queue.make_id('42'),
-            task_id='42',
-            agent_role='orchestrator-scheduler',
-            severity='blocking',
-            category='infra_issue',
-            summary='EXTERNAL_DEP_RESOLVER_DEGRADED: task 42 — resolver unreachable',
-            detail='',
-            suggested_action='manual_intervention',
-            level=1,
-        )
-        queue.submit(degraded)
 
+        await self._block_resolver_degraded(harness)
         await self._block_cancelled(harness)
 
         pending_l1s = queue.get_by_task('42', status='pending', level=1)
-        filed = [e for e in pending_l1s if e.category == 'dependency_discovered']
-        assert len(filed) == 1, f'Expected one dependency_discovered L1; got {pending_l1s!r}'
-        assert 'EXTERNAL_DEP_CANCELLED' in filed[0].summary, filed[0].summary
-        assert degraded.id in {e.id for e in pending_l1s}, 'the infra_issue L1 must stay pending'
+        by_category = {e.category: e for e in pending_l1s}
+        assert len(pending_l1s) == 2, f'Expected one L1 per cause; got {pending_l1s!r}'
+        assert 'EXTERNAL_DEP_RESOLVER_DEGRADED' in by_category['infra_issue'].summary
+        assert 'EXTERNAL_DEP_CANCELLED' in by_category['dependency_discovered'].summary
 
     @pytest.mark.asyncio
     async def test_callback_still_deduplicates_within_its_category(self, tmp_path: Path) -> None:
@@ -210,6 +181,25 @@ class TestHarnessExternalDepBlockWiring:
 
         pending_l1s = queue.get_by_task('42', status='pending', level=1)
         assert len(pending_l1s) == 1, f'Expected exactly 1 L1 after dedup; got {pending_l1s!r}'
+
+    @pytest.mark.asyncio
+    async def test_failed_status_write_still_files_and_names_the_gate(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A raising status write is logged with its category and summary; the L1 still files."""
+        harness, queue = self._real_queue_harness(tmp_path)
+        harness.scheduler.set_task_status = AsyncMock(side_effect=RuntimeError('fused-memory down'))
+        caplog.set_level(logging.WARNING, logger='orchestrator.harness')
+
+        await self._block_cancelled(harness)
+
+        assert len(queue.get_by_task('42', status='pending', level=1)) == 1
+        status_warnings = [
+            r.getMessage() for r in caplog.records if 'set_task_status raised' in r.getMessage()
+        ]
+        assert len(status_warnings) == 1, status_warnings
+        assert 'dependency_discovered' in status_warnings[0]
+        assert 'EXTERNAL_DEP_CANCELLED' in status_warnings[0]
 
 
 # ---------------------------------------------------------------------------
