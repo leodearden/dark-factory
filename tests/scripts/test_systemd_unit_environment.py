@@ -286,3 +286,72 @@ def test_a_complete_report_exits_ok(
 
     assert env.variable('PATH').verdict is sue.Verdict.MATCHES
     assert sue.exit_status(env) == sue.EXIT_OK
+
+
+def test_a_bus_error_prints_no_half_report(
+    busctl_world: WriteWorld, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bus_error = 'Failed to connect to bus: No medium found'
+    busctl_world({**_world({}), 'bus_error': bus_error})
+
+    assert sue.main([UNIT]) == sue.EXIT_SYSTEMD_UNANSWERED
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert 'busctl --user --json=short' in captured.err
+    assert bus_error in captured.err
+
+
+def test_a_missing_busctl_is_systemd_unanswered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', str(empty_bin))
+
+    assert sue.main([UNIT]) == sue.EXIT_SYSTEMD_UNANSWERED
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert 'busctl' in captured.err
+
+
+def test_a_unit_that_is_not_loaded_is_refused(
+    busctl_world: WriteWorld, capsys: pytest.CaptureFixture[str]
+) -> None:
+    busctl_world(_world({}))
+    missing = 'missing.service'
+
+    with pytest.raises(sue.UnitNotLoaded) as excinfo:
+        sue.inspect_unit(missing)
+    assert (excinfo.value.unit, excinfo.value.load_state) == (missing, 'not-found')
+
+    assert sue.main([missing]) == sue.EXIT_SYSTEMD_UNANSWERED
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert missing in captured.err
+    assert 'not-found' in captured.err
+
+
+def test_a_busctl_wedged_past_the_timeout_is_systemd_unanswered(
+    busctl_world: WriteWorld,
+) -> None:
+    busctl_world({**_world({}), 'hang_secs': 5})
+
+    with pytest.raises(sue.SystemdUnanswered) as excinfo:
+        sue.inspect_unit(UNIT, timeout_secs=0.5)
+    assert 'timed out' in excinfo.value.detail
+    assert '0.5' in excinfo.value.detail
+
+
+@pytest.mark.parametrize(
+    'garbage_stdout',
+    ['not json', '{"type":"s","data":"x"}', '{"type":"o","data":[1]}'],
+    ids=['not-json', 'wrong-type', 'wrong-data-shape'],
+)
+def test_a_malformed_reply_is_systemd_unanswered(
+    busctl_world: WriteWorld, garbage_stdout: str
+) -> None:
+    busctl_world({**_world({}), 'garbage_stdout': garbage_stdout})
+
+    with pytest.raises(sue.SystemdUnanswered) as excinfo:
+        sue.inspect_unit(UNIT)
+    assert garbage_stdout in excinfo.value.detail

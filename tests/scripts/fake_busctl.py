@@ -7,7 +7,9 @@ pinned. Unit object paths come from the world and are deliberately not
 systemd-escaped, so a caller that builds a path instead of asking LoadUnit for
 one fails. A unit the world does not define gets a path whose LoadState is
 "not-found" and whose Service properties answer their empty defaults, as the
-real manager does.
+real manager does. Optional world keys make every call fail instead:
+``bus_error`` (printed to stderr, exit 1), ``hang_secs`` (sleep first) and
+``garbage_stdout`` (printed instead of a reply, exit 0).
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,11 +55,20 @@ class _UnexpectedArgv(Exception):
 class _World:
     manager_environment: list[str]
     units: dict[str, dict[str, object]]
+    bus_error: str | None
+    hang_secs: float
+    garbage_stdout: str | None
 
     @classmethod
     def load(cls, path: Path) -> _World:
         raw = json.loads(path.read_text())
-        return cls(raw.get('manager_environment', []), raw.get('units', {}))
+        return cls(
+            manager_environment=raw.get('manager_environment', []),
+            units=raw.get('units', {}),
+            bus_error=raw.get('bus_error'),
+            hang_secs=raw.get('hang_secs', 0.0),
+            garbage_stdout=raw.get('garbage_stdout'),
+        )
 
     def unit_path(self, unit_name: str) -> str:
         unit = self.units.get(unit_name)
@@ -99,10 +111,19 @@ def main(argv: Sequence[str]) -> int:
         if args[: len(_PREFIX)] != _PREFIX:
             raise _UnexpectedArgv
         world = _World.load(Path(os.environ[WORLD_ENV]))
-        print(_answer(world, args[len(_PREFIX):]))
+        time.sleep(world.hang_secs)
+        if world.bus_error is not None:
+            print(world.bus_error, file=sys.stderr)
+            return 1
+        reply = (
+            world.garbage_stdout
+            if world.garbage_stdout is not None
+            else _answer(world, args[len(_PREFIX):])
+        )
     except _UnexpectedArgv:
         print(f'unexpected argv: {args!r}', file=sys.stderr)
         return EXIT_UNEXPECTED_ARGV
+    print(reply)
     return 0
 
 
