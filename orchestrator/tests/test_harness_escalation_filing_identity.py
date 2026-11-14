@@ -32,6 +32,10 @@ Covers:
   step-13/14  ``_build_task_claimant_lookup`` and its wiring into
               ``create_server``, which is how an AGENT-filed escalation gets
               stamped with its dispatching incarnation's identity.
+  task 4732   ``TestEveryHarnessEscalationStatesItsLevel``, an ast tripwire
+              requiring ``level=`` on every ``Escalation(...)`` in
+              ``harness.py``, and ``TestReconcileFailureReachesL1ThroughTheReaper``,
+              the orphan reaper folding the reconcile-failure L0s into one L1.
 """
 
 from __future__ import annotations
@@ -42,12 +46,16 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _curator_fake import FakeCurator
 from _escalation_server_capture import create_server_kwargs
+from _info_l0_router_fixtures import reaper_harness, router_reaper_config
 from escalation.models import Escalation
 from escalation.pins import _norm_id, classify_pins
+from escalation.queue import EscalationQueue
 from shared.task_claimant import compose_claimant_run_id
 
 import orchestrator.harness as harness_module
+from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.scheduler import SetTaskStatusRejected
 
@@ -161,15 +169,9 @@ class TestHarnessFilingsCarryTheIdentity:
         for visibility, not left immortal), and it is safe because the
         PROTECTIVE half survives: ``vetoes_done_flip`` stays True.
 
-        NOTE: ``level == 0`` here encodes the OBSERVED status quo.  That
-        site's docstring says "Submit an L1 escalation" but it passes no
-        ``level=``, so it builds at the dataclass default 0.  The
-        contradiction is filed as out-of-scope ticket
-        tkt_0RSVX7E03MYACJPMGPH1GWMW08 and deliberately NOT resolved here —
-        correcting the docstring is behaviour-neutral, while adding
-        ``level=1`` would flip this record from reaper-eligible DEAD_L0 to
-        permanently-pinning QUEUE_HANDOFF.  Whoever resolves that ticket moves
-        this assertion with them.
+        ``level == 0`` is this filer's intended level (task 4732):
+        ``TestReconcileFailureReachesL1ThroughTheReaper`` pins how the orphan
+        reaper turns these L0s into one L1.
         """
         h = _build_harness(mock_orch_config)
         h._run_id = 'run-xyz'
@@ -188,7 +190,7 @@ class TestHarnessFilingsCarryTheIdentity:
         assert len(submitted) == 1
         esc = submitted[0]
         assert esc.filing_claimant_run_id == h._filing_claimant_run_id
-        # The status quo this assertion encodes — see ticket note above.
+        # The intended level — see the docstring above.
         assert esc.level == 0
         assert esc.severity == 'blocking'
 
@@ -207,9 +209,12 @@ class TestHarnessFilingsCarryTheIdentity:
 _FILING_CALLABLES = frozenset({'Escalation', 'file_or_refresh'})
 
 
-def _filing_call_sites(module_path: Path) -> list[ast.Call]:
+def _filing_call_sites(
+    module_path: Path, callables: frozenset[str] = _FILING_CALLABLES,
+) -> list[ast.Call]:
     """Every filing site in *module_path*: an ``Escalation(...)`` construction,
     or a ``file_or_refresh(...)`` call, which builds the Escalation for its caller.
+    *callables* narrows the scan to the named callables.
 
     MUST be ``ast``, never a regex: ``harness.py`` carries docstring and
     comment prose mentioning ``Escalation(...)``, which a regex would report
@@ -220,7 +225,7 @@ def _filing_call_sites(module_path: Path) -> list[ast.Call]:
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id in _FILING_CALLABLES
+        and node.func.id in callables
     ]
 
 
@@ -256,6 +261,132 @@ class TestEveryHarnessFilingSiteIsStamped:
             f'must stamp the filing incarnation (task 3550); use '
             f'self._filing_claimant_run_id.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4732: every harness Escalation states its level, and the reconcile
+# failure L0 reaches one L1 through the orphan reaper
+# ---------------------------------------------------------------------------
+
+
+class TestEveryHarnessEscalationStatesItsLevel:
+    """The level decides how ``escalation.pins`` classifies a record: an
+    explicit level>=1 is a Link 3 queue handoff, while a level-0 non-``info``
+    record is governed by its filing identity (Link 4).  Leaving it to the
+    dataclass default hides that routing decision, which is how
+    ``_escalate_reconcile_failure``'s docstring came to say L1 while it filed
+    L0 (task 4732).  ``file_or_refresh`` sites are out of scope because
+    ``RefreshableAlarm`` requires a level.
+    """
+
+    def test_every_escalation_construction_passes_level(self) -> None:
+        calls = _filing_call_sites(_HARNESS_SRC_PATH, frozenset({'Escalation'}))
+        assert len(calls) >= 29, (
+            f'{_HARNESS_SRC_PATH.name}: expected >=29 Escalation(...) constructions, '
+            f'found {len(calls)} — if they moved to another module, scan that '
+            f'module here too, or this tripwire silently covers less.'
+        )
+
+        implicit = [
+            node.lineno for node in calls
+            if not any(kw.arg == 'level' for kw in node.keywords)
+        ]
+        assert not implicit, (
+            f'{_HARNESS_SRC_PATH.name}: Escalation(...) without level= at lines '
+            f'{implicit} — pass level= explicitly rather than relying on the '
+            f'dataclass default.'
+        )
+
+
+def _reconcile_reaper_harness(tmp_path: Path, mock_orch_config) -> Harness:
+    h = reaper_harness(
+        router_reaper_config(mock_orch_config, orphan_timeout_secs=0.0),
+        EscalationQueue(tmp_path / 'escalations'),
+        curator=FakeCurator(),
+        event_store=EventStore(tmp_path / 'runs.db', run_id='run-test'),
+    )
+    h._run_id = 'run-xyz'
+    return h
+
+
+def _file_reconcile_failure(h: Harness) -> Escalation:
+    queue = h._escalation_queue
+    assert queue is not None
+    before = {esc.id for esc in queue.get_by_task('77')}
+    h._escalate_reconcile_failure(
+        '77', SetTaskStatusRejected('77', 'provenance_missing', 'raw text'),
+    )
+    [filed] = [esc for esc in queue.get_by_task('77') if esc.id not in before]
+    return filed
+
+
+def _record(h: Harness, esc_id: str) -> Escalation:
+    assert h._escalation_queue is not None
+    esc = h._escalation_queue.get(esc_id)
+    assert esc is not None
+    return esc
+
+
+def _pending_routing(h: Harness) -> list[tuple[int, str, str]]:
+    assert h._escalation_queue is not None
+    return [
+        (esc.level, esc.agent_role, esc.category)
+        for esc in h._escalation_queue.get_by_task('77', status='pending')
+    ]
+
+
+_REAPER_L1 = (1, 'harness-orphan-reaper', 'reconcile_persistent_rejection')
+
+
+@pytest.mark.asyncio
+class TestReconcileFailureReachesL1ThroughTheReaper:
+    """Why ``_escalate_reconcile_failure`` files at level 0.
+
+    The filer has no dedup, and the reconcile sweep files on every refused
+    recovery write.  At L0 the orphan reaper turns that stream into ONE L1: it
+    promotes the first aged record and dismisses repeats as covered by the
+    open L1.  The harness filing identity can never equal a workflow
+    claimant, so a live workflow does not defer it.  Filing at L1 directly
+    would mint one L1 per sweep.
+    """
+
+    async def test_a_live_workflow_does_not_hold_it_back(
+        self, tmp_path: Path, mock_orch_config,
+    ) -> None:
+        h = _reconcile_reaper_harness(tmp_path, mock_orch_config)
+        h.scheduler.is_actively_held = MagicMock(return_value=True)
+        h.scheduler.get_task = AsyncMock(return_value={
+            'status': 'in-progress',
+            'claimant_run_id': compose_claimant_run_id('run-xyz', '77-abcd1234', os.getpid()),
+            'metadata': {},
+        })
+
+        filed = _file_reconcile_failure(h)
+
+        assert await h._reap_orphan_l0_escalations() == 1
+        assert _pending_routing(h) == [_REAPER_L1]
+        reaped = _record(h, filed.id)
+        assert (reaped.status, reaped.resolved_by) == ('dismissed', 'harness-orphan-reaper')
+
+    async def test_a_repeat_rejection_folds_into_the_open_l1(
+        self, tmp_path: Path, mock_orch_config,
+    ) -> None:
+        h = _reconcile_reaper_harness(tmp_path, mock_orch_config)
+
+        _file_reconcile_failure(h)
+        assert await h._reap_orphan_l0_escalations() == 1
+        assert h._escalation_queue is not None
+        [promoted] = h._escalation_queue.get_by_task('77', status='pending')
+
+        repeat = _file_reconcile_failure(h)
+        assert await h._reap_orphan_l0_escalations() == 0
+
+        assert [esc.id for esc in h._escalation_queue.get_by_task('77', status='pending')] == [
+            promoted.id,
+        ]
+        assert _pending_routing(h) == [_REAPER_L1]
+        folded = _record(h, repeat.id)
+        assert (folded.status, folded.resolved_by) == ('dismissed', 'harness-orphan-reaper')
 
 
 # ---------------------------------------------------------------------------

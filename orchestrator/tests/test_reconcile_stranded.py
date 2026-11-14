@@ -2948,7 +2948,7 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
     await harness._reconcile_stranded_in_progress()
 
     assert len(submissions) == 1, (
-        f'expected exactly one L1 submission after a single rejection, '
+        f'expected exactly one escalation submission after a single rejection, '
         f'got {len(submissions)}'
     )
     esc = submissions[0]
@@ -2961,7 +2961,7 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
     # dedup counter left to suppress it.
     await harness._reconcile_stranded_in_progress()
     assert len(submissions) == 2, (
-        f'expected a second L1 submission on the next rejection (no dedup '
+        f'expected a second escalation submission on the next rejection (no dedup '
         f'counter remains), got {len(submissions)}'
     )
 
@@ -2994,7 +2994,7 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
 
 # ---------------------------------------------------------------------------
 # task 2677 step-5/step-6 — done_evidence_stale must never be treated as
-# marked_done, must not file the generic L1 reconcile_persistent_rejection
+# marked_done, must not file the generic reconcile_persistent_rejection
 # (that path is for OTHER SetTaskStatusRejected subclasses), must not
 # release the warm lane (the task is NOT done), and must file exactly one
 # born-at-L2 provenance_conflict escalation via the shared
@@ -3061,7 +3061,7 @@ class TestReconcileOneStrandedStaleEvidenceConflict:
     ):
         """The full sweep (_reconcile_stranded_in_progress) must route a
         stale-evidence rejection to exactly one pending L2
-        provenance_conflict — never the generic L1
+        provenance_conflict — never the generic
         reconcile_persistent_rejection — and a second sweep at the same
         reopen_at must not create a second pending record (should_skip
         short-circuit or dedupe_count fold — either mechanism is
