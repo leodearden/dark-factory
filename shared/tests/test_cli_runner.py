@@ -78,7 +78,7 @@ def _grandchild_fake(tmp_path: Path, state_file: Path) -> Path:
 
 async def _wait_for_state(state_file: Path) -> dict[str, int]:
     deadline = asyncio.get_running_loop().time() + _STATE_WAIT_SECS
-    # noqa: wall-clock-deadline — shared/tests cannot import poll_responsive; a generous bound on a real subprocess, not a race
+    # noqa: wall-clock-deadline — shared/tests cannot import poll_responsive; a generous bound on a real subprocess, not a race  # debt: ticket tkt_0RVCE77JGW0CZGWPSFFZ00REB5
     while not state_file.exists():
         assert asyncio.get_running_loop().time() < deadline, (
             f'the fake never wrote {state_file} within {_STATE_WAIT_SECS}s'
@@ -89,7 +89,7 @@ async def _wait_for_state(state_file: Path) -> dict[str, int]:
 
 async def _group_terminated_within(pgid: int) -> bool:
     deadline = asyncio.get_running_loop().time() + _GROUP_GONE_SECS
-    # noqa: wall-clock-deadline — shared/tests cannot import poll_responsive; a generous bound on a real subprocess, not a race
+    # noqa: wall-clock-deadline — shared/tests cannot import poll_responsive; a generous bound on a real subprocess, not a race  # debt: ticket tkt_0RVCE77JGW0CZGWPSFFZ00REB5
     while asyncio.get_running_loop().time() < deadline:
         if process_group_terminated(pgid):
             return True
@@ -233,7 +233,7 @@ class TestCancellation:
             task = asyncio.ensure_future(run_cli_subprocess(
                 ['fake'], tmp_path, {}, backend='codex', model='m', timeout_seconds=0.01,
             ))
-            # noqa: wall-clock-deadline — shared/tests cannot import wait_responsive; a hang guard on a patched in-process barrier
+            # noqa: wall-clock-deadline — shared/tests cannot import wait_responsive; a hang guard on a patched in-process barrier  # debt: ticket tkt_0RVCE77JGW0CZGWPSFFZ00REB5
             await asyncio.wait_for(entered.wait(), timeout=5)
 
             task.cancel()
@@ -250,7 +250,8 @@ def test_subprocess_result_is_frozen() -> None:
     result = SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
 
     with pytest.raises(dataclasses.FrozenInstanceError):
-        result.returncode = 1  # type: ignore[misc]
+        mutable: Any = result
+        mutable.returncode = 1
 
 
 @pytest.fixture

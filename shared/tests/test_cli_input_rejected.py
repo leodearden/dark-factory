@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -65,7 +66,7 @@ def _fast_exit_subprocess(**overrides: object) -> SubprocessResult:
     cap hit (see TestClassifyInvocationCliInputRejectedIsNotACap for the
     sub-5s variant that does not).
     """
-    kwargs: dict[str, object] = {
+    kwargs: dict[str, Any] = {
         'stdout': '',
         'stderr': FAST_EXIT_STDERR,
         'returncode': 1,
@@ -74,7 +75,7 @@ def _fast_exit_subprocess(**overrides: object) -> SubprocessResult:
         'transcript_turns': None,
     }
     kwargs.update(overrides)
-    return SubprocessResult(**kwargs)  # type: ignore[arg-type]
+    return SubprocessResult(**kwargs)
 
 
 class TestParseClaudeOutputMintsCliInputRejectedSubtype:
