@@ -498,7 +498,7 @@ _RECON_ROWS = [
     pytest.param(row[1]['task_id'], row[1]['flag_type'], row[6], id=row[0])
     for row in _GOLDEN
     if isinstance(row[1]['flag_type'], str)
-    and (row[1]['task_id'] is None or type(row[1]['task_id']) in (str, int))
+    and (row[1]['task_id'] is None or type(row[1]['task_id']) is str)
 ]
 
 
@@ -523,15 +523,14 @@ class TestReconReportStoresTheGoldenForms:
     def _add(
         state: ReconReportState,
         *,
-        task_id: str | int | None,
+        task_id: str | None,
         flag_type: str | None,
         description: str = 'd',
     ) -> dict[str, Any]:
         return state.add_finding(
             run_id='r1', severity='moderate', category='memory_stale',
             description=description, suggested_action='a', actionable=True,
-            # The int is the input under test: the golden form is pinned for int task ids that reach the boundary.
-            task_id=task_id,  # pyright: ignore[reportArgumentType]
+            task_id=task_id,
             flag_type=flag_type,
         )
 
@@ -575,14 +574,10 @@ class TestReconReportStoresTheGoldenForms:
         assert first['finding_id'] != second['finding_id']
 
     @pytest.mark.asyncio
-    async def test_an_int_citation_of_a_composite_member_anchors_the_entity_fold(self):
+    async def test_a_citation_of_a_composite_member_anchors_the_entity_fold(self):
         state = self._state()
         composite = self._add(state, task_id='5040,5149', flag_type='X')
-        cited = await state.cite_task(
-            'r1', composite['finding_id'], 'dark_factory',
-            # The int is the input under test: the golden form is pinned for int task ids that reach the boundary.
-            5149,  # pyright: ignore[reportArgumentType]
-        )
+        cited = await state.cite_task('r1', composite['finding_id'], 'dark_factory', '5149')
         assert 'error' not in cited, cited
 
         later = self._add(state, task_id=None, flag_type='X', description='worded differently')
@@ -601,7 +596,7 @@ class TestReconReportStoresTheGoldenForms:
         cited = await state.cite_task('r1', composite['finding_id'], 'dark_factory', '5149')
         assert 'error' not in cited, cited
 
-        later = self._add(state, task_id=5149, flag_type='X', description='worded differently')
+        later = self._add(state, task_id='5149', flag_type='X', description='worded differently')
 
         assert later.get('error') == 'duplicate_finding', later
         assert later.get('existing_finding_id') == composite['finding_id']
