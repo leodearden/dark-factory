@@ -43,14 +43,21 @@ MIMO_SESSION_LIST = json.dumps([{'id': 'ses-1'}])
 TIMEOUT_SECS = 30.0
 NON_CLAUDE_BACKENDS = ('codex', 'gemini', 'pi', 'zcode', 'mimo')
 SINGLE_SPAWN_BACKENDS = ('codex', 'gemini', 'pi', 'zcode')
+ENV_OVERRIDE_BACKENDS = ('pi', 'zcode', 'mimo')
+CPU_NICE = 5
+MAX_NICE = 19
 
 _FAKE_CLI = '''#!{interpreter} -I
+import json
 import os
 import sys
 import time
 
 time.sleep(float(os.environ.get('FAKE_SLEEP', '0')))
-sys.stdout.write(os.environ.get('FAKE_STDOUT', ''))
+if os.environ.get('FAKE_REPORT_NICE'):
+    sys.stdout.write(json.dumps({{'nice': os.nice(0), 'cpu_nice_env': 'DF_AGENT_CPU_NICE' in os.environ}}))
+else:
+    sys.stdout.write(os.environ.get('FAKE_STDOUT', ''))
 sys.stderr.write(os.environ.get('FAKE_STDERR', ''))
 sys.exit(int(os.environ.get('FAKE_RC', '0')))
 '''
@@ -219,6 +226,25 @@ class TestNonClaudeTimeouts:
         )
         assert agent.timed_out is True
         assert agent.success is False
+
+
+class TestNonClaudeCpuNice:
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize('backend', ENV_OVERRIDE_BACKENDS)
+    async def test_a_cpu_nice_override_renices_every_spawn_and_never_reaches_the_child(
+        self, backend: str, worktree: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv('FAKE_REPORT_NICE', '1')
+        spy = _SpyRunner()
+
+        await _invoke(
+            backend, worktree, spy,
+            env_overrides={**(_endpoint_overrides(backend) or {}), 'DF_AGENT_CPU_NICE': str(CPU_NICE)},
+        )
+
+        expected = {'nice': min(os.nice(0) + CPU_NICE, MAX_NICE), 'cpu_nice_env': False}
+        assert spy.spawns
+        assert [json.loads(spawn.result.stdout) for spawn in spy.spawns] == [expected] * len(spy.spawns)
 
 
 async def test_the_agent_result_is_the_parsers_reading_of_the_runner_result(
