@@ -15,7 +15,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 from _quality_fixture import GitRepo, append_events, build_quality_project, routing_decision
-from _quality_snapshots import snapshot_doc, write_snapshot
+from _quality_snapshots import default_params, placed_point, snapshot_doc, write_snapshot
 from _runs_db_fixture import EventRow, write_runs_db
 from shared.project_id import project_id_for_root
 from shared.project_layout import runs_db
@@ -34,6 +34,7 @@ from dashboard.data.quality_markers import (
     DerivedState,
     Marker,
     MarkerKind,
+    MarkerSource,
     PromptCoverage,
     RoutingFold,
     SourceType,
@@ -507,10 +508,52 @@ async def test_stored_snapshots_reach_the_derivation_as_one_instrument_marker(
     await _tick(conn, [measured.root, unmeasured.root], factory, no_curated)
 
     [instrument] = [m for m in (await _derived(conn, pid)).markers if m.kind is MarkerKind.INSTRUMENT]
+    nightly_point = scan.points[1].point_id
     assert (instrument.marker_id, instrument.at, instrument.ref) == (
-        f'instrument:{nightly_sha}', SNAPSHOT_TIMES[1], nightly_sha,
+        f'instrument:{nightly_point}', SNAPSHOT_TIMES[1], nightly_sha,
     )
-    assert instrument.source.type is SourceType.INSTRUMENT
+    assert instrument.source == MarkerSource(SourceType.INSTRUMENT, point=nightly_point)
     assert 'instrument (unknown)' in instrument.label
     assert 'python_version (unknown)' in instrument.label
     assert not [m for m in (await _derived(conn, other)).markers if m.kind is MarkerKind.INSTRUMENT]
+
+
+SHA_A, SHA_B = 'a' * 40, 'b' * 40
+
+
+def _same_commit_scan(path: Path) -> RootScan:
+    """A nightly at SHA_A, then a baseline and a nightly both at SHA_B and one commit time, whose
+    python_version flips 3.13.9 -> 3.14.0 -> 3.13.9; each point diffed against the one before it."""
+    files = [
+        ('n-a', False, SHA_A, SNAPSHOT_TIMES[0], '3.13.9'),
+        ('b-b', True, SHA_B, SNAPSHOT_TIMES[1], '3.14.0'),
+        ('n-b', False, SHA_B, SNAPSHOT_TIMES[1], '3.13.9'),
+    ]
+    points = []
+    for point_id, baseline, sha, committed_at, python in files:
+        doc = snapshot_doc(3, as_of_sha=sha, run_id=point_id,
+                           params={**default_params(3), 'python_version': python})
+        points.append(placed_point(
+            write_snapshot(path / f'{point_id}.json', doc), point_id=point_id, baseline=baseline,
+            committed_at=committed_at, previous=points[-1] if points else None,
+        ))
+    return RootScan(points=tuple(points), unplaced=(), new_diffs={}, pending_summaries=0,
+                    pending_diffs=0, baseline_home=path, nightly_home=path)
+
+
+async def test_a_baseline_and_a_nightly_at_one_commit_are_two_instrument_markers(
+    conn: aiosqlite.Connection, factory: Path, no_curated: Path, tmp_path: Path,
+) -> None:
+    project = build_quality_project(tmp_path / 'proj', first_landed_at=datetime(2026, 11, 2, 9, 0, tzinfo=UTC))
+    pid = project_id_for_root(project.root)
+    await write_snapshot_scan(conn, pid, _same_commit_scan(tmp_path / 'snapshots'), NOW)
+    await conn.commit()
+
+    await _tick(conn, [project.root], factory, no_curated)
+
+    stored = await read_marker_state(conn, pid)
+    assert stored is not None and stored.failure is None, stored
+    instruments = [m for m in (await _derived(conn, pid)).markers if m.kind is MarkerKind.INSTRUMENT]
+    assert [(m.marker_id, m.source.point, m.ref) for m in instruments] == [
+        ('instrument:b-b', 'b-b', SHA_B), ('instrument:n-b', 'n-b', SHA_B),
+    ]

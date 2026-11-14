@@ -635,6 +635,9 @@ class TestTheSnapshotStore:
         identities = await read_snapshot_identities(conn, 'dark_factory')
 
         assert identities == [point.identity() for point in scan.points]
+        assert [(identity.point_id, identity.previous_id) for identity in identities] == [
+            (point.point_id, point.diff.previous_id) for point in scan.points
+        ]
         assert identities[0].unknown_params >= {'instrument', 'python_version'}
         assert identities[1].unknown_params == frozenset()
 
@@ -764,5 +767,5 @@ async def test_the_quality_loop_scans_snapshots_before_it_derives_markers_on_its
     assert [point.summary.as_of_sha for point in snapshots.scan.series.points] == [initial, project.plain_sha]
     assert markers.failure is None and markers.derived is not None, markers.failure
     assert [m.marker_id for m in markers.derived.markers if m.kind is MarkerKind.INSTRUMENT] == [
-        f'instrument:{project.plain_sha}',
+        f'instrument:{snapshots.scan.series.points[1].point_id}',
     ]

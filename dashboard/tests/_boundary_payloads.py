@@ -1087,8 +1087,9 @@ async def _scan_snapshots(config: DashboardConfig, root: Path, *, markers: bool)
 def _quality_snapshot_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     """Quality sketch row 20: a schema-2 baseline then two schema-3 nightly snapshots at three
     shas, with one params change, through the real snapshot and marker ticks over a project whose
-    landings are stored too, so its instrument marker also sits on the landing axis; and a root
-    that holds neither home.
+    landings are stored too, so its instrument marker also sits on the landing axis; the same
+    files with the baseline and the first nightly at one commit; and a root that holds neither
+    home.
     """
     assert client.portal is not None, 'the quality ticks run inside a live TestClient'
     bodies: dict[str, Any] = {}
@@ -1109,6 +1110,24 @@ def _quality_snapshot_family(client: TestClient, workdir: Path) -> dict[str, Any
     bodies['quality_snapshots'] = served
     second = served['QUALITY_SNAPSHOTS']['value']['points'][1]['id']
     bodies['quality_snapshot_diff'] = _get(client, QUALITY_SNAPSHOT_DIFF, project='dark_factory', point=second)
+
+    root = _quality_root(workdir / 'quality_snapshots_same_commit')
+    shared_sha, later_sha = _dated_commits(root, QUALITY_SNAPSHOT_TIMES[1:])
+    write_landing_events(root, landings)
+    _store_quality(client, root, landings, sampled_at=QUALITY_SNAPSHOT_SCANNED_AT)
+    config = app.state.config
+    write_snapshot(root / BASELINE_HOME / 'review-all-dark_factory-20261105.json',
+                   snapshot_doc(2, as_of_sha=shared_sha, run_id='review-all-dark_factory-20261105'))
+    for sha in (shared_sha, later_sha):
+        write_snapshot(config.quality_metrics_dir / project_id_for_root(root) / f'{sha}.json',
+                       snapshot_doc(3, as_of_sha=sha, run_id=f'nightly-{sha[:10]}'))
+    client.portal.call(partial(_scan_snapshots, config, root, markers=True))
+    served = _render_quality(client, QUALITY_AT)
+    bodies['quality_snapshots_same_commit'] = served
+    nightly = served['QUALITY_SNAPSHOTS']['value']['points'][1]['id']
+    bodies['quality_snapshots_same_commit_diff'] = _get(
+        client, QUALITY_SNAPSHOT_DIFF, project='dark_factory', point=nightly,
+    )
 
     root = _quality_root(workdir / 'quality_no_snapshot')
     _dated_commits(root, QUALITY_SNAPSHOT_TIMES[:1])

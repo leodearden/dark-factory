@@ -490,7 +490,9 @@ MARKER_SOURCES: dict[SourceType, tuple[MarkerKind, MarkerSource, str | None]] = 
     SourceType.MODEL_VERSION: (
         MarkerKind.MODEL, MarkerSource(SourceType.MODEL_VERSION, alias='opus'), 'claude-opus-5-5',
     ),
-    SourceType.INSTRUMENT: (MarkerKind.INSTRUMENT, MarkerSource(SourceType.INSTRUMENT), 'd' * 40),
+    SourceType.INSTRUMENT: (
+        MarkerKind.INSTRUMENT, MarkerSource(SourceType.INSTRUMENT, point='payload-nightly'), 'd' * 40,
+    ),
     SourceType.CURATED: (
         MarkerKind.REGIME, MarkerSource(SourceType.CURATED, file='regime-markers.yaml'), None,
     ),
