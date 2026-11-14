@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
+from typing import IO, TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar
 
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
@@ -2293,7 +2293,8 @@ class TranscriptWatch:
 
     Passing one selects the claude timeout handling: a SIGTERM-flush capture
     and a transcript re-read. ``None`` selects the flat kill of the process
-    group that every other backend gets.
+    group that every other backend gets. So ``TranscriptWatch()``, with no
+    session to read, is how a caller asks for the claude kill on its own.
     """
 
     session_id: str | None = None
@@ -2303,7 +2304,22 @@ class TranscriptWatch:
     absolute_cap_secs: float | None = None
 
 
-CliRunner = Callable[..., Awaitable[SubprocessResult]]
+class CliRunner(Protocol):
+    """The spawn seam: ``run_cli_subprocess``, or a test double with its signature."""
+
+    async def __call__(
+        self,
+        cmd: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        *,
+        backend: str,
+        model: str,
+        timeout_seconds: float | None = None,
+        stdin_data: bytes | None = None,
+        wrap_argv: ArgvWrapper | None = None,
+        transcript: TranscriptWatch | None = None,
+    ) -> SubprocessResult: ...
 
 
 @dataclass(frozen=True)
@@ -4699,10 +4715,11 @@ async def run_cli_subprocess(
         logger.info(f'Agent stderr (last 1000): {stderr_text[-1000:]}')
     logger.info(f'Agent exit code: {proc.returncode}')
     stdout_text_for_log = stdout.decode()
-    if proc.returncode != 0:
-        # On failure, dump the full stdout so downstream debugging can see
-        # the actual messages array (tool_use blocks, error details) instead
-        # of only the truncated result envelope.
+    if proc.returncode != 0 and transcript is not None:
+        # On a claude failure, dump the full stdout so downstream debugging
+        # can see the actual messages array (tool_use blocks, error details)
+        # instead of only the truncated result envelope.  Other backends keep
+        # the 500-byte excerpt: codex's --json stdout is a whole event stream.
         logger.info(
             f'Agent stdout length: {len(stdout)} bytes (full, returncode={proc.returncode}):\n{stdout_text_for_log}'
         )
