@@ -134,7 +134,7 @@ class _SourceFields(NamedTuple):
     optional: frozenset[str] = frozenset()
 
 
-_SOURCE_DETAILS = ('role', 'path', 'rule', 'alias', 'file')
+_SOURCE_DETAILS = ('role', 'path', 'rule', 'alias', 'file', 'point')
 
 _SOURCE_FIELDS: Mapping[SourceType, _SourceFields] = MappingProxyType({
     SourceType.ROUTING: _SourceFields(frozenset({'role'}), frozenset({'path'})),
@@ -142,11 +142,12 @@ _SOURCE_FIELDS: Mapping[SourceType, _SourceFields] = MappingProxyType({
     SourceType.POLICY_RULE: _SourceFields(frozenset({'rule'})),
     SourceType.DEPLOY: _SourceFields(frozenset()),
     SourceType.MODEL_VERSION: _SourceFields(frozenset({'alias'})),
-    SourceType.INSTRUMENT: _SourceFields(frozenset()),
+    SourceType.INSTRUMENT: _SourceFields(frozenset({'point'})),
     SourceType.CURATED: _SourceFields(frozenset({'file'})),
 })
 """Which details each source type carries. A routing marker's optional ``path`` is the
-config_reload path that dated it."""
+config_reload path that dated it, and an instrument marker's ``point`` is the snapshot point it
+sits at."""
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,7 @@ class MarkerSource:
     rule: str | None = None
     alias: str | None = None
     file: str | None = None
+    point: str | None = None
 
     def __post_init__(self) -> None:
         fields = _SOURCE_FIELDS[self.type]
@@ -190,6 +192,7 @@ class MarkerSource:
             rule=_wire_detail(wire, 'rule'),
             alias=_wire_detail(wire, 'alias'),
             file=_wire_detail(wire, 'file'),
+            point=_wire_detail(wire, 'point'),
         )
 
 
@@ -1036,12 +1039,16 @@ def model_version_markers(conn: sqlite3.Connection, project_id: str) -> SourceMa
 
 @dataclass(frozen=True)
 class SnapshotIdentity:
-    """Which instrument produced a quality-metrics snapshot: its sha, commit time and params.
+    """Which instrument produced a quality-metrics snapshot point: its sha, commit time and params.
 
-    ``unknown_params`` are the params keys the snapshot's schema does not record, as the
-    instrument's ``--summary --json`` reports them.
+    ``previous_id`` is the point the instrument's --diff compares this one against
+    (quality_snapshots.py::PointDiff), None for the series' first point. ``unknown_params`` are
+    the params keys the snapshot's schema does not record, as the instrument's
+    ``--summary --json`` reports them.
     """
 
+    point_id: str
+    previous_id: str | None
     as_of_sha: str
     committed_at: datetime
     params: Mapping[str, object]
@@ -1063,19 +1070,22 @@ def instrument_markers(project_id: str, snapshots: Iterable[SnapshotIdentity]) -
     """A marker exactly where the instrument's --diff against the predecessor opens 'params differ'.
 
     Unknown never equals unknown, as in the instrument: a key unknown on either side is a change.
+    The pairing is the diff's own, each point against its ``previous_id``, so a marker sits at
+    one point and its id is unique per point; sorted by (at, id).
     """
-    ordered = sorted(snapshots, key=lambda snapshot: snapshot.committed_at)
-    markers: list[Marker] = []
-    for before, after in pairwise(ordered):
-        keys = _changed_params(before, after)
-        if keys:
-            markers.append(Marker(
-                marker_id=f'instrument:{after.as_of_sha}', at=after.committed_at,
-                kind=MarkerKind.INSTRUMENT, scope=project_id, series=None, until=None,
-                label=f'instrument params changed: {", ".join(keys)}',
-                source=MarkerSource(SourceType.INSTRUMENT), ref=after.as_of_sha,
-            ))
-    return markers
+    by_point = {snapshot.point_id: snapshot for snapshot in snapshots}
+    markers = [
+        Marker(
+            marker_id=f'instrument:{after.point_id}', at=after.committed_at,
+            kind=MarkerKind.INSTRUMENT, scope=project_id, series=None, until=None,
+            label=f'instrument params changed: {", ".join(keys)}',
+            source=MarkerSource(SourceType.INSTRUMENT, point=after.point_id), ref=after.as_of_sha,
+        )
+        for after in by_point.values()
+        if after.previous_id in by_point
+        and (keys := _changed_params(by_point[after.previous_id], after))
+    ]
+    return sorted(markers, key=lambda marker: (marker.at, marker.marker_id))
 
 
 class DerivedMarkers(NamedTuple):

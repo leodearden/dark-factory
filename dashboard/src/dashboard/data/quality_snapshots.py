@@ -425,6 +425,7 @@ class ScannedPoint(FileState):
 
     def identity(self) -> SnapshotIdentity:
         return SnapshotIdentity(
+            point_id=self.point_id, previous_id=self.diff.previous_id,
             as_of_sha=self.summary.as_of_sha, committed_at=self.committed_at,
             params=self.summary.params, unknown_params=self.summary.unknown_params,
         )
