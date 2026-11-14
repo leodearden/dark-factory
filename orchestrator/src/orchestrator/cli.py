@@ -475,6 +475,39 @@ def verify_cache_audit_run_cmd(config_path: Path | None, log_dir: Path | None):
     sys.exit(asyncio.run(run_audit(tree, config, log_dir or tree / DEFAULT_LOG_DIR)))
 
 
+@verify_cache_group.command('enable')
+@click.option('--reason', required=True, help='Why the cache is safe to re-enable; recorded on the policy row.')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project.')
+def verify_cache_enable_cmd(reason: str, config_path: Path | None):
+    """Clear the verify cache's kill switch (an operator write, plans/verify-result-cache-prd.md § Audit)."""
+    from datetime import UTC, datetime
+
+    from orchestrator.verify_cache.audit import enable
+    from orchestrator.verify_cache.registry import Registry, RegistryError, registry_db_path
+    from orchestrator.verify_cache.status import render_status
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    registry = Registry(registry_db_path(Path(config.project_root)))
+    now = datetime.now(UTC)
+    try:
+        asyncio.run(enable(registry, reason, now))
+        summary = asyncio.run(registry.summary())
+    except RegistryError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint='--reason') from e
+    for line in render_status(config.verify_cache, summary, now):
+        click.echo(line)
+
+
 @main.command('probe-models')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None,
