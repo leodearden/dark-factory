@@ -65,8 +65,11 @@ SKIP = 'skip'     # metadata PRESENT but UNREADABLE — never "verified clean"
 # Signal names recorded on a blocking verdict.
 SIGNAL_MARKER = 'cross_repo_marker'
 SIGNAL_ALL_FILES_FOREIGN = 'all_files_foreign'
-# Recorded only on the fail-closed verdict built when classify_cross_repo raises; not a blocking leg.
+# Marks the fail-closed verdict built when classify_cross_repo raises; not a leg that fired.
 SIGNAL_CLASSIFY_ERROR = 'classify_error'
+
+# The crash's traceback is logged under this line, and its L1 tells the operator to search for it.
+_CLASSIFY_ERROR_LOG_LINE = 'cross_repo_gate: classify_cross_repo raised for task %s'
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +91,8 @@ class CrossRepoVerdict:
             guess a project name from a path.  An honest "unresolved" in the L1
             beats a placeholder a human would have to disbelieve.
         signals: The evidence legs that fired, e.g. ``('cross_repo_marker',)``.
+            The one exception is :data:`SIGNAL_CLASSIFY_ERROR`, which marks an
+            UNVERIFIED verdict (the classifier raised), not a leg that fired.
         foreign_paths: The declared entries the path-containment leg judged
             foreign (empty when no path evidence was weighed).
         reason: Human-readable explanation, rendered into the L1 detail.
@@ -105,18 +110,21 @@ class CrossRepoVerdict:
         return self.verdict == BLOCK
 
 
-def classify_error_verdict(exc: Exception) -> CrossRepoVerdict:
-    """Return the fail-CLOSED verdict for a :func:`classify_cross_repo` that raised.
+def classify_error_verdict(task_id: str, exc: Exception) -> CrossRepoVerdict:
+    """Log *exc*'s traceback and return the fail-CLOSED verdict for a crashed classify.
 
     Nothing about the task was read, so it names no owner and no paths; its
-    only signal is :data:`SIGNAL_CLASSIFY_ERROR`.
+    only signal is :data:`SIGNAL_CLASSIFY_ERROR`.  The log line is the one its
+    L1 (:func:`block_escalation_text`) tells the operator to search for.
     """
+    crash = f'{type(exc).__name__}: {exc}'
+    logger.warning(_CLASSIFY_ERROR_LOG_LINE + ': %s', task_id, crash, exc_info=exc)
     return CrossRepoVerdict(
         verdict=BLOCK,
         owner_project=None,
         signals=(SIGNAL_CLASSIFY_ERROR,),
         foreign_paths=(),
-        reason=f'cross-repo unverifiable / classify_cross_repo raised: {exc}',
+        reason=f'cross-repo unverifiable / classify_cross_repo raised {crash}',
     )
 
 
@@ -444,7 +452,15 @@ def block_escalation_text(task_id: str, verdict: CrossRepoVerdict) -> BlockEscal
 
     A classifier crash established nothing about the task, so it gets its own
     rendering; every other BLOCK is a misfile rendered by what its signals prove.
+
+    Raises:
+        ValueError: *verdict* is not a BLOCK — there is nothing to file.
     """
+    if not verdict.blocked:
+        raise ValueError(
+            f'block_escalation_text requires a BLOCK verdict; '
+            f'got verdict={verdict.verdict!r} for task {task_id}'
+        )
     if SIGNAL_CLASSIFY_ERROR in verdict.signals:
         return _classify_error_text(task_id, verdict)
     return _misfile_text(task_id, verdict)
@@ -520,7 +536,7 @@ def _classify_error_text(task_id: str, verdict: CrossRepoVerdict) -> BlockEscala
         'path was judged. This block is NOT evidence that the task is misfiled, so do '
         'not refile, re-scope or cancel it on this L1. '
         'The fix is in the orchestrator: find the traceback logged as '
-        f'"cross_repo_gate: classify_cross_repo raised for task {task_id}", fix the '
+        f'"{_CLASSIFY_ERROR_LOG_LINE % task_id}", fix the '
         'classifier or the metadata shape that crashed it, then unblock the task so '
         'the gate can run again.'
     )

@@ -9379,7 +9379,7 @@ class Harness:
         *,
         verdict,
     ) -> None:
-        """Block a task and file an L1 escalation for a cross-repo misfile.
+        """Block a task and file an L1 for a cross-repo BLOCK verdict (misfile or unverifiable).
 
         Structurally a sibling of ``_block_and_escalate_substrate_flip`` below —
         the two dispatch-gate blockers are kept adjacent deliberately:
@@ -9392,8 +9392,8 @@ class Harness:
         - No-ops gracefully when ``_escalation_queue`` is None (bare-Harness tests).
 
         ``scope_violation`` rather than the substrate gate's ``design_concern``:
-        the task's work belongs to ANOTHER project — a scope failure, not a
-        premise failure.
+        a misfile's work belongs to ANOTHER project — a scope failure, not a
+        premise failure.  A classifier crash fails closed on that same question.
 
         The summary/detail come from
         ``orchestrator/src/orchestrator/cross_repo_gate.py::block_escalation_text``.
@@ -9440,9 +9440,10 @@ class Harness:
         )
         self._escalation_queue.submit(esc)
         logger.warning(
-            'Filed L1 cross-repo-misfile escalation %s for task %s (owner=%s)',
+            'Filed L1 cross-repo escalation %s for task %s (signals=%r, owner=%s)',
             esc.id,
             task_id,
+            verdict.signals,
             verdict.owner_project or 'unresolved',
         )
 
@@ -9671,13 +9672,9 @@ class Harness:
                 project_root=self.config.project_root,
             )
         except Exception as exc:
-            logger.warning(
-                'cross_repo_gate: classify_cross_repo raised for task %s: %s',
-                task_id, exc, exc_info=True,
-            )
             # Fail CLOSED — an unverifiable classification is not a clean bill
             # of health (mirrors _run_substrate_gate's except branch).
-            verdict = cross_repo_gate.classify_error_verdict(exc)
+            verdict = cross_repo_gate.classify_error_verdict(task_id, exc)
 
         logger.info(
             'cross_repo_gate: task %s verdict=%s owner=%s signals=%r reason=%r',

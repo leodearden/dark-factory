@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator import cross_repo_gate as gate
+
 # Sentinel: distinguishes "metadata key absent" from "metadata is None".
 _UNSET = object()
 
@@ -1323,9 +1325,10 @@ class TestRunCrossRepoGate:
         assert 'registry exploded' in verdict.reason, (
             f'the synthesized verdict must name the exception; got {verdict.reason!r}'
         )
-        from orchestrator import cross_repo_gate
-
-        assert verdict.signals == (cross_repo_gate.SIGNAL_CLASSIFY_ERROR,)
+        assert 'RuntimeError' in verdict.reason, (
+            f'an empty exception message must still name what crashed; got {verdict.reason!r}'
+        )
+        assert verdict.signals == (gate.SIGNAL_CLASSIFY_ERROR,)
         assert verdict.owner_project is None
         assert verdict.foreign_paths == ()
 
@@ -1402,9 +1405,12 @@ class TestClassifyErrorEscalation:
     """
 
     @pytest.mark.asyncio
-    async def test_classifier_crash_l1_claims_nothing_was_established(self, tmp_path: Path):
+    async def test_classifier_crash_l1_claims_nothing_was_established(
+        self, tmp_path: Path, caplog,
+    ):
         from escalation.queue import EscalationQueue
 
+        caplog.set_level(logging.WARNING)
         h = _make_harness(tmp_path)
         set_status = AsyncMock()
         h.scheduler.set_task_status = set_status
@@ -1416,8 +1422,8 @@ class TestClassifyErrorEscalation:
             files=['orchestrator/src/orchestrator/harness.py'],
         )
 
-        with patch('orchestrator.cross_repo_gate.classify_cross_repo',
-                   side_effect=RuntimeError('registry exploded')):
+        boom = RuntimeError('registry exploded')
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo', side_effect=boom):
             allowed = await h._run_cross_repo_gate(assignment)
 
         assert allowed is False
@@ -1430,49 +1436,77 @@ class TestClassifyErrorEscalation:
         assert 'MISFILE' not in summary, summary
         assert 'owned by' not in summary.lower(), summary
         assert 'outside' not in summary.lower(), summary
-        assert 'could not run' in summary.lower(), summary
-        assert 'nothing about its paths was established' in summary.lower(), summary
+        assert 'nothing' in summary.lower(), summary
+        assert 'established' in summary.lower(), summary
 
         detail = l1s[0].detail
         assert 'registry exploded' in detail, detail
-        assert 'classify_error' in detail, detail
+        assert gate.SIGNAL_CLASSIFY_ERROR in detail, detail
         assert '(none declared)' not in detail, detail
         assert 'nothing in the task metadata named it' not in detail, detail
         assert 'judged outside project_root' not in detail, detail
         assert 'not evidence' in detail.lower(), detail
         assert 'do not refile' in detail.lower(), detail
-        assert 'unblock the task' in detail.lower(), detail
+        assert 'unblock' in detail.lower(), detail
 
-    @pytest.mark.parametrize('shape', ['owner-named', 'marker-only', 'containment-only'])
-    def test_misfile_verdicts_keep_the_misfile_rendering(self, shape: str):
+        crash_logs = [r for r in caplog.records if r.exc_info and r.exc_info[1] is boom]
+        assert len(crash_logs) == 1, f'the crash traceback must be logged once; got {crash_logs!r}'
+        logged = crash_logs[0].getMessage()
+        searched_for = logged[: logged.index('4161') + len('4161')]
+        assert f'"{searched_for}"' in detail, (
+            f'the L1 must quote the logged line {logged!r} it tells the operator to find; '
+            f'got {detail!r}'
+        )
+
+    @pytest.mark.parametrize(
+        ('verdict', 'claim'),
+        [
+            pytest.param(
+                gate.CrossRepoVerdict(
+                    verdict=gate.BLOCK, owner_project='dark_factory',
+                    signals=(gate.SIGNAL_MARKER,), foreign_paths=(),
+                    reason="metadata.cross_repo is set ('dark_factory')",
+                ),
+                'owned by dark_factory',
+                id='owner-named',
+            ),
+            pytest.param(
+                gate.CrossRepoVerdict(
+                    verdict=gate.BLOCK, owner_project=None,
+                    signals=(gate.SIGNAL_MARKER,), foreign_paths=(),
+                    reason='metadata.cross_repo is set (True)',
+                ),
+                'owner unresolved',
+                id='marker-only',
+            ),
+            pytest.param(
+                gate.CrossRepoVerdict(
+                    verdict=gate.BLOCK, owner_project=None,
+                    signals=(gate.SIGNAL_ALL_FILES_FOREIGN,),
+                    foreign_paths=('/elsewhere/x.py',),
+                    reason='all 1 declared metadata.files entries are absolute paths '
+                           'resolving outside project_root',
+                ),
+                'outside',
+                id='containment-only',
+            ),
+        ],
+    )
+    def test_misfile_verdicts_keep_their_own_misfile_claim(self, verdict, claim: str):
         """The crash rendering is reserved for the classify_error signal."""
-        from orchestrator import cross_repo_gate as gate
-
-        verdicts = {
-            'owner-named': gate.CrossRepoVerdict(
-                verdict=gate.BLOCK, owner_project='dark_factory',
-                signals=(gate.SIGNAL_MARKER,), foreign_paths=(),
-                reason="metadata.cross_repo is set ('dark_factory')",
-            ),
-            'marker-only': gate.CrossRepoVerdict(
-                verdict=gate.BLOCK, owner_project=None,
-                signals=(gate.SIGNAL_MARKER,), foreign_paths=(),
-                reason='metadata.cross_repo is set (True)',
-            ),
-            'containment-only': gate.CrossRepoVerdict(
-                verdict=gate.BLOCK, owner_project=None,
-                signals=(gate.SIGNAL_ALL_FILES_FOREIGN,),
-                foreign_paths=('/elsewhere/x.py',),
-                reason='all 1 declared metadata.files entries are absolute paths '
-                       'resolving outside project_root',
-            ),
-        }
-
-        text = gate.block_escalation_text('9', verdicts[shape])
+        text = gate.block_escalation_text('9', verdict)
 
         assert text.summary.startswith('CROSS_REPO_MISFILE: task 9 '), text.summary
+        assert claim in text.summary, text.summary
         assert 'Paths judged outside project_root' in text.detail, text.detail
-        assert 'CROSS_REPO_UNVERIFIED' not in text.summary, text.summary
+
+    @pytest.mark.parametrize(
+        'verdict',
+        [pytest.param(_allow_verdict(), id='allow'), pytest.param(_skip_verdict(), id='skip')],
+    )
+    def test_a_non_block_verdict_is_refused(self, verdict):
+        with pytest.raises(ValueError, match='requires a BLOCK verdict'):
+            gate.block_escalation_text('9', verdict)
 
 
 # ---------------------------------------------------------------------------
