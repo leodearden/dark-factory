@@ -929,6 +929,47 @@ class TestDTheLookAheadWaitsForTheChainDecision:
         assert all(reqs[name].result.done() for name in ('H', 'S', 'S1'))
 
 
+class TestFTheHeadChainsWhenAloneInTheFrontier:
+    """F: boundary row 9 of ``plans/merge-lane-policy-prd.md`` (D5).
+
+    A head with nothing else in the verify frontier chains the followers
+    buffered behind it, and the merger holds its look-ahead for that decision.
+    """
+
+    async def test_a_head_alone_chains_the_followers_buffered_behind_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """speculation_depth 3 leaves permits free, so without the hold the
+        merger would take F1 before H's dispatch could chain it."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'F1', 'F2')
+        h_entered, release_h = asyncio.Event(), asyncio.Event()
+        verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
+        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=3) as run:
+            run.put(reqs['H'], reqs['F1'], reqs['F2'])
+            await wait_responsive(
+                h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label="H's tip verify under way on local",
+            )
+            rows = [(r['owner_task_id'], r['link_task_ids']) for r in _reservations(run.lane)]
+            assert rows == [('H', ['F1', 'F2'])]
+            assert run.lane.unfrozen_suffix() == (reqs['F1'].request_id, reqs['F2'].request_id)
+
+            release_h.set()
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in ('H', 'F1', 'F2')
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert [outcomes[n].landed_via_chain for n in ('H', 'F1', 'F2')] == [1, 1, 1]
+            assert verifier.verified == ['H']
+            assert await _landed_task_files(scene) == ['H', 'F1', 'F2']
+            (h_verify,) = _verify_events_for(scene, {'H'})
+            assert (h_verify['data']['chain_items'], h_verify['data']['speculative']) == (3, False)
+            _assert_no_live_permit(run.lane)
+            assert _reservations(run.lane) == []
+
+
 async def _main_sha(scene: _Scene) -> str:
     _, sha, _ = await _run(['git', 'rev-parse', 'main'], cwd=scene.git_ops.project_root)
     return sha.strip()
