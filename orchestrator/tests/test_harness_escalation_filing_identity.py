@@ -169,15 +169,9 @@ class TestHarnessFilingsCarryTheIdentity:
         for visibility, not left immortal), and it is safe because the
         PROTECTIVE half survives: ``vetoes_done_flip`` stays True.
 
-        NOTE: ``level == 0`` here encodes the OBSERVED status quo.  That
-        site's docstring says "Submit an L1 escalation" but it passes no
-        ``level=``, so it builds at the dataclass default 0.  The
-        contradiction is filed as out-of-scope ticket
-        tkt_0RSVX7E03MYACJPMGPH1GWMW08 and deliberately NOT resolved here —
-        correcting the docstring is behaviour-neutral, while adding
-        ``level=1`` would flip this record from reaper-eligible DEAD_L0 to
-        permanently-pinning QUEUE_HANDOFF.  Whoever resolves that ticket moves
-        this assertion with them.
+        ``level == 0`` is this filer's intended level (task 4732):
+        ``TestReconcileFailureReachesL1ThroughTheReaper`` pins how the orphan
+        reaper turns these L0s into one L1.
         """
         h = _build_harness(mock_orch_config)
         h._run_id = 'run-xyz'
@@ -196,7 +190,7 @@ class TestHarnessFilingsCarryTheIdentity:
         assert len(submitted) == 1
         esc = submitted[0]
         assert esc.filing_claimant_run_id == h._filing_claimant_run_id
-        # The status quo this assertion encodes — see ticket note above.
+        # The intended level — see the docstring above.
         assert esc.level == 0
         assert esc.severity == 'blocking'
 

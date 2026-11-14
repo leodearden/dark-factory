@@ -7468,7 +7468,8 @@ class Harness:
             # predates a later reopen_at, so completing the task now would
             # phantom-complete a stale claim (task 2677). Route to the
             # shared sink (dedupe-guarded born-at-L2) instead of the
-            # generic reconcile_persistent_rejection L1 escalation — this
+            # generic reconcile_persistent_rejection escalation
+            # (``_escalate_reconcile_failure``) — this
             # is NOT an unexpected persistence-layer contradiction, it is
             # the provenance-integrity gate doing its job.
             self._provenance_conflict_sink.record_from_rejection(
@@ -7501,15 +7502,14 @@ class Harness:
         tid: str,
         exc: SetTaskStatusRejected,
     ) -> None:
-        """Submit an L1 escalation for a persistent reconcile failure.
+        """File an L0 for a reconcile-sweep recovery write the persistence layer refused.
 
-        Fired directly on every recovery-write rejection the reconcile sweep
-        observes for *tid* — a mark-done on landing evidence or the pending
-        revert of a stranded task (task 2243, W10-θ2 step-14 — the per-tid
-        strike counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
-        retired): the persistence layer refusing the sweep's recovery is
-        L1-worthy on its own without waiting for a run of consecutive sweeps
-        to confirm it.
+        Fires on every refused write the sweep observes for *tid* — a
+        mark-done on landing evidence, or the pending revert of a stranded
+        task — with no dedup of its own; task 2243 retired the per-tid strike
+        counter.  Level 0 is deliberate: the orphan L0 reaper promotes the
+        first aged record to one L1 and dismisses later ones as covered.
+        See orchestrator/tests/test_harness_escalation_filing_identity.py::TestReconcileFailureReachesL1ThroughTheReaper.
         """
         if not self._escalation_queue:
             return
@@ -7537,6 +7537,7 @@ class Harness:
                 f'name the gate that refused it. Manual investigation required.'
             ),
             suggested_action='investigate_persistence_layer_rejection',
+            level=0,
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
