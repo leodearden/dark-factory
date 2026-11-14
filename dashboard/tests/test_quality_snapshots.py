@@ -25,9 +25,21 @@ from _quality_snapshots import (
     snapshot_doc,
     write_snapshot,
 )
+from shared.project_id import project_id_for_root
 from shared.quality_series.git_lines import GitObjectMissing
 
+from dashboard.config import DashboardConfig
 from dashboard.data.datum import DatumState, validate_datum
+from dashboard.data.quality_marker_sampler import MARKER_PER_ROOT_BUDGET_SECONDS
+from dashboard.data.quality_sampler import (
+    QUALITY_PER_ROOT_BUDGET_SECONDS,
+    QUALITY_SAMPLE_INTERVAL_SECONDS,
+)
+from dashboard.data.quality_snapshot_sampler import (
+    SNAPSHOT_PER_ROOT_BUDGET_SECONDS,
+    SNAPSHOT_WORK_BUDGET_SECONDS,
+    refresh_snapshots,
+)
 from dashboard.data.quality_snapshots import (
     BASELINE_HOME,
     INSTRUMENT_SCRIPT,
@@ -278,7 +290,10 @@ sys.exit(subprocess.call([sys.executable, {real!r}, *sys.argv[1:]]))
 
 @dataclass(frozen=True)
 class Scene:
-    """A git root with three commits; a schema-2 baseline at sha1 and schema-3 nightlies at sha2, sha3."""
+    """A git root with three commits; a schema-2 baseline at sha1 and schema-3 nightlies at sha2, sha3.
+
+    The root's directory is named so that project_id_for_root gives the nightly home's project id.
+    """
 
     root: Path
     nightly: Path
@@ -309,7 +324,7 @@ class Scene:
 
 @pytest.fixture
 def scene(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Scene:
-    repo = GitRepo(tmp_path / 'root')
+    repo = GitRepo(tmp_path / 'dark_factory')
     times = (
         datetime(2026, 10, 8, 12, tzinfo=UTC),
         datetime(2026, 11, 1, 3, tzinfo=UTC),
@@ -629,3 +644,78 @@ class TestTheSnapshotStore:
         assert [point.diff.state for point in stored.scan.series.points] == [
             DiffState.FIRST, DiffState.PENDING, DiffState.PENDING,
         ]
+
+
+# ---------------------------------------------------------------------------
+# The snapshot tick: every git-checkout root scanned on a thread of its own, each stored on its own.
+
+
+def test_the_nightly_home_is_the_cadence_writers_data_dir(tmp_path: Path) -> None:
+    assert DashboardConfig(project_root=tmp_path).quality_metrics_dir == tmp_path / 'data' / 'quality-metrics'
+
+
+def test_the_snapshot_tick_fits_between_the_sample_and_marker_ticks_in_one_interval() -> None:
+    assert SNAPSHOT_WORK_BUDGET_SECONDS < SNAPSHOT_PER_ROOT_BUDGET_SECONDS
+    assert (QUALITY_PER_ROOT_BUDGET_SECONDS + SNAPSHOT_PER_ROOT_BUDGET_SECONDS + MARKER_PER_ROOT_BUDGET_SECONDS
+            <= QUALITY_SAMPLE_INTERVAL_SECONDS)
+
+
+async def _snapshot_tick(
+    conn: aiosqlite.Connection, roots: list[Path], nightly: Path, instrument: Path,
+    now: datetime = SCANNED_AT,
+) -> None:
+    await refresh_snapshots(conn, roots, nightly_dir=nightly, now=now, instrument=instrument)
+
+
+class TestTheSnapshotTick:
+    async def test_one_tick_stores_every_point_and_the_next_reruns_nothing(
+        self, conn: aiosqlite.Connection, scene: Scene
+    ) -> None:
+        assert project_id_for_root(scene.root) == 'dark_factory'
+
+        await _snapshot_tick(conn, [scene.root], scene.nightly, scene.instrument)
+        first = await read_snapshot_state(conn, 'dark_factory')
+        scene.calls()
+        later = SCANNED_AT + timedelta(minutes=10)
+        await _snapshot_tick(conn, [scene.root], scene.nightly, scene.instrument, later)
+        second = await read_snapshot_state(conn, 'dark_factory')
+
+        assert first is not None and first.scan is not None and first.failure is None
+        assert [point.summary.as_of_sha for point in first.scan.series.points] == list(scene.shas)
+        assert [point.diff.state for point in first.scan.series.points] == [
+            DiffState.FIRST, DiffState.READY, DiffState.READY,
+        ]
+        assert first.scan.scanned_at == SCANNED_AT
+        assert scene.calls() == []
+        assert second is not None and second.scan is not None
+        assert second.scan.series == first.scan.series
+        assert second.scan.scanned_at == later
+
+    async def test_a_root_that_is_not_a_git_checkout_is_skipped(
+        self, conn: aiosqlite.Connection, scene: Scene, tmp_path: Path
+    ) -> None:
+        plain = tmp_path / 'not-a-checkout'
+        write_snapshot(plain / BASELINE_HOME / 'baseline.json', snapshot_doc(3, as_of_sha=SHA_1, run_id='r1'))
+
+        await _snapshot_tick(conn, [plain, scene.root], scene.nightly, scene.instrument)
+
+        assert await read_snapshot_state(conn, project_id_for_root(plain)) is None
+        stored = await read_snapshot_state(conn, 'dark_factory')
+        assert stored is not None and stored.scan is not None and len(stored.scan.series.points) == 3
+
+    async def test_a_scan_that_raises_records_the_failure_and_keeps_the_previous_points(
+        self, conn: aiosqlite.Connection, scene: Scene, tmp_path: Path
+    ) -> None:
+        await _snapshot_tick(conn, [scene.root], scene.nightly, scene.instrument)
+        previous = await read_snapshot_state(conn, 'dark_factory')
+        absent = tmp_path / 'no-instrument' / 'quality_metrics_snapshot.py'
+        later = SCANNED_AT + timedelta(minutes=10)
+
+        await _snapshot_tick(conn, [scene.root], scene.nightly, absent, later)
+
+        stored = await read_snapshot_state(conn, 'dark_factory')
+        assert previous is not None and stored is not None
+        assert stored.scan == previous.scan
+        assert stored.attempted_at == later
+        assert stored.failure is not None and stored.failure.startswith('FileNotFoundError: ')
+        assert str(absent) in stored.failure
