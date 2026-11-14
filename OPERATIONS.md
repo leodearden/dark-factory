@@ -2835,6 +2835,51 @@ python3 /home/leo/src/dark-factory/scripts/falkordb_aof_gate.py \
   --compose-file /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml --check-only
 ```
 
+#### Experiments never touch production FalkorDB
+
+Production has segfaulted three times, and two of the crashes were ad-hoc
+probes. Both probes crash it again every time they run:
+
+- 2026-08-05: an `EVAL` that `RESTORE`d a `DUMP` of `dark_factory` on the
+  same server. This is fixed upstream in 4.22.1, but production runs 4.18.0.
+- 2026-10-04: an Entity read with `uuid IN ['a','b']` (FalkorDB#3348).
+
+So:
+
+1. **Experiments, clones and index work go to "The scratch FalkorDB" below.**
+   Scratch is shared by every test session, so a probe that you expect to
+   crash the server goes somewhere else. Run it in a private throwaway
+   container of the image production runs, with no `-p`:
+
+   ```bash
+   docker run -d --name <unique> "$(docker inspect -f '{{.Config.Image}}' docker-falkordb-1)"
+   docker exec <unique> redis-cli GRAPH.QUERY <graph> '<query>'
+   docker rm -f <unique>
+   ```
+
+2. **On production, ad-hoc access is reads through
+   `docker exec docker-falkordb-1 redis-cli`, and nothing else.** This rule
+   covers hand-run access. It does not cover this section's own remedy and
+   recovery procedures, or committed tooling, whose access to production is
+   settled when it is reviewed. The eval harness and
+   `seed_scratch_reference_graph.py` in "The scratch FalkorDB" below are
+   committed tooling of that kind.
+3. **Never clone a graph on production.** That means no `RESTORE` onto it and
+   no `EVAL`. The one sanctioned `DUMP` is
+   `fused-memory/scripts/seed_scratch_reference_graph.py`, and its `RESTORE`
+   goes to scratch.
+4. **No IN-list, and no OR of equalities, on an indexed property of Entity,
+   Episodic or Community,** unless every value has first been checked
+   against `graphiti_core.driver.falkordb.STOPWORDS`. The check ignores case.
+   This applies to reads too, because `GRAPH.RO_QUERY` crashes the same way.
+   A single `=` and a property map are safe. The measured shape matrix, the
+   other safe forms and the code-site audit are in
+   `plans/falkordb-stopword-in-list-audit.md`.
+5. **Never construct a graphiti driver for a probe.** graphiti_core's
+   `FalkorDriver.__init__` schedules `build_indices_and_constraints()`, which
+   writes `CREATE INDEX` to the graph the driver names. This was seen on
+   2026-10-29 on `default_db`.
+
 #### Deciding which FalkorDB copy is newest
 
 A data dir can hold two copies of the graph: the AOF (`appendonlydir/`, base
