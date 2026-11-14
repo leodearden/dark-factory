@@ -1,4 +1,4 @@
-"""Pins flag_identity's persisted forms, as literals, and its flag-subject parsing contract."""
+"""flag_identity's unit tests; its persisted forms are pinned as literals."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from fused_memory.reconciliation.flag_identity import (
     CONTENT_FP_PREFIX,
     FlagSubject,
     FlagTypeFamily,
+    canonical_flag_type_family,
     compute_content_fingerprint_signature,
     compute_flag_signature,
     compute_marker_signature,
@@ -360,6 +361,123 @@ class TestReconSignatureTaskId:
         assert signature_field(value) == expected
 
 
+_MD = 'missing_deliverable'
+
+
+class TestComputeFlagSignature:
+    @pytest.mark.parametrize(
+        ('flag', 'expected'),
+        [
+            ({'task_id': 123, 'flag_type': _MD}, ('123', _MD)),
+            ({'task_id': '123', 'flag_type': _MD}, ('123', _MD)),
+            ({'task_id': 0, 'flag_type': _MD}, ('0', _MD)),
+            ({'flag_type': _MD, 'cited_tasks': [{'project_id': 'p', 'task_id': '7'}]}, ('7', _MD)),
+            ({'flag_type': _MD, 'cited_tasks': [{'project_id': 'p', 'task_id': 99}]}, ('99', _MD)),
+        ],
+        ids=['int_task_id', 'str_task_id', 'zero_task_id', 'cited_only', 'cited_int_task_id'],
+    )
+    def test_a_task_anchor_and_a_flag_type_make_a_signature(self, flag, expected):
+        assert compute_flag_signature(flag) == expected
+
+    @pytest.mark.parametrize(
+        'flag',
+        [
+            {'flag_type': _MD},
+            {'flag_type': _MD, 'cited_tasks': []},
+            {'task_id': '42'},
+            {'cited_tasks': [{'project_id': 'p', 'task_id': '7'}]},
+            {'description': 'some flag'},
+            {},
+        ],
+        ids=['no_task_id', 'empty_cited_tasks', 'no_flag_type', 'cited_without_flag_type',
+             'neither', 'empty'],
+    )
+    def test_no_signature_without_both(self, flag):
+        assert compute_flag_signature(flag) is None
+
+    def test_a_cited_set_is_one_signature_in_any_order(self):
+        def cited(*ids: str) -> dict[str, Any]:
+            return {
+                'flag_type': 'stale',
+                'cited_tasks': [{'project_id': 'p', 'task_id': i} for i in ids],
+            }
+
+        assert compute_flag_signature(cited('c', 'a', 'b')) == ('a,b,c', 'stale')
+        assert compute_flag_signature(cited('b', 'c', 'a')) == ('a,b,c', 'stale')
+        assert compute_flag_signature(cited('1', '2')) != compute_flag_signature(cited('1', '3'))
+
+
+class TestComputeContentFingerprintSignature:
+    _ANCHORLESS: dict[str, Any] = {
+        'task_id': None, 'flag_type': 'stale_edge', 'description': 'orphaned edge found in graph',
+    }
+
+    def test_an_anchorless_flag_keys_on_its_description_fingerprint(self):
+        assert compute_content_fingerprint_signature(self._ANCHORLESS) == (
+            content_fingerprint('orphaned edge found in graph'), 'stale_edge',
+        )
+
+    def test_whitespace_and_case_variants_share_a_signature(self):
+        variant = {**self._ANCHORLESS, 'description': '  Orphaned   EDGE  found   in   Graph  '}
+        assert compute_content_fingerprint_signature(variant) == (
+            compute_content_fingerprint_signature(self._ANCHORLESS)
+        )
+
+    def test_different_descriptions_differ(self):
+        other = {**self._ANCHORLESS, 'description': 'a different finding about missing memory'}
+        assert compute_content_fingerprint_signature(other) != (
+            compute_content_fingerprint_signature(self._ANCHORLESS)
+        )
+
+    @pytest.mark.parametrize(
+        'overrides',
+        [
+            {'task_id': 42},
+            {'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}]},
+            {'description': '   '},
+            {'description': None},
+        ],
+        ids=['task_anchor', 'cited_task', 'blank_description', 'no_description'],
+    )
+    def test_defers_to_a_task_anchor_and_needs_a_description(self, overrides):
+        assert compute_content_fingerprint_signature({**self._ANCHORLESS, **overrides}) is None
+
+    def test_a_flag_with_no_flag_type_takes_the_sentinel(self):
+        signature = compute_content_fingerprint_signature({**self._ANCHORLESS, 'flag_type': None})
+        assert signature is not None
+        assert signature[1] == CONTENT_FP_FLAG_TYPE
+
+
+_FP_KEY = 'fp:9216e85ac497b68d93043b64684eb049'
+
+_MALFORMED_FP_KEYS = [
+    'fp:', 'fp:' + 'a' * 30, 'fp:' + 'a' * 64, 'fp:' + 'A' * 32, 'fp:' + 'a' * 31 + 'g',
+]
+
+
+class TestIsValidMarkerTaskId:
+    @pytest.mark.parametrize('tid', ['42', '0', '99999', '12,15', '1,2,3', '12, 15', _FP_KEY])
+    def test_accepts_task_ids_their_comma_joins_and_fp_keys(self, tid):
+        assert is_valid_marker_task_id(tid) is True
+
+    @pytest.mark.parametrize(
+        'tid', ['', 'abc', '12,', '12,fp:abc', '-1', '1.5', *_MALFORMED_FP_KEYS],
+    )
+    def test_rejects_every_other_shape(self, tid):
+        assert is_valid_marker_task_id(tid) is False
+
+
+class TestIsContentFingerprintTaskId:
+    def test_accepts_a_canonical_fp_key(self):
+        assert is_content_fingerprint_task_id(_FP_KEY) is True
+
+    @pytest.mark.parametrize(
+        'tid', ['42', '12,15', '', 'not-a-marker-key-at-all', *_MALFORMED_FP_KEYS],
+    )
+    def test_rejects_every_other_shape_including_valid_numeric_marker_keys(self, tid):
+        assert is_content_fingerprint_task_id(tid) is False
+
+
 class TestMarkerKeyAntiDrift:
     @pytest.mark.parametrize('description', [row[0] for row in _DESCRIPTIONS])
     def test_every_emitted_fingerprint_is_a_valid_fp_marker_key(self, description):
@@ -371,6 +489,32 @@ class TestMarkerKeyAntiDrift:
         assert CONTENT_FP_PREFIX == 'fp:'
         assert CONTENT_FP_HEXLEN == 32
         assert CONTENT_FP_FLAG_TYPE == '__content_fp__'
+
+
+class TestCanonicalFlagTypeFamily:
+    @pytest.mark.parametrize(
+        'variant',
+        [
+            'Missing_Deliverable',
+            'missing-deliverable',
+            'missing deliverable',
+            'deliverable_missing',
+        ],
+    )
+    def test_case_separator_and_word_order_variants_are_one_family(self, variant):
+        assert canonical_flag_type_family(variant) == canonical_flag_type_family(_MD)
+
+    def test_distinct_findings_stay_distinct(self):
+        assert canonical_flag_type_family(_MD) != canonical_flag_type_family('stale_metadata')
+
+    @pytest.mark.parametrize('value', ['', '   ', '___', '---'])
+    def test_degenerate_input_collapses_to_empty_string(self, value):
+        assert canonical_flag_type_family(value) == ''
+
+    @pytest.mark.parametrize('value', [_MD, 'Missing-Deliverable Foo', ''])
+    def test_idempotent(self, value):
+        once = canonical_flag_type_family(value)
+        assert canonical_flag_type_family(once) == once
 
 
 class TestFlagTypeFamily:
