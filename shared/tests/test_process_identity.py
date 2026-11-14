@@ -131,11 +131,16 @@ def test_other_host_is_decided_before_any_proc_read(live_child, tmp_path):
     assert liveness(elsewhere, proc_root=tmp_path / 'absent') is Liveness.OTHER_HOST
 
 
-def test_unreaped_zombie_is_dead(live_child):
+def test_unreaped_zombie_is_alive_and_captured_until_reaped(live_child):
     identity = _captured(live_child.pid)
 
     os.kill(live_child.pid, signal.SIGKILL)
     os.waitid(os.P_PID, live_child.pid, os.WEXITED | os.WNOWAIT)
+
+    assert liveness(identity) is Liveness.ALIVE
+    assert capture(live_child.pid) == identity
+
+    live_child.wait()
 
     assert liveness(identity) is Liveness.DEAD
     assert capture(live_child.pid) is None
