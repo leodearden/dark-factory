@@ -702,7 +702,7 @@ def _wire_plan_files_gate(wf, monkeypatch, results, *, narrowed=False):
     events = _RecordingEventStore()
     wf.event_store = events
 
-    wf._try_narrow_plan = AsyncMock(return_value=narrowed)  # type: ignore[method-assign]
+    monkeypatch.setattr(wf, '_try_narrow_plan', AsyncMock(return_value=narrowed))
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
     return check_seq, events, mark_blocked
