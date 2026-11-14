@@ -8,18 +8,28 @@ pins ``ORCH_PROJECT_ROOT`` to ``tmp_path``, so a CLI fixture's project IS ``tmp_
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import yaml
 from click.testing import CliRunner
+from escalation.categories import EscalationCategory
+from escalation.queue import EscalationQueue
 
 from orchestrator.cli import main
 from orchestrator.config import VerifyCacheConfig
-from orchestrator.verify_cache import audit, keys, policy, registry
-from orchestrator.verify_cache.audit_run import AuditNode
+from orchestrator.offline_lane_confirm import (
+    Confirmed,
+    ConfirmMode,
+    Unconfirmable,
+    UnconfirmableReason,
+)
+from orchestrator.verify_cache import audit, audit_hook, keys, policy, registry
+from orchestrator.verify_cache.audit_run import AUDIT_COMMAND, AuditNode
 from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV, CacheMode
+from orchestrator.verify_cache.status import render_status
 from orchestrator.verify_evidence import UnitTier
 
 T0 = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
@@ -250,3 +260,157 @@ class TestEnableCli:
 
         assert result.exit_code == 2, result.output
         assert '--reason' in result.output, result.output
+
+
+def _reproduced(*nodes: str) -> Confirmed:
+    return Confirmed(ConfirmMode.INTERSECTED, nodes, (), ())
+
+
+class _Hooked:
+    """The step-7 fixture registry behind a real VerifyCacheAuditHook and a real escalation queue."""
+
+    def __init__(self, tmp_path: Path, *, with_queue: bool = True) -> None:
+        self.seeded = _Seeded(tmp_path / 'verify_cache.db')
+        self.queue = EscalationQueue(tmp_path / 'escalations') if with_queue else None
+        self.hook = audit_hook.VerifyCacheAuditHook(self.seeded.registry, self.queue, now=lambda: self.seeded.now)
+
+    def call(self, outcome, *, command: str = AUDIT_COMMAND, head: str = HEAD):
+        return asyncio.run(self.hook(command, head, outcome, ()))
+
+    def pending(self):
+        assert self.queue is not None
+        return self.queue.get_by_task(audit_hook.AUDIT_ESCALATION_SENTINEL, status='pending')
+
+
+@pytest.fixture
+def hooked(tmp_path: Path) -> _Hooked:
+    return _Hooked(tmp_path)
+
+
+class TestAuditHook:
+    def test_row_12_a_leak_is_evicted_and_reported_as_a_note(self, hooked):
+        notes = hooked.call(_reproduced(ALPHA_NODE))
+
+        assert len(notes) == 1
+        note = notes[0]
+        assert (note.source, note.node) == ('verify-cache-audit', ALPHA_NODE)
+        entry = hooked.seeded.entry_alpha
+        for named in ('module:alpha:test', KA.key, f'entry {entry.entry_id}', HEAD, 'evidence event 7'):
+            assert named in note.text, note.text
+        assert not hooked.seeded.present(KA)
+        assert hooked.seeded.policy().streak == 1
+        assert hooked.pending() == []
+
+    def test_the_same_leak_on_three_passes_is_reported_each_time_and_counted_once(self, hooked):
+        for _ in range(3):
+            assert len(hooked.call(_reproduced(ALPHA_NODE))) == 1
+            hooked.seeded.advance(timedelta(minutes=30))
+
+        assert hooked.seeded.policy().streak == 1
+
+    def test_row_13_a_second_leak_disables_and_files_one_l2_blocker(self, hooked):
+        hooked.call(_reproduced(ALPHA_NODE))
+        hooked.seeded.advance(timedelta(days=1))
+        hooked.seeded.fresh_leak_source(KB, LATER_HEAD)
+
+        hooked.call(_reproduced(BETA_NODE), head=LATER_HEAD)
+
+        summary = asyncio.run(hooked.seeded.registry.summary())
+        assert 'DISABLED' in render_status(_BOTH_ON, summary, hooked.seeded.now)[-1]
+        [blocker] = hooked.pending()
+        assert (blocker.level, blocker.severity, blocker.category) == (2, 'critical', EscalationCategory.RISK_IDENTIFIED)
+        assert blocker.agent_role == audit_hook.AUDIT_ESCALATION_ROLE
+        assert blocker.agent_role.startswith('orchestrator-')
+        assert blocker.agent_role != 'orchestrator-offline-lane'
+        assert blocker.task_id == audit_hook.AUDIT_ESCALATION_SENTINEL
+        assert len(blocker.summary) <= 200
+        told = f'{blocker.summary}\n{blocker.detail}\n{blocker.suggested_action}'
+        for named in ('module:alpha:test', 'module:beta:test', HEAD, LATER_HEAD, KA.key, KB.key):
+            assert named in told, told
+        assert 'orchestrator verify-cache enable' in told, told
+
+    def test_a_disabled_cache_files_no_second_blocker_until_the_first_is_resolved(self, hooked):
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+        [blocker] = hooked.pending()
+        hooked.seeded.fresh_leak_source(KA, LATER_HEAD)
+
+        hooked.call(_reproduced(ALPHA_NODE), head=LATER_HEAD)
+
+        assert [esc.id for esc in hooked.pending()] == [blocker.id]
+        assert hooked.queue is not None
+        hooked.queue.resolve(blocker.id, 'root cause fixed')
+        asyncio.run(audit.enable(hooked.seeded.registry, 'root cause fixed', hooked.seeded.now))
+        hooked.seeded.fresh_leak_source(KA, 'c3' * 20)
+        hooked.seeded.fresh_leak_source(KB, 'c3' * 20)
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE), head='c3' * 20)
+        assert [esc.id for esc in hooked.pending()] != [blocker.id]
+        assert len(hooked.pending()) == 1
+
+    def test_row_14_a_red_on_a_unit_that_ran_takes_the_ordinary_path(self, hooked):
+        assert hooked.call(_reproduced(GAMMA_NODE)) == ()
+        assert hooked.seeded.present(KG)
+        assert hooked.seeded.policy().streak == 0
+
+    def test_an_unconfirmable_outcome_touches_nothing(self, tmp_path):
+        db_path = tmp_path / 'absent' / 'verify_cache.db'
+        hook = audit_hook.VerifyCacheAuditHook(registry.Registry(db_path), None)
+        outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '1')
+
+        assert asyncio.run(hook(AUDIT_COMMAND, HEAD, outcome, ())) == ()
+        assert not db_path.exists()
+
+    @pytest.mark.parametrize('outcome', [
+        Confirmed(ConfirmMode.INTERSECTED, (), (ALPHA_NODE,), ()),
+        Confirmed(ConfirmMode.INTERSECTED, (), (), (ALPHA_NODE,)),
+    ])
+    def test_a_cleared_or_inconclusive_node_is_never_attributed(self, hooked, outcome):
+        assert hooked.call(outcome) == ()
+        assert hooked.seeded.present(KA)
+
+    def test_another_lane_command_is_not_the_audit(self, hooked):
+        assert hooked.call(_reproduced(ALPHA_NODE), command='qdrant-integration') == ()
+        assert hooked.seeded.present(KA)
+
+    def test_an_unusable_registry_raises_for_the_lane_to_log(self, tmp_path):
+        directory = tmp_path / 'a-directory'
+        directory.mkdir()
+        corrupt = tmp_path / 'corrupt.db'
+        corrupt.write_bytes(b'this is not a sqlite database' * 64)
+        for db_path in (directory, corrupt):
+            hook = audit_hook.VerifyCacheAuditHook(registry.Registry(db_path), None)
+            with pytest.raises(registry.RegistryError):
+                asyncio.run(hook(AUDIT_COMMAND, HEAD, _reproduced(ALPHA_NODE), ()))
+
+    def test_a_failed_policy_write_leaves_the_eviction_done(self, tmp_path):
+        seeded = _Seeded(tmp_path / 'verify_cache.db')
+
+        class _WriteFails(registry.Registry):
+            async def write_policy_state(self, state: registry.PolicyState) -> None:
+                raise registry.RegistryError(tmp_path / 'verify_cache.db', 'disk full')
+
+        hook = audit_hook.VerifyCacheAuditHook(_WriteFails(tmp_path / 'verify_cache.db'), None)
+
+        with pytest.raises(registry.RegistryError):
+            asyncio.run(hook(AUDIT_COMMAND, HEAD, _reproduced(ALPHA_NODE), ()))
+        assert not seeded.present(KA)
+
+    def test_without_a_queue_the_disable_still_lands_and_the_loss_is_logged(self, tmp_path, caplog):
+        hooked = _Hooked(tmp_path, with_queue=False)
+
+        with caplog.at_level(logging.ERROR, logger=audit_hook.__name__):
+            notes = hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+
+        assert len(notes) == 2
+        assert hooked.seeded.policy().is_disabled(hooked.seeded.now)
+        assert any('no escalation queue' in record.getMessage() for record in caplog.records), caplog.text
+
+    def test_a_note_states_the_kill_switch_when_the_cache_is_disabled(self, hooked):
+        [quiet] = hooked.call(_reproduced(ALPHA_NODE))
+        assert 'DISABLED' not in quiet.text
+
+        hooked.seeded.fresh_leak_source(KB, LATER_HEAD)
+        [tripped] = hooked.call(_reproduced(BETA_NODE), head=LATER_HEAD)
+
+        until = hooked.seeded.policy().disabled_until
+        assert until is not None
+        assert f'verify cache DISABLED until {until.isoformat()}' in tripped.text, tripped.text
