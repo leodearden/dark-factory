@@ -10921,7 +10921,7 @@ def _one_event_per_chunk_assembler(memory_service, taskmaster, config, project_r
     """A ContextAssembler stand-in whose every chunk is the oldest peeked event."""
     inst = MagicMock()
 
-    async def assemble(peeked, watermark, project_id):
+    async def assemble(peeked, project_id):
         if not peeked:
             return AssembledPayload(events=[])
         return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
@@ -11059,7 +11059,7 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
     def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
         inst = MagicMock()
 
-        async def fake_assemble(peeked, watermark, project_id):
+        async def fake_assemble(peeked, project_id):
             if not peeked:
                 return AssembledPayload(events=[])
             # One-event-per-chunk, mirrors production token-budget chunking.
@@ -11235,7 +11235,7 @@ async def test_backlog_iterator_budget_bounds_chunks_and_converges_across_invoca
     def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
         inst = MagicMock()
 
-        async def fake_assemble(peeked, watermark, project_id):
+        async def fake_assemble(peeked, project_id):
             if not peeked:
                 return AssembledPayload(events=[])
             # One-event-per-chunk, mirrors production token-budget chunking.
