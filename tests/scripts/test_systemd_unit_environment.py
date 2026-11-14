@@ -21,6 +21,9 @@ import fake_busctl
 import pytest
 import systemd_unit_environment as sue
 import verify_command_invariants as vci
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 RECIPE_MARKER = 'unit-environment-recipe'
