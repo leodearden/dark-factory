@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly timer for the duplicate-cluster report (task 3136)
+
+[Timer]
+# Weekly, Sunday 06:30: after the 06:00 owner sweep and clear of the 03:15
+# memory-eval run, which also reads the Mem0 store; see the OPERATIONS.md
+# nightly ladder. The cadence is mirrored in fused-memory/config/duplicate-audit.yaml
+# (cadence.on_calendar), and a scripts/tests parity test keeps the two equal.
+OnCalendar=Sun *-*-* 06:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
