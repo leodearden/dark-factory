@@ -18,14 +18,19 @@ that only checked the units would leave exactly that property unpinned.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from config_reload_script_fakes import FakeEscalationMcp
+from merge_queue_fakes import FakeMergeQueue, assert_target_checkout_clean
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -166,8 +171,7 @@ def _write_recorder_shim(path, who, recorder):
 
 
 def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
-                     default_prefix=False, record_git=False,
-                     pad_commit_output=0, census_writes=None):
+                     default_prefix=False, record_git=False, census_writes=None):
     """Point both wrapper seams at fake recorders. Returns (env, state_path).
 
     `census_writes` ({repo-relative path: content}) is what the fake census
@@ -177,15 +181,6 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
     the wrapper's own `uv run --frozen --project <FM> python` prefix is the
     thing under test, with a fake `uv` recorder on PATH. Every other wrapper
     test overrides both seams and therefore never exercises that prefix at all.
-
-    `pad_commit_output` (bytes, default 0/off) is an opt-in knob on the
-    `record_git=True` shim: when set, the shim's handling of a `commit`
-    invocation captures the REAL git's combined output, replays it VERBATIM
-    first, then appends this many padding bytes, and exits with git's REAL
-    status. git's own behaviour never changes -- only the volume the wrapper
-    must read past does. This is what turns the wrapper's SIGPIPE-under-
-    pipefail misread (see the retry-predicate tests below) from a ~0.6% race
-    at git's natural output size into a deterministic reproduction.
     """
     bin_dir = _wrapper_bin_dir(tmp_path)
     bin_dir.mkdir(exist_ok=True)
@@ -206,7 +201,7 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
     if record_git:
         # A `git` shim that RECORDS the real argv and then delegates to the
         # real binary, so the wrapper's git behaviour is unchanged and the
-        # commit half still genuinely commits. The real git is resolved
+        # landing still genuinely lands. The real git is resolved
         # ABSOLUTELY here -- while bin_dir is not yet on PATH -- so the shim
         # can never re-enter itself.
         git_log = _git_argv_path(tmp_path)
@@ -218,35 +213,11 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
             'json.dumps(sys.argv[2:])+"\\n")\' '
             f'{git_log} "$@"\n'
         )
-        if pad_commit_output:
-            # Only `commit` invocations are padded. Skip any leading `-C
-            # <dir>` pair(s) before checking the subcommand, mirroring
-            # _forbidden_reason's own argv walk below, so this cannot be
-            # fooled by option placement either. Non-commit calls (rev-parse,
-            # status, the scoped add --) fall through to the plain `exec`
-            # branch, untouched.
-            shim.write_text(
-                '#!/usr/bin/env bash\n'
-                + record_snippet +
-                'rest=("$@")\n'
-                'while [ "${rest[0]:-}" = "-C" ] && [ "${#rest[@]}" -ge 2 ]; do\n'
-                '    rest=("${rest[@]:2}")\n'
-                'done\n'
-                'if [ "${rest[0]:-}" = "commit" ]; then\n'
-                f'    out="$({real_git} "$@" 2>&1)"\n'
-                '    rc=$?\n'
-                '    printf \'%s\' "$out"\n'
-                f'    head -c {pad_commit_output} /dev/zero | tr \'\\0\' x\n'
-                '    exit "$rc"\n'
-                'fi\n'
-                f'exec {real_git} "$@"\n'
-            )
-        else:
-            shim.write_text(
-                '#!/usr/bin/env bash\n'
-                + record_snippet +
-                f'exec {real_git} "$@"\n'
-            )
+        shim.write_text(
+            '#!/usr/bin/env bash\n'
+            + record_snippet +
+            f'exec {real_git} "$@"\n'
+        )
         shim.chmod(0o755)
 
     repo = tmp_path / 'fake-repo'
@@ -259,6 +230,7 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
         env.pop(key, None)
     # An ambient operator pin would steer the default prefix to a REAL uv.
     env.pop('UV_BIN', None)
+    env.pop('CENSUS_LANDING_TIMEOUT_SECS', None)
     if default_prefix:
         for key in ('COVERAGE_CENSUS_CMD', 'RETRO_STAMP_CMD'):
             env.pop(key, None)
@@ -575,28 +547,29 @@ def test_wrapper_resolves_uv_only_for_the_half_without_a_seam(
         assert call['argv'][:len(expected_head)] == expected_head, call
 
 
-# ── the wrapper commits what it regenerates (esc-4006-5) ────────────────────
+# ── the wrapper lands what it regenerates through the merge queue ───────────
 #
-# The census rewrites three GIT-TRACKED files under $REPO/plans/, and $REPO
-# defaults to the machine-operated project_root checkout. Leaving them dirty
-# every morning is not untidiness: memory-metadata-coverage-history.json is
-# APPEND-ONLY and IS the trend this task exists to build, so an uncommitted
-# append that the merge worker's advance path resets away takes that night's
-# row with it -- permanently, and with no error anywhere.
-#
-# Precedent for committing rather than not: both legibility jobs commit
-# through scripts/legibility/unlanded.py::commit_only, a scoped
-# `git commit --only` (the 03:00 census commits docs/legibility/census-state.json
-# with it).
+# The census regenerates three GIT-TRACKED files under plans/, and the history
+# file is APPEND-ONLY: it IS the trend this job builds, so a night's row that
+# never reaches main is lost for good. The wrapper lands the changed artifacts
+# on $REPO's main through $REPO's own merge queue
+# (scripts/_merge_queue_landing.py::land_files), never by a direct commit to
+# the machine-operated project_root checkout. These run the real wrapper end
+# to end against FakeEscalationMcp + FakeMergeQueue, which lands for real.
 
 _ARTIFACTS = (
     'plans/memory-metadata-census-report.json',
     'plans/memory-metadata-census-report.md',
     'plans/memory-metadata-coverage-history.json',
 )
+_HISTORY = 'plans/memory-metadata-coverage-history.json'
 
-# A night whose census rewrote all three artifacts.
+# What main carries, and a night whose census rewrote all three artifacts.
+_BASELINE = {rel: '{"baseline": true}\n' for rel in _ARTIFACTS}
 _REGENERATED = {rel: '{"regenerated": true}\n' for rel in _ARTIFACTS}
+
+_DEPLOY_BRANCH = re.compile(r'deploy-memory-metadata-census-\d{8}T\d{6}Z')
+_ORCHESTRATOR_CONFIG = 'dark-factory-orchestrator.yaml'
 
 
 def _git(repo, *args):
@@ -632,19 +605,34 @@ def _git_repo_harness(tmp_path, *, tracked=True, initial_branch='main'):
     _git(repo, 'config', 'commit.gpgsign', 'false')
 
     if tracked:
-        for rel in _ARTIFACTS:
-            (repo / rel).write_text('{"baseline": true}\n')
+        for rel, content in _BASELINE.items():
+            (repo / rel).write_text(content)
         _git(repo, 'add', '--', *_ARTIFACTS)
-        _git(repo, 'commit', '-q', '--no-verify', '-m', 'baseline')
-        return repo
-
-    # An untracked-artifacts repo still needs a root commit, so that `git
-    # commit --only <untracked path>` fails the way a real first run fails
-    # rather than the way an empty repo does.
-    (repo / 'README.md').write_text('unrelated\n')
-    _git(repo, 'add', '--', 'README.md')
+    else:
+        (repo / 'README.md').write_text('unrelated\n')
+        _git(repo, 'add', '--', 'README.md')
     _git(repo, 'commit', '-q', '--no-verify', '-m', 'baseline')
     return repo
+
+
+def _commit_orchestrator_config(repo, port):
+    """Commit *repo*'s dark-factory-orchestrator.yaml naming escalation *port*
+    (None: an escalation section with no port), so the checkout stays clean."""
+    escalation = f'escalation:\n  port: {port}\n' if port is not None else 'escalation: {}\n'
+    (repo / _ORCHESTRATOR_CONFIG).write_text(f'project_root: /nowhere\n{escalation}')
+    _git(repo, 'add', '--', _ORCHESTRATOR_CONFIG)
+    _git(repo, 'commit', '-q', '--no-verify', '-m', 'orchestrator config')
+
+
+@contextlib.contextmanager
+def _census_queue(repo, *, port_in_config=True, **queue_kwargs):
+    """*repo*'s merge queue: a FakeMergeQueue(**queue_kwargs) behind a
+    loopback escalation MCP whose port *repo*'s committed orchestrator config
+    names (none when *port_in_config* is false). Yields (queue, server)."""
+    queue = FakeMergeQueue(repo, **queue_kwargs)
+    with FakeEscalationMcp(tool_handlers=queue.handlers()) as server:
+        _commit_orchestrator_config(repo, server.port if port_in_config else None)
+        yield queue, server
 
 
 def _run_wrapper_in_git_repo(tmp_path, repo, **kwargs):
@@ -657,249 +645,197 @@ def _run_wrapper_in_git_repo(tmp_path, repo, **kwargs):
     return result, json.loads(state_path.read_text())
 
 
-def test_wrapper_commits_the_artifacts_it_regenerated(tmp_path):
-    """THE point of the fix. The history file is append-only and IS the trend;
-    an append left uncommitted in the machine-operated main checkout can be
-    reset away by the merge worker, silently losing that night's row."""
+def _main(repo):
+    return _git(repo, 'rev-parse', 'main').stdout.strip()
+
+
+def _landed_files(repo):
+    """The paths the deploy commit main^2 changed."""
+    return sorted(_git(repo, 'show', '--name-only', '--format=', 'main^2').stdout.split())
+
+
+def _assert_left_nothing_behind(tmp_path, repo):
+    assert_target_checkout_clean(repo)
+    scratch = _scratch_dir(tmp_path)
+    assert os.listdir(scratch) == [], f'scratch left behind: {os.listdir(scratch)}'
+
+
+def _utc_dates_spanning(run):
+    """The UTC dates a census commit message made during *run* may carry."""
+    before = datetime.now(UTC).strftime('%Y-%m-%d')
+    outcome = run()
+    return outcome, {before, datetime.now(UTC).strftime('%Y-%m-%d')}
+
+
+def test_a_drift_night_lands_its_artifacts_through_one_normal_lane_request(tmp_path):
+    """THE point of the job: the history row reaches main, gate-verified, as a
+    merge of a unique deploy branch, and project_root is never written."""
     repo = _git_repo_harness(tmp_path)
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+    with _census_queue(repo, states=['verifying', 'done']) as (queue, _):
+        base = _main(repo)
+        (result, _), dates = _utc_dates_spanning(lambda: _run_wrapper_in_git_repo(
+            tmp_path, repo, census_writes=_REGENERATED))
 
-    assert result.returncode == 0, (
-        f'stdout={result.stdout!r} stderr={result.stderr!r}')
-    status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
-    assert status.strip() == '', (
-        f'artifacts left dirty after the run: {status!r}')
-    subject = _git(repo, 'log', '-1', '--pretty=%s').stdout.strip()
-    assert subject != 'baseline', 'no commit was made'
-
-
-def test_wrapper_commits_artifacts_git_has_never_tracked(tmp_path):
-    """The FIRST-EVER run, and the one path no other test reaches.
-
-    `git commit --only <path>` fails outright for a path git has never seen
-    ("did not match any file(s) known to git"), so the wrapper stages those
-    paths scoped and retries once. Every other git test here seeds the
-    artifacts as already-tracked, so the retry branch never executed and a
-    typo in it -- or a future change to git's message -- would silently turn
-    the very first night into a narrated non-commit, losing the baseline row
-    the whole commit step exists to protect.
-    """
-    repo = _git_repo_harness(tmp_path, tracked=False)
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
-
-    assert result.returncode == 0, (
-        f'stdout={result.stdout!r} stderr={result.stderr!r}')
-    # commit=0 in the narration, not merely "the script survived".
-    assert 'commit=0' in result.stdout, result.stdout
-    assert 'committed the regenerated artifacts' in result.stdout
-    status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
-    assert status.strip() == '', f'artifacts left untracked/dirty: {status!r}'
-    # All three landed in ONE commit, and the scope held: README.md was
-    # already committed, so the retry's `git add --` must not have swept
-    # anything else in.
-    files = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout.split()
-    assert sorted(files) == sorted(_ARTIFACTS), files
-
-
-def test_the_untracked_retry_is_reached_only_because_the_plain_commit_fails(
-        tmp_path):
-    """Reachability, in the shape step-25 established for the git guard.
-
-    Asserts the PRECONDITION the retry branch keys on actually holds for
-    real git here: a scoped commit of a never-tracked path fails, and fails
-    with the message the wrapper greps for. If git ever reworded it, this
-    fails loudly instead of the wrapper silently not committing.
-    """
-    repo = _git_repo_harness(tmp_path, tracked=False)
+    assert result.returncode == 0, _diag(result)
+    (submitted,) = queue.calls_to('merge_request')
+    assert submitted['lane'] == 'normal' and submitted['verified_green'] is False, submitted
+    assert _DEPLOY_BRANCH.fullmatch(submitted['branch']), submitted
+    assert repo.resolve() not in Path(submitted['worktree']).resolve().parents, submitted
+    assert _git(repo, 'log', '-1', '--format=%s', 'main').stdout.strip() == (
+        f'Merge task/{submitted["branch"]} into main')
+    subject = _git(repo, 'log', '-1', '--format=%s', 'main^2').stdout.strip()
+    assert subject in {f'chore(census): nightly canonical/topic coverage census {d}'
+                       for d in dates}, subject
+    assert sorted(_git(repo, 'diff', '--name-only', base, 'main').stdout.split()) == sorted(
+        _ARTIFACTS)
     for rel, content in _REGENERATED.items():
-        (repo / rel).write_text(content)
-    proc = subprocess.run(
-        ['git', '-C', str(repo), 'commit', '--only', *_ARTIFACTS, '-m', 'probe'],
-        capture_output=True, text=True, timeout=60,
-    )
-    assert proc.returncode != 0
-    assert 'did not match any file' in (proc.stdout + proc.stderr).lower()
+        assert (repo / rel).read_text() == content, rel
+    assert 'commit=0 commit-step=landed:mr-deploy0001)' in _done_line(result.stdout), _diag(result)
+    _assert_left_nothing_behind(tmp_path, repo)
 
 
-# Trailing bytes appended AFTER git's real (verbatim) commit output, to force
-# the retry predicate's SIGPIPE misread deterministically rather than at its
-# natural ~0.6%-under-load rate.
-#
-# Mirrors tests/scripts/shell_sections.py::SIGPIPE_BULK_BYTES
-# (task 4204): that file's 30-trials-per-size measurement records 65536 as
-# FLAKY at 26/30 while 262144 and above are 30/30. Do NOT lower this -- a
-# too-small pad does not make the test flaky, it silently weakens its power to
-# catch a reintroduced `printf | grep -q` pipeline, which is worse because it
-# is invisible. (This task separately measured 200/200 at ~200KB on this box;
-# 262144 is the repo's already-established, better-sampled floor.)
-_PAD_COMMIT_OUTPUT_BYTES = 262144
-
-
-def test_the_untracked_retry_is_decided_by_gits_message_not_its_volume(
-        tmp_path):
-    """The untracked-run retry decision must be read from git's MESSAGE, not
-    manufactured by how much git printed.
-
-    ROOT CAUSE. The retry predicate (wrapper lines ~199-201) is
-
-        printf '%s' "$commit_out" | grep -qi 'did not match any file'
-
-    under `set -uo pipefail` (wrapper line 68). `grep -q` exits the instant
-    it matches, and the match is on line 1 of git's own error message; the
-    `printf` writer can then die of SIGPIPE once `commit_out` exceeds the pipe
-    buffer, `pipefail` promotes the pipeline's status to 141, and a TRUE
-    predicate reads FALSE -- so the scoped `git add --` retry is skipped and
-    the first-ever-run commit silently does not happen, even though the
-    string the grep looks for was genuinely present in `commit_out`.
-
-    MEASURED (this worktree, 2026-09-01, git 2.43.0, bash 5.2.21, fleet load
-    avg ~127/32 cores): 25/4000 (0.6%) misses at git's natural ~270-byte
-    message -- an intermittent flake, not a deterministic failure -- and
-    200/200 once the payload passes the pipe buffer. This test buys the
-    deterministic RED the second way: `pad_commit_output=
-    _PAD_COMMIT_OUTPUT_BYTES` inflates ONLY the volume `commit_out` carries
-    (git's real message is replayed verbatim first, and git's real exit
-    status is preserved) -- never git's message or status -- so a 0.6% race
-    becomes a certainty.
-
-    Already-fixed siblings of this exact defect class, adopted here rather
-    than rediscovered: scripts/setup-host.sh::_parity_verdict and
-    scripts/legibility/install-trickle-timer.sh (task 3527, commit
-    5653ccd4f5) -- both replaced `printf | grep -q` with bash's own `[[ ]]`
-    for the identical SIGPIPE-under-pipefail reason.
-
-    Asserts on the BRANCH THE WRAPPER TOOK -- the recorded argv, the
-    narration, the resulting commit -- never on "did the internal pipeline
-    return 141". Measured: that pipeline returns 141 at every payload size
-    tried, including 4096 bytes; it is only the VERDICT drawn from it that
-    races, so a bare exit-141 check would be green on a healthy wrapper too.
-    """
+def test_the_first_ever_run_lands_the_artifacts_as_new_files(tmp_path):
     repo = _git_repo_harness(tmp_path, tracked=False)
-    result, _ = _run_wrapper_in_git_repo(
-        tmp_path, repo, record_git=True,
-        pad_commit_output=_PAD_COMMIT_OUTPUT_BYTES, census_writes=_REGENERATED,
-    )
-    recorded = [
-        json.loads(line)
-        for line in _git_argv_path(tmp_path).read_text().splitlines() if line
-    ]
+    with _census_queue(repo) as _:
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
 
-    assert result.returncode == 0, (
-        f'stdout={result.stdout!r} stderr={result.stderr[:400]!r}')
-    # THE HONEST-FAILURE ASSERTION, checked FIRST -- same ordering as the
-    # honest-failure assertion in test_wrapper_never_invokes_a_forbidden_git_verb
-    # below (commit-step confirmed before argv is trusted). On the regression
-    # this test guards against, `commit_out` is padded on EVERY commit
-    # attempt, including the failed first one whose message the wrapper
-    # echoes to stderr on the `failed` branch -- so a stderr TAIL slice on
-    # that failure is a wall of padding, not a diagnostic (confirmed
-    # empirically). The commit-step token names the branch directly instead.
-    observed_step = _commit_step(result)
-    assert observed_step == 'committed', (
-        f'expected commit-step=committed, observed {observed_step!r}; '
-        f'stdout={result.stdout!r} stderr={result.stderr[:400]!r}')
-    # The scoped retry actually fired for THIS run -- the branch under test,
-    # not merely "the script survived". Same substring idiom as the pooled
-    # guard below (' add -- ' padded on both sides so a bare `add` verb never
-    # matches), scoped to this one run's own recorded argv. Checked only once
-    # the commit-step assertion above has confirmed this run actually
-    # committed, so a decline and a missing substring can never again be
-    # conflated into the same failure.
-    flat = [' '.join(a) for a in recorded]
-    assert any(' add -- ' in f'{c} ' for c in flat), (
-        f'the scoped `git add --` retry never fired for this run: {flat!r}')
-    assert 'committed the regenerated artifacts' in result.stdout, result.stdout
-    assert 'commit=0' in result.stdout, result.stdout
-    # All three landed in the one retried commit -- the retry stayed scoped.
-    files = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout.split()
-    assert sorted(files) == sorted(_ARTIFACTS), files
+    assert _commit_step(result) == 'landed:mr-deploy0001', _diag(result)
+    added = _git(repo, 'diff', '--name-only', '--diff-filter=A', 'main^1', 'main').stdout.split()
+    assert sorted(added) == sorted(_ARTIFACTS), added
+    _assert_left_nothing_behind(tmp_path, repo)
 
 
-def test_wrapper_commit_is_scoped_and_never_sweeps_unrelated_dirty_state(
-        tmp_path):
-    """CLAUDE.md's rule for this checkout: `git commit --only <paths>`, never a
-    bare `git commit` and never `git add -A`. A concurrent process's WIP in the
-    same tree must not be swept into the census's nightly commit."""
+def test_a_partial_drift_lands_only_the_artifacts_that_changed(tmp_path):
     repo = _git_repo_harness(tmp_path)
-    bystander = repo / 'plans' / 'someone-elses-wip.md'
-    bystander.write_text('concurrent work, not ours\n')
+    with _census_queue(repo) as _:
+        result, _ = _run_wrapper_in_git_repo(
+            tmp_path, repo, census_writes={_HISTORY: _REGENERATED[_HISTORY]})
+
+    assert _commit_step(result) == 'landed:mr-deploy0001', _diag(result)
+    assert _landed_files(repo) == [_HISTORY]
+
+
+def test_bystander_state_in_repo_survives_and_stays_out_of_the_landing(tmp_path):
+    """A concurrent process's WIP in project_root is not the census's to
+    land or to touch. No staged bystander: the fake lands with a real
+    `git merge`, which aborts on a dirty index the lane's own advance parks."""
+    repo = _git_repo_harness(tmp_path)
     tracked_bystander = repo / 'README.md'
     tracked_bystander.write_text('unrelated tracked edit\n')
     _git(repo, 'add', '--', 'README.md')
     _git(repo, 'commit', '-q', '--no-verify', '-m', 'bystander baseline')
     tracked_bystander.write_text('unrelated tracked edit, now dirty\n')
+    untracked_bystander = repo / 'plans' / 'someone-elses-wip.md'
+    untracked_bystander.write_text('concurrent work, not ours\n')
 
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
-    assert result.returncode == 0, result.stderr
+    with _census_queue(repo) as _:
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
 
-    committed = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout
-    assert 'someone-elses-wip.md' not in committed, committed
-    assert 'README.md' not in committed, committed
-    for rel in _ARTIFACTS:
-        assert rel in committed, f'{rel} missing from {committed!r}'
-    # And the bystanders are still exactly as the other process left them.
-    assert bystander.exists()
-    assert 'now dirty' in tracked_bystander.read_text()
+    assert _commit_step(result) == 'landed:mr-deploy0001', _diag(result)
+    assert _landed_files(repo) == sorted(_ARTIFACTS)
+    assert tracked_bystander.read_text() == 'unrelated tracked edit, now dirty\n'
+    assert untracked_bystander.read_text() == 'concurrent work, not ours\n'
 
 
-def test_wrapper_treats_an_unchanged_artifact_set_as_a_no_op_not_a_failure(
-        tmp_path):
-    """A night whose corpus did not drift produces byte-identical artifacts.
-    `git commit` reports "nothing to commit" with a NON-ZERO code; reading that
-    as a fault would narrate a failure every quiet night."""
+def test_a_night_the_census_reported_a_shortfall_still_lands(tmp_path):
+    """The census exits 1 by design when `coverage.complete` is false, and the
+    artifacts it wrote carry the evidence of that shortfall."""
     repo = _git_repo_harness(tmp_path)
-    before = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
+    with _census_queue(repo) as _:
+        result, _ = _run_wrapper_in_git_repo(
+            tmp_path, repo, census_exit=1, census_writes=_REGENERATED)
 
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
-    assert result.returncode == 0, result.stderr
-    after = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
-    assert after == before, 'an empty commit was created'
-    combined = result.stdout + result.stderr
-    assert 'commit=0' in combined, (
-        f'a no-drift night must not be narrated as a commit failure: '
-        f'{combined!r}')
+    assert result.returncode == 0, _diag(result)
+    assert 'census=1 ' in _done_line(result.stdout), _diag(result)
+    assert _commit_step(result) == 'landed:mr-deploy0001', _diag(result)
+    assert _landed_files(repo) == sorted(_ARTIFACTS)
+
+
+def test_a_night_without_drift_asks_the_queue_nothing(tmp_path):
+    """A quiet night regenerates main's exact bytes."""
+    repo = _git_repo_harness(tmp_path)
+    with _census_queue(repo) as (_, server):
+        before = _main(repo)
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_BASELINE)
+        calls = server.tool_calls()
+
+    assert result.returncode == 0, _diag(result)
+    assert 'commit=0 commit-step=skipped:no-drift)' in _done_line(result.stdout), _diag(result)
+    assert calls == []
+    assert _main(repo) == before
+    _assert_left_nothing_behind(tmp_path, repo)
+
+
+def test_a_landing_the_queue_refuses_is_narrated_and_still_exits_zero(tmp_path):
+    repo = _git_repo_harness(tmp_path)
+    with _census_queue(repo, states=['verifying', 'conflict']) as _:
+        before = _main(repo)
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+
+    assert result.returncode == 0, _diag(result)
+    assert 'commit=1 commit-step=failed:not_landed)' in _done_line(result.stdout), _diag(result)
+    assert _main(repo) == before
+    _assert_left_nothing_behind(tmp_path, repo)
+
+
+def test_the_landing_ceiling_is_the_units_environment_knob(tmp_path):
+    repo = _git_repo_harness(tmp_path)
+    with _census_queue(repo, states=['verifying'], eta_seconds=0.2) as (queue, _):
+        result, _ = _run_wrapper_in_git_repo(
+            tmp_path, repo, census_writes=_REGENERATED,
+            extra_env={'CENSUS_LANDING_TIMEOUT_SECS': '1'})
+
+    assert _commit_step(result) == 'failed:timed_out', _diag(result)
+    assert queue.calls_to('merge_cancel') == [{'request_id': queue.request_id}]
+    _assert_left_nothing_behind(tmp_path, repo)
+
+
+def test_a_config_naming_no_escalation_port_is_refused_before_any_call(tmp_path):
+    repo = _git_repo_harness(tmp_path)
+    with _census_queue(repo, port_in_config=False) as (_, server):
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+        calls = server.tool_calls()
+
+    assert result.returncode == 0, _diag(result)
+    assert 'commit=1 commit-step=refused:no-escalation-port)' in _done_line(result.stdout), (
+        _diag(result))
+    assert calls == []
+
+
+def test_uncommitted_state_at_an_artifact_path_is_refused_and_left_alone(tmp_path):
+    """Landing over it would halt the whole queue (wip_overlap) or overwrite it."""
+    repo = _git_repo_harness(tmp_path)
+    dirty = repo / _HISTORY
+    dirty.write_text('{"an operator is editing this": true}\n')
+
+    with _census_queue(repo) as (queue, _):
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+
+    assert _commit_step(result) == 'failed:checkout_dirty', _diag(result)
+    assert dirty.read_text() == '{"an operator is editing this": true}\n'
+    assert queue.calls_to('merge_request') == []
 
 
 def test_wrapper_still_exits_zero_when_the_commit_cannot_happen(tmp_path):
-    """Same oneshot contract as the other two halves: a commit failure is
-    narrated, never propagated, or the timer wedges in `failed` state and the
-    trend quietly ends. Exercised with $REPO not a git repo at all -- which is
-    also the state every other wrapper test runs in."""
+    """Same oneshot contract as the other two halves: a landing that cannot
+    happen is narrated, never propagated, or the timer wedges in `failed`
+    state and the trend quietly ends. Exercised with $REPO not a git repo at
+    all -- which is also the state the argv and uv tests run in."""
     result, calls = _run_wrapper(tmp_path)          # plain tmp dir, no .git
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
-    # Both halves still ran; the commit step aborted neither.
+    # Both halves still ran; the landing step aborted neither.
     assert [c['who'] for c in calls] == ['CENSUS', 'STAMP'], calls
-
-
-def test_wrapper_commits_even_when_the_census_reported_a_shortfall(tmp_path):
-    """The census exits 1 by design when `coverage.complete` is false, and the
-    header is explicit that the artifacts still carry the evidence of the
-    shortfall. That evidence is exactly what must reach the repo."""
-    repo = _git_repo_harness(tmp_path)
-    before = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_exit=1,
-                                         census_writes=_REGENERATED)
-    assert result.returncode == 0, result.stderr
-
-    after = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
-    assert after != before, (
-        'a shortfall night committed nothing — the evidence never reached '
-        'the repo')
-    committed = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout
-    for rel in _ARTIFACTS:
-        assert rel in committed, f'{rel} missing from {committed!r}'
 
 
 def test_wrapper_narrates_the_commit_outcome_alongside_the_other_two(tmp_path):
     """Exiting 0 must never mean the outcome is invisible -- the journal is the
     only place this job is readable."""
     repo = _git_repo_harness(tmp_path)
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
-    combined = result.stdout + result.stderr
-    assert 'census=0' in combined, combined
-    assert 'stamp=0' in combined, combined
-    assert 'commit=0' in combined, combined
+    with _census_queue(repo) as _:
+        result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+    line = _done_line(result.stdout)
+    assert 'census=0 stamp=0 commit=0 commit-step=' in line, line
 
 
 def _done_line(output):
@@ -926,14 +862,14 @@ def _parse_commit_step(line):
 
 
 def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
-    """Of the wrapper's five commit-step outcomes, FOUR narrate `commit=0` on
-    the final done(...) line -- which reads as success while nothing was
-    committed. In an unattended nightly whose journal is its only readable
-    surface, "declined" and "committed" being indistinguishable in the
+    """Of the seven commit-step outcomes driven here, FOUR narrate `commit=0`
+    on the final done(...) line -- which reads as success while nothing
+    landed. In an unattended nightly whose journal is its only readable
+    surface, "declined" and "landed" being indistinguishable in the
     summary line is exactly the silent-degradation shape CLAUDE.md's
     loud-over-silent norm warns about.
 
-    Drives the REAL wrapper into all five branches with the harnesses already
+    Drives the REAL wrapper into all seven branches with the harnesses already
     established in this file (INV-10 `guards-exercise-behaviour`: no
     source-text scanning) and asserts every done(...) line carries a
     `commit-step=<token>` field EQUAL TO the token that branch is contracted
@@ -946,13 +882,21 @@ def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
     """
     scenarios = {}
 
-    committed_repo = _git_repo_harness(tmp_path / 'committed')
-    scenarios['committed'], _ = _run_wrapper_in_git_repo(
-        tmp_path / 'committed', committed_repo, census_writes=_REGENERATED)
+    for token, states in (('landed:mr-deploy0001', ['verifying', 'done']),
+                          ('failed:not_landed', ['verifying', 'conflict'])):
+        scene = tmp_path / token.replace(':', '-')
+        landing_repo = _git_repo_harness(scene)
+        with _census_queue(landing_repo, states=states):
+            scenarios[token], _ = _run_wrapper_in_git_repo(
+                scene, landing_repo, census_writes=_REGENERATED)
 
     no_drift_repo = _git_repo_harness(tmp_path / 'no-drift')
     scenarios['skipped:no-drift'], _ = _run_wrapper_in_git_repo(
         tmp_path / 'no-drift', no_drift_repo)
+
+    no_main_repo = _git_repo_harness(tmp_path / 'no-main', initial_branch='trunk')
+    scenarios['failed:generation-worktree'], _ = _run_wrapper_in_git_repo(
+        tmp_path / 'no-main', no_main_repo)
 
     # _wrapper_harness builds `<dir>/wbin` without `parents=True`, so (unlike
     # the _git_repo_harness-backed scenarios above, whose own `parents=True`
@@ -1013,9 +957,10 @@ def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
 # Both problems are the same problem: a TEXT scan cannot tell code from prose.
 # Recording argv cannot be fooled by either, and needs no comment stripping, no
 # regex over source, and no hand-maintained copy of the wrapper's legitimate
-# calls. Every one of the wrapper's five git call sites (rev-parse, status
-# --porcelain, commit --only, the scoped `add --`, and the commit retry) is
-# reached by the scenarios below, so this observes the whole git surface.
+# calls. The scenarios below reach every git call the wrapper makes (rev-parse,
+# the generation worktree's add, status and removal) and, through the landing,
+# every one land_files makes in $REPO and its deploy worktree, so this observes
+# the whole git surface.
 _FORBIDDEN_GIT_SUBCOMMANDS = frozenset({'stash', 'reset', 'checkout', 'clean'})
 
 
@@ -1056,13 +1001,14 @@ def test_the_forbidden_reason_helper_actually_fires():
         ['commit', '-a', '-m', 'x'], ['-C', '/repo', 'commit', '--all', '-m', 'x'],
     ):
         assert _forbidden_reason(argv), f'{argv!r} must be caught'
-    # And the wrapper's real calls must never trip it -- notably the scoped
+    # And the real calls must never trip it -- notably the landing's scoped
     # `add --`, whose `--` is neither -A, --all nor `.`.
     for argv in (
         ['-C', '/repo', 'rev-parse', '--git-dir'],
-        ['-C', '/repo', 'status', '--porcelain', '--', 'a.json'],
-        ['-C', '/repo', 'commit', '--only', 'a.json', '-m', 'msg'],
-        ['-C', '/repo', 'add', '--', 'a.json'],
+        ['-C', '/repo', 'worktree', 'add', '--detach', '--quiet', '/tmp/x/tree', 'abc123'],
+        ['-C', '/tmp/x/tree', 'status', '--porcelain', '--', 'a.json'],
+        ['-C', '/deploy', 'add', '--', 'a.json'],
+        ['-C', '/deploy', 'commit', '-q', '--no-verify', '-m', 'msg', '--', 'a.json'],
     ):
         assert _forbidden_reason(argv) is None, f'{argv!r} false-positived'
 
@@ -1105,10 +1051,10 @@ def test_the_commit_step_reader_reports_a_decline_as_a_decline():
         return subprocess.CompletedProcess(
             args=['bash'], returncode=0, stdout=stdout, stderr='')
 
-    committed = _stub(
+    landed = _stub(
         'memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 '
-        'commit-step=committed)\n')
-    assert _commit_step(committed) == 'committed'
+        'commit-step=landed:mr-deploy0001)\n')
+    assert _commit_step(landed) == 'landed:mr-deploy0001'
 
     refused = _stub(
         'memory-metadata-coverage-census: done (census=0 stamp=0 commit=1 '
@@ -1128,46 +1074,41 @@ def test_the_commit_step_reader_reports_a_decline_as_a_decline():
 
 
 def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
-    """CLAUDE.md's hardest prohibition, on a script that commits UNATTENDED
-    into the machine-operated project_root checkout.
+    """CLAUDE.md's hardest prohibition, on a script that acts UNATTENDED on
+    the machine-operated project_root checkout: its generation worktree and
+    its landing both run git there.
 
     `git stash` is the sharpest of these: refs/stash is a SINGLE ref shared by
     every worktree, and the merge worker's advance path also consumes it
     (incident 13674d3c68), so a stash here can be popped out from under an
     unrelated process.
 
-    Each scenario's evidence stays SEPARATE rather than pooled. Pooling used
-    to let an environmental/precondition decline in one iteration hide behind
-    a healthy run in another: the old anti-vacuity check only proved that a
-    scoped commit and the add-- retry happened SOMEWHERE across all three
-    runs, so a run whose retry silently declined (the printf|grep -q SIGPIPE
-    misread pinned elsewhere in this file) could still pass as long as
-    ANOTHER iteration produced that substring -- and if it ever did trip, the
-    failure dumped a saferepr-truncated pooled list naming neither the
-    iteration nor the branch (esc-3647-3). Each iteration now asserts its OWN
-    commit-step branch and, only once that is confirmed, its OWN argv -- so a
-    precondition decline fails HERE, AS a decline, naming which iteration and
-    which branch, instead of surviving to a pooled check it was never meant
-    to satisfy. The anti-vacuity INTENT is unchanged: the guard still proves
-    the scoped-commit path and the add-- retry path were genuinely exercised.
+    Each scenario's evidence stays SEPARATE rather than pooled, so a
+    precondition decline in one iteration cannot hide behind a healthy run in
+    another (esc-3647-3): each iteration asserts its OWN commit-step branch
+    and, only once that is confirmed, its OWN argv. The landing's git calls
+    run under the same recording shim, which land_files inherits on PATH.
     """
     scenarios = (
         # (label, _git_repo_harness kwargs, what the census writes,
         #  expected commit-step,
-        #  a git-argv substring that scenario's OWN run must contain)
-        ('already-tracked artifacts', {}, _REGENERATED, 'committed', 'commit --only'),
-        ('first-ever run, untracked (exercises the add-- retry)',
-         {'tracked': False}, _REGENERATED, 'committed', ' add -- '),
-        ('a quiet night with no drift', {}, None, 'skipped:no-drift', None),
+        #  git-argv substrings that scenario's OWN run must contain)
+        ('already-tracked artifacts', {}, _REGENERATED, 'landed:mr-deploy0001',
+         ('worktree add --detach', ' add -- ')),
+        ('first-ever run, untracked', {'tracked': False}, _REGENERATED,
+         'landed:mr-deploy0001', ('worktree add --detach', ' add -- ')),
+        ('a quiet night with no drift', {}, None, 'skipped:no-drift',
+         ('worktree add --detach',)),
     )
-    for label, kwargs, census_writes, expected_step, expect_substring in scenarios:
+    for label, kwargs, census_writes, expected_step, expect_substrings in scenarios:
         repo = _git_repo_harness(tmp_path / label.split()[0], **kwargs)
         env, _ = _wrapper_harness(tmp_path, record_git=True, census_writes=census_writes)
         env['REPO'] = str(repo)
-        result = subprocess.run(
-            ['bash', str(WRAPPER)], env=env,
-            capture_output=True, text=True, timeout=120,
-        )
+        with _census_queue(repo):
+            result = subprocess.run(
+                ['bash', str(WRAPPER)], env=env,
+                capture_output=True, text=True, timeout=120,
+            )
         assert result.returncode == 0, f'{label}: {result.stderr!r}'
         recorded = [
             json.loads(line)
@@ -1181,24 +1122,14 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
             reason = _forbidden_reason(argv)
             assert reason is None, f'{label}: `git {" ".join(argv)}` — {reason}'
 
-        # THE HONEST-FAILURE ASSERTION. This is what actually flaked -- the
-        # untracked iteration's retry silently skipped under the SIGPIPE
-        # misread -- and it now fails HERE, naming the iteration, the branch
-        # it was built for, and the branch it actually took, rather than
-        # surviving to a pooled check that could not tell a decline in THIS
-        # iteration from a healthy run in a different one.
         observed_step = _commit_step(result)
         assert observed_step == expected_step, (
             f'{label}: expected commit-step={expected_step!r}, observed '
             f'{observed_step!r}; recorded={recorded!r} '
             f'stderr={result.stderr[-2000:]!r}')
 
-        if expect_substring is not None:
-            # Only checked once the commit-step assertion above has already
-            # confirmed this iteration actually committed -- so a missing
-            # substring and a declined commit can never again be conflated
-            # into the same failure.
-            flat = [' '.join(a) for a in recorded]
+        flat = [' '.join(a) for a in recorded]
+        for expect_substring in expect_substrings:
             assert any(expect_substring in f'{c} ' for c in flat), (
                 f'{label}: no git call recorded containing {expect_substring!r}: '
                 f'{flat!r}')
@@ -1229,9 +1160,10 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
 def _decoy_live_repo(tmp_path):
     """A real repo standing in for the live checkout, with its own identity.
 
-    Carries the same tracked artifact paths as the real thing, so a redirected
-    `commit --only` would SUCCEED here rather than failing on an unknown
-    pathspec -- otherwise the guard could pass for the wrong reason.
+    Carries a main and the same tracked artifact paths as the real thing, so
+    a redirected generation worktree or landing would SUCCEED here rather
+    than failing on an unknown ref or path -- otherwise the guard could pass
+    for the wrong reason.
     """
     decoy = tmp_path / 'decoy-live-checkout'
     (decoy / 'plans').mkdir(parents=True)
@@ -1269,10 +1201,11 @@ def test_wrapper_cannot_commit_into_a_repo_named_only_by_ambient_git_dir(tmp_pat
     before = _decoy_state(decoy)
 
     repo = _git_repo_harness(tmp_path / 'sandbox')
-    result, state = _run_wrapper_in_git_repo(
-        tmp_path, repo, extra_env={'GIT_DIR': str(decoy / '.git')},
-        census_writes=_REGENERATED,
-    )
+    with _census_queue(repo):
+        result, state = _run_wrapper_in_git_repo(
+            tmp_path, repo, extra_env={'GIT_DIR': str(decoy / '.git')},
+            census_writes=_REGENERATED,
+        )
 
     assert _decoy_state(decoy) == before, (
         'the wrapper wrote into a repository named only by an ambient GIT_DIR; '
@@ -1281,28 +1214,28 @@ def test_wrapper_cannot_commit_into_a_repo_named_only_by_ambient_git_dir(tmp_pat
     # POSITIVE CONTROL: the run must have done its real work in the sandbox.
     # Without this the assertion above passes just as well when the wrapper
     # dies on line 1 and touches nothing anywhere.
-    assert result.returncode == 0, (
-        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    assert result.returncode == 0, _diag(result)
     assert [c['who'] for c in state] == ['CENSUS', 'STAMP'], state
-    sandbox_status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
-    assert sandbox_status.strip() == '', (
-        f'the sandbox commit did not happen, so the guard proved nothing: '
-        f'{sandbox_status!r} stdout={result.stdout!r}')
+    assert _commit_step(result) == 'landed:mr-deploy0001', (
+        f'the sandbox landing did not happen, so the guard proved nothing: {_diag(result)}')
+    assert _landed_files(repo) == sorted(_ARTIFACTS)
 
 
 def test_wrapper_commit_runs_no_hook_injected_by_ambient_git_config_parameters(
         tmp_path):
     """GIT_CONFIG_PARAMETERS is git's own `-c` channel, read at command-line
-    precedence, so an ambient one can name a core.hooksPath whose pre-commit
-    hook the wrapper's `commit --only` (no --no-verify) would run. Injected via
-    `extra_env`, AFTER the harness scrub, so the wrapper's own `unset` is what
-    is under test."""
+    precedence, so an ambient one can name a core.hooksPath whose hooks the
+    generation worktree's checkout (post-checkout) and the landing's deploy
+    commit (post-commit, which --no-verify does not skip) would run. Injected
+    via `extra_env`, AFTER the harness scrub, so the wrapper's own `unset` is
+    what is under test."""
     hooks_dir = tmp_path / 'decoy-hooks'
     hooks_dir.mkdir()
     marker = tmp_path / 'hook-ran'
-    hook = hooks_dir / 'pre-commit'
-    hook.write_text(f'#!/bin/sh\ntouch {marker}\nexit 0\n')
-    hook.chmod(0o755)
+    for name in ('pre-commit', 'post-commit', 'post-checkout'):
+        hook = hooks_dir / name
+        hook.write_text(f'#!/bin/sh\ntouch {marker}\nexit 0\n')
+        hook.chmod(0o755)
     poisoned = f"'core.hooksPath={hooks_dir}'"
 
     # PREMISE CONTROL: this host's git really runs a hook injected this way,
@@ -1318,23 +1251,22 @@ def test_wrapper_commit_runs_no_hook_injected_by_ambient_git_config_parameters(
     marker.unlink()
 
     repo = _git_repo_harness(tmp_path / 'sandbox')
-    result, state = _run_wrapper_in_git_repo(
-        tmp_path, repo, extra_env={'GIT_CONFIG_PARAMETERS': poisoned},
-        census_writes=_REGENERATED,
-    )
+    with _census_queue(repo):
+        result, state = _run_wrapper_in_git_repo(
+            tmp_path, repo, extra_env={'GIT_CONFIG_PARAMETERS': poisoned},
+            census_writes=_REGENERATED,
+        )
 
     assert not marker.exists(), (
-        'the wrapper ran a pre-commit hook injected by an ambient '
+        'the wrapper ran a hook injected by an ambient '
         f'GIT_CONFIG_PARAMETERS; stdout={result.stdout!r} stderr={result.stderr!r}')
 
-    # POSITIVE CONTROL: the commit really happened, so a hook had its chance.
-    assert result.returncode == 0, (
-        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    # POSITIVE CONTROL: the checkout and the deploy commit really happened, so
+    # a hook had its chance.
+    assert result.returncode == 0, _diag(result)
     assert [c['who'] for c in state] == ['CENSUS', 'STAMP'], state
-    sandbox_status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
-    assert sandbox_status.strip() == '', (
-        f'the sandbox commit did not happen, so the guard proved nothing: '
-        f'{sandbox_status!r} stdout={result.stdout!r}')
+    assert _commit_step(result) == 'landed:mr-deploy0001', (
+        f'the sandbox landing did not happen, so the guard proved nothing: {_diag(result)}')
 
 
 def test_harness_git_calls_cannot_be_redirected_by_ambient_git_dir(
