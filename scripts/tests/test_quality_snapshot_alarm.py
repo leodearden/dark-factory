@@ -61,7 +61,7 @@ def fake_journalctl(tmp_path, monkeypatch) -> Path:
     return record
 
 
-def _failed_arguments() -> dict:
+def _failed_arguments() -> alarm.EscalationArguments:
     run = alarm.FailedRun.from_environment('proj_a', FAILED_ENVIRON)
     return alarm.escalation_arguments(run, JOURNAL, now=NOW)
 
