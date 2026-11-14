@@ -1076,6 +1076,16 @@ category. If `disposition == "integration_skew"`:
   main" path above; `branch_bug` and `indeterminate` are handled exactly as before
   (no disposition-specific change).
 
+**A block reason starting `Plan files not touched by branch` is a claim about a
+measured range: check that the range measured this task before promoting.** Run
+`git rev-list --count <own-work base>..<branch>` and
+`git diff --name-only <own-work base>..<branch>`, where the own-work base is
+`git merge-base <branch> main`. A PARTIAL not-touched list is a suspected
+mis-measurement, not evidence of partial delivery. Also check for sibling refs
+`task/<id>-*` that carry the declared work, a rebase in progress in the worktree,
+and uncommitted edits to the declared files. While any of those holds, never
+offer "restart the task" as an option.
+
 1. Fetch the current proposal (if any):
    ```python
    task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
@@ -1100,6 +1110,19 @@ category. If `disposition == "integration_skew"`:
    )
    ```
 4. Add to digest: `PROMOTED (L2 <id>): task_failure — <task_id> — <summary>` (include proposal snippet if present)
+
+#### `plan_delivery_unmeasured`
+
+**Producer.** `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._block_if_delivery_unmeasured`
+blocks the task when the pre-merge plan-files gate failed on a range that never
+measured the task's own work. The reason starts `Plan-file delivery not measured`
+and names the cause and its remedy (`merge_lane/unmeasured_delivery.py::UnmeasuredCause`):
+an unreadable history (`retry_merge`), a stopped rebase (`finish_or_abort_rebase`),
+uncommitted declared edits (`commit_worktree_edits`), or the work on a sibling ref
+(`recover_work_from_sibling_ref`). The record's `suggested_action` carries the same
+value. Promote with `category="plan_delivery_unmeasured"` and the reason's remedy
+as option A. Never offer "restart the task" or "narrow the plan": nothing was
+measured, so neither is supported by evidence.
 
 #### `workflow_exit_contract`
 
