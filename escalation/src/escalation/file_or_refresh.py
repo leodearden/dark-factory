@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from escalation.categories import EscalationCategory, require_registered_category
@@ -58,34 +56,47 @@ def file_or_refresh(
     alone. Alarms at different levels on one task_id are separate and never
     merge, and a record no longer pending is never refreshed.
 
-    The refresh holds no lock between its read and its write, so a record
-    resolved in that gap comes back as pending, and two concurrent refreshes
-    can lose a dedupe_count increment (follow-up ticket
-    tkt_0RWWPZJQAHK6HGVB5T7F93HEVD).
+    The refresh runs under the record's per-id lock
+    (EscalationQueue.refresh_pending). A record resolved, or moved off the
+    alarm's level, after the lookup is therefore not refreshed, and the alarm
+    is filed afresh instead; concurrent refreshes each count in dedupe_count.
+    No lock spans the lookup and make_id, so two concurrent FIRST filings can
+    each file.
 
     Failures propagate, and the caller decides what a failed filing costs.
     """
     pending = queue.get_by_task(alarm.task_id, status='pending', level=alarm.level)
     if pending:
-        escalation = dataclasses.replace(
-            pending[0],
-            summary=summary,
-            detail=detail,
-            timestamp=datetime.now(UTC).isoformat(),
-            dedupe_count=pending[0].dedupe_count + 1,
+        refreshed = queue.refresh_pending(
+            pending[0].id, level=alarm.level, summary=summary, detail=detail,
         )
-    else:
-        escalation = Escalation(
-            id=queue.make_id(alarm.task_id),
-            task_id=alarm.task_id,
-            agent_role=alarm.agent_role,
-            severity=alarm.severity,
-            level=alarm.level,
-            category=alarm.category,
-            summary=summary,
-            detail=detail,
-            suggested_action=alarm.suggested_action,
-            filing_claimant_run_id=filing_claimant_run_id,
-        )
+        if refreshed is not None:
+            return refreshed
+    return _file_afresh(
+        queue, alarm, summary=summary, detail=detail,
+        filing_claimant_run_id=filing_claimant_run_id,
+    )
+
+
+def _file_afresh(
+    queue: EscalationQueue,
+    alarm: RefreshableAlarm,
+    *,
+    summary: str,
+    detail: str,
+    filing_claimant_run_id: str | None,
+) -> Escalation:
+    escalation = Escalation(
+        id=queue.make_id(alarm.task_id),
+        task_id=alarm.task_id,
+        agent_role=alarm.agent_role,
+        severity=alarm.severity,
+        level=alarm.level,
+        category=alarm.category,
+        summary=summary,
+        detail=detail,
+        suggested_action=alarm.suggested_action,
+        filing_claimant_run_id=filing_claimant_run_id,
+    )
     queue.submit(escalation)
     return escalation

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,38 @@ L1_ALARM = RefreshableAlarm(
 class _SubmitFailsQueue(EscalationQueue):
     def submit(self, escalation: Escalation) -> str:
         raise OSError('disk full')
+
+
+class _RefreshFailsQueue(EscalationQueue):
+    def refresh_pending(
+        self, escalation_id: str, *, level: int, summary: str, detail: str,
+    ) -> Escalation | None:
+        raise OSError('disk full')
+
+
+class _ResolvedAfterLookupQueue(EscalationQueue):
+    def get_by_task(
+        self, task_id: str, status: str | None = None, level: int | None = None,
+        agent_role: str | None = None,
+    ) -> list[Escalation]:
+        found = super().get_by_task(task_id, status=status, level=level, agent_role=agent_role)
+        if found:
+            self.resolve(found[0].id, 'resolved in the gap', resolved_by='test')
+        return found
+
+
+class _LookupBarrierQueue(EscalationQueue):
+    def __init__(self, queue_dir: Path, parties: int) -> None:
+        super().__init__(queue_dir)
+        self._after_lookup = threading.Barrier(parties, timeout=30)
+
+    def get_by_task(
+        self, task_id: str, status: str | None = None, level: int | None = None,
+        agent_role: str | None = None,
+    ) -> list[Escalation]:
+        found = super().get_by_task(task_id, status=status, level=level, agent_role=agent_role)
+        self._after_lookup.wait()
+        return found
 
 
 @pytest.fixture
@@ -136,6 +170,50 @@ class TestOnlyAPendingRecordAtTheAlarmLevelIsRefreshed:
         assert resolved.status == 'resolved'
 
 
+class TestARefreshCannotRaceTheRecord:
+    def test_a_record_resolved_after_the_lookup_stays_resolved_and_the_alarm_is_filed_afresh(
+        self, queue, tmp_path,
+    ):
+        first = file_or_refresh(
+            queue, ALARM, summary='first', detail='detail', filing_claimant_run_id='run-a',
+        )
+        gap_queue = _ResolvedAfterLookupQueue(tmp_path / 'escalations')
+
+        second = file_or_refresh(
+            gap_queue, ALARM, summary='second', detail='detail', filing_claimant_run_id='run-b',
+        )
+
+        assert second.id == 'esc-file-or-refresh-test-2'
+        assert second.dedupe_count == 0
+        assert second.status == 'pending'
+        assert second.filing_claimant_run_id == 'run-b'
+        resolved = queue.get(first.id)
+        assert resolved is not None
+        assert resolved.status == 'resolved'
+        assert [esc.id for esc in queue.get_pending()] == [second.id]
+
+    def test_concurrent_refreshes_each_count(self, queue, tmp_path):
+        file_or_refresh(
+            queue, ALARM, summary='first', detail='detail', filing_claimant_run_id='run-a',
+        )
+        barrier_queue = _LookupBarrierQueue(tmp_path / 'escalations', parties=2)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(
+                    file_or_refresh, barrier_queue, ALARM, summary=f'refresh {n}',
+                    detail='detail', filing_claimant_run_id='run-b',
+                )
+                for n in range(2)
+            ]
+            for future in futures:
+                future.result()
+
+        pending = _pending(queue)
+        assert len(pending) == 1
+        assert pending[0].dedupe_count == 2
+
+
 class TestFailures:
     def test_an_unregistered_category_is_refused_at_construction(self):
         with pytest.raises(UnregisteredEscalationCategory):
@@ -153,3 +231,17 @@ class TestFailures:
                 queue, ALARM, summary='summary', detail='detail',
                 filing_claimant_run_id='run-a',
             )
+
+    def test_a_failing_refresh_propagates_and_files_nothing_afresh(self, queue, tmp_path):
+        file_or_refresh(
+            queue, ALARM, summary='first', detail='detail', filing_claimant_run_id='run-a',
+        )
+        failing = _RefreshFailsQueue(tmp_path / 'escalations')
+
+        with pytest.raises(OSError, match='disk full'):
+            file_or_refresh(
+                failing, ALARM, summary='second', detail='detail',
+                filing_claimant_run_id='run-b',
+            )
+
+        assert len(_pending(queue)) == 1

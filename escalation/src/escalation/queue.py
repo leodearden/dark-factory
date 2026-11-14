@@ -878,13 +878,16 @@ class EscalationQueue:
                 escalation.id, escalation.task_id,
             )
 
+        self._fire_notify(escalation)
+        return escalation.id
+
+    def _fire_notify(self, escalation: Escalation) -> None:
+        """Fire the notify callback, if set; a failing callback is logged, never raised."""
         if self._notify_callback:
             try:
                 self._notify_callback(escalation)
             except Exception as e:
                 logger.warning(f'Notify callback failed for {escalation.id}: {e}')
-
-        return escalation.id
 
     def _locate_path(self, escalation_id: str) -> Path | None:
         """Return the on-disk path for *escalation_id*, or None if not found.
@@ -2357,6 +2360,39 @@ class EscalationQueue:
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc
 
+    def refresh_pending(
+        self, escalation_id: str, *, level: int, summary: str, detail: str,
+    ) -> Escalation | None:
+        """Refresh a pending record in place and count the repeat; ``None`` when there is none to refresh.
+
+        Rewrites ``summary``, ``detail`` and ``timestamp`` (now, UTC) and adds
+        one to ``dedupe_count``. Keeps every other field, including ``id``,
+        ``filing_claimant_run_id`` and ``updated_at``: a refresh is not one of
+        the ``updated_at`` writers :meth:`stamp_triage` enumerates.
+
+        The read-modify-write runs under ``escalation_id_lock`` and reads the
+        queue root only, so a record resolved or archived meanwhile is never
+        resurrected, and concurrent refreshes each count. Returns ``None`` when
+        the record is absent, not pending, or no longer at *level*.
+
+        The write is durable, and notify fires outside the lock, both as in
+        :meth:`submit`.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self._load_root_pending(escalation_id)
+            if esc is None or esc.level != level:
+                return None
+            esc.summary = summary
+            esc.detail = detail
+            esc.timestamp = datetime.now(UTC).isoformat()
+            esc.dedupe_count += 1
+            self._atomic_write(escalation_id, esc.to_json(), durable=True)
+        logger.info(
+            'refresh_pending: refreshed %s (dedupe_count=%d)', escalation_id, esc.dedupe_count,
+        )
+        self._fire_notify(esc)
+        return esc
+
     def claim_policy_class(
         self, escalation_id: str, *, policy_class: str, claimed_by: str,
         refuse: Callable[[Escalation], R | None],
@@ -2849,8 +2885,9 @@ class EscalationQueue:
         after) — the same durability guarantee ``_write_seq_counter`` already
         uses. Defaults to False so existing callers are byte-identical.
 
-        Callers: submit() (durable=True), resolve(), submit_resolved(), _rewrite()
-        (the latter three keep the default durable=False).
+        Callers: submit() and refresh_pending() (durable=True), resolve(),
+        submit_resolved(), _rewrite() (the latter three keep the default
+        durable=False).
         """
         self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text, durable=durable)
 
