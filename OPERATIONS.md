@@ -616,7 +616,8 @@ run as `client-feed@<name>.service`. Every pass writes that project's
 client-safe evidence to its `out/` (`feed.jsonl`, `state.json`,
 `cursor.json`) and reads its `in/` (`inbox.jsonl`, `engagement.json`), which
 the client portal writes. `scripts/setup-host.sh` renders the unit from
-`scripts/client-feed.service.template` and never enables it. The design is
+`scripts/client-feed.service.template` and never enables it. To install or
+refresh only this unit, use the targeted render under "Enabling an instance". The design is
 `plans/client-feed-prd.md`; what the publisher may open and write is its
 isolation invariant, §8.
 
@@ -670,7 +671,10 @@ loginctl enable-linger leo
 From the checkout root:
 
 ```bash
-bash scripts/setup-host.sh       # renders client-feed@.service; enables nothing
+# render client-feed@.service (the arguments setup-host.sh §7a passes); enables nothing:
+python3 scripts/render_systemd_unit.py --unit client-feed --template scripts/client-feed.service.template \
+  --repo-root "$PWD" --uv-path "$(command -v uv)" --output ~/.config/systemd/user/client-feed@.service \
+  && systemctl --user daemon-reload
 # install the policy (above), then publish one pass; a refusal prints on stderr and exits 1:
 uv run --no-sync --project client-feed client-feed snapshot --config ~/.config/client-feed/<name>.yaml
 systemctl --user enable --now client-feed@<name>.service
@@ -681,8 +685,12 @@ journalctl --user -u client-feed@<name>.service
 
 The unit runs `uv run --no-sync`, so the shared `.venv` must already hold
 `client-feed`. setup-host's sync installs it, and so does
-`scripts/sync-orchestrator-env.sh`. After a template change, re-run setup-host
-and restart the instance. A clean stop exits 0. A refusal exits 1, and systemd
+`scripts/sync-orchestrator-env.sh`. After a template change, re-run the render
+command above and restart the instance. Do not use a full
+`scripts/setup-host.sh` run just for this: it restarts fused-memory
+(`systemctl --user stop fused-memory`, then start) whenever `fused-memory/.env`
+exists, which bounces the server behind every orchestrator, the dashboard and
+MCP sessions. A clean stop exits 0. A refusal exits 1, and systemd
 retries it with a 5s→60s backoff until the cause is fixed.
 
 #### Reading the heartbeat's degraded list
