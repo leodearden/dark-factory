@@ -2090,14 +2090,13 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Recover a single orphaned run row to 'failed'.
 
-        Shared mechanical body for the three recovery passes — the age-based
+        Shared mechanical body for the two recovery passes — the age-based
         ``_recover_stale_runs`` reaper and the startup ``_recover_predecessor_runs``
-        and ``_recover_legacy_interrupted_runs`` passes: error-stamp the run,
-        complete it, GC its per-run config dir, restore the drained events it
-        owned, release the lock when this run's own instance still owns it,
-        and replay any deferred writes for the project. Returns the
-        ``build_stale_run_diagnostics`` dict so the caller can drive its own
-        logging/escalation policy on top of this shared body.
+        pass: error-stamp the run, complete it, GC its per-run config dir,
+        restore the drained events it owned, release the lock when this run's
+        own instance still owns it, and replay any deferred writes for the
+        project. Returns the ``build_stale_run_diagnostics`` dict so the caller
+        can drive its own logging/escalation policy on top of this shared body.
 
         The terminalisation is a compare-and-set on ``run.status``, the status
         the caller's read observed. ``None`` means the row moved on since that
@@ -2239,62 +2238,6 @@ class ReconciliationHarness:
                     'disposition': diag['disposition'],
                 },
             )
-
-    async def _recover_legacy_interrupted_runs(self) -> None:
-        """One-shot startup pass: recover every 'interrupted' row to failed,
-        whatever its owner, lock or age.
-
-        Nothing writes 'interrupted' since task 5514 retired resume; this
-        converts the rows a pre-5514 process left behind, through the same
-        :meth:`_recover_one_run` body the other recovery passes use.
-
-        Rows are recovered one at a time, in isolation. If one row's recovery
-        raises, the error is logged with that row's run id and the sweep moves
-        on, so one bad row cannot strand the hundreds behind it. If the raise
-        came before the row's write to 'failed' landed, the row stays
-        'interrupted' and the next startup's sweep retries it; nothing else
-        selects that status.
-        """
-        runs = await self.journal.get_interrupted_runs()
-        stranded: list[str] = []
-        for run in runs:
-            try:
-                await self._recover_legacy_interrupted_run(run)
-            except Exception as e:
-                stranded.append(run.id)
-                logger.warning(
-                    'Legacy interrupted run %s (project %s) failed to recover at '
-                    'startup: %r',
-                    run.id, run.project_id, e,
-                )
-        if runs:
-            logger.log(
-                logging.WARNING if stranded else logging.INFO,
-                'reconciliation.legacy_interrupted_sweep_finished',
-                extra={'rows': len(runs), 'stranded_run_ids': stranded},
-            )
-
-    async def _recover_legacy_interrupted_run(self, run: ReconciliationRun) -> None:
-        lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
-        diag = await self._recover_one_run(
-            run, lock_holder, lock_age,
-            error_type='LegacyInterruptedRunRecovery',
-            error_message=(
-                'Legacy interrupted run (resume retired, task 5514) '
-                'recovered at startup'
-            ),
-        )
-        if diag is None:
-            return
-        logger.info(
-            'reconciliation.legacy_interrupted_run_recovered',
-            extra={
-                'run_id': run.id,
-                'project_id': run.project_id,
-                'instance_id': run.instance_id,
-                'disposition': diag['disposition'],
-            },
-        )
 
     # ── Dead-owner suppression storm counter ─────────────────────────
 
@@ -2984,14 +2927,6 @@ class ReconciliationHarness:
             await self._recover_predecessor_runs()
         except Exception as e:
             logger.warning(f'_recover_predecessor_runs at startup failed: {e}')
-
-        # One-shot: convert every legacy 'interrupted' row to failed (task 5514).
-        # Guarded like the predecessor pass above so a recovery hiccup can't
-        # crash harness startup.
-        try:
-            await self._recover_legacy_interrupted_runs()
-        except Exception as e:
-            logger.warning(f'_recover_legacy_interrupted_runs at startup failed: {e}')
 
         # One-shot: re-fire the judge for any run whose verdict a restart dropped
         # in the cycle-end→verdict-commit window (task 2708). The durable

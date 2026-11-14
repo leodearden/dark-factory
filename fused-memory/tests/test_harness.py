@@ -51,7 +51,6 @@ from fused_memory.models.scope import (
 from fused_memory.reconciliation.cli_stage_runner import (
     recon_archive_root,
     recon_config_base_dir,
-    run_config_dir_path,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
@@ -5070,7 +5069,7 @@ async def test_run_full_cycle_cancelled_marks_failed_and_restores_events(
     """Under the default config, a mid-cycle CancelledError ends the run
     `failed` with a CancelledError `_error` record, re-buffers its drained
     events and GCs its config dir, while the completed stage's report stays
-    persisted. Nothing writes 'interrupted' (task 5514)."""
+    persisted."""
     import asyncio
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
@@ -5819,7 +5818,6 @@ async def test_remediation_pass_cancellation_terminalises_row_as_failed(
     assert err['sqlite_errorname'] is None
     assert 'memory_consolidator' in row.stage_reports
     assert row.id not in {r.id for r in await journal.get_running_runs()}
-    assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
 
 
 @pytest.mark.asyncio
@@ -10377,239 +10375,6 @@ async def test_recover_predecessor_runs_skips_null_instance(
     assert after is not None
     assert after.status == RunStatus.running
     harness._escalate.assert_not_called()
-
-
-# ── Startup recovery of legacy interrupted runs (task 5514) ───────────────────
-
-
-async def _persist_legacy_interrupted_run(
-    journal,
-    event_buffer,
-    *,
-    dead_pred_iid: str | None,
-    hold_lock: bool,
-    project_id: str = 'test-project',
-    run_id: str = 'run-legacy-interrupted',
-) -> ReconciliationRun:
-    """Persist an ``interrupted`` run (the status a pre-5514 process wrote)
-    owned by ``dead_pred_iid``, with Stage 1 already reported, a session
-    snapshot, and two events drained under its run id. With ``hold_lock`` the
-    dead owner still holds a fresh lock (the hard-stop shape); without it no
-    lock row exists (the clean-stop shape).
-    """
-    from fused_memory.models.reconciliation import StageId
-
-    assert event_buffer.instance_id != dead_pred_iid
-
-    stage1_report = StageReport(
-        stage=StageId.memory_consolidator,
-        started_at=datetime.now(UTC),
-        completed_at=datetime.now(UTC),
-        items_flagged=[],
-        stats={},
-        llm_calls=1,
-        tokens_used=10,
-    )
-    run = ReconciliationRun(
-        id=run_id,
-        project_id=project_id,
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.interrupted,
-        stage_reports={'memory_consolidator': stage1_report},
-        instance_id=dead_pred_iid,
-    )
-    await journal.start_run(run)
-    await journal.update_run_stage_reports(run_id, {'memory_consolidator': stage1_report})
-    await journal.record_run_session(
-        run_id, session_id='S', stage_cursor='task_knowledge_sync',
-    )
-    await journal.complete_run(run_id, 'interrupted')
-
-    for _ in range(2):
-        await event_buffer.push(_make_event(project_id))
-    await event_buffer.drain(project_id, run_id=run_id)
-    if not hold_lock:
-        return run
-
-    # Dead predecessor's surviving lock: acquire as this instance then rewrite
-    # instance_id/heartbeat_at so it corroborates the run's claimed owner and is
-    # fresh enough to escape the stale-lock sweep.
-    acquired = await event_buffer.mark_run_active(project_id)
-    assert acquired is True
-    fresh_heartbeat = datetime.now(UTC).isoformat()
-    async with event_buffer._require_access().write() as db:
-        await db.execute(
-            'UPDATE reconciliation_locks SET instance_id = ?, heartbeat_at = ? '
-            'WHERE project_id = ?',
-            (dead_pred_iid, fresh_heartbeat, project_id),
-        )
-    return run
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('lock_state', ['released', 'held_by_dead_owner', 'null_instance'])
-async def test_run_loop_startup_recovers_legacy_interrupted_runs(
-    journal, event_buffer, mock_memory_service, lock_state,
-):
-    """Task 7040: harness startup converts every legacy 'interrupted' row to
-    failed, whatever its owner, lock state or age: its drained events are
-    buffered again, its config dir is GC'd, a dead owner's lock is released,
-    and nothing is resumed."""
-    project_id = 'test-project'
-    dead_iid = None if lock_state == 'null_instance' else 'dead-pred'
-    run = await _persist_legacy_interrupted_run(
-        journal, event_buffer,
-        dead_pred_iid=dead_iid,
-        hold_lock=lock_state == 'held_by_dead_owner',
-    )
-    config_dir = run_config_dir_path(journal.data_dir, run.id)
-    config_dir.mkdir(parents=True)
-    (config_dir / 'settings.json').write_text('{}')
-
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._start_escalation_server = AsyncMock()
-    harness._stop_escalation_server = AsyncMock()
-    if harness.judge is not None:
-        harness.judge.initialize = AsyncMock()
-    harness.buffer.get_active_projects = AsyncMock(return_value=[])
-    fired = _witness(harness.buffer, 'get_active_projects')
-
-    await _drive_run_loop_until(harness, fired)
-
-    after = await journal.get_run(run.id)
-    assert after is not None
-    assert after.status == RunStatus.failed
-    assert after.stage_reports['_error']['error_type'] == 'LegacyInterruptedRunRecovery'
-    assert await event_buffer.get_drained_events(project_id, run.id) == []
-    assert await event_buffer.count_buffered(project_id) == 2
-    assert not config_dir.exists()
-    assert await event_buffer.get_lock_holder_instance_id(project_id) != 'dead-pred'
-    assert [r.id for r in await journal.get_recent_runs(project_id, limit=10)] == [run.id]
-
-
-@pytest.mark.asyncio
-async def test_run_loop_startup_recovers_a_dead_owners_running_and_interrupted_rows(
-    journal, event_buffer, mock_memory_service,
-):
-    """A dead owner that left both a 'running' and an 'interrupted' row on one
-    project, still holding its lock, has both rows recovered at startup.
-
-    This pins the pass order behaviourally: the legacy sweep releases the
-    dead owner's lock, so had it run before the predecessor pass, the
-    'running' row would have lost its corroborating lock and been left to the
-    age reaper."""
-    project_id = 'test-project'
-    interrupted = await _persist_legacy_interrupted_run(
-        journal, event_buffer, dead_pred_iid='dead-pred', hold_lock=True,
-    )
-    running = ReconciliationRun(
-        id='run-dead-pred-running',
-        project_id=project_id,
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-        instance_id='dead-pred',
-    )
-    await journal.start_run(running)
-
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._start_escalation_server = AsyncMock()
-    harness._stop_escalation_server = AsyncMock()
-    if harness.judge is not None:
-        harness.judge.initialize = AsyncMock()
-    harness.buffer.get_active_projects = AsyncMock(return_value=[])
-    fired = _witness(harness.buffer, 'get_active_projects')
-
-    await _drive_run_loop_until(harness, fired)
-
-    for run_id, error_type in (
-        (running.id, 'PredecessorRunRecovery'),
-        (interrupted.id, 'LegacyInterruptedRunRecovery'),
-    ):
-        after = await journal.get_run(run_id)
-        assert after is not None
-        assert after.status == RunStatus.failed, run_id
-        assert after.stage_reports['_error']['error_type'] == error_type
-    assert await event_buffer.get_lock_holder_instance_id(project_id) != 'dead-pred'
-
-
-@pytest.mark.asyncio
-async def test_legacy_interrupted_sweep_isolates_a_row_whose_recovery_raises(
-    journal, event_buffer, mock_memory_service, caplog,
-):
-    """A row whose recovery raises is logged by run id and stays
-    'interrupted' for the next startup's sweep, and the sweep still recovers
-    the other rows rather than aborting the backlog into _start_up's guard."""
-    run_ids = {}
-    for project_id in ('project-a', 'project-b'):
-        run = await _persist_legacy_interrupted_run(
-            journal, event_buffer, dead_pred_iid='dead-pred', hold_lock=False,
-            project_id=project_id, run_id=f'run-legacy-{project_id}',
-        )
-        run_ids[project_id] = run.id
-
-    real_complete = journal.complete_run_if_status
-    failed_run_ids: list[str] = []
-
-    async def complete_failing_first_row(run_id, **kwargs):
-        if run_id in run_ids.values() and not failed_run_ids:
-            failed_run_ids.append(run_id)
-            raise sqlite3.OperationalError('database is locked')
-        return await real_complete(run_id, **kwargs)
-
-    journal.complete_run_if_status = AsyncMock(side_effect=complete_failing_first_row)
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._start_escalation_server = AsyncMock()
-    harness._stop_escalation_server = AsyncMock()
-    if harness.judge is not None:
-        harness.judge.initialize = AsyncMock()
-    harness.buffer.get_active_projects = AsyncMock(return_value=[])
-    fired = _witness(harness.buffer, 'get_active_projects')
-
-    with caplog.at_level(logging.WARNING):
-        await _drive_run_loop_until(harness, fired)
-
-    [stranded_id] = failed_run_ids
-    for project_id, run_id in run_ids.items():
-        after = await journal.get_run(run_id)
-        assert after is not None
-        if run_id == stranded_id:
-            assert after.status == RunStatus.interrupted
-        else:
-            assert after.status == RunStatus.failed
-            assert await event_buffer.count_buffered(project_id) == 2
-    assert any(
-        r.levelno >= logging.WARNING and stranded_id in r.getMessage()
-        for r in caplog.records
-    )
-    assert '_recover_legacy_interrupted_runs at startup failed' not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_run_loop_survives_a_failing_legacy_interrupted_sweep(
-    journal, event_buffer, mock_memory_service, caplog,
-):
-    """A legacy-interrupted sweep that raises at startup is logged, and the
-    loop still goes on to discover projects."""
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._start_escalation_server = AsyncMock()
-    harness._stop_escalation_server = AsyncMock()
-    if harness.judge is not None:
-        harness.judge.initialize = AsyncMock()
-    journal.get_interrupted_runs = AsyncMock(side_effect=RuntimeError('journal exploded'))
-    harness.buffer.get_active_projects = AsyncMock(return_value=[])
-    fired = _witness(harness.buffer, 'get_active_projects')
-
-    with caplog.at_level(logging.WARNING):
-        await _drive_run_loop_until(harness, fired)
-
-    journal.get_interrupted_runs.assert_awaited()
-    assert harness.buffer.get_active_projects.await_count >= 1
-    assert '_recover_legacy_interrupted_runs at startup failed' in caplog.text
-    assert 'journal exploded' in caplog.text
 
 
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
@@ -18521,7 +18286,7 @@ class TestHarnessIndexHealthStartupSweep:
         silently stopped running — the exact 'regression to invisible' the
         cadence-half wiring test (TestFullCycleWiringIndexHealth) exists to
         prevent.  Mirrors the sibling one-shot startup contract test
-        (test_run_loop_survives_a_failing_legacy_interrupted_sweep), including
+        (test_run_loop_recovers_predecessor_runs_once_at_startup_before_reaper_ticks), including
         its raise, which also pins that the startup guard around the sweep
         cannot crash run_loop.
         """
@@ -18552,7 +18317,6 @@ class TestHarnessIndexHealthStartupSweep:
             side_effect=sweep_side_effect
         )
         harness._recover_predecessor_runs = AsyncMock(return_value=None)
-        harness._recover_legacy_interrupted_runs = AsyncMock(return_value=None)
         harness._recover_stale_runs = AsyncMock(side_effect=stale_runs_side_effect)
         harness._start_escalation_server = AsyncMock()
         harness._stop_escalation_server = AsyncMock()
