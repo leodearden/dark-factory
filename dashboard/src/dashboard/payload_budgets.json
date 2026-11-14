@@ -1,0 +1,350 @@
+{
+  "_README": [
+    "A budget is the most wire bytes one REQUEST (path plus query) may serve. Request identity is (path, query), so one route may carry several entries.",
+    "Two enforcement points read this table: the pre-merge fleet sweep (dashboard/tests/test_payload_budget_sweep.py) and the live predicate (dashboard/src/dashboard/payload_check.py, run daily by the dashboard-payload-budgets recurrence chain).",
+    "history is APPEND-ONLY. The effective budget is the last entry. To raise or lower a budget, APPEND {budget_bytes, task, reason}; never edit, reorder or delete a recorded entry. The base-relative test in dashboard/tests/test_payload_budgets.py refuses it.",
+    "Headroom convention for a new number over a fresh live measurement m: round max(1.25*m, m + 16384) up to 2 significant figures.",
+    "Slack rule (payload_budgets.MAX_SLACK_RATIO, payload_budgets.SLACK_FLOOR_BYTES): the sweep fails when a budget exceeds max(MAX_SLACK_RATIO * measured, measured + SLACK_FLOOR_BYTES), so a real shrink must be recorded as a lowered entry and a fixture that stops reaching its data turns red.",
+    "data_keyed_maps lists the key paths of dicts keyed by DATA (project labels, dates, task ids) rather than by field name. Each is a list of segments, with [] for list descent and {} for a collapsed map. Field accounting collapses their keys to {}.",
+    "exempt is for TEMPLATED routes only, each with a reason. Entry paths plus exempt paths must equal every GET route under /api/v2/dashboard/. An exemption silences that completeness guard, so it is a governed INV-12 exception: a new one needs a disposition in the dashboard.payload_budgets.exempt declaration in dashboard/tests/test_payload_budgets.py, or that suite fails at collection.",
+    "The synthetic fleet the sweep measures lives in dashboard/tests/_payload_fleet.py (its census) and dashboard/tests/_payload_fleet_seed.py (its on-disk seeders)."
+  ],
+  "schema_version": 1,
+  "endpoints": [
+    {
+      "path": "/api/v2/dashboard/tasks",
+      "query": {},
+      "data_keyed_maps": [
+        [
+          "TASKS_SNAPSHOT"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 5500000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 4,351,859 bytes with no query. 4,953 active rows across 10 projects. Dominant fields: TASKS_SNAPSHOT.{}.rows.value[].meta_files 30%, .title 15%, .deps[].title 11%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/tasks",
+      "query": {
+        "projection": "census"
+      },
+      "data_keyed_maps": [
+        [
+          "TASKS_SNAPSHOT"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 23000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 6,329 bytes with projection=census. The census projection every tab polls: per-project status counts only, no rows."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/tasks",
+      "query": {
+        "terminal": "dark-factory"
+      },
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 5900000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 4,668,273 bytes with terminal=dark-factory. The full render plus the 400-row terminal window for dark-factory (done 351, cancelled 49). Dominant fields as for the bare request: rows[].meta_files 28%, .title 14%, .deps[].title 10%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        },
+        {
+          "budget_bytes": 420000,
+          "task": "5824",
+          "reason": "Lowered after task 5824's branch merged main, where ?terminal= no longer re-serves the full render. Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 328,164 bytes."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/costs",
+      "query": {
+        "window": "all"
+      },
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 140000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 110,987 bytes with window=all. Dominant fields: COSTS.trend.labels 43% (3,650 daily labels), COSTS.events[].detail 17%."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/performance",
+      "query": {
+        "window": "all"
+      },
+      "data_keyed_maps": [
+        [
+          "PERFORMANCE"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 490000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 390,104 bytes with window=all. Nine projects. Dominant fields: PERFORMANCE.{}.{escalation,one_pass,time_centiles}_history.labels 22% each."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/merge-queue",
+      "query": {
+        "window": "all"
+      },
+      "data_keyed_maps": [
+        [
+          "MERGE_QUEUE"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 580000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 457,345 bytes with window=all. Ten projects, recent capped at 200 each. Dominant fields: MERGE_QUEUE.{}.recent[].title.reason 15%, recent[].timestamp 12%."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/burndown",
+      "query": {
+        "window": "90d"
+      },
+      "data_keyed_maps": [
+        [
+          "BURNDOWN_BY_PROJECT"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 1200000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 891,450 bytes with window=90d. About 1,320 samples per project across 10 projects. Dominant field: BURNDOWN_BY_PROJECT.{}.labels 47%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/scheduler",
+      "query": {},
+      "data_keyed_maps": [
+        [
+          "SCHEDULER",
+          "events_by_task"
+        ],
+        [
+          "SCHEDULER",
+          "recovery_event_counts"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 6700000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 5,333,368 bytes with no query. 4,953 rows and 8,278 modules. Dominant fields: SCHEDULER.rows[].lock_set 24%, rows[].title 12%, modules[].path 9%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/escalations",
+      "query": {},
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 3700000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 2,922,466 bytes with no query. 352 pending escalations in 11 queues; 241 cards embed their whole task. Dominant fields: subsections[].escalations[].task.value.description 21%, .detail 17%, .task.value.metadata.dry_run_proposals[].proposal_text 15%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        },
+        {
+          "budget_bytes": 900000,
+          "task": "5824",
+          "reason": "Lowered after task 5824's branch merged main. Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 713,606 bytes with no query. 138 pending escalations at about 5.1 KB a card, down from the 2026-10-15 population; the fleet census was re-measured to match."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/escalation-analytics",
+      "query": {},
+      "data_keyed_maps": [
+        [
+          "ESCALATION_ANALYTICS",
+          "per_project",
+          "[]",
+          "origin",
+          "daily_by_source"
+        ],
+        [
+          "ESCALATION_ANALYTICS",
+          "per_project",
+          "[]",
+          "origin",
+          "daily_by_source",
+          "{}"
+        ],
+        [
+          "ESCALATION_ANALYTICS",
+          "per_project",
+          "[]",
+          "workflow",
+          "tier_weekly"
+        ],
+        [
+          "ESCALATION_ANALYTICS",
+          "per_project",
+          "[]",
+          "workflow",
+          "churn_daily"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 1200000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 890,400 bytes with no query. Dominant field: ESCALATION_ANALYTICS.per_project[].lifespan.samples 60%."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/recon",
+      "query": {},
+      "data_keyed_maps": [
+        [
+          "RECON_STATE",
+          "watermarks"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 50000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 32,881 bytes with no query. Dominant fields: RECON_STATE.agents_spark.labels and buffer.spark.labels, 15% each."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/memory",
+      "query": {},
+      "data_keyed_maps": [
+        [
+          "MEMORY_STATUS",
+          "projects"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 57000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 39,698 bytes with no query. MEMORY_STATUS.projects holds 172 project ids. Dominant fields: queue.spark.labels 13%, projects.{}.graphiti_nodes_24h_ago 11%."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/curator",
+      "query": {},
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 34000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 17,162 bytes with no query. Small; the 16 KiB headroom floor sets this budget."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/orchestrators",
+      "query": {},
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 25000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 8,080 bytes with no query. Eight running orchestrators. Small; the 16 KiB headroom floor sets this budget."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/memory-evals",
+      "query": {},
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 21000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 4,081 bytes with no query. Three evals. Small; the 16 KiB headroom floor sets this budget."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/memory-graphs",
+      "query": {},
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 19000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 1,747 bytes with no query. Small; the 16 KiB headroom floor sets this budget."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/invariants",
+      "query": {},
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 32000,
+          "task": "5824",
+          "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 15,239 bytes with no query. Ten roots, 77 terminal-tier violations listed. Small; the 16 KiB headroom floor sets this budget."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/prds",
+      "query": {},
+      "data_keyed_maps": [
+        [
+          "PRD_VIEW"
+        ],
+        [
+          "PRD_CONTENTION"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 740000,
+          "task": "5824",
+          "reason": "Measured 2026-11-14 08:12Z against the live dashboard (127.0.0.1:8080): 590,357 bytes with no query, every PRD-holding project's PRD_VIEW Datum fresh (autotrade, mission-control and market-predictor unknown for want of tasks or a runs.db, not in flight). 333 PRDs across twelve projects: dark-factory 119, reify 110, solar-challenge-platform 37, solar-challenge 23. PRD_VIEW 96%, PRD_CONTENTION 4%. The route landed on main after the 2026-10-15 measurements and reached this table when task 5824's branch merged main."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/quality",
+      "query": {
+        "project": "dark-factory",
+        "window": "all"
+      },
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 3900000,
+          "task": "5824",
+          "reason": "Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 3,072,421 bytes at the tab's widest landing window. 3,736 landings on 14 metric series: QUALITY.value.metrics 69%, .axis 28%. On demand, not polled. The route landed on main after the 2026-10-15 measurements. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        }
+      ]
+    }
+  ],
+  "exempt": [
+    {
+      "path": "/api/v2/dashboard/task/{project:path}/T-{task_id}",
+      "reason": "Serves ONE task's prose on demand, so its size is bounded by a single task record, not by population; it cannot grow organically. Measured 2026-10-15: 15,728 bytes for T-4866."
+    }
+  ]
+}

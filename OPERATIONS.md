@@ -864,6 +864,81 @@ Queue**, **Costs**, **Burndown**, **Escalations**, and **Analytics**
 whole fleet at a glance — reach for direct MCP reads (below) when you need
 a specific answer right now.
 
+#### Payload budgets
+
+Every dashboard API request has a byte budget, so payload growth fails a
+check instead of a browser tab. The budgets live in one table,
+`dashboard/src/dashboard/payload_budgets.json`. Each entry is one REQUEST
+(a path plus its query), and its budget is the last entry of its `history`.
+
+- **The history is append-only.** To raise OR lower a budget, append
+  `{budget_bytes, task, reason}`. Never edit, reorder or delete a recorded
+  entry: the verify lane compares the table against the merge base and
+  refuses that. The table's `_README` states the headroom convention.
+- **Exemptions are for templated routes only**, each with a reason. Today
+  that is one route, the per-task prose route. Every literal GET route
+  under `/api/v2/dashboard/` must carry an entry.
+
+There are two enforcement points:
+
+1. **Pre-merge**: `dashboard/tests/test_payload_budget_sweep.py` serves
+   every entry through the real app over a synthetic fleet sized to the live
+   census. It fails on an overage, and on a budget that is slack against the
+   fleet.
+2. **Live**: `scripts/check_dashboard_payload_budgets.sh`, a launcher for
+   `dashboard/src/dashboard/payload_check.py`, measures the running
+   dashboard. Exit codes: 0 means within budget; 1 means over budget; 2
+   means the instrument failed (unreachable, timeout, non-200, a request not
+   reached before the run deadline, unreadable table, or the checker itself
+   raised). It runs daily as the `dashboard-payload-budgets` recurrence
+   chain. The fixture sweep cannot see organic growth from more tasks
+   existing; this check is what sees it.
+
+**Reading a failed link.** A link that exits non-zero files a born-at-L2
+`milestone_check_failed`. The checker prints one line per request, then each
+overage with its largest leaf fields and the task and reason behind the
+current budget, worst overage last, then a JSON summary. The detail keeps
+only the last 2,000 characters of that output. So what reliably survives is
+the summary and usually the worst overage just above it. The summary names
+the worst ratio and the over-budget requests, as many as fit its
+`dashboard/src/dashboard/payload_check.py::SUMMARY_MAX_CHARS` cap, then
+`+N more`. One overage runs to 1,100-1,400 characters, so the per-request
+lines and every other overage are usually cut. For the full report, run
+`scripts/check_dashboard_payload_budgets.sh` by hand. The remedy is one of:
+
+- shrink the payload; or
+- merge a raise appended to that request's history, naming your task and
+  why the larger size is right.
+
+Then resolve the escalation. That re-runs the check, and the chain moves on
+only when it passes.
+
+**The seed link.** Task 5835 files it after this lands on main, because
+`deterministic_task_guard` rejects a `before_done.script` that does not
+exist yet. Task 5835 records the seed id here. The link's metadata:
+
+```
+task_kind:   deterministic
+milestone:   {mode: dated, at: <first run>}
+before_done: {kind: predicate, script: scripts/check_dashboard_payload_budgets.sh, timeout_secs: <payload_check.py::PREDICATE_TIMEOUT_SECS>}
+recurrence:  {key: dashboard-payload-budgets, interval_secs: 86400}
+```
+
+The checker bounds itself. Each request is bounded end to end, connect to
+last byte, by `--timeout` (60 s by default). The whole run is bounded by
+`--run-deadline`, whose default,
+`dashboard/src/dashboard/payload_check.py::RUN_DEADLINE_SECONDS`, is
+`PREDICATE_TIMEOUT_SECS` less a margin for start-up and one overage
+breakdown. A request not reached before the run deadline is NOT MEASURED,
+exit 2. So a stalled dashboard ends in the checker's own exit 2, never a
+no-verdict `ScriptTimeout`, however many requests the table holds. Seed the
+link with exactly
+`dashboard/src/dashboard/payload_check.py::PREDICATE_TIMEOUT_SECS` as
+merged: a smaller `timeout_secs` re-opens the no-verdict case. Minting renews
+the chain every interval. See
+`docs/task-authoring.md` §6 for the predicate contract and §6.1 for
+recurring chains.
+
 ### Useful MCP reads
 
 These are read-only and safe to call at any time from an interactive
