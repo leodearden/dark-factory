@@ -1109,7 +1109,7 @@ class TestNoVerdictIsNeverAVerdictCode:
                 f"sys.argv = [{str(SCRIPT)!r}, '--project-id', 'proj_a']; "
                 f"runpy.run_path({str(SCRIPT)!r}, run_name='__main__')",
             ],
-            'ImportError',
+            'ModuleNotFoundError',
             id='import-failure',
         ),
         pytest.param([sys.executable, str(SCRIPT)], 'usage', id='usage-error'),
