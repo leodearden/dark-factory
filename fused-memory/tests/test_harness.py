@@ -11056,18 +11056,6 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
             status=RunStatus.completed,
         )
 
-    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
-        inst = MagicMock()
-
-        async def fake_assemble(peeked, project_id):
-            if not peeked:
-                return AssembledPayload(events=[])
-            # One-event-per-chunk, mirrors production token-budget chunking.
-            return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
-
-        inst.assemble = fake_assemble
-        return inst
-
     # Fake clock: `start` reads 0.0; the next read (the between-chunks check
     # after chunk 1) reads 200.0 — comfortably past the 100s budget.
     time_values = iter([0.0, 200.0])
@@ -11091,7 +11079,7 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
         patch.object(harness, 'run_full_cycle', side_effect=fake_run_full_cycle),
         patch(
             'fused_memory.reconciliation.context_assembler.ContextAssembler',
-            side_effect=fake_assembler_factory,
+            side_effect=_one_event_per_chunk_assembler,
         ),
     ):
         iterator = BacklogIterator(
@@ -11232,18 +11220,6 @@ async def test_backlog_iterator_budget_bounds_chunks_and_converges_across_invoca
             status=RunStatus.completed,
         )
 
-    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
-        inst = MagicMock()
-
-        async def fake_assemble(peeked, project_id):
-            if not peeked:
-                return AssembledPayload(events=[])
-            # One-event-per-chunk, mirrors production token-budget chunking.
-            return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
-
-        inst.assemble = fake_assemble
-        return inst
-
     restore_calls: list[str] = []
     original_restore = event_buffer.restore_drained
 
@@ -11275,7 +11251,7 @@ async def test_backlog_iterator_budget_bounds_chunks_and_converges_across_invoca
         patch.object(harness, 'run_full_cycle', side_effect=fake_run_full_cycle),
         patch(
             'fused_memory.reconciliation.context_assembler.ContextAssembler',
-            side_effect=fake_assembler_factory,
+            side_effect=_one_event_per_chunk_assembler,
         ),
         caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'),
     ):
