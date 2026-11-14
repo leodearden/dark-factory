@@ -30,6 +30,7 @@ from orchestrator.agents.write_set import (
     WriteSet,
     compute_write_set,
     ensure_claude_fleet_dir,
+    write_set_of,
 )
 from orchestrator.artifacts import TaskArtifacts
 
@@ -240,6 +241,72 @@ class TestTaskMetaSymlinkResolution:
 
         assert ws.task_root == (real_meta_root / 'task-2904').resolve()
         assert ws.task_root != base_task_meta / 'task-2904'
+
+
+# ---------------------------------------------------------------------------
+# task 4825: WriteSet.is_foreign_task_meta() and write_set_of()
+# ---------------------------------------------------------------------------
+
+
+class TestForeignTaskMeta:
+    """A dispatch's only `.task-meta` grants are its lane dir (row 2) and its
+    task root (row 2b); every other path inside the `.task-meta` base belongs
+    to another lane or task, and no sandbox of this dispatch can write it."""
+
+    def test_sibling_lane_and_task_root_are_foreign(self, worktree: Path, tmp_home: Path):
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        base = worktree.parent / '.task-meta'
+        assert ws.is_foreign_task_meta(base / '4762' / 'plan.json')
+        assert ws.is_foreign_task_meta(base / 'task-4762' / 'plan.json')
+
+    def test_own_lane_and_task_root_are_not_foreign(self, worktree: Path, tmp_home: Path):
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        base = worktree.parent / '.task-meta'
+        assert not ws.is_foreign_task_meta(base / '2904' / 'plan.json')
+        assert not ws.is_foreign_task_meta(base / 'task-2904' / 'plan.json')
+
+    def test_base_itself_worktree_and_outside_paths_are_not_foreign(
+        self, worktree: Path, main_repo: Path, tmp_home: Path,
+    ):
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        assert not ws.is_foreign_task_meta(worktree.parent / '.task-meta')
+        assert not ws.is_foreign_task_meta(worktree / 'x.py')
+        assert not ws.is_foreign_task_meta(main_repo / 'README.md')
+
+    def test_a_single_root_dispatch_does_not_own_the_task_root(
+        self, worktree: Path, tmp_home: Path,
+    ):
+        lane_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        ws = compute_write_set(worktree, task_id='2904', task_root=lane_root, home=tmp_home)
+        assert ws.is_foreign_task_meta(worktree.parent / '.task-meta' / 'task-2904' / 'plan.json')
+
+    def test_a_path_spelled_through_a_symlinked_base_is_judged_on_its_real_path(
+        self, tmp_path: Path, worktree: Path, tmp_home: Path,
+    ):
+        real_meta_root = tmp_path / 'real-meta'
+        real_meta_root.mkdir()
+        base_task_meta = worktree.parent / '.task-meta'
+        base_task_meta.symlink_to(real_meta_root, target_is_directory=True)
+
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+
+        assert ws.is_foreign_task_meta(base_task_meta / '4762' / 'plan.json')
+        assert not ws.is_foreign_task_meta(base_task_meta / '2904' / 'plan.json')
+
+    def test_write_set_of_matches_compute_write_set(self, worktree: Path, tmp_home: Path):
+        artifacts = TaskArtifacts.for_task(worktree, '2904')
+        assert write_set_of(artifacts, home=tmp_home) == compute_write_set(
+            worktree, task_id='2904', home=tmp_home,
+        )
+
+    def test_write_set_of_a_single_root_dispatch_grants_its_lane_as_task_root(
+        self, worktree: Path, tmp_home: Path,
+    ):
+        lane_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        artifacts = TaskArtifacts(worktree, lane_root, lane_root)
+        assert write_set_of(artifacts, home=tmp_home) == compute_write_set(
+            worktree, task_id='2904', task_root=lane_root, home=tmp_home,
+        )
 
 
 # ---------------------------------------------------------------------------
