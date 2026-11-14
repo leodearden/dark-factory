@@ -1406,6 +1406,8 @@ class TestClassifyErrorEscalation:
         from escalation.queue import EscalationQueue
 
         h = _make_harness(tmp_path)
+        set_status = AsyncMock()
+        h.scheduler.set_task_status = set_status
         esc_queue = EscalationQueue(tmp_path / 'esc')
         h._escalation_queue = esc_queue
         # Files declared on purpose: a '(none declared)' line would be visibly false.
@@ -1419,7 +1421,7 @@ class TestClassifyErrorEscalation:
             allowed = await h._run_cross_repo_gate(assignment)
 
         assert allowed is False
-        h.scheduler.set_task_status.assert_awaited_once_with('4161', 'blocked')  # type: ignore[attr-defined]
+        set_status.assert_awaited_once_with('4161', 'blocked')
         l1s = [e for e in esc_queue.get_pending() if e.task_id == '4161' and e.level == 1]
         assert len(l1s) == 1, f'Expected exactly 1 L1 for task 4161; got {l1s!r}'
 
