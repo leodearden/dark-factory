@@ -747,6 +747,7 @@ async def test_the_quality_loop_scans_snapshots_before_it_derives_markers_on_its
     try:
         reader = await pool.get(path)
         assert reader is not None
+        # noqa: wall-clock-deadline — hang guard on the loop's first tick; poll_responsive is importable only under orchestrator/tests
         async with asyncio.timeout(90):
             while (markers := await read_marker_state(reader, 'dark_factory')) is None:
                 await asyncio.sleep(0.05)
