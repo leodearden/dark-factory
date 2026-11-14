@@ -19,18 +19,18 @@ from _unmeasured_delivery_scenes import (
     uncommitted_edits,
     work_on_sibling_ref,
 )
-from orchestrator.merge_lane.unmeasured_delivery import (
-    PLAN_DELIVERY_UNMEASURED_REASON_PREFIX,
-    UnmeasuredCause,
-    UnmeasuredDelivery,
-    diagnose_unmeasured_delivery,
-)
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.gates import (
     PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
     PlanFilesTouchedResult,
+)
+from orchestrator.merge_lane.unmeasured_delivery import (
+    PLAN_DELIVERY_UNMEASURED_REASON_PREFIX,
+    UnmeasuredCause,
+    UnmeasuredDelivery,
+    diagnose_unmeasured_delivery,
 )
 from orchestrator.unblock_types import BlockClass, classify_block_reason
 
