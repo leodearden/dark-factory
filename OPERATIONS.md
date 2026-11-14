@@ -3477,13 +3477,21 @@ check.
   that time, and its tables count every heal the run withheld or superseded.
 - **Calibrate first, and again after any change of model, alias target, brief
   or `link_heal.field_chars`.** From the
-  main checkout (the soak data is gitignored there):
+  main checkout (the soak data is gitignored there), in the same environment
+  as `scripts/fused-memory-link-heal.sh`:
 
   ```bash
-  python fused-memory/scripts/link_heal.py calibrate \
+  CONFIG_PATH=fused-memory/config/config.yaml \
+  uv run --no-sync --project fused-memory python fused-memory/scripts/link_heal.py calibrate \
       --ratings data/write-triage-soak-2026-10-19/correctness/adjudications.jsonl \
       --items data/write-triage-soak-2026-10-19/correctness/items_all.json
   ```
+
+  A bare `python` is the system interpreter, which has no `fused_memory`. Without
+  `CONFIG_PATH`, calibrate reads the default config, so a `config.yaml` override of
+  `link_heal.adjudicator_model`, `link_heal.field_chars` or
+  `reconciliation.data_dir` would record the calibration under a key or ledger
+  that the sweep never checks, and nothing would report the mismatch.
 
   It asks the adjudicator about every rated pair and scores the misfile and
   CORRECTS binaries against the final rater verdict. A binary passes when its
