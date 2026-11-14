@@ -18,6 +18,7 @@ import pytest_asyncio
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor, interceptor_write_succeeded
+from fused_memory.middleware.task_text_write_guard import text_fp_of
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.audit_trail_rotation import (
     ROLLUP_KEY,
@@ -115,12 +116,14 @@ async def stack(tmp_path):
 
 
 async def recon_cycle(interceptor: TaskInterceptor, root: str, agent_id: str | None) -> dict:
+    composed_against = await interceptor.get_task('1', root)
     return await interceptor.update_task(
         '1',
         root,
         description=DESCRIPTION + '\n\n' + NEW_BLOCK,
         metadata=json.dumps(RELAY_KEYS),
         agent_id=agent_id,
+        expected_text_fp=text_fp_of(composed_against),
     )
 
 
@@ -136,6 +139,7 @@ async def test_recon_write_past_the_threshold_comes_back_bounded(stack):
     after = await backend.get_task('1', root)
     assert task_payload_bytes(after) < ROTATE_THRESHOLD_BYTES
     assert result['audit_trail_rotation']['status'] == 'rotated'
+    assert result['text_verified'] is True
     assert {**result['updated_task'], 'id': after['id']} == after
     record = after['metadata'][ROLLUP_KEY]['rotations'][0]
     archived = archive.store[record['archive_memory_id']]

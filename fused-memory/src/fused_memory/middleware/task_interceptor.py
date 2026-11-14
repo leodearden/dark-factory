@@ -63,7 +63,7 @@ from fused_memory.backends.task_backend_types import (
     MetadataLookupResult,
 )
 from fused_memory.config.schema import CuratorConfig
-from fused_memory.middleware import deferral_gate, recon_write_policy
+from fused_memory.middleware import deferral_gate, recon_write_policy, task_text_write_guard
 from fused_memory.middleware.amendment_advisory import (
     TASK_TEXT_FIELDS,
     AmendmentWriter,
@@ -754,6 +754,12 @@ class TaskInterceptor:
         # unexpected status/claimant_run_id divergence. None (default) ->
         # exact current behavior (the pre-existing inline write).
         self._lifecycle_reset_filer: FileFindingFn | None = None
+        # Task 4650: where an unconfirmed recon-stage text write is reported.
+        # None (default) -> the readback still annotates text_verified, but
+        # nothing is filed; see set_text_write_unconfirmed_filer.
+        self._text_write_unconfirmed_filer: (
+            task_text_write_guard.FileTextFindingFn | None
+        ) = None
         # Task 5771: where recon-stage writes archive rotated-out audit trail.
         # None (default) -> no rotation; see set_audit_trail_archive.
         self._audit_trail_archive: AuditTrailArchive | None = None
@@ -833,6 +839,16 @@ class TaskInterceptor:
         behavior change.
         """
         self._lifecycle_reset_filer = filer
+
+    def set_text_write_unconfirmed_filer(
+        self, filer: task_text_write_guard.FileTextFindingFn,
+    ) -> None:
+        """Wire the async filer for recon-stage text writes that do not read back (task 4650).
+
+        Bootstrap calls this once, after ReconReportState exists. Until then
+        the readback still sets ``text_verified``; it just files nothing.
+        """
+        self._text_write_unconfirmed_filer = filer
 
     def set_audit_trail_archive(self, archive: AuditTrailArchive) -> None:
         """Wire the audit-trail rotation archive (task 5771).
@@ -5576,6 +5592,7 @@ class TaskInterceptor:
         *,
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        expected_text_fp: str | None = None,
         **kwargs: Any,
     ) -> dict:
         """Write task metadata through all interceptor gates.
@@ -5616,7 +5633,16 @@ class TaskInterceptor:
            project threshold; returns ``BacklogVerdict.to_error_dict()`` which has the
            shape ``{'error': '<msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
            (no ``success`` key).
-        4. ``_declared_scope_refusal`` — under the write lock, refuses any add, alter or
+        4. The task-text compare-and-swap (task 4650) —
+           :func:`~fused_memory.middleware.task_text_write_guard.check_text_base`,
+           judged against a ``before`` read under the write lock.
+           ``expected_text_fp`` is the ``task_text_fp`` of the read the write
+           was composed against. A supplied token that no longer matches is
+           rejected for every caller (``TaskTextBaseStale``); a recon-stage
+           write replacing ``description``/``details``/``prompt`` without one
+           is rejected (``ReconTaskTextBaseRequired``). Declared explicitly so
+           it never reaches the backend or the journal.
+        5. ``_declared_scope_refusal`` — under the write lock, refuses any add, alter or
            removal of ``metadata.declared_scope`` (an unchanged echo passes) with
            ``DeclaredScopeWriteAuthorityError.to_error_dict()``. It is here, not in the
            backend floor, to leave room for the ``basis='combine'`` re-stamp that task
@@ -5655,6 +5681,8 @@ class TaskInterceptor:
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
         is_recon_stage_write = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
+        text_write = task_text_write_guard.plan_text_write(kwargs)
+        tag = kwargs.get('tag')
         before: dict[str, Any] | None = None
         async with self._write_lock(project_id):
             # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
@@ -5667,11 +5695,11 @@ class TaskInterceptor:
             # between the check and the write). snapshot_token is extracted
             # from the incoming metadata payload so gate 3 (stale-snapshot)
             # can fire on this path. This same `before` read is reused by
-            # TWO other consumers, so a recon-stage write never issues two
+            # THREE other consumers, so a recon-stage write never issues two
             # before-reads: the lifecycle-reset guard's before-snapshot
-            # (task 2624) below, and the stale-gate-citation guard's live
+            # (task 2624) below, the stale-gate-citation guard's live
             # `dependencies` array (task 4919) immediately after the verdict
-            # check.
+            # check, and the task-text compare-and-swap (task 4650) after it.
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here
@@ -5679,7 +5707,7 @@ class TaskInterceptor:
                 # boolean, matching the recon_write_policy.check(agent_id: str)
                 # signature below.
                 assert isinstance(agent_id, str)
-                before = await tm.get_task(task_id, project_root)
+                before = await tm.get_task(task_id, project_root, tag)
                 # Awaited, not inline (task 3778): check() is a coroutine
                 # function now, so an un-awaited call would evaluate
                 # `.is_rejection` on a coroutine object — never a rejection —
@@ -5747,6 +5775,17 @@ class TaskInterceptor:
                 ):
                     return err
 
+            if before is None and expected_text_fp is not None:
+                before = await tm.get_task(task_id, project_root, tag)
+            if rejection := task_text_write_guard.check_text_base(
+                before=before,
+                write=text_write,
+                expected_text_fp=expected_text_fp,
+                fp_required=is_recon_stage_write,
+                task_id=task_id,
+                agent_id=agent_id,
+            ):
+                return rejection.to_error_dict()
             if err := await self._declared_scope_refusal(tm, task_id, project_root, kwargs, before):
                 return err
 
@@ -5804,6 +5843,18 @@ class TaskInterceptor:
                 # raise — holds for both tools.py (which delegates here) and
                 # direct interceptor callers (task C2).
                 return e.to_error_dict()
+            # Under the lock, before audit-trail rotation: confirms THIS write, not a rewrite.
+            if is_recon_stage_write and interceptor_write_succeeded(result):
+                result = await task_text_write_guard.verify_text_write_landed(
+                    result,
+                    task_id=task_id,
+                    project_id=project_id,
+                    project_root=project_root,
+                    tag=tag,
+                    write=text_write,
+                    get_task=tm.get_task,
+                    file_finding=self._text_write_unconfirmed_filer,
+                )
         rotation: RotationOutcome | None = None
         if is_recon_stage_write and interceptor_write_succeeded(result):
             result, rotation = await self._with_bounded_audit_trail(

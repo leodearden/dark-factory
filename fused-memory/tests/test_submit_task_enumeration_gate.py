@@ -421,7 +421,7 @@ def persisting_server(backend, memory_service, task_interceptor):
     async def _write_through(**kwargs: Any) -> dict[str, Any]:
         rest = {
             key: value for key, value in kwargs.items()
-            if key not in ('agent_id', 'client_op_id')
+            if key not in ('agent_id', 'client_op_id', 'expected_text_fp')
         }
         await backend.update_task(**rest)
         return {'success': True}

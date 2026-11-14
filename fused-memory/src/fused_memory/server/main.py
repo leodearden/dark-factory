@@ -953,6 +953,15 @@ async def run_server():
         task_interceptor.set_lifecycle_reset_filer(
             build_lifecycle_reset_filer(recon_report_state)
         )
+        # Task 4650: the same post-ReconReportState wiring for recon-stage
+        # text writes whose readback does not show the written text.
+        from fused_memory.server.recon_text_write_filer import (
+            build_text_write_unconfirmed_filer,
+        )
+
+        task_interceptor.set_text_write_unconfirmed_filer(
+            build_text_write_unconfirmed_filer(recon_report_state)
+        )
 
         # Reviewer finding race_condition: encode the ordering dependency in code.
         # The harness's run_loop() awaits this event before launching any stage

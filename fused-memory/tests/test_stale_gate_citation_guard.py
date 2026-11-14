@@ -18,6 +18,7 @@ import pytest_asyncio
 from _fm_git_repos import _init_git_repo
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.middleware.task_text_write_guard import text_fp_of
 from fused_memory.reconciliation import stale_gate_citation_guard
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.stale_gate_citation_guard import find_gate_citation_ids
@@ -471,6 +472,7 @@ class TestUpdateTaskBoundary:
     ):
         await interceptor.update_task(
             '3708', '/project', details=TRANSITIVE, agent_id=AGENT_ID,
+            expected_text_fp=text_fp_of(live_row),
         )
 
         taskmaster.update_task.assert_awaited_once()
@@ -497,6 +499,7 @@ class TestUpdateTaskBoundary:
         await interceptor.update_task(
             '3708', '/project', details=STALE_A,
             dependencies=['3658', '3659', '3660', '3707'], agent_id=AGENT_ID,
+            expected_text_fp=text_fp_of(live_row),
         )
 
         taskmaster.update_task.assert_awaited_once()
