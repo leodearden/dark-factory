@@ -25,10 +25,10 @@ from orchestrator.config import (
     load_config,
 )
 from orchestrator.verify_cache import keys, policy, registry
-from orchestrator.verify_cache.modes import CacheMode
+from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV, CacheMode
 from orchestrator.verify_evidence import Leg, UnitTier
 
-_FORCE_OFF = 'DF_VERIFY_CACHE'
+_FORCE_OFF = VERIFY_CACHE_ENV
 
 
 @pytest.fixture(autouse=True)
