@@ -114,7 +114,18 @@ class TestEscalationArguments:
         arguments = alarm.escalation_arguments(run, JOURNAL, now=NOW)
         assert 'unknown' in arguments['summary']
         assert 'root: unknown' in arguments['detail']
-        assert 'dark-factory/quality-snapshot/proj_a.env' in arguments['detail']
+        assert '~/.config/dark-factory/quality-snapshot/proj_a.env' in arguments['detail']
+        assert '%E' not in arguments['detail']
+
+    @pytest.mark.parametrize(('environ', 'expected'), [
+        ({'XDG_CONFIG_HOME': '/xdg', 'HOME': '/home/op'}, '/xdg/dark-factory/quality-snapshot/proj_a.env'),
+        ({'HOME': '/home/op'}, '/home/op/.config/dark-factory/quality-snapshot/proj_a.env'),
+    ])
+    def test_a_run_without_a_root_names_the_env_file_where_the_user_manager_resolves_it(self, environ, expected):
+        run = alarm.FailedRun.from_environment('proj_a', environ)
+
+        assert str(run.env_file) == expected
+        assert expected in alarm.escalation_arguments(run, JOURNAL, now=NOW)['detail']
 
 
 class TestJournalTail:
@@ -125,7 +136,7 @@ class TestJournalTail:
         argv = json.loads(fake_journalctl.read_text())
         assert '--user' in argv
         assert argv[argv.index('-u') + 1] == UNIT
-        assert argv[argv.index('-o') + 1] == 'cat'
+        assert argv[argv.index('-o') + 1] == 'short-iso'
         assert '--no-pager' in argv
         assert '-n' in argv
 
@@ -146,6 +157,17 @@ class TestJournalTail:
 
         assert text.startswith('(journal unreadable:'), text
         assert 'FileNotFoundError' in text, text
+
+
+class TestDefaultEscalationUrl:
+    def test_it_is_the_url_the_factory_roots_orchestrator_config_names(self, tmp_path):
+        (tmp_path / 'dark-factory-orchestrator.yaml').write_text('escalation:\n  port: 8102\n')
+
+        assert alarm.default_escalation_url(tmp_path) == 'http://127.0.0.1:8102/mcp'
+
+    def test_a_root_that_names_no_escalation_server_is_refused_naming_the_root(self, tmp_path):
+        with pytest.raises(alarm.NoEscalationServer, match=str(tmp_path)):
+            alarm.default_escalation_url(tmp_path)
 
 
 class _Recorder:

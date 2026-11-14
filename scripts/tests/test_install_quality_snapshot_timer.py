@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import quality_snapshot_alarm
 from committed_git_repo import committed_repo
 from shared.project_id import project_id_for_root
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -40,7 +41,7 @@ ENV_FILE = '%E/dark-factory/quality-snapshot/%i.env'
 
 
 _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
-"""Fake `systemctl`, copied from scripts/tests/test_install_return_brief_timer.py.
+"""Fake `systemctl`, copied from scripts/tests/test_install_link_heal_timer.py.
 
 Records every invocation (minus `--user`) into $FAKE_SYSTEMCTL_STATE.
 `enable --now <unit>` marks each non-flag arg enabled; `start` is recorded;
@@ -252,6 +253,33 @@ def test_the_wrapper_accepts_the_units_argv(tmp_path):
     assert 'usage:' not in result.stderr, result.stderr
 
 
+def test_the_alarm_accepts_its_units_argv(tmp_path):
+    """An alarm flag rename fails here: argparse took the unit's argv, so the failure is the post's own."""
+    (exec_start,) = _values(_directives(ALARM_NAME), 'Service', 'ExecStart')
+    handler = str(TEMPLATES_DIR / 'quality_snapshot_alarm.py')
+    substitutes = {
+        f'{PRODUCTION_ROOT}/.venv/bin/python': sys.executable,
+        f'{PRODUCTION_ROOT}/scripts/quality_snapshot_alarm.py': handler,
+        '%i': 'proj_a',
+    }
+    argv = [substitutes.get(token, token) for token in shlex.split(exec_start)]
+    assert argv[:2] == [sys.executable, handler], argv
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    journalctl = bin_dir / 'journalctl'
+    journalctl.write_text('#!/bin/sh\necho "fake journal line"\n')
+    journalctl.chmod(0o755)
+
+    result = subprocess.run(
+        [*argv, '--escalation-url', 'http://127.0.0.1:1/mcp'], capture_output=True, text=True, timeout=120,
+        env={**os.environ, 'PATH': f'{bin_dir}{os.pathsep}{os.environ["PATH"]}'},
+    )
+
+    assert result.returncode == 2, f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    assert 'quality_snapshot_alarm:' in result.stderr, result.stderr
+    assert 'usage:' not in result.stderr, result.stderr
+
+
 def test_alarm_unit_is_a_journalled_oneshot_that_runs_without_the_root_file():
     alarm = _directives(ALARM_NAME)
     assert _values(alarm, 'Service', 'Type') == ['oneshot']
@@ -302,6 +330,10 @@ def test_the_units_read_the_root_file_the_installer_writes(tmp_path, project):
     (alarm_reads,) = _values(_directives(ALARM_NAME), 'Service', 'EnvironmentFile')
     assert resolved(service_reads) == written
     assert resolved(alarm_reads.removeprefix('-')) == written
+    alarm_names = quality_snapshot_alarm.FailedRun.from_environment(
+        project_id, {'XDG_CONFIG_HOME': str(tmp_path / 'xdg')},
+    ).env_file
+    assert alarm_names == written
 
 
 def test_install_is_idempotent(tmp_path, project):
@@ -318,6 +350,37 @@ def test_install_is_idempotent(tmp_path, project):
     assert sorted(p.name for p in _env_dir(tmp_path).iterdir()) == [env_file.name]
     for name in UNIT_NAMES:
         assert (_unit_dir(tmp_path) / name).read_bytes() == (TEMPLATES_DIR / name).read_bytes()
+
+
+def test_a_second_root_with_the_same_id_is_refused_until_its_env_file_is_removed(tmp_path, project):
+    assert _run_script(tmp_path, project).returncode == 0
+    env_file = _env_dir(tmp_path) / f'{project_id_for_root(project)}.env'
+    first_env = env_file.read_bytes()
+    other = Path(committed_repo(tmp_path / 'elsewhere' / 'My-Proj', {})).resolve()
+
+    refused = _run_script(tmp_path, other)
+
+    assert refused.returncode != 0, f'stdout={refused.stdout!r} stderr={refused.stderr!r}'
+    assert str(project) in refused.stderr, refused.stderr
+    assert str(other) in refused.stderr, refused.stderr
+    assert env_file.read_bytes() == first_env
+    assert _systemctl_calls(tmp_path) == []
+
+    env_file.unlink()
+    moved = _run_script(tmp_path, other)
+
+    assert moved.returncode == 0, moved.stderr
+    assert env_file.read_text().splitlines() == [f'QUALITY_SNAPSHOT_ROOT={other}']
+
+
+def test_a_root_whose_id_the_wrapper_refuses_is_refused_before_anything_is_installed(tmp_path):
+    root = Path(committed_repo(tmp_path / '_scratch', {})).resolve()
+
+    result = _run_script(tmp_path, root)
+
+    assert result.returncode != 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    assert "'_scratch' is not a project id" in result.stderr, result.stderr
+    _nothing_installed(tmp_path)
 
 
 def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(tmp_path, project):

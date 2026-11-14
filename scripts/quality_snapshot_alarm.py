@@ -15,16 +15,16 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import TypedDict
 
 import _checkout as _checkout
-from dashboard.config import DashboardConfig
+from dashboard.config import discover_root_escalation_url
 from shared.mcp_post import mcp_server_base
 from shared.mcp_session import SyncMcpSession
 from shared.project_layout import default_project_root
 
 AGENT_ROLE = 'quality-snapshot-alarm'
-ENV_FILE_DISPLAY = '%E/dark-factory/quality-snapshot/{project_id}.env'
 EXIT_POSTED = 0
 EXIT_NOT_POSTED = 2
 JOURNAL_LINES = 40
@@ -70,10 +70,12 @@ class FailedRun:
     exit_status: str
     invocation_id: str | None
     project_root: str | None
+    env_file: Path
 
     @classmethod
     def from_environment(cls, project_id: str, environ: Mapping[str, str]) -> FailedRun:
         """The MONITOR_* facts systemd hands an OnFailure= unit, and the instance's root; absent ones read unknown."""
+        config_home = environ.get('XDG_CONFIG_HOME') or str(Path(environ.get('HOME') or '~') / '.config')
         return cls(
             project_id=project_id,
             unit=environ.get('MONITOR_UNIT') or f'quality-snapshot@{project_id}.service',
@@ -82,16 +84,18 @@ class FailedRun:
             exit_status=environ.get('MONITOR_EXIT_STATUS') or UNKNOWN,
             invocation_id=environ.get('MONITOR_INVOCATION_ID') or None,
             project_root=environ.get('QUALITY_SNAPSHOT_ROOT') or None,
+            env_file=Path(config_home) / 'dark-factory' / 'quality-snapshot' / f'{project_id}.env',
         )
 
 
 def journal_tail(unit: str, *, lines: int = JOURNAL_LINES) -> str:
-    """The newest *lines* of *unit*'s user journal; a journal that cannot be read is named, never raised.
+    """The newest *lines* of *unit*'s user journal, each stamped with its time; an unreadable journal is named, never raised.
 
-    Matched by unit rather than by invocation id: the user journal's invocation
-    field differs across systemd versions, and the failed run is the newest.
+    Matched by unit rather than by invocation id, because the user journal's
+    invocation field differs across systemd versions. So the tail can reach back
+    into earlier nights, and the stamps tell the failed run's lines from theirs.
     """
-    command = ['journalctl', '--user', '-u', unit, '-o', 'cat', '--no-pager', '-n', str(lines)]
+    command = ['journalctl', '--user', '-u', unit, '-o', 'short-iso', '--no-pager', '-n', str(lines)]
     try:
         completed = subprocess.run(
             command, capture_output=True, text=True, timeout=JOURNAL_TIMEOUT_SECS, check=False,
@@ -118,8 +122,7 @@ def _root_line(run: FailedRun) -> str:
         return f'Project root: {run.project_root}'
     return (
         'Project root: unknown -- QUALITY_SNAPSHOT_ROOT was not in this handler\'s environment; '
-        f'the unit reads it from {ENV_FILE_DISPLAY.format(project_id=run.project_id)}, '
-        'which scripts/install-quality-snapshot-timer.sh writes'
+        f'the unit reads it from {run.env_file}, which scripts/install-quality-snapshot-timer.sh writes'
     )
 
 
@@ -156,16 +159,15 @@ def escalation_arguments(run: FailedRun, journal: str, *, now: datetime.datetime
     }
 
 
-def default_escalation_url() -> str:
-    """The factory checkout's configured escalation MCP URL, found as scripts/transcript_secret_sweep.py::escalation_url does."""
-    config = DashboardConfig(project_root=default_project_root())
-    try:
-        return config.escalation_urls[config.project_root.name]
-    except KeyError:
+def default_escalation_url(factory_root: Path) -> str:
+    """The escalation MCP URL *factory_root*'s orchestrator config names; NoEscalationServer when it names none."""
+    url = discover_root_escalation_url(factory_root)
+    if url is None:
         raise NoEscalationServer(
-            f'{config.project_root}: no escalation server is configured '
+            f'{factory_root}: no escalation server is configured '
             '(escalation.port in its dark-factory-orchestrator.yaml)'
-        ) from None
+        )
+    return url
 
 
 def _post(base_url: str, arguments: Mapping[str, object]) -> object:
@@ -180,7 +182,7 @@ def _not_posted(why: str, exc: Exception) -> int:
 
 def _deliver(url: str | None, arguments: EscalationArguments, poster: Poster) -> int:
     try:
-        target = url or default_escalation_url()
+        target = url or default_escalation_url(default_project_root())
     except Exception as exc:
         return _not_posted('the factory escalation server could not be found', exc)
     try:
