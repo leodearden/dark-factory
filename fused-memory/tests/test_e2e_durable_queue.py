@@ -1168,26 +1168,20 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
     """The asymmetry the task names, and the regression that anchors it.
 
     `add_memory`'s Mem0 leg is a direct synchronous call, so its failure is
-    visible to the caller immediately. Its Graphiti leg is enqueued and
-    reported as WRITTEN at enqueue time — a true statement about durable
-    acceptance, and a false one about the graph — and until now its eventual
-    death reached nobody.
-
-    The response is deliberately left unchanged: `add_memory` structurally
-    CANNOT wait for the Graphiti write (that is the whole purpose of the
-    queue), and dropping graphiti from `stores_written` would be strictly
-    worse — the caller would lose the true fact that the write was durably
-    accepted and STILL learn nothing when it later died. So the FAILURE becomes
-    push instead.
+    visible to the caller immediately. Its Graphiti leg is reported in
+    `stores_queued` at enqueue time: durably accepted, not yet in the graph.
+    `add_memory` structurally CANNOT wait for the Graphiti write (that is the
+    whole purpose of the queue), so its eventual death is pushed as this
+    escalation.
     """
 
     @pytest.mark.asyncio
-    async def test_the_caller_is_told_graphiti_was_written_at_enqueue_time(
+    async def test_the_caller_is_told_graphiti_was_queued_at_enqueue_time(
         self, journaled_service, tmp_path,
     ):
-        """Today's behaviour, pinned so the regression below is anchored on a
-        measured fact rather than an assumed one."""
+        """The claim the response makes, and the one the alarm says it made."""
         from fused_memory.models.enums import MemoryCategory
+        from fused_memory.services.queued_writes import QueueOperation
 
         svc, _journal = journaled_service
         svc.set_known_projects({'main': str(tmp_path)})
@@ -1198,9 +1192,20 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
             project_id='main',
         )
 
-        assert SourceStore.graphiti in response.stores_written, (
-            "reported at ENQUEUE time, under add_memory's "
-            '"Durably persisted to SQLite — report as written" comment'
+        assert SourceStore.graphiti in response.stores_queued, (
+            'reported at ENQUEUE time as durably queued'
+        )
+        assert SourceStore.graphiti not in response.stores_written, (
+            'an enqueue is not a write to the graph'
+        )
+        lists_holding_graphiti = [
+            f
+            for f in ('stores_written', 'stores_queued', 'stores_pending_retry')
+            if SourceStore.graphiti in getattr(response, f)
+        ]
+        assert lists_holding_graphiti == ['stores_queued']
+        assert 'stores_queued' in _REPORTED_TO_CALLER[QueueOperation.ADD_MEMORY_GRAPHITI].text, (
+            'the dead-letter alarm must name the claim the response actually made'
         )
 
     @pytest.mark.asyncio
@@ -1220,7 +1225,7 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
             category=MemoryCategory.decisions_and_rationale.value,
             project_id='main',
         )
-        assert SourceStore.graphiti in response.stores_written
+        assert SourceStore.graphiti in response.stores_queued
 
         filed = await _poll_for_escalation(tmp_path)
         detail = filed[0]['detail']
@@ -1233,12 +1238,12 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
         # which is false, and is exactly the lie the alarm exists to surface.
         assert 'reported_to_caller=' in detail, detail
         assert _REPORTED_TO_CALLER['add_memory_graphiti'].text in detail, (
-            'the caller was told graphiti was WRITTEN, not that the write was '
-            'queued; an alarm that misreports what the caller was promised is '
-            'not triageable'
+            'the caller was told graphiti was QUEUED; an alarm that misreports '
+            'what the caller was promised is not triageable'
         )
         assert _REPORTED_TO_CALLER['add_episode'].text not in detail, (
-            'add_memory never returns a queued status — that is add_episode'
+            "add_episode's status='queued' is a distinct claim from add_memory's "
+            'stores_queued, and the alarm must name the one this caller received'
         )
 
     @pytest.mark.asyncio
