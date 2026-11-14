@@ -46,6 +46,7 @@ _SEGMENT_KEYS = {
     'timed_out',
     'duration_secs',
     'skip_reason',
+    'scope_launch_refused',
 }
 
 

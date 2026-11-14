@@ -53,6 +53,14 @@ def recorded_scope_spawns(argv_dir: Path) -> list[list[str]]:
     ]
 
 
+def scope_payload_command(record: list[str]) -> str:
+    """The leg command a recorded spawn's bash payload runs, i.e. the ``-c``
+    string after verify's launch-handshake line."""
+    _handshake, newline, command = record[-1].partition('\n')
+    assert newline, f'no launch-handshake line in the payload: {record!r}'
+    return command
+
+
 def assert_scope_carries(record: list[str], prop: str) -> None:
     """The adjacent pair ``-p <prop>`` precedes the payload.
 
