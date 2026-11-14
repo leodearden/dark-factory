@@ -62,6 +62,12 @@ from .eval_gate import (
     campaign_usage_gate,
     owned_usage_gate,
 )
+from .hermeticity import (
+    NO_PRODUCTION_WRITERS,
+    ProductionWriters,
+    refuse_production_writers,
+    writers_held_by,
+)
 from .metrics import (
     EvalMetrics,
     RoleUnderTest,
@@ -214,7 +220,10 @@ def build_eval_orch_config(
     """
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
-    base = base_config
+    # Re-rooted BEFORE profiling, so the profile's eval-root leaves resolve
+    # against the fixture's project, the project its worktree is cut from.
+    project_root = Path(task.get('project_root', str(base_config.project_root)))
+    base = base_config.model_copy(update={'project_root': project_root})
 
     # Architect pin: opus/claude/high by default (frozen-plan + plan-only paths),
     # or derived from architect_config for the both-live end-to-end run (μ). When
@@ -292,7 +301,6 @@ def build_eval_orch_config(
         'lint_command': task.get('verify_commands', {}).get('lint', base.lint_command),
         'type_check_command': task.get('verify_commands', {}).get('typecheck', base.type_check_command),
         'sandbox': SandboxConfig(enabled=False),
-        'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
         'implementer_brief_variant': config.harness_variant,
         'routing': _admit_claude_role_models(profiled.routing, models, backends),
@@ -304,7 +312,7 @@ def build_eval_orch_config(
     # effective_verify_env, so the pin reaches every verify subprocess. Absent a
     # .python-version, inject nothing (fail-safe) — leave verify_env untouched.
     #
-    # pin_source is the target project_root's CURRENT checkout — mirroring
+    # The pin source is the target project_root's CURRENT checkout — mirroring
     # production dispatch, which verifies under the target's current
     # .python-version — and the SAME tree snapshots._eval_setup_env reads for the
     # setup `uv sync`, so setup and verify agree on the interpreter. This reverts
@@ -314,8 +322,7 @@ def build_eval_orch_config(
     # Sourcing from project_root (a 3.13-bearing tree) fixes that AND preserves
     # 2847's setup==verify agreement, now anchored to a 3.13-bearing tree instead
     # of an arbitrarily-old fixture baseline (task 2875).
-    pin_source = Path(task.get('project_root', str(base.project_root)))
-    pin = read_python_pin(pin_source)
+    pin = read_python_pin(project_root)
     if pin is not None:
         update['verify_env'] = {**profiled.verify_env, 'UV_PYTHON': pin}
     # D8: an explicit recording endpoint layers over the profile's null
@@ -607,11 +614,16 @@ def _cell_workflow(
     *,
     replay_framed: bool,
     usage_gate: UsageGate | None,
+    writers: ProductionWriters = NO_PRODUCTION_WRITERS,
 ) -> TaskWorkflow:
     """The real TaskWorkflow for *task*, run in *worktree* against the eval stubs.
 
-    ``initial_plan=None`` makes the workflow's architect plan live.
+    ``initial_plan=None`` makes the workflow's architect plan live. Handed
+    *writers* are refused with ``EvalHermeticityError`` before anything is
+    built, and so is a built workflow holding one it was not handed, so the
+    cell writes no production state (C11).
     """
+    refuse_production_writers(writers)
     task_id = task['id']
     modules = task.get('modules', [])
     assignment = TaskAssignment(
@@ -636,7 +648,13 @@ def _cell_workflow(
         mcp=eval_mcp_lifecycle(orch_config),
         initial_plan=initial_plan,
         usage_gate=usage_gate,
+        escalation_queue=writers.escalation_queue,
+        steward_factory=writers.steward_factory,
+        event_store=writers.event_store,
+        cost_store=writers.cost_store,
     )
+    if isinstance(workflow, TaskWorkflow):  # tests that patch build_workflow hand back a MagicMock
+        refuse_production_writers(writers_held_by(workflow))
     workflow.worktree = worktree
     return workflow
 
