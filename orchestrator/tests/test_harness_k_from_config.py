@@ -60,10 +60,8 @@ class TestHarnessKFromConfig:
     would have no effect because no module-level binding exists there.
     """
 
-    async def _run_start_worker(self, config):
-        """Helper: build harness, patch, call _start_merge_worker, return mocks."""
-        h = _build_harness(config)
-
+    async def _run_start_worker(self, h: Harness):
+        """Helper: patch, call *h*._start_merge_worker, return mocks."""
         with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
@@ -101,7 +99,7 @@ class TestHarnessKFromConfig:
         mock_orch_config.fused_memory.project_id = 'test'
 
         mock_smw_cls, mock_liveness, mock_serial = await self._run_start_worker(
-            mock_orch_config
+            _build_harness(mock_orch_config),
         )
 
         smw_kwargs = mock_smw_cls.call_args[1]
@@ -128,7 +126,7 @@ class TestHarnessKFromConfig:
         mock_orch_config.fused_memory.project_id = 'test'
 
         mock_smw_cls, mock_liveness, mock_serial = await self._run_start_worker(
-            mock_orch_config
+            _build_harness(mock_orch_config),
         )
 
         smw_kwargs = mock_smw_cls.call_args[1]
@@ -160,14 +158,7 @@ class TestHarnessKFromConfig:
         pool = h.git_ops.spec_warm_lane_pool
         assert pool is not None
 
-        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
-             patch.object(h, '_build_service_restart_coordinator',
-                          return_value=MagicMock()), \
-             patch('asyncio.create_task', return_value=MagicMock()), \
-             patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin'), \
-             patch('orchestrator.merge_lane.liveness.enforce_persistent_worktree_serial_lane'):
-            mock_smw_cls.return_value = MagicMock()
-            await h._start_merge_worker()
+        mock_smw_cls, _, _ = await self._run_start_worker(h)
 
         depth = mock_smw_cls.call_args[1]['speculation_depth']
         assert depth == 3

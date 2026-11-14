@@ -1,12 +1,10 @@
 """A verify host is released at the verdict, not at landing (task 8526, policy δ).
 
-``plans/merge-lane-policy-prd.md`` §7 boundary rows 5 and 6, at K = hosts + 1:
-
-* row 5: a follower whose laptop verify has passed frees the laptop at its
-  verdict, so the next follower verifies there while the head still verifies,
-  and all three land in submission order with no gate re-verify;
-* row 6: a rebased head that finds both hosts held still waits first in line
-  and takes the first host that frees, holding no lease while it waits.
+``plans/merge-lane-policy-prd.md`` §7 boundary row 5, at K = hosts + 1: a
+follower whose laptop verify has passed frees the laptop at its verdict, so the
+next follower verifies there while the head still verifies, and all three land
+in submission order with no gate re-verify.  Row 6 at K = hosts + 1 is a case
+of test_merge_queue_rebased_landing_dead_base.py::TestRebasedHeadWaitsFirstForAHost.
 
 Each scene runs a real lane over a real tmp repo and observes only the lane's
 snapshot, request outcomes, the injected verifier and the injected event store.
@@ -24,16 +22,7 @@ from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config, pas
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
 from _verify_result_doubles import real_verify_result
-from test_merge_queue_concurrent_verify import _gated_runner, _inject_two_host_allocator
-from test_merge_queue_rebased_landing_dead_base import (
-    _awaiting_host,
-    _BaseRecordingVerifier,
-    _land_foreign_commit,
-    _LocalSlotTakenOnceFreed,
-    _running_lane,
-    _submitted,
-    _until,
-)
+from test_merge_queue_rebased_landing_dead_base import _running_lane, _submitted, _until
 from test_merge_speculation import _LateArrivalFakeEventStore
 
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -121,10 +110,6 @@ def _row(lane: MergeLane, task_id: str) -> tuple[str, str] | None:
     return (rows[0]['host'], rows[0]['activity']) if rows else None
 
 
-def _holding_a_lease(lane: MergeLane) -> list[str]:
-    return [r['task_id'] for r in _occupancy(lane)['leases'] if r['activity'] != _RELEASED]
-
-
 def _rows(store: _LateArrivalFakeEventStore, kind: EventType, task_id: str) -> list[dict]:
     return [e['data'] for e in store.speculative_events(kind) if e['task_id'] == task_id]
 
@@ -208,74 +193,15 @@ class TestLaptopReleasedAtVerdict:
         assert [o.status for o in outcomes] == ['done', 'done', 'done'], outcomes
         assert _landings(store) == ['lv-a', 'lv-b', 'lv-c']
         assert await _first_parent_chain(git_repo, 3) == [o.merge_sha for o in reversed(outcomes)]
-        assert [
-            row for row in _rows(store, EventType.merge_attempt, 'lv-b')
-            if row.get('outcome') == 'gate_retry'
-        ] == []
-        assert _rows(store, EventType.merge_reverify_gate, 'lv-b') == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
-class TestRebasedHeadWaitsForAHostAtKHostsPlusOne:
-
-    async def test_a_rebased_head_with_no_free_host_waits_first_and_takes_the_first_free_host(
-        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
-    ) -> None:
-        head_gate = asyncio.Event()
-        remote_release = asyncio.Event()
-        verifier = _BaseRecordingVerifier(scripts={
-            'wk-a': VerifyScript(result=passes().result, release=head_gate),
-        })
-        store = _LateArrivalFakeEventStore()
-
-        async with _running_lane(
-            git_ops, verifier=verifier, event_store=store, speculation_depth=3,
-        ) as (lane, queue):
-            remote = _gated_runner(remote_release, name='remote-wk')
-            allocator = _inject_two_host_allocator(
-                lane, remote, allocator_cls=_LocalSlotTakenOnceFreed,
-            )
-            assert isinstance(allocator, _LocalSlotTakenOnceFreed)
-            held_remote = allocator.acquire_remote()
-            assert held_remote is not None, 'precondition: the remote was free to hold'
-            local_handed_back = False
-            try:
-                req_a = await _submitted(git_ops, config, 'wk-a')
-                await queue.put(req_a)
-                await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
-
-                await _land_foreign_commit(git_repo)
-                head_gate.set()
-                await _until(
-                    lambda: _awaiting_host(lane) == ['wk-a'] and allocator.held_local is not None,
-                    what="A's rebased head to wait for a host, with both hosts held",
-                )
-                assert verifier.verified == ['wk-a'], verifier.verified
-                assert 'wk-a' not in _holding_a_lease(lane), lane.snapshot()['occupancy']
-
-                req_x = await _submitted(git_ops, config, 'wk-x')
-                await queue.put(req_x)
-                await _until(lambda: 'wk-x' in _awaiting_host(lane), what='X to wait for a host')
-                assert _awaiting_host(lane) == ['wk-a', 'wk-x'], lane.snapshot()['entries']
-                assert verifier.verified == ['wk-a'], verifier.verified
-
-                assert allocator.held_local is not None
-                local_handed_back = True
-                await allocator.release(allocator.held_local)
-                outcome_a = await wait_responsive(req_a.result, label='wk-a outcome')
-                outcome_x = await wait_responsive(req_x.result, label='wk-x outcome')
-            finally:
-                remote_release.set()
-                head_gate.set()
-                if allocator.held_local is not None and not local_handed_back:
-                    await allocator.release(allocator.held_local)
-                await allocator.release(held_remote)
-
-            assert (outcome_a.status, outcome_x.status) == ('done', 'done'), (outcome_a, outcome_x)
-            assert verifier.verified == ['wk-a', 'wk-a', 'wk-x'], verifier.verified
-            assert _landings(store) == ['wk-a', 'wk-x']
-            remote.run_merge_verify.assert_not_awaited()
+        for tid, outcome in zip(('lv-b', 'lv-c'), outcomes[1:], strict=True):
+            assert [row['merge_sha'] for row in _rows(store, EventType.merge_verify, tid)] == [
+                outcome.merge_sha,
+            ], f'{tid} landed the commit it verified, stacked on its predecessor'
+            assert [
+                row for row in _rows(store, EventType.merge_attempt, tid)
+                if row.get('outcome') == 'gate_retry'
+            ] == []
+            assert _rows(store, EventType.merge_reverify_gate, tid) == []
 
 
 @pytest.mark.asyncio

@@ -442,11 +442,13 @@ class TestScenario1SpeculativeCascade:
             # remote host when the cascade reaches it. A verdict reached first
             # would have freed that host already (task 8526).
             head_gate.set()
-            await _until(
-                lambda: gated_remote.cancel_verify.called,
-                what="the cascade to cancel N+1's running remote verify",
-            )
-            follower_release.set()
+            try:
+                await _until(
+                    lambda: gated_remote.cancel_verify.called,
+                    what="the cascade to cancel N+1's running remote verify",
+                )
+            finally:
+                follower_release.set()
 
             outcome_a = await wait_responsive(
                 req_a.result, label='casc1-a (N, head) outcome after head-failure cascade',
