@@ -44,6 +44,15 @@ sys.stdout.write((module / 'output.txt').read_text())
 sys.exit(int((module / 'rc').read_text()))
 '''
 
+_FAKE_PROVISION = '''\
+import pathlib, sys
+root = pathlib.Path(__file__).parent
+with (root / 'order.txt').open('a') as order:
+    order.write('provision\\n')
+(root / 'provisioned').touch()
+sys.exit(int((root / 'provision_rc').read_text()))
+'''
+
 _GREEN = '... [100%]\n== 3 passed in 1.0s ==\n'
 _ALPHA_RED = (
     'F.. [100%]\n'
@@ -95,6 +104,17 @@ class _Tree:
 
     def config(self) -> OrchestratorConfig:
         return load_config(self.config_path)
+
+    def provisioning_config(self, rc: int) -> OrchestratorConfig:
+        """The tree's config with a fake cold-preprovision command that exits *rc*.
+
+        conftest's autouse ``_isolate_orch_config`` empties the knob through the env, which wins
+        over the yaml, so the command is set on the loaded model instead.
+        """
+        script = self.root / 'fake_provision.py'
+        script.write_text(_FAKE_PROVISION)
+        (self.root / 'provision_rc').write_text(str(rc))
+        return self.config().model_copy(update={'verify_cold_preprovision_command': f'{sys.executable} {script}'})
 
     def env_of(self, prefix: str) -> dict[str, str]:
         return json.loads((self.root / prefix / 'env.json').read_text())
@@ -219,6 +239,7 @@ class TestRunAudit:
 
     async def test_the_module_child_env_is_the_merge_gates_plus_cache_off(self, tree, capsys, monkeypatch):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '/nonexistent/fake.yaml')
+        monkeypatch.setenv('PROJECT_ROOT', str(tree.root))
         monkeypatch.setenv('ORCH_AUDIT_PROBE', 'leak')
         tree.module('beta', output=_GREEN, rc=0, verify_env={'AUDIT_OVERRIDE': 'module'})
 
@@ -230,6 +251,40 @@ class TestRunAudit:
         assert (env['AUDIT_SHARED'], env['AUDIT_OVERRIDE']) == ('top', 'module')
         assert tree.env_of('alpha')['AUDIT_OVERRIDE'] == 'top'
         assert not [name for name in env if name.startswith('ORCH_')]
+        assert 'PROJECT_ROOT' not in env
+
+    async def test_a_verify_env_project_root_still_reaches_the_child(self, tree, capsys, monkeypatch):
+        monkeypatch.setenv('PROJECT_ROOT', str(tree.root))
+        tree.module('beta', output=_GREEN, rc=0, verify_env={'PROJECT_ROOT': '/from/verify_env'})
+
+        await audit_run.run_audit(tree.root, tree.config(), tree.root / 'logs')
+
+        assert tree.env_of('beta')['PROJECT_ROOT'] == '/from/verify_env'
+        assert 'PROJECT_ROOT' not in tree.env_of('alpha')
+
+    async def test_the_tree_is_provisioned_before_the_first_module_runs(self, tree, capsys):
+        rc = await audit_run.run_audit(tree.root, tree.provisioning_config(0), tree.root / 'logs')
+        report = capsys.readouterr().out
+
+        assert rc == 0
+        assert tree.order() == ['provision', 'alpha', 'beta', 'tests/scripts']
+        assert (tree.root / 'provisioned').exists()
+        assert _has_summary(report.splitlines()), report
+
+    async def test_a_failed_provision_runs_no_module_and_reports_no_test(self, tree, capsys, tmp_path):
+        rc = await audit_run.run_audit(tree.root, tree.provisioning_config(1), tree.root / 'logs')
+        report = capsys.readouterr().out
+
+        assert rc != 0
+        assert tree.order() == ['provision']
+        lines = report.splitlines()
+        assert parse_pytest_failures(report) == (), report
+        assert not [line for line in lines if line.startswith(('FAILED', 'ERROR'))], report
+        assert not _has_summary(lines), report
+        assert any(line.startswith('#') and 'provision' in line and 'failed' in line for line in lines), report
+        record = await _lane_record(tmp_path, report)
+        assert record.session_complete is False
+        assert record.failures == ()
 
     async def test_each_modules_raw_output_lands_in_its_named_log(self, tree, capsys):
         tree.module('alpha', output=_ALPHA_RED, rc=1)
