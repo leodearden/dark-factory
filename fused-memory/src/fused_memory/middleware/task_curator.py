@@ -75,6 +75,7 @@ from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 from shared.streak import KeyedStreaks
+from shared.task_fields import dependency_ids as _task_dependencies
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import ACTIVE
 from shared.transcript_archive import ArchiveBeforeDelete, archive_before_delete
@@ -134,7 +135,6 @@ from fused_memory.middleware.recon_code_fix_premise_guard import (
 from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
 from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 from fused_memory.reconciliation.context_assembler import estimate_tokens
-from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
 if TYPE_CHECKING:
     from qdrant_client.models import ExtendedPointId

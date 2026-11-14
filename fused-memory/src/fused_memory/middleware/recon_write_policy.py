@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from shared.scheduler_state import SchedulerStateSnapshot
+from shared.task_fields import dependency_ids as task_dependency_ids
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
@@ -81,7 +82,6 @@ from fused_memory.services.live_workflow_detector import (
     is_workflow_live_for_task,
 )
 from fused_memory.services.orchestrator_detector import orchestrator_started_at
-from fused_memory.utils.task_dependency_ids import task_dependency_ids
 
 logger = logging.getLogger(__name__)
 

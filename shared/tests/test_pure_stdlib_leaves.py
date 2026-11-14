@@ -99,6 +99,7 @@ PURE_STDLIB_LEAVES = (
     'streak',
     'task_claimant',
     'task_created_at',
+    'task_fields',
     'task_metadata_wire',
     'task_statuses',
     'task_store_schema',
