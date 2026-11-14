@@ -9,8 +9,9 @@ that no worktree, branch, agent, or steward is created for a gate (I4/B2).
 
 1. Idempotency / quiescence — hold or resume a task that already escalated
    or already ran its ``before_done`` action.
-2. before_done execution — the stop-instruction guard, then the ε
-   self-restart, γ cross-unit, target_unit-less and predicate sub-paths.
+2. before_done execution — the stop-instruction guard and the refused-record
+   check, then the ε self-restart, γ cross-unit, target_unit-less and
+   predicate sub-paths.
 3. Pure gate — file one born-at-L2 escalation and block; resume only on the
    two-rung proof ladder.
 
@@ -31,8 +32,9 @@ from typing import TYPE_CHECKING
 from escalation.models import Escalation, ReviewDueState
 from shared.before_done_paths import (
     BeforeDonePaths,
+    BeforeDonePathsRefused,
+    FactoryRootUnresolved,
     resolve_before_done_paths,
-    resolve_script_base,
 )
 from shared.milestone_rearm import rearmed_milestone
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
@@ -316,23 +318,6 @@ def _configured_project_root(scheduler) -> Path | None:
     return None
 
 
-class FactoryRootUnresolved(RuntimeError):
-    """before_done.script_root='factory' but ``resolve_dark_factory_root()``
-    found no dark-factory checkout.
-
-    ``_run_predicate`` files it through a dedicated no-verdict arm, never as a
-    verdict.
-    """
-
-    def __init__(self, script: str) -> None:
-        super().__init__(
-            f"before_done.script_root='factory' but the dark-factory tooling root is "
-            f'unresolvable, so script {script!r} cannot be located; set '
-            f'{DARK_FACTORY_ROOT_ENV} for the orchestrator process to the '
-            f'dark-factory checkout'
-        )
-
-
 def _snippet_project_root(scheduler) -> str:
     """The configured project_root for the runbook snippet, else a visible placeholder."""
     root = _configured_project_root(scheduler)
@@ -377,6 +362,9 @@ _CURATOR_STAMP_NOTE_MAX_CHARS: int = 64
 # Not a valid systemd unit name (unit names never contain angle brackets), so
 # it can never collide with a real target_unit.
 _CROSS_UNIT_OWN_UNIT_SENTINEL: str = '<no-self-target-known>'
+
+# The closing line of every escalation filed after before_done_ran_at is stamped.
+_I1_NOT_RERUN_LINE: str = 'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.'
 
 
 def _build_done_provenance(kind: str, **fields: object) -> dict:
@@ -864,7 +852,8 @@ class DeterministicRunner:
             the dark-factory root a ``before_done.script_root='factory'``
             script resolves under.  Defaults to
             ``shared.repo_paths.resolve_dark_factory_root``; consulted only for
-            such scripts.  ``None`` raises ``FactoryRootUnresolved``.
+            such scripts.  ``None`` raises
+            ``shared.before_done_paths.FactoryRootUnresolved``.
         predicate_recheck_stall_cap: How many consecutive exit-75 "not yet"
             verdicts a re-arming predicate may return before the runner files
             ``milestone_check_stalled`` (PRD completion-driven-triggers C1).
@@ -936,18 +925,9 @@ class DeterministicRunner:
                 'resolving before_done paths against the process cwd %s',
                 root,
             )
-        project_root = root.resolve()
         return resolve_before_done_paths(
-            before_done,
-            project_root,
-            script_base=self._script_base(before_done, project_root),
+            before_done, root.resolve(), self._factory_root_resolver,
         )
-
-    def _script_base(self, before_done: dict, project_root: Path) -> Path:
-        base = resolve_script_base(before_done, project_root, self._factory_root_resolver)
-        if base is None:
-            raise FactoryRootUnresolved(before_done['script'])
-        return base
 
     async def _default_schedule_detached_restart(
         self,
@@ -2239,7 +2219,8 @@ class DeterministicRunner:
           (next bullet but one): its non-carrier text asserts "deliberately not
           milestone_check_failed", which would contradict a carrier's own
           category.
-        - Outer-guard timeout / ``FactoryRootUnresolved`` (task 6386) /
+        - Outer-guard timeout /
+          ``shared.before_done_paths.FactoryRootUnresolved`` (task 6386) /
           unexpected error -> likewise an INFRA fault (no verdict was
           produced): born-at-L2 escalation + blocked (re-attempted on the next
           dispatch, no ``gate_escalated_at`` stamp).  The outer
@@ -2248,6 +2229,12 @@ class DeterministicRunner:
           arm shares one category, so each carries deliberately distinct
           summary/detail wording — that text is the only thing telling a human
           which guard fired.
+        - Any other ``shared.before_done_paths.BeforeDonePathsRefused`` (a
+          record that arrived through ``update_task`` with a missing,
+          non-string or blank script, a non-string cwd, or a ``script_root``
+          it may not use, task 9116) -> likewise an INFRA
+          fault: the check was never run.  Summary "Predicate before_done
+          refused (check not run)"; the detail names the refused field.
         - CARRIER SPLIT (task 4678 / r3, PRD R-D6 + C-5): for a task carrying
           ``metadata.recurrence`` — one link of a recurring chain — EVERY
           no-verdict arm above files ``milestone_check_failed`` instead of
@@ -2388,6 +2375,21 @@ class DeterministicRunner:
             return await self._file_infra_issue_and_block(
                 task_id,
                 summary='Predicate script root unresolvable',
+                detail='\n'.join([
+                    description,
+                    str(exc),
+                    f'Set {DARK_FACTORY_ROOT_ENV} for the orchestrator process to the '
+                    'dark-factory checkout.',
+                ]),
+                category=no_verdict_category,
+            )
+        except BeforeDonePathsRefused as exc:
+            # The record names a script or cwd this process cannot resolve, so
+            # the check never ran. After the FactoryRootUnresolved arm: that
+            # subclass has its own.
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate before_done refused (check not run)',
                 detail='\n'.join([description, str(exc)]),
                 category=no_verdict_category,
             )
@@ -2787,7 +2789,7 @@ class DeterministicRunner:
                 note,
                 f'Deploy run exceeded the outer guard timeout ({outer_timeout}s = '
                 f"before_done['timeout_secs'] + run_timeout_grace_secs).",
-                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                _I1_NOT_RERUN_LINE,
             ])
             return await self._file_infra_issue_and_block(
                 task_id,
@@ -2806,7 +2808,7 @@ class DeterministicRunner:
                 *_deploy_timeout_fact_lines(
                     exc, script=self._before_done_paths(before_done).script,
                 ),
-                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                _I1_NOT_RERUN_LINE,
             ])
             return await self._file_infra_issue_and_block(
                 task_id,
@@ -2822,7 +2824,7 @@ class DeterministicRunner:
                 description,
                 note,
                 f'Deploy run_fn raised an unexpected error: {exc!r}',
-                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                _I1_NOT_RERUN_LINE,
             ])
             return await self._file_infra_issue_and_block(
                 task_id,
@@ -2837,7 +2839,7 @@ class DeterministicRunner:
                 note,
                 f'Deploy script exit code: rc={rc}',
                 f'Output:\n{tail}',
-                'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                _I1_NOT_RERUN_LINE,
             ])
             return await self._file_infra_issue_and_block(
                 task_id,
@@ -3566,6 +3568,31 @@ class DeterministicRunner:
                     detail=stop_detail,
                 )
 
+            # ── Refused before_done record (task 9116) ───────────────────────
+            # A refusal depends only on the stored record, so it is filed
+            # BEFORE the stamp below: once the record is fixed, the next
+            # dispatch runs the deploy instead of resuming to done unrun (I1).
+            # No metadata: there is no deploy_state phase to advance yet.
+            try:
+                paths = self._before_done_paths(before_done)
+            except BeforeDonePathsRefused as exc:
+                return await self._file_infra_issue_and_block(
+                    task_id,
+                    summary=(
+                        f'Deploy refused before_done: {target_unit}' if target_unit
+                        else 'Deploy refused before_done (no target_unit)'
+                    ),
+                    detail='\n'.join([
+                        description,
+                        f'Target unit: {target_unit or "(none)"}',
+                        f'before_done was refused, so the deploy was NOT run: {exc}',
+                        'before_done_ran_at was NOT stamped.  Fix the record with '
+                        'update_task, then resolve this escalation (e.g. '
+                        "resolve_issue action='resume' or 'restart') to move the "
+                        'task back to pending; the next dispatch runs the deploy.',
+                    ]),
+                )
+
             # Stamp before_done_ran_at FIRST (crash-safe I1: stamp-before-run means a
             # crash mid-deploy leaves the stamp set → re-dispatch does NOT re-run).
             # This stamp is SHARED for both self-target and cross-unit paths so I1
@@ -3908,8 +3935,6 @@ class DeterministicRunner:
                     baseline_main_pid=baseline.get('MainPID', 0),
                     inspect_timeout_secs=self._inspect_timeout_secs,
                 )
-                paths = self._before_done_paths(before_done)
-
                 try:
                     plan = RestartPlan(
                         script=paths.script,
@@ -3935,7 +3960,7 @@ class DeterministicRunner:
                         f'Target unit: {target_unit}',
                         f'The deploy plan refused before_done, so the deploy script '
                         f'was NOT run: {exc}',
-                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                        _I1_NOT_RERUN_LINE,
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
@@ -3965,7 +3990,7 @@ class DeterministicRunner:
                         'unit inspect (verify) — the outer guard wraps both and cannot '
                         'distinguish which was pending. Check the unit out-of-band (e.g. '
                         'systemctl --user status, ps) before taking further action.',
-                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                        _I1_NOT_RERUN_LINE,
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
@@ -3987,7 +4012,7 @@ class DeterministicRunner:
                         'The post-deploy fresh-PID verify never ran, so the unit state '
                         'after the timeout is unobserved — check it out-of-band (e.g. '
                         'systemctl --user status) before resolving.',
-                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                        _I1_NOT_RERUN_LINE,
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
@@ -4003,7 +4028,7 @@ class DeterministicRunner:
                         description,
                         f'Target unit: {target_unit}',
                         f'Deploy run_fn raised an unexpected error: {exc!r}',
-                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                        _I1_NOT_RERUN_LINE,
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,

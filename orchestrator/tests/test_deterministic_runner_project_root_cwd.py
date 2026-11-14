@@ -11,6 +11,7 @@ real default script runner.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,6 +26,7 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
 RELATIVE_SCRIPT = 'data/ops/deploy.sh'
+_ABSENT = object()
 WRITE_CWD_TO_MARKER = '#!/bin/sh\npwd -P > "$MARKER"\n'
 
 BASELINE_UNIT_STATE: dict = {
@@ -447,3 +449,120 @@ class TestFactoryRootedPredicate:
 
         assert outcome == WorkflowOutcome.DONE
         assert marker.read_text().strip() == str(project_root.resolve())
+
+
+@dataclass(frozen=True)
+class _RefusalLeg:
+    fields: dict
+    summary: str
+    own_unit: str | None = None
+
+
+REFUSAL_LEGS = [
+    pytest.param(
+        _RefusalLeg(
+            {'kind': 'predicate', 'target_unit': None},
+            'Predicate before_done refused (check not run)',
+        ),
+        id='predicate',
+    ),
+    pytest.param(
+        _RefusalLeg({}, 'Deploy refused before_done (no target_unit)'),
+        id='targetless-deploy',
+    ),
+    pytest.param(
+        _RefusalLeg(
+            {'target_unit': 'orchestrator-other.service'},
+            'Deploy refused before_done: orchestrator-other.service',
+            own_unit='orchestrator.service',
+        ),
+        id='cross-unit-deploy',
+    ),
+    pytest.param(
+        _RefusalLeg(
+            {'target_unit': 'orchestrator-self.service'},
+            'Deploy refused before_done: orchestrator-self.service',
+            own_unit='orchestrator-self.service',
+        ),
+        id='self-target-restart',
+    ),
+]
+
+
+def _stamped_keys(scheduler) -> set[str]:
+    return {key for call in scheduler.update_task.await_args_list for key in call.args[1]}
+
+BEFORE_DONE_REFUSALS = [
+    pytest.param({'cwd': 5}, ('before_done.cwd', "'int'"), id='cwd-not-a-string'),
+    pytest.param({'script_root': 'elsewhere'}, ("'elsewhere'",), id='unknown-script-root'),
+    pytest.param({'script': 5}, ('before_done.script', 'int'), id='script-not-a-string'),
+    pytest.param({'script': _ABSENT}, ('before_done.script',), id='script-missing'),
+]
+
+
+@pytest.mark.asyncio
+class TestRefusedBeforeDoneIsANamedInfraIssue:
+    @pytest.mark.parametrize(('refusal_fields', 'detail_fragments'), BEFORE_DONE_REFUSALS)
+    @pytest.mark.parametrize('leg', REFUSAL_LEGS)
+    async def test_refusal_files_the_legs_own_summary_without_running_the_script(
+        self, leg: _RefusalLeg, refusal_fields: dict, detail_fragments: tuple[str, ...],
+        project_root: Path, elsewhere: Path, marker: Path, queue: EscalationQueue,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        task_id = f'9116-{request.node.callspec.id}'
+        record = {
+            'script': RELATIVE_SCRIPT,
+            'timeout_secs': 10,
+            'env': {'MARKER': str(marker)},
+            **leg.fields,
+            **refusal_fields,
+        }
+        task = _task(task_id, {key: value for key, value in record.items() if value is not _ABSENT})
+        scheduler = _scheduler(task, project_root)
+        runner_kwargs: dict = {}
+        if leg.own_unit is not None:
+            runner_kwargs['own_unit_resolver'] = lambda: leg.own_unit
+        runner = DeterministicRunner(
+            scheduler=scheduler, escalation_queue=queue, **runner_kwargs,
+        )
+        executed_plans: list[RestartPlan] = []
+
+        async def _record_execute(self, *, runner=None, inspector=None):
+            executed_plans.append(self)
+            return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
+
+        with patch.object(RestartPlan, 'execute', _record_execute):
+            outcome = await runner.run(_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert not marker.exists()
+        assert executed_plans == []
+        [esc] = queue.get_by_task(task_id, status='pending')
+        assert esc.category == 'infra_issue'
+        assert esc.summary == leg.summary, esc.summary
+        for fragment in detail_fragments:
+            assert fragment in esc.detail, esc.detail
+        statuses = [c.args[1] for c in scheduler.set_task_status.await_args_list]
+        assert 'done' not in statuses
+        assert {'before_done_ran_at', 'deploy_state'}.isdisjoint(_stamped_keys(scheduler))
+
+    async def test_fixed_record_runs_the_deploy_on_the_next_dispatch(
+        self, project_root: Path, elsewhere: Path, marker: Path, queue: EscalationQueue,
+    ) -> None:
+        fixed = {'script': RELATIVE_SCRIPT, 'timeout_secs': 10, 'env': {'MARKER': str(marker)}}
+        refused_task = _task('9117', {**fixed, 'cwd': 5})
+        runner = DeterministicRunner(
+            scheduler=_scheduler(refused_task, project_root), escalation_queue=queue,
+        )
+        assert await runner.run(_assignment(refused_task)) == WorkflowOutcome.BLOCKED
+        [esc] = queue.get_by_task('9117', status='pending')
+        queue.resolve(esc.id, 'cwd fixed via update_task', resolved_by='human')
+
+        fixed_task = _task('9117', fixed)
+        scheduler = _scheduler(fixed_task, project_root)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(_assignment(fixed_task))
+
+        assert outcome == WorkflowOutcome.DONE
+        assert marker.read_text().strip() == str(project_root.resolve())
+        assert _done_provenance_kind(scheduler) == 'deterministic-deploy'
