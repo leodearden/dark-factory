@@ -36,6 +36,7 @@ from _payload_budget_history import (
     history_violations,
     resolve_base_table,
 )
+from shared.governed_exceptions import Debt, TicketRef, governed_exceptions
 from starlette.responses import JSONResponse
 
 from dashboard.payload_budgets import (
@@ -51,6 +52,16 @@ from dashboard.payload_budgets import (
     render_overage,
     slack_violation,
 )
+
+PAYLOAD_BUDGET_EXEMPTIONS = governed_exceptions(
+    'dashboard.payload_budgets.exempt',
+    'A templated GET route under /api/v2/dashboard/ whose response is bounded by one record, '
+    'not by population, so it cannot grow organically and carries no payload budget.',
+    [exemption.path for exemption in load_budget_table().exempt],
+    default=Debt(TicketRef('tkt_0RWZFP07XTSRAT1K10N2GR1Q8D')),
+    default_covers=1,
+)
+"""Every exemption silences the completeness guard below, so each carries an INV-12 disposition."""
 
 
 @pytest.fixture(scope='module')

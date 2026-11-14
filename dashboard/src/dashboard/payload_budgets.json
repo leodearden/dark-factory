@@ -6,7 +6,7 @@
     "Headroom convention for a new number over a fresh live measurement m: round max(1.25*m, m + 16384) up to 2 significant figures.",
     "Slack rule (payload_budgets.MAX_SLACK_RATIO, payload_budgets.SLACK_FLOOR_BYTES): the sweep fails when a budget exceeds max(MAX_SLACK_RATIO * measured, measured + SLACK_FLOOR_BYTES), so a real shrink must be recorded as a lowered entry and a fixture that stops reaching its data turns red.",
     "data_keyed_maps lists the key paths of dicts keyed by DATA (project labels, dates, task ids) rather than by field name. Each is a list of segments, with [] for list descent and {} for a collapsed map. Field accounting collapses their keys to {}.",
-    "exempt is for TEMPLATED routes only, each with a reason. Entry paths plus exempt paths must equal every GET route under /api/v2/dashboard/.",
+    "exempt is for TEMPLATED routes only, each with a reason. Entry paths plus exempt paths must equal every GET route under /api/v2/dashboard/. An exemption silences that completeness guard, so it is a governed INV-12 exception: a new one needs a disposition in the dashboard.payload_budgets.exempt declaration in dashboard/tests/test_payload_budgets.py, or that suite fails at collection.",
     "The synthetic fleet the sweep measures lives in dashboard/tests/_payload_fleet.py (its census) and dashboard/tests/_payload_fleet_seed.py (its on-disk seeders)."
   ],
   "schema_version": 1,
