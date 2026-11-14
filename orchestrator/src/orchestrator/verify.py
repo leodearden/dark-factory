@@ -6220,7 +6220,8 @@ async def _discover_relocated_scopes(
 
 class ScopeLaunchRefused(NamedTuple):
     """The triple ``_run_cmd`` returns when its systemd-run scope launcher exited
-    without exec'ing the command; *output* is the launcher's own."""
+    without exec'ing the command; *output* is the launcher's own. The leg never
+    started, so ``classify_leg`` makes it ENV_TRANSIENT."""
 
     rc: int
     output: str
