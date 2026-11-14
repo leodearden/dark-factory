@@ -85,10 +85,11 @@ import logging
 import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _briefing_helpers import MEMORY_TRANSPORT
 from _workflow_helpers import ENC, PLAN, AgentStub, _init_repo
 from shared.cli_invoke import AgentResult
 from shared.project_layout import (
@@ -833,33 +834,6 @@ class _TranscriptWritingAgents(AgentStub):
         return await super().invoke_agent(prompt, system_prompt, cwd, **kwargs)
 
 
-def _refuse_every_memory_round_trip(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Answer every ``McpSession`` round-trip as the null sentinel's wire does; log its url.
-
-    Replaces the autouse ``forbid_live_mcp`` guard for a test that runs a whole
-    cell. The guard's ``pytest.fail`` would abort the cell's memory recall,
-    which the cell rides out as a transport failure. Here every attempt gets the
-    refused connection a dead ``127.0.0.1:1`` gives, so nothing reaches the
-    network, and the returned log lets the test assert which url each attempt
-    aimed at.
-    """
-    attempted: list[str] = []
-
-    def refuse(session: Any) -> NoReturn:
-        attempted.append(session.base_url)
-        raise ConnectionRefusedError(111, 'Connection refused', session.base_url)
-
-    async def initialize(self: Any) -> None:
-        refuse(self)
-
-    async def call(self: Any, method: str, params: Any = None, *, timeout: float = 30) -> dict:
-        refuse(self)
-
-    monkeypatch.setattr('shared.mcp_session.McpSession.initialize', initialize)
-    monkeypatch.setattr('shared.mcp_session.McpSession.call', call)
-    return attempted
-
-
 def _store_snapshot(store: Path) -> dict[str, bytes | None]:
     """Every entry of *store* mapped to its bytes (``None`` for a directory).
 
@@ -891,8 +865,8 @@ async def test_b11_eval_cell_writes_no_production_state(
     archive, task store) are byte- and listing-identical to their seeds; the
     workflow holds no queue, event store or cost store; a task write is refused
     by the eval stub session; every curator post's base url is the null
-    sentinel, as is every fused-memory round-trip the cell attempts; and every
-    transcript was archived under ``eval_worktree_root``.
+    sentinel, as is every memory recall the cell's briefings attempt; and
+    every transcript was archived under ``eval_worktree_root``.
     """
     proj = tmp_path / 'proj'
     _init_repo(proj)
@@ -932,7 +906,11 @@ async def test_b11_eval_cell_writes_no_production_state(
         task, base,
     )
 
-    memory_round_trips = _refuse_every_memory_round_trip(monkeypatch)
+    # The briefing's memory recall gets the refused connection the dead null
+    # sentinel gives; every other McpSession round-trip still meets the
+    # autouse forbid_live_mcp guard.
+    memory_recall = AsyncMock(side_effect=ConnectionRefusedError(111, 'Connection refused'))
+    monkeypatch.setattr(MEMORY_TRANSPORT, memory_recall)
     agents = _TranscriptWritingAgents()
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', agents.invoke_agent)
     monkeypatch.setattr(
@@ -970,7 +948,8 @@ async def test_b11_eval_cell_writes_no_production_state(
 
     assert workflow.mcp is not None
     assert workflow.mcp.url == FM_NULL_SENTINEL_URL
-    assert set(memory_round_trips) <= {FM_NULL_SENTINEL_URL}, memory_round_trips
+    recall_urls = {call.args[0] for call in memory_recall.call_args_list}
+    assert recall_urls <= {f'{FM_NULL_SENTINEL_URL}/mcp'}, recall_urls
 
     archive_root = resolve_archive_root(
         orch_config.project_root, orch_config.transcript_archive.root,
