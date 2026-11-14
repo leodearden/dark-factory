@@ -72,7 +72,7 @@ class CwdRefused(BeforeDonePathsRefused):
 
 
 class ScriptUnrunnable(BeforeDonePathsRefused):
-    """The resolved before_done script is not an executable file at run time."""
+    """The resolved before_done script does not exist, or this process may not execute it."""
 
 
 class ScriptMissing(ScriptUnrunnable):

@@ -1096,10 +1096,7 @@ class DeterministicRunner:
                 'for task %s: %s',
                 transient_unit, task_id, exc,
             )
-            return 1, (
-                f'{exc} The transient unit {transient_unit} was NOT registered, '
-                'so no restart will fire.'
-            )
+            return 1, f'{exc} The transient unit {transient_unit} was NOT registered.'
         outcome = await plan.execute()
         if outcome.disposition == RestartDisposition.REGISTRATION_FAILED:
             logger.warning(
@@ -3693,6 +3690,10 @@ class DeterministicRunner:
                         f'Transient unit: {transient_unit}',
                         f'Restart scheduling rc={rc}',
                         f'Output:\n{tail}',
+                        _I1_NOT_RERUN_LINE,
+                        "No restart is scheduled, so resolve_issue action='resume' "
+                        'marks the task done without one: fix the cause and restart '
+                        f'{target_unit} by hand before resuming.',
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,

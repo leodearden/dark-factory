@@ -188,6 +188,9 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   chmod'ed after submit, or a `before_done` edited through `update_task`,
   therefore blocks the task with the `Self-restart scheduling failed: <unit>`
   infra_issue instead of a phantom `deterministic-deploy-scheduled` done.
+  Either way no restart is scheduled, and as for any escalation filed after
+  the stamp, resolving with `resume` marks the task done without one; the
+  escalation detail says to restart the unit by hand first.
 
 Phase γ **cross-unit** sub-path (`target_unit` ≠ own unit or `ORCH_UNIT` unset):
 - Capture baseline unit state (`unit_inspector`).

@@ -97,24 +97,23 @@ def _assignment(task: dict) -> TaskAssignment:
     return TaskAssignment(task_id=str(task['id']), task=task, modules=[])
 
 
-async def _run_capturing_restart_plan(
+async def _run_recording_restart_plans(
     runner: DeterministicRunner, task: dict,
-) -> tuple[WorkflowOutcome, RestartPlan]:
-    captured_plans: list[RestartPlan] = []
+) -> tuple[WorkflowOutcome, list[RestartPlan]]:
+    executed_plans: list[RestartPlan] = []
 
-    async def _fake_execute(self, *, runner=None, inspector=None):
-        captured_plans.append(self)
+    async def _record_execute(self, *, runner=None, inspector=None):
+        executed_plans.append(self)
         return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
 
-    with patch.object(RestartPlan, 'execute', _fake_execute):
+    with patch.object(RestartPlan, 'execute', _record_execute):
         outcome = await runner.run(_assignment(task))
-    [plan] = captured_plans
-    return outcome, plan
+    return outcome, executed_plans
 
 
-def _self_target_task(task_id: str, own_unit: str) -> dict:
+def _self_target_task(task_id: str, own_unit: str, script: str = RELATIVE_SCRIPT) -> dict:
     return _task(task_id, {
-        'script': RELATIVE_SCRIPT,
+        'script': script,
         'timeout_secs': 10,
         'target_unit': own_unit,
     })
@@ -233,7 +232,7 @@ class TestBeforeDoneRunsUnderConfiguredProjectRoot:
             own_unit_resolver=lambda: own_unit,
         )
 
-        outcome, plan = await _run_capturing_restart_plan(runner, task)
+        outcome, [plan] = await _run_recording_restart_plans(runner, task)
 
         assert outcome == WorkflowOutcome.DONE
         assert plan.cwd == project_root.resolve()
@@ -263,18 +262,27 @@ class TestBeforeDoneRunsUnderConfiguredProjectRoot:
 SELF_RESTART_SCRIPT = 'scripts/orchestrator-redeploy-restart.sh'
 
 
-def _plant_missing(project_root: Path, elsewhere: Path) -> None:
-    decoy = elsewhere / SELF_RESTART_SCRIPT
-    decoy.parent.mkdir(parents=True)
-    decoy.write_text('#!/bin/sh\nexit 0\n')
-    decoy.chmod(0o755)
+def _write_self_restart_script(root: Path, mode: int) -> None:
+    script = root / SELF_RESTART_SCRIPT
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text('#!/bin/sh\nexit 0\n')
+    script.chmod(mode)
+
+
+def _plant_only_a_decoy_in_process_cwd(project_root: Path, elsewhere: Path) -> None:
+    _write_self_restart_script(elsewhere, 0o755)
 
 
 def _plant_not_executable(project_root: Path, elsewhere: Path) -> None:
-    script = project_root / SELF_RESTART_SCRIPT
-    script.parent.mkdir(parents=True)
-    script.write_text('#!/bin/sh\nexit 0\n')
-    script.chmod(0o644)
+    _write_self_restart_script(project_root, 0o644)
+
+
+def _persist_metadata_updates(scheduler: MagicMock, task: dict) -> None:
+    async def _merge(task_id: str, fields: dict, **_: object) -> bool:
+        task['metadata'].update(fields)
+        return True
+
+    scheduler.update_task.side_effect = _merge
 
 
 @pytest.mark.asyncio
@@ -282,7 +290,7 @@ class TestSelfTargetRefusesUnrunnableScript:
     @pytest.mark.parametrize(
         'plant',
         [
-            pytest.param(_plant_missing, id='missing'),
+            pytest.param(_plant_only_a_decoy_in_process_cwd, id='missing'),
             pytest.param(_plant_not_executable, id='not-executable'),
         ],
     )
@@ -291,23 +299,13 @@ class TestSelfTargetRefusesUnrunnableScript:
     ) -> None:
         plant(project_root, elsewhere)
         own_unit = 'orchestrator-reify.service'
-        task = _task('5312', {
-            'script': SELF_RESTART_SCRIPT,
-            'timeout_secs': 10,
-            'target_unit': own_unit,
-        })
+        task = _self_target_task('5312', own_unit, SELF_RESTART_SCRIPT)
         scheduler = _scheduler(task, project_root)
         runner = DeterministicRunner(
             scheduler=scheduler, escalation_queue=queue, own_unit_resolver=lambda: own_unit,
         )
-        executed_plans: list[RestartPlan] = []
 
-        async def _record_execute(self, *, runner=None, inspector=None):
-            executed_plans.append(self)
-            return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
-
-        with patch.object(RestartPlan, 'execute', _record_execute):
-            outcome = await runner.run(_assignment(task))
+        outcome, executed_plans = await _run_recording_restart_plans(runner, task)
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert executed_plans == []
@@ -317,6 +315,34 @@ class TestSelfTargetRefusesUnrunnableScript:
         assert esc.category == 'infra_issue'
         assert esc.summary == f'Self-restart scheduling failed: {own_unit}', esc.summary
         assert str(project_root.resolve() / SELF_RESTART_SCRIPT) in esc.detail, esc.detail
+
+    async def test_resume_after_the_refusal_marks_done_without_scheduling_a_restart(
+        self, project_root: Path, elsewhere: Path, queue: EscalationQueue,
+    ) -> None:
+        own_unit = 'orchestrator-reify.service'
+        task = _self_target_task('5313', own_unit, SELF_RESTART_SCRIPT)
+        refusing = _scheduler(task, project_root)
+        _persist_metadata_updates(refusing, task)
+        runner = DeterministicRunner(
+            scheduler=refusing, escalation_queue=queue, own_unit_resolver=lambda: own_unit,
+        )
+        refused, _ = await _run_recording_restart_plans(runner, task)
+        assert refused == WorkflowOutcome.BLOCKED
+        [esc] = queue.get_by_task('5313', status='pending')
+        assert "action='resume' marks the task done without one" in esc.detail, esc.detail
+        assert f'restart {own_unit} by hand before resuming' in esc.detail, esc.detail
+        _write_self_restart_script(project_root, 0o755)
+        queue.resolve(esc.id, 'script reinstalled, unit restarted by hand', resolved_by='human')
+
+        scheduler = _scheduler(task, project_root)
+        runner = DeterministicRunner(
+            scheduler=scheduler, escalation_queue=queue, own_unit_resolver=lambda: own_unit,
+        )
+        outcome, executed_plans = await _run_recording_restart_plans(runner, task)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert executed_plans == []
+        assert _done_provenance_kind(scheduler) == 'deterministic-deploy'
 
 
 @pytest.mark.asyncio
@@ -358,7 +384,7 @@ class TestNoConfiguredProjectRoot:
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.deterministic_runner'):
-            outcome, plan = await _run_capturing_restart_plan(runner, task)
+            outcome, [plan] = await _run_recording_restart_plans(runner, task)
 
         assert outcome == WorkflowOutcome.DONE
         assert plan.cwd == elsewhere.resolve()
@@ -586,14 +612,8 @@ class TestRefusedBeforeDoneIsANamedInfraIssue:
         runner = DeterministicRunner(
             scheduler=scheduler, escalation_queue=queue, **runner_kwargs,
         )
-        executed_plans: list[RestartPlan] = []
 
-        async def _record_execute(self, *, runner=None, inspector=None):
-            executed_plans.append(self)
-            return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
-
-        with patch.object(RestartPlan, 'execute', _record_execute):
-            outcome = await runner.run(_assignment(task))
+        outcome, executed_plans = await _run_recording_restart_plans(runner, task)
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert not marker.exists()
