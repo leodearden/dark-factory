@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -86,7 +87,8 @@ class TestReadTaskPriority:
 
     def test_a_field_of_the_wrong_type_is_unknown(self) -> None:
         def odd(task_id: str) -> TaskPriority:
-            return TaskPriority(tier=MagicMock(), pinned='yes')  # type: ignore[arg-type]
+            not_a_bool: Any = 'yes'
+            return TaskPriority(tier=MagicMock(), pinned=not_a_bool)
 
         assert read_task_priority(odd, '7') == UNKNOWN_PRIORITY
 

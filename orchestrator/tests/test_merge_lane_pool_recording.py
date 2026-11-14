@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +29,7 @@ from _merge_lane_fakes import (
 )
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
+from _poll_responsive import poll_responsive
 
 from orchestrator.config import GitConfig, MergeDeepConfig
 from orchestrator.event_store import EventStore
@@ -135,14 +135,6 @@ async def _outcomes(requests: list[MergeRequest]) -> dict[str, MergeOutcome]:
         )
         for req in requests
     }
-
-
-async def _until(predicate: Callable[[], bool], what: str) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + REAL_GIT_MERGE_RESULT_TIMEOUT
-    while not predicate():
-        assert loop.time() < deadline, f'timed out waiting for {what}'
-        await asyncio.sleep(0.05)
 
 
 async def _two_sequential_merges(
@@ -307,9 +299,9 @@ class TestBatchMembersOnMergeVerify:
                 await wait_responsive(entered.wait(), label='head verify entry')
                 for req in followers:
                     await scene.submit(req, None)
-                await _until(
+                await poll_responsive(
                     lambda: any(t in {'b1', 'b2', 'b3'} for t, _ in scene.rows('merge_dequeued')),
-                    'a follower to be dequeued',
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT, label='a follower to be dequeued',
                 )
             finally:
                 release.set()

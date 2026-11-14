@@ -76,7 +76,7 @@ class PickRecords:
         """Note that *picked* left *lane* while *buffers* held the rest."""
         try:
             snapshot = self._snapshot(picked, lane, buffers, graph)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'merge pool facts: no pick record for %s', picked.request_id, exc_info=True,
             )
@@ -149,7 +149,7 @@ def with_chain_members(
     base = facts if facts is not None else MergeVerifyDispatchFacts()
     try:
         members = _chain_members(req, chain)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning('merge pool facts: no chain members for %s', req.request_id, exc_info=True)
         return base
     return base if members is None else base.covering(members)

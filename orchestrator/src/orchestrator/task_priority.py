@@ -42,7 +42,7 @@ def read_task_priority(lookup: TaskPriorityLookup | None, task_id: object) -> Ta
         return UNKNOWN_PRIORITY
     try:
         found = lookup(str(task_id))
-    except Exception:  # noqa: BLE001
+    except Exception:
         return UNKNOWN_PRIORITY
     if not isinstance(found, TaskPriority):
         return UNKNOWN_PRIORITY
