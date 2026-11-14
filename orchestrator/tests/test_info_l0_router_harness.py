@@ -25,6 +25,7 @@ from orchestrator.escalation_router import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
+from orchestrator.merge_lane.worker import BreakerTrip
 
 TICKET_TIMEOUT_SECS = 900.0
 AGED_SECS = 300.0
@@ -243,6 +244,76 @@ class TestReaperRoutesInfoOrphans:
         assert l1.suggested_action == 'manual_intervention'
         assert esc.summary in l1.summary
         assert _curator(harness).calls == []
+
+
+def _notice_harness(tmp_path: Path, mock_orch_config) -> Harness:
+    config = router_reaper_config(
+        mock_orch_config, orphan_timeout_secs=0.0, ticket_timeout_secs=TICKET_TIMEOUT_SECS,
+    )
+    # The no-landings filer formats the breaker floor with ``:,``; a MagicMock
+    # knob raises inside the filer's swallow-all ``except`` and nothing is filed.
+    config.no_landings_breaker_window_samples = 3
+    config.no_landings_breaker_disk_free_floor_bytes = 1000
+    return reaper_harness(
+        config,
+        EscalationQueue(tmp_path / 'escalations'),
+        curator=FakeCurator(),
+        event_store=EventStore(tmp_path / 'runs.db', run_id='run-test'),
+    )
+
+
+async def _file_warm_base_hard_down(harness: Harness) -> None:
+    await harness._file_warm_base_hard_down_notice(
+        summary='warm-lane base is hard-down', detail='base ref unresolvable',
+    )
+
+
+async def _file_no_landings_breaker(harness: Harness) -> None:
+    harness._file_no_landings_info_escalation(BreakerTrip(
+        action='halt', window_samples=3, landings_in_window=0,
+        free_start=200, free_end=100, reason='r',
+    ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'file_notice', [_file_warm_base_hard_down, _file_no_landings_breaker],
+    ids=['warm-base-hard-down', 'no-landings-breaker'],
+)
+class TestHarnessSentinelNoticesAreRoutedNotLeftPending:
+    """The orphan reaper never leaves the harness's level-0 sentinel notices
+    pending; the harness filer docstrings' Routing notes point here."""
+
+    async def test_the_router_closes_it_status_info_on_its_class_aggregate(
+        self, tmp_path: Path, mock_orch_config, file_notice,
+    ):
+        h = _notice_harness(tmp_path, mock_orch_config)
+        await file_notice(h)
+        [esc] = _queue(h).get_pending()
+
+        assert await h._reap_orphan_l0_escalations() == 0
+
+        closed = _current(h, esc.id)
+        assert (closed.status, closed.resolution_class, closed.resolved_by) == (
+            'dismissed', 'status-info', ROUTER_ID,
+        )
+        (aggregate,) = _aggregates(h, status_info_sentinel(esc.agent_role))
+        assert esc.id in aggregate.detail
+        assert _l1s(h, agent_role='harness-orphan-reaper') == []
+
+    async def test_with_the_router_disabled_the_reaper_promotes_it(
+        self, tmp_path: Path, mock_orch_config, file_notice,
+    ):
+        h = _notice_harness(tmp_path, mock_orch_config)
+        h.config.info_l0_router_enabled = False
+        await file_notice(h)
+        [esc] = _queue(h).get_pending()
+
+        assert await h._reap_orphan_l0_escalations() == 1
+
+        (l1,) = _l1s(h, agent_role='harness-orphan-reaper')
+        assert l1.task_id == esc.task_id
+        assert _current(h, esc.id).status == 'dismissed'
 
 
 def _write_legacy(harness: Harness, task_id: str, *, level: int, category: str) -> Escalation:
