@@ -37,6 +37,10 @@ only once one of the two real legs has already fired.
 
 Task metadata is read through ``shared.task_metadata_wire.coerce_task_metadata``,
 whose unreadable (``None``) result is what defines :data:`SKIP` here.
+
+The module also renders the L1 text a BLOCK verdict is filed with
+(:func:`block_escalation_text`), so the claim each signal licenses lives beside
+the signal's definition rather than in the harness that files it.
 """
 
 from __future__ import annotations
@@ -61,6 +65,8 @@ SKIP = 'skip'     # metadata PRESENT but UNREADABLE — never "verified clean"
 # Signal names recorded on a blocking verdict.
 SIGNAL_MARKER = 'cross_repo_marker'
 SIGNAL_ALL_FILES_FOREIGN = 'all_files_foreign'
+# Recorded only on the fail-closed verdict built when classify_cross_repo raises; not a blocking leg.
+SIGNAL_CLASSIFY_ERROR = 'classify_error'
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +103,21 @@ class CrossRepoVerdict:
     def blocked(self) -> bool:
         """True when the verdict is BLOCK (gate should block dispatch)."""
         return self.verdict == BLOCK
+
+
+def classify_error_verdict(exc: Exception) -> CrossRepoVerdict:
+    """Return the fail-CLOSED verdict for a :func:`classify_cross_repo` that raised.
+
+    Nothing about the task was read, so it names no owner and no paths; its
+    only signal is :data:`SIGNAL_CLASSIFY_ERROR`.
+    """
+    return CrossRepoVerdict(
+        verdict=BLOCK,
+        owner_project=None,
+        signals=(SIGNAL_CLASSIFY_ERROR,),
+        foreign_paths=(),
+        reason=f'cross-repo unverifiable / classify_cross_repo raised: {exc}',
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -403,3 +424,104 @@ def classify_cross_repo(
         foreign_paths=foreign_paths,
         reason='; '.join(reasons),
     )
+
+
+# ---------------------------------------------------------------------------
+# L1 escalation text
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BlockEscalationText:
+    """The summary and detail a BLOCK verdict's L1 is filed with (untruncated)."""
+
+    summary: str
+    detail: str
+
+
+def block_escalation_text(task_id: str, verdict: CrossRepoVerdict) -> BlockEscalationText:
+    """Render the L1 text for a BLOCK *verdict* on *task_id*.
+
+    A classifier crash established nothing about the task, so it gets its own
+    rendering; every other BLOCK is a misfile rendered by what its signals prove.
+    """
+    if SIGNAL_CLASSIFY_ERROR in verdict.signals:
+        return _classify_error_text(task_id, verdict)
+    return _misfile_text(task_id, verdict)
+
+
+def _misfile_text(task_id: str, verdict: CrossRepoVerdict) -> BlockEscalationText:
+    owner = verdict.owner_project
+    signals = tuple(verdict.signals or ())
+
+    # Claim exactly what the evidence establishes, and no more.
+    #
+    # The path-containment leg proves only "every declared path is absolute
+    # and resolves outside project_root" — with no cross-project registry it
+    # CANNOT distinguish a sibling project's checkout from a path that
+    # belongs to no project at all (~/.claude/skills/…, /etc/…, a stray
+    # $HOME path).  Asserting foreign OWNERSHIP there, and telling the
+    # operator to refile under "the owning project", would be unactionable
+    # advice for a task whose paths have no owner.  _resolve_owner already
+    # refuses to invent a name; this prose holds the same line.
+    #
+    # The marker leg is different: metadata.cross_repo is the submit path's
+    # own assertion that the declared files ARE owned elsewhere, so ownership
+    # may be stated as fact even when nothing named the owner.
+    if owner:
+        claim = f'declares work owned by {owner}'
+        remedy = (
+            f'The fix is to refile this task under {owner} (and cancel or '
+            f're-scope this one), not to unblock it here.'
+        )
+    elif SIGNAL_MARKER in signals:
+        claim = 'declares work owned by another project (owner unresolved)'
+        remedy = (
+            'The submit path marked this task cross-repo but named no owner '
+            '(no metadata.cross_repo_project companion). The fix is to identify '
+            'the owning project and refile the task there, not to unblock it here.'
+        )
+    else:
+        claim = "declares only paths outside this orchestrator's project_root"
+        remedy = (
+            'This gate has no cross-project registry, so it CANNOT tell whether '
+            'these paths belong to another project or to no project at all. Two '
+            'remedies, depending on which it is: refile the task under the owning '
+            'project if one owns them, or correct metadata.files to the in-tree '
+            'paths this task actually delivers. Do not simply unblock it here.'
+        )
+
+    summary = f'CROSS_REPO_MISFILE: task {task_id} {claim}'
+    paths = '\n'.join(f'  - {path}' for path in verdict.foreign_paths) or '  (none declared)'
+    detail = (
+        f'Dispatch-time cross-repo admission gate blocked this task BEFORE any '
+        f'agent spun up.\n'
+        f'Owning project: {owner if owner else "UNRESOLVED — nothing in the task metadata named it"}\n'
+        f'Signals: {", ".join(signals) or "(none)"}\n'
+        f'Observed: {verdict.reason}\n'
+        f'Paths judged outside project_root:\n{paths}\n'
+        f'This orchestrator owns a single project_root and cannot legitimately land '
+        f'work outside it. {remedy}'
+    )
+    return BlockEscalationText(summary=summary, detail=detail)
+
+
+def _classify_error_text(task_id: str, verdict: CrossRepoVerdict) -> BlockEscalationText:
+    summary = (
+        f'CROSS_REPO_UNVERIFIED: task {task_id} could not be checked: the cross-repo '
+        f'classifier could not run, so nothing about its paths was established'
+    )
+    detail = (
+        'Dispatch-time cross-repo admission gate blocked this task BEFORE any agent '
+        'spun up, because classify_cross_repo raised and the gate fails CLOSED.\n'
+        f'Signals: {", ".join(verdict.signals)}\n'
+        f'Observed: {verdict.reason}\n'
+        'Nothing about this task was established: no owner was sought and no declared '
+        'path was judged. This block is NOT evidence that the task is misfiled, so do '
+        'not refile, re-scope or cancel it on this L1. '
+        'The fix is in the orchestrator: find the traceback logged as '
+        f'"cross_repo_gate: classify_cross_repo raised for task {task_id}", fix the '
+        'classifier or the metadata shape that crashed it, then unblock the task so '
+        'the gate can run again.'
+    )
+    return BlockEscalationText(summary=summary, detail=detail)
