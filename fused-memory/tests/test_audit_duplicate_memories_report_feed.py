@@ -6,7 +6,7 @@ duplicate-cluster report (``scripts/duplicate_cluster_report.py``) relies on:
 * RETENTION. A cluster member carrying a non-empty ``metadata.parent_id``
   (``'child_record'``) or a non-empty ``metadata.topic`` (``'topic_stamped'``)
   is never a delete candidate, whatever the rest of its cluster looks like. It
-  is listed in the group's ``retained_member_ids`` instead, and the plan counts
+  is listed in the group's ``retained_members`` instead, and the plan counts
   it in ``retained_carveout``. Every delete list derives from
   ``delete_candidate_ids``, so ``--apply`` can never act on one.
 * REPORT FEED. Per-member facts, plan-level child counts and the echoed scan
@@ -63,7 +63,7 @@ def _only_group(plan: dict) -> dict:
 
 
 def _retained(group: dict) -> list[dict]:
-    return group['retained_member_ids']
+    return group['retained_members']
 
 
 class TestStampedLosersAreRetainedNotDeleted:

@@ -2025,7 +2025,7 @@ class TestBuildSweepPlanTopicCarveout:
         assert set(group['member_ids']) == {'m1', 'm2'}
         assert plan['delete_candidates'] == []
         assert group['survivor_id'] == 'm1'
-        assert group['retained_member_ids'] == [{'id': 'm2', 'reason': 'topic_stamped'}]
+        assert group['retained_members'] == [{'id': 'm2', 'reason': 'topic_stamped'}]
         assert plan['topic_carveout_clusters'] == 0
 
     def test_partially_missing_topic_makes_only_the_unstamped_member_deletable(self):

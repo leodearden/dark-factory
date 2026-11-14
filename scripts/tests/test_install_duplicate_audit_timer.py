@@ -255,12 +255,13 @@ def test_service_path_reaches_uv_and_matches_the_fleet_spelling():
     assert ours == _path_env(PATH_TWIN)
 
 
-def test_service_documents_the_report_script_and_cites_its_task():
-    unit = _directives(SERVICE_NAME)
-    docs = _values(unit, 'Unit', 'Documentation')
-    assert any(d.endswith('/fused-memory/scripts/duplicate_cluster_report.py') for d in docs), docs
-    (description,) = _values(unit, 'Unit', 'Description')
-    assert 'task 3136' in description, description
+def test_service_documentation_links_resolve_in_the_repo():
+    docs = _values(_directives(SERVICE_NAME), 'Unit', 'Documentation')
+    assert docs
+    prefix = f'file://{PRODUCTION_ROOT}/'
+    for link in docs:
+        assert link.startswith(prefix), link
+        assert (TEMPLATES_DIR.parent / link.removeprefix(prefix)).is_file(), link
 
 
 def test_service_execstart_points_at_a_real_executable_wrapper():

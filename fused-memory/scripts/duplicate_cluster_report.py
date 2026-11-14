@@ -213,7 +213,7 @@ def cluster_entry(group: Mapping[str, Any], machine_written_kinds: Iterable[str]
         'ann_max_score': group.get('ann_max_score'),
         'lexical_max_ratio': group.get('lexical_max_ratio'),
         'delete_candidate_ids': list(group.get('delete_candidate_ids') or ()),
-        'retained_member_ids': list(group.get('retained_member_ids') or ()),
+        'retained_members': list(group.get('retained_members') or ()),
         'members': [dict(m) for m in members] if members is not None else None,
         'topics': sorted({str(m['topic']) for m in members or () if m.get('topic')}),
         'canonical_present': (

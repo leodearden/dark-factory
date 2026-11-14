@@ -259,7 +259,7 @@ class TestClusterInventory:
             assert cluster['category'] == group['category']
             assert cluster['size'] == len(group['member_ids'])
             for key in ('member_ids', 'survivor_id', 'found_by', 'ann_max_score',
-                        'lexical_max_ratio', 'delete_candidate_ids', 'retained_member_ids'):
+                        'lexical_max_ratio', 'delete_candidate_ids', 'retained_members'):
                 assert cluster[key] == group[key], key
 
     def test_member_facts_give_topics_canonical_presence_and_machine_authorship(
@@ -299,7 +299,7 @@ class TestClusterInventory:
         (cluster,) = _build(config, [('t0-os.json', legacy)])['clusters']
 
         assert cluster['size'] == 3
-        assert cluster['retained_member_ids'] == []
+        assert cluster['retained_members'] == []
         assert cluster['topics'] == []
         assert cluster['canonical_present'] is None
         assert cluster['machine_written'] is None

@@ -165,7 +165,7 @@ Safety carve-outs:
   - In any other cluster, a member carrying a non-empty ``metadata.topic``
     (a retained Option-C peer) or ``metadata.parent_id`` (an amendment or
     sighting child) is never a delete candidate either: it is reported in
-    ``retained_member_ids`` and counted in ``retained_carveout`` (see
+    ``retained_members`` and counted in ``retained_carveout`` (see
     ``split_retained``).
   - Liveness-snapshot recurrence groups are report-only BY CONSTRUCTION --
     they are never added to the delete lists, rather than filtered out of
@@ -1774,7 +1774,7 @@ def build_sweep_plan(
         ``lexical_clustered``, ``lexical_spanning``, ``ann_clique``,
         ``ann_max_score``, ``lexical_max_ratio``,
         ``lexical_max_ratio_sampled``, ``delete_candidate_ids`` and
-        ``retained_member_ids`` (losers ``split_retained`` keeps out of every
+        ``retained_members`` (losers ``split_retained`` keeps out of every
         delete list, as ``{'id', 'reason'}``); the plan additionally carries
         ``threshold``, ``ann_threshold``, ``ann_disclosure``,
         ``topic_carveout_clusters`` / ``topic_carveout_groups`` (see
@@ -1935,7 +1935,7 @@ def build_sweep_plan(
                 'lexical_max_ratio': max_ratio,
                 'lexical_max_ratio_sampled': ratio_sampled,
                 'delete_candidate_ids': deletable_ids,
-                'retained_member_ids': retained,
+                'retained_members': retained,
             })
             delete_candidates.extend(deletable_ids)
 

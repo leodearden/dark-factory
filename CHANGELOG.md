@@ -36,7 +36,7 @@ The detector (`fused-memory/scripts/audit_duplicate_memories.py`) changes in two
 - **Retention carve-out.** A cluster member carrying a non-empty `metadata.parent_id`
   (`child_record`) or `metadata.topic` (`topic_stamped`) is never a delete candidate,
   so `--apply` can no longer delete it. Such members are listed in the group's
-  `retained_member_ids`, and the plan's `retained_carveout` counts them. Before this, a
+  `retained_members`, and the plan's `retained_carveout` counts them. Before this, a
   stamped member of a mixed or differing-topic cluster could be deleted.
 - **Report-feed fields.** The stdout plan gains per-group `members` facts (`id`,
   `created_at`, `topic`, `canonical`, `parent_id`, `kind`), a plan-level `child_counts`
