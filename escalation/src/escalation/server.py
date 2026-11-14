@@ -79,9 +79,11 @@ from escalation.models import (
     ACTION_TERMINATE_CLEANLY,
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
+    EVAL_LANE_CONTAINMENT_RESOLVER,
     HARNESS_SENTINEL_ROLE_PREFIXES,
     KNOWN_SEVERITIES,
     NOTE_TO_FILE_CLASS,
+    PRE_SUBMIT_CHECK_RESOLVER,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
@@ -1933,7 +1935,7 @@ def create_server(
                 f'contained: eval-lane artifact ({eval_lane_reason}); not a '
                 'production signal, the eval measurement is scored from the '
                 'cell result artifacts',
-                resolved_by='escalation-eval-lane-containment',
+                resolved_by=EVAL_LANE_CONTAINMENT_RESOLVER,
                 resolution_class=NOTE_TO_FILE_CLASS if esc.note_to_file else 'benign',
             )
             return {
@@ -2064,7 +2066,7 @@ def create_server(
             resolved = queue.submit_resolved(
                 esc,
                 f'auto-resolved: task already terminal (status={status})',
-                resolved_by='escalation-mcp-pre-submit-check',
+                resolved_by=PRE_SUBMIT_CHECK_RESOLVER,
                 resolution_class='benign',
             )
             return {
