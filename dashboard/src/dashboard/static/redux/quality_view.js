@@ -2,12 +2,15 @@
 // (tab_quality.jsx): which served metrics each section draws and their titles,
 // the text of a headline, a counting rule, an alarm verdict and a before/after
 // comparison, the arrays and y-axis a metric's chart draws, the cost model's
-// readings, and where each served marker and alarm sits on that chart.
+// readings, and where each served marker and alarm sits on that chart; and for
+// the snapshot series, its column-per-snapshot axis, step charts, marks,
+// per-member table and texts.
 //
-// Every figure is read from the served QUALITY / QUALITY_MARKERS values
-// (dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire and
-// quality_markers.py::MarkerStream.to_wire own their shapes): nothing here
-// smooths, re-buckets or recomputes a statistic.
+// Every figure is read from the served QUALITY / QUALITY_MARKERS /
+// QUALITY_SNAPSHOTS values (dashboard/src/dashboard/data/quality_series.py
+// ::QualitySeries.to_wire, quality_markers.py::MarkerStream.to_wire and
+// quality_snapshots.py::SnapshotSeries.to_wire own their shapes): nothing here
+// smooths, re-buckets, totals, ranks or recomputes a statistic.
 //
 // LOAD CONTRACT. It destructures window.DF_CHART_MARKS at module scope with no
 // fallback, so index.html loads it after chart_marks.js and before the Babel
@@ -209,6 +212,10 @@ function qualityMarkerMark(marker, ordinals, verdict) {
   return placement && { key: marker.id, kind: marker.kind, label: marker.label, ...placement, ref: marker.ref, verdict };
 }
 
+// The marker kind that annotates the snapshot series, not landings
+// (quality_markers.py::REGIME_ROLE gives it no role on a landing axis).
+const QUALITY_INSTRUMENT_KIND = 'instrument';
+
 function qualityMarks({ axis, markers, alarms, beforeAfter, metricId, kind }) {
   const ordinals = axis.map(point => point.ordinal);
   const served = markers || [];
@@ -216,7 +223,7 @@ function qualityMarks({ axis, markers, alarms, beforeAfter, metricId, kind }) {
     .filter(entry => entry.metric === metricId)
     .map(entry => [entry.marker_id, beforeAfterText(entry, kind)]));
   const placed = served
-    .filter(marker => qualityAppliesTo(marker, metricId))
+    .filter(marker => marker.kind !== QUALITY_INSTRUMENT_KIND && qualityAppliesTo(marker, metricId))
     .map(marker => qualityMarkerMark(marker, ordinals, verdicts.get(marker.id) ?? null))
     .filter(mark => mark !== null);
   const byId = indexMarkers(served);
@@ -229,6 +236,122 @@ function qualityMarks({ axis, markers, alarms, beforeAfter, metricId, kind }) {
     verdict: null,
   })).filter(mark => mark.fraction !== null);
   return [...placed, ...alarmMarks];
+}
+
+// ── The snapshot series ──────────────────────────────────────────────────
+// One column per served point, in the served order (commit time, a baseline
+// before a nightly file at the same commit); a column is labelled by its
+// commit date. Contract §10: no ranking, target, average or total line count.
+
+const QUALITY_SHORT_SHA = 10;
+
+function qualityShortSha(sha) {
+  return sha.slice(0, QUALITY_SHORT_SHA);
+}
+
+function qualityCommitDate(point) {
+  return point.committed_at.slice(0, 10);
+}
+
+function snapshotAxis(points) {
+  return points.map(qualityCommitDate);
+}
+
+function snapshotSeries(key, label, read) {
+  return Object.freeze({ key, label, read });
+}
+
+// The domain counts each chart draws, read verbatim from a point; a count its
+// schema does not record is served null, and stays a hole.
+const QUALITY_SNAPSHOT_CHARTS = Object.freeze([
+  Object.freeze({
+    group: 'h14',
+    title: 'Files at the heuristic-14 marks',
+    series: Object.freeze([
+      snapshotSeries('at_soft_ceiling', 'at the soft ceiling', point => point.h14.at_soft_ceiling),
+      snapshotSeries('at_alarm', 'at the alarm', point => point.h14.at_alarm),
+    ]),
+  }),
+  Object.freeze({
+    group: 'cycles',
+    title: 'Import cycles',
+    series: Object.freeze([
+      snapshotSeries('cycles', 'cycles', point => point.cycles.cycles),
+      snapshotSeries('hidden_cycles', 'hidden cycles', point => point.cycles.hidden_cycles),
+      snapshotSeries('typing_cycles', 'typing cycles', point => point.cycles.typing_cycles),
+    ]),
+  }),
+  Object.freeze({
+    group: 'imports',
+    title: 'Deferred and cycle-closing imports',
+    series: Object.freeze([
+      snapshotSeries('deferred_imports', 'deferred imports', point => point.deferred_imports),
+      snapshotSeries('cycle_closing_imports', 'cycle-closing imports', point => point.cycle_closing_imports),
+    ]),
+  }),
+  Object.freeze({
+    group: 'private_patch_targets',
+    title: 'Private patch targets',
+    series: Object.freeze([
+      snapshotSeries('private_patch_targets', 'private patch targets', point => point.private_patch_targets),
+    ]),
+  }),
+]);
+
+function snapshotCharts(points) {
+  return QUALITY_SNAPSHOT_CHARTS.map(chart => ({
+    group: chart.group,
+    title: chart.title,
+    series: chart.series.map(({ key, label, read }) => ({ key, label, values: points.map(read), step: true })),
+  }));
+}
+
+// Marks at their point's column: a baseline at each baseline point, and each
+// instrument marker at the first point measured at its ref. A mark with no
+// column (an unserved sha, or a series of one point) is dropped.
+function snapshotMarks(points, markers) {
+  const columns = points.map((_, index) => index);
+  const at = index => qualityFractionAt(columns, index);
+  const baselines = points.flatMap((point, index) => (point.baseline ? [{
+    key: `baseline:${point.id}`, kind: 'baseline', label: `/review-all baseline ${qualityCommitDate(point)}`,
+    fraction: at(index), ref: point.as_of_sha, verdict: null,
+  }] : []));
+  const instruments = (markers || [])
+    .filter(marker => marker.kind === QUALITY_INSTRUMENT_KIND)
+    .map(marker => ({
+      key: marker.id, kind: marker.kind, label: marker.label,
+      fraction: at(points.findIndex(point => point.as_of_sha === marker.ref)), ref: marker.ref, verdict: null,
+    }));
+  return [...baselines, ...instruments].filter(mark => mark.fraction !== null);
+}
+
+// The instrument's --summary table for one point, as served: its member rows
+// in served order, pseudo as the markdown prints it, and no (domain) row.
+function snapshotTable(point) {
+  return {
+    headers: ['member', 'pseudo', ...point.members.columns],
+    rows: point.members.rows.map(row => [row.member, String(row.pseudo), ...row.cells]),
+  };
+}
+
+function instrumentText(point) {
+  if (point.unknown_params.includes('instrument')) return 'instrument unknown';
+  const blobs = Object.entries(point.params.instrument).map(([name, blob]) => `${name} ${qualityShortSha(blob)}`);
+  return `instrument ${blobs.join(' · ')}`;
+}
+
+function snapshotLabel(point) {
+  return [qualityCommitDate(point), point.baseline ? 'baseline' : 'nightly', qualityShortSha(point.as_of_sha)].join(' · ');
+}
+
+function snapshotHeading(point) {
+  return [snapshotLabel(point), point.complete ? 'complete' : 'incomplete', instrumentText(point)].join(' · ');
+}
+
+// QUALITY_SNAPSHOT_DIFF (quality_snapshots.py::ServedDiff.to_wire): the
+// instrument's --diff text when ready, and otherwise the served reason.
+function snapshotDiffText(diff) {
+  return diff.state === 'ready' ? diff.text : diff.reason;
 }
 
 // Module-unique export const, never a bare `API` — the CANONICAL note in
@@ -245,6 +368,14 @@ const QUALITY_VIEW_API = {
   beforeAfterText,
   costModelReadings,
   qualityMarks,
+  snapshotAxis,
+  snapshotCharts,
+  snapshotMarks,
+  snapshotTable,
+  instrumentText,
+  snapshotLabel,
+  snapshotHeading,
+  snapshotDiffText,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
