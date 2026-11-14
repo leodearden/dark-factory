@@ -45,18 +45,22 @@ import pytest
 # and cannot be confused with this file's own specimen constants.
 import test_consolidate_memories_tool as _consolidate
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING, RepairPolicy
+from mcp.shared.memory import create_connected_server_and_client_session
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     closer_for,
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.server.boundary_guards import boundary_guard_chain, install_boundary_guards
 from fused_memory.server.main import _install_safe_tool_wrapper
-from fused_memory.server.markup_guard import (
-    _resolve_project_root,
-    install_markup_guard,
-)
+from fused_memory.server.markup_guard import _resolve_project_root, build_markup_guard
+from fused_memory.server.tool_middleware_bridge import install_tool_middleware
 from fused_memory.server.tools import create_mcp_server
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -125,10 +129,8 @@ def _build_guarded_server(
     for method in methods:
         _pass_through(mock_service, method)
     server = create_mcp_server(mock_service)
-    install_markup_guard(
-        server,
-        policy=RepairPolicy.REJECT_WITH_REPAIR,
-        known_projects=_KNOWN_PROJECTS if known_projects is None else known_projects,
+    install_boundary_guards(
+        server, known_projects=_KNOWN_PROJECTS if known_projects is None else known_projects, prefix_resolver=None
     )
     return server, mock_service
 
@@ -500,10 +502,8 @@ class TestOverrideFlagNeverReachesPersistence:
         """
         svc = _consolidate.make_service()
         server = create_mcp_server(svc)
-        install_markup_guard(
-            server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
-            known_projects=_KNOWN_PROJECTS,
+        install_boundary_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )
 
         await server._tool_manager.call_tool(
@@ -824,10 +824,8 @@ def _build_server_installed(*, guard_first: bool) -> tuple[Any, AsyncMock]:
     server = create_mcp_server(mock_service)
 
     def _guard() -> None:
-        install_markup_guard(
-            server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
-            known_projects=_KNOWN_PROJECTS,
+        install_boundary_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )
 
     if guard_first:
@@ -868,12 +866,11 @@ class TestInstalledOnTheRealServer:
         a per-tool tier, because a per-tool tier would be exactly the tool-name
         inference INV-1 forbids.
         """
-        from fused_memory.server.boundary_guards import boundary_guard_chain
-
         markup_member = boundary_guard_chain(
             known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )[0]
 
+        assert isinstance(markup_member, MarkupGuardMiddleware)
         assert markup_member.policy is RepairPolicy.REJECT_WITH_REPAIR
 
     @pytest.mark.asyncio
@@ -885,11 +882,6 @@ class TestInstalledOnTheRealServer:
         through, so the tier installs without error, the repaired write LANDS
         with the absorbed parameter recovered, and the caller is told so.
         """
-        from mcp.shared.memory import create_connected_server_and_client_session
-
-        from fused_memory.server.markup_guard import build_markup_guard
-        from fused_memory.server.tool_middleware_bridge import install_tool_middleware
-
         mock_service = AsyncMock()
         _pass_through(mock_service, 'add_system_record')
         server = create_mcp_server(mock_service)
@@ -916,7 +908,7 @@ class TestInstalledOnTheRealServer:
         assert repair['recovered_params'] == ['agent_id']
 
     def test_installing_twice_does_not_double_wrap(self):
-        """The ``_fused_memory_markup_guarded`` sentinel's whole job.
+        """The ``_fused_memory_boundary_guarded`` sentinel's whole job.
 
         Without it a second install would chain a second guard around the first:
         every call scanned twice, and a rejection counted twice into the storm
@@ -925,13 +917,13 @@ class TestInstalledOnTheRealServer:
         guarded, mirroring ``_install_safe_tool_wrapper``'s own sentinel.
         """
         server = create_mcp_server(AsyncMock())
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=_KNOWN_PROJECTS
+        install_boundary_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )
         wrapped = server._tool_manager.call_tool
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=_KNOWN_PROJECTS
+        install_boundary_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )
 
         assert server._tool_manager.call_tool is wrapped
@@ -943,11 +935,13 @@ class TestInstalledOnTheRealServer:
         from fused_memory.server.main import _install_tool_dispatch_guards
 
         server = create_mcp_server(AsyncMock())
-        _install_tool_dispatch_guards(server, known_projects=_KNOWN_PROJECTS)
+        _install_tool_dispatch_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
+        )
 
         manager = server._tool_manager
         assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
-        assert getattr(manager, '_fused_memory_markup_guarded', False) is True
+        assert getattr(manager, '_fused_memory_boundary_guarded', False) is True
 
 
 class TestInstallationOrder:
@@ -1031,7 +1025,7 @@ class TestReconReportServerIsNotGuarded:
 
         manager = mcp._tool_manager
         assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
-        assert getattr(manager, '_fused_memory_markup_guarded', False) is False
+        assert getattr(manager, '_fused_memory_boundary_guarded', False) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1186,10 +1180,8 @@ class TestTheFiledProjectRootIsRegistryVouched:
         interceptor = AsyncMock()
         interceptor.submit_task.return_value = {'ticket': 'tkt_x'}
         server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-        install_markup_guard(
-            server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
-            known_projects={_PROJECT_ID: str(tmp_path / 'registered')},
+        install_boundary_guards(
+            server, known_projects={_PROJECT_ID: str(tmp_path / 'registered')}, prefix_resolver=None
         )
         chosen = tmp_path / 'chosen-by-the-caller'
 
