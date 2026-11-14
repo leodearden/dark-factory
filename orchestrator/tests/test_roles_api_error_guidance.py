@@ -55,6 +55,5 @@ def test_guidance_is_the_steward_prompts_only_api_error_entry() -> None:
         ),
     ],
 )
-def test_server_and_client_errors_both_reach_this_entry(result: AgentResult) -> None:
+def test_server_and_client_errors_both_classify_to_api_error(result: AgentResult) -> None:
     assert classify_agent_failure(result).kind is AgentFailureKind.API_ERROR
-    assert AgentFailureKind.API_ERROR.name in STEWARD_API_ERROR_GUIDANCE

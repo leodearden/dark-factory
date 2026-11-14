@@ -1898,8 +1898,10 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        the retry loop already gave up on — and the deferral matches
        ``classify_invocation``'s ModelNotFound > ServerError ranking, INV-5).
     7. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
-       ``API_ERROR`` (includes status code in the summary; transient — worth
-       retrying against another account). ``AuthFailed`` ({401, 403}) is a
+       ``API_ERROR`` (status code in the summary; 401/403 are failed over by
+       ``invoke_with_cap_retry``'s ``AuthFailed`` branch, other 4xx/429 are
+       not transient — see ``scheduler.py::is_transient_api_requeue``).
+       ``AuthFailed`` ({401, 403}) is a
        strict subset of "api_error_status is not None", so the ``OR`` never
        changes the verdict — it keeps this rule visibly tied to the
        InvocationOutcome contract without narrowing API_ERROR away from
