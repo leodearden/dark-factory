@@ -949,7 +949,7 @@ async def test_b11_eval_cell_writes_no_production_state(
     assert workflow.mcp is not None
     assert workflow.mcp.url == FM_NULL_SENTINEL_URL
     recall_urls = {call.args[0] for call in memory_recall.call_args_list}
-    assert recall_urls <= {f'{FM_NULL_SENTINEL_URL}/mcp'}, recall_urls
+    assert recall_urls == {f'{FM_NULL_SENTINEL_URL}/mcp'}, recall_urls
 
     archive_root = resolve_archive_root(
         orch_config.project_root, orch_config.transcript_archive.root,
