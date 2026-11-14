@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,7 +26,6 @@ from orchestrator.escalation_router import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
-from orchestrator.merge_lane.worker import BreakerTrip
 
 TICKET_TIMEOUT_SECS = 900.0
 AGED_SECS = 300.0
@@ -269,7 +269,9 @@ async def _file_warm_base_hard_down(harness: Harness) -> None:
 
 
 async def _file_no_landings_breaker(harness: Harness) -> None:
-    harness._file_no_landings_info_escalation(BreakerTrip(
+    # A stand-in for merge_lane.worker.BreakerTrip: importing it would make this
+    # file lane-importing and count all its private reads in the merge-lane ratchet.
+    harness._file_no_landings_info_escalation(SimpleNamespace(
         action='halt', window_samples=3, landings_in_window=0,
         free_start=200, free_end=100, reason='r',
     ))
