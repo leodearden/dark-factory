@@ -443,9 +443,17 @@ its own advisory escalation at submit time; here it only supplies an owner
 Metadata that is present but unreadable is a logged **SKIP** — dispatch
 proceeds (an unparseable blob is not evidence of a misfile) but the gate says
 loudly that it read nothing, so a skipped check never passes for a clean one.
-Absent metadata is the ordinary shape and is silent. The fix for a blocked task
-is to **refile it under the owning project** (or correct its `metadata.files`),
-not to unblock it in place.
+Absent metadata is the ordinary shape and is silent. When one of the two legs
+fired, the fix for the blocked task is to **refile it under the owning project**
+(or correct its `metadata.files`), not to unblock it in place.
+
+If the classifier itself raises, the gate fails **CLOSED**: the task is blocked
+(same `block_reason='cross_repo_misfile'`) and an L1 is filed whose summary
+starts `CROSS_REPO_UNVERIFIED` and states that nothing about the task's paths
+was established. That L1's advice is the opposite of the refile advice: the fix
+is in the orchestrator (fix the classifier or the metadata shape that crashed
+it, then unblock the task), **not** a refile. Both renderings live in
+`orchestrator/src/orchestrator/cross_repo_gate.py::block_escalation_text`.
 
 The merge-time `OutcomeKind.plan_files_cross_repo` route above is unchanged
 and still applies to a task that reaches merge by another path. It was
