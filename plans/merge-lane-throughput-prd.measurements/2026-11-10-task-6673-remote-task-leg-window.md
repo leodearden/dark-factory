@@ -100,6 +100,27 @@ Also report:
 - drift splits, and whether a task scope was live;
 - reify:8430's report alongside.
 
+## Step 5: measured (2026-11-13)
+
+Measured read-only by the L2 watcher at about 12:30Z. The full report and raw outputs are kept with
+the watcher's runtime evidence (data/sitting/evidence/6673/, untracked). Headline:
+
+- 169 eligible task verifies: 98.2% ran remote; runner-unavailable / no-verdict 0; remote_wait p50 0 s.
+- Same-tip laptop/local wall p50 0.67 (n=45). Verify-phase residence p50 0.15 h, against the 2.44 h
+  baseline. Most of the gain predates the window (slot raise, paused sibling projects).
+- Parity: 2 raw splits, 0 adjudicated. 7800: a local pytest timeout at load 196, laptop retry green.
+  6393: a real leaked-MagicMock bug the laptop caught, later fixed by ebdd5dfc5d. reify was never live.
+- Four task_slots reloads in the window (38a200d213, 3763a4c54d, d442a16c49, c52c6ee8c7). Every
+  headline holds in each of the five segments.
+- Costs: laptop merge_verify p50 22.5 min while a task leg overlaps, 19.3 min otherwise (16.2-16.7 min
+  before the window). Laptop free disk 59G down to 43G, with the 16G unattributed.
+
 ## Step 6: ruling
 
-_Pending; Leo rules on the step-5 report._
+Leo, 2026-11-13 (sitting item 561, option A):
+- keep remote task legs on (`verify_task_host_policy: remote_modules`, `[orchestrator]`);
+- `verify_task_remote_red_confirms_locally: false`;
+- keep `verify_task_remote_cross_check_every_n: 5` until task 7030 lands (until then the laptop can
+  silently skip three reify-dependent guards), then set it to 0;
+- task eta (the binary pressure hold) is NOT flipped: there is no overload signal;
+- file a task to attribute and reclaim the laptop's 16G disk loss.

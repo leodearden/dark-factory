@@ -7,6 +7,7 @@ every lock and park event from these methods' return values.
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +30,10 @@ from orchestrator.pin_reservation import (
 from orchestrator.time_sources import resolve_wall_time_source
 
 logger = logging.getLogger(__name__)
+
+#: The holder limit of a key no count of holders can fill: every limit test is
+#: ``len(<set of task ids>) >= limit``, and no Python collection is that long.
+UNLIMITED_HOLDERS = sys.maxsize
 
 
 class _ParkKey(NamedTuple):
@@ -884,6 +889,8 @@ class ModuleLockTable:
 
         Builds a fresh dict from ``_held`` so callers cannot mutate internal state.
         Preferred over direct ``_held`` access in :meth:`Scheduler.get_state_snapshot`.
+        It shows ONE holder per key: a key several tasks hold names only the
+        last one iterated, so ask :meth:`held_modules` for what one task holds.
         """
         result: dict[str, str] = {}
         for task_id, modules in self._held.items():
@@ -891,21 +898,33 @@ class ModuleLockTable:
                 result[m] = task_id
         return result
 
-    # --- Limit lookup (unchanged) ---
+    # --- Limit lookup ---
 
     def _limit_for(self, module: str) -> int:
         module = normalize_lock(module, self._config.lock_depth)
         if module not in self._limits:
-            mc = self._config.for_module(module)
-            if mc and mc.module_overrides and module in mc.module_overrides:
-                self._limits[module] = mc.module_overrides[module]
-            elif module in self._config.module_overrides:
-                self._limits[module] = self._config.module_overrides[module]
-            elif mc and mc.max_per_module is not None:
-                self._limits[module] = mc.max_per_module
-            else:
-                self._limits[module] = self._config.max_per_module
+            self._limits[module] = self._resolve_limit(module)
         return self._limits[module]
+
+    def _resolve_limit(self, key: str) -> int:
+        """*key*'s holder limit, the first that applies, in this order (the one statement of it).
+
+        The key's module config's ``module_overrides[key]``; the top-level
+        ``module_overrides[key]``; ``UNLIMITED_HOLDERS`` when the top-level
+        ``unlimited_holder_locks`` rule takes *key*; the module config's
+        ``max_per_module``; the top-level ``max_per_module``.  An exact entry
+        beating the rule is how a project keeps one file under a prefix exclusive.
+        """
+        mc = self._config.for_module(key)
+        if mc and mc.module_overrides and key in mc.module_overrides:
+            return mc.module_overrides[key]
+        if key in self._config.module_overrides:
+            return self._config.module_overrides[key]
+        if self._config.unlimited_holder_locks.takes_unlimited_holders(key):
+            return UNLIMITED_HOLDERS
+        if mc and mc.max_per_module is not None:
+            return mc.max_per_module
+        return self._config.max_per_module
 
     # --- Public API ---
 

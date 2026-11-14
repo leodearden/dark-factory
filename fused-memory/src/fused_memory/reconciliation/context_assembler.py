@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
+    ContextFetchFailure,
     ContextItem,
     EventType,
     ReconciliationEvent,
@@ -57,6 +58,10 @@ _HINT_JOURNAL_SOURCE = 'reconciliation_hint'
 #: hold a measured backlog chunk at these values, so they change together (plans/recon-evidence-caps-measurement-2026-10.md).
 _TASK_DESC_CHARS = 4_000
 _MEMORY_BODY_CHARS = 2_000
+
+#: Cap on a failed fetch's error text, which Stage 1 reads verbatim: a handler
+#: exception can carry a whole JSON or stderr body.
+_FETCH_ERROR_CHARS = 300
 
 
 def estimate_tokens(text: str) -> int:
@@ -138,6 +143,7 @@ class ContextAssembler:
         used = 1_400
         chunk_events: list[ReconciliationEvent] = []
         context_items: dict[str, ContextItem] = {}
+        context_fetch_failures: list[ContextFetchFailure] = []
 
         # Process events in batches for parallelized context fetching
         event_idx = 0
@@ -156,13 +162,20 @@ class ContextAssembler:
             # signals — this preserves the structured-cancellation contract and
             # prevents the assembler from silently converting a shutdown signal
             # into an empty context list.
-            # Pass 2 (below): per-event degrade-to-empty on ordinary Exceptions.
+            # Pass 2 (below): an ordinary Exception degrades that event to empty
+            # context AND is recorded, once the event is in the chunk, so the
+            # consumer reads its context as unknown rather than absent.
             batch_contexts = await gather_collect(fetch_tasks)
 
             for event, ctx_result in zip(batch, batch_contexts, strict=True):
+                fetch_failure = None
                 if isinstance(ctx_result, Exception):
-                    logger.warning(
-                        f'Context fetch failed for event {event.id}: {ctx_result}'
+                    error = f'{type(ctx_result).__name__}: {ctx_result}'
+                    logger.warning(f'Context fetch failed for event {event.id}: {error}')
+                    fetch_failure = ContextFetchFailure(
+                        event_id=event.id,
+                        event_type=event.type.value,
+                        error=elide_text(error, _FETCH_ERROR_CHARS, field='error').text,
                     )
                     ctx_result = []
 
@@ -185,6 +198,8 @@ class ContextAssembler:
 
                 # Add event and its context
                 chunk_events.append(event)
+                if fetch_failure is not None:
+                    context_fetch_failures.append(fetch_failure)
                 for item in new_items:
                     context_items[item.id] = item
                 used += total_cost
@@ -204,6 +219,7 @@ class ContextAssembler:
             total_tokens=used,
             events_remaining=events_remaining,
             token_budget=budget,
+            context_fetch_failures=tuple(context_fetch_failures),
         )
 
     async def _fetch_context(
@@ -224,11 +240,7 @@ class ContextAssembler:
         handler = dispatch.get(event.type)
         if handler is None:
             return []
-        try:
-            return await handler(event, project_id)
-        except Exception as e:
-            logger.warning(f'Context handler {event.type.value} failed: {e}')
-            return []
+        return await handler(event, project_id)
 
     async def _ctx_memory_added(
         self, event: ReconciliationEvent, project_id: str,

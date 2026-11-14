@@ -103,6 +103,7 @@ from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
     _unspliceable_pytest_spans,
+    applied_worker_count,
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
@@ -115,7 +116,6 @@ from orchestrator.verify_cmd import (
     split_chain_tail,
     with_junitxml,
     with_pytest_timeout,
-    worker_count_values,
 )
 from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
 
@@ -3676,7 +3676,7 @@ def _archive_attempt_summary(
     )
 
 
-def _archive_merge_verify_logs(
+def archive_verify_logs(
     runs: list[dict],
     archive_root: 'Path | None',
     task_id: str,
@@ -3685,21 +3685,29 @@ def _archive_merge_verify_logs(
     cause_hint: str,
     *,
     module_prefix: 'str | None' = None,
-    role: Literal['merge', 'task'] = 'merge',
+    role: Literal['merge', 'task'],
 ) -> list[Path]:
-    """Write merge-verify run outputs + summary DIRECTLY to the durable archive.
+    """Write a verify's run outputs + summary DIRECTLY to the durable archive.
+
+    ``role`` is stamped into the summary: 'merge' from the local merge lane
+    and ``verify_runner.RemoteRunner.run_merge_verify``, 'task' from
+    ``verify_runner.RemoteRunner.run_task_verify``.
 
     Unlike ``_archive_attempt_log`` (which copies files from the worktree's
     ``.task/verify/``), this function writes directly to
-    ``<archive_root>/<task_id>/`` because merge worktrees have ``.task/``
-    scrubbed by design (git_ops.py) and there are no intermediate worktree
-    log files to copy from.
+    ``<archive_root>/<task_id>/`` because no caller has worktree log files
+    to copy from: merge worktrees have ``.task/`` scrubbed by design
+    (git_ops.py), and a remote verify's streams arrive over ssh with no
+    worktree copy on this host.
 
     Differences from the task-path helpers:
-    - **No deny-list check**: on the merge path there is no debugger loop;
-      every failure reaches a human.  ``infra_timeout`` and ``test_failure``
-      (the exact categories that distinguish timeout-vs-real-failure) are
-      archived unconditionally.
+    - **No deny-list check, for either role**.  On the merge path there is
+      no debugger loop; every failure reaches a human.  A remote task
+      verify does have one, but ``plans/remote-task-leg-verify-prd.md``
+      §4.3 archives its streams on every red: this archive is their only
+      copy on this host, and the result's ``archive_log_paths`` point at it.
+      ``infra_timeout`` and ``test_failure`` (the exact categories that
+      distinguish timeout-vs-real-failure) are archived unconditionally.
     - **Direct-to-archive**: bypasses ``.task/verify/``; the archive is the
       only persistence target that survives merge_wt cleanup.
 
@@ -3719,7 +3727,7 @@ def _archive_merge_verify_logs(
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        logger.warning('_archive_merge_verify_logs: could not create %s: %s', target_dir, exc)
+        logger.warning('archive_verify_logs: could not create %s: %s', target_dir, exc)
         return []
 
     infix = _make_infix(module_prefix)
@@ -3733,7 +3741,7 @@ def _archive_merge_verify_logs(
             continue
         path = _write_run_log(
             target_dir, attempt_id, infix, run,
-            ts_suffix=ts_suffix, caller='_archive_merge_verify_logs',
+            ts_suffix=ts_suffix, caller='archive_verify_logs',
         )
         if path is not None:
             archived.append(path)
@@ -4731,7 +4739,7 @@ class CheckRun:
 
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
-        ``_build_summary_payload``/``_archive_merge_verify_logs``
+        ``_build_summary_payload``/``archive_verify_logs``
         (all take ``list[dict]``) — the exact 12-key shape (label/cmd/rc/output/
         timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission/
         carried_over), 7 of which were previously hand-built inline in
@@ -8301,7 +8309,7 @@ async def run_verification(
     # editing it would be an unrequested blast radius for a purely additive
     # verdict detail. Placed here — after BOTH `_summarize_checks` calls and
     # before `runs`/persistence — so the augmented hint reaches
-    # `_persist_attempt_logs`/`_archive_merge_verify_logs` too, not just the
+    # `_persist_attempt_logs`/`archive_verify_logs` too, not just the
     # returned VerifyResult.
     _not_run_labels = [
         seg['label']
@@ -8327,9 +8335,10 @@ async def run_verification(
         # that auto-excludes cold-shadow / drift paths (left at None).
         if archive_root is not None and task_id is not None and not passed:
             try:
-                arch_paths = _archive_merge_verify_logs(
+                arch_paths = archive_verify_logs(
                     runs, archive_root, task_id, _archive_attempt_id(attempt_id),
                     category, cause_hint, module_prefix=module_prefix,
+                    role=role,
                 )
                 archive_log_paths = [str(p) for p in arch_paths]
             except Exception as exc:  # noqa: BLE001
@@ -11830,18 +11839,16 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
 
     So two orthogonal facts, separately sourced:
 
-    - ``n_flag`` — the FIRST worker count the command NAMES, AS PARSED, or
-      ``None`` when it names none. Read off the STRUCTURED ``base_flags``,
-      never by regex over the string: a regex would find the ``-n`` inside a
-      cpu-governed ``<exec> -- /bin/bash -c '...'`` payload and report it as
-      this command's flag. The spellings, and the flag/value pairing that
-      keeps a ``-k '-n'`` from being mistaken for a worker count, are
-      ``verify_cmd.py::worker_count_values``'s, the one decoder the admission
-      guard also reads. A stamp that bound ``-n`` alone would report
-      ``n_flag: null`` for a module config using the long spelling, which the
-      census reads as "no flag on argv, so addopts decided the count" — a
-      wrong fact, silently, in the corpus this deliverable exists to make
-      trustworthy.
+    - ``n_flag`` — the worker count the command's argv APPLIES, AS PARSED, or
+      ``None`` when it names none; which count that is, in every spelling, is
+      ``verify_cmd.py::applied_worker_count``'s to decide. Read off the
+      STRUCTURED ``base_flags``, never by regex over the string: a regex would
+      find the ``-n`` inside a cpu-governed ``<exec> -- /bin/bash -c '...'``
+      payload and report it as this command's flag. A stamp that bound
+      ``-n`` alone would report ``n_flag: null`` for a module config using the
+      long spelling, which the census reads as "no flag on argv, so addopts
+      decided the count" — a wrong fact, silently, in the corpus this
+      deliverable exists to make trustworthy.
     - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
       own subprocess will see it, or ``None`` when nothing sets it. Resolved by
       asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
@@ -11877,7 +11884,7 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
         ).get('PYTEST_XDIST_AUTO_NUM_WORKERS')
         parsed = parse_config_command(cmd)
         if parsed.tool is ToolKind.PYTEST and parsed.raw is None:
-            n_flag = next(iter(worker_count_values(parsed.base_flags)), None)
+            n_flag = applied_worker_count(parsed.base_flags)
     except Exception:
         logger.warning(
             '_xdist_workers: could not read the worker facts off %r; '

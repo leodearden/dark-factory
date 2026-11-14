@@ -217,7 +217,7 @@ async def wedge_one_bypass(
     ``TTLCache.get_or_refresh`` -- then waits until the bypass refresh has
     actually been ENTERED, not merely scheduled, so the task is in flight by
     construction rather than by timing luck.  Callers monkeypatch
-    ``mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS`` down first so that bounded
+    ``mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS`` down first so that bounded
     wait is quick.
 
     *refresh_and_entered* substitutes any other ``(refresh, entered)`` pair of

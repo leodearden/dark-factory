@@ -288,6 +288,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'link_heal.misfile_share_ceiling',
     'link_heal.corrects_share_ceiling',
     'link_heal.shard_failure_streak',
+    # The scheduled sweep and its calibration gate (task 7159): same consumers.
+    'link_heal.projects',
+    'link_heal.writes',
+    'link_heal.sweep_actions',
+    'link_heal.sweep_window_hours',
+    'link_heal.calibration_kappa_margin',
+    'link_heal.calibration_min_project_items',
 })
 
 

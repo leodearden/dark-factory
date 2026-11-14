@@ -330,12 +330,12 @@ class ClaimResult(Generic[R]):
 class ResolveOutcome(TypedDict):
     """What ONE :meth:`EscalationQueue.resolve` call actually DID (task 4495).
 
-    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: the
-    ``Escalation`` is ``resolve()``'s primary return value and every existing
-    call site reads it directly, so widening the return into a tuple would churn
-    all of them — the member cascade, ``dismiss_all_pending``, the steward, the
-    five workflow auto-dismiss backstops — for a fact only ``server.resolve_issue``
-    wants.
+    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: only
+    ``server.resolve_issue`` and ``dismiss_all_pending`` want this fact, while the
+    ``Escalation`` is ``resolve()``'s primary return value and every other call
+    site reads it directly — the member cascade, the steward, the five workflow
+    auto-dismiss backstops — so widening the return into a tuple would churn all
+    of them.
 
     WHY IT EXISTS: ``resolve()``'s already-terminal branch is a no-op, so a caller
     whose text did NOT apply gets back a perfectly healthy-looking ``Escalation``
@@ -3012,16 +3012,17 @@ class EscalationQueue:
         notes survive for the orphan reaper
         (plans/info-l0-disposition-router-prd.md boundary #16).
 
-        Returns the number of escalations where resolve() returned non-None.
-        This is an UPPER BOUND on the records this call dismissed, not an exact
-        count.  Other processes, among them fused-memory's middlewares and
-        reconciliation, write this queue directory concurrently, so a record
-        one of them resolves between get_pending() and resolve() is still
-        counted: resolve() on an already-terminal record is a no-op that
-        returns the stored record.  Nor does the count distinguish the three
-        per-record outcomes — age-annotated, strand-stamped, or
-        ``pending_secs=unknown`` for a record whose timestamp would not parse;
-        a caller that needs that detail reads the resolved records themselves.
+        Returns the exact number of records THIS call dismissed: a record is
+        counted only when resolve()'s ``ResolveOutcome`` reports it applied.
+        Other processes, among them fused-memory's middlewares and
+        reconciliation, routinely write this queue directory, so a record one
+        of them resolves between get_pending() and resolve() is an
+        already-terminal no-op here and is not counted.  The stale-strand tally
+        in the INFO line is counted the same way.  The count does not
+        distinguish the three per-record outcomes — age-annotated,
+        strand-stamped, or ``pending_secs=unknown`` for a record whose
+        timestamp would not parse; a caller that needs that detail reads the
+        resolved records themselves.
         """
         pending = self.get_pending()
         now = now or datetime.now(UTC)
@@ -3052,14 +3053,16 @@ class EscalationQueue:
                 else:
                     is_strand = False
                     per_record = f'{resolution} [pending_secs=unknown severity={esc.severity}]'
-                resolved = self.resolve(
+                outcome = blank_resolve_outcome()
+                self.resolve(
                     esc.id,
                     per_record,
                     dismiss=True,
                     resolved_by='auto-dismissed',
                     resolution_class='stale-strand' if is_strand else None,
+                    outcome=outcome,
                 )
-                if resolved is not None:
+                if outcome['applied']:
                     count += 1
                     strands += int(is_strand)
             except Exception as e:

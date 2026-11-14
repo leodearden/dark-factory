@@ -96,6 +96,14 @@ class EventType(StrEnum):
     #   reviewer-leg disposition, which is made at no exit; ticket: the
     #   curator ticket id, or null; decided_at: ISO-8601 UTC.
     info_l0_dispositioned = 'info_l0_dispositioned'
+    # A briefing carried the task's escalation rulings (task 4764).  Producer:
+    # orchestrator/workflow.py::TaskWorkflow._record_rulings_briefed, once per
+    # build that found any and, for a review round, which reads the rulings
+    # once, once per reviewer briefed; the role column is the briefed role.
+    # data: {escalation_ids, since}
+    #   escalation_ids: the rulings listed, oldest first; since: the ISO-8601
+    #   plan-confirmation cutoff they were selected after, or null for every ruling.
+    escalation_rulings_briefed = 'escalation_rulings_briefed'
 
     # Waste detection
     waste_detected = 'waste_detected'
@@ -248,26 +256,18 @@ class EventType(StrEnum):
     # ReverifyGateDecision.event_data. A fire's verdict is the merge_verify row
     # with the same task_id and merge_sha.
     merge_reverify_gate = 'merge_reverify_gate'
-    # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
-    # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
-    # merge_verify, which is the merge worker's POST-rebase verify (branch
-    # already merged onto CURRENT main).  task_id-keyed; the workflow's rows
-    # (TaskWorkflow._emit_workflow_verify, task 5651) carry {passed, tip_sha,
-    # base_sha, branch, site, duration_ms, slot_wait_secs, plan_hash,
-    # cache_mode, units}, site per verify_evidence.py::VerifySite and the
-    # last three per verify_evidence.py::verify_event_fields.  duration_ms is
-    # the verify run's own wall
-    # (VerifyResult.duration_secs), excluding the admission queueing that
-    # slot_wait_secs records.  Escalation-side vouch rows carry only
-    # {passed, base_sha, branch} until task 5409.  A 2752 checkpoint hit emits
+    # The branch's OWN verify verdict at its tip, before any merge onto main —
+    # distinct from merge_verify, the merge worker's verify of the branch
+    # merged onto CURRENT main.  task_id-keyed; data is defined by
+    # orchestrator/src/orchestrator/verify_evidence.py::workflow_verify_event_data,
+    # and VerifySite there names every emitting site and what each reader
+    # makes of its rows.  A 2752 checkpoint hit emits
     # phase_skipped(verify, reason='durable_verified_green') INSTEAD of this
-    # row.  Consumed by the merge-skew
-    # attribution classifier's I5 branch-green fact (merge_disposition.
-    # _branch_pre_merge_verify_green).  Task 2381 α adds this member + the
-    # reader; task 2383 β emits it at the workflow VERIFY-pass site.  Its
-    # ABSENCE is honest, not a bug: non-orchestrator paths (/merge-queue,
-    # /unblock, /do) submit branches without emitting it -> classifier
-    # degrades to INDETERMINATE by design.
+    # row.  A non-orchestrator path (/merge-queue, /unblock, /do) emits it only
+    # through merge_request(verified_green=True); without that vouch it is
+    # absent, honestly, and the I5 branch-green fact
+    # (orchestrator/src/orchestrator/merge_lane/disposition.py::
+    # _branch_pre_merge_verify_green) degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
     # Client-feed θ (plans/client-feed-prd.md §4 decision 16). Producer:
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._emit_review_completed; data:

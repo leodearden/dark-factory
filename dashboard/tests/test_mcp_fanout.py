@@ -1321,7 +1321,7 @@ class TestTTLCacheBoundedLockAcquisition:
     queued behind it, while the other 8 TTLCache-backed roots stayed healthy
     throughout.
 
-    Every test here monkeypatches the new ``_LOCK_ACQUIRE_TIMEOUT_SECONDS``
+    Every test here monkeypatches the new ``LOCK_ACQUIRE_TIMEOUT_SECONDS``
     module constant down to a short REAL value and relies on the real clock —
     no fake clock anywhere in this class. The wedging refresh stub parks on a
     genuinely unresolved ``asyncio.Event`` that is NEVER set; a sleep-based
@@ -1364,7 +1364,7 @@ class TestTTLCacheBoundedLockAcquisition:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         first_task, refresh, calls = await self._wedge_key(cache)
 
@@ -1387,7 +1387,7 @@ class TestTTLCacheBoundedLockAcquisition:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         first_task, refresh, calls = await self._wedge_key(cache)
 
@@ -1412,7 +1412,7 @@ class TestTTLCacheBoundedLockAcquisition:
     async def test_a_wedged_key_degrades_only_itself(self, monkeypatch):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         first_task, refresh_a, _ = await self._wedge_key(cache, key='a')
 
@@ -1442,7 +1442,7 @@ class TestTTLCacheBoundedLockAcquisition:
     def test_lock_acquire_timeout_is_a_finite_named_module_constant(self):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        timeout = fanout_mod._LOCK_ACQUIRE_TIMEOUT_SECONDS
+        timeout = fanout_mod.LOCK_ACQUIRE_TIMEOUT_SECONDS
         assert isinstance(timeout, float)
         assert 0 < timeout < 120, (
             'a future None (or non-positive/unbounded) value would silently '
@@ -1465,7 +1465,7 @@ class TestTTLCacheBypassRechecksFreshness:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         # Guarantee the acquisition times out — the same reach-into-privates
@@ -1506,7 +1506,7 @@ class TestTTLCacheBypassRechecksFreshness:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         lock = cache._locks.setdefault('k', asyncio.Lock())
@@ -1580,7 +1580,7 @@ class TestTTLCacheLockBypassLogging:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
@@ -1602,7 +1602,7 @@ class TestTTLCacheLockBypassLogging:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
@@ -1627,7 +1627,7 @@ class TestTTLCacheLockBypassLogging:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         monkeypatch.setattr(fanout_mod, '_LOCK_BYPASS_REWARN_EVERY', 3)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
@@ -1647,7 +1647,7 @@ class TestTTLCacheLockBypassLogging:
     async def test_streaks_are_tracked_per_key(self, monkeypatch, caplog):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
@@ -1669,7 +1669,7 @@ class TestTTLCacheLockBypassLogging:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         key = 'recovering-key'
 
@@ -1702,7 +1702,7 @@ class TestTTLCacheLockBypassLogging:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         for _ in range(3):
@@ -1721,7 +1721,7 @@ class TestTTLCacheLockBypassLogging:
     async def test_clear_resets_bypass_streak_state(self, monkeypatch, caplog):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         await _force_bypass(cache, 'k', _named_refresh)
@@ -1757,7 +1757,7 @@ class TestTTLCacheBypassStreaksPruning:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
@@ -1787,7 +1787,7 @@ class TestTTLCacheBypassStreaksPruning:
         """The prune must not fire early and demote an ACTIVE streak's next warning."""
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         lock = cache._locks.setdefault('k', asyncio.Lock())
@@ -1837,7 +1837,7 @@ class TestTTLCacheBoundsBypassConcurrency:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         calls = {'n': 0}
         entered = asyncio.Event()
@@ -1892,7 +1892,7 @@ class TestTTLCacheBoundsBypassConcurrency:
             # because the constant is read as a module global at call time
             # (the _FANOUT_REWARN_EVERY idiom), so the raise takes effect
             # on the very next read.
-            monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 5.0)
+            monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 5.0)
 
             more = [
                 asyncio.create_task(
@@ -1940,10 +1940,10 @@ class TestTTLCacheBoundedBypassInheritance:
     ``cache._bypass_tasks['k']`` stayed pending. Confirmed.
 
     Invariant pinned here: a caller waits at most
-    ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` on the lock, and at most that again on
+    ``LOCK_ACQUIRE_TIMEOUT_SECONDS`` on the lock, and at most that again on
     any single refresh it did not start -- and never on one already known
     to have outlived that bound. Every method monkeypatches
-    ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` to 0.05 and uses the REAL clock.
+    ``LOCK_ACQUIRE_TIMEOUT_SECONDS`` to 0.05 and uses the REAL clock.
     These tests deliberately create tasks that never complete -- on the
     pre-fix code the pile is larger (a joiner that should have been
     promoted instead hangs forever too) -- so teardown cancels every
@@ -2010,7 +2010,7 @@ class TestTTLCacheBoundedBypassInheritance:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         calls = {'n': 0}
         entered = asyncio.Event()
@@ -2066,7 +2066,7 @@ class TestTTLCacheBoundedBypassInheritance:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         _refresh, entered, calls = self._always_wedging_refresh()
 
@@ -2119,7 +2119,7 @@ class TestTTLCacheBoundedBypassInheritance:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         _refresh, entered, calls = self._always_wedging_refresh()
 
@@ -2186,7 +2186,7 @@ class TestTTLCacheBoundedBypassInheritance:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         calls = {'n': 0}
         release = asyncio.Event()
@@ -2217,7 +2217,7 @@ class TestTTLCacheBoundedBypassInheritance:
             )
             assert (
                 calls['n']
-                <= 2 + elapsed / fanout_mod._LOCK_ACQUIRE_TIMEOUT_SECONDS
+                <= 2 + elapsed / fanout_mod.LOCK_ACQUIRE_TIMEOUT_SECONDS
             ), (
                 f"at most about one new refresh per bound-window is "
                 f"expected, got {calls['n']} over {elapsed:.3f}s"
@@ -2256,7 +2256,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
     a rate bound holds forever while the TOTAL still diverges. These tests
     assert the TOTAL, over many bound-windows.
 
-    Every method monkeypatches ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` to
+    Every method monkeypatches ``LOCK_ACQUIRE_TIMEOUT_SECONDS`` to
     ``BOUND_SECONDS``, runs on
     shared/src/shared/testing_virtual_clock.py::virtual_clock_test and
     drives callers by count via ``_drive_callers``, so a host stall can only
@@ -2303,7 +2303,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         import dashboard.data.mcp_fanout as fanout_mod
 
         monkeypatch.setattr(
-            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+            fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
         )
         # Pinned explicitly, and asserted against the LITERAL below rather
         # than against the constant: an assertion phrased as
@@ -2335,7 +2335,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
             start = loop.time()
             waiters = await self._drive_callers(cache, 'k', _refresh, count=30)
             elapsed = loop.time() - start
-            windows = elapsed / fanout_mod._LOCK_ACQUIRE_TIMEOUT_SECONDS
+            windows = elapsed / fanout_mod.LOCK_ACQUIRE_TIMEOUT_SECONDS
 
             assert windows >= 5, (
                 f'precondition: the driven callers must span several '
@@ -2369,7 +2369,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         import dashboard.data.mcp_fanout as fanout_mod
 
         monkeypatch.setattr(
-            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+            fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
         )
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         wedged = asyncio.Event()  # never set
@@ -2423,7 +2423,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         import dashboard.data.mcp_fanout as fanout_mod
 
         monkeypatch.setattr(
-            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+            fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
         )
         monkeypatch.setattr(fanout_mod, '_MAX_LIVE_BYPASSES_PER_KEY', 3)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
@@ -2484,7 +2484,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         import dashboard.data.mcp_fanout as fanout_mod
 
         monkeypatch.setattr(
-            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+            fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
         )
         monkeypatch.setattr(fanout_mod, '_MAX_LIVE_BYPASSES_PER_KEY', 3)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
@@ -2555,7 +2555,7 @@ class TestTTLCacheEvictsDeadBypassEntries:
     ``monkeypatch.setattr(fanout_mod, 'time', types.SimpleNamespace(monotonic=...))``
     (module-local per pre-1) -- so the entry's ``started_at`` and the
     sweep's ``now`` read the SAME clock and stay self-consistent, while
-    asyncio's own timers (and thus ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` itself)
+    asyncio's own timers (and thus ``LOCK_ACQUIRE_TIMEOUT_SECONDS`` itself)
     keep running on the real clock.
     """
 
@@ -2564,7 +2564,7 @@ class TestTTLCacheEvictsDeadBypassEntries:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=lambda: 20.0)
         clock = {'t': 0.0}
         monkeypatch.setattr(
@@ -2582,7 +2582,7 @@ class TestTTLCacheEvictsDeadBypassEntries:
         # Hold key 'a''s lock directly so the caller below times out
         # acquiring it and becomes the bypass creator -- the same idiom
         # TestTTLCacheBypassRechecksFreshness already uses. The REAL clock
-        # still drives _LOCK_ACQUIRE_TIMEOUT_SECONDS (mcp_fanout's own
+        # still drives LOCK_ACQUIRE_TIMEOUT_SECONDS (mcp_fanout's own
         # `time` name is stubbed, not asyncio's loop clock -- see pre-1).
         lock = cache._locks.setdefault('a', asyncio.Lock())
         await lock.acquire()
@@ -2629,7 +2629,7 @@ class TestTTLCacheEvictsDeadBypassEntries:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=lambda: 20.0)
         clock = {'t': 0.0}
         monkeypatch.setattr(
@@ -2689,7 +2689,7 @@ class TestTTLCacheEvictsDeadBypassEntries:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         lock = cache._locks.setdefault('a', asyncio.Lock())
@@ -2726,7 +2726,7 @@ class TestTTLCacheSweepsOnTheBypassPath:
     async def test_a_bypass_reclaims_an_unrelated_ancient_entry(self, monkeypatch):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=lambda: 20.0)
         clock = {'t': 0.0}
         monkeypatch.setattr(
@@ -2740,7 +2740,7 @@ class TestTTLCacheSweepsOnTheBypassPath:
 
         # Hold the target key's lock directly so the bypass path fires -- the
         # same idiom TestTTLCacheBypassRechecksFreshness already uses. The
-        # REAL clock still drives _LOCK_ACQUIRE_TIMEOUT_SECONDS (mcp_fanout's
+        # REAL clock still drives LOCK_ACQUIRE_TIMEOUT_SECONDS (mcp_fanout's
         # own `time` name is stubbed, not asyncio's loop clock -- see pre-1).
         lock = cache._locks.setdefault('k', asyncio.Lock())
         await lock.acquire()
@@ -2780,7 +2780,7 @@ class TestTTLCacheBypassCannotClobberANewerValue:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         original_entered = asyncio.Event()
@@ -2871,7 +2871,7 @@ class TestTTLCacheDetachedRefreshReaping:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         bypass, caller = await wedge_one_bypass(cache, 'k')
         assert not bypass.done(), 'precondition: the bypass is genuinely in flight'
@@ -2946,7 +2946,7 @@ class TestTTLCacheReapSurvivesAHostileUnwind:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         # Hostile first: the roster is built in key-insertion order, so this
@@ -3027,7 +3027,7 @@ class TestTTLCacheReapDoesNotWaitForeverForACleanupThatWontUnwind:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         monkeypatch.setattr(fanout_mod, '_REAP_UNWIND_TIMEOUT_SECONDS', 0.2)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
@@ -3138,7 +3138,7 @@ class TestTTLCacheReapIsScopedToTheRunningLoop:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         foreign = self._seed_bypass_on_a_closed_loop(cache, 'from-a-dead-loop')
@@ -3243,7 +3243,7 @@ class TestTTLCacheSparesABypassRunningOnAnotherLiveLoop:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         with self._a_loop_running_in_another_thread() as foreign_loop:
@@ -3318,7 +3318,7 @@ class TestReapIsolatesEachCache:
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         # Bound to a local on purpose: the registry is a WeakSet, so an
         # unreferenced cache drops straight back out of it and the sweep never
         # meets the exploder at all.

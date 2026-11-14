@@ -31,7 +31,6 @@ from _read_policy_logs import node_read_warnings
 from _rebuild_service_results import rebuild_service_result
 
 from fused_memory.backends.graphiti_client import (
-    _ACTIVE_EDGE_PREDICATE,
     INCOMPLETE_CENSUS_UNAVAILABLE,
     INCOMPLETE_SHORT_READ,
     INCOMPLETE_STRUCTURAL_KINDS,
@@ -42,6 +41,7 @@ from fused_memory.backends.graphiti_client import (
     StaleProbeResult,
     StaleSummaryResult,
 )
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE
 from fused_memory.config.schema import FusedMemoryConfig
 
 #: The logger the service hands both stale probes, detect_stale_with_edges and
@@ -2710,7 +2710,7 @@ class TestBulkAndSingleRefreshShareTheEdgePopulation:
         assert bulk, 'no RELATES_TO read recorded for the bulk path'
         assert single, 'no RELATES_TO read recorded for the refresh path'
         for query in bulk + single:
-            assert _ACTIVE_EDGE_PREDICATE in query, query
+            assert ACTIVE_EDGE_PREDICATE in query, query
             assert 'expired_at' not in query, query  # restored edges stay (esc-4714-9)
 
 

@@ -10,9 +10,8 @@ every id it moves or unlinks, re-checks under that lock, and treats ENOENT on
 the source as work a concurrent actor already did, not as a fault; a missing
 destination dated subdir is re-raised (see ``_source_vanished``).  Pass 3
 (``escalation/src/escalation/archive.py::prune_archive``) removes whole dated
-subdirectories past retention, takes no per-id lock and does not tolerate a
-concurrent removal: an rmtree of a subdir that has already vanished raises.
-Task 6662 owns that hardening.
+subdirectories past retention and takes no per-id lock; a subdir a concurrent
+prune removed first counts as already pruned, not as a fault.
 
 Usage:
   python -m escalation.sweep --queue-dir <path>          # dry-run (default)

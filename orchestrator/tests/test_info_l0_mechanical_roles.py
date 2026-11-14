@@ -10,62 +10,100 @@ fails at commit time instead, by requiring every registered role to still be an
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from _tree_scan import (
+    ORCHESTRATOR_SRC,
+    ORCHESTRATOR_SRC_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+)
 from escalation.classify import INFO_L0_MECHANICAL_ROLES
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# rglob()s and ast.parse()s every *.py under the orchestrator src tree, so this
-# module belongs to the whole-tree-scanner family (shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-_ORCH_SRC_DIR = Path(__file__).resolve().parent.parent / 'src' / 'orchestrator'
-
-
-def _string_constants_by_name(trees: list[ast.Module]) -> dict[str, set[str]]:
-    """Every ``NAME = '...'`` or ``NAME: T = '...'`` binding, at any depth, by name."""
-    bindings: dict[str, set[str]] = {}
-    for tree in trees:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                targets, value = node.targets, node.value
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                targets, value = [node.target], node.value
-            else:
-                continue
-            if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
-                continue
-            for target in targets:
-                if isinstance(target, ast.Name):
-                    bindings.setdefault(target.id, set()).add(value.value)
-    return bindings
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 
-def _resolved_strings(value: ast.expr, bindings: dict[str, set[str]]) -> set[str]:
-    if isinstance(value, ast.Constant) and isinstance(value.value, str):
-        return {value.value}
-    if isinstance(value, ast.Name):
-        return bindings.get(value.id, set())
-    if isinstance(value, ast.Attribute):
-        return bindings.get(value.attr, set())
-    return set()
+@dataclass(frozen=True)
+class _RoleFacts:
+    """One file's string-constant bindings and its ``agent_role=`` values, before resolution.
+
+    Resolution folds every file's bindings first, because a role constant may be
+    defined in one module and passed in another.
+    """
+
+    string_bindings: tuple[tuple[str, str], ...]
+    literal_roles: tuple[str, ...]
+    role_names: tuple[str, ...]
+
+
+def _string_constant_bindings(tree: ast.Module) -> tuple[tuple[str, str], ...]:
+    """Every ``NAME = '...'`` or ``NAME: T = '...'`` binding in *tree*, at any depth."""
+    bindings: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
+            continue
+        bindings.extend(
+            (target.id, value.value) for target in targets if isinstance(target, ast.Name)
+        )
+    return tuple(bindings)
+
+
+def _role_facts(module: ParsedModule) -> _RoleFacts:
+    """A string ``agent_role=`` is a literal role; a bare or dotted name is resolved by its trailing name."""
+    roles = [
+        node.value
+        for node in ast.walk(module.tree)
+        if isinstance(node, ast.keyword) and node.arg == 'agent_role'
+    ]
+    return _RoleFacts(
+        string_bindings=_string_constant_bindings(module.tree),
+        literal_roles=tuple(
+            role.value
+            for role in roles
+            if isinstance(role, ast.Constant) and isinstance(role.value, str)
+        ),
+        role_names=tuple(
+            role.id if isinstance(role, ast.Name) else role.attr
+            for role in roles
+            if isinstance(role, ast.Name | ast.Attribute)
+        ),
+    )
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_SRC, extract=_role_facts)
+TREE_ANALYSES = (ANALYSIS,)
 
 
 @pytest.fixture(scope='module')
-def filed_agent_roles() -> set[str]:
+def filed_agent_roles(tree_pass: TreePass) -> set[str]:
     """Every string passed as an ``agent_role=`` keyword in the orchestrator src tree."""
-    trees = [
-        ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
-        for path in sorted(_ORCH_SRC_DIR.rglob('*.py'))
-    ]
-    bindings = _string_constants_by_name(trees)
+    files = tree_pass.facts(ANALYSIS).values()
+    bindings: dict[str, set[str]] = {}
+    for facts in files:
+        for name, value in facts.string_bindings:
+            bindings.setdefault(name, set()).add(value)
     return {
         role
-        for tree in trees
-        for node in ast.walk(tree)
-        if isinstance(node, ast.keyword) and node.arg == 'agent_role'
-        for role in _resolved_strings(node.value, bindings)
+        for facts in files
+        for role in (
+            *facts.literal_roles,
+            *(value for name in facts.role_names for value in bindings.get(name, ())),
+        )
     }
 
 
@@ -73,7 +111,7 @@ def filed_agent_roles() -> set[str]:
 def test_registered_role_is_still_filed_by_the_orchestrator(role: str, filed_agent_roles: set[str]):
     assert role in filed_agent_roles, (
         f'{role!r} is in escalation.classify.INFO_L0_MECHANICAL_ROLES but no '
-        f'agent_role= under {_ORCH_SRC_DIR} files it any more; update the registry '
+        f'agent_role= under {ORCHESTRATOR_SRC_DIR} files it any more; update the registry '
         'to the filer\'s new role.'
     )
 

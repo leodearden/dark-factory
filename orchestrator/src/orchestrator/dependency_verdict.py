@@ -108,6 +108,14 @@ def task_external_deps(task: dict) -> list[str]:
     return metadata.external_deps
 
 
+def task_dependency_ids(task: dict) -> list[str]:
+    """THE single reader of *task*'s local dependency ids, as strings, dict-shaped deps unwrapped."""
+    return [
+        str(d.get('id', d) if isinstance(d, dict) else d)
+        for d in task.get('dependencies', []) or []
+    ]
+
+
 def deps_verdict(
     task: dict,
     status_map: dict[str, str],
@@ -198,10 +206,7 @@ def deps_verdict(
     and its current status to aid diagnosis of premature-dispatch issues.
     Emits a separate DEBUG log when the intra-train allowance fires.
     """
-    dep_ids = [
-        str(d.get('id', d) if isinstance(d, dict) else d)
-        for d in task.get('dependencies', [])
-    ]
+    dep_ids = task_dependency_ids(task)
     arms = (
         partial(_local_verdict, task, dep_ids, status_map, tasks_by_id),
         partial(

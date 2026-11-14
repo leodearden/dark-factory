@@ -52,6 +52,7 @@ from orchestrator.before_done_script import (
     run_script,
 )
 from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
+from orchestrator.dependency_verdict import task_dependency_ids
 from orchestrator.deploy_state import (
     SCHEDULED_DEPLOY_PROVENANCE_KIND,
     DeployPhase,
@@ -62,6 +63,10 @@ from orchestrator.deploy_state import (
 )
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import FM_RESTART_RETRY_WINDOW_SECS, fm_retry_backoffs
+from orchestrator.gate_preconditions import (
+    gate_held_since_escalation,
+    gate_preconditions_stamp,
+)
 from orchestrator.predicate_output import predicate_verdict, summarize_predicate_output
 from orchestrator.predicate_recheck import (
     PredicateRecheck,
@@ -692,11 +697,6 @@ class GateEscalationFields:
     review_due: ReviewDueState | None
 
 
-def _dependency_ids(task: dict) -> list[str]:
-    deps = task.get('dependencies', []) or []
-    return [str(d.get('id', d) if isinstance(d, dict) else d) for d in deps]
-
-
 def gate_escalation_category(metadata: dict) -> str:
     """The category a pure gate's done provenance cites: ``review_due`` for a valid human-gate chain."""
     if isinstance(human_gate_chain(metadata), TriggerChain):
@@ -723,7 +723,7 @@ def build_gate_escalation_fields(
     The operational-LLM token prefix applies to either.
     """
     task = task or {}
-    dep_ids = _dependency_ids(task)
+    dep_ids = task_dependency_ids(task)
     detail_parts = [task.get('description', '')]
     if dep_ids:
         detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
@@ -793,7 +793,7 @@ async def read_human_gate_facts(
 
 async def _read_completion_gate(scheduler, task: dict) -> CompletionGateReading:
     """Every dependency, read concurrently, then :func:`first_completion_gate` in dependency order."""
-    dep_ids = _dependency_ids(task)
+    dep_ids = task_dependency_ids(task)
     reads = await asyncio.gather(
         *(_read_dependency(scheduler, task.get('id'), dep_id) for dep_id in dep_ids),
     )
@@ -2086,7 +2086,7 @@ class DeterministicRunner:
         else:
             await self.scheduler.update_task(
                 task_id,
-                {'gate_escalated_at': now_iso},
+                {'gate_escalated_at': now_iso, **gate_preconditions_stamp(task)},
                 metadata_mode='merge',
             )
 
@@ -3026,6 +3026,20 @@ class DeterministicRunner:
                             're-filing the born-at-L2 gate instead of driving to '
                             'done (task 2954)',
                             task_id,
+                        )
+                        return await self._file_milestone_gate_and_block(
+                            task_id, task, metadata,
+                        )
+                    # Re-held behind a new precondition: docs/deterministic-runner.md §3.
+                    if gate_held_since_escalation(task):
+                        logger.warning(
+                            'DeterministicRunner: task %s pure-gate resume — the task '
+                            'now waits on a dependency or milestone its gate '
+                            'escalation (gate_escalated_at=%s) did not; the '
+                            'resolution held the gate, it did not approve it — '
+                            're-filing the born-at-L2 gate instead of driving to '
+                            'done (task 9520)',
+                            task_id, gate_escalated_at,
                         )
                         return await self._file_milestone_gate_and_block(
                             task_id, task, metadata,

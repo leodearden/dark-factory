@@ -12,13 +12,21 @@ import ast
 from pathlib import Path
 
 import pytest
+from _tree_scan import (
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# Whole-tree scanner: see shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-_TESTS_DIR = Path(__file__).parent
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _NOT_YET_MIGRATED = frozenset({
     '_merge_deep_scene.py',
@@ -149,14 +157,25 @@ def _local_repo_seeders(tree: ast.Module) -> list[str]:
     return seeders
 
 
+def _top_level_test_modules() -> tuple[Path, ...]:
+    return tuple(path for path in python_files(TESTS_DIR) if path.parent == TESTS_DIR)
+
+
+def _module_seeders(module: ParsedModule) -> tuple[str, ...]:
+    return tuple(_local_repo_seeders(module.tree))
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=_top_level_test_modules, extract=_module_seeders)
+TREE_ANALYSES = (ANALYSIS,)
+
+
 @pytest.fixture(scope='module')
-def seeders_by_module() -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {}
-    for module in sorted(_TESTS_DIR.glob('*.py')):
-        seeders = _local_repo_seeders(ast.parse(module.read_text(encoding='utf-8')))
-        if seeders:
-            found[module.name] = seeders
-    return found
+def seeders_by_module(tree_pass: TreePass) -> dict[str, list[str]]:
+    return {
+        path.name: list(seeders)
+        for path, seeders in tree_pass.facts(ANALYSIS).items()
+        if seeders
+    }
 
 
 def test_no_module_grows_its_own_repo_seeder(seeders_by_module: dict[str, list[str]]) -> None:

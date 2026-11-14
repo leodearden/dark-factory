@@ -8,10 +8,10 @@ across production dispatch (``harness.py``) and eval dispatch
 MANDATORY ``TaskWorkflow`` constructor parameter is either acquired by both
 call sites automatically or breaks BOTH at once — never drifts silently.
 
-The grep-guard tripwire (added in a later step) mechanises that invariant by
-source inspection: exactly one production-source file may construct
-``TaskWorkflow(`` and both dispatch sites must route through
-``build_workflow(``.
+The grep-guard tripwire mechanises that invariant by source inspection: both
+dispatch sites must route through ``build_workflow(`` (here), and exactly one
+production-source file may construct ``TaskWorkflow(``
+(test_taskworkflow_construction_point_guard.py).
 """
 
 from __future__ import annotations
@@ -21,24 +21,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
 from _orch_helpers import pydantic_spec
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import orchestrator
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow, build_workflow
-
-# test_single_taskworkflow_construction_point scans every *.py under
-# orchestrator/src via _orchestrator_src_root().rglob('*.py') -- the same
-# helper test_eval_boundary_suite.py imports from here, so one slow tree walk
-# is billed to two modules. Not individually reproduced under load; marked
-# because it is structurally identical to the three members that crashed.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def test_build_workflow_forwards_params():
@@ -158,16 +145,12 @@ def test_build_workflow_forwards_every_param_by_keyword():
 #
 # The single-construction-point invariant is enforced by source inspection, not
 # behaviour: (a) exactly one production-source file may construct ``TaskWorkflow(``
-# and (b) both dispatch sites must route through ``build_workflow(``. Together
-# these encode "one construction point + both sites route through it" — precisely
-# what makes a new required factory arg break BOTH constructions at once rather
-# than drift silently. Scoped to orchestrator/src/orchestrator/ because ~70 test
-# modules legitimately construct TaskWorkflow directly and would false-fail a
-# repo-wide guard.
+# (test_taskworkflow_construction_point_guard.py::test_single_taskworkflow_construction_point)
+# and (b) both dispatch sites must route through ``build_workflow(`` (below).
+# Together these encode "one construction point + both sites route through it" —
+# precisely what makes a new required factory arg break BOTH constructions at
+# once rather than drift silently.
 
-# ``TaskWorkflow(`` not preceded by a word char or dot — a construction call,
-# not ``build_workflow`` / ``class TaskWorkflow:`` / an attribute access.
-_CONSTRUCT_RE = re.compile(r"(?<![\w.])TaskWorkflow\(")
 # ``build_workflow(`` not preceded by a word char or dot — the factory call, not
 # a ``_build_workflow`` lookalike.
 _FACTORY_CALL_RE = re.compile(r"(?<![\w.])build_workflow\(")
@@ -181,25 +164,6 @@ def _orchestrator_src_root() -> Path:
     path-independent and always scans the checkout it is run against.
     """
     return Path(orchestrator.__file__).resolve().parent
-
-
-def test_single_taskworkflow_construction_point():
-    """Only ``workflow.py`` may construct ``TaskWorkflow(`` in production source."""
-    src_root = _orchestrator_src_root()
-    offenders: set[str] = set()
-    for path in src_root.rglob('*.py'):
-        text = path.read_text(encoding='utf-8', errors='ignore')
-        for line in text.splitlines():
-            code = line.split('#', 1)[0]  # drop trailing comment
-            if _CONSTRUCT_RE.search(code):
-                offenders.add(path.relative_to(src_root).as_posix())
-                break
-    assert offenders == {'workflow.py'}, (
-        'Direct TaskWorkflow(...) construction is only permitted in workflow.py '
-        '(the build_workflow() factory body, the single construction point). '
-        f'Offending files: {sorted(offenders)}. Route construction through '
-        'build_workflow().'
-    )
 
 
 def test_both_dispatch_sites_route_through_factory():

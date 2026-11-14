@@ -397,8 +397,12 @@ def _marker_git_ops(
     )
 
 
-def _config(tmp_path: Path, *, commit_citation_pattern: str | None = None) -> Any:
+def _config(
+    tmp_path: Path, *, commit_citation_pattern: str | None = None,
+    delivered_checks_enabled: bool = True,
+) -> Any:
     from orchestrator.config import (  # type: ignore[reportMissingImports]
+        DeliveredChecksConfig,
         GitConfig,
         OrchestratorConfig,
     )
@@ -410,6 +414,7 @@ def _config(tmp_path: Path, *, commit_citation_pattern: str | None = None) -> An
             worktree_dir='.worktrees',
             commit_citation_pattern=commit_citation_pattern,
         ),
+        delivered_checks=DeliveredChecksConfig(enabled=delivered_checks_enabled),
     )
 
 
@@ -430,6 +435,30 @@ def _task_declaring_checks() -> dict[str, Any]:
             ],
         },
     }
+
+
+def _confirming_check_runner(refs_run: list[str]) -> Callable[..., Any]:
+    """A ``run_delivered_check`` fake that makes the REAL differential confirm.
+
+    FALSE before the landing (``<sha>^1``), TRUE at it and at main: the
+    contract of ``orchestrator/tests/_landing_evidence_helpers.py::differential_confirms``,
+    which escalation tests cannot import.  Every ref asked about is appended
+    to *refs_run*, so a test can tell a check that never ran from one that
+    ran and declined.
+    """
+    from orchestrator.delivered_checks import (
+        DeliveredCheckResult,
+    )
+
+    async def _run(
+        check: dict[str, Any], *, project_root: Any, ref: str = 'main', runner: Any = None,
+    ) -> Any:
+        refs_run.append(ref)
+        if ref.endswith('^1'):
+            return DeliveredCheckResult.FAILED
+        return DeliveredCheckResult.DELIVERED
+
+    return _run
 
 
 def _force_differential_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -681,6 +710,46 @@ class TestProbeLanding:
         assert verdict.arm is GitAuthorityArm.marker
         assert verdict.rescued_by_delivered_checks is True
         assert verdict.merge_sha_fully_guarded is False
+
+    @pytest.mark.parametrize('enabled', [True, False])
+    @pytest.mark.parametrize('arm', ['ancestor', 'marker'])
+    async def test_the_project_kill_switch_governs_the_rescue_in_both_arms(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str, enabled: bool,
+    ) -> None:
+        """``delivered_checks.enabled`` reaches the differential from orch_config.
+
+        The REAL differential runs, with only its leaf check runner faked,
+        because the kill switch lives inside it.  A real ``GitOps.config`` is
+        the ``git`` sub-config and cannot carry the leaf, so the probe must
+        pass it from the project config in both arms.
+        """
+        git_ops = (
+            _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False)
+            if arm == 'ancestor'
+            else _marker_git_ops(marker='d' * 40, effect_present=False)
+        )
+        git_ops.project_root = tmp_path
+        refs_run: list[str] = []
+        monkeypatch.setattr(
+            'orchestrator.delivered_checks.run_delivered_check',
+            _confirming_check_runner(refs_run),
+        )
+
+        verdict = await probe_landing(
+            git_ops, '910',
+            orch_config=_config(tmp_path, delivered_checks_enabled=enabled),
+            harness=_harness(read=TaskFound(_task_declaring_checks())),
+        )
+
+        if enabled:
+            assert verdict.outcome is GitAuthorityOutcome.found_on_main
+            assert verdict.rescued_by_delivered_checks is True
+            assert verdict.merge_sha_fully_guarded is False
+        else:
+            assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
+            assert verdict.rescued_by_delivered_checks is False
+            assert verdict.merge_sha is None
+            assert refs_run == [], 'a disabled feature runs no declared check'
 
     async def test_declaring_checks_does_not_by_itself_set_the_flag(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

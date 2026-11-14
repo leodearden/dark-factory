@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeVar
 
 import pytest
@@ -102,15 +102,23 @@ def seed_edges_cypher(endpoint_label: str) -> str:
     )
 
 
+def canary_fact(edge: SeededEdge) -> str:
+    return f'{CANARY_TOKEN} fact {edge.uuid}'
+
+
 async def seed_edges(
-    graph: AsyncGraph, group_id: str, endpoint_label: str, edges: list[SeededEdge]
+    graph: AsyncGraph,
+    group_id: str,
+    endpoint_label: str,
+    edges: list[SeededEdge],
+    fact_of: Callable[[SeededEdge], str] = canary_fact,
 ) -> None:
     rows = [
         {
             'uuid': edge.uuid,
             'source_node_uuid': edge.source_node_uuid,
             'target_node_uuid': edge.target_node_uuid,
-            'fact': f'{CANARY_TOKEN} fact {edge.uuid}',
+            'fact': fact_of(edge),
             'fact_embedding': list(edge.fact_embedding),
         }
         for edge in edges
@@ -161,26 +169,72 @@ async def live_backend_factory(mock_config):
 
 
 @pytest_asyncio.fixture
-async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[SeededGraph]]:
+async def provision(live_backend_factory) -> Callable[[str, AsyncGraph], Awaitable[GraphDriver]]:
+    """``provision(name, graph)``: the production index sweep over a seeded graph, and its hardened driver.
+
+    Seeding creates the graph KEY, which the provisioning sweep requires.
+    """
+
+    async def provisioned(name: str, graph: AsyncGraph) -> GraphDriver:
+        backend = live_backend_factory({name})
+        await backend.provision_registered_graphs()
+        await await_index_operational(graph)
+        return live_backend_factory.driver_of(backend).clone(name)
+
+    return provisioned
+
+
+@pytest_asyncio.fixture
+async def seed_ring(scratch, provision) -> Callable[[int], Awaitable[SeededGraph]]:
     """``seed(count)``: a ring of *count* Entity edges plus an off-label twin, production-provisioned."""
 
     async def seed(count: int) -> SeededGraph:
         name, graph = scratch('ring')
         ring = ring_edges(count)
         off_label_edge = off_label_twin(ring[0])
-        # Seeding also creates the graph KEY, which the provisioning sweep requires.
         await seed_edges(graph, name, 'Entity', ring)
         await seed_edges(graph, name, 'CanaryEndpoint', [off_label_edge])
-        backend = live_backend_factory({name})
-        await backend.provision_registered_graphs()
-        await await_index_operational(graph)
         return SeededGraph(
             name=name,
             graph=graph,
-            driver=live_backend_factory.driver_of(backend).clone(name),
+            driver=await provision(name, graph),
             entity_edges={edge.uuid: edge for edge in ring},
             off_label_edge=off_label_edge,
         )
+
+    return seed
+
+
+@dataclass(frozen=True)
+class FactGraph:
+    name: str
+    graph: AsyncGraph
+    driver: GraphDriver
+
+    async def bm25_ranking(self, query: str, limit: int) -> list[str]:
+        """The uuids graphiti's edge BM25 leg returns for *query*, best first."""
+        edges = await search_utils.edge_fulltext_search(
+            self.driver, query, SearchFilters(), [self.name], limit
+        )
+        return [edge.uuid for edge in edges]
+
+    async def retire(self, uuids: Iterable[str]) -> None:
+        """Set ``invalid_at`` on the edges *uuids*, as graphiti does when it retires a fact."""
+        await self.graph.query(
+            'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids SET e.invalid_at = $retired_at',
+            {'uuids': list(uuids), 'retired_at': SEEDED_AT},
+        )
+
+
+@pytest_asyncio.fixture
+async def seed_facts(scratch, provision) -> Callable[[dict[str, str]], Awaitable[FactGraph]]:
+    """``seed(facts)``: one ring Entity edge per ``{uuid: fact}`` item, production-provisioned."""
+
+    async def seed(facts: dict[str, str]) -> FactGraph:
+        name, graph = scratch('facts')
+        edges = [replace(edge, uuid=uuid) for edge, uuid in zip(ring_edges(len(facts)), facts, strict=True)]
+        await seed_edges(graph, name, 'Entity', edges, lambda edge: facts[edge.uuid])
+        return FactGraph(name=name, graph=graph, driver=await provision(name, graph))
 
     return seed
 
@@ -313,6 +367,75 @@ class TestEdgeFulltextLeg:
         rewritten = {edge.uuid for edge in edges}
         assert rewritten == {edge.uuid for edge in builtin_edges} == set(seeded.entity_edges)
         assert seeded.off_label_edge.uuid not in rewritten
+
+
+# --- BM25 ranking ------------------------------------------------------------
+
+# Measured on scratch FalkorDB 41800 (task 9542): the union alone ranks long-id
+# 21st for IDENTIFIER_QUERY, with or without the (@group_id:...) prefix.
+IDENTIFIER_FACTS = {
+    **{f'prose-{i}': 'task context decisions related' for i in range(20)},
+    'long-id': (
+        'AllAccountsCappedException catch sites were added in the production orchestrator'
+        ' via ticket 877 commit 371d4763 after the usage cap work landed'
+    ),
+    'filler-1': 'unrelated filler sentence one',
+    'filler-2': 'unrelated filler sentence two',
+}
+IDENTIFIER_QUERY = 'task 877 context and related decisions'
+
+# Measured on scratch FalkorDB 41800 (task 9542): each outscores long-id on the
+# union, 1.0 against 0.167.
+RETIRED_IDENTIFIER_FACTS = {f'retired-{i}': f'Task 877 retired fact {i}' for i in range(5)}
+
+
+class TestEdgeFulltextRanking:
+    @pytest.mark.asyncio
+    async def test_an_edge_matching_every_identifier_outranks_prose_edges(self, seed_facts):
+        seeded = await seed_facts(IDENTIFIER_FACTS)
+
+        ranking = await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
+
+        assert ranking[0] == 'long-id', ranking
+
+    @pytest.mark.asyncio
+    async def test_retired_edges_are_not_promoted(self, seed_facts):
+        retired = dict(list(RETIRED_IDENTIFIER_FACTS.items())[:2])
+        seeded = await seed_facts({**IDENTIFIER_FACTS, **retired})
+        await seeded.retire(retired)
+
+        ranking = await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
+
+        assert ranking[0] == 'long-id', ranking
+
+    @pytest.mark.asyncio
+    async def test_the_tier_fits_the_leg_on_its_live_edges(self, seed_facts):
+        """Five retired edges and long-id would overflow a 5-row leg; long-id alone fits."""
+        seeded = await seed_facts({**IDENTIFIER_FACTS, **RETIRED_IDENTIFIER_FACTS})
+        await seeded.retire(RETIRED_IDENTIFIER_FACTS)
+
+        ranking = await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
+
+        assert ranking[0] == 'long-id', ranking
+
+    @pytest.mark.asyncio
+    async def test_identifiers_are_conjunctive(self, seed_facts):
+        seeded = await seed_facts(IDENTIFIER_FACTS)
+
+        ranking = await seeded.bm25_ranking('task 877 999 context and related decisions', 5)
+
+        assert 'long-id' not in ranking, ranking
+
+    @pytest.mark.asyncio
+    async def test_tier_and_union_queries_plan_without_a_per_row_scan(self, seed_facts):
+        seeded = await seed_facts(IDENTIFIER_FACTS)
+        issued = spy_on_queries(seeded.driver)
+
+        await seeded.bm25_ranking(IDENTIFIER_QUERY, 5)
+        plans = [await explain(seeded.graph, query) for query in issued]
+
+        assert len(plans) == 2, 'the tier query, then the union'
+        assert [non_leaf_scans(plan) for plan in plans] == [[], []], [str(plan) for plan in plans]
 
 
 # --- Cosine leg ---------------------------------------------------------------

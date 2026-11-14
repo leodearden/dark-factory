@@ -595,13 +595,25 @@ mem0_update:
   # storm_threshold: 20
   # storm_window_seconds: 3600.0
 
-# Link-heal executor caps and link adjudicator knobs (tasks 6181, 6184;
-# plans/write-triage-link-healing-prd.md H1, H2). Read by
-# fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at each
-# run start, so an edit takes effect on the next run with no restart. Every
-# value below is the shipped default, shown so the knobs are discoverable.
-# Uncomment to change one.
-# link_heal:
+# Link-heal executor caps, link adjudicator knobs and the scheduled sweep
+# (tasks 6181, 6184, 7159; plans/write-triage-link-healing-prd.md H1, H2). Read
+# by fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at
+# each run start, so an edit takes effect on the next run with no restart. The
+# commented values are the shipped defaults, shown so the knobs are
+# discoverable. Uncomment to change one.
+link_heal:
+  # The projects with write-triage children in the 2026-10-19 soak.
+  projects: [dark_factory, reify, solar_challenge, solar_challenge_platform, scoping_intake]
+  # Writes need a passing soak calibration and an operator flip (INV-12 owned hold; runbook: OPERATIONS.md).
+  writes: false
+#   # Heal actions a sweep may stage; the rest are recorded as not_enabled.
+#   sweep_actions: [detach, relabel]
+#   # How far back the first sweep looks; later sweeps resume from the last complete one.
+#   sweep_window_hours: 24
+#   # Calibration passes at no less than the raters' own kappa minus this.
+#   calibration_kappa_margin: 0.10
+#   # Rated pairs a project needs before calibration gates on it.
+#   calibration_min_project_items: 60
 #   # Write attempts per unattended run, oldest-planned first; the rest stay
 #   # pending as skipped_cap. 0 applies nothing unattended.
 #   max_actions_per_run: 25

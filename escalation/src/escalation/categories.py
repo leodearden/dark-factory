@@ -46,6 +46,7 @@ class EscalationCategory(StrEnum):
     INTEGRATION_SKEW = 'integration_skew'
     LANDING_DETECTOR_GIT_ERROR = 'landing_detector_git_error'
     LIMIT_EXHAUSTED = 'limit_exhausted'
+    LINK_HEAL_RUN_REPORT = 'link_heal_run_report'
     MCP_MARKUP_BOUNDARY_STORM = 'mcp_markup_boundary_storm'
     MCP_MARKUP_RESIDUE = 'mcp_markup_residue'
     MCP_MARKUP_STORM = 'mcp_markup_storm'

@@ -21,6 +21,7 @@ from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     CHILD,
     CHILD_TEXT,
+    COMPLETION_META,
     DEFAULT_LIMITS,
     DF,
     PARENT,
@@ -36,7 +37,7 @@ from _link_heal_harness import (
 )
 from orchestrator.agents.memory_recall import render_memory_results
 
-from fused_memory.maintenance.link_heal import BasisSource, LinkBasis
+from fused_memory.maintenance.link_heal import BasisSource, HealAction, LinkBasis
 from fused_memory.maintenance.link_heal_executor import (
     BACKLOG_ANCHOR,
     WRITE_FAILURE_ANCHOR,
@@ -319,6 +320,94 @@ class TestCorroborationSkipsStaleHeals:
         assert row.state is ActionState.SKIPPED_STALE
         assert row.detail == {'stale_field': 'children'}
         assert 'kind' not in harness.mem0.payload(DF, CHILD)
+
+
+class TestWriteTimeRecords:
+    @pytest.mark.asyncio
+    async def test_an_applied_heal_records_its_child_and_parent_before_and_child_after(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link()
+
+        report = await plan_then_apply(harness, ledger, tmp_path, corpus_basis('RELATED'))
+
+        row = only_outcome(ledger, report)
+        assert row.state is ActionState.APPLIED
+        assert row.before_child_snapshot_id is not None
+        assert row.before_parent_snapshot_id is not None
+        assert row.after_child_snapshot_id is not None
+        before = ledger.read_snapshot(row.before_child_snapshot_id)
+        after = ledger.read_snapshot(row.after_child_snapshot_id)
+        assert before.link_image() == row.planned.pre_image
+        assert before.content == CHILD_TEXT
+        assert ledger.read_snapshot(row.before_parent_snapshot_id).content == PARENT_TEXT
+        assert after.link_image() == row.planned.post_image
+        assert after.content == before.content
+        assert after.memory_id == CHILD
+
+    @pytest.mark.asyncio
+    async def test_the_plan_runs_records_show_what_the_apply_took(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link()
+        plan = await run_corpus_plan(
+            harness, ledger, tmp_path / 'plan.json', (corpus_basis('RELATED'),),
+        )
+
+        report = await run_corpus_apply(harness, ledger)
+
+        (record,) = ledger.run_records(plan.run_id)
+        row = only_outcome(ledger, report)
+        assert record.action_taken is HealAction.DETACH
+        assert record.after_child is not None
+        assert record.after_child.snapshot_id == row.after_child_snapshot_id
+        assert record.after_child.link_image() == row.planned.post_image
+
+    @pytest.mark.asyncio
+    async def test_a_completion_record_detach_reads_and_records_no_parent(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link(meta=COMPLETION_META)
+
+        report = await plan_then_apply(harness, ledger, tmp_path)
+
+        row = only_outcome(ledger, report)
+        assert row.planned.basis_source is BasisSource.COMPLETION_RECORD
+        assert row.state is ActionState.APPLIED
+        assert row.before_child_snapshot_id is not None
+        assert row.before_parent_snapshot_id is None
+        assert row.after_child_snapshot_id is not None
+
+    @pytest.mark.asyncio
+    async def test_a_stale_skip_records_the_before_state_that_showed_it(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link()
+
+        report = await plan_then_apply(
+            harness, ledger, tmp_path, corpus_basis('RELATED'),
+            between=_edit_child_text(harness),
+        )
+
+        row = only_outcome(ledger, report)
+        assert row.state is ActionState.SKIPPED_STALE
+        assert row.before_child_snapshot_id is not None
+        stale = ledger.read_snapshot(row.before_child_snapshot_id)
+        assert stale.content == 'the child note, edited after the plan'
+        assert row.after_child_snapshot_id is None
+
+    @pytest.mark.asyncio
+    async def test_a_cap_skip_records_nothing(self, harness, ledger, tmp_path):
+        await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', seed_sightings(harness, 26))
+
+        report = await run_corpus_apply(harness, ledger)
+
+        skipped = [row for row in executed_rows(ledger, report) if row.state is ActionState.SKIPPED_CAP]
+        assert len(skipped) == 1
+        (row,) = skipped
+        assert (
+            row.before_child_snapshot_id, row.before_parent_snapshot_id, row.after_child_snapshot_id,
+        ) == (None, None, None)
 
 
 class TestFailures:

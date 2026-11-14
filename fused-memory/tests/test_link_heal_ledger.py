@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
 import re
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -20,7 +23,10 @@ from fused_memory.maintenance.link_heal import (
 from fused_memory.maintenance.link_heal_ledger import (
     ActionState,
     AdjudicationRecord,
+    AdjudicatorCalibration,
     AmbiguousRun,
+    Disposition,
+    ExaminationRecord,
     LinkHealLedger,
     NothingToUndo,
     RunKind,
@@ -30,12 +36,15 @@ from fused_memory.maintenance.link_heal_ledger import (
     UndoTarget,
     UnknownRun,
 )
+from fused_memory.maintenance.link_heal_store import CreatedWindow, LiveRecord, text_sha256
 from fused_memory.server.grouped_read import CONTESTED_METADATA_KEY
 
 PROJECT = 'dark_factory'
 PARENT = '22222222-2222-2222-2222-222222222222'
 CHILD_SHA = 'c' * 64
 PARENT_SHA = 'p' * 64
+MODEL = 'opus'
+PROMPT_SHA = '9' * 64
 
 
 def _child(n: int) -> str:
@@ -81,7 +90,7 @@ class TestSchema:
             tables = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'"))
         finally:
             conn.close()
-        for name in ('runs', 'adjudications', 'run_adjudications', 'actions'):
+        for name in ('runs', 'adjudications', 'run_adjudications', 'actions', 'snapshots'):
             assert re.search(
                 r'\bid INTEGER PRIMARY KEY AUTOINCREMENT\b', tables[name],
             ), tables[name]
@@ -140,6 +149,238 @@ class TestSchema:
         finally:
             ledger.close()
         LinkHealLedger(db).close()
+
+    def test_a_ledger_written_before_the_records_opens_and_gains_them(self, tmp_path):
+        db = tmp_path / 'link_heal.db'
+        run_id = 'b' * 32
+        conn = sqlite3.connect(db)
+        try:
+            conn.executescript(_SCHEMA_BEFORE_RECORDS)
+            conn.execute(
+                'INSERT INTO runs (run_id, source, writes, started_at) VALUES (?, ?, ?, ?)',
+                (run_id, RunSource.CORPUS.value, 0, '2026-11-01T00:00:00+00:00'),
+            )
+            conn.execute(
+                'INSERT INTO actions (run_id, project_id, child_id, action, pre_image_json, '
+                'post_image_json, basis_source, basis_key, child_sha256, parent_sha256, state, '
+                'at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    run_id, PROJECT, _child(1), HealAction.DETACH.value,
+                    json.dumps({'parent_id': PARENT, 'kind': 'amendment'}), json.dumps({}),
+                    BasisSource.CORPUS.value, 'H001', CHILD_SHA, PARENT_SHA,
+                    ActionState.PLANNED.value, '2026-11-01T00:00:00+00:00',
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ledger = LinkHealLedger(db)
+        try:
+            (old,) = ledger.run_actions(run_id)
+            assert old.planned.child_id == _child(1)
+            record = LiveRecord(memory_id=_child(1), text='child', metadata={'parent_id': PARENT})
+            assert ledger.read_snapshot(ledger.snapshot(PROJECT, record)).content == 'child'
+        finally:
+            ledger.close()
+        assert _columns(db, 'adjudications') >= {'prompt_sha256'}
+        assert _columns(db, 'actions') >= {
+            'before_child_snapshot_id', 'before_parent_snapshot_id', 'after_child_snapshot_id',
+        }
+        LinkHealLedger(db).close()
+
+
+def test_an_adjudication_written_before_prompt_versions_is_never_reused(tmp_path):
+    db = tmp_path / 'link_heal.db'
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(_SCHEMA_BEFORE_RECORDS)
+        conn.execute(
+            'INSERT INTO adjudications (project_id, child_id, parent_id, child_sha256, '
+            'parent_sha256, verdict, reason, model, run_id, at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA, Verdict.SAME.value,
+                'old reason', 'opus', 'c' * 32, '2026-11-01T00:00:00+00:00',
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ledger = LinkHealLedger(db)
+    try:
+        row = ledger.adjudication_at(
+            PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA,
+            model='opus', prompt_sha256=PROMPT_SHA,
+        )
+    finally:
+        ledger.close()
+
+    assert row is None
+
+
+def test_a_prompt_version_round_trips(ledger):
+    run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+    record = dataclasses.replace(_record(1), prompt_sha256='d' * 64)
+
+    ledger.add_adjudications(run_id, [record])
+
+    row = ledger.adjudication_at(
+        PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA, model=MODEL, prompt_sha256='d' * 64,
+    )
+    assert row is not None
+    assert row.record == record
+
+
+def _columns(db: Path, table: str) -> set[str]:
+    conn = sqlite3.connect(db)
+    try:
+        return {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+    finally:
+        conn.close()
+
+
+#: ``link_heal.db``'s schema as task 7159 found it, before snapshots and the
+#: record columns: a ledger this old must open and migrate in place.
+_SCHEMA_BEFORE_RECORDS = """
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    writes INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    counts_json TEXT,
+    plan_sha256 TEXT,
+    plan_path TEXT
+);
+CREATE TABLE adjudications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    child_id TEXT NOT NULL,
+    parent_id TEXT NOT NULL,
+    child_sha256 TEXT NOT NULL,
+    parent_sha256 TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    reason TEXT,
+    model TEXT,
+    run_id TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE INDEX adjudications_by_texts
+    ON adjudications (project_id, child_id, parent_id, child_sha256, parent_sha256);
+CREATE TABLE run_adjudications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    adjudication_id INTEGER NOT NULL REFERENCES adjudications (id)
+);
+CREATE UNIQUE INDEX run_adjudications_by_run
+    ON run_adjudications (run_id, adjudication_id);
+CREATE TABLE actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    child_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    pre_image_json TEXT NOT NULL,
+    post_image_json TEXT NOT NULL,
+    basis_source TEXT NOT NULL,
+    basis_key TEXT,
+    child_sha256 TEXT NOT NULL,
+    parent_sha256 TEXT,
+    state TEXT NOT NULL,
+    detail TEXT,
+    at TEXT NOT NULL,
+    executed_run_id TEXT,
+    undone_run_id TEXT
+);
+CREATE INDEX actions_by_link ON actions (project_id, child_id);
+"""
+
+
+SNAPSHOT_META = {
+    'data': 'the child note',
+    'parent_id': PARENT,
+    'kind': 'amendment',
+    'created_at': '2026-11-11T20:00:00-07:00',
+    'updated_at': '2026-11-12T03:00:00+00:00',
+    'nested': {'b': 2, 'a': [1, 2]},
+}
+
+
+def _live_record(text: str = 'the child note', **meta_changes) -> LiveRecord:
+    return LiveRecord(memory_id=_child(1), text=text, metadata={**SNAPSHOT_META, **meta_changes})
+
+
+class TestSnapshots:
+    def test_a_snapshot_holds_the_full_record_and_its_hashes(self, ledger):
+        snapshot_id = ledger.snapshot(PROJECT, _live_record())
+
+        assert isinstance(snapshot_id, int)
+        snapshot = ledger.read_snapshot(snapshot_id)
+        assert snapshot.snapshot_id == snapshot_id
+        assert snapshot.project_id == PROJECT
+        assert snapshot.memory_id == _child(1)
+        assert snapshot.content == 'the child note'
+        assert snapshot.content_sha256 == text_sha256('the child note')
+        assert snapshot.metadata == SNAPSHOT_META
+        assert snapshot.metadata_sha256 == hashlib.sha256(
+            json.dumps(SNAPSHOT_META, sort_keys=True).encode('utf-8'),
+        ).hexdigest()
+        assert snapshot.created_at == '2026-11-11T20:00:00-07:00'
+        assert snapshot.updated_at == '2026-11-12T03:00:00+00:00'
+
+    def test_a_snapshot_without_timestamps_stores_none(self, ledger):
+        record = LiveRecord(memory_id=_child(2), text='bare', metadata={'parent_id': PARENT})
+
+        snapshot = ledger.read_snapshot(ledger.snapshot(PROJECT, record))
+
+        assert snapshot.created_at is None
+        assert snapshot.updated_at is None
+
+    def test_an_identical_record_reuses_its_snapshot(self, ledger):
+        first = ledger.snapshot(PROJECT, _live_record())
+
+        assert ledger.snapshot(PROJECT, _live_record()) == first
+
+    @pytest.mark.parametrize(
+        'changed',
+        [
+            {'text': 'the child note, edited'},
+            {'kind': 'sighting'},
+            {'nested': {'b': 3, 'a': [1, 2]}},
+        ],
+        ids=['content', 'one-key', 'nested-value'],
+    )
+    def test_a_changed_record_is_a_new_snapshot(self, ledger, changed):
+        first = ledger.snapshot(PROJECT, _live_record())
+
+        assert ledger.snapshot(PROJECT, _live_record(**changed)) != first
+
+    def test_the_same_record_in_another_project_is_a_new_snapshot(self, ledger):
+        first = ledger.snapshot(PROJECT, _live_record())
+
+        assert ledger.snapshot('reify', _live_record()) != first
+
+    def test_a_snapshot_reads_its_link(self, ledger):
+        snapshot = ledger.read_snapshot(ledger.snapshot(PROJECT, _live_record()))
+
+        assert snapshot.link_image() == LinkImage.from_metadata(SNAPSHOT_META)
+
+    def test_an_unknown_snapshot_id_is_refused(self, ledger):
+        with pytest.raises(LookupError):
+            ledger.read_snapshot(4242)
+
+    def test_sqlite_sequence_carries_snapshots_once_one_is_written(self, ledger):
+        ledger.snapshot(PROJECT, _live_record())
+
+        conn = sqlite3.connect(ledger.db_path)
+        try:
+            names = {name for (name,) in conn.execute('SELECT name FROM sqlite_sequence')}
+        finally:
+            conn.close()
+        assert 'snapshots' in names
 
 
 class TestRuns:
@@ -497,13 +738,30 @@ class TestActions:
         assert (step.undo_run_id, step.after) == (first_undo, part_way)
 
 
+def _staged(planned: PlannedAction) -> ExaminationRecord:
+    """The examination that stages *planned* as a new heal."""
+    return ExaminationRecord(
+        project_id=planned.project_id,
+        child=LiveRecord(
+            memory_id=planned.child_id, text='child', metadata=planned.pre_image.as_dict(),
+        ),
+        parent_id=planned.pre_image.parent_id,
+        parent=None,
+        basis_source=planned.basis_source,
+        basis_key=planned.basis_key,
+        decision=planned.action,
+        disposition=Disposition.STAGED,
+        staged=planned,
+    )
+
+
 class TestPublishingPlanned:
     def test_yields_the_pending_rows_with_the_new_ones_and_commits_them(self, ledger):
         earlier = ledger.start_run(RunSource.CORPUS, writes=False)
         ledger.add_planned(earlier, [_planned(1)])
         run_id = ledger.start_run(RunSource.CORPUS, writes=False)
 
-        with ledger.publishing_planned(run_id, [_planned(2)], RunSource.CORPUS) as pending:
+        with ledger.publishing_planned(run_id, [_staged(_planned(2))], RunSource.CORPUS) as pending:
             assert [row.planned for row in pending] == [_planned(1), _planned(2)]
 
         assert [row.planned for row in ledger.run_actions(run_id)] == [_planned(2)]
@@ -513,7 +771,7 @@ class TestPublishingPlanned:
 
         with (
             pytest.raises(OSError, match='disk full'),
-            ledger.publishing_planned(run_id, [_planned(1)], RunSource.CORPUS),
+            ledger.publishing_planned(run_id, [_staged(_planned(1))], RunSource.CORPUS),
         ):
             raise OSError('disk full')
 
@@ -533,6 +791,8 @@ def _record(
     parent: str = PARENT,
     child_sha: str = CHILD_SHA,
     parent_sha: str = PARENT_SHA,
+    model: str = MODEL,
+    prompt_sha256: str = PROMPT_SHA,
 ) -> AdjudicationRecord:
     return AdjudicationRecord(
         project_id=PROJECT,
@@ -542,8 +802,82 @@ def _record(
         parent_sha256=parent_sha,
         verdict=verdict,
         reason=f'reason {n}',
-        model='opus',
+        model=model,
+        prompt_sha256=prompt_sha256,
     )
+
+
+class TestBasisCalibration:
+    @staticmethod
+    def _adjudicated_heal(ledger: LinkHealLedger, basis_key: str | None = None):
+        if basis_key is None:
+            judged = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+            (adjudication_id,) = ledger.add_adjudications(judged, [_record(1)])
+            basis_key = str(adjudication_id)
+        run_id = ledger.start_run(RunSource.SWEEP, writes=False)
+        planned = dataclasses.replace(_planned(source=BasisSource.ADJUDICATOR), basis_key=basis_key)
+        ledger.add_planned(run_id, [planned])
+        (row,) = ledger.run_actions(run_id)
+        return row
+
+    @staticmethod
+    def _calibrated(ledger: LinkHealLedger, *, passed: bool) -> str:
+        run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
+        ledger.add_calibration(
+            run_id, model=MODEL, prompt_sha256=PROMPT_SHA, population_sha256='0' * 64,
+            passed=passed, report={'passed': passed},
+        )
+        return run_id
+
+    def test_a_heal_not_resting_on_an_adjudication_has_none(self, ledger):
+        run_id = ledger.start_run(RunSource.SWEEP, writes=False)
+        ledger.add_planned(run_id, [_planned(source=BasisSource.DETERMINISTIC, parent_sha=None)])
+        (row,) = ledger.run_actions(run_id)
+
+        assert ledger.basis_calibration(row) is None
+
+    def test_an_uncalibrated_adjudicator_has_no_calibration_and_has_not_passed(self, ledger):
+        standing = ledger.basis_calibration(self._adjudicated_heal(ledger))
+
+        assert standing == AdjudicatorCalibration(model=MODEL, prompt_sha256=PROMPT_SHA, calibration=None)
+        assert standing.passed is False
+
+    def test_the_newest_calibration_failing_has_not_passed(self, ledger):
+        self._calibrated(ledger, passed=True)
+        failed = self._calibrated(ledger, passed=False)
+
+        standing = ledger.basis_calibration(self._adjudicated_heal(ledger))
+
+        assert standing is not None
+        assert standing.calibration is not None
+        assert standing.calibration.run_id == failed
+        assert standing.passed is False
+
+    def test_the_newest_calibration_passing_has_passed(self, ledger):
+        self._calibrated(ledger, passed=False)
+        passed = self._calibrated(ledger, passed=True)
+
+        standing = ledger.basis_calibration(self._adjudicated_heal(ledger))
+
+        assert standing is not None
+        assert standing.passed is True
+        assert standing.calibration is not None
+        assert standing.calibration.run_id == passed
+
+    def test_the_adjudicator_lookup_gives_the_same_standing(self, ledger):
+        self._calibrated(ledger, passed=True)
+
+        assert ledger.adjudicator_calibration(MODEL, PROMPT_SHA) == ledger.basis_calibration(
+            self._adjudicated_heal(ledger),
+        )
+
+    def test_a_basis_naming_no_adjudication_is_refused(self, ledger):
+        row = self._adjudicated_heal(ledger, basis_key='999999')
+
+        with pytest.raises(LookupError, match='999999') as raised:
+            ledger.basis_calibration(row)
+
+        assert str(row.action_id) in str(raised.value)
 
 
 class TestAdjudications:
@@ -568,7 +902,9 @@ class TestAdjudications:
         second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
         (newest,) = ledger.add_adjudications(second, [_record(1, verdict=Verdict.RELATED)])
 
-        row = ledger.adjudication_at(PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA)
+        row = ledger.adjudication_at(
+            PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA, model=MODEL, prompt_sha256=PROMPT_SHA,
+        )
 
         assert row is not None
         assert row.adjudication_id == newest
@@ -583,9 +919,11 @@ class TestAdjudications:
             {'child_sha256': 'd' * 64},
             {'parent_sha256': 'q' * 64},
             {'parent_id': '33333333-3333-3333-3333-333333333333'},
+            {'model': 'another-model'},
+            {'prompt_sha256': 'e' * 64},
         ],
     )
-    def test_adjudication_at_misses_on_another_text_or_parent(self, ledger, changed):
+    def test_adjudication_at_misses_on_another_text_parent_or_adjudicator(self, ledger, changed):
         run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
         ledger.add_adjudications(run_id, [_record(1)])
         lookup = {
@@ -594,10 +932,29 @@ class TestAdjudications:
             'parent_id': PARENT,
             'child_sha256': CHILD_SHA,
             'parent_sha256': PARENT_SHA,
+            'model': MODEL,
+            'prompt_sha256': PROMPT_SHA,
             **changed,
         }
 
         assert ledger.adjudication_at(**lookup) is None
+
+    def test_adjudication_at_is_the_newest_by_exactly_that_adjudicator(self, ledger):
+        first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        (own,) = ledger.add_adjudications(first, [_record(1, verdict=Verdict.SAME)])
+        second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.add_adjudications(second, [
+            _record(1, verdict=Verdict.RELATED, model='another-model'),
+            _record(1, verdict=Verdict.RELATED, prompt_sha256='e' * 64),
+        ])
+
+        row = ledger.adjudication_at(
+            PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA, model=MODEL, prompt_sha256=PROMPT_SHA,
+        )
+
+        assert row is not None
+        assert row.adjudication_id == own
+        assert row.record.verdict is Verdict.SAME
 
     def test_adjudication_verdicts_are_those_of_the_named_runs(self, ledger):
         first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
@@ -653,6 +1010,82 @@ class TestAdjudications:
                 reason='r',
                 model='opus',
             )
+
+
+T0 = datetime(2026, 11, 1, tzinfo=UTC)
+T1 = datetime(2026, 11, 2, tzinfo=UTC)
+T2 = datetime(2026, 11, 3, tzinfo=UTC)
+T3 = datetime(2026, 11, 4, tzinfo=UTC)
+
+
+class TestPerProjectSweepWindows:
+    @staticmethod
+    def _swept(
+        ledger: LinkHealLedger,
+        since: datetime,
+        until: datetime,
+        *,
+        projects: tuple[str, ...] = (PROJECT,),
+        complete: bool = True,
+    ) -> None:
+        run_id = ledger.start_run(RunSource.SWEEP, writes=False)
+        ledger.record_sweep_window(
+            run_id, CreatedWindow(since=since, until=until), projects=projects, complete=complete,
+        )
+
+    def test_a_complete_window_sets_only_its_own_projects_watermark(self, ledger):
+        self._swept(ledger, T0, T1)
+
+        assert ledger.sweep_watermark(PROJECT) == T1
+        assert ledger.sweep_watermark('reify') is None
+
+    @pytest.mark.parametrize(('since', 'until'), [(T1, T2), (T0, T3)])
+    def test_a_complete_window_starting_at_or_before_the_watermark_extends_it(
+        self, ledger, since, until,
+    ):
+        self._swept(ledger, T0, T1)
+
+        self._swept(ledger, since, until)
+
+        assert ledger.sweep_watermark(PROJECT) == until
+
+    def test_a_complete_window_starting_after_the_watermark_leaves_it_alone(self, ledger):
+        self._swept(ledger, T0, T1)
+
+        self._swept(ledger, T2, T3)
+
+        assert ledger.sweep_watermark(PROJECT) == T1
+
+    def test_a_later_contiguous_window_still_extends_from_before_the_gap(self, ledger):
+        self._swept(ledger, T0, T1)
+        self._swept(ledger, T2, T3)
+
+        self._swept(ledger, T1, T2)
+
+        assert ledger.sweep_watermark(PROJECT) == T2
+
+    def test_an_incomplete_first_window_holds_it_at_that_window_s_start(self, ledger):
+        self._swept(ledger, T0, T1, complete=False)
+
+        assert ledger.sweep_watermark(PROJECT) == T0
+
+    def test_a_complete_window_over_an_incomplete_first_one_moves_it(self, ledger):
+        self._swept(ledger, T0, T1, complete=False)
+        self._swept(ledger, T0, T2)
+
+        assert ledger.sweep_watermark(PROJECT) == T2
+
+    def test_an_incomplete_window_never_moves_it(self, ledger):
+        self._swept(ledger, T0, T1)
+        self._swept(ledger, T1, T2, complete=False)
+
+        assert ledger.sweep_watermark(PROJECT) == T1
+
+    def test_one_window_over_two_projects_moves_both(self, ledger):
+        self._swept(ledger, T0, T1, projects=(PROJECT, 'reify'))
+
+        assert ledger.sweep_watermark(PROJECT) == T1
+        assert ledger.sweep_watermark('reify') == T1
 
 
 class TestRunLock:

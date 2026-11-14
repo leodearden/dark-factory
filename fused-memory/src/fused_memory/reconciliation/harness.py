@@ -56,6 +56,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.dangling_citation import dangling_citation_identity
 from fused_memory.reconciliation.drained_event_restore import (
+    restore_on_raise,
     restore_unless_completed_best_effort,
 )
 from fused_memory.reconciliation.episode_window import next_episode_window_anchor
@@ -72,7 +73,7 @@ from fused_memory.reconciliation.finding_task_escalation import (
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
-from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.judge import Judge, NoVerdict, NoVerdictReason
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.overreach_flags import (
     acknowledge_overreach_flags,
@@ -118,6 +119,7 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.services.id_resolver import IdResolver
 from fused_memory.services.live_workflow_detector import (
+    TaskLiveness,
     corroboration_for_task,
     is_pure_gate_metadata,
     is_workflow_live_for_task,
@@ -264,6 +266,11 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # escalates within a watchable window (≈ 10–180 minutes depending on cycle
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
+
+#: Detail key on a persistent-finding escalation listing the cited task ids
+#: whose liveness probe failed: the escalation filed because none was confirmed
+#: live, not because each was confirmed not live (task 5370).
+LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
 
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
@@ -2729,6 +2736,8 @@ class ReconciliationHarness:
         finding: dict,
         persistence: int,
         task_id: str | None = None,
+        *,
+        liveness_unknown: bool = False,
     ) -> str | None:
         """File a level-0 record for *finding* on its named task's ORCHESTRATOR queue.
 
@@ -2773,6 +2782,10 @@ class ReconciliationHarness:
         A7b note: this WRITES but never RESOLVES, and the queue it writes is
         NOT the recon queue the A7b invariant governs — see the contract block
         at the top of this module.
+
+        *liveness_unknown* says the target is filed because its liveness probe
+        failed, not because it was confirmed not live (task 5370). It marks the
+        WARNING-level filed log line; the record's detail does not carry it.
         """
         # Mirrors _escalate's guard: on ImportError the module-level names are
         # left UNBOUND (not set to None as in targeted.py), so `HAS_ESCALATION`
@@ -2883,7 +2896,8 @@ class ReconciliationHarness:
                 task_id, project_id, run_id, e,
             )
             return None
-        logger.info(
+        logger.log(
+            logging.WARNING if liveness_unknown else logging.INFO,
             'reconciliation.finding_task_escalation_filed',
             extra={
                 'project_id': project_id,
@@ -2892,6 +2906,7 @@ class ReconciliationHarness:
                 'escalation_id': esc_id,
                 'finding_category': finding.get('category', ''),
                 'persistence': persistence,
+                'liveness_unknown': liveness_unknown,
             },
         )
         return esc_id
@@ -3284,18 +3299,15 @@ class ReconciliationHarness:
         self, project_id: str, reason: str, tier: TierConfig | None,
     ) -> None:
         """Run one full cycle within cycle_timeout_seconds, under the injected
-        ``full_cycle_deadline``, as a caller-minted run; if it raises, the
-        timeout included, its own drained events are restored unless the
-        journal records it completed."""
+        ``full_cycle_deadline``, as a caller-minted run; if it raises or is
+        cancelled, a deadline or a shutdown, its own drained events are
+        restored unless the journal records it completed."""
         run_id = str(uuid4())
-        try:
-            async with self._full_cycle_deadline(self.config.cycle_timeout_seconds):
-                await self.run_full_cycle(project_id, reason, tier=tier, run_id=run_id)
-        except Exception:
-            await restore_unless_completed_best_effort(
-                self.journal, self.buffer, project_id, run_id,
-            )
-            raise
+        async with (
+            restore_on_raise(self.journal, self.buffer, project_id, run_id),
+            self._full_cycle_deadline(self.config.cycle_timeout_seconds),
+        ):
+            await self.run_full_cycle(project_id, reason, tier=tier, run_id=run_id)
 
     async def _heartbeat_loop(self, project_id: str) -> None:
         """Keep the reconciliation lock alive while a run is in progress."""
@@ -3397,10 +3409,15 @@ class ReconciliationHarness:
         try:
             assert self.judge is not None
             verdict = await self.judge.review_run(run_id)
-            if verdict:
-                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
+            if isinstance(verdict, NoVerdict):
+                logger.log(
+                    logging.INFO if verdict.reason is NoVerdictReason.PROJECT_HALTED
+                    else logging.WARNING,
+                    'Judge produced no verdict for run %s: reason=%s detail=%s',
+                    run_id, verdict.reason.value, verdict.detail,
+                )
             else:
-                logger.warning(f'Judge returned no verdict for run {run_id}')
+                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
         except asyncio.CancelledError:
             # Shutdown drain (or a cycle-aware restart) cancelled the judge
             # mid-review, before add_verdict's atomic marker-clear ran. The
@@ -3462,8 +3479,12 @@ class ReconciliationHarness:
             assembled_payload: Optional token-budgeted payload from ContextAssembler.
                     When provided, Stage 1 uses this instead of generic
                     time-windowed episode/memory fetches.
-            run_id: caller-minted id for this run, so a caller whose deadline
-                    timed out can still scope the restore of its events (task 6453).
+            run_id: caller-minted id for this run. The drain happens before
+                    the run row is written, so the caller must hold
+                    ``restore_on_raise(journal, buffer, project_id, run_id)``
+                    around the call: a raise or cancellation in between would
+                    otherwise strand the drained events under a run id with no
+                    row (tasks 6453, 6695). Task 9757 writes the row first.
         """
         # task 1143: pre-flight guard — raises before any side effects (no journal row,
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
@@ -5773,26 +5794,35 @@ class ReconciliationHarness:
                 # its call only because its read-to-use gap is microseconds; this
                 # one's is not, so the read moves to the use.
                 #
-                # Both are constant for this project_root over the gate loop below,
-                # and both are wrapped fail-safe → None: a None simply means that
-                # corroborating signal cannot fire (corroboration_for_task tolerates
-                # None inputs and never raises on them), which leaves the verdict
-                # biased toward "not corroborated" — the direction that lets a
-                # stranded escalation through only when nothing at all vouches for
-                # the task. read_scheduler_state already returns
+                # Both are constant for this project_root over the gate loop below.
+                # A read that raises leaves its signal unable to fire, so a False
+                # corroboration computed without it is not a confirmed one:
+                # `_corroboration_inputs_failed` makes `_task_liveness` report such
+                # a negative as UNKNOWN. read_scheduler_state already returns
                 # SchedulerStateSnapshot.empty() for an absent/invalid file;
                 # orchestrator_started_at returns None for an absent or
                 # unparseable lock.
+                _corroboration_inputs_failed = False
                 try:
                     _sched_state: SchedulerStateSnapshot | None = read_scheduler_state(
                         Path(project_root)
                     )
                 except Exception:
+                    logger.warning(
+                        'read_scheduler_state failed for %s; negative liveness '
+                        'verdicts this pass are unknown', project_root, exc_info=True,
+                    )
                     _sched_state = None
+                    _corroboration_inputs_failed = True
                 try:
                     _orch_started: datetime | None = orchestrator_started_at(project_root)
                 except Exception:
+                    logger.warning(
+                        'orchestrator_started_at failed for %s; negative liveness '
+                        'verdicts this pass are unknown', project_root, exc_info=True,
+                    )
                     _orch_started = None
+                    _corroboration_inputs_failed = True
 
                 # Task 3778: hoist the whole-repo `git worktree list --porcelain`
                 # out of the cited-task fan-out below, the same way
@@ -5811,25 +5841,21 @@ class ReconciliationHarness:
                 # tasks). A known-empty repo arrives as {'worktree_index': {}}.
                 _index_kwargs: dict = await worktree_index_kwargs(project_root)
 
-                async def _task_is_live(tid: str) -> bool:
+                async def _task_liveness(tid: str) -> TaskLiveness:
                     """Is task *tid* covered by a live workflow right now?
 
-                    Extracted verbatim (task 4821) from the per-cited-task body
-                    of the live-workflow gate below so a SECOND consumer — the
-                    routed-filing gate on the escalate branch — asks the exact
-                    same question of the exact same inputs.  A re-implementation
-                    would be free to drift; a shared helper cannot.
+                    Shared (task 4821) by the cited-task gate and the
+                    routed-target gate below, so both ask the same question of
+                    the same pass-local, loop-constant inputs (`task_by_id`,
+                    `_tasks_snapshot_at`, `_sched_state`, `_orch_started`,
+                    `_index_kwargs`).
 
-                    Closes over the five pass-local, loop-constant inputs
-                    (`task_by_id`, `_tasks_snapshot_at`, `_sched_state`,
-                    `_orch_started`, `_index_kwargs`) plus `project_root`, so
-                    the caller supplies only the task id.
-
-                    Fail-safe direction is UNCHANGED from the inline version it
-                    replaces: a corroboration error leaves the gate inert
-                    (`corroborated=None`), and a detector error is treated as
-                    NOT live — biasing toward escalating rather than toward
-                    silencing a genuine stranded-work escalation.
+                    LIVE suppresses an escalation here, so a probe that could
+                    not run must never answer LIVE (task 5370). A corroboration
+                    error reaches the detector as corroborated=False, which
+                    demands genuine per-task evidence; a negative verdict that
+                    rests on a failed corroboration or failed inputs is UNKNOWN,
+                    and so is a detector error.
                     """
                     _task = task_by_id.get(tid)
                     _metadata = _task.get('metadata') if _task else None
@@ -5838,6 +5864,7 @@ class ReconciliationHarness:
                     # `task.get('status') == 'in-progress'` guard so all
                     # three consumers gate corroboration identically.
                     corroborated: bool | None = None
+                    corroboration_known = True
                     if _status == 'in-progress' and _task is not None:
                         try:
                             corroborated = corroboration_for_task(
@@ -5851,17 +5878,22 @@ class ReconciliationHarness:
                                 scheduler_state=_sched_state,
                                 orchestrator_started_at=_orch_started,
                             )
-                        except Exception as _corr_exc:
-                            logger.debug(
-                                'corroboration_for_task error for task %s; '
-                                'leaving the gate inert: %s',
-                                tid, _corr_exc,
+                            corroboration_known = (
+                                corroborated or not _corroboration_inputs_failed
                             )
+                        except Exception:
+                            logger.warning(
+                                'corroboration_for_task failed for task %s; '
+                                'requiring per-task evidence of liveness',
+                                tid, exc_info=True,
+                            )
+                            corroborated = False
+                            corroboration_known = False
                     try:
                         # Awaited (task 3778): the detector's three git
                         # probes are async now, so this gate no longer
                         # blocks the loop this pass runs on.
-                        return bool(await is_workflow_live_for_task(
+                        live = await is_workflow_live_for_task(
                             tid, project_root,
                             status=_status,
                             **_index_kwargs,
@@ -5882,23 +5914,26 @@ class ReconciliationHarness:
                             # exists to establish.
                             pure_gate=is_pure_gate_metadata(_metadata),
                             corroborated=corroborated,
-                        ))
-                    except Exception as _det_exc:
-                        logger.debug(
-                            'live_workflow_detector error for task %s; treating as not-live: %s',
-                            tid, _det_exc,
                         )
-                        return False
+                    except Exception:
+                        logger.warning(
+                            'live_workflow_detector failed for task %s; liveness unknown',
+                            tid, exc_info=True,
+                        )
+                        return TaskLiveness.UNKNOWN
+                    if live:
+                        return TaskLiveness.LIVE
+                    return TaskLiveness.NOT_LIVE if corroboration_known else TaskLiveness.UNKNOWN
 
                 # Task 5550: liveness is loop-constant per task id here, like
                 # `_sched_state` above, so each id's git probes run once per pass.
-                _live_by_task: dict[str, bool] = {}
+                _liveness_by_task: dict[str, TaskLiveness] = {}
 
-                async def _task_is_live_memoised(tid: str) -> bool:
-                    """`_task_is_live`, asked once per id per pass."""
-                    if tid not in _live_by_task:
-                        _live_by_task[tid] = await _task_is_live(tid)
-                    return _live_by_task[tid]
+                async def _task_liveness_memoised(tid: str) -> TaskLiveness:
+                    """`_task_liveness`, asked once per id per pass."""
+                    if tid not in _liveness_by_task:
+                        _liveness_by_task[tid] = await _task_liveness(tid)
+                    return _liveness_by_task[tid]
 
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
@@ -5908,8 +5943,9 @@ class ReconciliationHarness:
                         # orchestrator), suppress this cycle's escalation with an INFO log.
                         # The finding keeps recurring and will escalate after the workflow
                         # finishes — so genuine stranded cases (all signals False) still
-                        # escalate.  Guard detector errors as not-live (fail toward escalating
-                        # rather than toward silencing a genuine stranded-work escalation).
+                        # escalate.  Only a LIVE verdict suppresses: a probe that failed is
+                        # UNKNOWN, which escalates rather than silencing a genuine
+                        # stranded-work escalation.
                         # Task 2031: cited tasks in a never-dispatched status
                         # (deferred/done/cancelled, via task_by_id above) drop the
                         # project-wide orchestrator_live signal, so a deferred task stuck
@@ -5937,14 +5973,12 @@ class ReconciliationHarness:
                         # with no recent commit. Post-2963 the renderer downgrades
                         # that to indeterminate and drops the task, while this gate
                         # still read it as live and silenced the stranded-work
-                        # escalation indefinitely. The fail-safe direction here is
-                        # UNCHANGED: any assembly error, a non-in-progress status,
-                        # or an absent task_by_id entry all leave corroborated=None,
-                        # the detector's gate stays inert, and the escalation is
-                        # still suppressed — this is never a new silencing path.
-                        # Only an explicit corroborated=False (nothing at all
-                        # vouches for the task) now lets a stranded escalation
-                        # through.
+                        # escalation indefinitely. A non-in-progress status or an
+                        # absent task_by_id entry leaves corroborated=None and the
+                        # detector's gate inert. A corroboration that could not be
+                        # computed is passed as False, so it cannot suppress
+                        # (task 5370); the escalation then lists the task under
+                        # LIVENESS_UNKNOWN_DETAIL_KEY.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,
@@ -5958,10 +5992,14 @@ class ReconciliationHarness:
                             if isinstance(c, dict) and 'task_id' in c
                         ]
                         any_live = False
+                        liveness_unknown: set[str] = set()
                         for tid in cited_task_ids:
-                            if await _task_is_live_memoised(tid):
+                            liveness = await _task_liveness_memoised(tid)
+                            if liveness is TaskLiveness.LIVE:
                                 any_live = True
                                 break
+                            if liveness is TaskLiveness.UNKNOWN:
+                                liveness_unknown.add(tid)
                         if any_live:
                             logger.info(
                                 'reconciliation.integrity_escalation_suppressed_live_workflow',
@@ -5974,15 +6012,25 @@ class ReconciliationHarness:
                                 },
                             )
                         else:
+                            escalation_detail = {**finding, 'persistence': persistence}
+                            if liveness_unknown:
+                                escalation_detail[LIVENESS_UNKNOWN_DETAIL_KEY] = sorted(
+                                    liveness_unknown
+                                )
+                                logger.warning(
+                                    'reconciliation.integrity_escalation_liveness_unknown',
+                                    extra={
+                                        'project_id': project_id,
+                                        'run_id': run_id,
+                                        'task_ids': sorted(liveness_unknown),
+                                    },
+                                )
                             self._escalate(
                                 _RECON_INTEGRITY_ISSUE_CATEGORY,
                                 run_id,
                                 f'Persistently unresolved after remediation '
                                 f'({persistence} cycles): {finding.get("description", "?")}',
-                                detail=json.dumps(
-                                    {**finding, 'persistence': persistence},
-                                    default=str,
-                                ),
+                                detail=json.dumps(escalation_detail, default=str),
                                 finding=finding,
                                 resolved_fps=resolved_fps,
                             )
@@ -6020,7 +6068,7 @@ class ReconciliationHarness:
                             # named task has live work in flight.  Gate the
                             # resolved target explicitly, skipping the recheck
                             # when it is already a cited id (the loop above just
-                            # proved that one not-live, and a recheck would spend
+                            # proved that one not LIVE, and a recheck would spend
                             # git subprocess calls to re-derive the same answer).
                             #
                             # The `_escalate` gate above is deliberately NOT
@@ -6100,7 +6148,8 @@ class ReconciliationHarness:
                                 )
                             elif (
                                 routed_task_id not in cited_task_ids
-                                and await _task_is_live_memoised(routed_task_id)
+                                and await _task_liveness_memoised(routed_task_id)
+                                is TaskLiveness.LIVE
                             ):
                                 logger.info(
                                     'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',
@@ -6117,9 +6166,17 @@ class ReconciliationHarness:
                                 # per DISTINCT persistent finding per task, and
                                 # none filed behind an open routed L1 — see
                                 # `finding_task_escalation.py::routed_record_covers_finding`.
+                                # Memoised: the cited loop or the gate above
+                                # has already probed this id.
+                                routed_liveness = await _task_liveness_memoised(
+                                    routed_task_id
+                                )
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
                                     task_id=routed_task_id,
+                                    liveness_unknown=(
+                                        routed_liveness is TaskLiveness.UNKNOWN
+                                    ),
                                 )
                     else:
                         logger.info(
@@ -6265,9 +6322,11 @@ class BacklogIterator:
         events that fit.  Stops when no events remain before the cutoff.
 
         The whole invocation is bounded by cycle_timeout_seconds under the
-        injected ``iteration_deadline`` (task 2040).  On that deadline the
-        in-flight run's events are restored unless it completed, and
-        TimeoutError propagates to the caller's log (task 6453).
+        injected ``iteration_deadline`` (task 2040).  Each chunk and the final
+        consolidation restore their own events on any raise
+        (``restore_on_raise``), so on the deadline the in-flight run's events
+        come back unless it completed, and TimeoutError propagates to the
+        caller's log (tasks 6453, 6695).
         """
         from fused_memory.reconciliation.context_assembler import ContextAssembler
 
@@ -6290,129 +6349,116 @@ class BacklogIterator:
             project_root=scope.project_root,
         )
 
-        in_flight_run_id: str | None = None
-        try:
-            async with self._iteration_deadline(self.config.cycle_timeout_seconds):
-                watermark = await self.journal.get_watermark(project_id)
+        async with self._iteration_deadline(self.config.cycle_timeout_seconds):
+            watermark = await self.journal.get_watermark(project_id)
 
-                chunk_num = 0
-                start = self.time_provider()
-                yielded = False
-                while True:
-                    # Cumulative between-chunks budget (task 2040): once at least one
-                    # chunk has completed and the wall-clock budget is exhausted,
-                    # stop launching new chunks and leave the remainder buffered.
-                    # The per-project lock releases via _project_loop's finally, so
-                    # the next cycle / trigger_reconciliation keeps draining instead
-                    # of one iteration holding the lock forever.
-                    if (
-                        chunk_num > 0
-                        and self.time_provider() - start
-                        >= self.config.backlog_iteration_budget_seconds
-                    ):
-                        stats = await self.buffer.get_buffer_stats(project_id)
-                        logger.info(
-                            'reconciliation.backlog_iteration_yielded',
-                            extra={
-                                'project_id': project_id,
-                                'chunks_processed': chunk_num,
-                                'events_remaining': stats.get('size', 0),
-                            },
-                        )
-                        yielded = True
-                        break
-
-                    # Peek at up to 1000 events (far more than a single budget can hold)
-                    peeked = await self.buffer.peek_buffered(
-                        project_id, limit=1000, before=cutoff,
+            chunk_num = 0
+            start = self.time_provider()
+            yielded = False
+            while True:
+                # Cumulative between-chunks budget (task 2040): once at least one
+                # chunk has completed and the wall-clock budget is exhausted,
+                # stop launching new chunks and leave the remainder buffered.
+                # The per-project lock releases via _project_loop's finally, so
+                # the next cycle / trigger_reconciliation keeps draining instead
+                # of one iteration holding the lock forever.
+                if (
+                    chunk_num > 0
+                    and self.time_provider() - start
+                    >= self.config.backlog_iteration_budget_seconds
+                ):
+                    stats = await self.buffer.get_buffer_stats(project_id)
+                    logger.info(
+                        'reconciliation.backlog_iteration_yielded',
+                        extra={
+                            'project_id': project_id,
+                            'chunks_processed': chunk_num,
+                            'events_remaining': stats.get('size', 0),
+                        },
                     )
-                    if not peeked:
-                        break
+                    yielded = True
+                    break
 
-                    # Assemble token-budgeted payload
-                    assembled = await assembler.assemble(peeked, watermark, project_id)
-                    if not assembled.events:
-                        break
-
-                    chunk_num += 1
-                    in_flight_run_id = str(uuid4())
-                    if not await self._run_chunk(
-                        project_id, chunk_num, assembled, in_flight_run_id, opus_tier,
-                    ):
-                        return  # Stop iteration on failure
-                    in_flight_run_id = None
-
-                # Final consolidation pass — skipped when the loop yielded on the
-                # cumulative budget (task 2040): the remaining backlog stays
-                # buffered for the next cycle instead of forcing an extra
-                # consolidation cycle past the budget.
-                if chunk_num > 0 and not yielded:
-                    in_flight_run_id = str(uuid4())
-                    await self._run_final_consolidation(project_id, in_flight_run_id, opus_tier)
-                    in_flight_run_id = None
-        except TimeoutError:
-            if in_flight_run_id is not None:
-                await restore_unless_completed_best_effort(
-                    self.journal, self.buffer, project_id, in_flight_run_id,
+                # Peek at up to 1000 events (far more than a single budget can hold)
+                peeked = await self.buffer.peek_buffered(
+                    project_id, limit=1000, before=cutoff,
                 )
-            raise
+                if not peeked:
+                    break
+
+                # Assemble token-budgeted payload
+                assembled = await assembler.assemble(peeked, watermark, project_id)
+                if not assembled.events:
+                    break
+
+                chunk_num += 1
+                if not await self._run_chunk(project_id, chunk_num, assembled, opus_tier):
+                    return  # Stop iteration on failure
+
+            # Final consolidation pass — skipped when the loop yielded on the
+            # cumulative budget (task 2040): the remaining backlog stays
+            # buffered for the next cycle instead of forcing an extra
+            # consolidation cycle past the budget.
+            if chunk_num > 0 and not yielded:
+                await self._run_final_consolidation(project_id, opus_tier)
 
     async def _run_chunk(
         self,
         project_id: str,
         chunk_num: int,
         assembled: AssembledPayload,
-        run_id: str,
         tier: TierConfig,
     ) -> bool:
-        """Drain and process one chunk as run *run_id*; False when it failed,
-        its own events restored, and iteration must stop."""
+        """Drain and process one chunk as its own run; False when it failed
+        and iteration must stop. A failure is escalated before its events are
+        restored, so a deadline expiring during the restore cannot suppress the
+        escalation; on any raise, cancellation included, the chunk's own events
+        are restored."""
+        run_id = str(uuid4())
         chunk_id = str(uuid4())
         try:
-            await self.buffer.drain_by_ids(
-                project_id, [e.id for e in assembled.events], run_id=run_id,
-            )
-            await self.journal.record_chunk_boundary(
-                project_id, chunk_id, len(assembled.events),
-            )
+            async with restore_on_raise(self.journal, self.buffer, project_id, run_id):
+                try:
+                    await self.buffer.drain_by_ids(
+                        project_id, [e.id for e in assembled.events], run_id=run_id,
+                    )
+                    await self.journal.record_chunk_boundary(
+                        project_id, chunk_id, len(assembled.events),
+                    )
 
-            logger.info(
-                f'Backlog chunk {chunk_num}: processing {len(assembled.events)} events '
-                f'({assembled.total_tokens} tokens, {len(assembled.context_items)} context items, '
-                f'{assembled.events_remaining} remaining) for {project_id}'
-            )
+                    logger.info(
+                        f'Backlog chunk {chunk_num}: processing {len(assembled.events)} events '
+                        f'({assembled.total_tokens} tokens, {len(assembled.context_items)} context items, '
+                        f'{assembled.events_remaining} remaining) for {project_id}'
+                    )
 
-            await self.harness.run_full_cycle(
-                project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
-                tier=tier,
-                events=assembled.events,
-                assembled_payload=assembled,
-                run_id=run_id,
-            )
-        except Exception as e:
-            logger.error(f'Backlog chunk {chunk_num} failed: {e}')
-            self.harness._escalate(
-                'recon_backlog_overflow', chunk_id,
-                f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
-            )
-            await restore_unless_completed_best_effort(
-                self.journal, self.buffer, project_id, run_id,
-            )
+                    await self.harness.run_full_cycle(
+                        project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
+                        tier=tier,
+                        events=assembled.events,
+                        assembled_payload=assembled,
+                        run_id=run_id,
+                    )
+                except Exception as e:
+                    logger.error(f'Backlog chunk {chunk_num} failed: {e}')
+                    self.harness._escalate(
+                        'recon_backlog_overflow', chunk_id,
+                        f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
+                    )
+                    raise
+        except Exception:
             return False
         return True
 
-    async def _run_final_consolidation(
-        self, project_id: str, run_id: str, tier: TierConfig,
-    ) -> None:
-        """One consolidation cycle after the chunks, as run *run_id*; on
-        failure its own events are restored."""
+    async def _run_final_consolidation(self, project_id: str, tier: TierConfig) -> None:
+        """One consolidation cycle after the chunks, as its own run; on any
+        raise, cancellation included, its own events are restored first."""
         logger.info(f'Backlog final consolidation for {project_id}')
+        run_id = str(uuid4())
         try:
-            await self.harness.run_full_cycle(
-                project_id, 'backlog_final_consolidation', tier=tier, run_id=run_id,
-            )
+            async with restore_on_raise(self.journal, self.buffer, project_id, run_id):
+                await self.harness.run_full_cycle(
+                    project_id, 'backlog_final_consolidation', tier=tier, run_id=run_id,
+                )
         except Exception as e:
             logger.error(f'Backlog final consolidation failed: {e}')
-            await restore_unless_completed_best_effort(
-                self.journal, self.buffer, project_id, run_id,
-            )

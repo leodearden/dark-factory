@@ -3,7 +3,15 @@
 ``link_heal.db`` is the one home of heal history and of the link adjudicator's
 verdicts: an adjudication is stored nowhere else (D8). Every table keys on an
 AUTOINCREMENT id, so a ``sqlite_sequence`` row proves something has written
-here (INV-13). Detail and counts are stored as JSON.
+here (INV-13). Detail and counts are stored as JSON. A record a run read is
+kept whole as a content-addressed :class:`RecordSnapshot`, stored once per
+distinct state. Every plan run records one examination per link it decided,
+committed with its planned rows; :meth:`LinkHealLedger.run_records` joins them
+into the run's :class:`CandidateRecord` view. A calibration of the adjudicator
+is kept per model and prompt version, so the gate on writes asks for exactly the
+adjudicator it would write with. Each sweep run records the creation window it
+examined for each project it covered; a project's next sweep starts where its
+unbroken run of complete windows ends. Nothing here is ever pruned.
 
 :class:`RunLock` keeps runs one at a time: an exclusive ``flock`` plus a JSON
 record of its holder. The kernel drops a crashed holder's ``flock``, which is
@@ -24,6 +32,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from shared.sqlite_column_migration import add_column_if_missing_sync
@@ -33,7 +42,15 @@ from fused_memory.maintenance.link_heal import (
     HealAction,
     LinkImage,
     PlannedAction,
+    Report,
     Verdict,
+)
+from fused_memory.maintenance.link_heal_store import (
+    CREATED_AT_KEY,
+    UPDATED_AT_KEY,
+    CreatedWindow,
+    LiveRecord,
+    text_sha256,
 )
 
 LEDGER_FILENAME = 'link_heal.db'
@@ -48,6 +65,10 @@ class RunSource(StrEnum):
     #: A plan whose heals rest on the deterministic rows alone.
     DETERMINISTIC = 'deterministic'
     UNDO = 'undo'
+    #: The adjudicator scored against rated pairs; it never plans or writes a heal.
+    CALIBRATION = 'calibration'
+    #: The scheduled adjudicator sweep over the links made since the last one.
+    SWEEP = 'sweep'
 
 
 class RunKind(StrEnum):
@@ -59,6 +80,8 @@ class RunKind(StrEnum):
     def of(cls, source: RunSource, *, writes: bool) -> RunKind:
         if source is RunSource.UNDO:
             return cls.UNDO
+        if source is RunSource.CALIBRATION:
+            return cls.PLAN
         return cls.APPLY if writes else cls.PLAN
 
 
@@ -72,9 +95,36 @@ class ActionState(StrEnum):
     SKIPPED_CAP = 'skipped_cap'
     FAILED = 'failed'
     UNDONE = 'undone'
+    #: A heal of a calibration-gated run source whose verdict came from an adjudicator
+    #: with no passing calibration. Terminal, so it never blocks a later heal of the
+    #: same pair from being staged afresh.
+    WITHHELD_UNCALIBRATED = 'withheld_uncalibrated'
+    #: A pending heal a later plan run of its source retired: that run's ruling on
+    #: the link, at the texts the heal rests on, no longer plans it. Terminal.
+    SUPERSEDED = 'superseded'
 
 
 PENDING_STATES = frozenset({ActionState.PLANNED, ActionState.SKIPPED_CAP})
+#: The states of a heal that applied: an undo marks a heal undone only after it applied,
+#: and keeps the run that applied it and the after-state that run read.
+APPLIED_STATES = frozenset({ActionState.APPLIED, ActionState.UNDONE})
+
+
+class Disposition(StrEnum):
+    """What a plan run did with one examined link's decision."""
+
+    STAGED = 'staged'
+    ALREADY_PENDING = 'already_pending'
+    UNDO_SUPPRESSED = 'undo_suppressed'
+    #: A heal outside the actions the run was enabled to stage.
+    NOT_ENABLED = 'not_enabled'
+    REPORTED = 'reported'
+
+
+_DECISIONS: Mapping[str, HealAction | Report] = MappingProxyType({
+    **{action.value: action for action in HealAction},
+    **{report.value: report for report in Report},
+})
 _PENDING_VALUES = tuple(sorted(state.value for state in PENDING_STATES))
 
 _SCHEMA = """
@@ -130,12 +180,72 @@ CREATE TABLE IF NOT EXISTS actions (
     undone_run_id TEXT
 );
 CREATE INDEX IF NOT EXISTS actions_by_link ON actions (project_id, child_id);
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    metadata_sha256 TEXT NOT NULL,
+    created_at TEXT,
+    updated_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS snapshots_by_state
+    ON snapshots (project_id, memory_id, content_sha256, metadata_sha256);
+CREATE TABLE IF NOT EXISTS examinations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    child_id TEXT NOT NULL,
+    parent_id TEXT,
+    child_snapshot_id INTEGER NOT NULL REFERENCES snapshots (id),
+    parent_snapshot_id INTEGER REFERENCES snapshots (id),
+    basis_source TEXT,
+    basis_key TEXT,
+    decision TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    action_id INTEGER REFERENCES actions (id),
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS examinations_by_run ON examinations (run_id);
+CREATE TABLE IF NOT EXISTS calibrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_sha256 TEXT NOT NULL,
+    population_sha256 TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    report_json TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS calibrations_by_prompt ON calibrations (model, prompt_sha256);
+CREATE TABLE IF NOT EXISTS sweep_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    since TEXT NOT NULL,
+    until TEXT NOT NULL,
+    complete INTEGER NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sweep_windows_by_project ON sweep_windows (project_id, id);
 """
+
+#: Columns added after their table first shipped: an older ledger gains them in place.
+_ADDED_COLUMNS = (
+    ('runs', 'plan_path', 'TEXT'),
+    ('adjudications', 'prompt_sha256', 'TEXT'),
+    ('actions', 'before_child_snapshot_id', 'INTEGER'),
+    ('actions', 'before_parent_snapshot_id', 'INTEGER'),
+    ('actions', 'after_child_snapshot_id', 'INTEGER'),
+)
 
 _ACTION_COLUMNS = (
     'actions.id, actions.run_id, project_id, child_id, action, pre_image_json, '
     'post_image_json, basis_source, basis_key, child_sha256, parent_sha256, state, '
-    'detail, executed_run_id, undone_run_id'
+    'detail, executed_run_id, undone_run_id, before_child_snapshot_id, '
+    'before_parent_snapshot_id, after_child_snapshot_id'
 )
 _HEALS_ONLY = f"basis_source != '{BasisSource.UNDO}'"
 _RUN_PREFIX = re.compile(r'[0-9a-f]{8,32}')
@@ -143,6 +253,11 @@ _RUN_PREFIX = re.compile(r'[0-9a-f]{8,32}')
 
 def new_run_id() -> str:
     return uuid.uuid4().hex
+
+
+def plan_document_path(ledger_dir: Path, run_id: str) -> Path:
+    """Where plan run *run_id*'s plan document goes when no other path is asked for."""
+    return ledger_dir / f'link-heal-plan-{run_id[:8]}.json'
 
 
 def _now() -> str:
@@ -167,6 +282,10 @@ def _loads_or_none(text: str | None) -> Any:
 
 class UnknownRun(LookupError):
     """No run has that id or prefix."""
+
+
+class UnknownSnapshot(LookupError):
+    """No snapshot has that id."""
 
 
 class AmbiguousRun(LookupError):
@@ -202,8 +321,19 @@ class NothingToUndo(LookupError):
 
 
 @dataclass(frozen=True)
+class WriteRecords:
+    """The records one heal's outcome was decided on, as the heal itself read them:
+    the child and parent its corroboration read, and the child its verification read."""
+
+    before_child: LiveRecord | None = None
+    before_parent: LiveRecord | None = None
+    after_child: LiveRecord | None = None
+
+
+@dataclass(frozen=True)
 class ActionRow:
-    """A planned heal and what became of it."""
+    """A planned heal and what became of it, with the snapshots of the records its
+    last outcome was decided on (see :class:`WriteRecords`)."""
 
     action_id: int
     run_id: str
@@ -212,6 +342,9 @@ class ActionRow:
     detail: Mapping[str, Any] | None
     executed_run_id: str | None
     undone_run_id: str | None
+    before_child_snapshot_id: int | None = None
+    before_parent_snapshot_id: int | None = None
+    after_child_snapshot_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -228,7 +361,11 @@ class UndoTarget:
 
 @dataclass(frozen=True)
 class AdjudicationRecord:
-    """The adjudicator's verdict on one (child, parent) pair, at the text hashes it judged."""
+    """The adjudicator's verdict on one (child, parent) pair, at the text hashes it judged.
+
+    ``prompt_sha256`` is the prompt version it was asked under; ``None`` on a
+    verdict ledgered before versions were recorded.
+    """
 
     project_id: str
     child_id: str
@@ -238,6 +375,7 @@ class AdjudicationRecord:
     verdict: Verdict
     reason: str
     model: str
+    prompt_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.verdict, Verdict):
@@ -250,6 +388,142 @@ class AdjudicationRow:
     run_id: str
     at: str
     record: AdjudicationRecord
+
+
+@dataclass(frozen=True)
+class CalibrationRow:
+    """One calibration of the adjudicator: the model and prompt version it scored,
+    the population it was scored on, whether it passed, and its report."""
+
+    calibration_id: int
+    run_id: str
+    model: str
+    prompt_sha256: str
+    population_sha256: str
+    passed: bool
+    report: Mapping[str, Any]
+    at: str
+
+
+@dataclass(frozen=True)
+class AdjudicatorCalibration:
+    """One adjudicator, *model* asked under *prompt_sha256*, with its newest calibration."""
+
+    model: str
+    prompt_sha256: str | None
+    calibration: CalibrationRow | None
+
+    @property
+    def passed(self) -> bool:
+        """Whether this adjudicator's verdicts may be written: its newest calibration passed."""
+        return self.calibration is not None and self.calibration.passed
+
+    def as_detail(self) -> dict[str, Any]:
+        if self.calibration is None:
+            standing = 'none'
+        else:
+            standing = 'passed' if self.calibration.passed else 'failed'
+        return {
+            'model': self.model,
+            'prompt_sha256': self.prompt_sha256,
+            'calibration': standing,
+            'calibration_run_id': None if self.calibration is None else self.calibration.run_id,
+        }
+
+
+@dataclass(frozen=True)
+class RecordSnapshot:
+    """One record exactly as a link-heal read returned it."""
+
+    snapshot_id: int
+    project_id: str
+    memory_id: str
+    content: str
+    content_sha256: str
+    metadata: Mapping[str, Any]
+    metadata_sha256: str
+    created_at: str | None
+    updated_at: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'metadata', MappingProxyType(dict(self.metadata)))
+
+    def link_image(self) -> LinkImage:
+        return LinkImage.from_metadata(self.metadata)
+
+
+@dataclass(frozen=True)
+class ExaminationRecord:
+    """One link a plan run examined, as read and as decided.
+
+    ``staged`` is the heal this examination adds as a new pending row, set
+    exactly for :attr:`Disposition.STAGED`; ``pending_action_id`` is the row its
+    heal was already pending as, set exactly for :attr:`Disposition.ALREADY_PENDING`.
+    ``supersedes`` names the other pending rows of the run's source that this
+    examination's ruling retires; never the row it stands behind.
+    """
+
+    project_id: str
+    child: LiveRecord
+    parent_id: str | None
+    parent: LiveRecord | None
+    basis_source: BasisSource | None
+    basis_key: str | None
+    decision: HealAction | Report
+    disposition: Disposition
+    staged: PlannedAction | None = None
+    pending_action_id: int | None = None
+    supersedes: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'supersedes', tuple(self.supersedes))
+        if self.pending_action_id is not None and self.pending_action_id in self.supersedes:
+            raise ValueError('an examination never supersedes the row it stands behind')
+        if (self.disposition is Disposition.STAGED) != (self.staged is not None):
+            raise ValueError('an examination carries a staged heal exactly when it is staged')
+        if (self.disposition is Disposition.ALREADY_PENDING) != (self.pending_action_id is not None):
+            raise ValueError(
+                'an examination names a pending row exactly when its heal is already pending',
+            )
+
+
+@dataclass(frozen=True)
+class CandidateRecord:
+    """One examined link of a plan run: its before-state, decision, and what became of it.
+
+    ``action_taken`` is the linked heal's action once it applied, even if an undo
+    later took it back, else ``None``; ``undone_run_id`` names that
+    undo run. ``action_state`` is the linked heal's state, ``None`` when no heal
+    was staged, so a failed, withheld or skipped heal is told apart from a dry run.
+    ``after_child`` is the child as a write's verification read it whenever one
+    was recorded, a failed heal's included; else the before-state when nothing
+    applied, and ``None`` for an applied heal whose after-state went unrecorded.
+    The verdict fields are
+    joined from the adjudication an adjudicator basis names, and are ``None``
+    for any other basis.
+    """
+
+    run_id: str
+    project_id: str
+    child_id: str
+    parent_id: str | None
+    before_child: RecordSnapshot
+    before_parent: RecordSnapshot | None
+    basis_source: BasisSource | None
+    basis_key: str | None
+    decision: HealAction | Report
+    disposition: Disposition
+    action_id: int | None
+    action_taken: HealAction | None
+    after_child: RecordSnapshot | None
+    at: str
+    action_state: ActionState | None = None
+    adjudication_id: int | None = None
+    verdict: Verdict | None = None
+    reason: str | None = None
+    model: str | None = None
+    prompt_sha256: str | None = None
+    undone_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -267,6 +541,8 @@ class UndoStepRow:
     basis_key: str
     state: ActionState
     detail: Mapping[str, Any] | None
+    before_child_snapshot_id: int | None = None
+    after_child_snapshot_id: int | None = None
 
 
 class LinkHealLedger:
@@ -277,8 +553,8 @@ class LinkHealLedger:
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
-        # A ledger written before runs.plan_path existed.
-        add_column_if_missing_sync(self._conn, 'runs', 'plan_path', 'TEXT')
+        for table, column, column_ddl in _ADDED_COLUMNS:
+            add_column_if_missing_sync(self._conn, table, column, column_ddl)
         self._conn.commit()
 
     def close(self) -> None:
@@ -348,13 +624,128 @@ class LinkHealLedger:
 
     @contextlib.contextmanager
     def publishing_planned(
-        self, run_id: str, actions: Sequence[PlannedAction], source: RunSource,
+        self, run_id: str, examinations: Sequence[ExaminationRecord], source: RunSource,
     ) -> Iterator[list[ActionRow]]:
-        """Add *actions* as *run_id*'s planned rows and yield *source*'s pending rows, theirs
-        included. The rows commit when the body returns and are rolled back when it raises."""
+        """Record *examinations* as *run_id*'s, adding each staged heal as a planned row
+        and retiring each pending row an examination supersedes, and yield *source*'s
+        pending rows, the new ones included. Everything commits when the body returns
+        and is rolled back when it raises."""
         with self._conn:
-            self._insert_all_planned(run_id, actions)
+            at = _now()
+            for examination in examinations:
+                action_id = (
+                    examination.pending_action_id
+                    if examination.staged is None
+                    else self._insert_planned(run_id, examination.staged, at)
+                )
+                examination_id = self._insert_examination(run_id, examination, action_id, at)
+                self._supersede(run_id, examination, examination_id, at)
             yield self.pending_actions(source)
+
+    def _supersede(
+        self, run_id: str, examination: ExaminationRecord, examination_id: int, at: str,
+    ) -> None:
+        """Retire the pending rows *examination* supersedes, naming the ruling that did."""
+        if not examination.supersedes:
+            return
+        detail = {
+            'superseded_by_run': run_id,
+            'examination_id': examination_id,
+            'decision': examination.decision.value,
+            'basis_source': (
+                None if examination.basis_source is None else examination.basis_source.value
+            ),
+            'basis_key': examination.basis_key,
+        }
+        ids = ', '.join('?' for _ in examination.supersedes)
+        self._conn.execute(
+            f'UPDATE actions SET state = ?, executed_run_id = ?, detail = ?, at = ? '
+            f'WHERE id IN ({ids}) AND state IN (?, ?)',
+            (
+                ActionState.SUPERSEDED.value, run_id, _json_or_none(detail), at,
+                *examination.supersedes, *_PENDING_VALUES,
+            ),
+        )
+
+    def _insert_examination(
+        self, run_id: str, examination: ExaminationRecord, action_id: int | None, at: str,
+    ) -> int:
+        project_id = examination.project_id
+        parent = examination.parent
+        cursor = self._conn.execute(
+            'INSERT INTO examinations (run_id, project_id, child_id, parent_id, '
+            'child_snapshot_id, parent_snapshot_id, basis_source, basis_key, decision, '
+            'disposition, action_id, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                run_id, project_id, examination.child.memory_id, examination.parent_id,
+                self._snapshot_id(project_id, examination.child),
+                None if parent is None else self._snapshot_id(project_id, parent),
+                None if examination.basis_source is None else examination.basis_source.value,
+                examination.basis_key, examination.decision.value,
+                examination.disposition.value, action_id, at,
+            ),
+        )
+        return _lastrowid(cursor)
+
+    def run_records(self, run_id: str) -> list[CandidateRecord]:
+        """Every link plan run *run_id* examined, in the order it examined them."""
+        rows = self._conn.execute(
+            f'{_RECORD_SELECT} WHERE examinations.run_id = ? ORDER BY examinations.id',
+            (BasisSource.ADJUDICATOR.value, run_id),
+        ).fetchall()
+        return [self._candidate_record(row) for row in rows]
+
+    def executed_records(self, executed_run_id: str) -> list[CandidateRecord]:
+        """Every heal run *executed_run_id* executed, each as the record of the
+        examination that first staged it, in the order the heals were staged."""
+        rows = self._conn.execute(
+            f'{_RECORD_SELECT} WHERE actions.executed_run_id = ? AND examinations.id = '
+            '(SELECT MIN(staging.id) FROM examinations AS staging '
+            'WHERE staging.action_id = actions.id) ORDER BY actions.id',
+            (BasisSource.ADJUDICATOR.value, executed_run_id),
+        ).fetchall()
+        return [self._candidate_record(row) for row in rows]
+
+    def _candidate_record(self, row: sqlite3.Row) -> CandidateRecord:
+        before_child = self.read_snapshot(row['child_snapshot_id'])
+        parent_snapshot_id = row['parent_snapshot_id']
+        action_state = None if row['action_state'] is None else ActionState(row['action_state'])
+        applied = action_state in APPLIED_STATES
+        after_child_snapshot_id = row['after_child_snapshot_id']
+        if after_child_snapshot_id is not None:
+            after_child: RecordSnapshot | None = self.read_snapshot(after_child_snapshot_id)
+        elif applied:
+            after_child = None
+        else:
+            after_child = before_child
+        return CandidateRecord(
+            run_id=row['run_id'],
+            project_id=row['project_id'],
+            child_id=row['child_id'],
+            parent_id=row['parent_id'],
+            before_child=before_child,
+            before_parent=(
+                None if parent_snapshot_id is None else self.read_snapshot(parent_snapshot_id)
+            ),
+            basis_source=None if row['basis_source'] is None else BasisSource(row['basis_source']),
+            basis_key=row['basis_key'],
+            decision=_DECISIONS[row['decision']],
+            disposition=Disposition(row['disposition']),
+            action_id=row['action_id'],
+            action_taken=HealAction(row['action_value']) if applied else None,
+            after_child=after_child,
+            at=row['at'],
+            action_state=action_state,
+            adjudication_id=row['adjudication_id'],
+            verdict=(
+                None if row['adjudicated_verdict'] is None
+                else Verdict(row['adjudicated_verdict'])
+            ),
+            reason=row['adjudicated_reason'],
+            model=row['adjudicated_model'],
+            prompt_sha256=row['adjudicated_prompt_sha256'],
+            undone_run_id=row['action_undone_run_id'],
+        )
 
     def _insert_all_planned(self, run_id: str, actions: Sequence[PlannedAction]) -> list[int]:
         at = _now()
@@ -408,13 +799,47 @@ class LinkHealLedger:
         state: ActionState,
         executed_run_id: str,
         detail: Mapping[str, Any] | None,
+        *,
+        records: WriteRecords | None = None,
     ) -> None:
         with self._conn:
-            self._conn.execute(
-                'UPDATE actions SET state = ?, executed_run_id = ?, detail = ?, at = ? '
-                'WHERE id = ?',
-                (state.value, executed_run_id, _json_or_none(detail), _now(), action_id),
+            snapshot_ids = (
+                (None, None, None)
+                if records is None
+                else self._record_snapshot_ids(self._action_project(action_id), records)
             )
+            self._conn.execute(
+                'UPDATE actions SET state = ?, executed_run_id = ?, detail = ?, at = ?, '
+                'before_child_snapshot_id = ?, before_parent_snapshot_id = ?, '
+                'after_child_snapshot_id = ? WHERE id = ?',
+                (
+                    state.value, executed_run_id, _json_or_none(detail), _now(),
+                    *snapshot_ids, action_id,
+                ),
+            )
+
+    def _action_project(self, action_id: int) -> str:
+        row = self._conn.execute(
+            'SELECT project_id FROM actions WHERE id = ?', (action_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f'no link-heal action {action_id} in {self.db_path}')
+        return row['project_id']
+
+    def _record_snapshot_ids(
+        self, project_id: str, records: WriteRecords | None,
+    ) -> tuple[int | None, int | None, int | None]:
+        """The snapshot ids of *records*' before-child, before-parent and after-child."""
+        if records is None:
+            return None, None, None
+        return (
+            self._optional_snapshot_id(project_id, records.before_child),
+            self._optional_snapshot_id(project_id, records.before_parent),
+            self._optional_snapshot_id(project_id, records.after_child),
+        )
+
+    def _optional_snapshot_id(self, project_id: str, record: LiveRecord | None) -> int | None:
+        return None if record is None else self._snapshot_id(project_id, record)
 
     def mark_undone(self, action_id: int, undo_run_id: str) -> None:
         with self._conn:
@@ -458,19 +883,25 @@ class LinkHealLedger:
         after: LinkImage,
         state: ActionState,
         detail: Mapping[str, Any] | None,
+        records: WriteRecords | None = None,
     ) -> int:
         heal = original.planned
         with self._conn:
+            before_child, _parent, after_child = self._record_snapshot_ids(
+                heal.project_id, records,
+            )
             cursor = self._conn.execute(
                 'INSERT INTO actions (run_id, project_id, child_id, action, pre_image_json, '
                 'post_image_json, basis_source, basis_key, child_sha256, parent_sha256, '
-                'state, detail, at, executed_run_id) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                'state, detail, at, executed_run_id, before_child_snapshot_id, '
+                'after_child_snapshot_id) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (
                     undo_run_id, heal.project_id, heal.child_id, UNDO_ACTION,
                     _image_json(before), _image_json(after), BasisSource.UNDO.value,
                     str(original.action_id), heal.child_sha256, heal.parent_sha256,
                     state.value, _json_or_none(detail), _now(), undo_run_id,
+                    before_child, after_child,
                 ),
             )
         return _lastrowid(cursor)
@@ -500,12 +931,12 @@ class LinkHealLedger:
             ids = [
                 _lastrowid(self._conn.execute(
                     'INSERT INTO adjudications (project_id, child_id, parent_id, child_sha256, '
-                    'parent_sha256, verdict, reason, model, run_id, at) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'parent_sha256, verdict, reason, model, prompt_sha256, run_id, at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         record.project_id, record.child_id, record.parent_id,
                         record.child_sha256, record.parent_sha256, record.verdict.value,
-                        record.reason, record.model, run_id, at,
+                        record.reason, record.model, record.prompt_sha256, run_id, at,
                     ),
                 ))
                 for record in records
@@ -531,12 +962,18 @@ class LinkHealLedger:
         parent_id: str,
         child_sha256: str,
         parent_sha256: str,
+        *,
+        model: str,
+        prompt_sha256: str,
     ) -> AdjudicationRow | None:
-        """The newest adjudication of this pair at exactly these text hashes."""
+        """The newest adjudication of this pair at these text hashes by exactly this
+        adjudicator: *model* asked under *prompt_sha256*. A legacy row with no prompt
+        version is never reused."""
         row = self._conn.execute(
             'SELECT * FROM adjudications WHERE project_id = ? AND child_id = ? AND parent_id = ? '
-            'AND child_sha256 = ? AND parent_sha256 = ? ORDER BY id DESC LIMIT 1',
-            (project_id, child_id, parent_id, child_sha256, parent_sha256),
+            'AND child_sha256 = ? AND parent_sha256 = ? AND model = ? AND prompt_sha256 = ? '
+            'ORDER BY id DESC LIMIT 1',
+            (project_id, child_id, parent_id, child_sha256, parent_sha256, model, prompt_sha256),
         ).fetchone()
         return None if row is None else _adjudication_row(row)
 
@@ -551,8 +988,165 @@ class LinkHealLedger:
         )
         return [Verdict(verdict) for (verdict,) in rows]
 
+    def add_calibration(
+        self,
+        run_id: str,
+        *,
+        model: str,
+        prompt_sha256: str,
+        population_sha256: str,
+        passed: bool,
+        report: Mapping[str, Any],
+    ) -> int:
+        with self._conn:
+            return _lastrowid(self._conn.execute(
+                'INSERT INTO calibrations (run_id, model, prompt_sha256, population_sha256, '
+                'passed, report_json, at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (
+                    run_id, model, prompt_sha256, population_sha256, int(passed),
+                    json.dumps(report, sort_keys=True), _now(),
+                ),
+            ))
+
+    def latest_calibration(self, model: str, prompt_sha256: str) -> CalibrationRow | None:
+        """The newest calibration of *model* asked under exactly *prompt_sha256*."""
+        row = self._conn.execute(
+            'SELECT * FROM calibrations WHERE model = ? AND prompt_sha256 = ? '
+            'ORDER BY id DESC LIMIT 1',
+            (model, prompt_sha256),
+        ).fetchone()
+        return None if row is None else _calibration_row(row)
+
+    def adjudicator_calibration(
+        self, model: str, prompt_sha256: str | None,
+    ) -> AdjudicatorCalibration:
+        """*model* asked under *prompt_sha256*, with its newest calibration. A verdict
+        with no prompt version has no calibration."""
+        calibration = (
+            None if prompt_sha256 is None else self.latest_calibration(model, prompt_sha256)
+        )
+        return AdjudicatorCalibration(model, prompt_sha256, calibration)
+
+    def basis_calibration(self, heal: ActionRow) -> AdjudicatorCalibration | None:
+        """The adjudicator whose verdict *heal* rests on, with its newest calibration;
+        ``None`` for a heal whose basis is not an adjudication."""
+        planned = heal.planned
+        if planned.basis_source is not BasisSource.ADJUDICATOR:
+            return None
+        row = self._conn.execute(
+            'SELECT model, prompt_sha256 FROM adjudications WHERE id = CAST(? AS INTEGER)',
+            (planned.basis_key,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(
+                f'link-heal action {heal.action_id} rests on adjudication '
+                f'{planned.basis_key!r}, which is not in {self.db_path}',
+            )
+        return self.adjudicator_calibration(row['model'], row['prompt_sha256'])
+
+    def record_sweep_window(
+        self,
+        run_id: str,
+        window: CreatedWindow,
+        *,
+        projects: Sequence[str],
+        complete: bool,
+    ) -> None:
+        """Record the window sweep run *run_id* examined, once for each of *projects*;
+        only a *complete* one can move a project's watermark."""
+        since = window.since.astimezone(UTC).isoformat()
+        until = window.until.astimezone(UTC).isoformat()
+        at = _now()
+        with self._conn:
+            self._conn.executemany(
+                'INSERT INTO sweep_windows (run_id, project_id, since, until, complete, at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                [(run_id, project_id, since, until, int(complete), at) for project_id in projects],
+            )
+
+    def sweep_watermark(self, project_id: str) -> datetime | None:
+        """Where *project_id*'s next sweep starts: the end of the unbroken run of
+        complete sweep windows from its first sweep, or that first window's start
+        when it was incomplete; ``None`` before any sweep."""
+        rows = self._conn.execute(
+            'SELECT since, until, complete FROM sweep_windows WHERE project_id = ? ORDER BY id',
+            (project_id,),
+        )
+        return _contiguous_end(
+            (
+                CreatedWindow(
+                    since=datetime.fromisoformat(since), until=datetime.fromisoformat(until),
+                ),
+                bool(complete),
+            )
+            for since, until, complete in rows
+        )
+
+    def snapshot(self, project_id: str, record: LiveRecord) -> int:
+        """The id of *record*'s snapshot, stored now unless this exact state already is."""
+        with self._conn:
+            return self._snapshot_id(project_id, record)
+
+    def _snapshot_id(self, project_id: str, record: LiveRecord) -> int:
+        """:meth:`snapshot` inside the caller's transaction."""
+        metadata_json = json.dumps(dict(record.metadata), sort_keys=True)
+        state = (project_id, record.memory_id, record.text_sha256, text_sha256(metadata_json))
+        self._conn.execute(
+            'INSERT OR IGNORE INTO snapshots (project_id, memory_id, content_sha256, '
+            'metadata_sha256, content, metadata_json, created_at, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                *state, record.text, metadata_json,
+                _payload_text(record.metadata, CREATED_AT_KEY),
+                _payload_text(record.metadata, UPDATED_AT_KEY),
+            ),
+        )
+        (snapshot_id,) = self._conn.execute(
+            'SELECT id FROM snapshots WHERE project_id = ? AND memory_id = ? '
+            'AND content_sha256 = ? AND metadata_sha256 = ?',
+            state,
+        ).fetchone()
+        return snapshot_id
+
+    def read_snapshot(self, snapshot_id: int) -> RecordSnapshot:
+        row = self._conn.execute(
+            'SELECT * FROM snapshots WHERE id = ?', (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise UnknownSnapshot(f'no link-heal snapshot {snapshot_id} in {self.db_path}')
+        return _snapshot(row)
+
     def _action_rows(self, sql: str, params: Sequence[Any]) -> list[ActionRow]:
         return [_action_row(row) for row in self._conn.execute(sql, params)]
+
+
+#: A :class:`CandidateRecord` row: an examination with its heal and its adjudication;
+#: binds the adjudicator basis source, then the caller's own parameters.
+_RECORD_SELECT = (
+    'SELECT examinations.*, actions.action AS action_value, actions.state AS action_state, '
+    'actions.after_child_snapshot_id AS after_child_snapshot_id, '
+    'actions.undone_run_id AS action_undone_run_id, '
+    'adjudications.id AS adjudication_id, adjudications.verdict AS adjudicated_verdict, '
+    'adjudications.reason AS adjudicated_reason, adjudications.model AS adjudicated_model, '
+    'adjudications.prompt_sha256 AS adjudicated_prompt_sha256 FROM examinations '
+    'LEFT JOIN actions ON actions.id = examinations.action_id '
+    'LEFT JOIN adjudications ON examinations.basis_source = ? '
+    'AND adjudications.id = CAST(examinations.basis_key AS INTEGER)'
+)
+
+def _contiguous_end(windows: Iterable[tuple[CreatedWindow, bool]]) -> datetime | None:
+    """The end of the unbroken run of complete *windows*, each paired with whether it
+    was complete, taken in order from the first. The first window starts the run at its
+    end when complete, else at its start, so the span it left undecided stays ahead. A
+    later window extends the run only when it is complete and starts at or before the
+    end so far; one starting after it leaves a gap, so it does not move it."""
+    end: datetime | None = None
+    for window, complete in windows:
+        if end is None:
+            end = window.until if complete else window.since
+        elif complete and window.since <= end:
+            end = max(end, window.until)
+    return end
 
 
 def _lastrowid(cursor: sqlite3.Cursor) -> int:
@@ -560,6 +1154,38 @@ def _lastrowid(cursor: sqlite3.Cursor) -> int:
     if rowid is None:
         raise RuntimeError('sqlite reported no row id for an insert')
     return rowid
+
+
+def _payload_text(metadata: Mapping[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _snapshot(row: sqlite3.Row) -> RecordSnapshot:
+    return RecordSnapshot(
+        snapshot_id=row['id'],
+        project_id=row['project_id'],
+        memory_id=row['memory_id'],
+        content=row['content'],
+        content_sha256=row['content_sha256'],
+        metadata=json.loads(row['metadata_json']),
+        metadata_sha256=row['metadata_sha256'],
+        created_at=row['created_at'],
+        updated_at=row['updated_at'],
+    )
+
+
+def _calibration_row(row: sqlite3.Row) -> CalibrationRow:
+    return CalibrationRow(
+        calibration_id=row['id'],
+        run_id=row['run_id'],
+        model=row['model'],
+        prompt_sha256=row['prompt_sha256'],
+        population_sha256=row['population_sha256'],
+        passed=bool(row['passed']),
+        report=json.loads(row['report_json']),
+        at=row['at'],
+    )
 
 
 def _run_row(row: sqlite3.Row) -> RunRow:
@@ -594,6 +1220,9 @@ def _action_row(row: sqlite3.Row) -> ActionRow:
         detail=_loads_or_none(row['detail']),
         executed_run_id=row['executed_run_id'],
         undone_run_id=row['undone_run_id'],
+        before_child_snapshot_id=row['before_child_snapshot_id'],
+        before_parent_snapshot_id=row['before_parent_snapshot_id'],
+        after_child_snapshot_id=row['after_child_snapshot_id'],
     )
 
 
@@ -611,6 +1240,7 @@ def _adjudication_row(row: sqlite3.Row) -> AdjudicationRow:
             verdict=Verdict(row['verdict']),
             reason=row['reason'],
             model=row['model'],
+            prompt_sha256=row['prompt_sha256'],
         ),
     )
 
@@ -628,6 +1258,8 @@ def _undo_step_row(row: sqlite3.Row) -> UndoStepRow:
         basis_key=row['basis_key'],
         state=ActionState(row['state']),
         detail=_loads_or_none(row['detail']),
+        before_child_snapshot_id=row['before_child_snapshot_id'],
+        after_child_snapshot_id=row['after_child_snapshot_id'],
     )
 
 

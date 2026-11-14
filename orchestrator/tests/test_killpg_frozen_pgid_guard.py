@@ -62,26 +62,25 @@ from __future__ import annotations
 
 import ast
 import functools
-import subprocess
 from pathlib import Path
 
 import pytest
+from _tree_scan import (
+    REPO_ROOT,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    checkout_python_files,
+    git_tracked_python_files,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This guard sweeps the WIDEST root in the family -- REPO_ROOT.glob('*/src/*')
-# and glob('*/tests') expanded, then rglob('*.py') under each, plus scripts/
-# and hooks/ -- and ast.parse()s every file found; the whole repo, not one
-# package. Not individually reproduced under load; marked because it is
-# structurally identical to the three members that crashed.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-_SKIP_PARTS = {'.worktrees', '.venv', 'node_modules', '__pycache__'}
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 # Minimum number of .py files the sweep must actually scan. Measured at 1593
 # unique files, so the floor sits ~8x below reality: low enough not to become
@@ -209,23 +208,15 @@ def _killpg_over_getpgid(source: str) -> list[tuple[int, str]]:
     AST-based, returning ``[]`` on a :class:`SyntaxError` so a stray
     non-Python-3 file in the tree cannot break the guard.
     """
-    # Token prefilter before the (expensive) parse.  This is EXACTLY as strong
-    # as the detector, not an approximation: every hit below is an ast.Call
-    # whose func is an ast.Attribute with ``.attr == 'killpg'`` or an ast.Name
-    # with ``.id == 'killpg'``, and both spellings require the literal token
-    # `killpg` to appear in the source text.  A dynamic spelling that avoids
-    # the token (``getattr(os, 'kill' + 'pg')``) is invisible to the AST walk
-    # too, so nothing detectable is lost.  Worth it: ~97% of the repo's 1593
-    # swept files never mention killpg, and skipping ast.parse on them takes
-    # the ratchet from ~13.5s to ~0.5s.
-    if 'killpg' not in source:
-        return []
-
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return []
+    return _killpg_over_getpgid_in(tree)
 
+
+def _killpg_over_getpgid_in(tree: ast.Module) -> list[tuple[int, str]]:
+    """:func:`_killpg_over_getpgid` over an already-parsed module."""
     # Keyed by lineno so the direct form always wins over the indirect one when
     # a single call qualifies as both, and so the result is deterministic.
     hits: dict[int, str] = {}
@@ -400,111 +391,41 @@ def test_known_gap_taint_does_not_reach_a_nested_def() -> None:
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
-def _git_tracked_python() -> tuple[Path, ...]:
-    """Every .py file git tracks in this checkout, or ``()`` if git is unavailable.
+def _killpg_sites(module: ParsedModule) -> tuple[tuple[int, str], ...]:
+    """Unsafe killpg dispatches in *module*; none if it cannot be read or parsed.
 
-    ``git ls-files`` is the authoritative answer to "what is actually in this
-    repo": it is complete by construction (no hand-maintained root list to grow
-    holes) and it excludes every generated, ephemeral or sibling-checkout tree
-    without an allowlist, because none of them are tracked.
-
-    NUL-delimited (``-z``) rather than newline-delimited on purpose: a path
-    containing a space or a newline would silently truncate the tracked set,
-    and a truncated ground truth makes the completeness test below *vacuously*
-    pass -- the exact failure mode it exists to prevent.
-
-    Cached (and returning an immutable tuple, so a caller cannot corrupt the
-    shared value) because four tests in this module consume the sweep and the
-    subprocess would otherwise be re-run once per test.
+    Every finding is a call named ``killpg``, so a module that cannot name it is
+    never parsed: ~97% of the swept files.  A dynamic spelling that avoids the
+    name (``getattr(os, 'kill' + 'pg')``) is invisible to the walk as well.
     """
     try:
-        out = subprocess.run(
-            ['git', '-C', str(REPO_ROOT), 'ls-files', '-z', '--', '*.py'],
-            capture_output=True, text=True, timeout=30, check=True,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+        if not module.may_name('killpg'):
+            return ()
+        tree = module.tree
+    except (UnicodeDecodeError, OSError, SyntaxError):
+        # The sweep reaches script trees parsed nowhere else. One undecodable,
+        # unreadable or unparseable file must not take the whole ratchet down.
         return ()
-    return tuple(REPO_ROOT / p for p in out.split('\0') if p)
+    return tuple(_killpg_over_getpgid_in(tree))
 
 
-def _root_glob_python() -> list[Path]:
-    """Every .py file under the repo's package/script roots.
-
-    The second source of the sweep, and the one that covers a brand-new .py an
-    implementer has written but not yet ``git add``ed -- work git cannot see
-    yet, but that lives inside a known package root.
-
-    The skip decision is made on the path RELATIVE to REPO_ROOT, never on the
-    absolute path. Every orchestrator-dispatched task runs in a worktree rooted
-    at ``<repo>/.worktrees/<id>/``, so REPO_ROOT's own absolute path contains
-    the substring ``.worktrees`` and an absolute-path filter would match EVERY
-    file -- scanning nothing while still reporting green.
-    """
-    roots = [
-        *sorted(REPO_ROOT.glob('*/src/*')),
-        *sorted(REPO_ROOT.glob('*/tests')),
-        REPO_ROOT / 'scripts',
-        REPO_ROOT / 'hooks',
-    ]
-    files: list[Path] = [
-        # Repo-root modules (conftest.py, df_pytest_isolation.py) are swept
-        # non-recursively: df_pytest_isolation.py is the one root module that
-        # actually does process-group killing, so it belongs in scope.
-        p for p in sorted(REPO_ROOT.glob('*.py'))
-    ]
-    for root in roots:
-        if not root.is_dir():
-            continue
-        for path in sorted(root.rglob('*.py')):
-            if _SKIP_PARTS & set(path.relative_to(REPO_ROOT).parts):
-                continue
-            files.append(path)
-    return files
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem,
+    files=functools.partial(checkout_python_files, REPO_ROOT),
+    extract=_killpg_sites,
+)
+TREE_ANALYSES = (ANALYSIS,)
 
 
-@functools.cache
-def _python_files() -> tuple[Path, ...]:
-    """The sweep's file set: git-tracked UNION package roots, deduped.
+def test_sweep_flags_a_compatibility_spelling_the_parser_normalizes(tmp_path: Path) -> None:
+    """``ｋｉｌｌｐｇ`` parses as ``killpg``, so the sweep must not skip the file unparsed."""
+    path = tmp_path / 'cleanup.py'
+    path.write_text('os.ｋｉｌｌｐｇ(os.getpgid(proc.pid), signal.SIGKILL)\n', encoding='utf-8')
 
-    Both sources are load-bearing, and neither alone is sufficient:
-
-    * git-tracked alone would miss a brand-new .py written but not yet
-      ``git add``ed. The roots keep covering in-progress work.
-    * the roots alone are what produced this guard's coverage hole, and they
-      are unmaintainable: the obvious widening (``REPO_ROOT/'tests'`` plus a
-      ``*/scripts`` glob) STILL misses
-      ``skills/factory-init/scripts/find_escalation_port.py``, because
-      ``*/scripts`` matches at depth 2 and that path is depth 3. A
-      hand-maintained root list keeps growing new holes; ``git ls-files`` is
-      complete by construction.
-
-    ``is_file()`` is required, not defensive: ``git ls-files`` lists INDEX
-    entries, so a tracked-but-deleted file would raise FileNotFoundError in the
-    ratchet's ``read_text`` and turn a coverage win into a crash. The ``set``
-    also fixes the roots' mutual overlap (``*/tests`` matches ``scripts/tests``,
-    which ``REPO_ROOT/'scripts'`` rglobs into as well).
-
-    *** Do NOT "simplify" this into a whole-repo rglob from REPO_ROOT. *** The
-    main checkout carries ``.eval-worktrees/`` and ``.claude/worktrees/`` --
-    full copies of THIS repo at older, pre-fix revisions -- and ~30 files under
-    them still contain the literal ``os.killpg(os.getpgid(proc.pid),
-    signal.SIGKILL)``. A whole-repo sweep would go permanently red in the main
-    checkout on code belonging to other revisions. Both sources here are
-    structurally immune: git never lists those trees (untracked/ignored) and
-    the root globs never reach them. Re-verify that immunity before adding any
-    third source.
-
-    Cached, returning an immutable tuple: four tests in this module consume the
-    sweep, and without this the ``git ls-files`` subprocess plus the full rglob
-    (~0.25s) would run once per test. The cache is session-scoped, which is
-    correct here -- the tree does not change mid-run.
-    """
-    candidates = [*_git_tracked_python(), *_root_glob_python()]
-    return tuple(sorted({p for p in candidates if p.is_file()}))
+    assert _killpg_sites(ParsedModule(path)) == ((1, _DIRECT),)
 
 
-def test_sweep_is_not_vacuous() -> None:
+def test_sweep_is_not_vacuous(tree_pass: TreePass) -> None:
     """The sweep must actually scan the tree.
 
     Load-bearing, not stylistic: a zero-file sweep passes the ratchet below
@@ -512,10 +433,10 @@ def test_sweep_is_not_vacuous() -> None:
     -- and it would look healthy specifically inside task worktrees, i.e.
     everywhere branches are verified.
     """
-    scanned = _python_files()
+    scanned = tree_pass.facts(ANALYSIS).keys()
     relative = {str(p.relative_to(REPO_ROOT)) for p in scanned}
 
-    # Witnesses reachable from `_root_glob_python()` alone, so these hold
+    # Witnesses reachable from the on-disk package roots alone, so these hold
     # unconditionally -- including on a machine with no git.
     for required in (
         'orchestrator/src/orchestrator/deterministic_runner.py',
@@ -533,7 +454,7 @@ def test_sweep_is_not_vacuous() -> None:
     # process-group killing outside the two sites task 3884 closed.
     #
     # These are asserted only when the git source is LIVE, because none of the
-    # three is reachable from `_root_glob_python()` (whose roots are `*/src/*`,
+    # three is reachable from the on-disk package roots (`*/src/*`,
     # `*/tests`, `scripts`, `hooks` and root-level `*.py` -- top-level `tests/`,
     # `fused-memory/scripts/` and `skills/**` match none of them); they enter
     # the sweep solely via `git ls-files`. Asserting them unconditionally would
@@ -541,7 +462,7 @@ def test_sweep_is_not_vacuous() -> None:
     # root globs or the skip filter", sending a debugger at the wrong
     # subsystem, while the test that actually owns completeness
     # (`test_sweep_covers_every_tracked_python_file`) skips cleanly.
-    if _git_tracked_python():
+    if git_tracked_python_files(REPO_ROOT):
         for required in (
             'tests/scripts/test_drain_process_leak_isolation.py',
             'fused-memory/scripts/audit_duplicate_memories.py',
@@ -562,7 +483,7 @@ def test_sweep_is_not_vacuous() -> None:
     )
 
 
-def test_sweep_covers_every_tracked_python_file() -> None:
+def test_sweep_covers_every_tracked_python_file(tree_pass: TreePass) -> None:
     """Every .py file git tracks must be inside the sweep.
 
     This is the *completeness* assertion, and it is a different instrument from
@@ -573,12 +494,12 @@ def test_sweep_covers_every_tracked_python_file() -> None:
     ``git ls-files`` is the right ground truth -- it is exactly "the content
     that can land on main".
     """
-    tracked = {p for p in _git_tracked_python() if p.is_file()}
+    tracked = {p for p in git_tracked_python_files(REPO_ROOT) if p.is_file()}
     if not tracked:
         pytest.skip('git unavailable -- completeness cannot be established')
 
     missing = sorted(
-        str(p.relative_to(REPO_ROOT)) for p in tracked - set(_python_files())
+        str(p.relative_to(REPO_ROOT)) for p in tracked - tree_pass.facts(ANALYSIS).keys()
     )
     if missing:
         shown = '\n  '.join(missing[:20])
@@ -588,7 +509,7 @@ def test_sweep_covers_every_tracked_python_file() -> None:
             f'sweep, i.e. UNGUARDED: someone can re-introduce '
             f'`os.killpg(os.getpgid(p.pid), SIGKILL)` in any of them and ship '
             f'green, which defeats the ratchet entirely.\n\n'
-            f'Fix by WIDENING `_python_files()` so it covers them -- do NOT '
+            f'Fix by WIDENING `_tree_scan.py::checkout_python_files` so it covers them -- do NOT '
             f'trim this assertion or add an exclusion. The sweep is meant to '
             f'be complete by construction; a hand-maintained root list is the '
             f'mechanism that produced this hole in the first place.\n\n'
@@ -606,7 +527,7 @@ def test_sweep_yields_no_duplicates() -> None:
     number the vacuity floor is compared against, re-reads and re-parses every
     affected file, and reports any real offender twice in the failure message.
     """
-    scanned = _python_files()
+    scanned = checkout_python_files(REPO_ROOT)
     assert len(scanned) == len(set(scanned)), (
         f'sweep visited {len(scanned)} paths but only '
         f'{len(set(scanned))} are distinct -- the file sources overlap and are '
@@ -614,22 +535,13 @@ def test_sweep_yields_no_duplicates() -> None:
     )
 
 
-def test_no_killpg_over_getpgid_in_repo() -> None:
+def test_no_killpg_over_getpgid_in_repo(tree_pass: TreePass) -> None:
     """No file in the repo may re-derive a pgid inside a killpg dispatch."""
-    offenders: list[str] = []
-
-    for py_file in _python_files():
-        try:
-            source = py_file.read_text(encoding='utf-8')
-        except (UnicodeDecodeError, OSError):
-            # The sweep now reaches script trees never parsed before. One
-            # undecodable or unreadable file must not take the whole ratchet
-            # down -- same posture as the detector's SyntaxError -> [].
-            continue
-        for lineno, description in _killpg_over_getpgid(source):
-            offenders.append(
-                f'{py_file.relative_to(REPO_ROOT)}:{lineno}: {description}'
-            )
+    offenders = [
+        f'{py_file.relative_to(REPO_ROOT)}:{lineno}: {description}'
+        for py_file, sites in tree_pass.facts(ANALYSIS).items()
+        for lineno, description in sites
+    ]
 
     if offenders:
         offender_list = '\n  '.join(offenders)

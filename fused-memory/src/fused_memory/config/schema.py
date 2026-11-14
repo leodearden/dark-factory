@@ -1862,16 +1862,17 @@ class ReconciliationConfig(BaseModel):
     # Restart-tier: read from config each cycle; deliberately NOT in
     # RELOADABLE_FIELDS.
     auto_unhalt_after_cooldown: bool = Field(default=False)
-    # Judge transport/infra-failure tolerance (task 2947 ask a). Bounds the
-    # number of CONSECUTIVE judge CLI transport/infra failures (api_error,
-    # timeout, cap-wait exhaustion, etc. — NOT genuinely-malformed reachable
-    # content) a project may accumulate before review_run applies a truthful
-    # judge-unreachable halt and routes an infra_issue escalation. Below this
-    # threshold each infra failure is bounded backoff: no verdict is stamped
-    # and no halt fires (the transient outage is given room to recover). Any
-    # successful transport (a parsed verdict) resets the per-project counter.
+    # Judge no-verdict tolerance (task 2947 ask a; task 5370). Bounds the
+    # number of CONSECUTIVE no-verdict failures on a loaded run — judge CLI
+    # transport/infra failures (api_error, timeout, cap-wait exhaustion, etc. —
+    # NOT genuinely-malformed reachable content) and review errors — a project
+    # may accumulate before review_run applies a truthful halt (judge-unreachable
+    # or judge-review-error, after the last failure) and routes an infra_issue
+    # escalation. Below this threshold each failure is bounded backoff: no
+    # verdict is stamped and no halt fires (the transient outage is given room
+    # to recover). A completed review resets the per-project counter.
     # Gated on halt_on_judge_serious, same master switch as the serious-verdict
-    # halt. ge=1 → a value of 1 halts on the first infra failure.
+    # halt. ge=1 → a value of 1 halts on the first no-verdict failure.
     judge_infra_max_consecutive_failures: int = Field(default=3, ge=1)
 
     # Escalation
@@ -3532,7 +3533,8 @@ class ConsolidationAutoConfig(BaseModel):
 
 
 class LinkHealConfig(BaseModel):
-    """Caps, storm escapes and adjudicator knobs for link healing (tasks 6181, 6184).
+    """Caps, storm escapes, adjudicator knobs and the scheduled sweep for link
+    healing (tasks 6181, 6184, 7159).
 
     Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
     escapes", and H2, the link adjudicator. The consumers are
@@ -3613,6 +3615,59 @@ class LinkHealConfig(BaseModel):
             'Consecutive failed adjudicator shards that stop adjudicating. A plan run '
             'records the storm as would_escape under link-heal-adjudicator and files '
             'nothing; a writing run that adjudicates files it. PRD H1, H2.'
+        ),
+    )
+    projects: list[str] = Field(
+        default_factory=list,
+        description=(
+            'The projects one scheduled sweep covers, in one run, so a parent in '
+            'another listed project is told apart from a deleted one. Read by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    writes: bool = Field(
+        default=False,
+        description=(
+            'Whether a scheduled sweep may apply its heals. A writing sweep also '
+            'needs a passing calibration for the exact adjudicator model and '
+            'prompt; false records and reports only. Read by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    sweep_actions: list[str] = Field(
+        default_factory=lambda: ['detach', 'relabel'],
+        description=(
+            'The heal actions a scheduled sweep may stage; every other heal is '
+            'recorded as not_enabled. Strings, parsed as heal actions by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    sweep_window_hours: int = Field(
+        default=24,
+        ge=1,
+        description=(
+            'How far back the first scheduled sweep looks for newly created '
+            'children; later sweeps start where the last complete one ended. '
+            'Read by maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    calibration_kappa_margin: float = Field(
+        default=0.10,
+        ge=0,
+        le=1,
+        description=(
+            "How far below the raters' own kappa the adjudicator's kappa may fall, "
+            'per binary, pooled and per gated project, and still pass. Read by '
+            'maintenance/link_heal_calibration.py at each run start. Task 7159.'
+        ),
+    )
+    calibration_min_project_items: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            'Rated pairs a project needs before calibration gates on its own '
+            'kappa; smaller projects are reported, not gated. Read by '
+            'maintenance/link_heal_calibration.py at each run start. Task 7159.'
         ),
     )
 

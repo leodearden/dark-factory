@@ -119,6 +119,7 @@ from orchestrator.escalation_router import (
     reviewer_notes,
     router_owns,
 )
+from orchestrator.escalation_rulings import Ruling, plan_confirmed_at, select_rulings
 from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
@@ -237,7 +238,7 @@ from orchestrator.verify_categories import (
     FailureCategory,
 )
 from orchestrator.verify_checkpoint import green_checkpoint_at_tip
-from orchestrator.verify_evidence import VerifySite, verify_event_fields
+from orchestrator.verify_evidence import TipUnresolved, VerifySite, workflow_verify_event_data
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     BlockDisposition,
     CancellationScope,
@@ -647,6 +648,7 @@ class _BriefingLike(Protocol):
         self, task: dict, worktree: Path | None = ..., context: str | None = ...,
         *, include_prior_proposals: bool = ...,
         committed_work: list[dict] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -664,18 +666,21 @@ class _BriefingLike(Protocol):
         self, plan: dict, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
         wip_notice: list[dict] | None = ...,
-        *, scope_drift: ScopeDriftReport | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
+        scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_amender_prompt(
         self, plan: dict,
         suggestions: list[dict], locked_modules: list[str],
         context: str | None = ..., task_id: str | None = ...,
-        *, scope_drift: ScopeDriftReport | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
+        scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
         *, attempt_context: VerifyAttemptContext | None = ...,
+        rulings: Sequence[Ruling] = ...,
         scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
@@ -683,11 +688,13 @@ class _BriefingLike(Protocol):
         *, amendment_suggestions: list[dict] | None = ...,
         task: dict | None = ...,
         open_info_notes: Sequence[Escalation] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
         open_info_notes: Sequence[Escalation] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str: ...
     async def build_revalidation_prompt(
@@ -696,10 +703,12 @@ class _BriefingLike(Protocol):
         context: str | None = ...,
         *, text_drift: TaskTextDrift | None = ...,
         integrity_refusal: DoneStepIntegrityVerdict | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict,
         worktree: Path | None = ..., context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_plan_tightening_prompt(
         self, task: dict, plan: dict, not_touched: list[str],
@@ -710,10 +719,12 @@ class _BriefingLike(Protocol):
     ) -> str: ...
     async def build_replan_prompt(
         self, task: dict, review_feedback: str, context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_simple_task_prompt(
         self, task: dict, worktree: Path | None = ...,
         context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_completion_judge_prompt(
         self, plan: dict, iteration_log: list[dict], diff: str,
@@ -1486,11 +1497,10 @@ class TaskWorkflow:
         # workflow_verify re-emit — verify did not run this cycle, so
         # re-asserting a green would be dishonest (the honest signal is
         # phase_skipped(verify)).  Reset to False at the top of each loop pass.
-        # _verify_green_tip_sha: the branch tip captured right after a PASSING
-        # _verify_debugfix_loop and before _enter_phase(REVIEW); recorded in the
-        # workflow_verify payload as the durable checkpoint key for the next run.
+        # _verify_green_tip_sha: the tip of this pass's passing verify, or why there is
+        # none (TaskWorkflow._verified_tip); the next run's checkpoint key. Reset each VERIFY pass.
         self._verify_checkpoint_hit: bool = False
-        self._verify_green_tip_sha: str | None = None
+        self._verify_green_tip_sha: str | TipUnresolved = TipUnresolved.NOT_CAPTURED
         # The passing VerifyResult behind _verify_green_tip_sha (task 5651); reset each VERIFY pass.
         self._verify_green_result: VerifyResult | None = None
         # The host whose verdict that green is (task 6670), with the same lifetime.
@@ -2694,34 +2704,28 @@ class TaskWorkflow:
         site: VerifySite,
         result: VerifyResult | None,
         passed: bool,
-        tip_sha: str | None,
+        tip_sha: str | TipUnresolved,
         base_sha: str | None,
         runner: str,
     ) -> None:
         """Record one task-role verify verdict; both workflow sites emit through here.
 
         *runner* names the host whose verdict this is (task 6670).
-
-        The escalation-side merge_request(verified_green=True) row carries only
-        passed/base_sha/branch, and gains these keys through task 5409's shared
-        emit_workflow_verify constructor.
         """
         if self.event_store is None:
             return
         self.event_store.emit(
             EventType.workflow_verify,
             task_id=self.task_id,
-            data={
-                'passed': passed,
-                'tip_sha': tip_sha,
-                'base_sha': base_sha,
-                'branch': f'{self.config.git.branch_prefix}{self.task_id}',
-                'duration_ms': None if result is None else round(result.duration_secs * 1000),
-                'slot_wait_secs': None if result is None else result.slot_wait_secs,
-                'site': str(site),
-                'runner': runner,
-                **verify_event_fields(result),
-            },
+            data=workflow_verify_event_data(
+                passed,
+                tip_sha=tip_sha,
+                base_sha=base_sha,
+                branch=f'{self.config.git.branch_prefix}{self.task_id}',
+                result=result,
+                site=site,
+                runner=runner,
+            ),
         )
 
     async def _restamp_branch_base_if_no_own_commits(self) -> bool:
@@ -3930,8 +3934,7 @@ class TaskWorkflow:
         # The enqueue-boundary clear in _submit_to_merge_queue covers the normal
         # path, but ghost-loop / eval-mode successes reach DONE without passing
         # through it — so clear here too, keeping a DONE task from carrying a
-        # fresh stamp that would briefly defer an unrelated stranded divergence
-        # orphan in the reaper. Idempotent no-op when unstamped.
+        # fresh stamp. Idempotent no-op when unstamped.
         await self._clear_merge_phase_entered()
 
         # SUCCESS — write completion knowledge (best-effort after merge)
@@ -4147,13 +4150,13 @@ class TaskWorkflow:
                 event_store=self.event_store,
             )
         if self.event_store is not None:
-            tip = (await self._get_head_commit()) or None
+            tip = await self._verified_tip('the post-rebase re-verify')
             self._emit_workflow_verify(
                 site=VerifySite.PRE_MERGE,
                 result=verify,
                 passed=verify.passed,
                 tip_sha=tip,
-                base_sha=await self.git_ops.merge_base_with_main(tip) if tip else None,
+                base_sha=None if isinstance(tip, TipUnresolved) else await self.git_ops.merge_base_with_main(tip),
                 runner=LOCAL_RUNNER,
             )
         if not verify.passed:
@@ -4194,16 +4197,9 @@ class TaskWorkflow:
 
         self._enter_phase(WorkflowState.MERGE)
 
-        # task 2991: write the durable, restart-survivable merge-phase liveness
-        # stamp immediately on merge entry — BEFORE _check_scope_invariant files
-        # its plan.files/metadata.files divergence L0 and BEFORE the gating bail
-        # below. The orphan-L0 divergence reaper's _has_fresh_merge_phase gate
-        # reads it to DEFER (not promote) a live merge-stage task, which the
-        # pre-enqueue loop (no LLM calls) would otherwise fail the task-2931
-        # routing.latest freshness gate. Placed here so it is refreshed on every
-        # (re-)dispatch into merge phase, including passes that immediately bail
-        # to ESCALATED — exactly the passes a live-but-wedged task cycles
-        # through. (Distinct from the in-memory note_merge_phase_entered at the
+        # task 2991: write the durable merge-phase liveness stamp on merge
+        # entry, BEFORE _check_scope_invariant, which reuses the returned
+        # metadata. (Distinct from the in-memory note_merge_phase_entered at the
         # retry-loop top, which is the self-redeploy coordinator's signal.)
         _entry_metadata = await self._stamp_merge_phase_entered()
 
@@ -4286,24 +4282,17 @@ class TaskWorkflow:
             # and defensively in the harness _run_slot finally.
             self.scheduler.note_merge_phase_entered(self.task_id)
             # task 2991 (review-fix R2-B): refresh the DURABLE liveness stamp
-            # alongside the in-memory one above, for the same reason. Each
-            # REQUEUED retry re-runs a full vulnerable pre-enqueue window
-            # (Phase-1 rebase, and the rollback-only re-verify
-            # `pre_merge_reverify`; zero LLM calls)
-            # AFTER _submit_to_merge_queue discharged the stamp at the enqueue
-            # boundary. Without this re-stamp that window has neither a durable
-            # merge_phase_liveness nor a fresh routing.latest, so the task
-            # 2931/2991 divergence false positive recurs on every merge retry
-            # (a REQUEUED retry goes through a steward resolution first, so the
-            # merge-entry L0 is already older than orphan_l0_timeout_secs when
-            # attempt 2 begins). The merge-entry stamp above is KEPT — it must
-            # precede _check_scope_invariant and the gating bail, both of which
-            # sit above this loop — so attempt 1 writes twice: an accepted cost
-            # (two cheap best-effort metadata writes, bounded by
-            # max_merge_retries+1 per merge entry) for the simple invariant "a
-            # fresh durable stamp exists at the start of every pre-enqueue
-            # window", which an `if _merge_attempt > 0` would make dependent on
-            # loop-index reasoning.
+            # alongside the in-memory one above, at the start of every
+            # pre-enqueue window: each REQUEUED retry runs after
+            # _submit_to_merge_queue discharged the stamp at the enqueue
+            # boundary. The merge-entry stamp above is KEPT — it must precede
+            # _check_scope_invariant, which reuses its returned metadata — so
+            # attempt 1 writes twice: an accepted cost (two cheap best-effort
+            # metadata writes, bounded by max_merge_retries+1 per merge entry)
+            # for the simple invariant "a fresh durable stamp exists at the
+            # start of every pre-enqueue window", which an
+            # `if _merge_attempt > 0` would make dependent on loop-index
+            # reasoning.
             await self._stamp_merge_phase_entered()
             # Phase 1: pre-merge rebase (no lock, no queue slot); see
             # _rebase_before_enqueue.
@@ -5581,6 +5570,7 @@ class TaskWorkflow:
                 return await self.briefing.build_plan_completion_prompt(
                     self.task, self._live_plan() or existing_plan,
                     worktree=self.worktree,
+                    rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
                 )
 
             build_prompt = build_completion_prompt
@@ -5629,11 +5619,13 @@ class TaskWorkflow:
                 # (e.g. blast-radius lock denied) — fall through.
 
             changed_files = revalidation_changed_files
+            confirmed_at = plan_confirmed_at(existing_plan)
 
             async def build_revalidation_prompt() -> str:
                 return await self.briefing.build_revalidation_prompt(
                     self.task, self._live_plan() or existing_plan, changed_files,
                     worktree=self.worktree, text_drift=text_drift,
+                    rulings=await self._escalation_rulings(ARCHITECT.name, since=confirmed_at),
                 )
 
             build_prompt = build_revalidation_prompt
@@ -5684,6 +5676,7 @@ class TaskWorkflow:
                     self.task, worktree=self.worktree,
                     include_prior_proposals=include_prior_proposals,
                     committed_work=committed_work,
+                    rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
                 )
 
             build_prompt = build_fresh_prompt
@@ -6036,12 +6029,14 @@ class TaskWorkflow:
         if verdict.passed:
             return None
         assert self.worktree is not None
+        confirmed_at = plan_confirmed_at(before)
 
         async def build_remedy_prompt() -> str:
             return await self.briefing.build_revalidation_prompt(
                 self.task, self._live_plan(), changed_files,
                 worktree=self.worktree, text_drift=text_drift,
                 integrity_refusal=verdict,
+                rulings=await self._escalation_rulings(ARCHITECT.name, since=confirmed_at),
             )
 
         if outcome := await self._run_architect_for_plan(build_remedy_prompt):
@@ -6343,10 +6338,11 @@ class TaskWorkflow:
         """
         assert self.worktree is not None and self.artifacts is not None
 
-        build_prompt = partial(
-            self.briefing.build_simple_task_prompt,
-            self.task, worktree=self.worktree,
-        )
+        async def build_prompt() -> str:
+            return await self.briefing.build_simple_task_prompt(
+                self.task, worktree=self.worktree,
+                rulings=await self._escalation_rulings(SIMPLE_TASK.name, since=None),
+            )
 
         try:
             result = await self._invoke(SIMPLE_TASK, build_prompt, self.worktree)
@@ -7496,18 +7492,9 @@ class TaskWorkflow:
     async def _stamp_merge_phase_entered(self) -> dict | None:
         """Persist a durable merge-phase-liveness stamp into task metadata.
 
-        Task 2991: the restart-survivable analog of ``routing.latest`` for the
-        orphan-L0 divergence reaper. The pre-enqueue MERGE loop (rebase +
-        scoped verify + queue submit) makes NO LLM calls, so it never refreshes
-        ``metadata.routing.latest.decided_at`` — the reaper's task-2931
-        ``_has_fresh_dispatch`` gate cannot see a legitimately-live merge-stage
-        task and false-promotes its scope-invariant L0 to a human-facing L1
-        (cluster esc-2789-22). This stamp records ``{'entered_at': <iso>}``;
-        the reaper's ``_has_fresh_merge_phase`` gate defers a divergence L0
-        whose task carries a fresh stamp. Being durable task metadata it
-        survives an orchestrator restart (unlike the per-process
-        ``Scheduler._merge_phase_at``), covering the exact redispatch window in
-        which the false positive wedged 2789/2885.
+        Task 2991: the stamp records ``{'entered_at': <iso>}``. It currently
+        has no in-tree reader, since the orphan-L0 reaper's merge-phase gate
+        was retired (task 3002).
 
         Written at TWO points in :meth:`_run_merge_phase`, so a fresh stamp
         exists at the start of every pre-enqueue window: (1) on merge entry,
@@ -7526,8 +7513,7 @@ class TaskWorkflow:
         (``retry_ledger``, ``memory_hints``) is not clobbered, update the
         in-memory task, and persist via ``scheduler.update_task`` inside a
         logged try/except. A persistence failure must never crash the merge
-        path — a lost stamp is self-healing (re-written on the next merge entry,
-        and at worst the reaper promotes rather than silently suppresses).
+        path — a lost stamp is self-healing (re-written on the next merge entry).
 
         Returns:
             The backend metadata blob this stamp just read (``{}`` when the
@@ -7567,8 +7553,7 @@ class TaskWorkflow:
         called at the durable-enqueue boundary in
         :meth:`_submit_to_merge_queue` (alongside ``scheduler.clear_merge_phase``)
         and on merge SUCCESS in :meth:`_merge_and_finalise`, so a just-enqueued
-        / just-merged task does not carry a fresh stamp that would briefly defer
-        an unrelated stranded divergence orphan.
+        / just-merged task does not carry a fresh stamp.
 
         Deletion requires ``metadata_mode='replace'`` (review-fix R2-A). A plain
         ``scheduler.update_task(metadata=...)`` resolves to
@@ -7583,9 +7568,8 @@ class TaskWorkflow:
         write is SKIPPED (in-memory clear only), because a ``'replace'`` built
         from in-memory-only metadata would delete backend-only keys
         (``memory_hints``, ``_causation_id``) — the #4271 sibling-clobber bug.
-        The bounded cost of skipping is that the reaper may keep deferring for
-        up to ``orphan_l0_merge_phase_freshness_secs`` before the stale stamp
-        ages out (deferral, never suppression).
+        Skipping leaves a stale stamp; :meth:`_stamp_merge_phase_entered`
+        says who reads it.
 
         ACCEPTED residual race (review amendment) — ``'replace'`` is NOT
         unconditionally safe once the read succeeded. This is a
@@ -7593,9 +7577,7 @@ class TaskWorkflow:
         and a whole-blob overwrite drops any key another process wrote in
         between; ``'merge'`` mode could not lose an unsupplied key that way.
         At risk in that window: ``memory_hints`` re-attached by Stage-2
-        reconciliation, ``_causation_id``, and ``routing.latest`` — the input
-        to the reaper's SIBLING ``_has_fresh_dispatch`` gate, so a clobber
-        there would re-open the task-2931 false positive. Mitigations, in
+        reconciliation, ``_causation_id``, and ``routing.latest``. Mitigations, in
         order: (1) read and write are back-to-back with no intervening awaits,
         which is the narrowest this can be without a new backend primitive;
         (2) this workflow issues no LLM call while the clear runs, so its own
@@ -7610,9 +7592,8 @@ class TaskWorkflow:
         ``test_clear_replace_loses_concurrent_backend_write_in_read_window``.
 
         Deliberately NOT cleared defensively in the harness ``_run_slot``
-        finally (unlike the in-memory ``clear_merge_phase`` grace stamp): an
-        abnormal exit must LEAVE the durable stamp so the reaper keeps deferring
-        across the crash/restart/redispatch window (fix-direction b). A
+        finally (unlike the in-memory ``clear_merge_phase`` grace stamp), so an
+        abnormal exit leaves the durable stamp in place. A
         persistence failure must never crash the merge path; a subsequent merge
         (re-)entry re-stamps, so a lost clear is self-healing.
 
@@ -7632,8 +7613,7 @@ class TaskWorkflow:
                 'Task %s: skipping durable merge_phase_liveness clear — could '
                 'not re-read backend metadata, and a replace-mode write built '
                 'from in-memory metadata alone would clobber backend-only keys '
-                '(clearing in-memory only; the stale stamp ages out of the '
-                'reaper grace on its own)',
+                '(clearing in-memory only)',
                 self.task_id,
             )
             self.task['metadata'] = {
@@ -8912,34 +8892,18 @@ class TaskWorkflow:
             # re-emit is suppressed in _enter_phase (gated on
             # _verify_checkpoint_hit) so we never assert a verify that did not
             # run this cycle.  Fail-closed on every axis: no event store, a
-            # checkpoint miss, a RAISING _get_head_commit (caught below →
-            # tip=None → miss), an empty tip, or a green_checkpoint_at_tip read
-            # error all fall through to the normal verify path
-            # (green_checkpoint_at_tip never raises, and the tip fetch is
-            # wrapped in try/except so a spawn failure cannot crash the loop).
+            # checkpoint miss, an unreadable HEAD (_head_commit_or_none), or a
+            # green_checkpoint_at_tip read error all fall through to the
+            # normal verify path.
             # Task 2749's tree-hash verdict cache then skips REVIEW below,
             # composing into the fast-path to merge.
             self._verify_checkpoint_hit = False
+            self._verify_green_tip_sha = TipUnresolved.NOT_CAPTURED
             self._verify_green_result = None
             self._verify_green_runner = LOCAL_RUNNER
             self._enter_phase(WorkflowState.VERIFY)
             if self.event_store is not None:
-                try:
-                    tip = await self._get_head_commit()
-                except Exception:
-                    # A raising _get_head_commit (git not on PATH →
-                    # FileNotFoundError, a None worktree, a transient spawn
-                    # failure) must NOT crash the loop: degrade to the normal
-                    # verify path (tip=None → green_checkpoint_at_tip miss →
-                    # _verify_debugfix_loop runs).  This is exactly the
-                    # fail-safe the comment above promises for a
-                    # _get_head_commit error.
-                    logger.warning(
-                        'Task %s: VERIFY checkpoint tip fetch failed; running '
-                        'the normal verify (fail-safe) (task 2752)',
-                        self.task_id, exc_info=True,
-                    )
-                    tip = None
+                tip = await self._head_commit_or_none('the VERIFY checkpoint lookup')
                 if green_checkpoint_at_tip(
                     self.event_store, EventType.workflow_verify, self.task_id, tip,
                 ):
@@ -8981,16 +8945,10 @@ class TaskWorkflow:
                         )
                     detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
                     return await self._mark_blocked('Verification attempts exhausted', detail=detail)
-                # Passing fall-through (_verify_debugfix_loop returns DONE):
-                # capture the verified branch tip so the subsequent
-                # _enter_phase(REVIEW) records it in the workflow_verify payload
-                # as the durable checkpoint key for the next run (task 2752).
-                # Normalize an empty tip (a failed `git rev-parse` returns '' —
-                # see _get_head_commit) to None so we never record '' as a
-                # green key: a later run that also read '' must MISS the
-                # checkpoint (green_checkpoint_at_tip fails closed on an empty
-                # tip), not match '' == '' and falsely skip verify.
-                self._verify_green_tip_sha = (await self._get_head_commit()) or None
+                # Passing fall-through: the tip _enter_phase(REVIEW) records as
+                # the next run's checkpoint key (task 2752), or why it has none.
+                if self.event_store is not None:
+                    self._verify_green_tip_sha = await self._verified_tip('the post-verify green tip')
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
@@ -10509,6 +10467,9 @@ class TaskWorkflow:
         return await self.briefing.build_implementer_prompt(
             plan, rebase_notice=rebase_notice,
             task_id=self.task_id, wip_notice=await self._detect_tip_wip_commits(plan),
+            rulings=await self._escalation_rulings(
+                IMPLEMENTER.name, since=plan_confirmed_at(plan),
+            ),
             scope_drift=scope_drift,
         )
 
@@ -11319,9 +11280,13 @@ class TaskWorkflow:
                 failure_report: str = failure_report,
                 attempt_context: VerifyAttemptContext = attempt_context,
             ) -> str:
+                plan = self._live_plan()
                 return await self.briefing.build_debugger_prompt(
-                    failure_report, self._live_plan(), task_id=self.task_id,
+                    failure_report, plan, task_id=self.task_id,
                     attempt_context=attempt_context,
+                    rulings=await self._escalation_rulings(
+                        DEBUGGER.name, since=plan_confirmed_at(plan),
+                    ),
                     scope_drift=scope_drift,
                 )
 
@@ -11645,6 +11610,7 @@ class TaskWorkflow:
         amendment_suggestions = (
             amendment_ctx.amended_suggestions if amendment_ctx is not None else None
         )
+        rulings = await self._read_rulings(since=None, briefed='review round')
         stagger = self.config.reviewer_stagger_secs
 
         # Staggered launch — spread OAuth session creation
@@ -11653,6 +11619,7 @@ class TaskWorkflow:
                 await asyncio.sleep(idx * stagger)
             return await self._run_reviewer(
                 role, diff, amendment_suggestions=amendment_suggestions, subject=subject,
+                rulings=rulings,
             )
 
         tasks = [_staggered(i, r) for i, r in enumerate(roster)]
@@ -11672,7 +11639,7 @@ class TaskWorkflow:
                     results[i] = await self._run_reviewer(
                         roster[i], diff,
                         amendment_suggestions=amendment_suggestions,
-                        subject=subject,
+                        subject=subject, rulings=rulings,
                     )
                 except Exception as exc:
                     results[i] = exc
@@ -11818,26 +11785,30 @@ class TaskWorkflow:
         self, role: AgentRole, diff: str,
         amendment_suggestions: list[dict] | None = None,
         *, subject: ReviewSubject | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> dict:
         """Run a single reviewer and read its verdict artifact.
 
         *amendment_suggestions*, when set, threads the post-amendment advisory
         scope section into the reviewer prompt (task 2750). *subject*, when
         set, briefs the context-complete generation from it instead of *diff*.
+        *rulings* are every ruling on the task, read once per review round by
+        ``_review``.
         """
         assert self.worktree is not None and self.artifacts is not None
         notes = self._reviewer_notes()
+        self._record_rulings_briefed(role.name, rulings, since=None)
         if subject is None:
             build_prompt = partial(
                 self.briefing.build_reviewer_prompt,
                 role.name, diff, amendment_suggestions=amendment_suggestions,
-                task=self.task, open_info_notes=notes,
+                task=self.task, open_info_notes=notes, rulings=rulings,
             )
         else:
             build_prompt = partial(
                 self.briefing.build_context_complete_reviewer_prompt,
                 role.name, subject, amendment_suggestions=amendment_suggestions,
-                open_info_notes=notes,
+                open_info_notes=notes, rulings=rulings,
             )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
@@ -12050,13 +12021,21 @@ class TaskWorkflow:
         return in_scope
 
     async def _replan(self, reviews) -> None:
-        """Feed review feedback back to architect for re-planning."""
+        """Feed review feedback back to architect for re-planning.
+
+        The architect answers reviewer findings, which are judged against every
+        ruling, so it is shown every ruling however recently the plan was confirmed.
+        """
         assert self.worktree is not None and self.artifacts is not None
         self.plan = self.artifacts.read_plan()
-        build_prompt = partial(
-            self.briefing.build_replan_prompt,
-            self.task, reviews.format_for_replan(),
-        )
+        feedback = reviews.format_for_replan()
+
+        async def build_prompt() -> str:
+            return await self.briefing.build_replan_prompt(
+                self.task, feedback,
+                rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
+            )
+
         await self._invoke(ARCHITECT, build_prompt, self.worktree)
         self.plan = self.artifacts.read_plan()
 
@@ -12139,11 +12118,15 @@ class TaskWorkflow:
         locked_modules = list(self.modules)
 
         async def build_prompt(scope_drift: ScopeDriftReport | None) -> str:
+            plan = self._live_plan()
             return await self.briefing.build_amender_prompt(
-                plan=self._live_plan(),
+                plan=plan,
                 suggestions=in_scope,
                 locked_modules=locked_modules,
                 task_id=self.task_id,
+                rulings=await self._escalation_rulings(
+                    IMPLEMENTER.name, since=plan_confirmed_at(plan),
+                ),
                 scope_drift=scope_drift,
             )
 
@@ -12760,34 +12743,7 @@ class TaskWorkflow:
         # abnormal exits before this point.)
         self.scheduler.clear_merge_phase(self.task_id)
         # Task 2991: discharge the DURABLE merge-phase-liveness stamp at the same
-        # boundary — the pre-enqueue window the orphan reaper's
-        # _has_fresh_merge_phase gate protects is over, so a lingering fresh
-        # stamp would briefly defer an unrelated stranded divergence orphan.
-        # Unlike the in-memory grace stamp above, this one is deliberately NOT
-        # cleared defensively in the harness _run_slot finally: an abnormal exit
-        # before this point must LEAVE the stamp so the reaper keeps deferring
-        # across the crash/restart/redispatch window.
-        #
-        # KNOWN, ACCEPTED GAP (review amendment): discharging here leaves the
-        # POST-enqueue window (queue wait + worker rebase/verify/merge) with no
-        # durable liveness signal — the stamp is gone and routing.latest stays
-        # stale, since the merge worker makes no LLM calls either. In-process
-        # that window IS covered: the task is still in _dispatched, so
-        # is_actively_held short-circuits the reaper. After a restart it is
-        # NOT: Harness._recover_pending_merges rebuilds the request from the
-        # merge journal and hands it to the WORKER, which never re-enters
-        # _run_merge_phase (nothing re-stamps), and _reconcile_stranded_in_
-        # progress LEAVEs — does not re-dispatch — a task that has an open
-        # escalation, which the merge-entry divergence L0 is. So a restart
-        # while the merge is queued/in-flight still promotes that L0.
-        # Accepted here rather than fixed: closing it means moving the
-        # discharge to the merge terminal outcome, which changes the
-        # stamp/clear pairing this task deliberately co-located with task
-        # 2753's in-memory clear_merge_phase (pinned by TestEnqueueClearWiring)
-        # — filed as follow-up work. The gap is pinned meanwhile by
-        # test_orphan_l0_reaper.py::...::
-        # test_post_enqueue_restart_still_promotes_known_accepted_gap, so it is
-        # visible in the suite instead of silently absent from it.
+        # boundary.
         await self._clear_merge_phase_entered()
 
         # Soft-cancel hook: detach the workflow waiter instead of cancelling
@@ -16051,6 +16007,30 @@ class TaskWorkflow:
             return ''
         return stdout.decode().strip()
 
+    async def _head_commit_or_none(self, purpose: str) -> str | None:
+        """HEAD sha, or None when it cannot be read: git exits non-zero ('') or the spawn raises. For callers that must fail safe rather than crash."""
+        try:
+            return (await self._get_head_commit()) or None
+        except Exception:
+            logger.warning(
+                'Task %s: HEAD read for %s failed; treating HEAD as unknown (fail-safe)',
+                self.task_id, purpose, exc_info=True,
+            )
+            return None
+
+    async def _verified_tip(self, purpose: str) -> str | TipUnresolved:
+        """The tip a verdict is recorded at, read with one retry, or why it could not be read."""
+        for _attempt in range(2):
+            tip = await self._head_commit_or_none(purpose)
+            if tip is not None:
+                return tip
+        logger.warning(
+            'Task %s: HEAD unreadable twice for %s; recording the verdict with '
+            'tip_sha_unresolved (task 5409)',
+            self.task_id, purpose,
+        )
+        return TipUnresolved.HEAD_UNREADABLE
+
     async def _iteration_commit_provenance(self, pre_head: str) -> dict:
         """Compare pre/post HEAD and report truthful commit provenance for an
         iteration-ledger entry (task 2759).
@@ -16544,6 +16524,7 @@ class TaskWorkflow:
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
                 delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+                checks_enabled=self.config.delivered_checks.enabled,
             )
         except Exception:
             logger.warning(
@@ -17346,11 +17327,6 @@ class TaskWorkflow:
         alpha-stripped and thus unverifiable as a safe metadata.files
         superset (review amendment, task 3429). Mirrors
         :meth:`_escalate_plan_overwrite`'s submission shape.
-
-        The ``summary`` string is load-bearing: ``harness._is_scope_divergence_orphan``
-        discriminates this entire escalation class on the substring
-        ``'plan.files/metadata.files divergence detected'``. Keep it verbatim;
-        only ``detail`` is free to evolve.
         """
         summary = (
             f'plan.files/metadata.files divergence detected for task {self.task_id}'
@@ -19267,6 +19243,48 @@ class TaskWorkflow:
                 self.task_id, type(exc).__name__, exc, exc_info=True,
             )
             return []
+
+    async def _escalation_rulings(
+        self, role: str, *, since: datetime | None,
+    ) -> tuple[Ruling, ...]:
+        """The task's rulings resolved after *since* to brief *role* with, recorded as briefed."""
+        rulings = await self._read_rulings(since=since, briefed=role)
+        self._record_rulings_briefed(role, rulings, since=since)
+        return rulings
+
+    async def _read_rulings(
+        self, *, since: datetime | None, briefed: str,
+    ) -> tuple[Ruling, ...]:
+        """The task's rulings resolved after *since*; a queue fault costs only the rulings.
+
+        The read scans the queue archive, so it runs off the event loop (task
+        4567).  *briefed* names the briefing in the fault's log line.
+        """
+        queue = self.escalation_queue
+        if queue is None:
+            return ()
+        try:
+            records = await asyncio.to_thread(queue.get_by_task, self.task_id, status='resolved')
+            return select_rulings(records, since=since)
+        except Exception as exc:
+            logger.warning(
+                'Task %s: reading the escalation rulings for the %s briefing failed '
+                '(%s: %s); it proceeds without them',
+                self.task_id, briefed, type(exc).__name__, exc, exc_info=True,
+            )
+            return ()
+
+    def _record_rulings_briefed(
+        self, role: str, rulings: Sequence[Ruling], *, since: datetime | None,
+    ) -> None:
+        if rulings and self.event_store:
+            self.event_store.emit(
+                EventType.escalation_rulings_briefed, task_id=self.task_id, role=role,
+                data={
+                    'escalation_ids': [ruling.escalation_id for ruling in rulings],
+                    'since': since.isoformat() if since is not None else None,
+                },
+            )
 
     def _apply_note_dispositions(self, reviews: ReviewAggregation) -> None:
         """Apply the review round's verdicts on the task's info notes (D2); a note left pending is the exit router's."""

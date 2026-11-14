@@ -97,9 +97,9 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
     per_call = task_snapshot.PER_CALL_TIMEOUT
     shared_per_call = tasks.DEFAULT_PER_CALL_TIMEOUT
     calls = task_snapshot.PER_PROJECT_MCP_CALLS
-    per_project = active_tasks._TASKS_PER_PROJECT_BUDGET
-    total = active_tasks._TASKS_TOTAL_BUDGET
-    concurrency = active_tasks._TASKS_ROOT_CONCURRENCY
+    per_project = active_tasks.TASKS_BUDGET.per_project
+    total = active_tasks.TASKS_BUDGET.total
+    concurrency = active_tasks.TASKS_BUDGET.root_concurrency
 
     assert len(calls) > 0, (
         'PER_PROJECT_MCP_CALLS must enumerate the real per-project bounded '
@@ -163,7 +163,7 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
 
     # (f) CONCURRENCY: parallel, but bounded.
     assert concurrency > 1, (
-        f'_TASKS_ROOT_CONCURRENCY is {concurrency} — at 1 this is the '
+        f'TASKS_BUDGET.root_concurrency is {concurrency} — at 1 this is the '
         'SEQUENTIAL walk that caused the starvation this constant exists to '
         'fix: with N roots the wall clock is the SUM of the per-root costs, '
         'so the tail roots consistently exhausted _TASKS_TOTAL_BUDGET and '
@@ -171,7 +171,7 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
         'entire point of the constant.'
     )
     assert concurrency <= 8, (
-        f'_TASKS_ROOT_CONCURRENCY is {concurrency} — the walk must stay '
+        f'TASKS_BUDGET.root_concurrency is {concurrency} — the walk must stay '
         'BOUNDED; see the WHY BOUNDED comment on '
         'active_tasks._TASKS_ROOT_CONCURRENCY. An unbounded gather trades '
         'this endpoint\'s latency for every other endpoint\'s availability.'
@@ -191,8 +191,8 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
     'enclosing_deadline',
     [
         pytest.param(
-            active_tasks._TASKS_PER_PROJECT_BUDGET,
-            id='active_tasks._TASKS_PER_PROJECT_BUDGET',
+            active_tasks.TASKS_BUDGET.per_project,
+            id='active_tasks.TASKS_BUDGET.per_project',
         ),
         pytest.param(
             task_lookup.LOOKUP_BUDGET_SECONDS,
@@ -206,14 +206,14 @@ def test_lock_acquire_bound_is_unreachable_under_each_bounded_caller(
     """Each caller the reachability paragraph names must time out before the lock bound.
 
     One param per enclosing deadline that the paragraph above
-    ``mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS`` calls unreachable; the
+    ``mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS`` calls unreachable; the
     derivation lives there, not here.
     """
-    lock_bound = mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS
+    lock_bound = mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS
 
     assert lock_bound > enclosing_deadline, (
         f'lock bound {lock_bound}s <= enclosing deadline {enclosing_deadline}s; '
         'see the reachability paragraph above '
-        'mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS and update it deliberately '
+        'mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS and update it deliberately '
         'rather than retuning a constant just to pass'
     )

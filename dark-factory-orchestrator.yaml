@@ -1625,10 +1625,15 @@ verify_cross_check_remote_green: false
 # Q7: cross-check 0 and red-confirm off after a zero-disagreement window, the 5416
 # precedent). The laptop side (verify_admission_task_slots: 1,
 # verify_admission_pytest_n: "8") lives in leo-laptop's dark-factory-laptop.yaml.
+# 2026-11-13, gate 6673 step 6, Leo's ruling (esc-6673-1): keep remote legs on, turn
+# red-confirm off, and keep the cross-check at 5 until task 7030 lands. 7030 gives the
+# laptop a pinned reify checkout; until then three reify-dependent guards can skip
+# there silently. The cross-check then goes to 0. Measurements:
+# plans/merge-lane-throughput-prd.measurements/2026-11-10-task-6673-remote-task-leg-window.md.
 verify_task_host_policy: remote_modules        # local | remote_modules | remote_all
 verify_task_remote_modules: [orchestrator]     # must be non-empty under remote_modules
-verify_task_remote_red_confirms_locally: true  # a remote red re-runs locally, local wins
-verify_task_remote_cross_check_every_n: 5      # every 5th remote verdict (per process) is re-run locally, local wins
+verify_task_remote_red_confirms_locally: false # off after the window (2 raw / 0 adjudicated splits)
+verify_task_remote_cross_check_every_n: 5      # kept until task 7030 lands, then 0
 # ROLLBACK: verify_task_host_policy: local (or delete the keys) + mcp__escalation__reload_config.
 
 # Pre-merge rebase: the merge phase only REBASES (Leo, 2026-10-09, task 6580).
@@ -1768,7 +1773,16 @@ convert_to_blocked_enforce: true
 # window. Restart-only, so it goes live at the next fleet restart.
 workflow_exit_contract_enforce: true
 
-psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
+# INTERIM (Leo 2026-11-13): raise the starvation watchdog's lock_refused/dual
+# threshold from the default 50 so a task must be refused in more scans before
+# it is announced. That cuts the post-restart bursts of the auto-pin cap L1
+# (plans/starvation-cap-study-2026-11-12.md). The cap itself stays 3. Task 9636
+# makes that L1 change-driven and restart-safe, and DELETES this block when it
+# lands. Green tier: applied with reload_config.
+starvation_watchdog:
+  skip_threshold: 150
+
+psi_admission:           # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
   mem_some_avg10: 15.0
   mem_full_avg10: 3.0
   io_some_avg10: 40.0

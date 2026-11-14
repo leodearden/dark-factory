@@ -161,6 +161,12 @@ _ALLOWED_RENAMERS = {
         'on (its durable= flag became fsync=); a follow-up may migrate it.',
     ('escalation/src/escalation/queue.py', 'EscalationQueue._archive_resolved'):
         'Moves a resolved file into the dated archive dir; not a write path.',
+    ('orchestrator/src/orchestrator/git_ops.py', 'GitOps._rename_unregistered'):
+        'MOVES an existing worktree DIRECTORY into quarantine_base (task 4845): '
+        'the dir git no longer lists as a worktree, so `git worktree move` '
+        'refuses it. There is no content to write, only a tree to relink, and '
+        'os.rename is chosen so a cross-device destination fails rather than '
+        'copying a warm lane build tree.',
     ('escalation/src/escalation/sweep.py', '_atomic_move'):
         'Out of task 3223 enumerated scope; moves an existing file, does not write.',
     ('orchestrator/src/orchestrator/digest.py', 'write_digest_entry'):

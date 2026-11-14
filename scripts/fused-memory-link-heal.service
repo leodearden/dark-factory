@@ -1,0 +1,14 @@
+[Unit]
+Description=Scheduled link-heal sweep: adjudicate new write-triage children, record, report; writes gated on calibration (task 7159)
+Documentation=file:///home/leo/src/dark-factory/fused-memory/scripts/link_heal.py
+Documentation=file:///home/leo/src/dark-factory/OPERATIONS.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/leo/src/dark-factory
+# The fleet's one PATH spelling, copied from fused-memory-flag-marker-sweep.service,
+# which records why a Persistent=true boot catch-up needs it.
+Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=/home/leo/src/dark-factory/scripts/fused-memory-link-heal.sh
+StandardOutput=journal
+StandardError=journal

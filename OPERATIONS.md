@@ -3225,6 +3225,7 @@ missing `LoadState` detector).
 
 | Slot | Job | Units |
 |---|---|---|
+| 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
 | 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
 | 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`) | `fused-memory-memory-eval.timer` |
@@ -3241,7 +3242,8 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones,
+for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
+02:15 one; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones,
 [Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one, and
 [The owner sweep timer (06:00) and its age](#the-owner-sweep-timer-0600-and-its-age) in §12a
 for the 06:00 one.
@@ -3266,6 +3268,121 @@ harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
 reconciliation. Those residual units do **not** collide with the new 04:30 job:
 they carry a different unit name, and a re-armed sweep would merely fail
 `203/EXEC` alongside it rather than contend for anything.
+
+### Nightly link-heal sweep (02:15)
+
+The sweep asks the link adjudicator about the write-triage links made since
+the last complete sweep, and heals the misfiled ones. The contract is
+`plans/write-triage-link-healing-prd.md` H1 and H2 (task 7159). Its four files are
+`scripts/fused-memory-link-heal.{sh,service,timer}` and
+`scripts/install-link-heal-timer.sh`, which kicks no immediate run. Installing
+it is the post-merge deterministic deploy described above. This section does
+not claim the timer is installed: `systemctl --user list-timers --all` is the
+check.
+
+- **What one run examines.** `fused-memory/scripts/link_heal.py sweep` plans
+  over every link in each project of `link_heal.projects` (else the home
+  project) whose child was created inside the run window. The window runs up
+  to now from the earliest start over the run's projects. A project's start is
+  the end of its unbroken run of complete sweeps, or
+  `link_heal.sweep_window_hours` back for a project no sweep has completed. A
+  run with a read or adjudication failure does not move the window, so the
+  next run examines those links again; when a project's first run was the
+  failed one, the next run starts from that run's start. A writing run's
+  report also counts the heals it wrote that earlier runs staged. A run over fewer projects leaves the
+  other projects' windows for the next run. A run starting after a project's
+  start (`--since`) leaves the gap before it, so the next run covers that gap.
+  A parent missing from its child's project is looked for in every project of
+  `link_heal.projects` as well as the ones examined, and one found there is
+  reported cross-project, never detached. A parent hosted in a project outside
+  `link_heal.projects` reads as absent, so list every project that hosts
+  parents there.
+  Examining a link again is harmless: verdicts are reused and pending heals are
+  deduped. A pending heal that a later run's verdict on the same link, at the
+  same texts, no longer supports is recorded `superseded` and never written:
+  the newest ruling stands. Only the heals in `link_heal.sweep_actions` (default `detach`,
+  `relabel`) are staged; every other heal is recorded as `not_enabled`.
+- **When it writes.** It writes only when `link_heal.writes: true` is set, no
+  `--dry-run` is given, and the latest calibration of the adjudicator's exact
+  model and prompt version passed. The prompt version is the sha256 of the
+  rendered system prompt together with `link_heal.field_chars`, the cap the
+  pair texts are cut to. The model is keyed as `link_heal.adjudicator_model`
+  spells it: an alias such as the default `opus` stays the same key when the
+  Claude CLI moves the alias to a newer model, so the old calibration and old
+  verdicts keep counting. Re-run `calibrate` after a CLI upgrade moves the
+  alias, or set `link_heal.adjudicator_model` to an exact model id.
+  Otherwise the report's Writes line says `dry-run` or
+  `withheld (uncalibrated)` / `withheld (calibration_failed)`, or
+  `withheld (plan_stopped)` when the run's own plan document could not be
+  written: nothing is written after that, older pending heals included. A writing run
+  keeps the per-run cap and the backlog, share-ceiling and write-failure
+  escapes, and also files the adjudicator failure storm. A verdict is reused
+  only by the same model and prompt version, so a model or brief change asks
+  again. At write time
+  (`fused-memory/src/fused_memory/maintenance/link_heal_executor.py::run_apply`)
+  every sweep heal whose verdict came from an adjudicator without a passing
+  calibration is withheld, not written. That includes a heal staged before a
+  model or brief change. Each one is recorded as `withheld_uncalibrated`, and the
+  report's Writes line counts them. A writing sweep withholds them before it
+  stages its own heals, so a link its window re-examines under a newly
+  calibrated adjudicator is staged afresh and written in the same run. A link
+  outside the window is not re-examined: after a recalibration, run
+  `link_heal.py sweep --since <the oldest withheld child's created_at>`. The
+  report's Writes line and its `withheld_heals.oldest_child_created_at` give
+  that time, and its tables count every heal the run withheld or superseded.
+- **Calibrate first, and again after any change of model, alias target, brief
+  or `link_heal.field_chars`.** From the
+  main checkout (the soak data is gitignored there):
+
+  ```bash
+  python fused-memory/scripts/link_heal.py calibrate \
+      --ratings data/write-triage-soak-2026-10-19/correctness/adjudications.jsonl \
+      --items data/write-triage-soak-2026-10-19/correctness/items_all.json
+  ```
+
+  It asks the adjudicator about every rated pair and scores the misfile and
+  CORRECTS binaries against the final rater verdict. A binary passes when its
+  kappa is at least the raters' own kappa, minus
+  `link_heal.calibration_kappa_margin` (0.10). The raters' kappa is the second
+  rater against the primary, recomputed from the file. That floor applies
+  pooled, and to each project with at least
+  `link_heal.calibration_min_project_items` (60) rated pairs. At most 5% of
+  pairs may go unanswered. Exit 0 is a pass. Exit 1 is a fail, and files a
+  blocking `link-heal-calibration` escalation naming the report.
+- **Run it by hand.** `link_heal.py sweep [--dry-run] [--project P ...]`. The
+  one-off backlog run, covering everything since triage went live, is
+  `link_heal.py sweep --since 2026-10-11T00:00:00+00:00`. `--since` needs a UTC
+  offset. The cap drains a large backlog over several nights. To drain it at
+  once, review the latest sweep plan document that `status` lists, then run
+  `link_heal.py apply --sweep --approved-plan-sha <its sha>`. `apply --sweep`
+  is refused (exit 2) while `link_heal.writes` is off, and applies the same
+  write-time calibration gate.
+- **Undo.** A report whose run applied anything names that apply run as
+  `undo_run_id`, with the literal command
+  `fused-memory/scripts/link_heal.py undo --run <apply run id>`. The run-report
+  escalation prints the same command, from
+  `fused-memory/src/fused_memory/maintenance/link_heal_executor.py::undo_command`.
+- **What it leaves.**
+  - A JSON and a Markdown report,
+    `<reconciliation.data_dir>/link-heal-reports/link-heal-sweep-<date>-<run8>.{json,md}`.
+    They give counts by project × decision × verdict × action, the escapes
+    filed and would-escape, the window, the calibration status and the undo
+    run.
+  - One info escalation per run naming the report, or naming why the report
+    could not be written (the run then exits 1): category
+    `link_heal_run_report`, anchor `link-heal-run-report`, never folded.
+    Filing it dismisses the previous run's record if that is still pending, so
+    only the newest report is open work; every report stays on disk.
+  - The records, in `<reconciliation.data_dir>/link_heal.db`. Each examined
+    link has its child and parent exactly as read, the verdict with its
+    model, prompt version and reason, the decision and its disposition, and
+    each write's before and after snapshots. An undone heal keeps its action
+    and after-state and names the undo run that took it back. The records are
+    append-only and never pruned.
+- **Exit codes.** 0 when the run is complete, or partial only by the cap or
+  stale skips. 1 on a read, adjudication or write failure, a stopped run, or a
+  report it could not write.
+  2 when the run was refused before it started.
 
 ### Transcript secret sweep (02:30)
 

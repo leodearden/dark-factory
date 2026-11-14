@@ -3745,6 +3745,76 @@ class ShadowEvalConfig(BaseModel):
         return self.candidate_sample_rates.get(candidate, self.sample_rate)
 
 
+def _prefix_shape_problem(prefix: str) -> str | None:
+    """What makes *prefix* unusable as an unlimited-holder prefix, or None when it is well formed."""
+    if not prefix:
+        return 'must not be empty'
+    if not prefix.endswith('/'):
+        return 'must end in "/"'
+    if prefix.startswith('/'):
+        return 'must be relative (no leading "/")'
+    if '\\' in prefix:
+        return 'must use "/" separators, not "\\"'
+    problems = (_segment_problem(segment) for segment in prefix[:-1].split('/'))
+    return next((problem for problem in problems if problem), None)
+
+
+def _segment_problem(segment: str) -> str | None:
+    """What makes one path *segment* of a prefix match no lock key, or None."""
+    if segment in ('', '.', '..'):
+        return 'must not contain an empty, "." or ".." segment'
+    if segment != segment.strip():
+        return 'must not have a segment with leading or trailing whitespace'
+    if any(char in segment for char in '*?['):
+        return 'is a literal path, not a glob: no "*", "?" or "["'
+    return None
+
+
+class UnlimitedHolderLocksConfig(BaseModel):
+    """Lock keys any number of tasks may hold at once, chosen by rule rather than key by key.
+
+    Matched against the lock KEY, after ``normalize_lock`` at ``lock_depth``. Where
+    it sits among the other limits is stated once, at
+    ``orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._resolve_limit``.
+    The keys stay in every task's lock list; only their holder limit changes.
+    Off unless a project sets it. Restart tier, like ``module_overrides``.
+    """
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    prefixes: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            'Directory prefixes, each a relative path ending in "/". A key matches '
+            'when it lies under one or is that directory itself.'
+        ),
+    )
+    root_markdown: bool = Field(
+        default=False,
+        description='Also match every key at the repository root ending in ".md" (case-sensitive).',
+    )
+
+    @field_validator('prefixes')
+    @classmethod
+    def _well_formed_prefixes(cls, prefixes: tuple[str, ...]) -> tuple[str, ...]:
+        for prefix in prefixes:
+            problem = _prefix_shape_problem(prefix)
+            if problem:
+                raise ValueError(f'unlimited_holder_locks.prefixes entry {prefix!r} {problem}')
+        duplicates = sorted({prefix for prefix in prefixes if prefixes.count(prefix) > 1})
+        if duplicates:
+            raise ValueError(f'unlimited_holder_locks.prefixes lists {duplicates} more than once')
+        return prefixes
+
+    def takes_unlimited_holders(self, lock_key: str) -> bool:
+        """Whether *lock_key*, already normalised to ``lock_depth``, takes unlimited holders."""
+        if self.root_markdown and '/' not in lock_key and lock_key.endswith('.md'):
+            return True
+        return any(
+            lock_key.startswith(prefix) or lock_key == prefix[:-1] for prefix in self.prefixes
+        )
+
+
 # --- Top-level ---
 
 
@@ -3756,6 +3826,9 @@ class OrchestratorConfig(BaseSettings):
     max_per_module: int = Field(default=1)
     lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
+    unlimited_holder_locks: UnlimitedHolderLocksConfig = Field(
+        default_factory=UnlimitedHolderLocksConfig,
+    )
 
     # Run-forever idle poll cadence (seconds).  When the queue drains and the
     # orchestrator is running forever (no --until-idle), it idles and re-polls
@@ -4699,35 +4772,6 @@ class OrchestratorConfig(BaseSettings):
     orphan_l0_reaper_enabled: bool = Field(default=True)
     orphan_l0_timeout_secs: float = Field(default=600.0)
     orphan_l0_check_interval_secs: float = Field(default=60.0)
-    # Task 2931: freshness grace (seconds) for the divergence-class
-    # ``routing.latest`` liveness gate in the orphan-L0 reaper. The
-    # plan.files/metadata.files divergence false positive recurred after task
-    # 2878 because the lock-free ``reviewer_comprehensive`` /
-    # ``resettled_adjudicator`` stages hold no module locks and are absent
-    # from ``_dispatched``, so ``Scheduler.is_actively_held`` cannot see a task
-    # that is genuinely live mid-dispatch. Those stages DO stamp
-    # ``metadata.routing.latest.decided_at`` fresh per LLM invocation; if that
-    # timestamp is within this grace of the reaper's sweep ``now`` snapshot the
-    # task is live mid-dispatch and its divergence L0 is deferred (not
-    # promoted). Default 300s covers a single long reviewer/adjudicator
-    # invocation while staying well under ``orphan_l0_timeout_secs``=600, so a
-    # genuinely stranded task's stale decision still ages out and promotes.
-    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
-    orphan_l0_dispatch_freshness_secs: float = Field(default=300.0)
-    # Task 2991: freshness grace (seconds) for the merge-phase-liveness gate in
-    # the orphan-L0 divergence reaper. The divergence false positive recurred
-    # for MERGE-stage tasks (successor to task 2931): the pre-enqueue merge
-    # loop (rebase + scoped verify + queue submit) makes NO LLM calls, so it
-    # never refreshes ``metadata.routing.latest.decided_at`` — a legitimately
-    # live merge-stage task therefore fails the ``_has_fresh_dispatch`` gate
-    # and gets false-promoted. A durable ``metadata.merge_phase_liveness.
-    # entered_at`` stamp (restart-survivable, written at merge entry) is read
-    # by ``_has_fresh_merge_phase``; if within this grace of the sweep ``now``
-    # the divergence L0 is deferred (not promoted). Default 600.0 anchored to
-    # ``orchestrator_restart_merge_phase_grace_secs`` (the existing legitimate
-    # pre-enqueue merge-phase duration bound), not a guessed threshold.
-    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
-    orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
     # Info-L0 disposition router (plans/info-l0-disposition-router-prd.md
     # D5/D9/D12, plus beta's reviewer block): routes info-severity L0s at
@@ -6027,6 +6071,18 @@ class OrchestratorConfig(BaseSettings):
         return self
 
     @model_validator(mode='after')
+    def _unlimited_holder_prefixes_within_lock_depth(self) -> 'OrchestratorConfig':
+        too_deep = [
+            p for p in self.unlimited_holder_locks.prefixes if p.count('/') > self.lock_depth
+        ]
+        if too_deep:
+            raise ValueError(
+                f'unlimited_holder_locks.prefixes {too_deep} have more path components '
+                f'than lock_depth {self.lock_depth}, so no lock key can ever match them'
+            )
+        return self
+
+    @model_validator(mode='after')
     def _validate_verify_task_remote_modules(self) -> 'OrchestratorConfig':
         if self.verify_task_host_policy == 'remote_modules' and not self.verify_task_remote_modules:
             raise ValueError(
@@ -6875,15 +6931,6 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # failure-mode family and stay restart-only)
         'idle_poll_secs',
         'orphan_l0_timeout_secs',
-        # Task 2931: sibling of orphan_l0_timeout_secs — freshness grace for
-        # the divergence-class routing.latest liveness gate; hot-reloadable so
-        # the FP-suppression window can be tuned without a redeploy.
-        'orphan_l0_dispatch_freshness_secs',
-        # Task 2991: sibling of orphan_l0_dispatch_freshness_secs — freshness
-        # grace for the merge-phase-liveness gate in the divergence reaper;
-        # hot-reloadable so the merge-phase FP-suppression window can be tuned
-        # without a redeploy.
-        'orphan_l0_merge_phase_freshness_secs',
         # Siblings of orphan_l0_timeout_secs, read live on each sweep or exit:
         # a retune lands on the next routing pass, and the kill switch must not need a restart.
         'info_l0_router_enabled',

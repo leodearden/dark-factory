@@ -66,8 +66,11 @@ runs the full suite.
 - **Scanners ⊆ family is enforced**, by two mechanisms. For orchestrator,
   `orchestrator/tests/test_whole_tree_scan_timeout_guard.py` turns red on any
   detected `rglob`/`glob('*.py')` scanner that `is_whole_tree_guard_module`
-  does not admit. For fused-memory, shared, scripts/tests, tests/scripts and
-  tests/repo_guards, each tree's `test_repo_wide_guard_family.py` instance of
+  does not admit; the same check covers every module that consumes the shared
+  tree pass (`orchestrator/tests/_tree_scan.py`), so a guard that stops globbing
+  privately and joins the pass cannot drop out of the family either. For
+  fused-memory, shared, scripts/tests, tests/scripts and tests/repo_guards,
+  each tree's `test_repo_wide_guard_family.py` instance of
   `shared/src/shared/testing_repo_wide_tests.py::judge_repo_wide_family` turns
   red on any repo-wide test module outside the family. Without these checks a
   new scanner would silently drop out of task-role verify.

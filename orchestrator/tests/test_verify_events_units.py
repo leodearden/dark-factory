@@ -423,6 +423,8 @@ class TestImplementSiteWorkflowVerify:
         assert _workflow_verify_rows(store) == [{
             'passed': True,
             'tip_sha': _git(workflow.worktree, 'rev-parse', 'HEAD'),
+            'tip_sha_unresolved': False,
+            'tip_sha_unresolved_reason': None,
             'base_sha': _git(config.project_root, 'rev-parse', 'main'),
             'branch': f'task/{_TASK_ID}',
             'duration_ms': 12500,
@@ -473,6 +475,8 @@ class TestPreMergeSiteWorkflowVerify:
         assert _workflow_verify_rows(store) == [{
             'passed': passed,
             'tip_sha': tip,
+            'tip_sha_unresolved': False,
+            'tip_sha_unresolved_reason': None,
             'base_sha': main_tip,
             'branch': f'task/{_TASK_ID}',
             'duration_ms': 7000,

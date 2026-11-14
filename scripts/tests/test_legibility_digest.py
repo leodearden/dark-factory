@@ -2770,9 +2770,26 @@ class TestRenderDigest:
         assert meta['cwd'] == _DIGEST_CWD
         assert meta['date'] == '2026-07-11'
         assert meta['agent_class'] == 'interactive'
-        # No transcript path given -> encoded_dir falls back to the mirror of
-        # session_registry.encode_cwd (every '/', '.' and '_' maps to '-').
+        # No transcript path given -> encoded_dir falls back to
+        # inventory.encode_cwd (every '/', '.' and '_' maps to '-').
         assert meta['encoded_dir'] == '-home-leo-src-dark-factory'
+
+    # Observed on-disk ~/.claude/projects dir names, hard-coded as literals:
+    # an expected value computed by an encoder cannot catch that encoder's bug.
+    @pytest.mark.parametrize(('cwd', 'expected_dir'), [
+        ('/home/leo/src/dark-factory/.worktrees/2573', '-home-leo-src-dark-factory--worktrees-2573'),
+        ('/home/leo/src/warm-lanes/worktrees/_lane-39', '-home-leo-src-warm-lanes-worktrees--lane-39'),
+        ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
+    ])
+    def test_encoded_dir_fallback_matches_real_on_disk_dir_names(self, cwd, expected_dir):
+        records = [_with_session_meta(_user_text('hi'), cwd=cwd)]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['encoded_dir'] == expected_dir
 
     def test_encoded_dir_prefers_transcript_path_parent_dir_name(self, tmp_path):
         # An arbitrary dir name unrelated to cwd's mirror encoding, so a

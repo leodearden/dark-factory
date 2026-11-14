@@ -52,9 +52,7 @@ from fused_memory.memory_metadata import (
     parent_liveness_violation,
     validate_memory_metadata,
 )
-from fused_memory.middleware import (
-    dead_letter_escalator,  # a module import on purpose: see tests/middleware/test_dead_letter_escalator.py::TestImportsCleanlyOnItsOwn
-)
+from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware.dependency_direction_check import (
     DependencyDirectionFinding,
     build_dependency_index,
@@ -1526,7 +1524,7 @@ def _edge_to_dict(e: Any) -> dict:
 
 def _edge_is_retired(edge: Any) -> bool:
     """True when a graphiti-core ``EntityEdge``'s ``invalid_at`` is set — the
-    Python mirror of backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, which
+    Python mirror of backends/relates_to_schema.py::ACTIVE_EDGE_PREDICATE, which
     explains why ``expired_at`` is deliberately not consulted (a restored edge
     keeps it).
     """
@@ -8075,7 +8073,7 @@ class MemoryService:
         get_valid_edges_for_node traversal returns every valid edge for the
         resolved node uuid(s), uncapped. Both branches exclude invalidated
         edges (invalid_at set): the exact branch at the Cypher level
-        (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE), and the fuzzy
+        (backends/relates_to_schema.py::ACTIVE_EDGE_PREDICATE), and the fuzzy
         branch via `_edge_is_retired` applied to the search() results,
         mirroring search()'s own drop (task 312) — so neither branch surfaces
         superseded facts (task 2726). Neither filters on `expired_at`: a
@@ -8199,7 +8197,8 @@ class MemoryService:
         node_data = [_node_to_dict(n) for n in nodes]
         # Drop superseded edges (invalid_at set) so the fuzzy/semantic branch
         # presents the same valid-edge semantics as the exact/topological branch
-        # (get_valid_edges_for_node's Cypher _ACTIVE_EDGE_PREDICATE) and as
+        # (get_valid_edges_for_node's Cypher
+        # backends/relates_to_schema.py::ACTIVE_EDGE_PREDICATE) and as
         # search() (task 312) — otherwise an agent resolving via the fuzzy
         # fallback could silently act on a stale fact (task 2726).
         edge_data = [_edge_to_dict(e) for e in edges if not _edge_is_retired(e)]

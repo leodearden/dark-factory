@@ -1,0 +1,24 @@
+{
+  "task_id": "4845",
+  "reason": "review fix (esc-4845-3): an unregistered parking's .git gitfile is repointed at a never-created admin entry before the os.rename and restored if the move fails, so git in the parking cannot alias the live checkout a later git worktree add recreates at the same slot",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1524,
+      "current": 1528
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_unregistered",
+      "baseline": 9,
+      "current": 11
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5214,
+      "current": 5218
+    }
+  ]
+}

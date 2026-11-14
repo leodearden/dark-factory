@@ -13,6 +13,8 @@ from collections.abc import Callable, Iterable, Sequence, Set
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from orchestrator.escalation_rulings import ruling_resolution
+
 if TYPE_CHECKING:
     from escalation.models import Escalation
 
@@ -48,14 +50,14 @@ def select_carried_resolutions(
         CarriedResolution(
             escalation_id=e.id,
             summary=e.summary,
-            resolution=e.resolution,
+            resolution=resolution,
             resolved_at=e.resolved_at,
             resolved_by=e.resolved_by,
             resolution_action=e.resolution_action,
             answered_this_round=e.id not in resolved_before_round,
         )
         for e in ordered
-        if e.status == 'resolved' and e.resolution is not None
+        if (resolution := ruling_resolution(e)) is not None
     )
 
 

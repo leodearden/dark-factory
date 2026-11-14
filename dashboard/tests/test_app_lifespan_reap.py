@@ -64,7 +64,7 @@ class TestLifespanReapsDetachedBypassRefreshes:
         import dashboard.data.mcp_fanout as fanout_mod
 
         apply_isolated_env(monkeypatch, tmp_path)
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, 'LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
 
         wedged: dict[str, asyncio.Task] = {}
         observed: dict[str, bool] = {}

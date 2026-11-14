@@ -34,6 +34,20 @@ __all__ = [
 # `timeout_method`, retuning the ceiling, or revising the measurements is one
 # edit rather than one per member.
 #
+# WHAT THE ORCHESTRATOR FAMILY IS (task 4600): the consumers of the one shared
+# tree pass (orchestrator/tests/_tree_scan.py::TreePass, served by
+# orchestrator/tests/conftest.py's session `tree_pass` fixture), plus the one
+# permanent private sweeper and test_merge_lane_ratchet.py, both named with
+# their reasons in orchestrator/tests/test_whole_tree_scan_timeout_guard.py.
+# For a consumer, the per-item cost this ceiling must clear is no longer a
+# sweep of its own but the SHARED PASS: one streaming read of the union of
+# every requested analysis's file set, each file parsed at most once and
+# walked only by the analyses whose `ParsedModule.may_name` prefilter cannot
+# rule it out, billed to whichever consumer item requests `tree_pass` first on
+# its worker, while every later consumer item projects facts already held.
+# Any consumer may be the item billed, which is why each one carries this
+# mark however cheap its own tests are.
+#
 # It is the pyproject's own sanctioned escape hatch -- "Slow tests opt out
 # with `@pytest.mark.timeout(N)`", the comment on
 # `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- applied
@@ -42,7 +56,8 @@ __all__ = [
 # default).  A tighter decorator still WINS where one is present, so the
 # module mark narrows nothing.  Coverage of the family is ENFORCED, not
 # sprinkled: orchestrator/tests/test_whole_tree_scan_timeout_guard.py
-# recomputes the census from source on every run and fails a scanner that
+# recomputes the census (private sweepers and shared-pass consumers) from
+# source on every run and fails a member that
 # lacks the mark OR pins it below this ceiling, and
 # shared/src/shared/testing_repo_wide_tests.py::judge_repo_wide_family fails
 # every unmarked repo-wide test module in the other packages' tests.

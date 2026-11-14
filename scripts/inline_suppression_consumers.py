@@ -242,21 +242,24 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
 #: defines it.  These are not ruff codes at all — no selector can ever match a
 #: kebab-case token — so they are resolved AHEAD of the ruff path.
 #:
-#: A SECOND COPY OF A PRIVATE CONSTANT, knowingly.  The source of truth is
-#: `_RULE_A_CODE` / `_RULE_B_CODE` / `_RULE_C_CODE` in a stdlib-only script in
-#: another package, which offers no public seam to import; a copy is
+#: A SECOND COPY OF A PRIVATE CONSTANT, knowingly.  The source of truth is each
+#: stdlib-only fused-memory/scripts checker's private rule-code constant — the
+#: checkers that honour `fused-memory/scripts/_lint_cli.py::is_exempted`'s
+#: pragma grammar.  They offer no public seam to import; a copy is
 #: unavoidable, so heuristic 11 asks that its DRIFT be made loud rather than
 #: that the copy be hidden.  The guard is behavioural and bidirectional:
-#: `scripts/tests/test_inline_suppression_consumers.py` runs that checker over one
-#: fixture per rule and asserts SET EQUALITY between the codes it emits and this
-#: table.  Equality, not containment — a table that merely holds real codes can
-#: still MISS one, which is the expensive direction (the scanner would tell an
-#: author to delete a marker a live checker reads).
+#: `scripts/tests/test_inline_suppression_consumers.py` runs EVERY checker this
+#: table names over one fixture per rule and asserts, per checker, SET
+#: EQUALITY between the codes it emits and this table.  Equality, not
+#: containment — a table that merely holds real codes can still MISS one,
+#: which is the expensive direction (the scanner would tell an author to
+#: delete a marker a live checker reads).
 FIRST_PARTY_CODES: Mapping[str, str] = MappingProxyType(
     {
         'bare-magicmock': 'fused-memory/scripts/check_bare_magicmock_config.py',
         'bare-dataclass-double': 'fused-memory/scripts/check_bare_magicmock_config.py',
         'wall-clock-deadline': 'fused-memory/scripts/check_bare_magicmock_config.py',
+        'module-local-testclient': 'fused-memory/scripts/check_module_local_testclient.py',
     }
 )
 

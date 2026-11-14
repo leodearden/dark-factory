@@ -1298,42 +1298,6 @@ class TestCheckScopeInvariant:
         assert esc.severity == 'blocking', 'PRD D11 keeps the gate'
         assert esc.category == 'infra_issue', 'PRD D11 keeps the gate'
 
-    async def test_divergence_escalation_still_matches_orphan_reaper_predicate(
-        self, config, git_ops, task_assignment, tmp_path,
-    ):
-        """Coupling pin (guards step-4's edit of the submission site): the
-        record filed by the unsafe-direction path must still match
-        ``harness._is_scope_divergence_orphan``, which discriminates the
-        whole plan.files/metadata.files divergence class on the summary
-        substring 'plan.files/metadata.files divergence detected'
-        (harness.py:696-722, documented there as the unique robust
-        discriminator). Without this pin a future summary re-word would
-        silently break the orphan-L0 reaper's handling of this class. This
-        test passes on the base branch by construction — a deliberate
-        characterization guard added while the submission site is in flux —
-        and must stay green through step-4.
-        """
-        from orchestrator.harness import _is_scope_divergence_orphan
-
-        plan_files = ['a.py', 'b.py']
-        metadata_files = ['a.py']
-        workflow, scheduler, queue = self._arrange(
-            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
-        )
-
-        await workflow._check_scope_invariant()
-
-        pending = queue.get_by_task(task_assignment.task_id, status='pending')
-        infra_issues = [e for e in pending if e.category == 'infra_issue']
-        assert infra_issues, (
-            f'expected an infra_issue escalation; pending={pending!r}'
-        )
-        assert _is_scope_divergence_orphan(infra_issues[0]), (
-            'the escalation filed by the unsafe-direction path must still '
-            'match the orphan-L0 reaper predicate — a future summary '
-            're-word would silently break its divergence-class handling'
-        )
-
     async def test_empty_plan_files_with_nonempty_metadata_escalates(
         self, config, git_ops, task_assignment, tmp_path,
     ):

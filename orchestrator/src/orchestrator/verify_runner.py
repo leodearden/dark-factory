@@ -88,8 +88,8 @@ from orchestrator.task_verify_spec import (
 )
 from orchestrator.verify import (
     VerifyResult,
-    _archive_merge_verify_logs,
     _target_subprocess_env,
+    archive_verify_logs,
 )
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
@@ -2142,9 +2142,9 @@ class RemoteRunner:
     ) -> list[Path]:
         """Archive *result*'s captured test/lint/type output streams under *archive*.
 
-        Mirrors verify._archive_merge_verify_logs by projecting the three VerifyResult
+        Mirrors verify.archive_verify_logs by projecting the three VerifyResult
         output fields into synthetic per-stream run dicts, one per NON-EMPTY stream.
-        Delegates to _archive_merge_verify_logs so filenames, the microsecond UTC timestamp,
+        Delegates to archive_verify_logs so filenames, the microsecond UTC timestamp,
         and the summary.json shape are byte-identical to local merge-verify archives.
 
         Filename convention (task 1921):
@@ -2166,7 +2166,7 @@ class RemoteRunner:
 
         Best-effort: any exception is swallowed with a WARNING (returning ``[]``) so
         the caller's VerifyResult is always returned unchanged (PRD §A Invariant 5).
-        _archive_merge_verify_logs already swallows OSError internally; this outer
+        archive_verify_logs already swallows OSError internally; this outer
         guard additionally swallows non-OSError failures as a backstop (task 1921 step-4).
         """
         try:
@@ -2195,7 +2195,7 @@ class RemoteRunner:
             # result.timed_out=True when a timeout occurred.  Distinguishability in the
             # emitted summary.json depends on the remote host honouring this contract;
             # this method threads the fields through verbatim but cannot enforce them.
-            return _archive_merge_verify_logs(
+            return archive_verify_logs(
                 runs,
                 archive.root,
                 archive.task_id,

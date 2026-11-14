@@ -451,13 +451,12 @@ ref holding pre-rebase shas none of which is on main. What decides it is whether
 - an in-window `done`/`already_merged` from `merge_request` that carries a `request_id`; its
   `commit`, when present, is the sha.
 
-A polled request_id-arm `done` from the event-store tier carries no top-level `merge_sha`. The
-request's recorded landing sha is `last_outcome.merge_sha`, valid when `last_outcome.state` is
-`done` and `last_outcome.branch` names `task/<TASK_ID>`
-(`escalation/src/escalation/merge_status_answer.py::LastOutcome`); on the rebased path it is the
-rebased tip. **Never** take the sha from a record-sourced `branch`/`task_id`-arm answer
-(`last_outcome`, event-store rows): those resolve to the newest record for the branch, which can
-be a prior round's. A `source: "git"` `found_on_main` answer is not record-sourced; the
+A polled request_id-arm `done` from the event-store tier (`source: "event_store"`) carries the
+request's recorded landing sha as its top-level `merge_sha`
+(`escalation/src/escalation/server.py::merge_status`, its current-run tier). On the rebased path
+it is the rebased tip. **Never** take the sha from a record-sourced `branch`/`task_id`-arm answer
+(its top-level `merge_sha` beside `source: "event_store"`, or `last_outcome`): those resolve to
+the newest record for the branch, which can be a prior round's. A `source: "git"` `found_on_main` answer is not record-sourced; the
 no-request-scoped-`done` bullet below says how to use it.
 
 Holding that sha as `<MERGE_SHA>`, run all four lines:
@@ -528,8 +527,8 @@ empty output from a tip that is not an ancestor of main as `not_landed`.
       aborts). It never licenses `merge_cancel`: a single-commit branch that landed rebased with
       context drift prints exactly one `+` line, which is this same output, so `git cherry` alone
       cannot exclude a landing.
-- **No `last_outcome.merge_sha`** (absent or null, e.g. the rebase+fast-forward no-marker shape)
-  is expected to be rare. It routes to **landing-unattributable**: a human derives and stamps it
+- **No sha on the request-scoped `done`** (no `merge_sha` on a polled one, no `commit` on an
+  in-window one; e.g. the rebase+fast-forward no-marker shape) is expected to be rare. It routes to **landing-unattributable**: a human derives and stamps it
   (`git cherry` all `-` plus a diff check).
 
 <a id="landing-unattributable"></a>
