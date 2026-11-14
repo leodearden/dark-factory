@@ -79,7 +79,7 @@ class TestFirstSight:
         assert anchors.tracked_ids() == frozenset()
         assert [anchors.age(tid, 100) for tid in ('5', '6', '7')] == [0, 0, 0]
 
-    def test_a_terminal_observation_leaves_a_held_anchor_alone(self, tmp_path: Path):
+    def test_a_terminal_observation_leaves_a_tracked_anchor_alone(self, tmp_path: Path):
         anchors = AgeAnchors(tmp_path)
         anchors.observe([_task('5', pending_since=_FILED)], 100)
 
@@ -185,6 +185,19 @@ class TestWrites:
         writes.clear()
         anchors.observe(tasks, 200)
         assert writes.count(_guard(tmp_path)) == 0
+
+    def test_a_restart_that_finds_every_stamp_changed_writes_once(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        ids = [str(tid) for tid in range(100, 150)]
+        AgeAnchors(tmp_path).observe([_task(tid, pending_since=_FILED) for tid in ids], 200)
+        restarted = AgeAnchors(tmp_path)
+        writes = _spy_on_writes(monkeypatch)
+
+        resets = restarted.observe([_task(tid, pending_since=_REOPENED) for tid in ids], 300)
+
+        assert set(resets) == set(ids)
+        assert writes.count(_guard(tmp_path)) == 1
 
     def test_a_mass_departure_writes_once_and_departing_nothing_never(
         self, tmp_path: Path, monkeypatch,

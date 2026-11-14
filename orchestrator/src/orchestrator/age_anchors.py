@@ -20,7 +20,7 @@ from orchestrator.task_status import TERMINAL_STATUSES
 AGE_ANCHORS_FILE = 'scheduler_age_anchors.json'
 
 # How long a record outlives the last write that recorded it.  Every write
-# re-records every held anchor, so only a departed task's record expires, or a
+# re-records every tracked anchor, so only a departed task's record expires, or a
 # live one through a whole TTL with no write; a restart then re-anchors that
 # task to its own id.
 AGE_ANCHOR_TTL = timedelta(days=30)
@@ -69,8 +69,8 @@ class AgeAnchor:
 
 
 class AgeAnchors:
-    """The held anchors of the active fetch, and the durable record of every
-    anchor, held or departed.  A ``None`` *project_root* keeps it in memory."""
+    """The tracked anchors of the active fetch, and the durable record of every
+    anchor, tracked or departed.  A ``None`` *project_root* keeps it in memory."""
 
     def __init__(
         self,
@@ -78,18 +78,18 @@ class AgeAnchors:
         *,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        self._held: dict[str, AgeAnchor] = {}
+        self._tracked: dict[str, AgeAnchor] = {}
         self._records = PersistentMap(
             guard_path(project_root, AGE_ANCHORS_FILE), ttl=AGE_ANCHOR_TTL, now=now,
         )
 
     def observe(self, tasks: Iterable[Mapping], max_id: int) -> Mapping[str, AgeAnchor]:
-        """Hold one anchor per active task in *tasks*; return the resets applied.
+        """Track one anchor per active task in *tasks*; return the resets applied.
 
         - A task with an empty or terminal status is skipped: it is not an
           observation of the active population, and recording its departure
           is :meth:`record_departures`' job alone.
-        - Any other task keeps its known anchor: the held one, else the
+        - Any other task keeps its known anchor: the tracked one, else the
           recorded one, else its own numeric id (so a genuinely-old task
           carries its accumulated age), else *max_id*.  So a requeue, an
           unblock, an undefer, an infra-hold resume, a done reopen and a
@@ -111,7 +111,7 @@ class AgeAnchors:
             if not tid or not status or status in TERMINAL_STATUSES:
                 continue
             stamp = _pending_since(t)
-            stored = self._held.get(tid) or AgeAnchor.from_record(self._records.get(tid))
+            stored = self._tracked.get(tid) or AgeAnchor.from_record(self._records.get(tid))
             known = stored or AgeAnchor(int(tid) if tid.isdecimal() else max_id, stamp)
             if known.is_reset_by(stamp):
                 current = AgeAnchor(max_id, stamp)
@@ -120,36 +120,36 @@ class AgeAnchors:
                 current = AgeAnchor(known.anchor, stamp or known.pending_since)
             if current != stored:
                 changed[tid] = current
-            self._held[tid] = current
+            self._tracked[tid] = current
         self._record(changed)
         return resets
 
     def record_departures(self, task_ids: Iterable[str]) -> None:
-        """Stop holding each of *task_ids* and record its anchor, so a return
-        restores it.  An id not held is ignored."""
-        departed = {tid: self._held.pop(tid) for tid in task_ids if tid in self._held}
+        """Stop tracking each of *task_ids* and record its anchor, so a return
+        restores it.  An untracked id is ignored."""
+        departed = {tid: self._tracked.pop(tid) for tid in task_ids if tid in self._tracked}
         self._record(departed)
 
     def age(self, task_id: str, max_id: int) -> int:
-        """The task's age in newer-task-count units; 0 when it is not held."""
-        held = self._held.get(task_id)
-        if held is None:
+        """The task's age in newer-task-count units; 0 when it is untracked."""
+        tracked = self._tracked.get(task_id)
+        if tracked is None:
             return 0
-        return max(0, max_id - held.anchor)
+        return max(0, max_id - tracked.anchor)
 
     def tracked_ids(self) -> frozenset[str]:
-        return frozenset(self._held)
+        return frozenset(self._tracked)
 
     def _record(self, records: Mapping[str, AgeAnchor]) -> None:
-        """Write *records*, and every held anchor with them, in ONE write.
+        """Write *records*, and every tracked anchor with them, in ONE write.
 
         One write, because each write rewrites the whole file: a cold start
         or a mass departure of N tasks would otherwise perform N writes of an
-        N-entry file.  Re-recording the held anchors adds no write and
+        N-entry file.  Re-recording the tracked anchors adds no write and
         refreshes their TTL, so a task that stays in the fetch keeps its
         record while any write lands within ``AGE_ANCHOR_TTL``.  No records,
         no write.
         """
         if not records:
             return
-        self._records.put_many({tid: a.to_record() for tid, a in {**self._held, **records}.items()})
+        self._records.put_many({tid: a.to_record() for tid, a in {**self._tracked, **records}.items()})

@@ -32,7 +32,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import shared.safe_io as _safe_io
 from _lane_episode_fakes import Clock, FakeLedgerClient
 from _merge_lane_fakes import lane_scene_config
 from _orch_helpers import make_placeholder_future, pydantic_spec
@@ -696,21 +695,10 @@ async def _tick(scheduler, tasks: list[dict]) -> str | None:
     return assignment.task_id if assignment is not None else None
 
 
-def _spy_on_guard_writes(monkeypatch) -> list:
-    calls: list = []
-    real = _safe_io.atomic_write_text
-
-    def recorder(path, text, **kwargs):
-        calls.append(path)
-        return real(path, text, **kwargs)
-
-    monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
-    return calls
-
-
 class TestResurrectionAnchorSurvivesRedeploy:
-    """``Scheduler.age_anchors`` is driven directly, so the assertion is about
-    the anchor and nothing else."""
+    """A second Scheduler on the same ``project_root`` restores the age
+    anchors the first recorded.  The anchor rules themselves are pinned in
+    test_age_anchors.py."""
 
     def test_a_resurrected_task_does_not_re_acquire_its_age_bonus(self, guard_clock):
         """On main the fresh scheduler anchors '100' to ``int('100')``, giving
@@ -725,60 +713,6 @@ class TestResurrectionAnchorSurvivesRedeploy:
         redeployed.age_anchors.observe([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
         assert redeployed.age_anchors.age('100', _MAX_ID) == 0
-
-    def test_a_genuinely_old_pending_task_keeps_its_age(self, guard_clock):
-        """The property the fix must not break."""
-        redeployed = _scheduler()
-        redeployed.age_anchors.observe([_task('200')], _MAX_ID)
-
-        assert redeployed.age_anchors.age('200', _MAX_ID) == _MAX_ID - 200
-
-    def test_a_non_numeric_id_anchors_to_max_id_either_way(self, guard_clock):
-        """Pins the third branch across the change."""
-        first = _scheduler()
-        first.age_anchors.observe([_task('epic-a', status='cancelled')], _MAX_ID)
-
-        redeployed = _scheduler()
-        redeployed.age_anchors.observe([_task('epic-a')], _MAX_ID)
-        redeployed.age_anchors.observe([_task('epic-b')], _MAX_ID)
-
-        assert redeployed.age_anchors.age('epic-a', _MAX_ID) == 0
-        assert redeployed.age_anchors.age('epic-b', _MAX_ID) == 0
-
-    @pytest.mark.asyncio
-    async def test_a_cold_start_writes_once_and_a_steady_state_tick_not_at_all(
-        self, guard_clock, monkeypatch,
-    ):
-        """The two halves of one property, measured from the same spy.
-
-        The COLD START is a first tick that finds N stamps changed while the
-        process was down, inline on the event loop.  Its N resets are
-        batched, so it pays one write rather than N writes of an N-entry file.
-        The STEADY STATE re-observes the same ids every ~15s, which is
-        the difference between a quiet guard and a file rewritten ~5,760 times
-        a day.  Spying from BEFORE the first call is what makes the cold start
-        assertable at all.
-        """
-        ids = range(1000, 1200)
-        first = _scheduler()
-        await _tick(first, [_task(str(tid), 'in-progress', _FILED) for tid in ids])
-        await _tick(first, [_task('99', 'in-progress')])
-
-        cold_start = [_task(str(tid), pending_since=_REOPENED) for tid in ids]
-        scheduler = _scheduler()
-
-        writes = _spy_on_guard_writes(monkeypatch)
-        scheduler.age_anchors.observe(cold_start, _MAX_ID)
-
-        assert len(writes) == 1, (
-            f'a cold start of {len(cold_start)} observations must be one write,'
-            f' got {len(writes)}'
-        )
-
-        writes.clear()
-        scheduler.age_anchors.observe(cold_start, _MAX_ID)
-
-        assert writes == [], 'a re-observation of an unchanged observation must be silent'
 
     @pytest.mark.asyncio
     async def test_the_guard_expires(self, guard_clock):
