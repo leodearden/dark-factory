@@ -21,7 +21,7 @@ INV-11 `no-silent-fail-soft`, INV-4 `storm-escape-required`, INV-9
 
 > **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: the lane no longer files an L0 info at filing; it raises one level-1 `dependency_discovered` escalation per covering task after `git.offline_lane_red_unlanded_hours` (D11).
 
-> **Amended 2026-11-14** (task 5226): scope-divergence is not an info class. `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._escalate_scope_invariant_violation` files `severity='blocking'` by design (plans/task-escalation-state-graph-prd.md D11: the scope gate is real and stays), so this PRD never routes it. The substrate row "Mechanical info filers are enumerable by role" and D8 are corrected to drop it; `escalation/src/escalation/classify.py::INFO_L0_MECHANICAL_ROLES` never carried it.
+> **Amended 2026-11-14** (task 5226): scope-divergence is not an info class. `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._escalate_scope_invariant_violation` files `severity='blocking'` by design (plans/task-escalation-state-graph-prd.md D11: the scope gate is real and stays), so this PRD never routes it. The substrate row "Mechanical info filers are enumerable by role" and D8 are corrected to drop it; `escalation/src/escalation/classify.py::INFO_L0_MECHANICAL_ROLES` never carried it. As built, that frozenset holds the mechanical roles only. The done-step class is not a member: it is the second arm of `escalation/src/escalation/classify.py::info_l0_mechanical_class`.
 
 **Code anchors** verified against main `a24b1fb665` (2026-09-08). Main moves
 fast — cite-by-symbol; re-locate at implementation time.
