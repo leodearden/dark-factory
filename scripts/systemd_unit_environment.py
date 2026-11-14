@@ -57,9 +57,22 @@ def _single_object_path(data: object) -> str:
     raise ValueError(f'expected one object path, got {data!r}')
 
 
+def _path_flag_pairs(data: object) -> tuple[tuple[str, bool], ...]:
+    if isinstance(data, list) and all(
+        isinstance(entry, list)
+        and len(entry) == 2
+        and isinstance(entry[0], str)
+        and isinstance(entry[1], bool)
+        for entry in data
+    ):
+        return tuple((entry[0], entry[1]) for entry in data)
+    raise ValueError(f'expected a list of [path, flag] pairs, got {data!r}')
+
+
 _STRINGS = _ReplyType('as', _strings)
 _UINT32 = _ReplyType('u', _integer)
 _UINT64 = _ReplyType('t', _integer)
+_PATH_FLAG_PAIRS = _ReplyType('a(sb)', _path_flag_pairs)
 _LOAD_UNIT_REPLY = _ReplyType('o', _single_object_path)
 
 
@@ -129,12 +142,18 @@ def read_process_environ(pid: int, *, proc_root: Path = _DEFAULT_PROC_ROOT) -> d
 class Verdict(enum.Enum):
     MATCHES = enum.auto()
     DRIFTED = enum.auto()
+    NOT_RUNNING = enum.auto()
+    INDETERMINATE = enum.auto()
 
 
 _VERDICT_MEANINGS: Mapping[Verdict, str] = {
     Verdict.MATCHES: 'the running process has the value a restart would give',
     Verdict.DRIFTED: (
         'the running process predates the current value; restarting the unit picks it up'
+    ),
+    Verdict.NOT_RUNNING: 'the unit has no running process to compare',
+    Verdict.INDETERMINATE: (
+        'inputs systemd does not expose over D-Bus decide the value a restart would give'
     ),
 }
 
@@ -144,6 +163,14 @@ class LiveEnviron:
     pid: int
     started_at: datetime | None
     values: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class NoLiveProcess:
+    pass
+
+
+LiveLayer = LiveEnviron | NoLiveProcess
 
 
 @dataclass(frozen=True)
@@ -158,29 +185,64 @@ class VariableReport:
 
 @dataclass(frozen=True)
 class UnitEnvironment:
-    """One unit's environment layers: the manager block, the unit's Environment=, the live process."""
+    """One unit's environment layers: the manager block, the unit's Environment=, the live process.
+
+    *unmodelled* names the unit's EnvironmentFile=, PassEnvironment= and
+    UnsetEnvironment= inputs, whose effect on a restart is not visible over D-Bus.
+    """
 
     unit: str
     manager: Mapping[str, str]
     assignments: Mapping[str, str]
-    live: LiveEnviron
+    unmodelled: tuple[str, ...]
+    live: LiveLayer
 
     def variable(self, name: str) -> VariableReport:
-        restart_value = self.assignments.get(name, self.manager.get(name))
-        live_value = self.live.values.get(name)
-        verdict = Verdict.MATCHES if restart_value == live_value else Verdict.DRIFTED
+        restart_value = self._restart_value(name)
+        live_value = self.live.values.get(name) if isinstance(self.live, LiveEnviron) else None
         return VariableReport(
             name=name,
             manager_value=self.manager.get(name),
             unit_value=self.assignments.get(name),
             restart_value=restart_value,
             live_value=live_value,
-            verdict=verdict,
+            verdict=self._verdict(restart_value, live_value),
         )
+
+    def _restart_value(self, name: str) -> str | None:
+        if self.unmodelled:
+            return None
+        return self.assignments.get(name, self.manager.get(name))
+
+    def _verdict(self, restart_value: str | None, live_value: str | None) -> Verdict:
+        if isinstance(self.live, NoLiveProcess):
+            return Verdict.NOT_RUNNING
+        if self.unmodelled:
+            return Verdict.INDETERMINATE
+        return Verdict.MATCHES if restart_value == live_value else Verdict.DRIFTED
 
 
 def _started_at(microseconds: int) -> datetime | None:
     return _EPOCH + timedelta(microseconds=microseconds) if microseconds else None
+
+
+def _unmodelled_inputs(manager: _UserManager, path: str) -> tuple[str, ...]:
+    files = manager.unit_property(path, _SERVICE_INTERFACE, 'EnvironmentFiles', _PATH_FLAG_PAIRS)
+    passed = manager.unit_property(path, _SERVICE_INTERFACE, 'PassEnvironment', _STRINGS)
+    unset = manager.unit_property(path, _SERVICE_INTERFACE, 'UnsetEnvironment', _STRINGS)
+    return (
+        *(f'EnvironmentFile={"-" if optional else ""}{file}' for file, optional in files),
+        *(f'PassEnvironment={name}' for name in passed),
+        *(f'UnsetEnvironment={name}' for name in unset),
+    )
+
+
+def _live_layer(manager: _UserManager, path: str, proc_root: Path) -> LiveLayer:
+    pid = manager.unit_property(path, _SERVICE_INTERFACE, 'MainPID', _UINT32)
+    if pid == 0:
+        return NoLiveProcess()
+    started = manager.unit_property(path, _SERVICE_INTERFACE, 'ExecMainStartTimestamp', _UINT64)
+    return LiveEnviron(pid, _started_at(started), read_process_environ(pid, proc_root=proc_root))
 
 
 def inspect_unit(
@@ -193,14 +255,12 @@ def inspect_unit(
     manager = _UserManager(timeout_secs)
     path = manager.load_unit_path(unit)
     environment = manager.unit_property(path, _SERVICE_INTERFACE, 'Environment', _STRINGS)
-    pid = manager.unit_property(path, _SERVICE_INTERFACE, 'MainPID', _UINT32)
-    started = manager.unit_property(path, _SERVICE_INTERFACE, 'ExecMainStartTimestamp', _UINT64)
-    live = LiveEnviron(pid, _started_at(started), read_process_environ(pid, proc_root=proc_root))
     return UnitEnvironment(
         unit=unit,
         manager=parse_assignments(manager.environment()),
         assignments=parse_assignments(environment),
-        live=live,
+        unmodelled=_unmodelled_inputs(manager, path),
+        live=_live_layer(manager, path, proc_root),
     )
 
 
@@ -208,26 +268,38 @@ def _shown(value: str | None, absent: str = '(not set)') -> str:
     return absent if value is None else value
 
 
+def _live_header(live: LiveLayer) -> str:
+    if isinstance(live, NoLiveProcess):
+        return 'live process: not running'
+    when = live.started_at.isoformat() if live.started_at is not None else 'start time unknown'
+    return f'live process: pid {live.pid}, started {when}'
+
+
 def _header(env: UnitEnvironment) -> list[str]:
-    started = env.live.started_at
-    when = started.isoformat() if started is not None else 'start time unknown'
-    return [f'unit: {env.unit}', f'live process: pid {env.live.pid}, started {when}']
+    lines = [f'unit: {env.unit}', _live_header(env.live)]
+    if env.unmodelled:
+        lines.append(
+            f'not modelled: {", ".join(env.unmodelled)} (effect not visible over D-Bus)'
+        )
+    return lines
 
 
-def _variable_lines(report: VariableReport) -> list[str]:
+def _variable_lines(env: UnitEnvironment, report: VariableReport) -> list[str]:
+    restart = 'unknown (see "not modelled" above)' if env.unmodelled else _shown(report.restart_value)
+    live = _shown(report.live_value) if isinstance(env.live, LiveEnviron) else '(not running)'
     return [
         report.name,
         f'  manager now:   {_shown(report.manager_value)}',
         f'  unit sets:     {_shown(report.unit_value, "(not set by unit)")}',
-        f'  restart gets:  {_shown(report.restart_value)}',
-        f'  live process:  {_shown(report.live_value)}',
+        f'  restart gets:  {restart}',
+        f'  live process:  {live}',
         f'  verdict:       {report.verdict.name}: {_VERDICT_MEANINGS[report.verdict]}',
     ]
 
 
 def render(env: UnitEnvironment, names: Iterable[str]) -> str:
     """A header for the unit, then one block per variable in *names*."""
-    blocks = [_header(env), *(_variable_lines(env.variable(name)) for name in names)]
+    blocks = [_header(env), *(_variable_lines(env, env.variable(name)) for name in names)]
     return '\n\n'.join('\n'.join(block) for block in blocks)
 
 
