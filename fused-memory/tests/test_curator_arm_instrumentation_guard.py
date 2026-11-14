@@ -1,4 +1,4 @@
-"""Structural guards on how ``task_curator.py`` fails open, or defers.
+"""Structural guards on how the curator and the task interceptor fail open, or defer.
 
 All four guard one hazard: a curation that no judgement stands behind, yet
 which no signal distinguishes from a healthy one.
@@ -13,8 +13,10 @@ which no signal distinguishes from a healthy one.
    directly.
 2. No ``TaskCurator`` method builds an ``action='create'`` decision except the
    ``_degraded_create`` funnel, which is what advances the degraded streak.
-3. Every ``CuratorDecision(action='create', ...)`` in the module states its
-   ``degraded=`` classification explicitly, as a literal.
+3. Every ``CuratorDecision(action='create', ...)`` in ``task_curator.py``
+   and in ``task_interceptor.py`` states its ``degraded=`` classification
+   explicitly, as a literal. In the interceptor that literal decides whether
+   the created task carries the ``dedupe_skipped`` marker.
 4. ``CuratorDecision.deferred`` (in ``curator_types.py``) is the only builder
    of ``action='defer'`` in the vocabulary, the curator and the interceptor, so
    every defer carries a ``DeferReason``.
@@ -227,15 +229,18 @@ def test_no_curator_method_but_the_funnel_builds_a_create():
 # --- Invariant 3: every fail-open create states its classification ---------
 #
 # Module-level parsers have no curator to count against, so they mark
-# degradation on the decision itself and the caller counts it. Whether a
-# branch is degraded is therefore part of the data each branch writes, never
-# a default nobody chose.
+# degradation on the decision itself and the caller counts it. The
+# interceptor's batch fallbacks build creates no verdict judged, and there
+# task_interceptor.py::_dedupe_skipped_reason stamps the dedupe_skipped marker
+# only when ``decision.degraded``: a fallback left at the False default would
+# ship a fail-open create unmarked. Whether a branch is degraded is therefore
+# part of the data each branch writes, never a default nobody chose.
 
 
-def _module_create_constructions() -> list[ast.Call]:
+def _module_create_constructions(module: pathlib.Path) -> list[ast.Call]:
     return [
         call
-        for call in calls_named(parse_python_module(TASK_CURATOR), DECISION_TYPE)
+        for call in calls_named(parse_python_module(module), DECISION_TYPE)
         if _is_create_construction(call)
     ]
 
@@ -252,15 +257,22 @@ def _justification_text(call: ast.Call) -> str:
     return ast.unparse(justification) if justification is not None else '<none>'
 
 
-def test_every_fail_open_create_declares_degradedness():
-    creates = _module_create_constructions()
+@pytest.mark.parametrize(
+    'module',
+    [
+        pytest.param(TASK_CURATOR, id='curator'),
+        pytest.param(TASK_INTERCEPTOR, id='interceptor'),
+    ],
+)
+def test_every_fail_open_create_declares_degradedness(module: pathlib.Path):
+    creates = _module_create_constructions(module)
     assert creates, (
-        f'no {DECISION_TYPE}(action=\'create\') in {TASK_CURATOR.name} — this '
+        f'no {DECISION_TYPE}(action=\'create\') in {module.name} — this '
         f'guard has lost its subject; re-point it rather than deleting it.'
     )
     unclassified = [call for call in creates if not _declares_degradedness(call)]
     assert not unclassified, (
-        f'{TASK_CURATOR.name} builds fail-open create(s) without a literal '
+        f'{module.name} builds fail-open create(s) without a literal '
         'degraded=True/False: '
         + ', '.join(
             f'line {call.lineno} ({_justification_text(call)})'
@@ -269,7 +281,8 @@ def test_every_fail_open_create_declares_degradedness():
         + '. Classify each by what its verdict DEPENDS ON. degraded=True when '
         'no usable decision was obtained, or only the RESPONSE was consulted '
         '(the model broke the output contract): sustained, that is an outage '
-        'the streak alarm must see. degraded=False when POOL STATE declined an '
+        'the streak alarm must see, and the created task must carry the '
+        'dedupe_skipped marker. degraded=False when POOL STATE declined an '
         'otherwise usable decision: routine on a healthy curator, so counting '
         'it would fire the alarm on a working service. Give each cause its own '
         'branch — a condition ORing a payload failure into a state veto hands '
