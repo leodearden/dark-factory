@@ -39,6 +39,7 @@ from fused_memory.reconciliation.predecessor_drain_recovery import (
 from reconciliation.harness_fixtures import (
     make_harness,
     make_harness_config,
+    make_memory_service,
     open_event_buffer,
     open_journal,
 )
@@ -225,10 +226,12 @@ async def test_run_loop_recovers_a_dead_predecessors_runless_drain_before_its_fi
     await stores.live.defer_write(
         PROJECT_P, 'deferred-during-dead-tenure', 'observations_and_summaries', {},
     )
+    memory_service = make_memory_service()
     harness = make_harness(
         journal=stores.journal,
         event_buffer=stores.live,
         taskmaster=AsyncMock(),
+        memory_service=memory_service,
         config=make_harness_config(judge_enabled=False),
         known_projects={PROJECT_P: '/tmp/test-project'},
     )
@@ -245,7 +248,7 @@ async def test_run_loop_recovers_a_dead_predecessors_runless_drain_before_its_fi
 
         assert await stores.live.count_buffered(PROJECT_P) == 2
         assert await stores.live.get_lock_holder_instance_id(PROJECT_P) is None
-        harness.memory.add_memory.assert_awaited()
+        memory_service.add_memory.assert_awaited()
     finally:
         tick_wait.cancel()
         loop_task.cancel()
