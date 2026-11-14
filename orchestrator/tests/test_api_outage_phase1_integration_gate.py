@@ -37,6 +37,7 @@ async def test_incident_burst_rows_1_to_5_hold_in_one_harness_run(tmp_path, monk
     _assert_rows_2_and_3(ledger)
     _assert_row_4(ledger)
     _assert_row_5(ledger)
+    _assert_recovery(ledger)
 
 
 def _assert_burst_premises(ledger: BurstLedger) -> None:
@@ -207,3 +208,28 @@ def _assert_row_5(ledger: BurstLedger) -> None:
     assert end.parked_window_churn_count == 0, (
         f'row 5: parked_window_churn_count {end.parked_window_churn_count} after phase A'
     )
+
+
+def _assert_recovery(ledger: BurstLedger) -> None:
+    expected_dispatches = {
+        **dict.fromkeys(ledger.cast.burst, KILLS_PER_TASK + 1),
+        ledger.cast.genuine: 2,
+    }
+    for tid, expected in expected_dispatches.items():
+        where = f'recovery: task {tid}'
+        dispatches = ledger.dispatches_of(tid)
+        assert len(dispatches) == expected, f'{where}: {len(dispatches)} dispatches, expected {expected}'
+        last = dispatches[-1]
+        assert last.report.outcome == WorkflowOutcome.DONE, f'{where}: last outcome {last.report.outcome!r}'
+        assert last.transient_requeue_count == 0, (
+            f'{where}: transient count {last.transient_requeue_count} survived DONE'
+        )
+        assert last.requeue_history == (), f'{where}: requeue history survived DONE: {last.requeue_history}'
+        assert ledger.final_status[tid] == 'done', f'{where}: final status {ledger.final_status[tid]!r}'
+        assert 'blocked' not in ledger.status_writes[tid], (
+            f'{where}: written blocked at some point: {ledger.status_writes[tid]}'
+        )
+        assert ledger.escalations_by_task[tid] == (), (
+            f'{where}: escalations filed during the run: {ledger.escalations_by_task[tid]}'
+        )
+    assert ledger.end_of_run.paused is False, 'recovery: scheduler paused at end of run'
