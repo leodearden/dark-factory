@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from _quality_rows import (
     write_marker_state_db,
     write_quality_db,
 )
+from _quality_snapshots import snapshot_doc, write_snapshot
 from _runs_db_fixture import EventRow
 from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck
@@ -38,7 +40,16 @@ from dashboard.api.window import (
 from dashboard.config import DashboardConfig
 from dashboard.data import quality_markers
 from dashboard.data.quality_marker_sampler import refresh_markers
-from dashboard.data.quality_store import QualitySample
+from dashboard.data.quality_snapshot_sampler import refresh_snapshots
+from dashboard.data.quality_snapshots import (
+    BASELINE_HOME,
+    RootScan,
+    SnapshotCache,
+    diff_text,
+    scan_root,
+    summarise,
+)
+from dashboard.data.quality_store import QualitySample, write_snapshot_scan
 from dashboard.loops import _QualityStore
 
 LANDINGS: dict[str, int | None] = {'100': 100, '300': 300, 'all': None}
@@ -148,15 +159,6 @@ def test_the_route_serves_every_window_its_chip_offers(
 
     assert body['WINDOW'] == {'requested': label, 'served': label, 'landings': landings}
     assert len(body['QUALITY']['value']['axis']) == STORED
-
-
-def test_snapshots_are_unknown_until_their_producer_lands(quality_client) -> None:
-    snapshots = _get(quality_client, 'project=dark_factory&window=100')['QUALITY_SNAPSHOTS']
-
-    assert set(snapshots) == DATUM_KEYS
-    assert (snapshots['state'], snapshots['value'], snapshots['as_of']) == ('unknown', None, None)
-    assert snapshots['reason'].startswith('no producer has written here')
-    assert 'snapshot' in snapshots['reason']
 
 
 def test_markers_never_derived_for_a_project_are_unknown_saying_so(quality_client) -> None:
@@ -593,3 +595,201 @@ def test_a_blank_module_serves_what_no_module_serves(drill_client) -> None:
 
     assert blank == whole
     assert len(whole['QUALITY']['value']['axis']) == STORED
+
+
+# --- the snapshot series and one point's diff (PRD leaf ι) -----------------------------------
+
+DIFF_URL = '/api/v2/dashboard/quality/snapshot-diff'
+SNAPSHOT_TIMES = (
+    datetime(2026, 10, 8, 12, tzinfo=UTC),
+    datetime(2026, 11, 1, 3, tzinfo=UTC),
+    datetime(2026, 11, 2, 3, tzinfo=UTC),
+)
+SNAPSHOT_SCANNED_AT = NOW - timedelta(minutes=5)
+POINT_KEYS = {
+    'id', 'file', 'baseline', 'as_of_sha', 'committed_at', 'run_id', 'params', 'unknown_params',
+    'complete', 'members', 'h14', 'cycles', 'deferred_imports', 'cycle_closing_imports',
+    'private_patch_targets', 'diff',
+}
+"""A served point: the member table as cell texts, the domain counts, and no domain row or line total."""
+DIFF_KEYS = {'point_id', 'previous_id', 'state', 'text', 'reason'}
+
+
+def _snapshot_files(config: DashboardConfig, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, ...]:
+    """The root made a git checkout of three commits at SNAPSHOT_TIMES: a schema-2 baseline at the
+    first, schema-3 nightly files at the other two; the files in commit order."""
+    repo = GitRepo(config.project_root)
+    shas: list[str] = []
+    for index, at in enumerate(SNAPSHOT_TIMES):
+        monkeypatch.setenv('GIT_COMMITTER_DATE', at.isoformat())
+        shas.append(repo.commit({'a.txt': f'{index}\n'}, f'commit {index}') if shas else repo.init())
+    monkeypatch.delenv('GIT_COMMITTER_DATE')
+    baseline = write_snapshot(config.project_root / BASELINE_HOME / 'review-all-dark_factory-20261008.json',
+                              snapshot_doc(2, as_of_sha=shas[0], run_id='r1'))
+    nightly = [write_snapshot(config.quality_metrics_dir / 'dark_factory' / f'{sha}.json',
+                              snapshot_doc(3, as_of_sha=sha, run_id=f'r{index}'))
+               for index, sha in enumerate(shas[1:], start=2)]
+    return baseline, *nightly
+
+
+async def _snapshot_tick(config: DashboardConfig) -> None:
+    async with _QualityStore(config.quality_db) as store:
+        await refresh_snapshots(store.connection, [config.project_root],
+                                nightly_dir=config.quality_metrics_dir, now=SNAPSHOT_SCANNED_AT)
+
+
+async def _store_scan(config: DashboardConfig, scan: RootScan) -> None:
+    async with _QualityStore(config.quality_db) as store:
+        await write_snapshot_scan(store.connection, 'dark_factory', scan, SNAPSHOT_SCANNED_AT)
+        await store.connection.commit()
+
+
+@dataclass(frozen=True)
+class SnapshotScene:
+    client: Any
+    files: tuple[Path, ...]
+
+
+@pytest.fixture
+def snapshot_client(quality_client, monkeypatch: pytest.MonkeyPatch) -> SnapshotScene:
+    """quality_client after one snapshot tick over its root's three snapshot files."""
+    config = quality_client.app.state.config
+    files = _snapshot_files(config, monkeypatch)
+    asyncio.run(_snapshot_tick(config))
+    return SnapshotScene(quality_client, files)
+
+
+def _snapshots(client: Any, query: str = 'project=dark_factory') -> dict[str, Any]:
+    return _get(client, query)['QUALITY_SNAPSHOTS']
+
+
+def _point_ids(client: Any) -> list[str]:
+    return [point['id'] for point in _snapshots(client)['value']['points']]
+
+
+def test_snapshot_homes_never_scanned_are_unknown_saying_so(quality_client) -> None:
+    snapshots = _snapshots(quality_client)
+
+    assert set(snapshots) == DATUM_KEYS
+    assert (snapshots['state'], snapshots['value'], snapshots['as_of']) == ('unknown', None, None)
+    assert 'dark_factory have not been scanned yet' in snapshots['reason']
+
+
+def test_a_scan_finding_no_snapshot_file_is_unknown_naming_both_homes(quality_client) -> None:
+    config = quality_client.app.state.config
+    GitRepo(config.project_root).init()
+    asyncio.run(_snapshot_tick(config))
+
+    snapshots = _snapshots(quality_client)
+
+    assert (snapshots['state'], snapshots['value']) == ('unknown', None)
+    assert snapshots['reason'].startswith('no snapshot yet')
+    assert f'{config.project_root / BASELINE_HOME}/' in snapshots['reason']
+    assert f'{config.quality_metrics_dir / "dark_factory"}/' in snapshots['reason']
+
+
+def test_stored_points_are_served_fresh_in_commit_order_with_their_baseline_flags(
+    snapshot_client: SnapshotScene,
+) -> None:
+    snapshots = _snapshots(snapshot_client.client)
+
+    assert (snapshots['state'], snapshots['as_of']) == ('fresh', SNAPSHOT_SCANNED_AT.isoformat())
+    points = snapshots['value']['points']
+    assert [point['committed_at'] for point in points] == [at.isoformat() for at in SNAPSHOT_TIMES]
+    assert [point['baseline'] for point in points] == [True, False, False]
+    assert [Path(point['file']) for point in points] == list(snapshot_client.files)
+    assert snapshots['value']['unplaced'] == []
+
+
+def test_a_point_carries_the_instruments_member_texts_and_domain_counts_only(
+    snapshot_client: SnapshotScene,
+) -> None:
+    points = _snapshots(snapshot_client.client)['value']['points']
+
+    for point, file in zip(points, snapshot_client.files, strict=True):
+        summary = summarise(file)
+        assert set(point) == POINT_KEYS, 'no domain row and no total line count is served'
+        assert point['members'] == {
+            'columns': [column.header for column in summary.columns],
+            'rows': [{'member': row.member, 'pseudo': row.pseudo, 'cells': [cell.text for cell in row.cells]}
+                     for row in summary.members],
+        }
+        assert point['h14'] == asdict(summary.h14)
+        assert (point['h14']['soft_ceiling_lines'], point['h14']['alarm_lines']) == (1500, 2000)
+        assert point['cycles'] == {'cycles': 2, 'hidden_cycles': 1, 'typing_cycles': 1}
+        assert (point['deferred_imports'], point['cycle_closing_imports'], point['private_patch_targets']) == (3, 2, 3)
+    assert set(points[0]['unknown_params']) >= {'instrument', 'python_version'}
+    assert [point['unknown_params'] for point in points[1:]] == [[], []]
+
+
+def test_snapshots_for_a_token_naming_no_root_are_unknown_as_quality_is(
+    snapshot_client: SnapshotScene,
+) -> None:
+    body = _get(snapshot_client.client, 'project=nowhere')
+
+    assert (body['QUALITY_SNAPSHOTS']['state'], body['QUALITY_SNAPSHOTS']['value']) == ('unknown', None)
+    assert body['QUALITY_SNAPSHOTS']['reason'] == body['QUALITY']['reason']
+
+
+def _diff(client: Any, query: str) -> dict[str, Any]:
+    response = client.get(f'{DIFF_URL}?{query}' if query else DIFF_URL)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {'QUALITY_SNAPSHOT_DIFF'}
+    assert set(body['QUALITY_SNAPSHOT_DIFF']) == DIFF_KEYS
+    return body['QUALITY_SNAPSHOT_DIFF']
+
+
+def test_a_ready_diff_serves_the_instruments_text_verbatim(snapshot_client: SnapshotScene) -> None:
+    first, second, _ = _point_ids(snapshot_client.client)
+    baseline, nightly, _ = snapshot_client.files
+
+    diff = _diff(snapshot_client.client, f'project=dark_factory&point={second}')
+
+    assert (diff['point_id'], diff['previous_id'], diff['state'], diff['reason']) == (
+        second, first, 'ready', None)
+    assert diff['text'] == diff_text(nightly, baseline)
+
+
+def test_the_first_points_diff_has_no_text_and_says_why(snapshot_client: SnapshotScene) -> None:
+    first = _point_ids(snapshot_client.client)[0]
+
+    diff = _diff(snapshot_client.client, f'project=dark-factory&point={first}')
+
+    assert (diff['point_id'], diff['previous_id'], diff['state'], diff['text']) == (first, None, 'first', None)
+    assert isinstance(diff['reason'], str) and diff['reason']
+
+
+def test_a_diff_not_yet_computed_is_pending_saying_so(
+    quality_client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = quality_client.app.state.config
+    _snapshot_files(config, monkeypatch)
+    scan = scan_root(config.project_root, 'dark_factory', config.quality_metrics_dir, SnapshotCache.empty(),
+                     deadline=time.monotonic() + 120)
+    asyncio.run(_store_scan(config, replace(scan, new_diffs={})))
+    previous, point = scan.points[0].point_id, scan.points[1].point_id
+
+    diff = _diff(quality_client, f'project=dark_factory&point={point}')
+
+    assert (diff['point_id'], diff['previous_id'], diff['state'], diff['text']) == (
+        point, previous, 'pending', None)
+    assert isinstance(diff['reason'], str) and diff['reason']
+
+
+@pytest.mark.parametrize(('query', 'point_id', 'named'), [
+    ('project=dark_factory&point=no-such-point', 'no-such-point', 'no-such-point'),
+    ('project=dark_factory', None, '?point='),
+    ('project=dark_factory&point=', None, '?point='),
+    ('project=nowhere&point=no-such-point', 'no-such-point', 'nowhere'),
+    ('point=no-such-point', 'no-such-point', '?project='),
+    ('', None, '?project='),
+])
+def test_a_diff_with_nothing_to_serve_answers_absent_naming_what_is_missing(
+    snapshot_client: SnapshotScene, query: str, point_id: str | None, named: str,
+) -> None:
+    diff = _diff(snapshot_client.client, query)
+
+    assert (diff['point_id'], diff['previous_id'], diff['state'], diff['text']) == (
+        point_id, None, 'absent', None)
+    assert named in diff['reason']

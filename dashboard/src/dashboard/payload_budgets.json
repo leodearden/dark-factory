@@ -339,6 +339,21 @@
           "reason": "Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 3,072,421 bytes at the tab's widest landing window. 3,736 landings on 14 metric series: QUALITY.value.metrics 69%, .axis 28%. On demand, not polled. The route landed on main after the 2026-10-15 measurements. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
         }
       ]
+    },
+    {
+      "path": "/api/v2/dashboard/quality/snapshot-diff",
+      "query": {
+        "project": "dark-factory",
+        "point": "payload-fleet-nightly"
+      },
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 590000,
+          "task": "8465",
+          "reason": "Measured 2026-11-14 as a census, since no snapshot pair existed live: a schema-3 snapshot of task/8465's HEAD (797ec583d0) diffed against df's committed 2026-10-08 baseline is 470,807 bytes of instrument report (6,016 lines, about 476,800 bytes JSON-encoded); the payload fleet seeds that many characters as its point's ready diff. The body is ONE pair's instrument --diff text, fetched on demand when the Quality tab's drill-down opens that point, never polled. The live predicate requests this same fixed point id, which no live project holds, so it answers state 'absent' there until such a point exists."
+        }
+      ]
     }
   ],
   "exempt": [

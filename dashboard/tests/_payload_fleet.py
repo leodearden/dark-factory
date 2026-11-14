@@ -57,6 +57,7 @@ from _payload_fleet_seed import (
     text,
 )
 from _quality_rows import NO_COST, NO_OUTCOMES, history, write_quality_db
+from _quality_snapshots import placed_point, snapshot_doc, write_snapshot
 from _runs_db_fixture import runs_db_path
 from _served_reads import forget_served_reads
 from _tasks_db_fixture import task_row, write_tasks_db
@@ -73,8 +74,10 @@ from dashboard.data import task_lookup
 from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue, serve_corpus
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.orchestrator import find_running_orchestrators
-from dashboard.data.quality_store import QualitySample
+from dashboard.data.quality_snapshots import BASELINE_HOME, ComputedDiff, DiffState, RootScan
+from dashboard.data.quality_store import QualitySample, write_snapshot_scan
 from dashboard.data.scheduler import _scheduler_cache_clear
+from dashboard.loops import _QualityStore
 
 
 @dataclass(frozen=True)
@@ -112,10 +115,12 @@ class RootCensus:
 
 @dataclass(frozen=True)
 class QualityShape:
-    """The quality sampler's store for the budgeted root: its landings and the modules they touch."""
+    """The quality store for the budgeted root: its landings, the modules they touch, and the
+    length of its newest snapshot point's diff text."""
 
     landings: int
     modules: int
+    snapshot_diff_chars: int
 
 
 @dataclass(frozen=True)
@@ -160,6 +165,15 @@ class FleetCensus:
     The quality store was measured live on 2026-11-14 (3,072,421 bytes at
     ``?project=dark-factory&window=all``): 3,736 landings, each a point on
     14 metric series, across 338 modules. Only that root is budgeted.
+
+    The snapshot diff was measured on 2026-11-14 from the pair df's snapshot
+    series will hold between its committed baseline
+    (plans/quality-metrics/review-all-dark_factory-20261008.json, schema 1)
+    and its first nightly point: a schema-3 snapshot of task/8465's HEAD
+    (797ec583d0) diffed against that baseline is 470,807 bytes of instrument
+    report in 6,016 lines. No such pair existed live, since nothing had yet
+    written data/quality-metrics/. The fleet serves that many filler
+    characters; the real text's newlines JSON-escape to about 6 KB more.
 
     The PRD population was measured live on 2026-11-14 (590,357 bytes at
     /prds, every PRD-holding root fresh): dark-factory 119 PRDs, reify 110,
@@ -319,11 +333,14 @@ CENSUS = FleetCensus(
         ('add_system_record', 'write'), ('find_tasks_by_metadata', 'read'), ('task_combined', 'write'),
         ('update_edge', 'write'), ('remove_dependency', 'write'),
     )),
-    quality=QualityShape(landings=3736, modules=338),
+    quality=QualityShape(landings=3736, modules=338, snapshot_diff_chars=470_807),
 )
 
 TERMINAL_WINDOW_ROOT = 'dark-factory'
 """The root the budgeted ``?terminal=`` request names; it must be in the census."""
+
+SNAPSHOT_DIFF_POINT = 'payload-fleet-nightly'
+"""The seeded snapshot point of TERMINAL_WINDOW_ROOT whose diff the budgeted ``/quality/snapshot-diff`` request names."""
 
 _PRIORITY_CYCLE = ('low', 'low', 'medium', 'high')
 """Effective priorities in the live mix: about half low, a quarter each medium and high."""
@@ -868,6 +885,41 @@ def _seed_quality(config: DashboardConfig, shape: QualityShape, *, now: datetime
         landings_deferred=0, git_check=GitCrossCheck(0, 0, 0),
     )
     asyncio.run(write_quality_db(config.quality_db, rows, [sample]))
+    scan = _snapshot_scan(config, root, project_id, shape, now=now)
+    asyncio.run(_write_snapshot_scan(config, project_id, scan, now=now))
+
+
+def _snapshot_scan(
+    config: DashboardConfig, root: Path, project_id: str, shape: QualityShape, *, now: datetime,
+) -> RootScan:
+    """A baseline point and, a day later, the SNAPSHOT_DIFF_POINT nightly point, whose diff against
+    the baseline is ready at the census length."""
+    nightly_home = config.quality_metrics_dir / project_id
+    baseline = placed_point(
+        write_snapshot(root / BASELINE_HOME / 'review-all-payload-fleet.json',
+                       snapshot_doc(2, as_of_sha='b' * 40, run_id='payload-fleet-baseline')),
+        point_id='payload-fleet-baseline', baseline=True, committed_at=now - timedelta(days=2),
+    )
+    nightly = placed_point(
+        write_snapshot(nightly_home / f'{"c" * 40}.json',
+                       snapshot_doc(3, as_of_sha='c' * 40, run_id='payload-fleet-nightly')),
+        point_id=SNAPSHOT_DIFF_POINT, baseline=False, committed_at=now - timedelta(days=1),
+        previous=baseline,
+    )
+    assert nightly.diff.pair_key is not None
+    diff = ComputedDiff(DiffState.READY, text('params differ:', shape.snapshot_diff_chars), None)
+    return RootScan(
+        points=(baseline, nightly), unplaced=(), new_diffs={nightly.diff.pair_key: diff},
+        pending_summaries=0, pending_diffs=0, baseline_home=root / BASELINE_HOME, nightly_home=nightly_home,
+    )
+
+
+async def _write_snapshot_scan(
+    config: DashboardConfig, project_id: str, scan: RootScan, *, now: datetime,
+) -> None:
+    async with _QualityStore(config.quality_db) as store:
+        await write_snapshot_scan(store.connection, project_id, scan, now)
+        await store.connection.commit()
 
 
 def _bindings_of(target: object, name: str, known: frozenset[str]) -> list[ModuleType]:

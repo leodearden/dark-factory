@@ -2,16 +2,30 @@
 
 Builders only; tests hold the expectations. ``snapshot_doc`` returns a schema-1, -2 or -3 snapshot
 in the shape scripts/quality_metrics_snapshot.py::validate_snapshot checks, so a test reading one
-through the REAL instrument proves the fixture as well as the reader.
+through the REAL instrument proves the fixture as well as the reader. ``placed_point`` is such a
+file as a scan places it, for a store seeded without git.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from dashboard.data.quality_snapshots import (
+    INSTRUMENT_SCRIPT,
+    DiffState,
+    PointDiff,
+    ScannedPoint,
+    cache_identity,
+    pair_key,
+    summarise,
+    summariser_digest,
+)
 
 SOFT_CEILING_LINES = 1500
 ALARM_LINES = 2000
@@ -147,3 +161,25 @@ def write_snapshot(path: Path, doc: Mapping[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc, indent=1), encoding='utf-8')
     return path
+
+
+def placed_point(
+    path: Path, *, point_id: str, baseline: bool, committed_at: datetime,
+    previous: ScannedPoint | None = None, diff_state: DiffState = DiffState.READY,
+) -> ScannedPoint:
+    """The snapshot file at *path* placed at *committed_at*, summarised by the REAL instrument: the
+    series' first point, or one whose diff against *previous* is in *diff_state*."""
+    data = path.read_bytes()
+    stat = path.stat()
+    summariser = summariser_digest(INSTRUMENT_SCRIPT)
+    summary = summarise(path)
+    digest = hashlib.sha256(data).hexdigest()
+    if previous is None:
+        diff = PointDiff(None, None, DiffState.FIRST)
+    else:
+        key = pair_key(cache_identity(previous.summary, previous.digest), cache_identity(summary, digest), summariser)
+        diff = PointDiff(previous.point_id, key, diff_state)
+    return ScannedPoint(
+        point_id=point_id, file=path, baseline=baseline, size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+        digest=digest, summariser=summariser, summary=summary, committed_at=committed_at, diff=diff,
+    )
