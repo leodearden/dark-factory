@@ -16,6 +16,8 @@ Covers:
 
 import pytest
 
+from fused_memory.reconciliation.flag_identity import description_digest
+
 # ---------------------------------------------------------------------------
 # step-1: Config schema — RED until step-2 adds the fields
 # ---------------------------------------------------------------------------
@@ -922,9 +924,8 @@ class TestReconReportReaper:
         assert state.get_assembled_report('r1', 'stage_one') is None
         assert state.get_assembled_report('r1', 'stage_two') is None
 
-        assert 'r1' not in state._run_sig_index
-        assert 'r1' not in state._run_desc_index
-        assert 'r1' not in state._run_finding_index
+        assert state.run_index('r1') is None
+        assert state.violations() == []
 
     def test_partial_eviction_of_one_run_does_not_affect_concurrent_run(self):
         """Evicting a completed stage of run r1 while r1 is still live must
@@ -981,7 +982,9 @@ class TestReconReportReaper:
 
         # r2's sig index, finding index, and dedup behavior must be entirely
         # unaffected by r1's partial eviction.
-        assert state._run_sig_index.get('r2', {}).get(
+        r2_index = state.run_index('r2')
+        assert r2_index is not None
+        assert r2_index.by_signature(
             ('2077', 'cycle_summary_prune_rerun_needed_post_2077')
         ) == r2_finding_id
         assert state._resolve_finding('r2', r2_finding_id) is not None
@@ -1017,6 +1020,7 @@ class TestReconReportReaper:
             f'Expected r1 dedup to survive its own partial eviction, got: {r1_dup}'
         )
         assert r1_dup['existing_finding_id'] == r1_finding_id
+        assert state.violations() == []
 
 
 # ---------------------------------------------------------------------------
@@ -1801,8 +1805,8 @@ class TestReconReportNullDescDedup:
         assert r1['finding_id'] != r2['finding_id']
 
     def test_eviction_clears_desc_index(self):
-        """After TTL eviction via tick(), _run_desc_index must not retain the
-        evicted run's hashes (prevents unbounded growth across runs)."""
+        """After TTL eviction via tick(), the run's finding index must not
+        retain the evicted run's hashes (prevents unbounded growth across runs)."""
         state, t = self._make_state(ttl=300)
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         self._finding(state, run_id='r1', description='an informational note')
@@ -1816,8 +1820,9 @@ class TestReconReportNullDescDedup:
         # Entry is gone
         assert state.get_assembled_report('r1', 's1') is None
 
-        # _run_desc_index must not retain r1's hashes
-        assert 'r1' not in state._run_desc_index
+        # The run's finding index, and with it r1's hashes, is released
+        assert state.run_index('r1') is None
+        assert state.violations() == []
 
     def test_partial_eviction_preserves_deschash_dedup_for_live_run(self):
         """Same partial-eviction scenario as the reaper's signature-path test,
@@ -1923,7 +1928,10 @@ class TestReconReportNullDescDedup:
         # Run is still LIVE (stage_two in-progress) — the run-level desc
         # index must be PRESERVED, not torn down just because stage_one
         # evicted, and dedup against the canonical finding must still fire.
-        assert 'r1' in state._run_desc_index
+        r1_index = state.run_index('r1')
+        assert r1_index is not None
+        assert r1_index.by_desc(description_digest('shared observation')) == first_id
+        assert state.violations() == []
         still_dup = self._finding(state, run_id='r1', description='shared observation')
         assert still_dup.get('error') == 'duplicate_finding', (
             f'Expected dedup to survive partial eviction, got: {still_dup}'
@@ -1937,10 +1945,9 @@ class TestReconReportNullDescDedup:
         assert evicted_2 == 1, f'Expected 1 eviction, got {evicted_2}'
         assert state.get_assembled_report('r1', 'stage_two') is None
 
-        # Full quiescence — the run-level indices must now be released.
-        assert 'r1' not in state._run_desc_index
-        assert 'r1' not in state._run_sig_index
-        assert 'r1' not in state._run_finding_index
+        # Full quiescence — the run's finding index must now be released.
+        assert state.run_index('r1') is None
+        assert state.violations() == []
 
 
 # ---------------------------------------------------------------------------
@@ -2841,7 +2848,7 @@ class TestReconReportSignatureTypeCanonicalization:
 
     Root cause (run 9542fa10): ``sig = (task_id, flag_type)`` was built from
     the RAW argument values with no type coercion, so ``(1976, ft) != ('1976',
-    ft)`` and the ``_run_sig_index`` lookup missed, allocating a second
+    ft)`` and the signature lookup missed, allocating a second
     finding row instead of returning ``duplicate_finding``.  This mirrors
     flag_dedup.compute_flag_signature's str-coercion, which documents
     "integer task_id is common in LLM output" as the reason for it.
@@ -3136,8 +3143,8 @@ class TestReconReportFlagTypeInheritance:
         }
 
     def test_null_flag_inherit_survives_partial_eviction(self):
-        """The inherit lookup reads the run-quiescence-scoped _run_sig_index
-        (task-2088), so it must still find Stage 1's established flag_type
+        """The inherit lookup reads the run's finding index, which lives until
+        the run quiesces (task-2088), so it must still find Stage 1's established flag_type
         even after Stage 1's own _ReportEntry has been evicted by tick() —
         as long as the run itself (Stage 2) is still live.
         """
@@ -3262,7 +3269,7 @@ class TestReconReportFlagTypeInheritance:
         assert task_b['finding_id'] != task_a['finding_id']
 
     def test_null_flag_not_inherited_across_different_run(self):
-        """The inherit lookup scans ``_run_sig_index.get(run_id, {})``, so a
+        """The inherit lookup reads the run's own finding index, so a
         flag_type established for a task_id in run r1 must never be
         inherited by a bare-null re-raise for the SAME task_id filed under a
         DIFFERENT run_id r2 — in-run dedup (and its inheritance extension)
@@ -3855,7 +3862,7 @@ class TestReconReportDeleteFinding:
         delete_finding's index cleanup recomputes the signature from the
         STORED finding.task_id/flag_type (never from a caller-submitted
         None) -- deleting via the id obtained through the inheriting
-        re-raise must pop ONLY ('42', 'f1') from _run_sig_index, leave B's
+        re-raise must pop ONLY ('42', 'f1') from the run's finding index, leave B's
         ('42', 'f2') entry untouched, and allow a fresh (42, 'f1') finding
         to be filed afterwards instead of bouncing off a stale
         duplicate_finding pointer.
@@ -3906,8 +3913,10 @@ class TestReconReportDeleteFinding:
         delete_result = state.delete_finding('r1', reraise['existing_finding_id'])
         assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
 
-        assert state._run_sig_index.get('r1', {}).get(('42', 'f1')) is None
-        assert state._run_sig_index.get('r1', {}).get(('42', 'f2')) == fid_b
+        r1_index = state.run_index('r1')
+        assert r1_index is not None
+        assert r1_index.by_signature(('42', 'f1')) is None
+        assert r1_index.by_signature(('42', 'f2')) == fid_b
 
         refiled = state.add_finding(
             run_id='r1',
@@ -3920,6 +3929,7 @@ class TestReconReportDeleteFinding:
         )
         assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
         assert refiled['finding_id'] != fid_a
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_cite_after_delete_of_cross_stage_duplicate_returns_finding_unknown(self):

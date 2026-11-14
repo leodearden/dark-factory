@@ -705,6 +705,7 @@ class TestCiteTaskInRunCitedTaskDedup:
         assert report is not None
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [finding_id_1]
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_different_primary_cited_tasks_both_survive(self):
@@ -899,8 +900,8 @@ class TestCiteTaskInRunCitedTaskDedup:
         anchor that a later non-mc-stage finding relies on. Stage 1 cites an
         external task first; Stage 2 (reconciler) then cites the SAME task
         as ITS OWN primary citation -- it must succeed plainly (not fold),
-        proving the Stage-1 citation registered nothing in
-        ``_run_cited_task_index`` for the non-mc stage to collide with.
+        proving the Stage-1 citation registered no cited-task key in the
+        run's finding index for the non-mc stage to collide with.
         """
         state, _ = self._make_state()
 
@@ -1103,6 +1104,7 @@ class TestCiteTaskEntityScopedFold:
         assert report is not None
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [fid2]
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_same_project_single_task_id_folds(self):
@@ -1373,13 +1375,9 @@ class TestCiteTaskEntityScopedFold:
 
     # -- Purge/refile clears the derived sig (task-2432 step-11) -------
     #
-    # _purge_finding (as of step-10) only clears the ORDINARY sig
-    # (finding.task_id, finding.flag_type) and the project-scoped
-    # _run_cited_task_index anchor -- it does not know about the derived
-    # (cited_task_id, flag_type) key the entity-scoped fold registers into
-    # _run_sig_index. Deleting a finding that was a derived-sig anchor
-    # therefore leaves a stale pointer a later refile bounces off. step-12
-    # extends _purge_finding to also clear it.
+    # Deleting a finding that was a derived-sig anchor must clear the
+    # derived (cited_task_id, flag_type) key the entity-scoped fold
+    # registered, or a later refile bounces off a stale pointer.
 
     @pytest.mark.asyncio
     async def test_delete_then_refile_matching_top_level_task_id_succeeds(self):
@@ -1416,6 +1414,7 @@ class TestCiteTaskEntityScopedFold:
         assert report is not None
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [occ2['finding_id']]
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_delete_then_refile_comma_joined_top_level_task_id_succeeds(self):
@@ -1470,7 +1469,7 @@ class TestCiteTaskCrossProjectNearCollision:
     """Cross-project near-collisions on the entity-scoped derived signature
     (task-4185).
 
-    ``_run_sig_index``'s derived key is ``(canonical(cited task_id),
+    The run finding index's derived key is ``(canonical(cited task_id),
     flag_type)`` — deliberately PROJECTLESS. Operator ruling (2026-08-12):
     the projectless key STAYS, because it is what lets a bare top-level
     task_id (which names no project at all) fold onto a foreign citation,
@@ -1699,6 +1698,7 @@ class TestCiteTaskCrossProjectNearCollision:
         assert [
             (c['project_id'], c['task_id']) for c in foreign_resolved[1].cited_tasks
         ] == [('other_project', '42')]
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_skipped_fold_does_not_steal_the_anchor(self):
@@ -1836,11 +1836,14 @@ class TestCiteTaskCrossProjectNearCollision:
             assert resolved is not None
             assert [(c['project_id'], c['task_id']) for c in resolved[1].cited_tasks] == [expected]
 
-        assert state._run_sig_index.get('run-1', {}).get(('42', 'X')) == local_id
+        run_index = state.run_index('run-1')
+        assert run_index is not None
+        assert run_index.by_signature(('42', 'X')) == local_id
         # The fold-1 lane the comment points at: the first foreign citation
         # DID anchor 'other_project:42' there (its key carries a project), so
         # a null-task_id foreign duplicate would still fold.
-        assert state._run_cited_task_index.get('run-1', {}).get('other_project:42') == foreign_a_id
+        assert run_index.by_cited_task('other_project:42') == foreign_a_id
+        assert state.violations() == []
 
     # -- THE NEAR-COLLISION LOG ------------------------------------------
 
@@ -2788,7 +2791,7 @@ class TestCiteTaskFoldPurgeRecordPersistence(_FoldPurgeRecordHarness):
 
 class TestCiteTaskFoldKeyClearedOnDelete:
     """delete_finding must clear the primary-cited-task fold key (task-2425)
-    it registered in ``_run_cited_task_index``, mirroring how it already
+    it registered in the run's finding index, mirroring how it already
     clears the sig/desc dedup indices. Otherwise a deleted finding leaves a
     dangling fold-key pointer, and a LATER finding that cites the same
     external task as its own primary citation wrongly folds into the
@@ -2854,16 +2857,15 @@ class TestCiteTaskFoldKeyClearedOnDelete:
 
 
 # ---------------------------------------------------------------------------
-# task-2425 step-5: TestCiteTaskFoldReleasedAtRunQuiescence — RED until
-# step-6 makes tick() pop _run_cited_task_index at run quiescence
+# task-2425 step-5: TestCiteTaskFoldReleasedAtRunQuiescence
 # ---------------------------------------------------------------------------
 
 
 class TestCiteTaskFoldReleasedAtRunQuiescence:
     """tick()'s run-quiescence release (task-2088) must also release the
-    primary-cited-task fold index (task-2425) once a run's last entry
-    evicts — mirroring the existing _run_sig_index / _run_desc_index /
-    _run_finding_index release. Otherwise a stale fold key survives past
+    primary-cited-task fold key (task-2425) once a run's last entry
+    evicts, together with the rest of the run's finding index. Otherwise a
+    stale fold key survives past
     the run it belonged to and wrongly folds a citation on a later,
     unrelated run that happens to cite the same external task.
     """
@@ -2902,7 +2904,10 @@ class TestCiteTaskFoldReleasedAtRunQuiescence:
 
         cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
         assert 'error' not in cite1, cite1
-        assert state._run_cited_task_index.get('run-1', {}).get('dark_factory:2405') == fid1
+        run_index = state.run_index('run-1')
+        assert run_index is not None
+        assert run_index.by_cited_task('dark_factory:2405') == fid1
+        assert state.violations() == []
 
         state.complete('run-1', 'stage done')
 
@@ -2912,10 +2917,8 @@ class TestCiteTaskFoldReleasedAtRunQuiescence:
         assert evicted == 1
 
         assert state.get_assembled_report('run-1', 'reconciler') is None
-        assert 'run-1' not in state._run_sig_index
-        assert 'run-1' not in state._run_desc_index
-        assert 'run-1' not in state._run_finding_index
-        assert 'run-1' not in state._run_cited_task_index
+        assert state.run_index('run-1') is None
+        assert state.violations() == []
 
         # A FRESH run citing the SAME external task as its primary citation
         # must succeed plainly — the released index must not leak across runs.

@@ -417,3 +417,141 @@ class TestViolations:
         anchor.cited_tasks.append(_cite('p', '5'))
         idx.register_citation(anchor, second)
         assert idx.violations() == []
+
+
+class _FakeMemoryService:
+    async def get_entity(self, name, project_id):
+        return {'nodes': [{'uuid': 'a1b2c3d4-e5f6-7890-abcd-ef1234567890', 'name': name}]}
+
+
+class _FakeTaskInterceptor:
+    async def get_task(self, task_id, project_root, tag=None):
+        return {'id': task_id, 'title': f'T-{task_id}'}
+
+
+class TestRunIndexAcrossRestartViaMcpTools:
+    """B9 and B10: the run index survives eviction, folds and restarts with
+    no resurrected finding and no duplicate, driven through the MCP tools."""
+
+    _RUN = 'b-run'
+    _S1 = 'memory_consolidator'
+    _S2 = 'task_knowledge_sync'
+
+    def _open(self, db, clock):
+        from fused_memory.server.recon_report import (
+            ReconReportState,
+            create_recon_report_server,
+        )
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(db)
+        store.open()
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: clock[0],
+            memory_service=_FakeMemoryService(),
+            task_interceptor=_FakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        state.hydrate_from_store()
+        return store, state, create_recon_report_server(state)._tool_manager
+
+    async def _add(self, tools, task_id, flag_type, description='d'):
+        return await tools.call_tool('add_finding', {
+            'run_id': self._RUN, 'severity': 'moderate', 'category': 'memory_stale',
+            'description': description, 'suggested_action': 'a',
+            'task_id': task_id, 'flag_type': flag_type,
+        })
+
+    @staticmethod
+    def _row_finding_ids(store, stage):
+        import json
+
+        (row,) = [r for r in store.load_all() if r['stage'] == stage]
+        return {f['finding_id'] for f in json.loads(row['entry_json'])['findings']}
+
+    @pytest.mark.asyncio
+    async def test_b9_folded_evicted_finding_is_not_resurrected(self, tmp_path):
+        db = tmp_path / 'recon_report_state.db'
+        clock = [0.0]
+        store, state, tools = self._open(db, clock)
+        try:
+            await tools.call_tool('start_report', {
+                'run_id': self._RUN, 'stage': self._S1, 'project_id': 'dark_factory',
+            })
+            a_id = (await self._add(tools, '42', 'X', 'claim about 42'))['finding_id']
+            b_id = (await self._add(tools, None, 'X', 'unanchored claim'))['finding_id']
+            await tools.call_tool('complete', {'run_id': self._RUN, 'summary': 's1'})
+            await tools.call_tool('start_report', {
+                'run_id': self._RUN, 'stage': self._S2, 'project_id': 'dark_factory',
+            })
+            assert state.violations() == []
+
+            clock[0] = 301.0
+            assert state.tick() == 1
+            assert state.violations() == []
+
+            folded = await tools.call_tool('cite_task', {
+                'run_id': self._RUN, 'finding_id': b_id,
+                'project_id': 'dark_factory', 'task_id': '42',
+            })
+            assert folded['error'] == 'duplicate_finding'
+            assert folded['existing_finding_id'] == a_id
+            assert self._row_finding_ids(store, self._S1) == {a_id}
+            assert state.violations() == []
+        finally:
+            store.close()
+
+        store, state, tools = self._open(db, [0.0])
+        try:
+            assert state.violations() == []
+            gone = await tools.call_tool('cite_entity', {
+                'run_id': self._RUN, 'finding_id': b_id, 'name': 'Foo',
+            })
+            assert gone['error'] == 'finding_unknown'
+            kept = await tools.call_tool('cite_entity', {
+                'run_id': self._RUN, 'finding_id': a_id, 'name': 'Foo',
+            })
+            assert 'error' not in kept, kept
+            refiled = await self._add(tools, '42', 'X', 'claim about 42 again')
+            assert refiled['error'] == 'duplicate_finding'
+            assert refiled['existing_finding_id'] == a_id
+            assert state.violations() == []
+        finally:
+            store.close()
+
+    @pytest.mark.asyncio
+    async def test_b10_restart_between_two_filings_dedups(self, tmp_path):
+        db = tmp_path / 'recon_report_state.db'
+        store, state, tools = self._open(db, [0.0])
+        try:
+            await tools.call_tool('start_report', {
+                'run_id': self._RUN, 'stage': self._S1, 'project_id': 'dark_factory',
+            })
+            sig_id = (await self._add(tools, '42', 'X', 'first'))['finding_id']
+            note_id = (await self._add(tools, None, None, 'An informational note'))[
+                'finding_id'
+            ]
+        finally:
+            store.close()
+
+        store, state, tools = self._open(db, [0.0])
+        try:
+            assert state.violations() == []
+            again = await self._add(tools, '42', 'X', 'second, worded differently')
+            assert again['error'] == 'duplicate_finding'
+            assert again['existing_finding_id'] == sig_id
+            note_again = await self._add(tools, None, None, 'an  informational NOTE')
+            assert note_again['error'] == 'duplicate_finding'
+            assert note_again['existing_finding_id'] == note_id
+
+            report = state.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            identities = [(i['task_id'], i['flag_type']) for i in report['flagged_items']]
+            assert sorted(identities, key=repr) == sorted(
+                [('42', 'X'), (None, None)], key=repr
+            )
+            assert state.violations() == []
+        finally:
+            store.close()
