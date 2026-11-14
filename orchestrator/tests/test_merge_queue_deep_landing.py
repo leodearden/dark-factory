@@ -2298,26 +2298,38 @@ class TestHeadCancelOnAdoption:
         """A non-speculative tip is built on main, so its tree contains no entry ahead of it.
 
         When the chained item IS the head (PRD D5), the only entry that can sit
-        ahead of it in ``_inflight`` is a vacated one, which must not be marked
-        adopted.
+        ahead of it in ``_inflight`` is a vacated one: here I0, whose own verify
+        requeued its request, still head-of-line and awaiting finalize.  It must
+        not be marked adopted.
         """
         import dataclasses
 
+        from orchestrator.merge_lane.types import InflightStatus, InflightVerifyResult
+
+        def _requeued_verify(_git_ops) -> asyncio.Future:
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(InflightVerifyResult(
+                outcome=None, merge_wt=None, status=InflightStatus.REQUEUED,
+            ))
+            return done
+
         s = await _head_and_prefix_scene(
             git_repo, tmp_path, monkeypatch, db_name='delta-head-non-spec-tip.db',
+            head_task_factory=_requeued_verify,
         )
-        non_spec_tip = dataclasses.replace(
+        requeued = s['head_entry']
+        requeued.lease = None
+        requeued.status = InflightStatus.REQUEUED
+        assert requeued.vacated
+        chained_head = dataclasses.replace(
             s['spec_item'], speculative=False, permit=None, base_sha=s['main_sha'],
         )
 
-        adopted = await s['worker']._adopt_head_on_tip_authority(non_spec_tip)
+        adopted = await s['worker']._adopt_head_on_tip_authority(chained_head)
 
         assert adopted is None
-        assert s['head_entry'].chain_adopted is False
-        head_task = s['head_entry'].verify_task
-        assert head_task is not None and not head_task.cancelled(), (
-            'the decline must leave the head untouched'
-        )
+        assert requeued.chain_adopted is False
+        assert requeued.status is InflightStatus.REQUEUED
 
 
 @pytest.mark.asyncio
