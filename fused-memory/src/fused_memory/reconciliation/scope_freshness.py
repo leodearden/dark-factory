@@ -73,10 +73,9 @@ add-then-delete pool-cap pattern, and reuses
 deterministic description fingerprint (avoids storing full description text
 in the snapshot payload).
 
-This module has no imports from ``harness`` or ``stages/`` (other than the
-pure ``flag_identity`` fingerprint helper) — callers inject ``memory_service``,
-``taskmaster``, and a ``resolve_project_root`` callable, keeping it
-decoupled and unit-testable without a real harness.
+This module has no imports from ``harness`` or ``stages/`` — callers inject
+``memory_service``, ``taskmaster``, and a ``resolve_project_root`` callable,
+keeping it decoupled and unit-testable without a real harness.
 """
 
 from __future__ import annotations

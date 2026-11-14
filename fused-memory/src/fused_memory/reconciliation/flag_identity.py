@@ -19,10 +19,15 @@ Four outputs are stored, so their bytes are frozen.
 The two task-id orders differ on purpose: each is a stored form, so neither
 may change to match the other.
 
-Invariants: every function is pure, and total over the LLM-authored flags and
-task-id values it reads; malformed input yields an empty subject or a
-``None`` signature, never an exception.  The marker-key predicates take the
-``str`` key a signature emitted.
+Invariants: every function is pure.  The readers of a flag dict's values or
+of a task-id value (the signatures, :func:`parse_flag_subject`,
+:func:`extract_flag_uuids` and :class:`FlagTypeFamily`'s methods) are total
+over whatever an LLM put there: a malformed value yields an empty subject, a
+``None`` signature or no match, never an exception.  Every other function
+takes a ``str``, as annotated, and may raise on anything else: the
+description functions, :func:`canonical_flag_type_family`, and the
+marker-key predicates, which take the key a signature emitted.  A caller
+holding a raw LLM value checks it is a ``str`` first.
 """
 
 from __future__ import annotations

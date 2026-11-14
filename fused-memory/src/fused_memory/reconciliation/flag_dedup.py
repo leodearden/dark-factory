@@ -32,8 +32,8 @@ Ledger-backed marker UPSERT (task 2227)
 ----------------------------------------
 ``dedup_flags`` is the entry point.  For each flag with a computable
 signature — ``(task_id, flag_type)`` via ``compute_marker_signature``, which
-falls back to ``compute_content_fingerprint_signature`` for null-task_id
-flags lacking ``cited_tasks`` — the corresponding ``stage1_flag_marker``
+falls back to ``flag_identity.py::compute_content_fingerprint_signature``
+for null-task_id flags lacking ``cited_tasks`` — the corresponding ``stage1_flag_marker``
 row is looked up via ``get_by_identity(project_id, 'stage1_flag_marker',
 task_id, flag_type, run_id='')``.  Note ``run_id=''`` in the identity: the
 dedup identity is ``(task_id, flag_type)`` only, so the *current*
@@ -1370,7 +1370,7 @@ async def dedup_flags(
       marker payload (task 4712).  The accepted consequence for the CITATION
       producer: a carried-forward finding whose LLM output re-emits NO
       citation on a given cycle keys to a DIFFERENT row (see
-      :func:`compute_flag_signature`'s cited_tasks union), so that cycle is a
+      ``flag_identity.py::compute_flag_signature``'s cited_tasks union), so that cycle is a
       MISS and the finding is RE-ASSERTED rather than suppressed.  Citation-
       driven suppression is reliable exactly when the LLM keeps re-citing the
       same fix task — the common case for a still-open remediation.  The
@@ -1459,7 +1459,8 @@ async def dedup_flags(
             continue
         tid, ftype = sig
         # Guard: skip search + write for genuinely-invalid tids.
-        # Canonical fp:+32-hex keys produced by compute_content_fingerprint_signature
+        # Canonical fp:+32-hex keys produced by
+        # flag_identity.py::compute_content_fingerprint_signature
         # PASS this guard (task-1670 Option A): they are Stage-1-internal dedup
         # artifacts that are safe to persist because Stage 2's _query_stage2_flags
         # processes only flag_for_stage2=True records and never touches stage1_flag_marker
@@ -1656,7 +1657,7 @@ async def dedup_flags(
                 #
                 # THE CITATION IS A LOCAL VALUE.  It must not be assigned to
                 # flag['cited_tasks'] and must not enter `payload`:
-                # compute_flag_signature already read cited_tasks at the top of
+                # compute_marker_signature already read cited_tasks at the top of
                 # this loop and folds them into the marker row KEY, so
                 # enriching the flag would RELOCATE the row; the gate is
                 # HIT-only, so the first relocated cycle would be a MISS, and
@@ -4027,7 +4028,7 @@ async def _discover_foreign_fix_task_citations(
     ever emitted such a citation, so the gate landed, was enabled, and stayed
     inert.  Stage 1's context is its own project's task tree, so the model has
     nothing to cite from; and enriching the marker from Stage 2 (option (a))
-    is defeated outright, because :func:`compute_flag_signature` folds cited
+    is defeated outright, because :func:`compute_marker_signature` folds cited
     task ids into the marker row's own KEY, so an enriched row RELOCATES
     rather than annotates (task 4712's invariant).
 
@@ -4040,7 +4041,7 @@ async def _discover_foreign_fix_task_citations(
     **The returned citations are an in-memory GATE INPUT ONLY.**  They must be
     passed straight to :func:`_resolve_live_cross_project_fix_task` and MUST
     NEVER be written back onto the flag (``flag['cited_tasks']``) or into the
-    marker payload.  ``compute_flag_signature`` runs BEFORE the gate and reads
+    marker payload.  ``compute_marker_signature`` runs BEFORE the gate and reads
     ``cited_tasks``, so mutating the flag would move the marker to a different
     row; since the gate is HIT-only, the first enriched cycle would become a
     MISS, and because discovery matches against a live backlog that changes
