@@ -36,6 +36,27 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _DEFAULT_PROC_ROOT = Path('/proc')
 _DEFAULT_TIMEOUT_SECS = 10.0
 
+# The names systemd.exec(5) "Environment Variables in Spawned Processes" says
+# the manager computes for each process it spawns, from per-invocation state or
+# unit settings that no D-Bus environment property carries. Its PATH, LANG,
+# USER, LOGNAME, HOME, SHELL and XDG_RUNTIME_DIR a user service inherits from
+# the manager block, and TERM is set only on a terminal, so those are compared.
+_SET_AT_SPAWN = frozenset({
+    'INVOCATION_ID',
+    'RUNTIME_DIRECTORY', 'STATE_DIRECTORY', 'CACHE_DIRECTORY', 'LOGS_DIRECTORY',
+    'CONFIGURATION_DIRECTORY', 'CREDENTIALS_DIRECTORY',
+    'MAINPID', 'MANAGERPID', 'SYSTEMD_EXEC_PID', 'PIDFILE',
+    'LISTEN_FDS', 'LISTEN_PID', 'LISTEN_FDNAMES', 'REMOTE_ADDR', 'REMOTE_PORT',
+    'NOTIFY_SOCKET', 'WATCHDOG_PID', 'WATCHDOG_USEC', 'FDSTORE',
+    'LOG_NAMESPACE', 'JOURNAL_STREAM',
+    'SERVICE_RESULT', 'EXIT_CODE', 'EXIT_STATUS',
+    'MONITOR_SERVICE_RESULT', 'MONITOR_EXIT_CODE', 'MONITOR_EXIT_STATUS',
+    'MONITOR_INVOCATION_ID', 'MONITOR_UNIT',
+    'TRIGGER_UNIT', 'TRIGGER_PATH', 'TRIGGER_TIMER_REALTIME_USEC',
+    'TRIGGER_TIMER_MONOTONIC_USEC',
+    'MEMORY_PRESSURE_WATCH', 'MEMORY_PRESSURE_WRITE',
+})
+
 _T = TypeVar('_T')
 
 
@@ -203,6 +224,7 @@ class Verdict(enum.Enum):
     NOT_RUNNING = enum.auto()
     UNREADABLE = enum.auto()
     INDETERMINATE = enum.auto()
+    SET_AT_SPAWN = enum.auto()
 
 
 _VERDICT_MEANINGS: Mapping[Verdict, str] = {
@@ -214,6 +236,10 @@ _VERDICT_MEANINGS: Mapping[Verdict, str] = {
     Verdict.UNREADABLE: "the running process's environment could not be read",
     Verdict.INDETERMINATE: (
         'inputs systemd does not expose over D-Bus decide the value a restart would give'
+    ),
+    Verdict.SET_AT_SPAWN: (
+        'systemd sets this anew each time it spawns the process, so no layer holds '
+        'the value a restart would give'
     ),
 }
 
@@ -238,7 +264,38 @@ class LiveEnvironUnreadable:
     strerror: str
 
 
-LiveLayer = LiveEnviron | NoLiveProcess | LiveEnvironUnreadable
+@dataclass(frozen=True)
+class LiveEnvironEmpty:
+    """The MainPID's environ held no assignments, as when read mid-exec just after a (re)start."""
+
+    pid: int
+    path: Path
+
+
+LiveNotRead = LiveEnvironUnreadable | LiveEnvironEmpty
+LiveLayer = LiveEnviron | NoLiveProcess | LiveNotRead
+
+
+@dataclass(frozen=True)
+class RestartValue:
+    """The value a restart would give the variable; None when it would leave it unset."""
+
+    value: str | None
+
+
+class RestartUnknown(enum.Enum):
+    """Why the value a restart would give cannot be read from systemd over D-Bus."""
+
+    UNMODELLED_INPUTS = enum.auto()
+    SET_AT_SPAWN = enum.auto()
+
+
+RestartOutcome = RestartValue | RestartUnknown
+
+_UNKNOWN_RESTART_VERDICTS: Mapping[RestartUnknown, Verdict] = {
+    RestartUnknown.UNMODELLED_INPUTS: Verdict.INDETERMINATE,
+    RestartUnknown.SET_AT_SPAWN: Verdict.SET_AT_SPAWN,
+}
 
 
 @dataclass(frozen=True)
@@ -246,7 +303,7 @@ class VariableReport:
     name: str
     manager_value: str | None
     unit_value: str | None
-    restart_value: str | None
+    restart: RestartOutcome
     live_value: str | None
     verdict: Verdict
 
@@ -266,30 +323,35 @@ class UnitEnvironment:
     live: LiveLayer
 
     def variable(self, name: str) -> VariableReport:
-        restart_value = self._restart_value(name)
+        restart = self._restart(name)
         live_value = self.live.values.get(name) if isinstance(self.live, LiveEnviron) else None
         return VariableReport(
             name=name,
             manager_value=self.manager.get(name),
             unit_value=self.assignments.get(name),
-            restart_value=restart_value,
+            restart=restart,
             live_value=live_value,
-            verdict=self._verdict(restart_value, live_value),
+            verdict=self._verdict(restart, live_value),
         )
 
-    def _restart_value(self, name: str) -> str | None:
+    def _restart(self, name: str) -> RestartOutcome:
+        """The highest-precedence source decides, in systemd.exec(5)'s order."""
         if self.unmodelled:
-            return None
-        return self.assignments.get(name, self.manager.get(name))
+            return RestartUnknown.UNMODELLED_INPUTS
+        if name in self.assignments:
+            return RestartValue(self.assignments[name])
+        if name in _SET_AT_SPAWN:
+            return RestartUnknown.SET_AT_SPAWN
+        return RestartValue(self.manager.get(name))
 
-    def _verdict(self, restart_value: str | None, live_value: str | None) -> Verdict:
+    def _verdict(self, restart: RestartOutcome, live_value: str | None) -> Verdict:
         if isinstance(self.live, NoLiveProcess):
             return Verdict.NOT_RUNNING
-        if isinstance(self.live, LiveEnvironUnreadable):
+        if isinstance(self.live, LiveNotRead):
             return Verdict.UNREADABLE
-        if self.unmodelled:
-            return Verdict.INDETERMINATE
-        return Verdict.MATCHES if restart_value == live_value else Verdict.DRIFTED
+        if isinstance(restart, RestartUnknown):
+            return _UNKNOWN_RESTART_VERDICTS[restart]
+        return Verdict.MATCHES if restart.value == live_value else Verdict.DRIFTED
 
 
 def _started_at(microseconds: int) -> datetime | None:
@@ -321,6 +383,8 @@ def _live_layer(manager: _UserManager, path: str, proc_root: Path) -> LiveLayer:
             errno=exc.errno or 0,
             strerror=exc.strerror or str(exc),
         )
+    if not values:
+        return LiveEnvironEmpty(pid=pid, path=_environ_path(pid, proc_root))
     return LiveEnviron(pid, _started_at(started), values)
 
 
@@ -348,11 +412,16 @@ def inspect_unit(
 
 def exit_status(env: UnitEnvironment) -> int:
     """EXIT_LIVE_UNREADABLE when the report lacks the live layer, else EXIT_OK."""
-    return EXIT_LIVE_UNREADABLE if isinstance(env.live, LiveEnvironUnreadable) else EXIT_OK
+    return EXIT_LIVE_UNREADABLE if isinstance(env.live, LiveNotRead) else EXIT_OK
+
+
+def _printable(value: str) -> str:
+    """*value* with each environ byte that was not UTF-8 shown as a ``\\xNN`` escape."""
+    return value.encode(errors='surrogateescape').decode(errors='backslashreplace')
 
 
 def _shown(value: str | None, absent: str = '(not set)') -> str:
-    return absent if value is None else value
+    return absent if value is None else _printable(value)
 
 
 _REFUSED_HINT = (
@@ -361,6 +430,7 @@ _REFUSED_HINT = (
     'outright; "manager now" is the way to see what the manager hands units'
 )
 _EXITED_HINT = 'the process exited between the MainPID query and the read; re-run'
+_EMPTY_HINT = 'the process was still being set up by exec, as just after a (re)start; re-run'
 _UNREADABLE_HINTS: Mapping[int, str] = {
     errno.EACCES: _REFUSED_HINT,
     errno.EPERM: _REFUSED_HINT,
@@ -381,16 +451,30 @@ def _live_header(live: LiveLayer) -> list[str]:
         return ['live process: not running']
     if isinstance(live, LiveEnvironUnreadable):
         return _unreadable_lines(live)
-    when = live.started_at.isoformat() if live.started_at is not None else 'start time unknown'
-    return [f'live process: pid {live.pid}, started {when}']
+    if isinstance(live, LiveEnvironEmpty):
+        return [f'live process: pid {live.pid}, {live.path} read empty', f'  {_EMPTY_HINT}']
+    when = 'start time unknown' if live.started_at is None else f'started {live.started_at.isoformat()}'
+    return [f'live process: pid {live.pid}, {when}']
 
 
 def _live_shown(live: LiveLayer, value: str | None) -> str:
     if isinstance(live, NoLiveProcess):
         return '(not running)'
-    if isinstance(live, LiveEnvironUnreadable):
+    if isinstance(live, LiveNotRead):
         return '(unreadable)'
     return _shown(value)
+
+
+_UNKNOWN_RESTART_SHOWN: Mapping[RestartUnknown, str] = {
+    RestartUnknown.UNMODELLED_INPUTS: 'unknown (see "not modelled" above)',
+    RestartUnknown.SET_AT_SPAWN: 'a new value, set by systemd at spawn',
+}
+
+
+def _restart_shown(restart: RestartOutcome) -> str:
+    if isinstance(restart, RestartUnknown):
+        return _UNKNOWN_RESTART_SHOWN[restart]
+    return _shown(restart.value)
 
 
 def _header(env: UnitEnvironment) -> list[str]:
@@ -402,22 +486,20 @@ def _header(env: UnitEnvironment) -> list[str]:
     return lines
 
 
-def _variable_lines(env: UnitEnvironment, report: VariableReport) -> list[str]:
-    restart = 'unknown (see "not modelled" above)' if env.unmodelled else _shown(report.restart_value)
-    live = _live_shown(env.live, report.live_value)
+def _variable_lines(report: VariableReport, live: LiveLayer) -> list[str]:
     return [
         report.name,
         f'  manager now:   {_shown(report.manager_value)}',
         f'  unit sets:     {_shown(report.unit_value, "(not set by unit)")}',
-        f'  restart gets:  {restart}',
-        f'  live process:  {live}',
+        f'  restart gets:  {_restart_shown(report.restart)}',
+        f'  live process:  {_live_shown(live, report.live_value)}',
         f'  verdict:       {report.verdict.name}: {_VERDICT_MEANINGS[report.verdict]}',
     ]
 
 
 def render(env: UnitEnvironment, names: Iterable[str]) -> str:
     """A header for the unit, then one block per variable in *names*."""
-    blocks = [_header(env), *(_variable_lines(env, env.variable(name)) for name in names)]
+    blocks = [_header(env), *(_variable_lines(env.variable(name), env.live) for name in names)]
     return '\n\n'.join('\n'.join(block) for block in blocks)
 
 

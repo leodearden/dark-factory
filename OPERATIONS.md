@@ -221,8 +221,9 @@ value a restart would give, the live value, and a verdict:
 | `MATCHES` | The running process has the value a restart would give | None; the environment is not the problem |
 | `DRIFTED` | The running process predates the current value | Restart the unit |
 | `NOT_RUNNING` | `MainPID` is 0: stopped, or an idle oneshot | None; the next start gets the restart value |
-| `UNREADABLE` | The process's environ could not be read; the report names the path and errno | `EACCES`: re-run outside the sandbox, as the unit's uid. `ENOENT`: the process exited mid-read, so re-run |
+| `UNREADABLE` | The process's environ could not be read, or read empty; the report names the path, and the errno for a failed read | `EACCES`: re-run outside the sandbox, as the unit's uid. `ENOENT`: the process exited mid-read, so re-run. Read empty: the process was mid-exec, just (re)started, so re-run |
 | `INDETERMINATE` | The unit has `EnvironmentFile=`, `PassEnvironment=` or `UnsetEnvironment=`, whose effect is not visible over D-Bus; the report names them | Read the named inputs by hand; the live value is still reported |
+| `SET_AT_SPAWN` | systemd sets the variable anew each time it spawns the process, as it does `INVOCATION_ID`, `JOURNAL_STREAM`, `NOTIFY_SOCKET` and `LISTEN_FDS` (systemd.exec(5), "Environment Variables in Spawned Processes"), and the unit's `Environment=` does not set it | None; it is not configuration, and a restart replaces it |
 
 Exit codes: `0`, report printed; `3`, nothing read (busctl missing, failing,
 timed out or malformed, or the unit not loaded), with the reason on stderr and

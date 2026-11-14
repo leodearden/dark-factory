@@ -107,7 +107,7 @@ def test_boot_time_unit_whose_process_predates_the_manager_path_is_drifted(
 
     assert report.manager_value == MANAGER_PATH_VALUE
     assert report.unit_value is None
-    assert report.restart_value == MANAGER_PATH_VALUE
+    assert report.restart == sue.RestartValue(MANAGER_PATH_VALUE)
     assert report.live_value == '/usr/bin'
     assert report.verdict is sue.Verdict.DRIFTED
 
@@ -134,7 +134,7 @@ def test_unit_environment_overrides_the_manager_block(
 
     assert report.manager_value == MANAGER_PATH_VALUE
     assert report.unit_value == '/pinned/bin'
-    assert report.restart_value == '/pinned/bin'
+    assert report.restart == sue.RestartValue('/pinned/bin')
     assert report.live_value == '/pinned/bin'
     assert report.verdict is sue.Verdict.MATCHES
 
@@ -148,7 +148,7 @@ def test_values_containing_equals_signs_survive_every_layer(
     busctl_world(_world({'Environment': ['FOO=a=b'], 'MainPID': pid}))
 
     report = sue.inspect_unit(UNIT).variable('FOO')
-    assert (report.restart_value, report.live_value) == ('a=b', 'a=b')
+    assert (report.restart, report.live_value) == (sue.RestartValue('a=b'), 'a=b')
     assert report.verdict is sue.Verdict.MATCHES
 
     assert sue.main([UNIT, '--var', 'PATH', '--var', 'FOO']) == 0
@@ -187,7 +187,7 @@ def test_a_unit_with_no_main_pid_is_not_running_and_proc_is_never_read(
 
     assert report.verdict is sue.Verdict.NOT_RUNNING
     assert report.live_value is None
-    assert report.restart_value == '/pinned/bin'
+    assert report.restart == sue.RestartValue('/pinned/bin')
 
     assert sue.main([UNIT]) == 0
     stdout = capsys.readouterr().out
@@ -202,11 +202,15 @@ def test_a_unit_with_no_main_pid_is_not_running_and_proc_is_never_read(
 @pytest.mark.parametrize(
     ('unmodelled', 'named'),
     [
-        ({'EnvironmentFiles': [['/etc/example.env', False]]}, '/etc/example.env'),
+        ({'EnvironmentFiles': [['/etc/example.env', False]]}, 'EnvironmentFile=/etc/example.env'),
+        (
+            {'EnvironmentFiles': [['/etc/example.env', True]]},
+            'EnvironmentFile=-/etc/example.env',
+        ),
         ({'PassEnvironment': ['PATH']}, 'PassEnvironment=PATH'),
         ({'UnsetEnvironment': ['PATH']}, 'UnsetEnvironment=PATH'),
     ],
-    ids=['EnvironmentFile', 'PassEnvironment', 'UnsetEnvironment'],
+    ids=['EnvironmentFile', 'optional-EnvironmentFile', 'PassEnvironment', 'UnsetEnvironment'],
 )
 def test_unmodelled_environment_inputs_make_every_variable_indeterminate(
     busctl_world: WriteWorld,
@@ -224,7 +228,7 @@ def test_unmodelled_environment_inputs_make_every_variable_indeterminate(
 
     for name, live_value in (('PATH', '/pinned/bin'), ('LANG', 'C.UTF-8')):
         report = env.variable(name)
-        assert report.restart_value is None, name
+        assert report.restart is sue.RestartUnknown.UNMODELLED_INPUTS, name
         assert report.verdict is sue.Verdict.INDETERMINATE, name
         assert report.live_value == live_value, name
 
@@ -240,10 +244,105 @@ def test_not_running_is_decided_before_unmodelled_inputs(busctl_world: WriteWorl
         _world({'MainPID': 0, 'EnvironmentFiles': [['/etc/example.env', False]]})
     )
 
-    report = sue.inspect_unit(UNIT).variable('PATH')
+    env = sue.inspect_unit(UNIT)
+    report = env.variable('PATH')
 
     assert report.verdict is sue.Verdict.NOT_RUNNING
-    assert report.restart_value is None
+    assert report.restart is sue.RestartUnknown.UNMODELLED_INPUTS
+    restart_line = next(
+        line
+        for line in _variable_block(sue.render(env, ['PATH']), 'PATH').splitlines()
+        if 'restart gets' in line
+    )
+    assert 'unknown' in restart_line
+
+
+def test_variables_systemd_sets_at_spawn_are_not_compared_against_any_layer(
+    busctl_world: WriteWorld,
+    live_process: SpawnLive,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pid = live_process(
+        {'PATH': MANAGER_PATH_VALUE, 'INVOCATION_ID': 'abc123', 'JOURNAL_STREAM': '8:4242'}
+    )
+    busctl_world(_world({'MainPID': pid}))
+
+    env = sue.inspect_unit(UNIT)
+
+    for name, live_value in (('INVOCATION_ID', 'abc123'), ('JOURNAL_STREAM', '8:4242')):
+        report = env.variable(name)
+        assert report.restart is sue.RestartUnknown.SET_AT_SPAWN, name
+        assert report.verdict is sue.Verdict.SET_AT_SPAWN, name
+        assert report.live_value == live_value, name
+
+    assert sue.main([UNIT, '--var', 'INVOCATION_ID', '--var', 'JOURNAL_STREAM']) == 0
+    stdout = capsys.readouterr().out
+    for name in ('INVOCATION_ID', 'JOURNAL_STREAM'):
+        block = _variable_block(stdout, name)
+        assert 'SET_AT_SPAWN' in block, name
+        assert 'DRIFTED' not in block, name
+
+
+def test_a_unit_environment_assignment_overrides_a_variable_systemd_sets_at_spawn(
+    busctl_world: WriteWorld, live_process: SpawnLive
+) -> None:
+    pid = live_process({'PATH': MANAGER_PATH_VALUE, 'NOTIFY_SOCKET': '/run/pinned'})
+    busctl_world(_world({'Environment': ['NOTIFY_SOCKET=/run/pinned'], 'MainPID': pid}))
+
+    report = sue.inspect_unit(UNIT).variable('NOTIFY_SOCKET')
+
+    assert report.restart == sue.RestartValue('/run/pinned')
+    assert report.verdict is sue.Verdict.MATCHES
+
+
+def test_a_live_process_without_a_start_timestamp_says_its_start_time_is_unknown(
+    busctl_world: WriteWorld, live_process: SpawnLive
+) -> None:
+    pid = live_process({'PATH': MANAGER_PATH_VALUE})
+    busctl_world(_world({'MainPID': pid}))
+
+    env = sue.inspect_unit(UNIT)
+
+    assert isinstance(env.live, sue.LiveEnviron)
+    assert env.live.started_at is None
+    assert f'live process: pid {pid}, start time unknown' in sue.render(env, ['PATH'])
+
+
+def test_a_byte_that_is_not_utf8_is_shown_escaped_rather_than_crashing_the_report(
+    busctl_world: WriteWorld,
+    live_process: SpawnLive,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pid = live_process({'PATH': MANAGER_PATH_VALUE, 'ODD': 'a\udcffb'})
+    busctl_world(_world({'MainPID': pid}))
+
+    assert sue.main([UNIT, '--var', 'ODD']) == 0
+    block = _variable_block(capsys.readouterr().out, 'ODD')
+    assert any(line.rstrip().endswith(r' a\xffb') for line in block.splitlines())
+    assert 'DRIFTED' in block
+
+
+def test_a_live_environ_that_reads_empty_is_unreadable_not_an_empty_environment(
+    busctl_world: WriteWorld, tmp_path: Path
+) -> None:
+    busctl_world(_world({'Environment': ['PATH=/pinned/bin'], 'MainPID': 4242}))
+    proc_root = tmp_path / 'proc'
+    environ = proc_root / '4242' / 'environ'
+    environ.parent.mkdir(parents=True)
+    environ.write_bytes(b'')
+
+    env = sue.inspect_unit(UNIT, proc_root=proc_root)
+
+    assert isinstance(env.live, sue.LiveEnvironEmpty)
+    assert (env.live.pid, env.live.path) == (4242, environ)
+    report = env.variable('PATH')
+    assert report.verdict is sue.Verdict.UNREADABLE
+    assert report.live_value is None
+    assert sue.exit_status(env) == sue.EXIT_LIVE_UNREADABLE
+    rendered = sue.render(env, ['PATH'])
+    assert str(environ) in rendered
+    assert 're-run' in rendered
+    assert 'DRIFTED' not in rendered
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file regardless')
@@ -269,7 +368,9 @@ def test_an_unreadable_live_environ_is_reported_not_raised(
     assert env.variable('PATH').manager_value == MANAGER_PATH_VALUE
     assert env.variable('PATH').unit_value == '/pinned/bin'
     assert sue.exit_status(env) == sue.EXIT_LIVE_UNREADABLE
-    assert str(environ) in sue.render(env, ['PATH'])
+    rendered = sue.render(env, ['PATH'])
+    assert str(environ) in rendered
+    assert 'another uid' in rendered
 
 
 def test_a_main_pid_that_has_exited_is_unreadable_through_the_real_proc(
@@ -285,6 +386,7 @@ def test_a_main_pid_that_has_exited_is_unreadable_through_the_real_proc(
     assert MANAGER_PATH_VALUE in block
     assert '/pinned/bin' in block
     assert f'/proc/{exited.pid}/environ' in stdout
+    assert 're-run' in stdout
 
 
 def test_a_complete_report_exits_ok(
