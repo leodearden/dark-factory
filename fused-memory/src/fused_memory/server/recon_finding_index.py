@@ -216,16 +216,30 @@ class RunFindingIndex(Generic[EntryT]):
     # -- registration -----------------------------------------------------
 
     def register(self, finding: FindingRecord, entry: EntryT) -> FindingKeys:
-        self._owners.setdefault(finding.finding_id, entry)
+        """Make *entry*, which holds *finding*, its owner and register its keys."""
+        self._require_held(finding, entry, 'register')
+        owner = self._owners.setdefault(finding.finding_id, entry)
+        if owner is not entry:
+            raise ValueError(
+                f'run {self._run_id!r}: cannot register finding {finding.finding_id!r} '
+                f'to stage {entry.stage!r}; stage {owner.stage!r} owns it'
+            )
         keys = self.keys_for(finding)
         for _name, index, key, _required in self._keys_by_map(keys):
             if key is not None:
                 index.setdefault(key, finding.finding_id)
         return keys
 
-    def register_citation(self, finding: FindingRecord, entry: EntryT) -> None:
-        """Register the keys *finding*'s primary citation adds."""
-        self._owners.setdefault(finding.finding_id, entry)
+    def register_citation(self, finding: FindingRecord) -> None:
+        """Register the keys *finding*'s primary citation adds.  *finding* must
+        be registered and still held by its owner."""
+        owner = self._owners.get(finding.finding_id)
+        if owner is None:
+            raise ValueError(
+                f'run {self._run_id!r}: cannot register a citation of finding '
+                f'{finding.finding_id!r}, which is not registered'
+            )
+        self._require_held(finding, owner, 'register a citation of')
         keys = self.keys_for(finding)
         if keys.cited_task is not None:
             self._by_cited_task.setdefault(keys.cited_task, finding.finding_id)
@@ -239,6 +253,13 @@ class RunFindingIndex(Generic[EntryT]):
             if key is not None and index.get(key) == finding.finding_id:
                 del index[key]
         del self._owners[finding.finding_id]
+
+    def _require_held(self, finding: FindingRecord, entry: EntryT, operation: str) -> None:
+        if not any(held is finding for held in entry.findings):
+            raise ValueError(
+                f'run {self._run_id!r}: cannot {operation} finding {finding.finding_id!r}, '
+                f'which stage {entry.stage!r} does not hold'
+            )
 
     def _named_maps(self) -> tuple[tuple[str, dict[Any, str]], ...]:
         return (

@@ -2718,7 +2718,7 @@ class ReconReportState:
         if not already_cited:
             finding.cited_tasks.append(citation)
         if is_primary_citation:
-            idx.register_citation(finding, finding_entry)
+            idx.register_citation(finding)
         self._persist_run(run_id)
         return citation
 

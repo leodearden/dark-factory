@@ -196,7 +196,7 @@ class TestRegister:
         rec = _Rec('f', None, 'X', 'd')
         _add(idx, entry, rec)
         rec.cited_tasks.append(_cite('p', '42'))
-        idx.register_citation(rec, entry)
+        idx.register_citation(rec)
         assert idx.by_cited_task('p:42') == 'f'
         assert idx.by_signature(('42', 'X')) == 'f'
         assert idx.violations() == []
@@ -208,10 +208,52 @@ class TestRegister:
         late = _Rec('l', None, 'X', 'd2')
         _add(idx, entry, late)
         late.cited_tasks.append(_cite('other', '42'))
-        idx.register_citation(late, entry)
+        idx.register_citation(late)
         assert idx.by_signature(('42', 'X')) == 'o'
         assert idx.by_cited_task('other:42') == 'l'
         assert idx.violations() == []
+
+    def test_register_of_a_finding_the_entry_does_not_hold_raises(self):
+        idx, entry = _index_with('s1')
+        with pytest.raises(ValueError, match=r"run-1.*'f'.*'s1'"):
+            idx.register(_Rec('f', '42', 'X', 'd'), entry)
+        assert idx.owner_of('f') is None
+        assert idx.by_signature(('42', 'X')) is None
+
+    def test_register_of_a_finding_another_entry_owns_raises(self):
+        idx, first = _index_with('s1')
+        rec = _Rec('f', '42', 'X', 'd')
+        _add(idx, first, rec)
+        second = _Entry(RUN, 's2', [rec])
+        idx.install(second)
+        with pytest.raises(ValueError, match=r"run-1.*'f'.*'s2'.*'s1'"):
+            idx.register(rec, second)
+        assert idx.owner_of('f') is first
+
+    def test_register_citation_of_an_unregistered_finding_raises(self):
+        idx, entry = _index_with()
+        rec = _Rec('f', None, 'X', 'd')
+        _add(idx, entry, rec)
+        entry.findings.remove(rec)
+        idx.unregister(rec)
+        rec.cited_tasks.append(_cite('p', '42'))
+        with pytest.raises(ValueError, match=r"run-1.*'f'.*not registered"):
+            idx.register_citation(rec)
+        assert idx.owner_of('f') is None
+        assert idx.by_cited_task('p:42') is None
+        assert idx.by_signature(('42', 'X')) is None
+        assert idx.violations() == []
+
+    def test_register_citation_of_a_finding_its_owner_no_longer_holds_raises(self):
+        idx, entry = _index_with('s1')
+        rec = _Rec('f', None, 'X', 'd')
+        _add(idx, entry, rec)
+        entry.findings.remove(rec)
+        rec.cited_tasks.append(_cite('p', '42'))
+        with pytest.raises(ValueError, match=r"run-1.*'f'.*'s1'"):
+            idx.register_citation(rec)
+        assert idx.by_cited_task('p:42') is None
+        assert idx.by_signature(('42', 'X')) is None
 
 
 class TestUnregister:
@@ -222,7 +264,7 @@ class TestUnregister:
         late = _Rec('l', None, 'X', 'd2')
         _add(idx, entry, late)
         late.cited_tasks.append(_cite('p', '42'))
-        idx.register_citation(late, entry)
+        idx.register_citation(late)
 
         entry.findings.remove(late)
         idx.unregister(late)
@@ -250,7 +292,7 @@ class TestFlagTypesForTask:
         anchor = _Rec('c', None, 'Y', 'd3')
         _add(idx, entry, anchor)
         anchor.cited_tasks.append(_cite('p', '42'))
-        idx.register_citation(anchor, entry)
+        idx.register_citation(anchor)
         assert idx.flag_types_for_task('42') == {'X', 'Y'}
         assert idx.flag_types_for_task('99') == set()
 
@@ -316,7 +358,7 @@ class TestPersistedSlice:
         for rec in (ordinary, note, anchor):
             _add(idx, entry, rec)
         anchor.cited_tasks.append(_cite('p', '7'))
-        idx.register_citation(anchor, entry)
+        idx.register_citation(anchor)
         return idx, entry, ordinary, note, anchor
 
     def test_owned_slice_partitions_like_entry_json(self):
@@ -415,7 +457,7 @@ class TestViolations:
         anchor = _Rec('c', None, 'Y', 'd2')
         _add(idx, second, anchor)
         anchor.cited_tasks.append(_cite('p', '5'))
-        idx.register_citation(anchor, second)
+        idx.register_citation(anchor)
         assert idx.violations() == []
 
 
