@@ -1,16 +1,18 @@
 """Tests for orchestrator.mcp.foreign_task_meta (task 4825).
 
-The module finds the absolute paths a plan's prose names inside another
-lane's or task's ``.task-meta`` directory, and attaches them to a
-plan-tools response. Every case runs against a REAL linked worktree, so
-the write set is derived from a real ``.git`` gitdir file.
+The module finds the paths a plan's prose names inside another lane's or
+task's ``.task-meta`` directory, and attaches them to a plan-tools response.
+Every case runs against a REAL linked worktree, so the write set is derived
+from a real ``.git`` gitdir file. The lane is named ``lane`` while the task
+is 4825, the production shape where a lane name differs from its task id.
 """
 from __future__ import annotations
 
-import subprocess
+import os
 from pathlib import Path
 
 import pytest
+from _git_checkouts import main_checkout_with_lane
 
 from orchestrator.agents.write_set import WriteSet, compute_write_set
 from orchestrator.artifacts import TaskArtifacts
@@ -23,25 +25,9 @@ from orchestrator.mcp.foreign_task_meta import (
 )
 
 
-def _git(args: list[str], cwd: Path) -> None:
-    subprocess.run(['git', *args], cwd=cwd, check=True, capture_output=True)
-
-
 @pytest.fixture
 def wt(tmp_path: Path) -> Path:
-    main = tmp_path / 'main-repo'
-    main.mkdir()
-    _git(['init', '-b', 'main'], main)
-    _git(['config', 'user.email', 'test@test.com'], main)
-    _git(['config', 'user.name', 'Test'], main)
-    (main / 'README.md').write_text('# test\n')
-    _git(['add', '-A'], main)
-    _git(['commit', '-m', 'initial commit'], main)
-    base = tmp_path / 'worktrees'
-    base.mkdir()
-    worktree = base / '4825'
-    _git(['worktree', 'add', '-b', 'task/4825', str(worktree), 'main'], main)
-    return worktree
+    return main_checkout_with_lane(tmp_path)[1]
 
 
 @pytest.fixture
@@ -66,12 +52,23 @@ class TestForeignTaskMetaPaths:
         text = f'cp `{meta_base}/4762/plan.json` aside.'
         assert foreign_task_meta_paths(text, ws) == (f'{meta_base}/4762/plan.json',)
 
-    @pytest.mark.parametrize('punctuation', ['.', ':'])
+    @pytest.mark.parametrize('punctuation', ['.', ':', '!', '?'])
     def test_trailing_sentence_punctuation_is_stripped(
         self, ws: WriteSet, meta_base: str, punctuation: str,
     ):
         text = f'Then read {meta_base}/4762/plan.json{punctuation}'
         assert foreign_task_meta_paths(text, ws) == (f'{meta_base}/4762/plan.json',)
+
+    def test_a_worktree_relative_dotdot_path_is_reported_as_written(self, ws: WriteSet):
+        text = 'cp ../.task-meta/4762/plan.json x'
+        assert foreign_task_meta_paths(text, ws) == ('../.task-meta/4762/plan.json',)
+
+    def test_a_home_relative_path_is_reported_as_written(
+        self, ws: WriteSet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv('HOME', str(tmp_path))
+        text = 'cp ~/.task-meta/4762/plan.json x'
+        assert foreign_task_meta_paths(text, ws) == ('~/.task-meta/4762/plan.json',)
 
     def test_distinct_paths_are_reported_once_each_in_first_seen_order(
         self, ws: WriteSet, meta_base: str,
@@ -84,11 +81,25 @@ class TestForeignTaskMetaPaths:
     def test_the_plans_own_lane_and_task_dirs_are_not_reported(
         self, ws: WriteSet, meta_base: str,
     ):
-        text = f'write {meta_base}/4825/plan.json and {meta_base}/task-4825/plan.json'
+        text = f'write {meta_base}/lane/plan.json and {meta_base}/task-4825/plan.json'
         assert foreign_task_meta_paths(text, ws) == ()
+
+    def test_a_dir_named_for_the_task_id_but_not_its_lane_is_reported(
+        self, ws: WriteSet, meta_base: str,
+    ):
+        assert foreign_task_meta_paths(f'write {meta_base}/4825/plan.json', ws) == (
+            f'{meta_base}/4825/plan.json',
+        )
+
+    def test_an_unresolvable_token_is_skipped_and_its_neighbours_still_checked(
+        self, ws: WriteSet, meta_base: str,
+    ):
+        text = f'{meta_base}/47\x0062/plan.json then {meta_base}/4762/plan.json'
+        assert foreign_task_meta_paths(text, ws) == (f'{meta_base}/4762/plan.json',)
 
     @pytest.mark.parametrize('shape', [
         'see `.worktrees/.task-meta/4762/plan.json`',
+        'a fixture at tmp/.task-meta/L',
         'a fixture at <base>/.task-meta/other/x',
         'the fixture /w/.task-meta/task-7',
         'copy {meta_base}/<task>/verdicts/x.json in',
@@ -119,6 +130,12 @@ class TestStepFindings:
         worktree = tmp_path / 'no-git-wt'
         worktree.mkdir()
         assert step_findings(TaskArtifacts(worktree), self._entries(meta_base)) == {}
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file')
+    def test_an_unreadable_git_file_fails_open(self, wt: Path, meta_base: str):
+        (wt / '.git').chmod(0)
+        artifacts = TaskArtifacts.for_task(wt, '4825')
+        assert step_findings(artifacts, self._entries(meta_base)) == {}
 
 
 class TestAnnotate:

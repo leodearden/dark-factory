@@ -28,24 +28,31 @@ FOREIGN_TASK_META_NOTE = (
     "whose only .task-meta entries are this dispatch's own lane and task dirs, "
     "and an escalation's granted_files does not widen it. Reading them is fine. "
     'A step that WRITES one cannot be implemented, so move the write out of the '
-    'plan. To make another task plan afresh, a handler resolves an escalation '
-    "for that task with resolve_issue(action='restart', recut=True), which "
-    'moves its .task-meta aside; for any other such write, call '
+    'plan. Only absolute, ~/ and worktree-relative ../ paths are checked. '
+    'To make another task plan afresh, call escalate_blocker for THIS task with '
+    'a suggested_action naming the target task id. The handler then resolves an '
+    "escalation whose task_id is the TARGET's with resolve_issue(action='restart', "
+    'recut=True), filing one for the target first if none is pending; that moves '
+    "the target's .task-meta aside. restart+recut on this task's own escalation "
+    'would recut this task, not the target. For any other such write, call '
     'escalate_blocker for a handler-side run. See docs/task-authoring.md §9 '
     '"Superseding another task\'s plan".'
 )
 
-_ABSOLUTE_PATH_TOKEN = re.compile(r'/[^\s`\'"()<>\[\]{},;|*]+')
+_PATH_TOKEN = re.compile(r'(?<![\w.~/-])(?:~|\.\.)?/[^\s`\'"()<>\[\]{},;|*]+')
+_TRAILING_PUNCTUATION = '.:!?'
 
 
 def foreign_task_meta_paths(text: str, write_set: WriteSet) -> tuple[str, ...]:
-    """The absolute paths *text* names inside another lane's or task's
-    ``.task-meta`` dir, as written, deduped in first-seen order."""
+    """The absolute, ``~/`` and ``../`` paths *text* names inside another
+    lane's or task's ``.task-meta`` dir, as written, deduped in first-seen
+    order. A ``../`` path is read from the worktree, a lane's cwd; a path
+    that starts mid-word is relative to something unknown and is skipped."""
     kept: list[str] = []
-    for match in _ABSOLUTE_PATH_TOKEN.finditer(text):
-        token = match.group().rstrip('.:')
+    for match in _PATH_TOKEN.finditer(text):
+        token = match.group().rstrip(_TRAILING_PUNCTUATION)
         try:
-            if write_set.is_foreign_task_meta(Path(token)):
+            if write_set.is_foreign_task_meta(write_set.worktree / Path(token).expanduser()):
                 kept.append(token)
         except (OSError, RuntimeError, ValueError):
             continue
@@ -56,11 +63,11 @@ def step_findings(artifacts: TaskArtifacts, entries: Iterable[object]) -> dict[s
     """Step or prerequisite id -> the foreign paths its description names.
 
     Empty when no write set can be derived for *artifacts*: the check is
-    advisory, so it fails open.
+    advisory and runs after the entry is saved, so it fails open.
     """
     try:
         write_set = write_set_of(artifacts)
-    except ValueError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         logger.info('foreign .task-meta check skipped for %s: %s', artifacts.worktree, exc)
         return {}
     findings: dict[str, list[str]] = {}

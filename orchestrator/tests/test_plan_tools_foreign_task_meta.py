@@ -1,19 +1,19 @@
 """plan-tools flags a plan entry naming another task's ``.task-meta`` (task 4825).
 
 add_plan_step, add_prerequisite, replace_plan_step and confirm_plan attach
-``foreign_task_meta`` to their OK response when an entry's description names
-an absolute path no lane of this task can write. The flag is advisory: the
-entry is still stored and the plan is still confirmed. A sibling of
+``foreign_task_meta`` to their response when an entry's description names
+a path no lane of this task can write. The flag is advisory: the entry is
+still stored and the plan is still confirmed. A sibling of
 ``test_plan_tools_step_type.py``, run on a REAL dual-root linked worktree.
 """
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_checkouts import main_checkout_with_lane
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp.foreign_task_meta import FOREIGN_TASK_META_KEY, FOREIGN_TASK_META_NOTE
@@ -26,25 +26,9 @@ from orchestrator.mcp.plan_tools import (
 )
 
 
-def _git(args: list[str], cwd: Path) -> None:
-    subprocess.run(['git', *args], cwd=cwd, check=True, capture_output=True)
-
-
 @pytest.fixture
 def wt(tmp_path: Path) -> Path:
-    main = tmp_path / 'main-repo'
-    main.mkdir()
-    _git(['init', '-b', 'main'], main)
-    _git(['config', 'user.email', 'test@test.com'], main)
-    _git(['config', 'user.name', 'Test'], main)
-    (main / 'README.md').write_text('# test\n')
-    _git(['add', '-A'], main)
-    _git(['commit', '-m', 'initial commit'], main)
-    base = tmp_path / 'worktrees'
-    base.mkdir()
-    worktree = base / '4825'
-    _git(['worktree', 'add', '-b', 'task/4825', str(worktree), 'main'], main)
-    return worktree
+    return main_checkout_with_lane(tmp_path)[1]
 
 
 @pytest.fixture
@@ -118,6 +102,19 @@ def test_confirm_plan_flags_every_dirty_entry_and_still_confirms(
     assert response['finalized'] is True
     assert response[FOREIGN_TASK_META_KEY]['paths'] == {'step-1': [foreign]}
     assert '_finalized_at' in artifacts.read_plan()
+
+
+def test_a_refused_confirm_plan_still_flags_its_dirty_entries(wt: Path, foreign: str):
+    a = TaskArtifacts.for_task(wt, '4825')
+    a.init('4825', 'T', 'D')
+    _create_plan(a, '4825', 'T', 'A', [])
+    _add_plan_step(a, 'step-1', 'impl', _dirty(foreign))
+
+    response = _confirm_plan(a)
+
+    assert response['status'] == 'error'
+    assert 'no files' in response['message']
+    assert response[FOREIGN_TASK_META_KEY]['paths'] == {'step-1': [foreign]}
 
 
 def test_confirm_plan_on_a_clean_plan_carries_no_flag(artifacts: TaskArtifacts):
