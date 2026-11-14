@@ -1403,21 +1403,14 @@ class TestRepairLiveRunRefusalAndDryRun:
 # imported from the implementation's own allowlist, so this states an
 # INDEPENDENT expectation instead of restating the code under test, and
 # ``test_verdict_map_covers_every_run_status`` pins it to the enum EXACTLY: add a
-# seventh status later and this module fails until someone labels it, rather
+# new status later and this module fails until someone labels it, rather
 # than the new member silently defaulting to repairable — which is precisely how
 # ``interrupted`` slipped through the original single-value guard.
 _STATUS_VERDICTS: dict[RunStatus, str] = {
     # In flight by its own row.
     RunStatus.running: 'refused',
-    # Legacy, not yet settled (task 5514). Nothing writes it any more, but the
-    # startup sweep ``harness.py::ReconciliationHarness._recover_legacy_interrupted_runs``
-    # selects exactly these rows (``journal.get_interrupted_runs()`` is
-    # ``SELECT * FROM runs WHERE status = 'interrupted'``) and converts each to
-    # ``failed`` with a wholesale ``stage_reports`` write from its loaded copy —
-    # so a repair applied before that conversion would be silently overwritten.
-    RunStatus.interrupted: 'refused',
-    # Genuinely terminal: the ``get_interrupted_runs`` query above never selects
-    # these, and nothing else re-adopts a run, so no writer can clobber a repair.
+    # Genuinely terminal: no writer re-adopts a run once it leaves 'running', so
+    # nothing can clobber a repair.
     RunStatus.completed: 'repairable',
     RunStatus.failed: 'repairable',
     RunStatus.rolled_back: 'repairable',

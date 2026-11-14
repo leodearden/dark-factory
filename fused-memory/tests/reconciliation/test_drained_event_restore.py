@@ -90,8 +90,8 @@ async def test_completed_run_events_stay_drained(journal, buffer):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'b_status',
-    [RunStatus.failed, RunStatus.interrupted, RunStatus.running, None],
-    ids=['failed', 'interrupted', 'running', 'no_journal_row'],
+    [RunStatus.failed, RunStatus.running, None],
+    ids=['failed', 'running', 'no_journal_row'],
 )
 async def test_unfinished_run_restores_only_its_own_events(journal, buffer, b_status):
     await _drain_new_events(buffer, 2, run_id='A')

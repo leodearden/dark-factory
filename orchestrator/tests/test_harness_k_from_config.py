@@ -1,16 +1,16 @@
-"""Tests for K / num_hosts wiring in harness._start_merge_worker (task 1716).
+"""Tests for K / num_hosts wiring in harness._start_merge_worker.
 
-Verifies that _start_merge_worker derives K from
-``1 + len(config.enabled_verify_runners)`` (not from the pinned
-``_MERGE_AHEAD_BOUND``), and passes ``num_hosts=K`` to
-``enforce_persistent_worktree_serial_lane``.
+Task 1716 wired the merge lane's sizing from config.  Task 8526 (merge-lane
+policy δ, plans/merge-lane-policy-prd.md D4) split it into two facts:
 
-Modeled on test_harness_merge_registry_wiring.py:154
-TestStartMergeWorkerCallsLivenessGuard.
+- the verify-host count, ``1 + len(config.enabled_verify_runners)``, which
+  bounds concurrently leased verifies (one allocator slot per host) and so is
+  what ``enforce_persistent_worktree_serial_lane`` receives as both
+  ``merge_ahead_bound`` and ``num_hosts``;
+- the speculation depth K = hosts + 1, which sizes the worker's frontier
+  (``speculation_depth``) and the spec warm-lane pool.
 
-RED until step-12 replaces ``_k = _MERGE_AHEAD_BOUND`` with
-``_k = 1 + len(self.config.enabled_verify_runners)`` and passes
-``num_hosts=_k`` to ``enforce_persistent_worktree_serial_lane``.
+Modeled on test_harness_merge_registry_wiring.py::TestStartMergeWorkerCallsLivenessGuard.
 """
 
 from __future__ import annotations
@@ -44,7 +44,9 @@ def _build_harness(config) -> Harness:
 
 @pytest.mark.asyncio
 class TestHarnessKFromConfig:
-    """K and num_hosts are both derived from 1 + len(config.enabled_verify_runners).
+    """K = hosts + 1; the serial-lane guard is fed the host count.
+
+    hosts = 1 + len(config.enabled_verify_runners).
 
     Patching strategy
     -----------------
@@ -58,10 +60,8 @@ class TestHarnessKFromConfig:
     would have no effect because no module-level binding exists there.
     """
 
-    async def _run_start_worker(self, config):
-        """Helper: build harness, patch, call _start_merge_worker, return mocks."""
-        h = _build_harness(config)
-
+    async def _run_start_worker(self, h: Harness):
+        """Helper: patch, call *h*._start_merge_worker, return mocks."""
         with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
@@ -76,16 +76,17 @@ class TestHarnessKFromConfig:
 
         return mock_smw_cls, mock_liveness, mock_serial
 
-    async def test_k3_with_two_enabled_runners(self, mock_orch_config) -> None:
-        """Two enabled verify_runners → K=3.
+    async def test_k_is_hosts_plus_one_with_two_enabled_runners(
+        self, mock_orch_config,
+    ) -> None:
+        """Two enabled verify_runners → hosts=3, K=4.
 
         Asserts:
-          (a) SpeculativeMergeWorker(speculation_depth=3)
+          (a) SpeculativeMergeWorker(speculation_depth=4)
           (b) enforce_persistent_worktree_serial_lane(..., merge_ahead_bound=3, num_hosts=3)
+              — the HOST count, the bound on concurrently leased verifies, not K
           (c) enforce_merge_liveness_margin(config) — config only, no kwargs
               (task-1729 drops raw _k: heartbeat floor makes K irrelevant to the liveness guard)
-
-        RED until step-12 wires K from config.enabled_verify_runners.
         """
         r1 = VerifyRunnerConfig(
             name='r1', ssh_host='h1.local', git_remote='remote1', df_checkout_path='/df',
@@ -98,62 +99,70 @@ class TestHarnessKFromConfig:
         mock_orch_config.fused_memory.project_id = 'test'
 
         mock_smw_cls, mock_liveness, mock_serial = await self._run_start_worker(
-            mock_orch_config
+            _build_harness(mock_orch_config),
         )
 
-        # (a) SpeculativeMergeWorker called with speculation_depth=3
         smw_kwargs = mock_smw_cls.call_args[1]
-        assert smw_kwargs['speculation_depth'] == 3, (
-            f'Expected speculation_depth=3 (K=1+2), got {smw_kwargs.get("speculation_depth")!r}; '
-            'step-12 wires _k from config.enabled_verify_runners'
+        assert smw_kwargs['speculation_depth'] == 4, (
+            f'Expected speculation_depth=4 (K = hosts + 1 = 3 + 1), '
+            f'got {smw_kwargs.get("speculation_depth")!r}'
         )
 
-        # (b) enforce_persistent_worktree_serial_lane called with merge_ahead_bound=3
-        #     AND num_hosts=3 (currently num_hosts is never passed — step-12 adds it)
         mock_serial.assert_called_once()
         serial_kwargs = mock_serial.call_args[1]
         assert serial_kwargs.get('merge_ahead_bound') == 3, (
-            f'Expected merge_ahead_bound=3, got {serial_kwargs!r}'
+            f'Expected merge_ahead_bound=3 (the host count), got {serial_kwargs!r}'
         )
         assert serial_kwargs.get('num_hosts') == 3, (
-            f'Expected num_hosts=3, got {serial_kwargs!r}; '
-            'step-12 adds num_hosts=_k to enforce_persistent_worktree_serial_lane'
+            f'Expected num_hosts=3, got {serial_kwargs!r}'
         )
 
-        # (c) enforce_merge_liveness_margin called with self.config ONLY (no bound/hosts kwargs;
-        #     task-1729 drops raw _k — heartbeat floor makes K irrelevant to the liveness guard)
         mock_liveness.assert_called_once_with(mock_orch_config)
 
-    async def test_k1_with_zero_runners_byte_identical(self, mock_orch_config) -> None:
-        """Zero verify_runners → K=1, num_hosts=1 (byte-identical to pre-task behavior).
-
-        RED until step-12 adds num_hosts=_k to enforce_persistent_worktree_serial_lane.
-        """
+    async def test_zero_runners_is_one_host_and_k_two(self, mock_orch_config) -> None:
+        """Zero verify_runners → hosts=1, K=2; the guard sees bound 1 over 1 host."""
         mock_orch_config.enabled_verify_runners = []
         mock_orch_config.max_concurrent_tasks = 2
         mock_orch_config.fused_memory.project_id = 'test'
 
         mock_smw_cls, mock_liveness, mock_serial = await self._run_start_worker(
-            mock_orch_config
+            _build_harness(mock_orch_config),
         )
 
-        # speculation_depth=1
         smw_kwargs = mock_smw_cls.call_args[1]
-        assert smw_kwargs['speculation_depth'] == 1, (
-            f'Expected speculation_depth=1, got {smw_kwargs.get("speculation_depth")!r}'
+        assert smw_kwargs['speculation_depth'] == 2, (
+            f'Expected speculation_depth=2, got {smw_kwargs.get("speculation_depth")!r}'
         )
 
-        # enforce_persistent_worktree_serial_lane: merge_ahead_bound=1, num_hosts=1
         serial_kwargs = mock_serial.call_args[1]
         assert serial_kwargs.get('merge_ahead_bound') == 1
         assert serial_kwargs.get('num_hosts') == 1, (
-            f'Expected num_hosts=1, got {serial_kwargs!r}; '
-            'step-12 adds explicit num_hosts=_k (=1 when no runners)'
+            f'Expected num_hosts=1, got {serial_kwargs!r}'
         )
 
-        # (c) enforce_merge_liveness_margin called with self.config ONLY (no bound/hosts kwargs;
-        #     task-1729 drops raw _k — heartbeat floor makes K irrelevant to the liveness guard)
         mock_liveness.assert_called_once_with(mock_orch_config)
+
+    async def test_spec_pool_and_worker_share_one_k(self, mock_orch_config) -> None:
+        """The spec warm-lane pool holds one lane per frontier entry: K of them."""
+        r1 = VerifyRunnerConfig(
+            name='r1', ssh_host='h1.local', git_remote='remote1', df_checkout_path='/df',
+        )
+        mock_orch_config.enabled_verify_runners = [r1]
+        mock_orch_config.max_concurrent_tasks = 2
+        mock_orch_config.fused_memory.project_id = 'test'
+        mock_orch_config.git = mock_orch_config.git.model_copy(
+            update={'merge_spec_warm_lane_pool': True},
+        )
+
+        h = _build_harness(mock_orch_config)
+        pool = h.git_ops.spec_warm_lane_pool
+        assert pool is not None
+
+        mock_smw_cls, _, _ = await self._run_start_worker(h)
+
+        depth = mock_smw_cls.call_args[1]['speculation_depth']
+        assert depth == 3
+        assert pool.capacity == depth
 
 
 # ---------------------------------------------------------------------------
@@ -163,11 +172,11 @@ class TestHarnessKFromConfig:
 
 @pytest.mark.asyncio
 class TestStartMergeWorkerK2LivenessRepro:
-    """K=2 startup repro through the REAL liveness guard (γ integration gate).
+    """Two-host startup repro through the REAL guards (γ integration gate).
 
     Drives _start_merge_worker end-to-end with the actual
     enforce_merge_liveness_margin against the 2026-06-10 crash config
-    (one enabled verify_runner → K=2, cold_timeout_secs=7200).
+    (one enabled verify_runner → two hosts, cold_timeout_secs=7200).
 
     Patch set: ONLY SpeculativeMergeWorker / asyncio.create_task /
     _build_service_restart_coordinator.  Both guards run REAL.
@@ -183,13 +192,13 @@ class TestStartMergeWorkerK2LivenessRepro:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """K=2, cold_timeout=7200 passes the real enforce_merge_liveness_margin.
+        """Two hosts, cold_timeout=7200 pass the real enforce_merge_liveness_margin.
 
         The exact operator config that crashed pre-β is now safe because the
         heartbeat-floor formula (worst_case = _HEARTBEAT_POLL_S ×
         TOUCH_MISS_TOLERANCE = 600 s) decouples from cold timeout and K.
         """
-        # Exact 2026-06-10 crash config: one enabled verify_runner → K=2,
+        # Exact 2026-06-10 crash config: one enabled verify_runner (two hosts),
         # cold_timeout=7200.  Pre-β the formula scaled with cold_timeout×K and
         # raised MergeLivenessConfigError; post-β the floor is constant at 600 s.
         config = OrchestratorConfig(
@@ -232,11 +241,12 @@ class TestStartMergeWorkerK2LivenessRepro:
             # accepted this config.  (A raised error would propagate and fail the test.)
             await h._start_merge_worker()
 
-        # (2) SpeculativeMergeWorker called once with speculation_depth=2 (K = 1 + 1)
+        # (2) SpeculativeMergeWorker called once with speculation_depth=3
+        #     (hosts = 1 + 1 verify_runner = 2, K = hosts + 1)
         mock_smw_cls.assert_called_once()
         smw_kwargs = mock_smw_cls.call_args[1]
-        assert smw_kwargs['speculation_depth'] == 2, (
-            f'Expected speculation_depth=2 (K=1+1 verify_runner), '
+        assert smw_kwargs['speculation_depth'] == 3, (
+            f'Expected speculation_depth=3 (K = 2 hosts + 1), '
             f'got {smw_kwargs.get("speculation_depth")!r}'
         )
 
@@ -245,9 +255,10 @@ class TestStartMergeWorkerK2LivenessRepro:
             f'Expected startup log in caplog; got: {caplog.text!r}'
         )
 
-        # (4) Serial-lane guard at K=2/num_hosts=2 → per_host=ceil(2/2)=1 → no raise.
-        # Proven implicitly by clean completion above with persistent_merge_worktree=True
-        # (the guard early-returns only when the knob is off; here it runs and passes).
-        # This regression-holds the 1692 seam: num_hosts=K keeps per-host bound = 1.
+        # (4) Serial-lane guard fed the host count (bound 2 over 2 hosts) →
+        # per_host = 1 → no raise.  Proven by clean completion above with
+        # persistent_merge_worktree=True (the guard early-returns only when the
+        # knob is off; here it runs and passes).  Fed K = 3 against 2 hosts it
+        # would compute per_host = 2 and refuse startup — reify's live shape.
         # The β config-independence property (worst_case_secs invariant across cold
         # timeouts) is owned by TestMergeLivenessMargin in test_merge_queue.py.

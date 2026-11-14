@@ -118,22 +118,23 @@ module_overrides:
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
   orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
-  # DOCUMENTATION FILES (Leo's ruling of 2026-11-12): unbounded for the same reason
-  # as the ratchet paths. OPERATIONS.md is declared by 171 pending tasks and was at
-  # capacity 99% of 2026-11-09..11-12; two edits of a prose file conflict textually,
-  # at rebase. INTERIM for task 5467, which strips docs/ and root-level Markdown
-  # from lock derivation for every project: remove these ten keys when it lands.
-  # skills/ is deliberately not listed (agent instructions; no ruling).
-  OPERATIONS.md: 99
-  ARCHITECTURE.md: 99
-  CHANGELOG.md: 99
-  CLAUDE.md: 99
-  CONTRIBUTING.md: 99
-  DESIGN.md: 99
-  README.md: 99
-  RECONCILIATION_PLAN.md: 99
-  SETUP.md: 99
-  docs/task-authoring.md: 99
+
+# DOCUMENTATION LOCK KEYS take unlimited holders (Leo's rulings of 2026-09-13,
+# 2026-11-12 and 2026-11-13; task 5467). Every key under docs/ and every root-level
+# *.md stays in each task's lock list, but any number of tasks may hold it at once:
+# two edits of a prose file conflict textually, at rebase, so the lock only
+# serialised work (OPERATIONS.md: 171 pending declarers, held 99% of 11-09..11-12).
+# docs/ also holds machine-read and tool-written files (docs/legibility/
+# census-state.json, confusion-codebook.yaml, the PRD capability manifests); an
+# exact module_overrides entry beats this rule, so one `<key>: 1` line there pins
+# any of them back, but only against requests for that file itself: a request for
+# a directory above it (docs/legibility, docs) still matches the prefix and takes
+# unlimited holders.
+# skills/ is deliberately outside it (agent instructions; no ruling).
+# Same red tier as module_overrides: takes effect at the next restart.
+unlimited_holder_locks:
+  prefixes: ["docs/"]
+  root_markdown: true
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its

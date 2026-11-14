@@ -2718,8 +2718,9 @@ class GitConfig(BaseModel):
             'When True, LOCAL speculative merge-verify slots allocate from a '
             'per-box pool of K CoW-seeded warm lanes (_spec-0 .. _spec-{K-1}), '
             'one per speculation depth, instead of using the single serial '
-            '_merge-verify worktree.  K = 1 + len(enabled_verify_runners) '
-            '(same expression as speculation_depth).  Each acquire re-seeds '
+            "_merge-verify worktree.  K = the lane's speculation depth "
+            '(orchestrator/src/orchestrator/harness.py::Harness._speculation_k).  '
+            'Each acquire re-seeds '
             'target/ from the CURRENT warm base (inv.8 always-re-seed-at-acquire). '
             'On pool exhaustion or seed failure, falls back to a cold ephemeral '
             'worktree — never blocks the scheduler (inv.6).  The existing '

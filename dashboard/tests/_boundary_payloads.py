@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import httpx
-from _canned_mcp import CannedMCP, _raw_row, is_metadata_projection
+from _canned_mcp import ByRoot, CannedMCP, _raw_row, is_metadata_projection
 from _dt_helpers import fixed_clock, installed_clock
 from _prd_lanes_tree import (
     CARRIER,
@@ -253,31 +253,6 @@ def _heal(substrate: CannedMCP) -> None:
     substrate.fail_when = lambda call: False
 
 
-class _ByRoot:
-    """One canned substrate per project root, routed by the read's ``project_root``.
-
-    ``get_external_statuses`` names no root: it answers each ``project:id`` dep
-    from the substrate labelled ``project``, flat, with fused-memory's
-    ``unknown_project`` / ``unknown_task`` sentinels for one no substrate holds.
-    """
-
-    def __init__(self, by_label: Mapping[str, CannedMCP]) -> None:
-        self._by_label = by_label
-
-    async def __call__(self, client, url, tool, args, **kwargs):
-        if tool == 'get_external_statuses':
-            return {dep: self._external_status(dep) for dep in args['deps']}
-        substrate = self._by_label[Path(args['project_root']).name]
-        return await substrate(client, url, tool, args, **kwargs)
-
-    def _external_status(self, dep: str) -> str:
-        label, _, task_id = dep.partition(':')
-        substrate = self._by_label.get(label)
-        if substrate is None:
-            return 'unknown_project'
-        return substrate.status_map.get(int(task_id), 'unknown_task')
-
-
 class _SchedulerByRoot:
     """The scheduler fan-out, one canned state per root label; a label mapped to ``None`` is
     unreachable. Every other root serves :data:`CANNED_SCHEDULER_STATE`, and no root has events."""
@@ -340,7 +315,7 @@ def _canned_roots(
 
     try:
         with (
-            patch('dashboard.data.tasks.mcp_tool_call', new=_ByRoot(substrates)),
+            patch('dashboard.data.tasks.mcp_tool_call', new=ByRoot(substrates)),
             patch('dashboard.data.scheduler.mcp_tool_call', new=_SchedulerByRoot(schedulers or {})),
             patch('dashboard.data.active_tasks.fetch_task_runtime', new=AsyncMock(return_value={})),
             patch.object(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0),

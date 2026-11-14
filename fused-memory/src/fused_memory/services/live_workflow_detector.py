@@ -212,11 +212,11 @@ from shared.task_claimant import (
     carries_claimant,
     has_live_claimant,
 )
+from shared.task_fields import dependency_ids as task_dependency_ids
 from shared.task_metadata import RoutingState
 from shared.task_statuses import ACTIVE, TaskStatus
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
-from fused_memory.utils.task_dependency_ids import task_dependency_ids
 
 logger = logging.getLogger(__name__)
 
