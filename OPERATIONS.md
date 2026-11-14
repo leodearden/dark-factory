@@ -2835,6 +2835,148 @@ docker exec docker-falkordb-scratch-1 redis-cli CONFIG GET save    # save / 3600
 docker exec docker-falkordb-scratch-1 redis-cli GRAPH.LIST         # lists evalmem_lme_ref_incumbent_a
 ```
 
+### FalkorDB index provisioning: expected set, drift, the BM25 canary, the composite trap
+
+fused-memory builds the range and fulltext indices on every registered project
+graph itself (`docs/prds/falkordb-index-provisioning.md`). Until it did, no
+graph had them, and BM25 returned nothing without anyone noticing. Nothing
+here asks you to create or drop an index by hand.
+
+**Who provisions, and when.** At startup `GraphitiBackend.initialize` calls
+`GraphitiBackend.provision_registered_graphs`, which provisions every
+registered graph that already exists
+(`fused-memory/src/fused_memory/backends/graphiti_client.py`). A registered
+graph's first write in a process goes through `GraphitiBackend._ensure_indices`,
+so a registered project with no graph key yet is provisioned on its first
+write, with no restart. Each run reads `list_indices()`, diffs it against the
+expected set and creates only what is missing
+(`fused-memory/src/fused_memory/backends/falkor_indices.py::plan_index_statements`).
+A provisioning failure fails neither the write nor the rest of the sweep. A
+failed statement is logged at WARNING and the graph is still cached, so only a
+restart retries it. A provisioning run that raises or times out is left
+uncached, so the next write or a restart retries it.
+
+The scope is the project registry, `taskmaster.project_root` plus
+`DASHBOARD_KNOWN_PROJECT_ROOTS`, not a graph name. Probe, test and scratch
+graphs are never provisioned. A live graph that should carry indices but is not
+registered gets REGISTERED, never special-cased (PRD D5).
+
+The `pass` override on `_MultiTenantFalkorDriver.build_indices_and_constraints`
+stays, deliberately. It suppresses the implicit build every `clone()` would
+otherwise fire, which caused the `723ec915c3` storm (PRD D4). Do not delete it.
+
+**Repair** is a fused-memory restart:
+`/home/leo/src/dark-factory/scripts/restart-fused-memory.sh`, whose default
+path runs `systemctl --user restart fused-memory` between reconciliation
+cycles. It is one shared process, so a manual restart needs operator sign-off.
+Provisioning is cached per process, so an index that disappears while
+fused-memory runs is not rebuilt until the next restart. A
+`recon_missing_index` escalation's `suggested_action` says to provision with
+`ensure_indices(group_id=...)`. No MCP tool or script exposes that method to an
+operator; a restart is how you reach it.
+
+**The expected set.** Its single home is
+`fused-memory/src/fused_memory/backends/falkor_indices.py::expected_index_set`,
+parsed from graphiti's own `get_range_indices` / `get_fulltext_indices` output
+for `GraphProvider.FALKORDB`. It holds RANGE and FULLTEXT specs in the normal
+form `(label, entity_type, field, index_type)`, one tuple per property. Its
+members move with a graphiti-core bump (`fused-memory/pyproject.toml` pins it
+open-ended), so they are not listed here. Print them; the command imports no
+driver and touches no graph:
+
+```bash
+cd /home/leo/src/dark-factory/fused-memory && uv run python -c 'from fused_memory.backends.falkor_indices import expected_index_set as e; print(*("\t".join(s) for s in sorted(e())), sep="\n")'
+```
+
+An upstream statement the parser does not recognise raises
+`UnparsedIndexStatementError` rather than shortening the set. That failure is
+loud in the journal only: provisioning logs `did not complete` and the drift
+detector logs `_detect_index_drift failed`, and no escalation is filed. After a
+graphiti-core bump, read the journal, not the queue.
+
+**Checking for drift.** One detector,
+`fused-memory/src/fused_memory/reconciliation/harness.py::_detect_index_drift`,
+runs at startup over the registered projects and on every reconciliation
+cycle. For each drifted graph it files one L1 `recon_missing_index` escalation
+on the reconciliation queue (port 8103, see
+[§4](#recon-escalation-watcher-for-the-reconciliation-queue)). Its `task_id` is
+`graph:<group_id>`, an opaque dedup key and NOT a task. The structured payload
+is `index_health.group_id`, `index_health.missing` and
+`index_health.unexpected`, and the exit owner is `/recon-escalation-watcher`.
+An open one is the standing signal, which is why it files once rather than
+once per cycle. No open one means either every registered graph was healthy as
+of its last cycle, or its health could not be determined: a failed read, a
+detector that raised, or a failed dedup read files nothing. A registered
+graph with no key yet is also not checked, by design. Read the journal lines
+below before taking an empty queue as healthy.
+
+In `journalctl --user -u fused-memory`:
+
+| Line | Level | Means |
+|---|---|---|
+| `reconciliation.index_drift_detected` | WARNING | a graph's missing set changed; logged on change only |
+| `reconciliation.index_unexpected_present` | INFO | indices outside the expected set, such as operator-added ones; reported, never acted on |
+| `Provisioned indices on graph` | INFO | provisioning created or failed to create something; read the `created=` and `failed=` counts. Logged only when something changed, so silence means nothing was missing |
+| `Index provisioning statement failed on graph` | WARNING | one statement failed; the line names it. The graph stays cached, so only a restart retries it |
+| `Index provisioning on graph ... did not complete` | WARNING | that graph's provisioning raised or timed out; it stays uncached, so the next write or restart retries it |
+| `_detect_index_drift failed for project_id=`, `_check_index_health_at_startup ... failed` | WARNING | the detector raised, so health is UNKNOWN and no escalation is filed. An `UnparsedIndexStatementError` lands here |
+| `_check_index_health failed for group_id=`, `_check_index_health could not determine whether graph` | WARNING | the index read failed, so health is UNKNOWN and no escalation is filed |
+| `index_drift_detector: dedup read failed`, `index_drift_detector: failed to escalate` | WARNING | drift was found but not filed this cycle; the next cycle re-observes it |
+
+To check on demand, call the fused-memory MCP tool
+`trigger_reconciliation(project_id=...)`. It runs a FULL reconciliation cycle
+for that project, which includes this detector; the harness picks it up within
+about 5 s, and a halted project answers `status='halted'` and runs nothing.
+
+A raw, read-only glance:
+
+```bash
+docker exec docker-falkordb-1 redis-cli GRAPH.RO_QUERY <graph> 'CALL db.indexes()'
+```
+
+FalkorDB merges every index on a label into ONE record with a list-valued
+`properties`, so comparing it by eye with the per-property expected set
+misreads composites. The `status` column is the part worth reading by eye.
+
+**What the BM25 canary means.** Present in `db.indexes()` is not serving.
+CREATE returns in milliseconds, but the index builds in the background and
+reads `UNDER CONSTRUCTION` until `OPERATIONAL`, measured up to 594.5 ms after
+creation (PRD §"Measured cost and benefit"). A fulltext query against a missing
+or still-building index returns 0 rows WITH NO ERROR, so `rrf([[], cosine])`
+degenerates to pure cosine. That is how BM25 returned nothing, unnoticed, until
+this PRD. `fused-memory/tests/test_bm25_serving_integration.py::bm25_canary`
+judges service, not metadata: its tests seed a known token on an ephemeral
+scratch graph and assert that graphiti's own fulltext query returns at least
+one row once the index is `OPERATIONAL`. They are `integration`-marked, so the
+default addopts deselect them, and they run against the scratch FalkorDB
+([§8 The scratch FalkorDB](#the-scratch-falkordb)), never production:
+
+```bash
+cd /home/leo/src/dark-factory/fused-memory && uv run pytest tests/test_bm25_serving_integration.py -m integration
+```
+
+Never treat a successful CREATE as serving.
+
+**The composite trap**, so nobody re-introduces it. FalkorDB rejects a
+composite `CREATE INDEX FOR (n:L) ON (n.a, n.b, …)` WHOLESALE when any listed
+property is already indexed, with `Attribute 'uuid' is already indexed`.
+graphiti swallows that error:
+`graphiti_core/driver/falkordb_driver.py::FalkorDriver.execute_query` ignores
+any error containing `already indexed`. Every property in the statement is lost
+silently while the logs read as success. Measured on a replica of the trap
+graphs' starting state, Entity's composite would lose all 4 of its range
+properties and RELATES_TO's all 7 (PRD §"The crux"). The fix is one range statement per property
+(`fused-memory/src/fused_memory/backends/falkor_indices.py::range_create_statement`),
+with fulltext statements issued as upstream emits them. Per-property
+statements converge to the same index state the composite builds on a virgin
+graph (PRD D1). So:
+
+- Never "simplify" provisioning back to upstream's statements or to
+  `build_indices_and_constraints()`.
+- `CREATE INDEX IF NOT EXISTS` is a FalkorDB syntax error. Idempotence comes
+  from the diff, not the statement.
+- Experiment on the scratch FalkorDB, never by hand on production graphs.
+
 ### The local embedder (`embedder` compose service)
 
 `embedder` is a service in `fused-memory/docker/docker-compose.yml`, beside
@@ -3243,6 +3385,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | Two branches that each moved `orchestrator/tests/merge_lane_ratchet_baseline.json` conflict on it (a probe bounce or a stopped merge), although they moved different code | The structured merge driver `.gitattributes` names (`merge=ratchet-baseline`) is not installed in this host's `.git/config`, so git falls back to its line merge, which conflicts whenever two branches touch one baseline row; or the driver REFUSED this pair (it says why on stderr: two different changes to one scalar, a row deleted on one side and changed on the other, two insertions at one place in a path list) and wrote git's own text merge with markers. The probe (`git merge-tree` at `project_root`) reads attributes from `project_root`'s working tree, so it composes only once `.gitattributes` is on main and `project_root` has re-synced | `git config --get merge.ratchet-baseline.driver` on the host: empty means run `python3 scripts/merge_lane_ratchet_merge.py install` from the main checkout (it writes the shared `.git/config`, so it covers every linked worktree; `scripts/setup-host.sh` step 9 does the same on a new host). A merge or probe that instead DIES with `fatal: custom merge driver ratchet-baseline lacks command line` (exit 128) means a `merge.ratchet-baseline` section without its `driver` key: `git config --remove-section merge.ratchet-baseline`, then install. A refusal is an ordinary conflict: resolve the code, then regenerate the baseline with `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json`. While a driver merge runs under the probe, git leaves transient `.merge_file_*` files in `project_root`; they are untracked and gone when the probe returns. A raise is never authorized in the baseline file itself: it is one new file under `orchestrator/tests/merge_lane_ratchet_raises/`, which never conflicts |
 | `git commit` finishing a merge (one stopped on another file) is refused by the ratchet commit gate for a baseline raise over its 3-way bound, and `--write-baseline --authorize-raise` then prints `no measure rose; nothing recorded` | The staged baseline holds more than merging both parents can (`scripts/merge_lane_metrics.py::_both_moved_bound`; two raises of one measure compose, so the ratchet-baseline merge driver's own `ours + theirs - base` passes), and the excess is the merge's own raise; but the file on disk already holds that value, so the write gate sees nothing rising | `git checkout HEAD -- orchestrator/tests/merge_lane_ratchet_baseline.json` (ours; `--ours` does nothing once the driver resolved the file), then `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason "<why>"`: it measures from ours, records the merge's own entry file, and the commit passes. The gate's refusal prints the same recipe |
 | `scripts/setup-host.sh` §11 prints a `Network exposure:` FAIL, or `python3 scripts/check_network_exposure.py` exits 1 | Read the kind on each tagged line. `[exposed]`: a listener is bound to a wildcard address. That is `fused-memory.socket`'s `ListenStream` (`scripts/fused-memory.socket.template`), fused-memory's `server.host`, which binds `:8003` itself (`fused-memory/config/config.yaml`), or a compose `ports` entry without a `127.0.0.1:` prefix (`fused-memory/docker/docker-compose.yml`). `[not-listening]`: the named owner is down, or bound somewhere other than `127.0.0.1`. `[timed-out]`: an off-loopback connect was neither accepted nor refused, typically because a DROP rule hides whatever listens there; a timeout counts as a failure. `[unverified]`: an off-loopback connect failed with the errno the line names, so that address was not checked. `[source-error]`: `systemctl` or `ip` could not be read, usually because there is no user bus for `systemctl --user` or no `ip` binary; every port it could still find was probed | Bind the named owner to `127.0.0.1` in its committed home and restart it. A socket's `ListenStream` change needs the stop-then-start in [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts); for fused-memory that is `scripts/restart-fused-memory.sh --rebind-socket`. `plans/mcp-network-exposure-prd.md` tracks the loopback flip of today's known wildcard binds. Start a not-listening owner. For an unverified address, read the errno (a link going down, say) and rerun once the link has settled. For a source error, run the check as the login user with `XDG_RUNTIME_DIR` set. How to run the check: [§8 Network exposure check](#network-exposure-check) |
+| A `recon_missing_index` escalation appears on the reconciliation queue (port 8103, `task_id` `graph:<group_id>`) | A registered graph lacks indices in the expected set, typically because a provisioning statement failed or the graph was born after the last restart and its first-write provisioning did not complete. `index_health.missing` names the specs | Read the `Index provisioning statement failed on graph` (or `did not complete`) journal line for that graph in `journalctl --user -u fused-memory`, fix what it names, then restart fused-memory (`scripts/restart-fused-memory.sh`, with operator sign-off): startup provisioning creates only what is missing. That restart is how the escalation's `ensure_indices(group_id=...)` suggestion is carried out, since no tool exposes it. The next reconciliation cycle re-checks it. See [§8 FalkorDB index provisioning](#falkordb-index-provisioning-expected-set-drift-the-bm25-canary-the-composite-trap) |
 | A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_queued` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
 
 ---

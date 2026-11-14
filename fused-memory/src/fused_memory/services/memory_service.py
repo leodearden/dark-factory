@@ -2874,6 +2874,9 @@ class MemoryService:
         graphiti_core's ingestion-time entity resolution (resolve_extracted_nodes)
         only resolves each extracted node against candidates surfaced by hybrid
         embedding+BM25 search — there is no guaranteed exact-name Cypher lookup.
+        (Until FalkorDB index provisioning landed — docs/prds/falkordb-index-provisioning.md,
+        task 3708, 2026-10-02 — no fulltext index existed, so the BM25 leg silently
+        returned zero rows and this search was cosine-only.)
         When that search misses an existing canonical node, ingestion mints a
         brand-new node even though a node with the exact same name already
         exists. This sweep re-checks each entity name this episode touched by
