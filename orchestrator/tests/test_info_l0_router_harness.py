@@ -245,14 +245,20 @@ class TestReaperRoutesInfoOrphans:
         assert _curator(harness).calls == []
 
 
+_BREAKER_WINDOW = 3
+_BREAKER_FLOOR_BYTES = 1000
+
+
 def _notice_harness(tmp_path: Path, mock_orch_config) -> Harness:
     config = router_reaper_config(
         mock_orch_config, orphan_timeout_secs=0.0, ticket_timeout_secs=TICKET_TIMEOUT_SECS,
     )
-    # The no-landings filer formats the breaker floor with ``:,``; a MagicMock
-    # knob raises inside the filer's swallow-all ``except`` and nothing is filed.
-    config.no_landings_breaker_window_samples = 3
-    config.no_landings_breaker_disk_free_floor_bytes = 1000
+    # The harness builds its breaker from these knobs, so they set what
+    # ``_file_no_landings_breaker`` must feed it to trip.  They must be real
+    # ints: the filer formats the floor with ``:,``, and a MagicMock knob
+    # raises inside the filer's swallow-all ``except``, so nothing is filed.
+    config.no_landings_breaker_window_samples = _BREAKER_WINDOW
+    config.no_landings_breaker_disk_free_floor_bytes = _BREAKER_FLOOR_BYTES
     return reaper_harness(
         config,
         EscalationQueue(tmp_path / 'escalations'),
@@ -269,9 +275,9 @@ async def _file_warm_base_hard_down(harness: Harness) -> None:
 
 async def _file_no_landings_breaker(harness: Harness) -> None:
     breaker = harness._no_landings_breaker
-    breaker.observe(0, 300)
-    breaker.observe(0, 200)
-    trip = breaker.observe(0, 100)
+    below_floor = _BREAKER_FLOOR_BYTES - 1
+    falling_window = reversed(range(below_floor, below_floor + _BREAKER_WINDOW))
+    [*_, trip] = [breaker.observe(0, free_bytes) for free_bytes in falling_window]
     assert trip is not None and trip.action == 'halt'
     harness._file_no_landings_info_escalation(trip)
 
