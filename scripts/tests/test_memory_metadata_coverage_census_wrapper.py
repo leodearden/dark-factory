@@ -82,22 +82,46 @@ $FAKE_STATE, then exits with $FAKE_EXIT_<WHO> (default 0).
 Recording them from INSIDE the invoked command is the only way to OBSERVE that
 the exports actually ran: all three names also appear in the wrapper's header
 comment, so a source-text grep stays green with the real `export` lines deleted.
+
+A CENSUS call also records the checkout it measures -- the root its script
+argument resolves to, as census_memory_metadata.py::_REPO_ROOT does -- with
+that root's HEAD and git common dir at call time, and writes each
+$FAKE_CENSUS_WRITES {repo-relative path: content} entry under that root, as
+the real census writes its artifacts beside its own file.
 """
 import json
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 SERVICE_ENV_KEYS = ("CONFIG_PATH", "PROJECT_ROOT", "FALKORDB_URI")
+
+
+def git(root, *args):
+    proc = subprocess.run([os.environ["FAKE_REAL_GIT"], "-C", str(root), *args],
+                          capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
 
 who = os.environ["FAKE_WHO"]
 state_path = os.environ["FAKE_STATE"]
 with open(state_path) as f:
     state = json.load(f)
-state.append({
+entry = {
     "who": who,
     "argv": sys.argv[1:],
     "env": {k: os.environ.get(k) for k in SERVICE_ENV_KEYS},
-})
+}
+if who == "CENSUS":
+    root = Path(sys.argv[1]).resolve().parents[2]
+    entry["root"] = str(root)
+    entry["head"] = git(root, "rev-parse", "HEAD")
+    entry["common_dir"] = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    for rel, content in json.loads(os.environ.get("FAKE_CENSUS_WRITES", "{}")).items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(content)
+state.append(entry)
 with open(state_path, "w") as f:
     json.dump(state, f)
 
@@ -122,6 +146,11 @@ def _wrapper_bin_dir(tmp_path):
     return tmp_path / 'wbin'
 
 
+def _scratch_dir(tmp_path):
+    """The TMPDIR every wrapper run gets, so a test can assert it is left empty."""
+    return tmp_path / 'deploy-tmp'
+
+
 def _write_recorder_shim(path, who, recorder):
     """An executable that records its argv under `who` via `recorder`.
 
@@ -138,8 +167,11 @@ def _write_recorder_shim(path, who, recorder):
 
 def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
                      default_prefix=False, record_git=False,
-                     pad_commit_output=0):
+                     pad_commit_output=0, census_writes=None):
     """Point both wrapper seams at fake recorders. Returns (env, state_path).
+
+    `census_writes` ({repo-relative path: content}) is what the fake census
+    writes under the checkout it measures: the night's drift.
 
     With `default_prefix=True` the two `*_CMD` seams are left UNSET instead, so
     the wrapper's own `uv run --frozen --project <FM> python` prefix is the
@@ -160,6 +192,8 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
     state_path = tmp_path / 'wrapper_state.json'
     state_path.write_text('[]')
 
+    real_git = shutil.which('git')
+    assert real_git, 'no real git on PATH to delegate to'
     shims = {'fake-census': 'CENSUS', 'fake-stamp': 'STAMP'}
     if default_prefix:
         # ONE fake `uv` serves BOTH halves, so it cannot key on FAKE_WHO: every
@@ -175,8 +209,6 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
         # commit half still genuinely commits. The real git is resolved
         # ABSOLUTELY here -- while bin_dir is not yet on PATH -- so the shim
         # can never re-enter itself.
-        real_git = shutil.which('git')
-        assert real_git, 'no real git on PATH to delegate to'
         git_log = _git_argv_path(tmp_path)
         git_log.write_text('')
         shim = bin_dir / 'git'
@@ -236,6 +268,11 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
         env['COVERAGE_CENSUS_CMD'] = str(bin_dir / 'fake-census')
         env['RETRO_STAMP_CMD'] = str(bin_dir / 'fake-stamp')
     env['FAKE_STATE'] = str(state_path)
+    env['FAKE_REAL_GIT'] = real_git
+    env['FAKE_CENSUS_WRITES'] = json.dumps(census_writes or {})
+    scratch = _scratch_dir(tmp_path)
+    scratch.mkdir(exist_ok=True)
+    env['TMPDIR'] = str(scratch)
     env['FAKE_EXIT_CENSUS'] = str(census_exit)
     env['FAKE_EXIT_STAMP'] = str(stamp_exit)
     if extra_env:
@@ -558,6 +595,9 @@ _ARTIFACTS = (
     'plans/memory-metadata-coverage-history.json',
 )
 
+# A night whose census rewrote all three artifacts.
+_REGENERATED = {rel: '{"regenerated": true}\n' for rel in _ARTIFACTS}
+
 
 def _git(repo, *args):
     # env= is load-bearing, not tidiness: these are the calls that wrote
@@ -571,22 +611,21 @@ def _git(repo, *args):
     )
 
 
-def _git_repo_harness(tmp_path, *, dirty=True, tracked=True):
-    """Make $REPO a REAL git repo carrying the three artifacts.
+def _git_repo_harness(tmp_path, *, tracked=True, initial_branch='main'):
+    """Make $REPO a REAL, clean git repo with every file committed.
 
-    The fake census recorder does not write artifacts, so the drift a live run
-    would produce is staged here directly -- what is under test is the
-    wrapper's commit step, not the census's rendering.
+    The night's drift is what the fake census writes (`census_writes`), so
+    what is under test is the wrapper's handling of it, not the census's
+    rendering.
 
-    ``tracked=False`` models the FIRST-EVER run: the artifacts exist on disk
-    but git has never seen them, which is the only state that reaches the
-    wrapper's `did not match any file` retry branch.
+    ``tracked=False`` models the FIRST-EVER run: git has never seen the
+    artifacts, so whatever the census writes is new.
     """
     repo = tmp_path / 'fake-repo'
     (repo / 'plans').mkdir(parents=True, exist_ok=True)
     (repo / 'fused-memory' / 'scripts').mkdir(parents=True, exist_ok=True)
 
-    _git(repo, 'init', '-q', '-b', 'main')
+    _git(repo, 'init', '-q', '-b', initial_branch)
     _git(repo, 'config', 'user.email', 'test@example.com')
     _git(repo, 'config', 'user.name', 'Test')
     # No hooks, no signing -- this exercises the wrapper, not the repo's gates.
@@ -597,9 +636,6 @@ def _git_repo_harness(tmp_path, *, dirty=True, tracked=True):
             (repo / rel).write_text('{"baseline": true}\n')
         _git(repo, 'add', '--', *_ARTIFACTS)
         _git(repo, 'commit', '-q', '--no-verify', '-m', 'baseline')
-        if dirty:
-            for rel in _ARTIFACTS:
-                (repo / rel).write_text('{"regenerated": true}\n')
         return repo
 
     # An untracked-artifacts repo still needs a root commit, so that `git
@@ -608,8 +644,6 @@ def _git_repo_harness(tmp_path, *, dirty=True, tracked=True):
     (repo / 'README.md').write_text('unrelated\n')
     _git(repo, 'add', '--', 'README.md')
     _git(repo, 'commit', '-q', '--no-verify', '-m', 'baseline')
-    for rel in _ARTIFACTS:
-        (repo / rel).write_text('{"regenerated": true}\n')
     return repo
 
 
@@ -628,7 +662,7 @@ def test_wrapper_commits_the_artifacts_it_regenerated(tmp_path):
     an append left uncommitted in the machine-operated main checkout can be
     reset away by the merge worker, silently losing that night's row."""
     repo = _git_repo_harness(tmp_path)
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
 
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
@@ -651,7 +685,7 @@ def test_wrapper_commits_artifacts_git_has_never_tracked(tmp_path):
     the whole commit step exists to protect.
     """
     repo = _git_repo_harness(tmp_path, tracked=False)
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
 
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
@@ -677,6 +711,8 @@ def test_the_untracked_retry_is_reached_only_because_the_plain_commit_fails(
     fails loudly instead of the wrapper silently not committing.
     """
     repo = _git_repo_harness(tmp_path, tracked=False)
+    for rel, content in _REGENERATED.items():
+        (repo / rel).write_text(content)
     proc = subprocess.run(
         ['git', '-C', str(repo), 'commit', '--only', *_ARTIFACTS, '-m', 'probe'],
         capture_output=True, text=True, timeout=60,
@@ -741,7 +777,7 @@ def test_the_untracked_retry_is_decided_by_gits_message_not_its_volume(
     repo = _git_repo_harness(tmp_path, tracked=False)
     result, _ = _run_wrapper_in_git_repo(
         tmp_path, repo, record_git=True,
-        pad_commit_output=_PAD_COMMIT_OUTPUT_BYTES,
+        pad_commit_output=_PAD_COMMIT_OUTPUT_BYTES, census_writes=_REGENERATED,
     )
     recorded = [
         json.loads(line)
@@ -793,7 +829,7 @@ def test_wrapper_commit_is_scoped_and_never_sweeps_unrelated_dirty_state(
     _git(repo, 'commit', '-q', '--no-verify', '-m', 'bystander baseline')
     tracked_bystander.write_text('unrelated tracked edit, now dirty\n')
 
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
     assert result.returncode == 0, result.stderr
 
     committed = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout
@@ -811,7 +847,7 @@ def test_wrapper_treats_an_unchanged_artifact_set_as_a_no_op_not_a_failure(
     """A night whose corpus did not drift produces byte-identical artifacts.
     `git commit` reports "nothing to commit" with a NON-ZERO code; reading that
     as a fault would narrate a failure every quiet night."""
-    repo = _git_repo_harness(tmp_path, dirty=False)
+    repo = _git_repo_harness(tmp_path)
     before = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
 
     result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
@@ -842,7 +878,8 @@ def test_wrapper_commits_even_when_the_census_reported_a_shortfall(tmp_path):
     shortfall. That evidence is exactly what must reach the repo."""
     repo = _git_repo_harness(tmp_path)
     before = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_exit=1)
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_exit=1,
+                                         census_writes=_REGENERATED)
     assert result.returncode == 0, result.stderr
 
     after = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
@@ -858,7 +895,7 @@ def test_wrapper_narrates_the_commit_outcome_alongside_the_other_two(tmp_path):
     """Exiting 0 must never mean the outcome is invisible -- the journal is the
     only place this job is readable."""
     repo = _git_repo_harness(tmp_path)
-    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
     combined = result.stdout + result.stderr
     assert 'census=0' in combined, combined
     assert 'stamp=0' in combined, combined
@@ -911,9 +948,9 @@ def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
 
     committed_repo = _git_repo_harness(tmp_path / 'committed')
     scenarios['committed'], _ = _run_wrapper_in_git_repo(
-        tmp_path / 'committed', committed_repo)
+        tmp_path / 'committed', committed_repo, census_writes=_REGENERATED)
 
-    no_drift_repo = _git_repo_harness(tmp_path / 'no-drift', dirty=False)
+    no_drift_repo = _git_repo_harness(tmp_path / 'no-drift')
     scenarios['skipped:no-drift'], _ = _run_wrapper_in_git_repo(
         tmp_path / 'no-drift', no_drift_repo)
 
@@ -1115,16 +1152,17 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
     the scoped-commit path and the add-- retry path were genuinely exercised.
     """
     scenarios = (
-        # (label, _git_repo_harness kwargs, expected commit-step,
+        # (label, _git_repo_harness kwargs, what the census writes,
+        #  expected commit-step,
         #  a git-argv substring that scenario's OWN run must contain)
-        ('already-tracked artifacts', {}, 'committed', 'commit --only'),
+        ('already-tracked artifacts', {}, _REGENERATED, 'committed', 'commit --only'),
         ('first-ever run, untracked (exercises the add-- retry)',
-         {'tracked': False}, 'committed', ' add -- '),
-        ('a quiet night with no drift', {'dirty': False}, 'skipped:no-drift', None),
+         {'tracked': False}, _REGENERATED, 'committed', ' add -- '),
+        ('a quiet night with no drift', {}, None, 'skipped:no-drift', None),
     )
-    for label, kwargs, expected_step, expect_substring in scenarios:
+    for label, kwargs, census_writes, expected_step, expect_substring in scenarios:
         repo = _git_repo_harness(tmp_path / label.split()[0], **kwargs)
-        env, _ = _wrapper_harness(tmp_path, record_git=True)
+        env, _ = _wrapper_harness(tmp_path, record_git=True, census_writes=census_writes)
         env['REPO'] = str(repo)
         result = subprocess.run(
             ['bash', str(WRAPPER)], env=env,
@@ -1233,6 +1271,7 @@ def test_wrapper_cannot_commit_into_a_repo_named_only_by_ambient_git_dir(tmp_pat
     repo = _git_repo_harness(tmp_path / 'sandbox')
     result, state = _run_wrapper_in_git_repo(
         tmp_path, repo, extra_env={'GIT_DIR': str(decoy / '.git')},
+        census_writes=_REGENERATED,
     )
 
     assert _decoy_state(decoy) == before, (
@@ -1281,6 +1320,7 @@ def test_wrapper_commit_runs_no_hook_injected_by_ambient_git_config_parameters(
     repo = _git_repo_harness(tmp_path / 'sandbox')
     result, state = _run_wrapper_in_git_repo(
         tmp_path, repo, extra_env={'GIT_CONFIG_PARAMETERS': poisoned},
+        census_writes=_REGENERATED,
     )
 
     assert not marker.exists(), (
@@ -1340,3 +1380,90 @@ def test_wrapper_refuses_to_commit_when_repo_is_not_the_repository_root(tmp_path
         f'about; stderr={result.stderr!r}')
     # Still exits 0: a refused commit must not wedge the recurring oneshot.
     assert result.returncode == 0, result.stderr
+
+
+# ── the census measures in a generation worktree, never in $REPO ────────────
+#
+# A checkout root's census runs on a detached worktree of main's tip, so the
+# census writes no checkout's working tree but its own: dirty tracked files at
+# the landed paths in project_root are what halt the merge queue (wip_overlap).
+# A $REPO inside no checkout still runs in place.
+
+def _census_call(calls):
+    (census,) = [c for c in calls if c['who'] == 'CENSUS']
+    return census
+
+
+def _worktree_paths(repo):
+    listing = _git(repo, 'worktree', 'list', '--porcelain').stdout
+    return [line.removeprefix('worktree ') for line in listing.splitlines()
+            if line.startswith('worktree ')]
+
+
+def _measure_only(tmp_path, repo, **kwargs):
+    """A CENSUS_COMMIT=0 run of the wrapper on *repo*: measure and rehearse,
+    land nothing."""
+    return _run_wrapper_in_git_repo(
+        tmp_path, repo, extra_env={'CENSUS_COMMIT': '0'}, **kwargs)
+
+
+def test_the_census_measures_a_linked_worktree_at_mains_tip(tmp_path):
+    repo = _git_repo_harness(tmp_path)
+    main = _git(repo, 'rev-parse', 'main').stdout.strip()
+
+    result, calls = _measure_only(tmp_path, repo)
+
+    assert result.returncode == 0, _diag(result)
+    census = _census_call(calls)
+    root = Path(census['root'])
+    assert census['argv'][0].endswith('/fused-memory/scripts/census_memory_metadata.py'), census
+    assert root != repo.resolve() and repo.resolve() not in root.parents, census
+    assert census['common_dir'] == str((repo / '.git').resolve()), census
+    assert census['head'] == main, census
+
+
+@pytest.mark.parametrize('census_exit', [0, 1])
+def test_a_run_leaves_the_checkout_and_tmpdir_as_it_found_them(tmp_path, census_exit):
+    repo = _git_repo_harness(tmp_path)
+
+    result, calls = _measure_only(
+        tmp_path, repo, census_exit=census_exit, census_writes=_REGENERATED)
+
+    assert result.returncode == 0, _diag(result)
+    assert _census_call(calls)['root'], calls
+    status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
+    assert status == '', f'the census wrote into $REPO: {status!r}'
+    assert _worktree_paths(repo) == [str(repo)], _worktree_paths(repo)
+    assert os.listdir(_scratch_dir(tmp_path)) == [], os.listdir(_scratch_dir(tmp_path))
+
+
+def test_a_repo_inside_a_checkout_but_not_its_root_runs_no_census(tmp_path):
+    outer = _git_repo_harness(tmp_path / 'outer')
+    before = (_git(outer, 'log', '--pretty=%H').stdout,
+              _git(outer, 'status', '--porcelain', '--untracked-files=all').stdout)
+
+    result, calls = _measure_only(
+        tmp_path / 'outer', outer / 'plans', census_writes=_REGENERATED)
+
+    assert result.returncode == 0, _diag(result)
+    assert [c['who'] for c in calls] == ['STAMP'], calls
+    assert 'census=skipped ' in _done_line(result.stdout), _diag(result)
+    assert (_git(outer, 'log', '--pretty=%H').stdout,
+            _git(outer, 'status', '--porcelain', '--untracked-files=all').stdout) == before
+
+
+def test_a_checkout_without_main_runs_no_census(tmp_path):
+    """No main means no tip to measure, and measuring in place instead would
+    write the very checkout the worktree exists to keep clean."""
+    repo = _git_repo_harness(tmp_path, initial_branch='trunk')
+    before = _git(repo, 'log', '--pretty=%H').stdout
+
+    result, calls = _run_wrapper_in_git_repo(tmp_path, repo, census_writes=_REGENERATED)
+
+    assert result.returncode == 0, _diag(result)
+    assert [c['who'] for c in calls] == ['STAMP'], calls
+    line = _done_line(result.stdout)
+    assert 'census=skipped ' in line and 'commit=1 ' in line, _diag(result)
+    assert _commit_step(result) == 'failed:generation-worktree', _diag(result)
+    assert _git(repo, 'status', '--porcelain', '--untracked-files=all').stdout == ''
+    assert _git(repo, 'log', '--pretty=%H').stdout == before
