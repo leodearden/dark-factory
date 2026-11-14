@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly timer for the quality-metrics snapshot of %i's main
+
+[Timer]
+# 03:45 is the free rung between 03:30 and 04:00 on the OPERATIONS.md §12
+# nightly ladder. Persistent=true catches up a missed night; a catch-up
+# measures main as of the catch-up, which is harmless because a snapshot's
+# file is keyed by the sha it measured.
+OnCalendar=*-*-* 03:45:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
