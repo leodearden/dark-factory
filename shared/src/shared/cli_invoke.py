@@ -406,9 +406,11 @@ class AgentResult:
       captured by ``snapshot_process_group(pgid)`` at the top of the
       ``TimeoutError`` handler in ``_run_subprocess`` — i.e. while the wedged
       children are still alive and their ``/proc`` entries are readable.
-      Empty string when the invocation did not time out.  Persisted to
-      ``.task/zero_output_evidence-iter{N}.json`` by the workflow's
-      ``_capture_zero_output_evidence`` helper (task 1739).
+      Empty string when the invocation did not time out.  Persisted by
+      ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._capture_zero_output_evidence``
+      to the path
+      ``orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.zero_output_evidence_path``
+      derives, under the task's TASK root (task 1739).
     - ``resume_fallbacks``: how many times THIS invocation armed ``--resume``
       and fell back to a fresh session because the CLI REJECTED the resume
       before any model turn (``is_resume_rejected``; tasks 3578, 5579).
