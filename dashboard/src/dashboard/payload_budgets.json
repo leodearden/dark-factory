@@ -50,16 +50,17 @@
       "query": {
         "terminal": "dark-factory"
       },
-      "data_keyed_maps": [
-        [
-          "TASKS_SNAPSHOT"
-        ]
-      ],
+      "data_keyed_maps": [],
       "history": [
         {
           "budget_bytes": 5900000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 4,668,273 bytes with terminal=dark-factory. The full render plus the 400-row terminal window for dark-factory (done 351, cancelled 49). Dominant fields as for the bare request: rows[].meta_files 28%, .title 14%, .deps[].title 10%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        },
+        {
+          "budget_bytes": 420000,
+          "task": "5824",
+          "reason": "Lowered after task 5824's branch merged main, where ?terminal= no longer re-serves the full render. Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 328,164 bytes."
         }
       ]
     },
@@ -161,6 +162,11 @@
           "budget_bytes": 3700000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 2,922,466 bytes with no query. 352 pending escalations in 11 queues; 241 cards embed their whole task. Dominant fields: subsections[].escalations[].task.value.description 21%, .detail 17%, .task.value.metadata.dry_run_proposals[].proposal_text 15%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        },
+        {
+          "budget_bytes": 900000,
+          "task": "5824",
+          "reason": "Lowered after task 5824's branch merged main. Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 713,606 bytes with no query. 138 pending escalations at about 5.1 KB a card, down from the 2026-10-15 population; the fleet census was re-measured to match."
         }
       ]
     },
@@ -299,11 +305,45 @@
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 15,239 bytes with no query. Ten roots, 77 terminal-tier violations listed. Small; the 16 KiB headroom floor sets this budget."
         }
       ]
+    },
+    {
+      "path": "/api/v2/dashboard/prds",
+      "query": {},
+      "data_keyed_maps": [
+        [
+          "PRD_VIEW"
+        ],
+        [
+          "PRD_CONTENTION"
+        ]
+      ],
+      "history": [
+        {
+          "budget_bytes": 150000,
+          "task": "5824",
+          "reason": "Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 113,632 bytes with no query. Twelve projects; the route landed on main after the 2026-10-15 measurements and reached this table when task 5824's branch merged main."
+        }
+      ]
+    },
+    {
+      "path": "/api/v2/dashboard/quality",
+      "query": {
+        "project": "dark-factory",
+        "window": "all"
+      },
+      "data_keyed_maps": [],
+      "history": [
+        {
+          "budget_bytes": 3900000,
+          "task": "5824",
+          "reason": "Measured 2026-11-14 against the live dashboard (127.0.0.1:8080): 3,072,421 bytes at the tab's widest landing window. 3,736 landings on 14 metric series: QUALITY.value.metrics 69%, .axis 28%. On demand, not polled. The route landed on main after the 2026-10-15 measurements. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        }
+      ]
     }
   ],
   "exempt": [
     {
-      "path": "/api/v2/dashboard/task/{project}/T-{task_id}",
+      "path": "/api/v2/dashboard/task/{project:path}/T-{task_id}",
       "reason": "Serves ONE task's prose on demand, so its size is bounded by a single task record, not by population; it cannot grow organically. Measured 2026-10-15: 15,728 bytes for T-4866."
     }
   ]

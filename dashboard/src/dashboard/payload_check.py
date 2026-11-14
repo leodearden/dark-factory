@@ -59,7 +59,7 @@ DEFAULT_TIMEOUT_SECONDS = 60.0
 
 SUMMARY_MAX_CHARS = 400
 """The deterministic runner's cap on a predicate's done note
-(orchestrator/src/orchestrator/deterministic_runner.py::_PREDICATE_NOTE_MAX_PAYLOAD_CHARS)."""
+(orchestrator/src/orchestrator/predicate_output.py::PREDICATE_NOTE_MAX_PAYLOAD_CHARS)."""
 
 
 @dataclass(frozen=True)

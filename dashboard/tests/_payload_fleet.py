@@ -18,11 +18,12 @@ have a fixed width.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -54,19 +55,23 @@ from _payload_fleet_seed import (
     seed_task_results,
     text,
 )
+from _quality_rows import NO_COST, NO_OUTCOMES, history, write_quality_db
+from _served_reads import forget_served_reads
 from _tasks_db_fixture import task_row, write_tasks_db
 from fastapi.testclient import TestClient
-from shared.project_id import normalize_project_id
+from shared.project_id import normalize_project_id, project_id_for_root
+from shared.quality_series.git_lines import ModuleLines
+from shared.quality_series.landings import GitCrossCheck
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.task_statuses import TERMINAL, TaskStatus
 
-import dashboard.api.escalations as api_escalations
 import dashboard.app
 from dashboard.config import DashboardConfig
-from dashboard.data import active_tasks, escalation_corpus, task_lookup, task_snapshot
+from dashboard.data import task_lookup
 from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.orchestrator import find_running_orchestrators
+from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
 
 
@@ -99,6 +104,14 @@ class RootCensus:
     claimed_terminal: int = 0
     merges: int = 0
     trains: int = 0
+
+
+@dataclass(frozen=True)
+class QualityShape:
+    """The quality sampler's store for the budgeted root: its landings and the modules they touch."""
+
+    landings: int
+    modules: int
 
 
 @dataclass(frozen=True)
@@ -136,6 +149,14 @@ class FleetCensus:
     * memory-graphs (1,722): 17 operations hourly; the journal's counts are
       five digits a bucket live, a few rows here, a difference of bytes.
 
+    The pending escalations were re-measured live on 2026-11-14, when main's
+    cards had shrunk /escalations to 713,606 bytes: 138 pending, 51 of them in
+    the reconciliation queue (the dual tree adds five to the 46 seeded here).
+
+    The quality store was measured live on 2026-11-14 (3,072,421 bytes at
+    ``?project=dark-factory&window=all``): 3,736 landings, each a point on
+    14 metric series, across 338 modules. Only that root is budgeted.
+
     Re-grow this census, rather than loosening a budget, whenever a budget
     raised for real growth would otherwise trip the sweep's slack rule.
     """
@@ -161,6 +182,7 @@ class FleetCensus:
     memory: MemoryShape
     recon: ReconShape
     memory_ops: MemoryOpsShape
+    quality: QualityShape
 
 
 CENSUS = FleetCensus(
@@ -174,7 +196,7 @@ CENSUS = FleetCensus(
             {TaskStatus.DONE: 4929, TaskStatus.CANCELLED: 396},
             files_per_row=5, modules=2792, deps_per_100_rows=25,
             parked=5, skipped=4, pinned=17, recovery_events=1,
-            pending_escalations=38, resolved_escalations=1968,
+            pending_escalations=12, resolved_escalations=1968,
             completed_hours=1555, claimed_terminal=40, merges=600, trains=50,
         ),
         RootCensus(
@@ -182,7 +204,7 @@ CENSUS = FleetCensus(
             {TaskStatus.PENDING: 2095, TaskStatus.DEFERRED: 223, TaskStatus.IN_PROGRESS: 23},
             {TaskStatus.DONE: 6076, TaskStatus.CANCELLED: 772},
             files_per_row=5, modules=3775, deps_per_100_rows=131, parked=4, skipped=4,
-            pending_escalations=7, resolved_escalations=8658,
+            pending_escalations=4, resolved_escalations=8658,
             completed_hours=2123, claimed_terminal=37, merges=600, trains=4,
         ),
         RootCensus(
@@ -190,7 +212,7 @@ CENSUS = FleetCensus(
             {TaskStatus.PENDING: 499, TaskStatus.IN_PROGRESS: 18, TaskStatus.BLOCKED: 9},
             {TaskStatus.DONE: 715, TaskStatus.CANCELLED: 94},
             files_per_row=8, modules=1255, deps_per_100_rows=247,
-            pending_escalations=35, resolved_escalations=1380,
+            pending_escalations=31, resolved_escalations=1380,
             completed_hours=529, merges=400,
         ),
         RootCensus(
@@ -198,7 +220,7 @@ CENSUS = FleetCensus(
             {TaskStatus.PENDING: 200, TaskStatus.IN_PROGRESS: 20, TaskStatus.BLOCKED: 3},
             {TaskStatus.DONE: 658, TaskStatus.CANCELLED: 133},
             files_per_row=8, modules=354, deps_per_100_rows=270, recovery_events=6,
-            pending_escalations=48, resolved_escalations=633,
+            pending_escalations=8, resolved_escalations=633,
             completed_hours=397, merges=400,
         ),
         RootCensus(
@@ -206,7 +228,7 @@ CENSUS = FleetCensus(
             {TaskStatus.PENDING: 45, TaskStatus.IN_PROGRESS: 3},
             {TaskStatus.DONE: 50, TaskStatus.CANCELLED: 3},
             files_per_row=5, modules=88, deps_per_100_rows=181,
-            pending_escalations=3, resolved_escalations=67,
+            pending_escalations=0, resolved_escalations=67,
             completed_hours=32, merges=51,
         ),
         RootCensus(
@@ -214,13 +236,13 @@ CENSUS = FleetCensus(
             {TaskStatus.DEFERRED: 10, TaskStatus.BLOCKED: 6},
             {TaskStatus.DONE: 594, TaskStatus.CANCELLED: 2},
             files_per_row=2, modules=10, deps_per_100_rows=214,
-            pending_escalations=83, resolved_escalations=13,
+            pending_escalations=14, resolved_escalations=13,
             completed_hours=113, merges=300,
         ),
         RootCensus(
             'pump-web-ui', {TaskStatus.BLOCKED: 5}, {TaskStatus.DONE: 14, TaskStatus.CANCELLED: 1},
             files_per_row=1, modules=2,
-            pending_escalations=45,
+            pending_escalations=11,
             completed_hours=13, merges=15,
         ),
         RootCensus(
@@ -228,7 +250,7 @@ CENSUS = FleetCensus(
             {TaskStatus.DEFERRED: 1, TaskStatus.BLOCKED: 1},
             {TaskStatus.DONE: 615, TaskStatus.CANCELLED: 37},
             files_per_row=1, modules=2,
-            pending_escalations=31, resolved_escalations=7,
+            pending_escalations=4, resolved_escalations=7,
             completed_hours=58, merges=250,
         ),
         RootCensus('autotrade', {}, {}, orchestrator_running=False),
@@ -248,7 +270,7 @@ CENSUS = FleetCensus(
     escalation=EscalationShape(
         detail_len=1950, summary_len=150, triage_note_len=250, option_len=110, history_days=30,
     ),
-    reconciliation_escalations=62,
+    reconciliation_escalations=46,
     merge_history_days=196,
     live_queue_depth=5,
     costs=CostShape(
@@ -287,6 +309,7 @@ CENSUS = FleetCensus(
         ('add_system_record', 'write'), ('find_tasks_by_metadata', 'read'), ('task_combined', 'write'),
         ('update_edge', 'write'), ('remove_dependency', 'write'),
     )),
+    quality=QualityShape(landings=3736, modules=338),
 )
 
 TERMINAL_WINDOW_ROOT = 'dark-factory'
@@ -809,6 +832,30 @@ def _seed_histories(
         config.reconciliation_db, fleet.recon, [normalize_project_id(root.label) for root in fleet.roots], now=now,
     )
     seed_write_journal(config.write_journal_db, fleet.memory_ops, now=now)
+    _seed_quality(config, fleet.quality, now=now)
+
+
+def _seed_quality(config: DashboardConfig, shape: QualityShape, *, now: datetime) -> None:
+    """The budgeted root's landings in quality.db, the newest an hour old, and the sampler tick
+    that measured them, so /quality serves every series fresh."""
+    root = next(path for path in (config.project_root, *config.known_project_roots)
+                if path.name == TERMINAL_WINDOW_ROOT)
+    project_id = project_id_for_root(root)
+    step = timedelta(hours=2)
+    rows = history(
+        shape.landings, start=now - timedelta(hours=1) - step * (shape.landings - 1), step=step,
+        project_id=project_id,
+        outcome=lambda i: replace(NO_OUTCOMES, reviewed=True, rejected=i % 5 == 0,
+                                  rejection_events=int(i % 5 == 0), review_blocking=i % 4 == 0),
+        cost=lambda i: replace(NO_COST, all_role_usd=2.0 + (i % 7) / 3, by_role=(('implementer', 2.0),),
+                               implementer_invocations=1 + i % 3, turns=40 + i % 11),
+        modules=lambda i: (ModuleLines(f'module-{i % shape.modules:03d}', 40 + i % 97),),
+    )
+    sample = QualitySample.value(
+        project_id, now, cursor_sha=rows[-1].landing.merge_sha, landings_sampled=len(rows),
+        landings_deferred=0, git_check=GitCrossCheck(0, 0, 0),
+    )
+    asyncio.run(write_quality_db(config.quality_db, rows, [sample]))
 
 
 def _bindings_of(target: object, name: str, known: frozenset[str]) -> list[ModuleType]:
@@ -829,13 +876,9 @@ def _bindings_of(target: object, name: str, known: frozenset[str]) -> list[Modul
 
 def _clear_caches() -> None:
     """Every cache a served payload could come from, so no other test's entry is served here."""
-    task_snapshot._snapshot_cache_clear()
+    forget_served_reads()
     task_lookup._lookup_cache_clear()
-    escalation_corpus._corpus_cache_clear()
-    api_escalations._analytics_memo_clear()
     _scheduler_cache_clear()
-    active_tasks._reset_root_rotation()
-    dashboard.app._memory_evals_cache_clear()
 
 
 @contextmanager

@@ -632,6 +632,7 @@ class TestResolveBaseTable:
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.reads_git_history
 def test_the_shipped_history_only_appends_to_the_merge_base() -> None:
     """THE GUARD: no recorded budget entry was edited, reordered or deleted."""
     base = resolve_base_table(_REPO_ROOT)

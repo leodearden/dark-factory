@@ -18,7 +18,7 @@ DASHBOARD_API_PREFIX = '/api/v2/dashboard/'
 class DashboardGetPaths:
     """The GET paths, split by whether a request can name them verbatim.
 
-    ``templated`` paths carry path parameters (``/task/{project}/T-{task_id}``),
+    ``templated`` paths carry path parameters (``/task/{project:path}/T-{task_id}``),
     so requesting one needs real parameter values bound in; ``literal`` paths
     can be requested exactly as written. Both are sorted.
     """
