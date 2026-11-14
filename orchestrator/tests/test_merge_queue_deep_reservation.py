@@ -979,6 +979,61 @@ async def _main_sha(scene: _Scene) -> str:
     return sha.strip()
 
 
+class TestGTheRebasedHeadChainsAheadOfItsReparkedSuccessor:
+    """G: PRD D3 with D5. The gate re-verify dispatches H's rebased commit alone
+    in the verify frontier, so it chains the followers buffered in the lane,
+    and S, re-parked behind it, re-anchors on the chain tip.
+
+    ``chain_snapshot()`` reads the lane buffers and not the redispatch park, so
+    the newer F1 and F2 land before S: every tree is sound, FIFO is not.
+    """
+
+    async def test_the_reparked_successor_lands_once_on_the_chain_tip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S, merged on H, waits for the one host, so the merger holds F1 and F2
+        in the lane; main moves while H verifies, and H's gate re-verifies."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S', 'F1', 'F2')
+        h_entered, release_h = asyncio.Event(), asyncio.Event()
+        verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
+        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=3) as run:
+            run.put(reqs['H'])
+            await wait_responsive(
+                h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label="H's verify under way on local",
+            )
+            run.put(reqs['S'], reqs['F1'], reqs['F2'])
+            await _until(
+                lambda: (
+                    lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH
+                    and run.lane.unfrozen_suffix() == (
+                        reqs['F1'].request_id, reqs['F2'].request_id,
+                    )
+                ),
+                label='S merged on H and waiting for the host, F1 and F2 buffered',
+            )
+
+            await _move_main_by_a_foreign_commit(scene)
+            release_h.set()
+            names = ('H', 'S', 'F1', 'F2')
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in names
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
+            assert _gate_decided_reverify(scene, 'H')
+            assert [
+                (e['data']['chain_items'], e['data']['speculative'])
+                for e in _verify_events_for(scene, {'H'})
+            ] == [(1, False), (3, False)]
+            assert [outcomes[n].landed_via_chain for n in ('F1', 'F2')] == [1, 1]
+            assert await _landed_task_files(scene) == ['H', 'F1', 'F2', 'S']
+            assert run.lane.two_layer_invariants(await _main_sha(scene)) == []
+            _assert_no_live_permit(run.lane)
+            assert _reservations(run.lane) == []
+
+
 class TestCAnItemBehindTheChainStacksOnTheChainTip:
     """C: the look-ahead skips the reserved links and stacks the next item on the chain tip."""
 
