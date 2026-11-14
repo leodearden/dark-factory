@@ -13,13 +13,14 @@
 #      largest leaf fields. Remedy: shrink the payload, or merge an appended,
 #      reasoned raise to its history, then resolve the escalation to re-run.
 #   2  the instrument failed and nothing measured over: the dashboard was
-#      unreachable, a request timed out or answered non-200, or the table
-#      could not be read. Never reported as an overage.
+#      unreachable, a request timed out or answered non-200, a request was not
+#      reached before the run deadline, or the table could not be read. Never
+#      reported as an overage.
 # Both non-zero codes surface as a born-at-L2 milestone_check_failed.
 #
-# Arguments are forwarded unchanged (--base-url, --timeout, --table). The
-# python invocation is overridable via CHECK_DASHBOARD_PAYLOAD_PY so tests can
-# substitute a stub command without spinning up uv.
+# Arguments are forwarded unchanged (--base-url, --timeout, --run-deadline,
+# --table). The python invocation is overridable via CHECK_DASHBOARD_PAYLOAD_PY
+# so tests can substitute a stub command without spinning up uv.
 #
 # This path is a contract with task 5835's seed link: do not rename it.
 set -euo pipefail

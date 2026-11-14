@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
 
 import httpx
@@ -87,10 +87,12 @@ def _body(size: int) -> bytes:
     return head + b'x' * (size - len(head) - len(tail)) + tail
 
 
-Responder = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
+SyncResponder = Callable[[httpx.Request], httpx.Response]
+AsyncResponder = Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+Responder = SyncResponder | AsyncResponder
 
 
-def _serving(sizes: Mapping[tuple[str, str], int]) -> Callable[[httpx.Request], httpx.Response]:
+def _serving(sizes: Mapping[tuple[str, str], int]) -> SyncResponder:
     """Answer each (path, query string) with a JSON body of the given size."""
     def respond(request: httpx.Request) -> httpx.Response:
         size = sizes[(request.url.path, request.url.query.decode())]
@@ -231,10 +233,11 @@ async def test_an_over_budget_body_that_is_not_json_is_still_an_overage():
     assert _summary(report)['over'] == [BURNDOWN]
 
 
-def _failing_on_census(failure: Responder) -> Responder:
-    def respond(request: httpx.Request) -> httpx.Response | Awaitable[httpx.Response]:
+def _failing_on_census(failure: Responder) -> AsyncResponder:
+    async def respond(request: httpx.Request) -> httpx.Response:
         if request.url.query == b'projection=census':
-            return failure(request)
+            answer = failure(request)
+            return answer if isinstance(answer, httpx.Response) else await answer
         return _serving(WITHIN)(request)
     return respond
 
@@ -343,10 +346,10 @@ async def test_a_request_cut_short_by_the_run_deadline_names_the_runs_deadline()
 
 
 async def test_an_overage_outlives_the_run_deadline():
-    def respond(request: httpx.Request) -> httpx.Response | Awaitable[httpx.Response]:
+    async def respond(request: httpx.Request) -> httpx.Response:
         if (request.url.path, request.url.query) == ('/api/v2/dashboard/tasks', b''):
             return httpx.Response(200, content=_body(2_500))
-        return _stall(request)
+        return await _stall(request)
 
     report, elapsed = await _timed_check(respond, run_deadline_seconds=0.5)
 
