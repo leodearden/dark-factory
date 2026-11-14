@@ -44,19 +44,29 @@ def busctl_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WriteWorld:
 
 @pytest.fixture
 def live_process() -> Iterator[SpawnLive]:
+    """Spawn a sleeping child with exactly *env*; return its pid once it is running.
+
+    Popen returns as soon as exec closes its CLOEXEC error pipe, which is before
+    the kernel has set up the new image's environment, so /proc/<pid>/environ
+    can read empty until the child reports in.
+    """
     children: list[subprocess.Popen[bytes]] = []
 
     def spawn(env: dict[str, str]) -> int:
         child = subprocess.Popen(
-            [sys.executable, '-c', 'import time; time.sleep(120)'], env=env
+            [sys.executable, '-c', 'import time; print(flush=True); time.sleep(120)'],
+            env=env,
+            stdout=subprocess.PIPE,
         )
         children.append(child)
+        assert child.stdout is not None
+        child.stdout.readline()
         return child.pid
 
     yield spawn
     for child in children:
         child.terminate()
-        child.wait(timeout=10)
+        child.communicate(timeout=10)
 
 
 def _world(unit: dict[str, object], manager_path: str = MANAGER_PATH_VALUE) -> dict[str, object]:
