@@ -352,6 +352,29 @@ def test_service_pins_the_boot_catch_up_path():
     assert '/usr/bin' in directories, directories
 
 
+# land_file can return up to ~190 s plus its git teardown past its ceiling
+# (scripts/_merge_queue_landing.py::land_files); OPERATIONS.md §12 budgets 300.
+_LANDING_OVERRUN_SECS = 300
+_SECONDS_PER_DAY = 86400
+
+
+def test_a_nights_landing_is_bounded_so_the_next_elapse_finds_the_unit_inactive():
+    """A Type=oneshot has no start timeout by default and systemd never starts
+    a second instance while one is activating, so this bound is what keeps one
+    night's landing from swallowing the next night's run."""
+    service = _directives(SERVICE_NAME)
+    ceilings = [v.removeprefix('CENSUS_LANDING_TIMEOUT_SECS=')
+                for v in _values(service, 'Service', 'Environment')
+                if v.startswith('CENSUS_LANDING_TIMEOUT_SECS=')]
+    assert len(ceilings) == 1 and ceilings[0].isdigit(), ceilings
+    (start_timeout,) = _values(service, 'Service', 'TimeoutStartSec')
+    assert start_timeout.isdigit(), start_timeout
+    (delay,) = _values(_directives(TIMER_NAME), 'Timer', 'RandomizedDelaySec')
+
+    assert int(ceilings[0]) + _LANDING_OVERRUN_SECS <= int(start_timeout)
+    assert int(start_timeout) + int(delay) < _SECONDS_PER_DAY
+
+
 def test_service_sends_both_streams_to_the_journal():
     """The report is written to files, but the run's narration -- and any
     shortfall the census exits 1 on -- is only ever readable in the journal."""
