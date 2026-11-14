@@ -18,6 +18,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# The consolidate cluster harness, reused rather than re-modelled: a bare
+# AsyncMock leaves every `mem0_update` config leaf a Mock, which the fail-closed
+# authz resolver rejects (tests/test_markup_guard_fused_memory.py does the same).
+import test_consolidate_memories_tool as _consolidate
 from fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import CallToolResult, TextContent
@@ -444,3 +449,169 @@ class TestMainInstallsTheUuidMember:
         assert getattr(server._tool_manager, '_fused_memory_safe_wrapped', False) is True
         assert FULL in mock_service.add_memory.await_args.kwargs['content']
         assert _repair(result)['substitutions'] == [_SUBSTITUTION]
+
+
+_OVERRIDE = 'allow_uuid_prefix'
+_ORDINARY = {'x_probe': 'kept'}
+
+
+def _as_dict(metadata: Any) -> dict[str, Any]:
+    """Persisted task metadata arrives as a JSON string; memory metadata as a dict."""
+    if isinstance(metadata, str):
+        return json.loads(metadata)
+    return dict(metadata or {})
+
+
+def _assert_stripped_and_kept(persisted: Any) -> None:
+    persisted = _as_dict(persisted)
+    assert _OVERRIDE not in persisted, f'the write-time flag was persisted: {persisted!r}'
+    assert persisted.get('x_probe') == 'kept', f"the caller's own key was lost: {persisted!r}"
+
+
+def _overriding(*, as_json: bool = False) -> dict[str, Any] | str:
+    metadata = {_OVERRIDE: True, **_ORDINARY}
+    return json.dumps(metadata) if as_json else metadata
+
+
+class TestTheUuidPrefixOverrideNeverReachesPersistence:
+    """``allow_uuid_prefix`` is a WRITE-TIME control, stripped by each tool body.
+
+    The guard forwards the flag UNCHANGED to a tool that declares ``metadata``
+    (layer 1 is its schema-conditional strip for tools that do not), so these
+    six bodies are the party that keeps it out of the stores. Each case keeps an
+    ordinary caller key, so a wholesale metadata drop cannot pass.
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_memory_keeps_the_bare_prefix_and_drops_the_flag(self):
+        resolver = RecordingResolver(UNIQUE)
+        server, mock_service = _memory_server(resolver)
+
+        result = await _wire(
+            server, 'add_memory', {**_add_memory_citing(), 'metadata': _overriding()}
+        )
+
+        assert resolver.calls == []
+        assert mock_service.add_memory.await_args.kwargs['content'] == _CITING
+        assert result.meta is None or 'uuid_prefix_repair' not in result.meta
+        _assert_stripped_and_kept(mock_service.add_memory.await_args.kwargs['metadata'])
+
+    @pytest.mark.asyncio
+    async def test_add_episode_keeps_the_bare_prefix_and_persists_no_flag(self):
+        """add_episode forwards no metadata to its store at all; its strip is defensive."""
+        resolver = RecordingResolver(UNIQUE)
+        server, mock_service = _memory_server(resolver)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {'project_id': 'reify', 'content': _CITING, 'metadata': _overriding()},
+        )
+
+        assert resolver.calls == []
+        assert mock_service.add_episode.await_args.kwargs['content'] == _CITING
+        assert 'uuid_prefix_repair' not in result
+        assert _OVERRIDE not in repr(mock_service.add_episode.await_args)
+
+    @pytest.mark.asyncio
+    async def test_add_system_record_drops_the_flag(self):
+        resolver = RecordingResolver(UNIQUE)
+        mock_service = AsyncMock()
+        _pass_through(mock_service, 'add_system_record')
+        server = create_mcp_server(mock_service)
+        install_boundary_guards(server, known_projects=_KNOWN_PROJECTS, prefix_resolver=resolver)
+
+        await server._tool_manager.call_tool(
+            'add_system_record',
+            {
+                'content': _CITING,
+                'project_id': 'reify',
+                'category': 'observations_and_summaries',
+                'agent_id': 'recon-stage-9',
+                'metadata': _overriding(),
+            },
+        )
+
+        assert resolver.calls == []
+        assert mock_service.add_system_record.await_args.kwargs['content'] == _CITING
+        _assert_stripped_and_kept(mock_service.add_system_record.await_args.kwargs['metadata'])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('as_json', [False, True], ids=['dict', 'json-string'])
+    async def test_submit_task_drops_the_flag(self, task_server_for, as_json):
+        resolver = RecordingResolver(UNIQUE)
+        server, interceptor = task_server_for(resolver, known_projects={'scratch': _PROJECT_ROOT})
+        description = f'Repair cited as {PREFIX} in the review.'
+
+        await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': _PROJECT_ROOT,
+                'title': 'Follow the dead repair',
+                'description': description,
+                'metadata': _overriding(as_json=as_json),
+            },
+        )
+
+        assert resolver.calls == []
+        interceptor.submit_task.assert_awaited_once()
+        assert interceptor.submit_task.await_args.kwargs['description'] == description
+        _assert_stripped_and_kept(interceptor.submit_task.await_args.kwargs['metadata'])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('as_json', [False, True], ids=['dict', 'json-string'])
+    async def test_update_task_drops_the_flag(self, task_server_for, as_json):
+        resolver = RecordingResolver(UNIQUE)
+        server, interceptor = task_server_for(resolver, known_projects={'scratch': _PROJECT_ROOT})
+        description = f'Repair cited as {PREFIX} in the review.'
+
+        await server._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '7',
+                'project_root': _PROJECT_ROOT,
+                'description': description,
+                'metadata': _overriding(as_json=as_json),
+            },
+        )
+
+        assert resolver.calls == []
+        assert interceptor.update_task.await_args.kwargs['description'] == description
+        _assert_stripped_and_kept(interceptor.update_task.await_args.kwargs['metadata'])
+
+    @pytest.mark.asyncio
+    async def test_consolidate_memories_drops_the_flag_it_receives_untouched(self):
+        """Exempt from resolution, so the flag reaches this body as the caller sent it."""
+        resolver = RecordingResolver(UNIQUE)
+        svc = _consolidate.make_service()
+        server = create_mcp_server(svc)
+        install_boundary_guards(server, known_projects=_KNOWN_PROJECTS, prefix_resolver=resolver)
+
+        await server._tool_manager.call_tool(
+            'consolidate_memories',
+            {
+                'canonical_content': f'{_consolidate.CONTENT} See {PREFIX}.',
+                'topic': _consolidate.TOPIC,
+                'project_id': _PROJECT_ID,
+                'supersedes': list(_consolidate.SUPERSEDES),
+                'run_id': _consolidate.RUN_ID,
+                'agent_id': _consolidate.AGENT,
+                'metadata': _overriding(),
+            },
+        )
+
+        assert resolver.calls == []
+        svc.add_memory.assert_awaited_once()
+        _assert_stripped_and_kept(svc.add_memory.await_args.kwargs['metadata'])
+
+    @pytest.mark.asyncio
+    async def test_a_non_literal_true_flag_does_not_unlock_the_guard(self):
+        resolver = RecordingResolver(UNIQUE)
+        server, mock_service = _memory_server(resolver)
+
+        await server._tool_manager.call_tool(
+            'add_memory',
+            {**_add_memory_citing(), 'metadata': {_OVERRIDE: 'yes', **_ORDINARY}},
+        )
+
+        assert resolver.calls == [('reify', PREFIX)]
+        assert FULL in mock_service.add_memory.await_args.kwargs['content']
