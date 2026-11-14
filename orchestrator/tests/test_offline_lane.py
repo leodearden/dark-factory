@@ -970,8 +970,10 @@ def _children(*children: tuple[bytes, int]):
 
 def _assert_lane_env(env: dict[str, str]) -> None:
     assert env['DF_VERIFY_ROLE'] == 'offline'
+    pool = [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')]
+    assert pool == [], f'the lane env must not carry the CLAUDE_OAUTH_TOKEN_* account pool: {pool!r}'
     for key, value in os.environ.items():
-        if key != 'DF_VERIFY_ROLE':
+        if key != 'DF_VERIFY_ROLE' and not key.startswith('CLAUDE_OAUTH_TOKEN_'):
             assert env.get(key) == value, f'the lane env must overlay os.environ (missing/altered {key!r})'
 
 
