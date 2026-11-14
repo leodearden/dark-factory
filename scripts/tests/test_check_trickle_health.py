@@ -75,7 +75,7 @@ class TestAggregateVerdict:
     def test_both_probes_passing_is_healthy(self):
         result = _check()
 
-        assert result.exit_code == 0
+        assert result.exit_code == check_trickle_health.EXIT_HEALTHY
         assert result.progress_ok is True
         assert result.liveness_ok is True
         assert 'progress' in result.reason.lower()
@@ -84,7 +84,7 @@ class TestAggregateVerdict:
     def test_a_failing_progress_probe_fails_the_aggregate(self):
         result = _check(progress_runner=_fails('ERROR: barren streak'))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.progress_ok is False
         assert result.liveness_ok is True
 
@@ -92,7 +92,7 @@ class TestAggregateVerdict:
         """A unit that ran and failed fails the aggregate on its own."""
         result = _check(liveness_runner=_fails('ERROR: Result=failed'))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.progress_ok is True
         assert result.liveness_ok is False
 
@@ -105,7 +105,7 @@ class TestAggregateVerdict:
             liveness_runner=_fails('ERROR: liveness detail here'),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.progress_ok is False
         assert result.liveness_ok is False
         assert 'progress detail here' in result.progress_output
@@ -123,7 +123,7 @@ class TestAggregateVerdict:
         never an uncaught traceback."""
         result = _check(progress_runner=_raises(exc))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.progress_ok is False
         assert type(exc).__name__ in result.progress_output, (
             'the reason a probe could not run must be named, not swallowed'
@@ -133,7 +133,7 @@ class TestAggregateVerdict:
     def test_a_failing_census_probe_fails_the_aggregate(self):
         result = _check(census_runner=_fails('ERROR: census fired unadvanced'))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.census_ok is False
         assert result.progress_ok is True
         assert result.liveness_ok is True
@@ -146,7 +146,7 @@ class TestAggregateVerdict:
             census_runner=_fails('ERROR: census detail here'),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert (result.progress_ok, result.liveness_ok, result.census_ok) == (
             False, False, False,
         )
@@ -155,7 +155,7 @@ class TestAggregateVerdict:
     def test_a_raising_census_runner_is_a_failed_probe(self):
         result = _check(census_runner=_raises(FileNotFoundError('no probe')))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.census_ok is False
         assert 'FileNotFoundError' in result.census_output
 
@@ -232,7 +232,8 @@ class TestCli:
         monkeypatch.setattr(
             check_trickle_health, 'run_health_check',
             lambda **kw: seen.update(kw) or check_trickle_health.HealthResult(
-                exit_code=0, progress_ok=True, liveness_ok=True,
+                exit_code=check_trickle_health.EXIT_HEALTHY,
+                progress_ok=True, liveness_ok=True,
                 progress_output='', liveness_output='',
                 census_ok=True, census_output='', escalated=False,
                 reason='synthetic healthy reason',
@@ -253,7 +254,8 @@ class TestCli:
         monkeypatch.setattr(
             check_trickle_health, 'run_health_check',
             lambda **kw: seen.update(kw) or check_trickle_health.HealthResult(
-                exit_code=0, progress_ok=True, liveness_ok=True,
+                exit_code=check_trickle_health.EXIT_HEALTHY,
+                progress_ok=True, liveness_ok=True,
                 progress_output='', liveness_output='',
                 census_ok=True, census_output='', escalated=False,
                 reason='synthetic healthy reason',
@@ -261,7 +263,9 @@ class TestCli:
         )
         config_path = _write_project_config(tmp_path, project_id='proj_a')
 
-        assert check_trickle_health.main(['--config', str(config_path)]) == 0
+        assert check_trickle_health.main(['--config', str(config_path)]) == (
+            check_trickle_health.EXIT_HEALTHY
+        )
 
         assert seen['project_id'] is None
         assert seen['config_path'] == str(config_path)
@@ -272,14 +276,17 @@ class TestCli:
         monkeypatch.setattr(
             check_trickle_health, 'run_health_check',
             lambda **kw: check_trickle_health.HealthResult(
-                exit_code=1, progress_ok=False, liveness_ok=True,
+                exit_code=check_trickle_health.EXIT_DEGRADED,
+                progress_ok=False, liveness_ok=True,
                 progress_output='', liveness_output='',
                 census_ok=True, census_output='', escalated=False,
                 reason='synthetic failure reason',
             ),
         )
 
-        assert check_trickle_health.main(['--project-id', 'dark_factory']) == 1
+        assert check_trickle_health.main(['--project-id', 'dark_factory']) == (
+            check_trickle_health.EXIT_DEGRADED
+        )
 
         captured = capsys.readouterr()
         assert 'synthetic failure reason' in captured.err
@@ -289,14 +296,17 @@ class TestCli:
         monkeypatch.setattr(
             check_trickle_health, 'run_health_check',
             lambda **kw: check_trickle_health.HealthResult(
-                exit_code=0, progress_ok=True, liveness_ok=True,
+                exit_code=check_trickle_health.EXIT_HEALTHY,
+                progress_ok=True, liveness_ok=True,
                 progress_output='', liveness_output='',
                 census_ok=True, census_output='', escalated=False,
                 reason='synthetic healthy reason',
             ),
         )
 
-        assert check_trickle_health.main(['--project-id', 'dark_factory']) == 0
+        assert check_trickle_health.main(['--project-id', 'dark_factory']) == (
+            check_trickle_health.EXIT_HEALTHY
+        )
 
         captured = capsys.readouterr()
         assert 'synthetic healthy reason' in captured.out
@@ -399,7 +409,7 @@ class TestEscalation:
             tmp_path, progress_runner=_fails('ERROR: barren streak'),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is True
         assert len(posted) == 1, 'ONE escalation for the whole invocation'
 
@@ -441,7 +451,7 @@ class TestEscalation:
             tmp_path, liveness_runner=_fails('ERROR: Result=failed'),
         )
 
-        assert result.exit_code == 1, 'still loud'
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED, 'still loud'
         assert result.escalated is False
         assert posted == []
 
@@ -452,7 +462,7 @@ class TestEscalation:
             tmp_path, census_runner=_fails('CENSUS-MARKER fired unadvanced'),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is True
         assert len(posted) == 1
         arguments = posted[0][1]
@@ -479,13 +489,13 @@ class TestEscalation:
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert len(posted) == 1
 
     def test_two_green_probes_post_nothing(self, tmp_path):
         result, posted = self._posted(tmp_path)
 
-        assert result.exit_code == 0
+        assert result.exit_code == check_trickle_health.EXIT_HEALTHY
         assert result.escalated is False
         assert posted == []
 
@@ -500,7 +510,7 @@ class TestEscalation:
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is False
         assert posted == []
 
@@ -517,7 +527,7 @@ class TestEscalation:
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert len(posted) == 1
 
     def test_a_frozen_threshold_document_does_not_suppress_forever(
@@ -546,7 +556,7 @@ class TestEscalation:
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert len(posted) == 1
 
     @pytest.mark.parametrize('offset_hours, expected_escalations', [
@@ -608,7 +618,7 @@ class TestEscalation:
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert len(posted) == 1
 
     def test_the_barren_edge_suppression_does_not_apply_to_a_failed_streak(
@@ -624,7 +634,7 @@ class TestEscalation:
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert len(posted) == 1
 
     @pytest.mark.parametrize(
@@ -696,7 +706,7 @@ class TestEscalation:
                 poster=_boom,
             )
 
-        assert result.exit_code == 1, 'the verdict is unchanged'
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED, 'the verdict is unchanged'
         assert result.escalated is False
         assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
         [journaled] = [r.getMessage() for r in caplog.records if r.levelname == 'ERROR']
@@ -716,7 +726,7 @@ class TestEscalation:
             poster=lambda url, arguments: None,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is False
 
     def test_under_pytest_the_default_poster_refuses_a_real_post(self, tmp_path):
@@ -734,7 +744,7 @@ class TestEscalation:
             )
             requests = server.requests
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is False
         assert requests == ()
 
@@ -807,7 +817,7 @@ class TestProjectIdResolution:
             poster=lambda url, arguments: posted.append(arguments),
         )
 
-        assert result.exit_code == 0
+        assert result.exit_code == check_trickle_health.EXIT_HEALTHY
         assert result.escalated is False
         assert posted == []
         assert 'proj_a' in result.reason
@@ -866,7 +876,7 @@ class TestProjectIdResolution:
             poster=lambda url, arguments: posted.append(arguments),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert len(posted) == 1
         arguments = posted[0]
         assert arguments['task_id'] == 'legibility-trickle-health-dark_factory'
@@ -904,7 +914,7 @@ class TestProjectIdResolution:
             poster=lambda url, arguments: posted.append(arguments),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_UNRESOLVED
         assert result.escalated is False
         assert posted == []
         assert progress_calls == [], 'the progress probe must never be invoked'
@@ -930,7 +940,7 @@ class TestProjectIdResolution:
             poster=lambda url, arguments: posted.append(arguments),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert len(posted) == 1
         arguments = posted[0]
         assert arguments['task_id'] == 'legibility-trickle-health-proj_a'
@@ -1043,7 +1053,7 @@ class TestTheDefaultRunnersReallyExecute:
             poster=lambda url, arguments: None,
         )
 
-        assert result.exit_code == 0
+        assert result.exit_code == check_trickle_health.EXIT_HEALTHY
         assert result.progress_ok is True
         assert 'OK:' in result.progress_output
         assert 'proj_defaults_e2e' in result.progress_output
@@ -1083,3 +1093,39 @@ class TestTheDefaultRunnersReallyExecute:
         assert returncode == 1
         assert 'no-such-binary' in output
         assert 'not evidence of health' in output
+
+
+class TestNoVerdictIsNeverAVerdictCode:
+    """A crash and a verdict are distinguishable by exit status alone —
+    the property ``check_trickle_health_liveness.sh`` relies on. Runs the
+    REAL script, because Python's own uncaught-exception status is what a
+    top-level import failure produces, and no in-process call reaches it."""
+
+    @pytest.mark.parametrize('argv, stderr_marker', [
+        pytest.param(
+            [
+                sys.executable, '-c',
+                "import runpy, sys; sys.modules['legibility.alarm'] = None; "
+                f"sys.argv = [{str(SCRIPT)!r}, '--project-id', 'proj_a']; "
+                f"runpy.run_path({str(SCRIPT)!r}, run_name='__main__')",
+            ],
+            'ImportError',
+            id='import-failure',
+        ),
+        pytest.param([sys.executable, str(SCRIPT)], 'usage', id='usage-error'),
+    ])
+    def test_a_run_that_reaches_no_verdict_exits_with_neither_verdict_code(
+        self, argv, stderr_marker
+    ):
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60, check=False,
+        )
+
+        assert completed.returncode not in (
+            check_trickle_health.EXIT_HEALTHY, check_trickle_health.EXIT_DEGRADED,
+        ), (
+            f'exit {completed.returncode} is a verdict code, so a liveness '
+            f'probe would read this crash as a verdict.\n'
+            f'stdout: {completed.stdout}\nstderr: {completed.stderr}'
+        )
+        assert stderr_marker in completed.stderr, completed.stderr

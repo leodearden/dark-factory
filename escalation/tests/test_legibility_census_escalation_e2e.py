@@ -239,7 +239,7 @@ def test_trickle_health_finding_lands_a_retrievable_escalation(tmp_path, serve_e
     _base_url, port, queue = serve_escalation_mcp(tmp_path / 'queue')
     cfg = _live_cfg(tmp_path, port)
     result = check_trickle_health.HealthResult(
-        exit_code=1,
+        exit_code=check_trickle_health.EXIT_DEGRADED,
         progress_ok=False,
         liveness_ok=True,
         progress_output='last run FAILED',
