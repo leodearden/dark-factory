@@ -7588,6 +7588,15 @@ def select_probe_depth(
 # _deep_chain_placement passes `cap - 1` / `d - 1` (see its docstring).
 
 
+def may_chain(*, speculative: bool, frontier_depth: int | None) -> bool:
+    """Whether a dispatch may build a deep chain (``plans/merge-lane-policy-prd.md`` D5).
+
+    Its item is speculative, or no other entry is in the verify frontier; a
+    *frontier_depth* of ``None`` is unknown and never licenses a non-speculative chain.
+    """
+    return speculative or frontier_depth == 0
+
+
 def select_chain_depth(
     chain_cap: int,
     queue_len: int,
