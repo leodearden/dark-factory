@@ -89,6 +89,20 @@ sub-path below) and excludes every resume/idempotency branch above (those
 already have `before_done_ran_at` or `gate_escalated_at` set, so they
 never reach this first-dispatch check).
 
+**Refused `before_done` record** (task 9116): next, still before the
+stamp, the runner resolves the record's paths once through
+`shared/src/shared/before_done_paths.py::resolve_before_done_paths`.  A
+`BeforeDonePathsRefused` (a non-string `cwd`, or a `script_root` the
+record may not use, reaching the runner through `update_task`) files a
+born-at-L2 `infra_issue` — summary "Deploy refused before_done:
+<target_unit>", or "Deploy refused before_done (no target_unit)" — and
+blocks without running the deploy, without stamping `before_done_ran_at`
+and without advancing `deploy_state`.  Because nothing is stamped, fixing
+the record and resolving the escalation (`resume`/`restart`) leads to a
+first dispatch that really runs the deploy; filed after the stamp, a
+`resume` would drive the task to done with the deploy never run.  The
+cross-unit sub-path reuses these resolved paths.
+
 The `before_done_ran_at` stamp is written FIRST (crash-safe I1) and is
 SHARED between the self-target (ε) and cross-unit sub-paths below.
 
