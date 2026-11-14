@@ -92,9 +92,9 @@ def _assert_row_1(ledger: BurstLedger) -> None:
             )
             assert len(record.evidence) == 1, f'{where}: evidence files {record.evidence!r}'
             evidence = record.evidence[0]
-            assert evidence['api_error_status'] == 529, f'{where}: evidence {evidence!r}'
-            assert 'overloaded_error' in evidence['output_tail'], f'{where}: evidence {evidence!r}'
-            assert evidence['output_tail'].endswith(PROVIDER_529_ERROR), f'{where}: evidence {evidence!r}'
+            assert evidence.api_error_status == 529, f'{where}: evidence {evidence!r}'
+            assert 'overloaded_error' in evidence.output_tail, f'{where}: evidence {evidence!r}'
+            assert evidence.output_tail.endswith(PROVIDER_529_ERROR), f'{where}: evidence {evidence!r}'
         writes = ledger.status_writes[tid]
         assert 'blocked' not in writes, f'row 1: task {tid} was written blocked: {writes}'
         assert ledger.escalations_by_task[tid] == (), (
