@@ -124,13 +124,6 @@ def _install_refusing_systemd_run(tmp_path: Path, monkeypatch, refusal: str) -> 
     _install_systemd_run(tmp_path, monkeypatch, _refusal_body(refusal))
 
 
-@pytest.fixture(params=_SAMPLES)
-def unreachable_bus(request, tmp_path, monkeypatch) -> str:
-    """A refusing ``systemd-run`` printing a grounded refusal; returns the refusal."""
-    _install_refusing_systemd_run(tmp_path, monkeypatch, request.param)
-    return request.param
-
-
 @pytest.fixture(params=_ALL_REFUSALS)
 def refusing_launcher(request, tmp_path, monkeypatch) -> str:
     """A refusing ``systemd-run`` for every reason, observed or not; returns the refusal."""
@@ -172,7 +165,7 @@ def _cockpit_module_config() -> ModuleConfig:
     )
 
 
-async def _verify_with_unreachable_bus(worktree: Path) -> VerifyResult:
+async def _scoped_cockpit_merge_verify(worktree: Path) -> VerifyResult:
     return await run_verification(
         worktree,
         OrchestratorConfig(verify_use_cgroup_scope=True),
@@ -182,22 +175,12 @@ async def _verify_with_unreachable_bus(worktree: Path) -> VerifyResult:
     )
 
 
-@pytest.mark.usefixtures('code_default_config', 'unreachable_bus')
-class TestScopedVerifyWithUnreachableBus:
-
-    @pytest.mark.asyncio
-    async def test_every_leg_refused_is_env_transient(self, worktree):
-        result = await _verify_with_unreachable_bus(worktree)
-        assert result.passed is False
-        assert result.category == FailureCategory.ENV_TRANSIENT, result.summary
-
-
 @pytest.mark.usefixtures('code_default_config', 'refusing_launcher')
 class TestRefusalReasonDoesNotMatter:
 
     @pytest.mark.asyncio
     async def test_every_leg_refused_is_env_transient_for_any_reason(self, worktree):
-        result = await _verify_with_unreachable_bus(worktree)
+        result = await _scoped_cockpit_merge_verify(worktree)
         assert result.passed is False
         assert result.category == FailureCategory.ENV_TRANSIENT, result.summary
 
@@ -369,12 +352,12 @@ def _make_req(project_root: Path) -> MagicMock:
     return req
 
 
-@pytest.mark.usefixtures('code_default_config', 'unreachable_bus')
+@pytest.mark.usefixtures('code_default_config', 'refusing_launcher')
 class TestMergeLaneHoldsScopeSpawnFailure:
 
     @pytest.mark.asyncio
     async def test_persistent_refusal_holds_as_transient_infra(self, worktree, tmp_path):
-        spawn_failed = await _verify_with_unreachable_bus(worktree)
+        spawn_failed = await _scoped_cockpit_merge_verify(worktree)
         verifier = FakeVerifier(default=VerifyScript(result=spawn_failed))
         timeouts: dict[str, int] = {}
 
@@ -396,7 +379,7 @@ class TestMergeLaneHoldsScopeSpawnFailure:
 
     @pytest.mark.asyncio
     async def test_refusal_that_clears_on_retry_lets_the_merge_proceed(self, worktree, tmp_path):
-        spawn_failed = await _verify_with_unreachable_bus(worktree)
+        spawn_failed = await _scoped_cockpit_merge_verify(worktree)
         verifier = FakeVerifier(sequence=[VerifyScript(result=spawn_failed)])
 
         outcome = await _run_post_merge_verify(
