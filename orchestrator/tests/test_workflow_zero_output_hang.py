@@ -13,6 +13,7 @@ All tests are RED until step-8 (circuit breaker + routing) is implemented.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -860,3 +861,57 @@ class TestZeroOutputEvidenceCarriesServerErrorCause:
         data = json.loads(evidence_path.read_text())
         assert data['api_error_status'] == 529
         assert 'overloaded_error' in data['output_tail']
+
+
+def _with_dual_root_artifacts(wf: TaskWorkflow) -> TaskArtifacts:
+    """Swap the harness's single-root artifacts for the production dual-root shape."""
+    artifacts = TaskArtifacts.for_task(wf.worktree, wf.task_id)
+    artifacts.task_root.mkdir(parents=True, exist_ok=True)
+    wf.artifacts = artifacts
+    return artifacts
+
+
+@pytest.mark.asyncio
+class TestHangDetailNamesTaskRootEvidence:
+    """The infra block detail names a glob that finds the evidence the run wrote,
+    under the TASK root rather than the lane root."""
+
+    async def test_breaker_trip_detail_names_the_evidence_glob(self, tmp_path: Path):
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=10,
+            max_consecutive_zero_output_timeouts=2,
+        )
+        artifacts = _with_dual_root_artifacts(wf)
+        _stub_iteration_helpers(wf, _zero_output_agent_result())
+        glob = artifacts.zero_output_evidence_glob()
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert glob in wf._zero_output_hang_info['detail']  # type: ignore[attr-defined]
+        assert Path(glob).parent == artifacts.task_root
+        for n in (1, 2):
+            evidence_path = artifacts.zero_output_evidence_path(n)
+            assert evidence_path.exists()
+            assert fnmatch.fnmatch(str(evidence_path), glob)
+
+    async def test_iteration_cap_detail_names_the_evidence_glob(self, tmp_path: Path):
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=1,
+            max_consecutive_zero_output_timeouts=2,
+        )
+        artifacts = _with_dual_root_artifacts(wf)
+        _stub_iteration_helpers(wf, _zero_output_agent_result())
+        glob = artifacts.zero_output_evidence_glob()
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        detail = wf._zero_output_hang_info['detail']  # type: ignore[attr-defined]
+        assert glob in detail
+        assert 'at_iteration_cap=True' in detail
+        evidence_path = artifacts.zero_output_evidence_path(1)
+        assert evidence_path.exists()
+        assert fnmatch.fnmatch(str(evidence_path), glob)
