@@ -117,6 +117,13 @@ class TestRequireRegisteredCategory:
         with pytest.raises(UnregisteredEscalationCategory):
             require_registered_category(value)
 
+    # Each value's only producer is gone: recon_resume_failure_storm's went
+    # with the resume pass that task 5514 deleted.
+    @pytest.mark.parametrize('value', ['recon_resume_failure_storm'])
+    def test_a_category_retired_with_its_producer_is_refused(self, value: str):
+        with pytest.raises(UnregisteredEscalationCategory):
+            require_registered_category(value)
+
 
 def _esc(queue: EscalationQueue, category: str) -> Escalation:
     return Escalation(
