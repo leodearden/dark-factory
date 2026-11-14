@@ -48,7 +48,7 @@ Bindings in this section checked against main `38a200d213` (2026-11-10).
 | A remote result with no usable verdict has an existing path | `grep:orchestrator/src/orchestrator/verify_runner.py::RunnerUnavailable` | PASS — wired |
 | Keyed toolchain inputs have one producer | `grep:orchestrator/src/orchestrator/verify_cache/toolchain.py::ToolchainFingerprint.as_inputs` | PASS |
 | The local decision, recorder and `consumed` write that γ2 reuses | producer: task 5653 (γ), upstream by dependency edge | PASS — producer upstream |
-| `toolchain.runner` keyed input; `verify_cache` block on both specs; the candidate query | capability→producer (built here) in `orchestrator/src/orchestrator/verify_cache/` and the two spec modules | PASS |
+| `verify_cache` block on both specs; the candidate query over greens from any host (A6) | capability→producer (built here) in `orchestrator/src/orchestrator/verify_cache/` and the two spec modules | PASS |
 
 ## δ — Repo-wide guard module (leaf)
 
