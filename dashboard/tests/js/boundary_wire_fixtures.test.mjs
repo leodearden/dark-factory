@@ -22,6 +22,8 @@ import {
   qualityMetric,
   qualityModuleRow,
   qualityPayload,
+  qualitySnapshotPoint,
+  qualitySnapshots,
   schedulerLockRow,
   schedulerModule,
   schedulerSnapshot,
@@ -220,4 +222,30 @@ test('a QUALITY_MARKERS stream and its derived marker are built with exactly the
   assertSameKeys(built.prompt_coverage, served.value.prompt_coverage, 'QUALITY_MARKERS.value.prompt_coverage');
   assertSameKeys(built.markers[0], servedMarker, 'QUALITY_MARKERS.value.markers[0]');
   assertSameKeys(built.markers[0].source, servedMarker.source, 'QUALITY_MARKERS.value.markers[0].source');
+});
+
+test('a QUALITY_SNAPSHOTS series and its point are built with exactly the keys /quality serves', () => {
+  const served = payload('quality_snapshots').QUALITY_SNAPSHOTS.value;
+  const [servedPoint, servedNightly] = served.points;
+  const built = qualitySnapshotPoint();
+
+  assertSameKeys(qualitySnapshots([built]), served, 'QUALITY_SNAPSHOTS.value');
+  assertSameKeys(qualitySnapshots([built]).pending, served.pending, 'QUALITY_SNAPSHOTS.value.pending');
+  assertSameKeys(built, servedPoint, 'QUALITY_SNAPSHOTS.value.points[0]');
+  for (const key of ['members', 'h14', 'cycles', 'diff']) {
+    assertSameKeys(built[key], servedPoint[key], `QUALITY_SNAPSHOTS.value.points[0].${key}`);
+  }
+  assertSameKeys(built.members.rows[0], servedPoint.members.rows[0], 'QUALITY_SNAPSHOTS.value.points[0].members.rows[0]');
+  // The default builder is a schema-3 nightly point, so its params are held to the served one's.
+  assert.equal(servedNightly.baseline, false);
+  assertBuiltKeysServed(built, servedNightly, 'QUALITY_SNAPSHOTS.value.points[1]');
+});
+
+test('the no-snapshot body is built as the unknown Datum a scan that found neither home serves', () => {
+  const served = payload('quality_no_snapshot').QUALITY_SNAPSHOTS;
+  const built = qualityBody({ quality: qualityPayload({ axis: [], metrics: {} }) }).QUALITY_SNAPSHOTS;
+
+  assertSameKeys(built, served, 'the QUALITY_SNAPSHOTS Datum');
+  assert.equal(built.state, served.state);
+  assert.ok(built.reason.startsWith('no snapshot yet') && served.reason.startsWith('no snapshot yet'));
 });
