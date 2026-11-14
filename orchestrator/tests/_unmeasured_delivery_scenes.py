@@ -22,6 +22,8 @@ _IGNORES_TASK_DIR = ('.gitignore', '.task/\n')
 class Scene:
     repo: Path
     worktree: Path
+    creation_sha: str
+    """main's tip when the task worktree was cut."""
 
 
 def seeded_repo(tmp_path: Path, files: Mapping[str, str]) -> Path:
@@ -46,6 +48,7 @@ def commit(cwd: Path, files: Mapping[str, str], message: str) -> str:
 def stopped_rebase(tmp_path: Path, branch: str) -> Scene:
     """*branch* commits x.py then y.py; main's x.py conflicts, so ``git rebase main`` stops at step 1 of 2."""
     repo = seeded_repo(tmp_path, {'x.py': 'x = 1\n', 'y.py': 'y = 1\n', 'z.py': 'z = 1\n'})
+    creation_sha = git(repo, 'rev-parse', 'HEAD')
     worktree = add_worktree(repo, tmp_path / 'wt', branch)
     commit(worktree, {'x.py': 'x = 2\n'}, 'task edits x')
     commit(worktree, {'y.py': 'y = 2\n'}, 'task edits y')
@@ -54,7 +57,7 @@ def stopped_rebase(tmp_path: Path, branch: str) -> Scene:
         ['git', 'rebase', 'main'], cwd=worktree, capture_output=True, text=True,
     )
     assert stopped.returncode != 0, stopped.stdout
-    return Scene(repo=repo, worktree=worktree)
+    return Scene(repo=repo, worktree=worktree, creation_sha=creation_sha)
 
 
 def uncommitted_edits(tmp_path: Path) -> Scene:
@@ -66,13 +69,14 @@ def uncommitted_edits(tmp_path: Path) -> Scene:
     (worktree / 'pkg').mkdir()
     (worktree / 'pkg' / 'inner.py').write_text('i = 1\n')
     git(worktree, 'add', 'pkg/inner.py')
-    return Scene(repo=repo, worktree=worktree)
+    return Scene(repo=repo, worktree=worktree, creation_sha=git(repo, 'rev-parse', 'HEAD'))
 
 
 @dataclass(frozen=True)
 class SiblingScene:
     repo: Path
     worktree: Path
+    creation_sha: str
     sibling_ref: str
     sibling_tip: str
 
@@ -86,6 +90,6 @@ def work_on_sibling_ref(tmp_path: Path) -> SiblingScene:
     other = add_worktree(repo, tmp_path / 'wt-500', 'task/500')
     commit(other, {'b.py': 'b = 2\n'}, 'another task')
     return SiblingScene(
-        repo=repo, worktree=worktree,
+        repo=repo, worktree=worktree, creation_sha=git(repo, 'rev-parse', 'HEAD'),
         sibling_ref='task/50-skip-attempt', sibling_tip=sibling_tip,
     )
