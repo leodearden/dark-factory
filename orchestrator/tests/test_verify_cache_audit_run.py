@@ -15,9 +15,12 @@ from pathlib import Path
 
 import pytest
 import yaml
+from click.testing import CliRunner
 from shared.proc_group import pid_running
 
+from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig, load_config
+from orchestrator.offline_lane_confirm import ConfirmMode, confirm_mode, reproduce_line
 from orchestrator.offline_lane_records import Leg, Phase, RunRecord, RunRecordStore
 from orchestrator.offline_lane_runs import OutputFormat, launch
 from orchestrator.verify import FailureKind, PytestFailure, parse_pytest_failures
@@ -55,6 +58,9 @@ _BETA_COLLECTION_ERROR = (
     '!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n'
     '== 1 error in 1.0s ==\n'
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 
 _ALPHA_ONE = 'alpha::tests/test_a.py::test_one'
 _ALPHA_TWO = 'alpha::tests/test_a.py::test_two[x-y]'
@@ -272,3 +278,67 @@ class TestRenderReport:
         lines = audit_run.render_report([_run('alpha', 1, audit_run.ModuleEnd.EXIT, crash)], 1.0)
 
         assert [f.node_id for f in parse_pytest_failures('\n'.join(lines))] == ['alpha::tests/test_a.py::t']
+
+
+class TestAuditRunCli:
+    def _invoke(self, tree: _Tree):
+        return CliRunner().invoke(main, ['verify-cache', 'audit-run', '--config', str(tree.config_path)])
+
+    def test_a_red_module_prints_qualified_failures_and_exits_one(self, tree):
+        tree.module('alpha', output=_ALPHA_RED, rc=1)
+
+        result = self._invoke(tree)
+
+        assert result.exit_code == 1, result.output
+        assert f'FAILED {_ALPHA_ONE} - AssertionError: one' in result.output.splitlines(), result.output
+
+    def test_all_green_exits_zero_and_logs_under_the_default_dir(self, tree):
+        result = self._invoke(tree)
+
+        assert result.exit_code == 0, result.output
+        assert 'FAILED' not in result.output, result.output
+        logs = tree.root / audit_run.DEFAULT_LOG_DIR
+        assert sorted(path.name for path in logs.iterdir()) == ['alpha.log', 'beta.log', 'tests--scripts.log']
+
+
+def _committed_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
+    """The COMMITTED yaml through the real model, as test_warm_lane_bash_bucket_placement.py loads it."""
+    assert DF_CONFIG_PATH.exists(), DF_CONFIG_PATH
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(DF_CONFIG_PATH))
+    return OrchestratorConfig()
+
+
+def _detect_naming_ids() -> RunRecord:
+    at = datetime(2026, 11, 14, tzinfo=UTC)
+    return RunRecord(
+        command=audit_run.AUDIT_COMMAND, leg=Leg.GENERIC.value, head='c0ffee', phase=Phase.DETECT.value,
+        started_at=at, ended_at=at, returncode=1, ended_by='exit', output_path='/dev/null', junit_path=None,
+        failures=(), ids_available=True, outcomes=None, session_complete=True, probe=None,
+    )
+
+
+class TestCommittedLaneEntry:
+    def test_the_lane_runs_the_audit_uncached_against_the_heads_own_config(self, monkeypatch):
+        entries = [
+            entry for entry in _committed_config(monkeypatch).git.offline_lane_commands
+            if entry.enabled and entry.name == audit_run.AUDIT_COMMAND
+        ]
+
+        assert len(entries) == 1, entries
+        entry = entries[0]
+        assert entry.command.startswith('DF_VERIFY_CACHE=off '), entry.command
+        assert 'PROJECT_ROOT="$PWD"' in entry.command, entry.command
+        assert (
+            'uv run --project orchestrator orchestrator verify-cache audit-run --config dark-factory-orchestrator.yaml'
+            in entry.command
+        ), entry.command
+        assert (entry.cwd, entry.fix_task_priority, entry.outage_probe) == ('.', 'high', None)
+
+    def test_the_lane_treats_the_audit_as_opaque_and_intersects(self, monkeypatch):
+        entry = next(
+            entry for entry in _committed_config(monkeypatch).git.offline_lane_commands
+            if entry.name == audit_run.AUDIT_COMMAND
+        )
+
+        assert reproduce_line(entry, ['m::t.py::x']) is None
+        assert confirm_mode(entry, _detect_naming_ids()) is ConfirmMode.INTERSECTED
