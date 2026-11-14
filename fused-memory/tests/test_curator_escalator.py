@@ -1264,9 +1264,30 @@ class TestBackendBinaryUnresolvableEscalation:
                     search_path='/usr/bin:/bin',
                 )
 
-            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
-            assert len(files) == 4
-            assert escalator._failure_log == {}
+            categories = [r['category'] for r in _pending_records(tmp_path)]
+            assert categories == ['curator_backend_binary_unresolvable'] * 4
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_binary_alarms_leave_the_burst_window_untouched(self, tmp_path):
+        """The ordinary failure budget of three per window survives any number of binary alarms."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(4):
+                await escalator.report_backend_binary_unresolvable(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    binary_spec='claude', search_path='/usr/bin:/bin',
+                )
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='boom', candidate_title='T',
+                )
+
+            categories = [r['category'] for r in _pending_records(tmp_path)]
+            assert categories.count('curator_failure') == 3
         finally:
             handle.close()
 
