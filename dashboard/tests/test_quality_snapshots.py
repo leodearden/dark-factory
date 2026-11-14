@@ -6,26 +6,40 @@ instrument proves the fixtures (dashboard/tests/_quality_snapshots.py) as well a
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from _quality_fixture import GitRepo
-from _quality_snapshots import DEFAULT_GRAPH, DEFAULT_MEMBERS, snapshot_doc, write_snapshot
+from _quality_snapshots import (
+    DEFAULT_GRAPH,
+    DEFAULT_MEMBERS,
+    default_params,
+    snapshot_doc,
+    write_snapshot,
+)
+from shared.quality_series.git_lines import GitObjectMissing
+
 from dashboard.data.quality_snapshots import (
     BASELINE_HOME,
     INSTRUMENT_SCRIPT,
     SNAPSHOT_GIT_TIMEOUT_SECONDS,
+    DiffState,
     InstrumentRefused,
+    RootScan,
+    SnapshotCache,
     SnapshotSummary,
     commit_time,
     diff_text,
+    scan_root,
     snapshot_files,
     summarise,
 )
-from shared.quality_series.git_lines import GitObjectMissing
 
 SHA_1 = '1' * 40
 SHA_2 = '2' * 40
@@ -232,3 +246,174 @@ class TestCommitTime:
 
         with pytest.raises(GitObjectMissing):
             commit_time(repo.root, 'f' * 40, SNAPSHOT_GIT_TIMEOUT_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# scan_root: one root's scan on a worker thread, cached by file state, digest and identity pair.
+
+_COUNTING_INSTRUMENT = """\
+import pathlib
+import subprocess
+import sys
+
+with open(pathlib.Path(__file__).with_name('calls.log'), 'a', encoding='utf-8') as log:
+    log.write(sys.argv[1] + '\\n')
+sys.exit(subprocess.call([sys.executable, {real!r}, *sys.argv[1:]]))
+"""
+
+
+@dataclass(frozen=True)
+class Scene:
+    """A git root with three commits; a schema-2 baseline at sha1 and schema-3 nightlies at sha2, sha3."""
+
+    root: Path
+    nightly: Path
+    shas: tuple[str, str, str]
+    times: tuple[datetime, datetime, datetime]
+    instrument: Path
+
+    @property
+    def home(self) -> Path:
+        return self.nightly / 'dark_factory'
+
+    def calls(self) -> list[str]:
+        """The instrument modes run since the last call (--summary or --current)."""
+        log = self.instrument.with_name('calls.log')
+        if not log.exists():
+            return []
+        modes = log.read_text(encoding='utf-8').splitlines()
+        log.unlink()
+        return modes
+
+    def scan(self, cache: SnapshotCache | None = None, *, deadline: float | None = None) -> RootScan:
+        return scan_root(
+            self.root, 'dark_factory', self.nightly, cache or SnapshotCache.empty(),
+            deadline=time.monotonic() + 120 if deadline is None else deadline,
+            instrument=self.instrument,
+        )
+
+
+@pytest.fixture
+def scene(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Scene:
+    repo = GitRepo(tmp_path / 'root')
+    times = (
+        datetime(2026, 10, 8, 12, tzinfo=UTC),
+        datetime(2026, 11, 1, 3, tzinfo=UTC),
+        datetime(2026, 11, 2, 3, tzinfo=UTC),
+    )
+    monkeypatch.setenv('GIT_COMMITTER_DATE', times[0].isoformat())
+    sha1 = repo.init()
+    monkeypatch.setenv('GIT_COMMITTER_DATE', times[1].isoformat())
+    sha2 = repo.commit({'a.txt': 'two\n'}, 'two')
+    monkeypatch.setenv('GIT_COMMITTER_DATE', times[2].isoformat())
+    sha3 = repo.commit({'a.txt': 'three\n'}, 'three')
+    monkeypatch.delenv('GIT_COMMITTER_DATE')
+    write_snapshot(repo.root / BASELINE_HOME / 'review-all-dark_factory-20261008.json',
+                   snapshot_doc(2, as_of_sha=sha1, run_id='r1'))
+    nightly = tmp_path / 'nightly'
+    for sha, run_id in ((sha2, 'r2'), (sha3, 'r3')):
+        write_snapshot(nightly / 'dark_factory' / f'{sha}.json', snapshot_doc(3, as_of_sha=sha, run_id=run_id))
+    instrument_dir = tmp_path / 'instrument'
+    instrument_dir.mkdir()
+    instrument = instrument_dir / 'quality_metrics_snapshot.py'
+    instrument.write_text(_COUNTING_INSTRUMENT.format(real=str(INSTRUMENT_SCRIPT)), encoding='utf-8')
+    (instrument_dir / 'source_measures.py').symlink_to(INSTRUMENT_SCRIPT.with_name('source_measures.py'))
+    return Scene(repo.root, nightly, (sha1, sha2, sha3), times, instrument)
+
+
+def _rewrite(path: Path, doc: dict[str, object]) -> None:
+    before = path.stat().st_mtime_ns
+    write_snapshot(path, doc)
+    os.utime(path, ns=(before + 1_000_000_000, before + 1_000_000_000))
+
+
+class TestScanRoot:
+    def test_a_cold_scan_places_every_point_with_its_diff(self, scene: Scene) -> None:
+        scan = scene.scan()
+
+        assert [point.summary.as_of_sha for point in scan.points] == list(scene.shas)
+        assert [point.baseline for point in scan.points] == [True, False, False]
+        assert [point.committed_at for point in scan.points] == list(scene.times)
+        assert [point.diff.state for point in scan.points] == [DiffState.FIRST, DiffState.READY, DiffState.READY]
+        for previous, point in zip(scan.points, scan.points[1:], strict=False):
+            assert point.diff.previous_id == previous.point_id
+            assert scan.new_diffs[point.diff.pair_key].text == diff_text(point.file, previous.file)
+        assert (scan.unplaced, scan.pending_summaries, scan.pending_diffs) == ((), 0, 0)
+        assert sorted(scene.calls()) == ['--current', '--current', '--summary', '--summary', '--summary']
+
+    def test_a_warm_scan_recomputes_nothing(self, scene: Scene) -> None:
+        first = scene.scan()
+        scene.calls()
+
+        second = scene.scan(SnapshotCache.from_scan(first))
+
+        assert scene.calls() == []
+        assert second.new_diffs == {}
+        assert second.points == first.points
+
+    def test_new_content_resummarises_that_file_and_rediffs_only_a_changed_identity_pair(
+        self, scene: Scene
+    ) -> None:
+        first = scene.scan()
+        scene.calls()
+        sha1, sha2, sha3 = scene.shas
+
+        _rewrite(scene.home / f'{sha2}.json', snapshot_doc(3, as_of_sha=sha2, run_id='r2-again'))
+        same_identity = scene.scan(SnapshotCache.from_scan(first))
+
+        assert scene.calls() == ['--summary']
+        assert same_identity.new_diffs == {}
+        assert same_identity.points[1].summary.run_id == 'r2-again'
+
+        changed = {**default_params(3), 'complexipy_version': '6.3.0'}
+        _rewrite(scene.home / f'{sha3}.json', snapshot_doc(3, as_of_sha=sha3, run_id='r3', params=changed))
+        new_identity = scene.scan(SnapshotCache.from_scan(same_identity))
+
+        assert scene.calls() == ['--summary', '--current']
+        assert list(new_identity.new_diffs) == [new_identity.points[2].diff.pair_key]
+        assert new_identity.points[2].diff.pair_key != first.points[2].diff.pair_key
+
+    def test_a_removed_file_drops_out(self, scene: Scene) -> None:
+        first = scene.scan()
+        (scene.home / f'{scene.shas[2]}.json').unlink()
+
+        second = scene.scan(SnapshotCache.from_scan(first))
+
+        assert [point.point_id for point in second.points] == [point.point_id for point in first.points[:2]]
+
+    def test_unplaceable_files_are_listed_with_their_reason(self, scene: Scene) -> None:
+        refused = scene.home / 'foreign.json'
+        refused.write_text('{"instrument": "other"}', encoding='utf-8')
+        unknown_sha = 'f' * 40
+        write_snapshot(scene.home / f'{unknown_sha}.json', snapshot_doc(3, as_of_sha=unknown_sha, run_id='r9'))
+
+        scan = scene.scan()
+
+        reasons = {reading.file.name: reading.reason for reading in scan.unplaced}
+        assert set(reasons) == {'foreign.json', f'{unknown_sha}.json'}
+        with pytest.raises(InstrumentRefused) as raised:
+            summarise(refused)
+        assert reasons['foreign.json'] == raised.value.stderr
+        assert unknown_sha in reasons[f'{unknown_sha}.json']
+        assert len(scan.points) == 3
+
+    def test_a_passed_deadline_computes_nothing(self, scene: Scene) -> None:
+        scan = scene.scan(deadline=time.monotonic() - 1)
+
+        assert (scan.points, scan.new_diffs, scan.pending_summaries) == ((), {}, 3)
+        assert scene.calls() == []
+
+    def test_a_byte_identical_copy_reuses_the_summary_and_the_pair_key(self, scene: Scene) -> None:
+        first = scene.scan()
+        scene.calls()
+        nightly = scene.home / f'{scene.shas[2]}.json'
+        copy = scene.root / BASELINE_HOME / nightly.name
+        copy.write_bytes(nightly.read_bytes())
+
+        second = scene.scan(SnapshotCache.from_scan(first))
+
+        assert scene.calls() == ['--current']
+        assert [(point.file, point.baseline) for point in second.points[2:]] == [(copy, True), (nightly, False)]
+        assert second.points[2].diff.pair_key == first.points[2].diff.pair_key
+        assert second.points[2].diff.state is DiffState.READY
+        assert list(second.new_diffs) == [second.points[3].diff.pair_key]
