@@ -4276,6 +4276,13 @@ that category. A reason discloses a difference; the diff is still computed.
 the 2026-08-11 T0 run, so at `scan_limit: 5000` its cluster counts are floors
 and it reports `scan_truncated`. Compare its deltas only between runs at the same limit.
 
+Each `child_rankings` row names its `category`. Its `previous_count` and
+`delta` are null unless the previous report counted children in that
+category, that is, unless its `categories` entry has `child_counts_known:
+true`. A category that failed or was absent last run is excluded, and so is
+one swept from a T0 legacy plan. A null means unknown, not zero. A row's
+category ties it to that category's `incomparable_reasons`.
+
 **Exit status.**
 
 - 0: every report was written, and every detector run succeeded.
