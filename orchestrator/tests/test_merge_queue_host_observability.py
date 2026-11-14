@@ -1152,10 +1152,12 @@ class TestOccupancyLeaseFidelity:
     """occupancy.leases / verifying_by_host: what each held lease is doing.
 
     by_host and inflight_by_host report LEASES, and a lease can outlive its
-    verify: a verdict kept on the persistent merge lane holds it until
-    finalize (any other verdict releases it, task 8526), a remote whose dispatch
-    returned runs its tail on THIS host, and a lease can sit on a host benched
-    since.  The heartbeat's 'verifying N/M' counts none of the three.
+    verify: a verdict reached at the front of _inflight (the head, or the next
+    entry behind a popped head still finalizing) or kept on the persistent
+    merge lane holds it until its own finalize (a verdict behind another entry
+    releases it, task 8526), a remote whose dispatch returned runs its tail on
+    THIS host, and a lease can sit on a host benched since.  The heartbeat's
+    'verifying N/M' counts none of the three.
     """
 
     async def test_finished_lease_is_not_reported_verifying(

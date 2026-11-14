@@ -1872,8 +1872,11 @@ class LeaseActivity(StrEnum):
     hang on an ssh connect) or after it returned (task 2822's cross-check, a
     task-6155 parked gate, which runs nothing remote since task 8525); the
     runner does not tell the two apart.
-    FINISHED is a held lease whose verify is done: a verdict kept on the
-    persistent merge lane until landing, or a hand-built entry.
+    FINISHED is a held lease whose verify, or parked gate re-verify, is done.
+    The entry keeps it through its own finalize when its verdict came at the
+    front of ``_inflight``: the head, or the next entry behind a popped head
+    still finalizing.  A verdict kept on the persistent merge lane holds it
+    until landing too, as does a hand-built entry.
     VERIFIED_PENDING_LANDING holds no lease: the verdict is in, the lease was
     released, and the entry awaits its in-order landing (task 8526).
     """
@@ -2002,7 +2005,9 @@ class InflightEntry:
                      when it vacates the entry (see :attr:`vacated`, task 4582);
                      VERIFIED_PENDING_LANDING by the verify when it releases the
                      lease at its verdict (task 8526).
-    verdict_host   : the host a released verdict came from, or ``None``.
+    verdict_host   : the host a released verdict came from, or ``None``;
+                     written with that status only by
+                     :meth:`release_lease_at_verdict`.
     chain          : the :class:`ChainResult` this dispatch's verify was
                      REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
                      ordinary adjacent-verify path.  Its READER is
@@ -2082,6 +2087,27 @@ class InflightEntry:
         """True once the verify dropped or requeued this entry's request and
         released its lease; only the head-of-line finalize remains."""
         return self.status in (InflightStatus.REQUEUED, InflightStatus.DROPPED)
+
+    @property
+    def verify_host(self) -> str | None:
+        """The host of this entry's verify: the held lease's, else the one it
+        released at its verdict (task 8526); ``None`` when it has neither."""
+        return self.lease.name if self.lease is not None else self.verdict_host
+
+    def release_lease_at_verdict(self) -> HostLease:
+        """Clear and return the held lease, leaving the entry
+        VERIFIED_PENDING_LANDING on :attr:`verdict_host` (task 8526).
+
+        The one writer of that status and that field, so neither is ever set
+        without the other.
+        """
+        lease = self.lease
+        if lease is None:
+            raise ValueError(f'{self.item.request.task_id}: no lease to release at the verdict')
+        self.lease = None
+        self.verdict_host = lease.name
+        self.status = InflightStatus.VERIFIED_PENDING_LANDING
+        return lease
 
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).

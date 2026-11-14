@@ -9163,7 +9163,7 @@ class SpeculativeMergeWorker:
         self, entry_slot: InflightEntrySlot, vr: InflightVerifyResult,
     ) -> None:
         """Free the host of the entry in *entry_slot* once *vr* is a verdict
-        and an earlier entry is still to land ahead of it.
+        and the entry sits behind the ``_inflight`` head.
 
         The entry keeps its ``_inflight`` place for its in-order landing, as
         VERIFIED_PENDING_LANDING.  The head keeps its lease to its finalize,
@@ -9178,18 +9178,18 @@ class SpeculativeMergeWorker:
         entry = entry_slot.entry
         if (
             vr.status is not None or entry is None or entry.lease is None
-            or self._host_allocator is None or not self._lands_behind_another(entry)
+            or self._host_allocator is None or not self._behind_inflight_head(entry)
             or (vr.merge_wt is not None and self._git_ops.is_persistent_merge_lane(vr.merge_wt))
         ):
             return
-        lease = entry.lease
-        entry.lease = None
-        entry.verdict_host = lease.name
-        entry.status = InflightStatus.VERIFIED_PENDING_LANDING
-        await self._host_allocator.release(lease)
+        await self._host_allocator.release(entry.release_lease_at_verdict())
 
-    def _lands_behind_another(self, entry: InflightEntry) -> bool:
-        """Whether an earlier ``_inflight`` entry is still to land ahead of *entry*."""
+    def _behind_inflight_head(self, entry: InflightEntry) -> bool:
+        """Whether *entry* sits behind the ``_inflight`` head.
+
+        A head popped for its finalize is not counted, so the entry then at
+        ``_inflight[0]`` keeps its host through its own finalize.
+        """
         return any(e is entry for e in itertools.islice(self._inflight, 1, None))
 
     # ── task 3204 sweep: two neighbouring candidates, deliberately REJECTED ──
@@ -12453,7 +12453,7 @@ class SpeculativeMergeWorker:
         found = [
             VerifyInFlight.for_request(
                 entry.item.request,
-                host=entry.lease.name if entry.lease is not None else None,
+                host=entry.verify_host,
                 kind=VerifyInFlightKind.for_phase(self._entry_phase(entry)),
                 started_ts=self._phase_started.get(
                     entry.item.request.request_id,
@@ -12556,15 +12556,14 @@ class SpeculativeMergeWorker:
 
     def _entry_row(self, entry: InflightEntry) -> LeaseRow | None:
         """*entry*'s held lease, or the host it released at its verdict (task 8526)."""
-        if entry.lease is not None:
-            return self._host_row(
-                entry, entry.lease.name, lease_activity(entry.lease, entry.pending_task),
-            )
-        if entry.status is InflightStatus.VERIFIED_PENDING_LANDING and entry.verdict_host:
-            return self._host_row(
-                entry, entry.verdict_host, LeaseActivity.VERIFIED_PENDING_LANDING,
-            )
-        return None
+        host = entry.verify_host
+        if host is None:
+            return None
+        activity = (
+            lease_activity(entry.lease, entry.pending_task) if entry.lease is not None
+            else LeaseActivity.VERIFIED_PENDING_LANDING
+        )
+        return self._host_row(entry, host, activity)
 
     def _host_row(self, entry: InflightEntry, host: str, activity: LeaseActivity) -> LeaseRow:
         return LeaseRow(
@@ -12730,7 +12729,7 @@ class SpeculativeMergeWorker:
                 worktree_path=infl.merge_wt,
                 position=position,
             )
-            e['host'] = infl.lease.name if infl.lease is not None else None
+            e['host'] = infl.verify_host
             e['verify_started_at'] = infl.started_at
             e['verify_age_secs'] = (
                 max(0.0, now - infl.started_at)
