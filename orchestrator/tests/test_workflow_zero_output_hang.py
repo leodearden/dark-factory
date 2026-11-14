@@ -828,7 +828,7 @@ class TestZeroOutputEvidenceCarriesServerErrorCause:
         assert wf.artifacts is not None
         result = _server_error_zero_output_result()
 
-        wf._capture_zero_output_evidence(result, 1)  # type: ignore[attr-defined]
+        wf._capture_zero_output_evidence(result, 1)
 
         data = json.loads(wf.artifacts.zero_output_evidence_path(1).read_text())
         assert data['api_error_status'] == 529
@@ -839,7 +839,7 @@ class TestZeroOutputEvidenceCarriesServerErrorCause:
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
 
-        wf._capture_zero_output_evidence(_zero_output_agent_result(), 1)  # type: ignore[attr-defined]
+        wf._capture_zero_output_evidence(_zero_output_agent_result(), 1)
 
         data = json.loads(wf.artifacts.zero_output_evidence_path(1).read_text())
         assert 'api_error_status' in data
@@ -849,8 +849,8 @@ class TestZeroOutputEvidenceCarriesServerErrorCause:
     async def test_server_error_requeue_writes_evidence_with_status(self, tmp_path: Path):
         wf = _make_workflow(tmp_path=tmp_path)
         _stub_iteration_helpers(wf, _server_error_zero_output_result())
-        wf.scheduler.set_task_status = AsyncMock()  # type: ignore[method-assign]
-        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+        wf.scheduler.set_task_status = AsyncMock()
+        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
 
         outcome = await wf._execute_iterations()
 
@@ -890,7 +890,9 @@ class TestHangDetailNamesTaskRootEvidence:
         outcome = await wf._execute_iterations()
 
         assert outcome == WorkflowOutcome.BLOCKED
-        assert glob in wf._zero_output_hang_info['detail']  # type: ignore[attr-defined]
+        info = wf._zero_output_hang_info
+        assert info is not None
+        assert glob in info['detail']
         assert Path(glob).parent == artifacts.task_root
         for n in (1, 2):
             evidence_path = artifacts.zero_output_evidence_path(n)
@@ -910,7 +912,9 @@ class TestHangDetailNamesTaskRootEvidence:
         outcome = await wf._execute_iterations()
 
         assert outcome == WorkflowOutcome.BLOCKED
-        detail = wf._zero_output_hang_info['detail']  # type: ignore[attr-defined]
+        info = wf._zero_output_hang_info
+        assert info is not None
+        detail = info['detail']
         assert glob in detail
         assert 'at_iteration_cap=True' in detail
         evidence_path = artifacts.zero_output_evidence_path(1)
