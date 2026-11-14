@@ -11329,12 +11329,13 @@ class SpeculativeMergeWorker:
         return ProbePlacement(depth=d, base=base)
 
     async def _deep_chain_placement(self, item: RealMergeItem) -> ChainResult | None:
-        """Decide whether THIS second-slot dispatch should verify a deep CHAIN
-        tip instead of the item's own adjacent merge commit (task 3185, PRD γ).
+        """Decide whether THIS dispatch should verify a deep CHAIN tip instead
+        of the item's own adjacent merge commit (task 3185, PRD γ; task 8527
+        extends it to a head alone in the verify frontier).
 
         The deep twin of :meth:`_probe_verify_placement`, and deliberately the
-        same shape: a slot-1 guard, a hoisted zero-cost kill-switch guard, then
-        the pure policy.  The one structural difference is what a firing
+        same shape: an eligibility guard, a hoisted zero-cost kill-switch guard,
+        then the pure policy.  The one structural difference is what a firing
         placement MEANS.  A :class:`ProbePlacement` only RELABELS the dispatch's
         depth/base attribution — the verify still exercises *item*'s own tree
         (its "KNOWN PHASE-1 LIMITATION").  A :class:`ChainResult` genuinely
@@ -11349,11 +11350,14 @@ class SpeculativeMergeWorker:
 
         The guards, in order, and why that order:
 
-          1. ``not item.speculative`` -> ``None``.  **Slot 1 is never chained.**
-             The head item is merged onto REAL main and is the pipeline's trust
-             anchor: its verdict is the one :meth:`_finalize_inflight` lands a
-             CAS advance on.  Chaining it would make that anchor a verdict about
-             a cumulative tree instead of about the item being landed.
+          1. not :func:`may_chain` -> ``None``
+             (``plans/merge-lane-policy-prd.md`` D5).  A speculative item may
+             chain.  A non-speculative item (the head, merged onto REAL main)
+             may chain only when no other entry is in the verify frontier:
+             anything landing ahead of a main-based item would leave its chain
+             stale.  The dispatching item has no entry yet, so the depth read
+             here is the same value :meth:`_launch_verify` passes to
+             :meth:`_run_inflight_verify` as ``depth``.
           2. ``cap = item.request.config.merge_deep.chain_cap; cap <= 0`` ->
              ``None``.  α's shipped kill switch, hoisted ABOVE the queue scan
              for the same reason :meth:`_probe_verify_placement` hoists its
@@ -11408,7 +11412,9 @@ class SpeculativeMergeWorker:
             caller must release it exactly once — see
             :meth:`_run_inflight_verify`'s chain arm), or ``None``.
         """
-        if not item.speculative:
+        if not may_chain(
+            speculative=item.speculative, frontier_depth=self._verify_frontier_depth(),
+        ):
             return None
         cap = item.request.config.merge_deep.chain_cap
         if cap <= 0:
@@ -19841,10 +19847,9 @@ class SpeculativeMergeWorker:
                 #     True, so those verifies are cancelled and their requests
                 #     manually requeued (NOT re-merged onto the stale tip) --
                 #     again correct, for the same base-is-gone reason.
-                # "Head path unaffected" DOES hold literally: the deep gate
-                # returns None for a non-speculative item, and the head
-                # finalizes ahead of the deep item in submission order, so slot
-                # 1 never reaches this branch on account of a chain.
+                # A chained head (alone in the frontier, PRD D5) reaches this
+                # branch on a red tip as a slot-2 tip does, and its successors,
+                # stacked on its dead chain tip, die in the cascade.
                 _n_failed_val = True
                 if vr.status == InflightStatus.DROPPED:
                     self._retire_item(req.request_id)
