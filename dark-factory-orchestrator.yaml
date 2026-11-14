@@ -1804,3 +1804,18 @@ merge_deep:
   chain_cap: 6
   # No warm spec pool here, so builds are git-only (8 builds, max 31 s).
   chain_build_timeout_secs: 300
+
+# TRIAL (Leo 2026-11-14, lock hand-off study): the automatic file reservation
+# is off. A threshold of 1000 or more means a task that keeps losing its files
+# never earns a reservation by being skipped. The pin reservation (operator and
+# starvation-watchdog pins, at most pin_reservation_max_active owners) is
+# unchanged. Polish stays at its default. Review and stop conditions: task
+# 10128. To end the trial delete this block; the code defaults then apply
+# (critical 0, high 1, medium 2, low 4). Green tier: applied with reload_config.
+fairness:
+  skip_threshold:
+    critical: 1000
+    high: 1000
+    medium: 1000
+    low: 1000
+    polish: 9999

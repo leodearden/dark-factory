@@ -2951,6 +2951,15 @@ class TestFairness:
         config.fairness.skip_threshold = 3
         return config
 
+    @pytest.fixture
+    def per_tier_config(self) -> OrchestratorConfig:
+        """OrchestratorConfig with per-tier thresholds; high parks on its first skip."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = {
+            'critical': 0, 'high': 1, 'medium': 2, 'low': 4, 'polish': 9999,
+        }
+        return config
+
     @staticmethod
     def _broad_task():
         return {
@@ -3104,15 +3113,13 @@ class TestFairness:
     # ---- skip-threshold / unconditional park tests ----
 
     @pytest.mark.asyncio
-    async def test_parks_install_unconditionally_without_v2_flag(self):
-        """Parks install after the per-tier threshold with default config.
+    async def test_parks_install_unconditionally_without_v2_flag(self, per_tier_config):
+        """Parks install after the per-tier threshold with no flag set.
 
-        Regression guard: no flag is needed.  Default high-tier threshold=1,
+        Regression guard: no flag is needed.  High-tier threshold=1,
         so one skip is enough.
         """
-        # Default config — no flag assignment needed.
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(per_tier_config)
         scheduler.finish_startup()
 
         # Seed compiler/src so A (high priority) is forced to skip.
@@ -3131,16 +3138,14 @@ class TestFairness:
         assert scheduler.lock_table.has_parks('A')
 
     @pytest.mark.asyncio
-    async def test_eager_park_full_module_set(self):
+    async def test_eager_park_full_module_set(self, per_tier_config):
         """Parks install on ALL of A's modules at once (eager, full coverage).
 
         Even modules not currently held by another task are covered — this
         prevents racing lower-priority tasks from grabbing a free module
         while A waits for a blocked one.
         """
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        # Per-tier defaults: high -> threshold=1.
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(per_tier_config)
         scheduler.finish_startup()
 
         # B holds compiler/src; C holds eval/src; tools/src is FREE.
@@ -3168,7 +3173,7 @@ class TestFairness:
         assert not scheduler.lock_table.try_acquire('D', ['tools/src'])
 
     @pytest.mark.asyncio
-    async def test_cross_tier_preemption(self):
+    async def test_cross_tier_preemption(self, per_tier_config):
         """A high-tier skip-bump SHADOWS (not destroys) an overlapping low-tier park.
 
         Setup: low-priority L is already parked on m1+m2 with skip_count=3.
@@ -3180,7 +3185,7 @@ class TestFairness:
         (L shadowed on m1).  ZERO reservation_evicted events — the old destructive
         eviction is no longer emitted on preemption.
         """
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config = per_tier_config
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         scheduler.finish_startup()
