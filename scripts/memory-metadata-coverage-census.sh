@@ -21,10 +21,11 @@
 # number nobody is accountable for. The census runs FIRST so the rehearsal is
 # read against a report generated moments before rather than last night's.
 #
-# Then a third, non-measuring step COMMITS what the census regenerated. It is
-# not part of the measure/rehearse pairing -- it is what keeps the trend from
-# evaporating; see the block above the commit itself for why that is a
-# data-loss question rather than a tidiness one.
+# Then a third, non-measuring step LANDS what the census regenerated on main
+# through the target's own merge queue, waiting for that landing to settle.
+# The census measures a detached generation worktree of main's tip, so the
+# machine-operated project_root checkout is never written; why, and how to
+# read each outcome, is OPERATIONS.md §12.
 #
 # THE REHEARSAL IS NEVER `--apply`. 3201 writes `canonical: true` in bulk. Under
 # the shipped `memory_metadata.enforce: false` default those writes are not even
@@ -45,7 +46,9 @@
 # routine outcome, not a fault. Propagating it would wedge the timer on the
 # first churny night and quietly end the trend -- while the artifacts, which
 # carry the evidence of the shortfall, were written anyway. Both exit codes are
-# narrated instead, so exiting 0 never means the failure is invisible.
+# narrated instead, so exiting 0 never means the failure is invisible. A stop
+# signal (a unit stop, TimeoutStartSec) ends the run with 143 or 130 once the
+# landing in flight has cancelled its request.
 #
 # The ONE exception is a refusal to START: when the shared uv resolver cannot
 # be loaded or uv cannot be resolved, the wrapper exits 127 (the code a bare
@@ -66,8 +69,8 @@
 # ordering without touching uv, live Qdrant or the live corpus) -- mirrors the
 # FLAG_MARKER_SWEEP_CMD / REIFY_CLOSURE_SWEEP_CMD seam convention. REPO is
 # similarly overridable so tests can point it at a tmp dir with no `.env` (a
-# no-op source). CENSUS_COMMIT=0 skips the artifact commit, for an ad-hoc
-# operator run that should leave the checkout alone.
+# no-op source). CENSUS_COMMIT=0 measures and rehearses but lands nothing;
+# CENSUS_LANDING_TIMEOUT_SECS bounds the wait for the landing.
 #
 # For a half whose *_CMD seam is unset, uv is resolved to an absolute path by
 # scripts/lib/resolve_uv.sh::require_uv_bin (that lib holds the ladder and the
@@ -83,7 +86,7 @@ set -uo pipefail
 # Every git call below is spelled `git -C "$REPO" <verb>`, which READS as "act
 # on $REPO" but is not: `-C` only changes directory, while GIT_DIR and its
 # siblings SKIP repository discovery outright. An ambient GIT_DIR therefore
-# redirects all five call sites -- `commit --only` and the scoped `add --`
+# redirects every call site -- the generation worktree's and the landing's
 # included -- into a repository this script was never told about, with both
 # $REPO and -C inert. Measured 2026-08-31: that is how a test run of
 # scripts/tests/test_install_memory_metadata_coverage_census_timer.py committed
@@ -208,109 +211,104 @@ if [ "$stamp_rc" -ne 0 ]; then
     echo "memory-metadata-coverage-census: retro-stamp rehearsal exited $stamp_rc" >&2
 fi
 
-# ── COMMIT WHAT THE CENSUS REGENERATED ──────────────────────────────────────
+# ── LAND WHAT THE CENSUS REGENERATED ────────────────────────────────────────
 #
-# The census rewrites three GIT-TRACKED files under $REPO/plans/ (it resolves
-# them from its own __file__, so they land in $REPO no matter the cwd), and
-# $REPO defaults to the project_root checkout that CLAUDE.md flags as
-# MACHINE-OPERATED: the merge worker, the startup reconciler and git hooks all
-# act on it directly. Leaving the artifacts dirty every morning is therefore
-# not untidiness but a silent data-loss path --
-# plans/memory-metadata-coverage-history.json is APPEND-ONLY and IS the trend
-# this job exists to produce, so an uncommitted append that the merge worker's
-# advance path resets away takes that night's row with it, permanently and
-# with no error anywhere. Committing is what makes the trend durable.
-#
-# SCOPED, per CLAUDE.md's rule for this checkout: `git commit --only <paths>`
-# and never a bare `git commit` (which would sweep a concurrent process's
-# staged work into the census's nightly commit), never `git add -A`, and never
-# `git stash` (refs/stash is ONE ref shared by every worktree and the merge
-# worker's advance path also consumes it -- incident 13674d3c68).
-#
-# Same untracked-path fallback as scripts/legibility/unlanded.py::commit_only,
-# the one scoped committer both legibility jobs use (the 03:00 census commits
-# docs/legibility/census-state.json through it): a path git has never tracked
-# makes `--only` fail with "did not match any file", so the commit is retried
-# once after a scoped `git add -- <paths>`. Unlike commit_only, this wrapper
-# does not retry an index.lock contention.
-#
-# BEST-EFFORT, LIKE BOTH OTHER HALVES: the outcome is narrated and never
-# propagated (see the always-exit-0 oneshot rationale in the header), and it
-# runs even when the census exited non-zero -- a `coverage.complete: false`
-# night still WROTE artifacts carrying the evidence of the shortfall, and that
-# evidence is exactly what needs to reach the repo.
-#
-# CENSUS_COMMIT=0 skips the step entirely, for an operator running the gauge
-# ad-hoc who does not want a commit (pairs with the census's own --no-history).
+# Through scripts/_merge_queue_landing.py::land_files: one commit of the
+# changed artifacts, read from the generation worktree, on a unique deploy
+# branch, through one normal-lane request on $REPO's own merge queue, waited
+# for and confirmed by git. `commit_step` names the outcome in ONE stable
+# token on the done(...) line (the vocabulary is OPERATIONS.md §12's); the
+# heredoc prints it as its last stdout line. `commit_rc` says whether the
+# landing step failed.
+SCRIPT_DIR=$(cd "$_self_dir" && pwd)
+PY="$SCRIPT_DIR/../.venv/bin/python3"
+[ -x "$PY" ] || PY=python3
+
+land_artifacts() {
+    "$PY" - "$@" <<'LAND_PY'
+import os
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+script_dir, repo, base, census_root, label, message, *changed = sys.argv[1:]
+sys.path.insert(0, script_dir)
+
+
+def verdict(token, narration, *, rc):
+    print(f"memory-metadata-coverage-census: {narration}", file=sys.stderr, flush=True)
+    print(token, flush=True)
+    sys.exit(rc)
+
+
+try:
+    from _merge_queue_landing import LandingNotConfirmed, land_files
+    from dashboard.config import discover_root_escalation_url
+except ImportError as exc:
+    from _config_reload_gate import transport_not_importable_remedy
+    verdict("failed:transport_not_importable", transport_not_importable_remedy(exc), rc=1)
+
+url = discover_root_escalation_url(Path(repo))
+try:
+    port = urlsplit(url).port if url else None
+except ValueError:
+    port = None
+if port is None:
+    verdict("refused:no-escalation-port",
+            f"{repo}'s orchestrator config names no escalation port ({url}), so there is no "
+            f"merge queue to land through", rc=1)
+
+files = {rel: (Path(census_root) / rel).read_bytes() for rel in changed}
+try:
+    landing = land_files(
+        repo, files, base, port=str(port), label=label, message=message,
+        timeout_secs=os.environ.get("CENSUS_LANDING_TIMEOUT_SECS") or None,
+    )
+except LandingNotConfirmed as exc:
+    verdict(f"failed:{exc.failure.value}", exc.detail, rc=1)
+verdict(f"landed:{landing.request_id or landing.branch}",
+        f"landed {landing.branch} request_id={landing.request_id} as {landing.landed_as}", rc=0)
+LAND_PY
+}
+
 commit_rc=0
-# `commit_step` names, in ONE stable machine-readable token, which of the
-# branches below actually ran -- appended to the `done (...)` line so an
-# operator (or a test) can tell "declined" from "committed" without parsing
-# prose. See the exit-0 comment at the bottom of this block for why the
-# token exists instead of a non-zero exit.
 if [ "${CENSUS_COMMIT:-1}" != "1" ]; then
     commit_step="skipped:disabled"
-    echo "memory-metadata-coverage-census: CENSUS_COMMIT=0 — leaving the" \
-         "regenerated artifacts uncommitted"
+    echo "memory-metadata-coverage-census: CENSUS_COMMIT=0 — measured and" \
+         "rehearsed; landing nothing"
 elif [ -n "$land_refusal" ]; then
     commit_step="$land_refusal"
     case "$land_refusal" in skipped:*) ;; *) commit_rc=1 ;; esac
     echo "memory-metadata-coverage-census: not landing the artifacts ($land_refusal)" >&2
-elif [ -z "$(git -C "$census_root" status --porcelain -- "${ARTIFACTS[@]}" 2>/dev/null)" ]; then
-    # The ordinary quiet-night outcome. Checked BEFORE committing so that
-    # "nothing to commit" -- which git reports with a NON-ZERO code -- is never
-    # narrated as a failure.
-    commit_step="skipped:no-drift"
-    echo "memory-metadata-coverage-census: artifacts unchanged — nothing to commit"
 else
-    # Interim (task 7154): carries the generation worktree's artifacts into
-    # $REPO for the direct commit below, until the merge-queue landing
-    # replaces both.
+    changed=()
     for rel in "${ARTIFACTS[@]}"; do
-        cp -- "$census_root/$rel" "$REPO/$rel"
+        [ -n "$(git -C "$census_root" status --porcelain --untracked-files=all -- "$rel")" ] &&
+            changed+=("$rel")
     done
-    commit_msg="chore(census): nightly canonical/topic coverage census $(date -u +%Y-%m-%d)"
-    commit_out=$(git -C "$REPO" commit --only "${ARTIFACTS[@]}" \
-        -m "$commit_msg" 2>&1)
-    commit_rc=$?
-    # NEVER `printf '%s' "$commit_out" | grep -qi ...` here. `grep -q` exits
-    # the instant it matches, and the match is on line 1 of git's own error
-    # message; the `printf` writer can then die of SIGPIPE, `set -o pipefail`
-    # (line 68) promotes the pipeline's status to 141, and a TRUE predicate
-    # reads FALSE — silently skipping the retry below on the very first night
-    # this path is ever committed. Measured: 0.6% (25/4000) at git's natural
-    # ~270-byte message under fleet load, 100% once the message passes the
-    # ~64KB pipe buffer. `${commit_out,,}` is a pure parameter expansion: it
-    # forks nothing, so the predicate is a function of the message, not of how
-    # much of it a subprocess got to read before another one hung up on it.
-    # scripts/setup-host.sh::_parity_verdict already reached this same
-    # conclusion at a sibling site; this adopts its settled remedy.
-    if [ "$commit_rc" -ne 0 ] && \
-       [[ "${commit_out,,}" == *'did not match any file'* ]]; then
-        # First-ever run for a path git has never tracked — stage just those
-        # paths and retry once.
-        git -C "$REPO" add -- "${ARTIFACTS[@]}" >/dev/null 2>&1
-        commit_out=$(git -C "$REPO" commit --only "${ARTIFACTS[@]}" \
-            -m "$commit_msg" 2>&1)
-        commit_rc=$?
-    fi
-    if [ "$commit_rc" -ne 0 ]; then
-        commit_step="failed"
-        echo "memory-metadata-coverage-census: artifact commit exited" \
-             "$commit_rc — the regenerated files are still on disk, but" \
-             "UNCOMMITTED in a machine-operated checkout: $commit_out" >&2
+    if [ "${#changed[@]}" -eq 0 ]; then
+        commit_step="skipped:no-drift"
+        echo "memory-metadata-coverage-census: artifacts unchanged — nothing to land"
     else
-        commit_step="committed"
-        echo "memory-metadata-coverage-census: committed the regenerated artifacts"
+        verdict_file="$gen_scratch/landing-verdict"
+        land_artifacts "$SCRIPT_DIR" "$REPO" "$BASE" "$census_root" memory-metadata-census \
+            "chore(census): nightly canonical/topic coverage census $(date -u +%Y-%m-%d)" \
+            "${changed[@]}" > "$verdict_file"
+        commit_rc=$?
+        mapfile -t verdict_lines < "$verdict_file"
+        commit_step="failed:no-verdict"
+        [ "${#verdict_lines[@]}" -gt 0 ] && [ -n "${verdict_lines[-1]}" ] &&
+            commit_step="${verdict_lines[-1]}"
+        [ "$commit_step" = "failed:no-verdict" ] && commit_rc=1
     fi
 fi
 
 # `commit-step=` is appended AFTER `commit=$commit_rc` so every existing
 # `'commit=0' in ...` / `'commit=1' in ...` substring check keeps matching.
-# `commit_rc` keeps its own meaning ("did the commit step fail?"); the token
-# is orthogonal ("which branch ran?") -- four of the six tokens narrate
-# commit=0, which is exactly what made "declined" and "committed" ambiguous
-# in the journal before this field existed.
+# `commit_rc` keeps its own meaning ("did the landing step fail?"); the token
+# is orthogonal ("which branch ran?"): several tokens narrate commit=0, which
+# is exactly what made "declined" and "landed" ambiguous in the journal before
+# this field existed.
 echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc commit=$commit_rc commit-step=$commit_step)"
 # Always 0 once the halves have run (the pre-flight 127 is the header's one
 # exception) — a recurring systemd oneshot that exits non-zero enters `failed`
@@ -320,5 +318,5 @@ echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc c
 # costs -- the next run's append restores it. The loud-over-silent-
 # degradation norm this invokes is satisfied by LEGIBILITY, not by a wedged
 # timer: commit-step= above names exactly which branch declined and why, so
-# `commit=0` can no longer read as "committed" when it was not.
+# `commit=0` can no longer read as "landed" when it was not.
 exit 0
