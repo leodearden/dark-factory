@@ -35,7 +35,14 @@ from typing import Any
 
 import pytest
 from _git_checkouts import main_checkout_with_lane
+from _markup_corpus import corpus_specimen, load_corpus
 from _markup_helpers import LT, closer, type_alternatives
+from _markup_sink_rig import (
+    QUEUE_LOSS_SHAPES,
+    LossRecorder,
+    RecordingQueue,
+    seed_plan,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from fastmcp import Client
@@ -51,43 +58,6 @@ from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, verdict_tools
 from orchestrator.mcp.verdict_tools import _SINGLETON_ROLE_TOOLS, create_server
-
-# ---------------------------------------------------------------------------
-# The committed corpus.
-# ---------------------------------------------------------------------------
-#
-# Read with a small module-local loader rather than by importing
-# ``shared/tests/toolcall_markup_corpus_extract``: the orchestrator package
-# cannot import another package's test tree. The format is one JSON object per
-# line, which is the whole of what that helper does for a reader.
-
-CORPUS_PATH = (
-    Path(__file__).resolve().parents[2]
-    / 'shared'
-    / 'tests'
-    / 'fixtures'
-    / 'toolcall_markup_corpus.jsonl'
-)
-
-
-def load_corpus() -> list[dict[str, Any]]:
-    records = []
-    with CORPUS_PATH.open(encoding='utf-8') as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    assert records, f'the committed corpus at {CORPUS_PATH} is empty'
-    return records
-
-
-def specimen(tool_use_id: str) -> dict[str, Any]:
-    """The committed corpus record with this ``tool_use_id``."""
-    for record in load_corpus():
-        if record.get('tool_use_id') == tool_use_id:
-            return record
-    raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
-
 
 #: Recovers the REQUIRED list-typed ``issues`` — PRD boundary row B14's shape.
 #: The parameter is absent from the wire entirely, so the call works only
@@ -180,25 +150,6 @@ def rooted_at(root: Path | None) -> Callable[[Path], Path | None]:
 # ---------------------------------------------------------------------------
 
 
-def seed_plan(artifacts: TaskArtifacts) -> None:
-    """Write the plan a verdict is ABOUT — which is what attribution reads.
-
-    ``verdict_tools._markup_subject_task_id`` reads ``plan.json``'s own
-    ``task_id``, NOT ``metadata.json``'s, and in the fleet there always is one
-    by the time a verdict is submitted: the verdict is about that plan's diff.
-    The ``artifacts`` fixture writes only metadata (``TaskArtifacts.init``), so
-    a row that wants the real attribution answer rather than
-    ``markup_sink.resolve_subject``'s worktree-name fallback seeds it here.
-    """
-    artifacts.write_plan({
-        'task_id': 'test-1',
-        'title': 'Test task',
-        'analysis': 'A test',
-        'prerequisites': [],
-        'steps': [],
-    })
-
-
 async def repaired_call(
     artifacts: TaskArtifacts,
     *,
@@ -212,7 +163,7 @@ async def repaired_call(
     recovery rows below, and the durable-journal rows, which want the one
     outcome that never touches the escalation channel (task 4917).
     """
-    record = specimen(ISSUES_SPECIMEN)
+    record = corpus_specimen(ISSUES_SPECIMEN)
     assert record['expected_outcome'] == 'repaired'
     assert record['expected_recovered'] == ['issues']
     # `issues` is ABSENT from the wire — the caller supplied only these
@@ -482,7 +433,7 @@ UNREPAIRABLE_SPECIMEN = 'toolu_012YjuXbKZAMwNAo9WR4Pvjx'
 
 def unrepairable_value() -> str:
     """The ``UNREPAIRABLE_SPECIMEN`` payload, its outcome asserted rather than assumed."""
-    record = specimen(UNREPAIRABLE_SPECIMEN)
+    record = corpus_specimen(UNREPAIRABLE_SPECIMEN)
     assert record['expected_outcome'] == 'unrepairable'
     assert record['expected_recovered'] == []
     return record['value']
@@ -696,7 +647,7 @@ class TestUnrepairableResidueIsPreserved:
         catch that disagreement. What happens when the queue cannot be reached
         at all is the business of the (f, floor) row above.
         """
-        seed_plan(artifacts)
+        seed_plan(artifacts, 'test-1')
 
         await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
@@ -1119,63 +1070,23 @@ class TestTheWidenedRepairVocabularyStaysContained:
 # ---------------------------------------------------------------------------
 
 
-class _RefusingQueue:
-    """A queue that opens, but whose ``submit`` fails as a full disk would."""
-
-    def make_id(self, anchor: str) -> str:
-        return f'esc-{anchor}-1'
-
-    def submit(self, esc: Any) -> str:
-        raise OSError('No space left on device')
-
-
-class _LossRecorder:
-    """The loss sink every direct sink build here needs: it keeps what it was handed.
-
-    The loss contract itself is ``test_markup_sink_losses.py``'s.
-    """
-
-    def __init__(self) -> None:
-        self.records: list[dict[str, Any]] = []
-
-    async def __call__(self, record: dict[str, Any]) -> None:
-        self.records.append(record)
-
-
-class _RecordingQueue:
-    """A queue that takes every record and keeps it for the row to read."""
-
-    def __init__(self) -> None:
-        self.submitted: list[Any] = []
-
-    def make_id(self, anchor: str) -> str:
-        return f'esc-{anchor}-1'
-
-    def get_by_task(self, anchor: str, status: str = '') -> list[Any]:
-        return []
-
-    def submit(self, esc: Any) -> str:
-        self.submitted.append(esc)
-        return esc.id
-
-
 #: A record kind today's middleware does not emit. There is, by construction,
 #: no way to make today's middleware emit tomorrow's record, so rows using it
 #: drive the sink directly.
 UNKNOWN_KIND = 'mcp_markup_some_future_kind'
 
 
-async def file_an_unknown_kind(root: Path) -> _RecordingQueue:
+async def file_an_unknown_kind(root: Path) -> RecordingQueue:
     """Send one ``UNKNOWN_KIND`` record straight at a verdict-tools sink and
     return the queue it filed into."""
-    queue = _RecordingQueue()
+    queue = RecordingQueue()
     sink = markup_sink.make_escalation_sink(
         worktree=root,
         spec=verdict_tools.MARKUP_SINK_SPEC,
         subject_task_id=lambda: '6083',
         resolve_root=lambda worktree: root,
         open_channel=lambda project_root: (Escalation, queue),
-        loss_sink=_LossRecorder(),
+        loss_sink=LossRecorder(),
     )
     await sink({
         'error_type': UNKNOWN_KIND,
@@ -1270,7 +1181,7 @@ class TestVerdictToolsResidueChannelIsShared:
         """The channel is the queue."""
         from orchestrator.mcp import markup_sink, verdict_tools
 
-        queue = _RecordingQueue()
+        queue = RecordingQueue()
         submitted = queue.submitted
 
         from escalation.models import Escalation
@@ -1281,7 +1192,7 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: tmp_path,
             open_channel=lambda root: (Escalation, queue),
-            loss_sink=_LossRecorder(),
+            loss_sink=LossRecorder(),
         )
         record = {
             'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
@@ -1344,38 +1255,25 @@ class TestVerdictToolsResidueChannelIsShared:
         assert 'THE ONLY SURVIVING COPY' in filed.detail
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ('resolve_root', 'open_channel'),
-        [
-            pytest.param(
-                lambda worktree: None, lambda root: None, id='root-unresolved',
-            ),
-            pytest.param(
-                lambda worktree: worktree, lambda root: None, id='queue-unopened',
-            ),
-            pytest.param(
-                lambda worktree: worktree,
-                lambda root: (Escalation, _RefusingQueue()),
-                id='submit-raised',
-            ),
-        ],
-    )
+    @pytest.mark.parametrize(('resolve_root', 'open_channel', 'cause'), QUEUE_LOSS_SHAPES)
     async def test_a_payload_the_queue_cannot_take_is_reported_lost_once(
-        self, tmp_path, caplog, resolve_root, open_channel,
+        self, tmp_path, caplog, resolve_root, open_channel, cause,
     ):
         """Queue or nothing, and the nothing is LOUD.
 
         Exactly one ERROR line per lost payload whichever step failed, so a
         loss is countable, and it names the leak and the size of what was lost.
+        The loss record's own contract is ``test_markup_sink_losses.py``'s.
         """
         raw = 'THE ONLY SURVIVING COPY'
+        losses = LossRecorder()
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
             spec=verdict_tools.MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
             resolve_root=resolve_root,
             open_channel=open_channel,
-            loss_sink=_LossRecorder(),
+            loss_sink=losses,
         )
 
         with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
@@ -1395,6 +1293,7 @@ class TestVerdictToolsResidueChannelIsShared:
         assert len(errors) == 1, errors
         assert 'submit_review_verdict.issues' in errors[0]
         assert str(len(raw)) in errors[0]
+        assert [loss['cause'] for loss in losses.records] == [cause.value]
 
     @pytest.mark.asyncio
     async def test_a_lost_burst_alarm_is_reported_in_its_own_terms(
@@ -1408,7 +1307,7 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: None,
             open_channel=lambda root: None,
-            loss_sink=_LossRecorder(),
+            loss_sink=LossRecorder(),
         )
 
         with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
@@ -1446,7 +1345,7 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: None,
             open_channel=lambda root: None,
-            loss_sink=_LossRecorder(),
+            loss_sink=LossRecorder(),
         )
         assert await sink({'error_type': 'mcp_markup_unrepairable'}) is None
 
@@ -1482,7 +1381,7 @@ class TestTheVerdictFactReachesADurableJournal:
         self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(a) THE user-observable signal, on the measured leak shape."""
-        seed_plan(artifacts)
+        seed_plan(artifacts, 'test-1')
 
         await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
@@ -1529,7 +1428,7 @@ class TestTheVerdictFactReachesADurableJournal:
         / window_seconds / outcome / project, and ``project`` is structurally
         None on this boundary. WHICH caller leaked is a per-event fact.
         """
-        seed_plan(artifacts)
+        seed_plan(artifacts, 'test-1')
 
         for _ in range(3):
             await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
@@ -1579,7 +1478,7 @@ class TestCreateServerTakesAProjectRootResolver:
         """The unrepairable outcome is the one where both channels fire, so it
         is where a residue record and its journal line must meet."""
         main_checkout = tmp_path / 'main'
-        seed_plan(artifacts)
+        seed_plan(artifacts, 'test-1')
 
         payload = await refused_call(
             artifacts, resolve_project_root=rooted_at(main_checkout),
@@ -1608,8 +1507,8 @@ class TestCreateServerTakesAProjectRootResolver:
             artifacts, REVIEWER_ROLE, resolve_project_root=recording_resolver,
         )
         assert asked == []
-        seed_plan(artifacts)
-        record = specimen(ISSUES_SPECIMEN)
+        seed_plan(artifacts, 'test-1')
+        record = corpus_specimen(ISSUES_SPECIMEN)
 
         async with Client(server) as client:
             await client.call_tool('submit_review_verdict', {
@@ -1632,7 +1531,7 @@ class TestCreateServerTakesAProjectRootResolver:
         checkout, lane = main_checkout_with_lane(tmp_path)
         lane_artifacts = TaskArtifacts(lane)
         lane_artifacts.init('test-1', 'Test task', 'A test')
-        seed_plan(lane_artifacts)
+        seed_plan(lane_artifacts, 'test-1')
 
         await repaired_call(lane_artifacts)
 
@@ -1698,7 +1597,7 @@ class TestTheStormRecordNamesTheJournal:
         merely better-worded. So this one FOLLOWS it: pull the path the record
         names out of its own body, open that exact file, and read the line.
         """
-        seed_plan(artifacts)
+        seed_plan(artifacts, 'test-1')
 
         await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 

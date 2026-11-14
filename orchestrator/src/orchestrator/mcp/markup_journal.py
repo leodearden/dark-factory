@@ -34,9 +34,11 @@ bounded write. This journal answers "who leaked, from which tool, into which
 parameter, when" — the question the storm record asks a human to answer and
 gives them no way to.
 
-The file also receives the escalation sink's loss records (fact
-``markup_record_lost``, outcome ``lost``, task 7128): one line for each record
-the queue could not take, naming why and the payload's size. They are
+The file also receives the escalation sink's loss records (task 7128), whose
+fact and outcome are
+``orchestrator/src/orchestrator/mcp/markup_sink.py::MARKUP_RECORD_LOST_FACT``
+and ``::MARKUP_RECORD_LOST_OUTCOME``: one line for each record the queue could
+not take, naming why and the payload's size. They are
 payload-free like every other line, so the rule above is unchanged.
 
 Shape inherited from ``markup_sink.make_escalation_sink``: never raises, does

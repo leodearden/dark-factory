@@ -63,8 +63,13 @@ MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 _LOSS_LOG_FORMAT = 'markup guard: %s, so %s (subject %r)'
 
 
-class LossCause(enum.StrEnum):
-    """Why a record the queue could not take was lost."""
+class LossCause(enum.Enum):
+    """Why a record the queue could not take was lost.
+
+    Deliberately not a ``str``: the sink's body answers a queued id OR one of
+    these, and only a non-``str`` cause keeps that union discriminated for the
+    type checker. Its ``value`` is what the loss record carries.
+    """
 
     ROOT_UNRESOLVED = 'project_root_unresolved'
     QUEUE_UNOPENED = 'queue_unopened'
@@ -701,10 +706,16 @@ def _loss_account(record: dict[str, Any]) -> str:
     return (
         f'the {record.get("error_type")!r} record for '
         f'{record.get("tool")}.{record.get("field")} '
-        f'({len(record.get("raw_value") or "")}-char raw value) was preserved '
+        f'({_raw_value_chars(record) or 0}-char raw value) was preserved '
         'NOWHERE; the caller is told nothing was preserved and to resend from '
         'its own copy'
     )
+
+
+def _raw_value_chars(record: Mapping[str, Any]) -> int | None:
+    """The size of *record*'s payload, or ``None`` for a record that carries none."""
+    raw_value = record.get('raw_value')
+    return len(raw_value) if isinstance(raw_value, str) else None
 
 
 def _loss_fact(record: Mapping[str, Any], cause: LossCause) -> dict[str, Any]:
@@ -713,7 +724,6 @@ def _loss_fact(record: Mapping[str, Any], cause: LossCause) -> dict[str, Any]:
     ``param`` is the journal's floor-key name for the record's ``field``, so a
     line cut to its floor still names the tool and the parameter.
     """
-    raw_value = record.get('raw_value')
     return {
         'fact': MARKUP_RECORD_LOST_FACT,
         'outcome': MARKUP_RECORD_LOST_OUTCOME,
@@ -721,7 +731,7 @@ def _loss_fact(record: Mapping[str, Any], cause: LossCause) -> dict[str, Any]:
         'error_type': record.get('error_type'),
         'tool': record.get('tool'),
         'param': record.get('field'),
-        'raw_value_chars': len(raw_value) if isinstance(raw_value, str) else None,
+        'raw_value_chars': _raw_value_chars(record),
     }
 
 
@@ -806,9 +816,12 @@ def make_escalation_sink(
     project_root: Path | None = None
     channel: tuple[Any, Any] | None = None
 
-    def report_lost(record: dict[str, Any], cause: LossCause) -> LossCause:
+    def report_lost(
+        record: dict[str, Any], cause: LossCause, *, exc_info: bool | None = None,
+    ) -> LossCause:
         logger.error(
             _LOSS_LOG_FORMAT, _LOSS_PROSE[cause], _loss_account(record), _subject(),
+            exc_info=exc_info,
         )
         return cause
 
@@ -861,35 +874,27 @@ def make_escalation_sink(
                 escalation_cls, queue, worktree, subject, record, spec,
             )
         except Exception:
-            logger.error(
-                _LOSS_LOG_FORMAT, _LOSS_PROSE[LossCause.SUBMIT_FAILED],
-                _loss_account(record), subject, exc_info=True,
-            )
-            return LossCause.SUBMIT_FAILED
+            return report_lost(record, LossCause.SUBMIT_FAILED, exc_info=True)
 
     def _subject() -> str:
         return resolve_subject(subject_task_id, worktree, what='record')
 
     async def sink(record: dict[str, Any]) -> str | None:
         try:
-            filed = await asyncio.to_thread(file_record, record)
+            result = await asyncio.to_thread(file_record, record)
         except Exception:
             # ``file_record`` already contains every filing failure; this is the
             # floor under the thread hop itself, so the never-raises contract
             # holds for the whole emitter and not merely for its body.
-            logger.exception(
-                'markup guard: could not run the escalation sink for %r; the '
-                'refusal stands', record.get('error_type'),
-            )
-            filed = LossCause.SINK_FAILED
-        if not isinstance(filed, LossCause):
-            return filed
+            result = report_lost(record, LossCause.SINK_FAILED, exc_info=True)
+        if not isinstance(result, LossCause):
+            return result
         try:
-            await loss_sink(_loss_fact(record, filed))
+            await loss_sink(_loss_fact(record, result))
         except Exception:
             logger.warning(
                 'markup guard: the loss of the %r record (%s) could not be '
-                'handed to the loss sink', record.get('error_type'), filed.value,
+                'handed to the loss sink', record.get('error_type'), result.value,
                 exc_info=True,
             )
         return None

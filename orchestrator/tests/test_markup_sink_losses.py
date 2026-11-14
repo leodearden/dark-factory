@@ -25,11 +25,17 @@ from typing import Any
 
 import pytest
 from _git_checkouts import git
+from _markup_corpus import corpus_specimen
+from _markup_sink_rig import QUEUE_LOSS_SHAPES, RecordingQueue, seed_plan
 from _plan_markup_fixtures import isolate_the_refusal_memo  # noqa: F401 — re-export
 from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import FACT_MARKUP_DETECTED, OUTCOMES
+from shared.mcp_markup_middleware import (
+    FACT_MARKUP_DETECTED,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    OUTCOMES,
+)
 from shared.project_layout import escalation_queue_dir
 
 from orchestrator.artifacts import TaskArtifacts
@@ -45,11 +51,6 @@ from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT
 SUBJECT = '7128'
 RAW = 'THE ONLY SURVIVING COPY'
 REVIEWER_ROLE = 'test_analyst'
-
-CORPUS_PATH = (
-    Path(__file__).resolve().parents[2]
-    / 'shared' / 'tests' / 'fixtures' / 'toolcall_markup_corpus.jsonl'
-)
 
 #: A real ``submit_review_verdict`` payload the guard refuses, driven as ``summary``.
 VERDICT_SPECIMEN = 'toolu_012YjuXbKZAMwNAo9WR4Pvjx'
@@ -68,14 +69,9 @@ def _clear_pending_stamps():
 
 def unrepairable_value(tool_use_id: str) -> str:
     """The committed corpus payload for *tool_use_id*, its outcome asserted."""
-    for line in CORPUS_PATH.read_text(encoding='utf-8').splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        if record.get('tool_use_id') == tool_use_id:
-            assert record['expected_outcome'] == 'unrepairable'
-            return record['value']
-    raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
+    record = corpus_specimen(tool_use_id)
+    assert record['expected_outcome'] == 'unrepairable'
+    return record['value']
 
 
 def journal_lines(root: Path, server_label: str) -> list[dict[str, Any]]:
@@ -107,54 +103,16 @@ def block_the_queue(root: Path) -> None:
     queue_dir.write_text('not a directory\n', encoding='utf-8')
 
 
-def seed_plan(artifacts: TaskArtifacts) -> None:
-    """The plan both servers read their subject off."""
-    artifacts.write_plan({
-        'task_id': SUBJECT,
-        'title': 'Test task',
-        'analysis': 'A test',
-        'prerequisites': [],
-        'steps': [],
-    })
-
-
 def task_artifacts(worktree: Path) -> TaskArtifacts:
     artifacts = TaskArtifacts(worktree)
     artifacts.init(SUBJECT, 'Test task', 'A test')
-    seed_plan(artifacts)
+    seed_plan(artifacts, SUBJECT)
     return artifacts
 
 
 # ---------------------------------------------------------------------------
 # The sink's own contract, driven directly.
 # ---------------------------------------------------------------------------
-
-
-class _RefusingQueue:
-    """A queue that opens, but whose ``submit`` fails as a full disk would."""
-
-    def make_id(self, anchor: str) -> str:
-        return f'esc-{anchor}-1'
-
-    def submit(self, esc: Any) -> str:
-        raise OSError('No space left on device')
-
-
-class _RecordingQueue:
-    """A queue that takes every record."""
-
-    def __init__(self) -> None:
-        self.submitted: list[Any] = []
-
-    def make_id(self, anchor: str) -> str:
-        return f'esc-{anchor}-1'
-
-    def get_by_task(self, anchor: str, status: str = '') -> list[Any]:
-        return []
-
-    def submit(self, esc: Any) -> str:
-        self.submitted.append(esc)
-        return esc.id
 
 
 def verdict_journal(root: Path):
@@ -183,9 +141,11 @@ def sink_over(
     )
 
 
-def residue_record() -> dict[str, Any]:
+def residue_record(
+    error_type: str = markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+) -> dict[str, Any]:
     return {
-        'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+        'error_type': error_type,
         'tool': 'submit_review_verdict',
         'field': 'issues',
         'raw_value': RAW,
@@ -204,41 +164,32 @@ def storm_record() -> dict[str, Any]:
     }
 
 
+#: Both residue kinds: a refusal's, and FORWARD_REPAIR's dropped slice.
+RESIDUE_KINDS = [
+    pytest.param(markup_sink.MARKUP_RESIDUE_ERROR_TYPE, id='refused'),
+    pytest.param(MARKUP_UNRECOVERED_PARAM_ERROR_TYPE, id='dropped-slice'),
+]
+
+
 class TestEveryLostRecordIsJournalled:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ('resolve_root', 'open_channel', 'cause'),
-        [
-            pytest.param(
-                lambda worktree: None, lambda root: None,
-                'project_root_unresolved', id='root-unresolved',
-            ),
-            pytest.param(
-                lambda worktree: worktree, lambda root: None,
-                'queue_unopened', id='queue-unopened',
-            ),
-            pytest.param(
-                lambda worktree: worktree,
-                lambda root: (Escalation, _RefusingQueue()),
-                'submit_failed', id='submit-raised',
-            ),
-        ],
-    )
+    @pytest.mark.parametrize('error_type', RESIDUE_KINDS)
+    @pytest.mark.parametrize(('resolve_root', 'open_channel', 'cause'), QUEUE_LOSS_SHAPES)
     async def test_a_residue_the_queue_cannot_take_leaves_one_loss_line(
-        self, tmp_path, resolve_root, open_channel, cause,
+        self, tmp_path, resolve_root, open_channel, cause, error_type,
     ):
         sink = sink_over(tmp_path, resolve_root=resolve_root, open_channel=open_channel)
 
-        assert await sink(residue_record()) is None
+        assert await sink(residue_record(error_type)) is None
 
         (line,) = journal_lines(tmp_path, 'verdict-tools')
         assert line['fact'] == markup_sink.MARKUP_RECORD_LOST_FACT
         assert line['outcome'] == markup_sink.MARKUP_RECORD_LOST_OUTCOME
-        assert line['cause'] == markup_sink.LossCause(cause)
+        assert line['cause'] == cause.value
         assert {key: line[key] for key in (
             'error_type', 'tool', 'param', 'raw_value_chars', 'subject_task_id', 'server',
         )} == {
-            'error_type': 'mcp_markup_unrepairable',
+            'error_type': error_type,
             'tool': 'submit_review_verdict',
             'param': 'issues',
             'raw_value_chars': len(RAW),
@@ -268,20 +219,32 @@ class TestEveryLostRecordIsJournalled:
         }
 
     @pytest.mark.asyncio
-    async def test_a_sink_that_fails_outright_is_journalled_as_sink_failed(self, tmp_path):
+    async def test_a_sink_that_fails_outright_is_journalled_as_sink_failed(
+        self, tmp_path, caplog,
+    ):
         def exploding_root(worktree: Path) -> Path | None:
             raise RuntimeError('the resolver blew up')
 
         sink = sink_over(tmp_path, resolve_root=exploding_root)
 
-        assert await sink(residue_record()) is None
+        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
+            assert await sink(residue_record()) is None
 
         (line,) = loss_lines(tmp_path, 'verdict-tools')
-        assert line['cause'] == 'sink_failed'
+        assert line['cause'] == markup_sink.LossCause.SINK_FAILED.value
+        (error,) = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.mcp.markup_sink' and r.levelno >= logging.ERROR
+        ]
+        assert isinstance(error.exc_info[1], RuntimeError)
+        assert 'submit_review_verdict.issues' in error.getMessage(), (
+            'a sink failure must give the same account of the loss as every other cause'
+        )
+        assert f'{len(RAW)}-char raw value' in error.getMessage()
 
     @pytest.mark.asyncio
     async def test_a_filed_record_is_not_a_loss(self, tmp_path):
-        queue = _RecordingQueue()
+        queue = RecordingQueue()
         sink = sink_over(
             tmp_path,
             resolve_root=lambda worktree: worktree,

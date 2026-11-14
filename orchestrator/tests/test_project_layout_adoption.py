@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 from _escalation_server_capture import create_server_kwargs
+from _markup_sink_rig import LossRecorder
 from _orch_helpers import _init_harness_state_for_test
 from _sandbox_soak_fixtures import (
     build_events_db,
@@ -267,17 +268,13 @@ class TestOperatorToolsFollowTheLayout:
             storm_consequence='every later leaked call is written through.',
             attribution_source='read the test journal',
         )
-        losses: list[dict] = []
-
-        async def record_loss(record: dict) -> None:
-            losses.append(record)
-
+        losses = LossRecorder()
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path / 'proj' / '.worktrees' / '6714',
             spec=spec,
             subject_task_id=lambda: '6714',
             resolve_root=lambda _wt: tmp_path,
-            loss_sink=record_loss,
+            loss_sink=losses,
         )
 
         filed = await sink({
@@ -293,7 +290,7 @@ class TestOperatorToolsFollowTheLayout:
         assert [e.id for e in EscalationQueue(escalation_queue_dir(tmp_path)).get_pending()] == [
             filed,
         ]
-        assert losses == []
+        assert losses.records == []
 
 
 def test_the_census_ignore_audit_reads_the_layout_task_store(tmp_path):

@@ -61,6 +61,7 @@ from typing import Any
 
 import pytest
 from _git_checkouts import git, main_checkout_with_lane
+from _markup_corpus import corpus_specimen
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
@@ -947,36 +948,12 @@ class TestEveryToolDeclaresTheOverrideParameter:
 # preserved verbatim in the escalation named above".
 
 #: The committed corpus of REAL leaked calls (task 3688, boundary row B13).
-CORPUS_PATH = (
-    Path(__file__).resolve().parents[2]
-    / 'shared' / 'tests' / 'fixtures' / 'toolcall_markup_corpus.jsonl'
-)
-
-
-def _specimen(tool_use_id: str) -> dict[str, Any]:
-    """The committed corpus record with this ``tool_use_id``.
-
-    Keyed by id rather than by index or by "the shortest one", so a corpus
-    refresh that adds records cannot silently repoint a test at a different
-    payload. Read as JSON, which is also how the raw envelope literals reach
-    this module WITHOUT appearing in its own source text — the corpus escapes
-    every one of them as ``\\u003c``.
-    """
-    for line in CORPUS_PATH.read_text(encoding='utf-8').splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        if record.get('tool_use_id') == tool_use_id:
-            return record
-    raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
-
-
 #: A REAL ``add_design_decision.decision`` payload whose own boundary cannot be
 #: determined. A refusal is the one outcome an invented specimen can trivially
 #: fake — anything sufficiently mangled refuses — so the assertion that this
 #: guard never guesses is only worth something against input the harness really
 #: produced.
-UNREPAIRABLE_SPECIMEN = _specimen('toolu_01CX8okLpKgz5auenVYQzY23')
+UNREPAIRABLE_SPECIMEN = corpus_specimen('toolu_01CX8okLpKgz5auenVYQzY23')
 UNREPAIRABLE_DECISION: str = UNREPAIRABLE_SPECIMEN['value']
 
 #: What ``add_design_decision`` declares, as the middleware resolves it LIVE
@@ -1430,7 +1407,7 @@ class TestUnrepairableResidueIsPreserved:
 #: A SECOND real unrepairable ``add_design_decision.decision`` payload, so
 #: "residue records never dedup" is asserted across two DISTINCT caller
 #: payloads rather than the same one twice.
-SECOND_UNREPAIRABLE_SPECIMEN = _specimen('toolu_0183rUJqrD3dMjmWAx71mKmP')
+SECOND_UNREPAIRABLE_SPECIMEN = corpus_specimen('toolu_0183rUJqrD3dMjmWAx71mKmP')
 SECOND_UNREPAIRABLE_DECISION: str = SECOND_UNREPAIRABLE_SPECIMEN['value']
 
 
