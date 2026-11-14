@@ -30,7 +30,7 @@ DETECTION. This arm is the plumbing only.
 
 This module performs NO filesystem or network I/O and imports nothing from the
 ``escalation`` package (which is an optional workspace member — see the guarded
-imports in ``reconciliation/targeted.py`` and ``reconciliation/harness.py``).
+imports in ``reconciliation/reconciler_escalation.py`` and ``reconciliation/harness.py``).
 That keeps it hermetically testable from plain dicts, mirroring the stated
 purity contract of the sibling module ``reconciliation/predicate_contradiction.py``.
 """

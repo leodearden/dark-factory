@@ -5,12 +5,10 @@ import contextlib
 import json
 import logging
 import uuid as uuid_mod
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.project_layout import escalation_queue_dir
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -31,6 +29,12 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.reconciler_escalation import (
+    INSTALLED_ESCALATION_QUEUE_FACTORY,
+    EscalationQueueFactory,
+    file_reconciler_l1,
+    pending_escalations,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     retire_flag_markers_for_terminal_task,
 )
@@ -54,17 +58,6 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
-
-EscalationQueueFactory = Callable[[Path], 'EscalationQueue']
-
-# `escalation` is an optional workspace package. When it is absent the default
-# factory is None and every escalation path degrades to its logged no-op or veto.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-    _INSTALLED_ESCALATION_QUEUE_FACTORY: EscalationQueueFactory | None = EscalationQueue
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    _INSTALLED_ESCALATION_QUEUE_FACTORY = None
 
 logger = logging.getLogger(__name__)
 
@@ -217,45 +210,6 @@ def _write_error_code(resp: object) -> str:
     return str(code) if code else 'unknown'
 
 
-def _file_reconciler_l1(
-    queue_factory: EscalationQueueFactory,
-    project_root: ProjectRoot,
-    *,
-    task_id: str,
-    severity: str,
-    category: str,
-    summary: str,
-    detail: str,
-    suggested_action: str,
-) -> str:
-    """File one reconciler-authored L1 escalation and return its id.
-
-    Blocking filesystem I/O: callers run it under ``asyncio.to_thread``
-    (INV-8). The queue is built here, only when a filing actually happens,
-    because ``EscalationQueue.__init__`` mkdirs: an eager build would leave
-    ``data/escalations/`` in every target project. Raises whatever the queue
-    raised; each caller owns its containment.
-    """
-    queue = queue_factory(escalation_queue_dir(project_root))
-    return queue.submit(Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role='reconciler',
-        severity=severity,
-        category=category,
-        summary=summary,
-        detail=detail,
-        suggested_action=suggested_action,
-        level=1,
-    ))
-
-
-def _pending_escalations(
-    queue_factory: EscalationQueueFactory, project_root: ProjectRoot,
-) -> list['Escalation']:
-    return queue_factory(escalation_queue_dir(project_root)).get_pending()
-
-
 class TargetedReconciler:
     """Lightweight reconciliation triggered by task state transitions."""
 
@@ -268,7 +222,7 @@ class TargetedReconciler:
         event_buffer: EventBuffer | None = None,
         *,
         escalation_queue_factory: EscalationQueueFactory | None = (
-            _INSTALLED_ESCALATION_QUEUE_FACTORY
+            INSTALLED_ESCALATION_QUEUE_FACTORY
         ),
     ):
         self.memory = memory_service
@@ -1826,7 +1780,7 @@ class TargetedReconciler:
 
         try:
             esc_id = await asyncio.to_thread(
-                _file_reconciler_l1, factory, project_root,
+                file_reconciler_l1, factory, project_root,
                 task_id=task_id,
                 severity='blocking',
                 category='scope_violation',
@@ -1954,7 +1908,7 @@ class TargetedReconciler:
         # hence warn, never a silent `pass`.
         try:
             esc_id = await asyncio.to_thread(
-                _file_reconciler_l1, factory, project_root,
+                file_reconciler_l1, factory, project_root,
                 task_id=task_id,
                 severity='info',
                 category='risk_identified',
@@ -2139,7 +2093,7 @@ class TargetedReconciler:
         index: dict[str, list[str]] | None
         try:
             index = {}
-            for esc in await asyncio.to_thread(_pending_escalations, factory, project_root):
+            for esc in await asyncio.to_thread(pending_escalations, factory, project_root):
                 # str() both sides of what get_by_task compared with ==, so an
                 # int-typed task_id still pins its dependent rather than
                 # silently missing the lookup.
