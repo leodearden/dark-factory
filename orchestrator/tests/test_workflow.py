@@ -687,6 +687,27 @@ class TestSubmitToMergeQueueCrossRepo:
         self._assert_cross_repo(outcome, events, narrow, mark_blocked)
 
 
+def _wire_plan_files_gate(wf, monkeypatch, results):
+    """Stub the plan-files gate with *results*; return its call recorder, the event store and the _mark_blocked mock."""
+    check_seq = _CheckSequence(results)
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+        check_seq,
+    )
+
+    async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        return 0, 'fake_head_sha\n', ''
+    monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+    events = _RecordingEventStore()
+    wf.event_store = events
+
+    wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+    return check_seq, events, mark_blocked
+
+
 @pytest.mark.asyncio
 class TestSubmitToMergeQueueStalePathMessage:
     """The failure message must not claim about the branch what it never
@@ -704,26 +725,6 @@ class TestSubmitToMergeQueueStalePathMessage:
     """
 
     _NEVER_TOUCHED_SENTENCE = 'no commit on the branch touched them'
-
-    def _wire(self, wf, monkeypatch, results):
-        """Stub the gate with *results*, record events and the block reason."""
-        check_seq = _CheckSequence(results)
-        monkeypatch.setattr(
-            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
-            check_seq,
-        )
-
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
-            return 0, 'fake_head_sha\n', ''
-        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-
-        events = _RecordingEventStore()
-        wf.event_store = events
-
-        wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-        return events, mark_blocked
 
     @staticmethod
     def _reason_of(mark_blocked) -> str:
@@ -747,7 +748,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             missing_from_tree=[stale],
             resolved_renames={stale: resolved},
         )
-        events, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, events, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -783,7 +784,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             not_touched=[real, stale],
             missing_from_tree=[stale],
         )
-        _, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, _, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -816,7 +817,7 @@ class TestSubmitToMergeQueueStalePathMessage:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.plan = {'files': ['a.py']}
         result = PlanFilesTouchedResult(not_touched=['a.py'], missing_from_tree=[])
-        _, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, _, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -840,25 +841,6 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
     _SHA = 'c2e8f8c14d' + '0' * 30
     _SUBJECT = 'chore(3490): bump the redux cache-buster uniformly, 43 -> 44'
 
-    def _wire(self, wf, monkeypatch, results):
-        """Stub the gate with *results*; record its calls, events and the block."""
-        check_seq = _CheckSequence(results)
-        monkeypatch.setattr(
-            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
-            check_seq,
-        )
-
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
-            return 0, 'fake_head_sha\n', ''
-        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-
-        events = _RecordingEventStore()
-        wf.event_store = events
-        wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-        return check_seq, events, mark_blocked
-
     async def test_dropped_entry_is_attributed_with_routing_unchanged(
         self, tmp_path: Path, monkeypatch,
     ):
@@ -872,7 +854,7 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
                 DroppedCommit(sha=self._SHA, subject=self._SUBJECT, paths=('index.html',)),
             )},
         )
-        check_seq, events, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        check_seq, events, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
