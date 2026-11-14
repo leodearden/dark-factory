@@ -496,6 +496,19 @@ When `status ∈ TERMINAL` and the caller did not explicitly supply `claimant_ru
 written `NULL` in the same UPDATE as the status column. An explicitly supplied claimant is honoured
 (the caller is asserting a deliberate exception and owns it).
 
+*C4-E2 amended 2026-11-14 (task 4897; `docs/prds/claimant-invariant-detection.md` D-5/E-2,
+delivered as its d3 in task 4866) — the honoured exception is ledgered.* When a terminal write
+honours an explicitly supplied non-NULL claimant, `TaskInterceptor._apply_status_transition` stamps
+`metadata.claimant_exception` = `{claimant_run_id, target_status, agent_id, tag, stamped_at}`
+(`fused-memory/src/fused_memory/middleware/task_interceptor.py::_claimant_exception_entry`). The
+stamp is written atomically with the status column, in one transaction, through
+`SqliteTaskBackend.set_status_and_stamp_audit`; once the write has persisted, a structured
+`claimant_exception:` WARNING carries the same fields. An explicit `None` is not an exception — it
+clears exactly like an unsupplied claimant — and non-terminal writes and the same-status no-op stamp
+nothing. The alarm tier is C4-E1 *and* unledgered:
+`violates_terminal_claimant_invariant(task) and not ledger_covers_claimant(task)`
+(`shared/src/shared/task_claimant.py`). The C4-E1 predicate itself is unchanged.
+
 **C4-E3 (non-terminal rule).** For `status ∉ TERMINAL`, the claimant columns are untouched by the
 status write. Clearing on those transitions is caller-side and legal **only** where the caller has
 already established that no live claimant exists.
@@ -518,6 +531,35 @@ loudly and structurally, never raised, never silently absorbed. **This PRD deliv
 reports every violating row through `--dry-run` / `--json`, so an operator can observe the invariant
 on demand today. The recurring, unattended alarm is deferred to the detection PRD, which owns the
 invocation model, the discriminator, the closer analysis, and the re-arm control.
+
+*C4-E7 amended 2026-11-14 (task 4897; `docs/prds/claimant-invariant-detection.md` D-4, E-5) — how
+"loudly and structurally" is delivered.*
+
+- **No unattended alarm, deliberately.** The loudness downgrade is a contract decision Leo ratified
+  on 2026-08-24 (detection PRD D-4). It is recorded here as ratified, not re-argued.
+- **Delivery mechanisms.**
+  - (i) The denominated dashboard gauge, `GET /api/v2/dashboard/invariants`
+    (`dashboard/src/dashboard/api/invariants.py::api_invariants`; d1, task 4670). Each per-root
+    record carries `rows_scanned`, `measured_at` and `status` `ok|blind`, and a blind root never
+    reads as zero. Its chip renders in the dashboard's Tasks tab.
+  - (ii) The C4-E2 ledger (d3; see C4-E2's 2026-11-14 amendment), plus the
+    `claimant_stamped_on_terminal` ERROR tripwire in `SqliteTaskBackend.set_task_claimant`
+    (d4, task 4674).
+  - (iii) The ζ census on demand, `scripts/clear_leaked_claimants.py` (task 4625). It reports
+    the raw C4-E1 terminal tier with ledgered rows included: `classify_tier` applies
+    `violates_terminal_claimant_invariant` alone, so the ledger layer of detection PRD D-5 reached
+    the gauge but not the census (task 6777 owns adding it). Before reading a census terminal
+    row as unledgered, or before `--apply`, check it against the gauge's `ledgered` flag or the
+    row's `metadata.claimant_exception`.
+  - (iv) The watcher-rotation consumption step in both watcher skills' Main Loop (d2, landed via
+    task 4894), whose single statement is `skills/_shared/reading-the-invariants-gauge.md`.
+- **Named re-arm trigger.** Any observation, after ζ's repair has cleared the pre-existing
+  residue, of a nonzero *unledgered* terminal tier — via gauge, census cross-checked as in (iii),
+  or watcher rotation — mandates that the observer file ε.2, the escalation-grade alarm, at
+  observation time.
+- **ε.2's shape is pre-chosen** in detection PRD D-7: a deterministic-task record class, a
+  deny-listed category, `root_cause` dedup, and resolution on positive evidence only.
+- **Never alarmable:** hygiene-tier rows and ledgered rows.
 
 ## Boundary-test sketch (B+H)
 
