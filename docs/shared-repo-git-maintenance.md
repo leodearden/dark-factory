@@ -53,12 +53,76 @@ is that repository maintenance no longer happens on its own.
 
 ## gc ownership is now out-of-band
 
-Because auto-gc no longer runs, packing/gc of an orchestrator-managed shared
-repo is the **operator's / orchestrator's** responsibility, scheduled
-out-of-band (e.g. a cron/systemd timer running `git gc` — or `git maintenance
-run` — while no task lane holds the narrow read-only write-set, i.e. against a
-repo with full write access). This is a deliberate ownership move, not an
-oversight.
+Because auto-gc no longer runs, packing an orchestrator-managed shared repo is
+the **operator's** responsibility, scheduled out-of-band. This is a deliberate
+ownership move, not an oversight. The job that carries it is a systemd user
+timer (task 8076):
+
+| Piece | Path |
+|---|---|
+| Units | `scripts/shared-repo-git-maintenance.service`, `scripts/shared-repo-git-maintenance.timer` (daily at 02:00) |
+| Wrapper | `scripts/shared-repo-git-maintenance.sh` |
+| Job | `scripts/shared_repo_git_maintenance.py` |
+| Installer | `scripts/install-shared-repo-git-maintenance-timer.sh` |
+
+**Installing.** Run `scripts/install-shared-repo-git-maintenance-timer.sh` on
+the host. An agent cannot: `~/.config/systemd/user/` is outside the sandbox
+write-set, so the deploy is task 8087. The units carry the same names as the
+2026-11-01 hand install, so the installer replaces it in place; after that
+`~/bin/shared-repo-git-maintenance.sh` is no longer referenced.
+
+**What it runs.** Per repo, both commands niced:
+
+```bash
+nice -n 19 ionice -c3 git repack -d -q -n \
+  && nice -n 19 ionice -c3 git commit-graph write --reachable
+```
+
+Repos are maintained one at a time, under a host-wide flock
+(`$XDG_RUNTIME_DIR/shared-repo-git-maintenance.lock`); a run that finds the
+lock held does nothing and exits 0. A root is skipped as `not-a-repo` unless it
+is itself a repository's top level, so git discovery can never walk up into an
+enclosing repo. It is skipped as `busy` while `gc.pid` or
+`objects/maintenance.lock` sits in its git dir.
+
+**The roster.** Every root an installed `orchestrator-*.service` runs, read by
+`scripts/orchestrator_projects.py::targets_from_args`. Those are exactly the
+repos whose auto-gc an orchestrator disabled. It is not
+`DASHBOARD_KNOWN_PROJECT_ROOTS`, which also names projects with no
+orchestrator. `--project-root` (repeatable) replaces the roster for a by-hand
+run.
+
+**Reading the journal.** `journalctl --user -u shared-repo-git-maintenance`
+shows one JSON record per repo (`root`, `outcome`, `loose_before`,
+`loose_after`, `repack_rc`, `commit_graph_rc`, `seconds`), then
+`shared-repo-git-maintenance: done (maintenance=<rc>)`. The wrapper always
+exits 0; `<rc>` is the job's own code: 0 nothing failed (or another run held
+the lock), 1 some repo failed (its record says `failed`), 2 the roster was
+empty. A repo that reads `busy` every night has a leftover `gc.pid` or
+`objects/maintenance.lock`; remove it once no gc or maintenance run is live.
+
+### What the timer may and may not run
+
+- Plain `git repack -d` touches no refs (zero `reference-transaction` hook
+  calls), deletes only loose objects already in a pack, and takes no lock a
+  lane's git takes. `git commit-graph write` takes only
+  `objects/info/commit-graph.lock`. Verified 2026-11-01 by strace, a hook
+  trace, and a 146-round concurrent-commit stress.
+- **Never `git repack -a -d`.** It deletes packed unreachable objects outright,
+  and the evals' `git clone --shared` scratch clones (alternates) and the
+  git-ref ledger depend on them.
+  `scripts/tests/test_shared_repo_git_maintenance.py` pins this with a packed
+  unreachable commit that must survive a run.
+- A consolidating step, if one is ever wanted, is `git repack -A -d` or
+  `git repack --cruft -d`. On reify (~37 GB of packs) that is a full rewrite,
+  to be scheduled deliberately and never from this timer.
+- Plain repack packs only REACHABLE loose objects, so a high loose count after
+  a run is expected. Journal 2026-11-14: dark-factory went from 358346 loose
+  objects to 349305. Reclaiming the unreachable rest is the prune/cruft
+  decision tracked by task 8088.
+- `git gc` stays out of scope. It would fire each repo's
+  `hooks/reference-transaction` through `pack-refs`. Both hooks tolerate the
+  zero old oid (measured 2026-10-24), but nothing here needs gc.
 
 ## Verification
 
@@ -148,6 +212,11 @@ prints `ratchet-baseline`.
   call.
 - `scripts/merge_lane_ratchet_merge.py` — the ratchet-baseline merge driver,
   its rules and its `install` verb (task 7298).
+- `scripts/shared_repo_git_maintenance.py` — the nightly repack + commit-graph
+  job; `scripts/shared-repo-git-maintenance.sh`, its `.service` and `.timer`,
+  and `scripts/install-shared-repo-git-maintenance-timer.sh` (task 8076).
+- `scripts/git_env.py::scrubbed_git_env` — the ambient-redirection scrub every
+  git call of that job runs under.
 - `orchestrator/src/orchestrator/agents/sandbox_git_config.py` — the sandbox
   git-config policy; `orchestrator/tests/test_landlock.py::TestLandlockSandboxedConflictedMerge`
   — its real-kernel regression test.
