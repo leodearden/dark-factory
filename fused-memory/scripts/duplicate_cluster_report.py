@@ -178,6 +178,7 @@ def _category_entry(plan: Plan, category: str, source: str) -> dict[str, Any]:
         'lexical_threshold': plan.get('threshold'),
         'ann_cutoff': (plan.get('ann_threshold_by_category') or {}).get(category),
         'source': source,
+        'child_counts_known': 'child_counts' in plan,
     }
 
 
@@ -226,21 +227,27 @@ def cluster_entry(group: Mapping[str, Any], machine_written_kinds: Iterable[str]
 
 
 def merge_child_counts(plans: Iterable[Plan]) -> dict[str, list[dict[str, Any]]]:
-    """Sum every plan's ``child_counts`` into ``{kind: [{'parent_id', 'count'}]}``.
+    """Sum every plan's ``child_counts`` into ``{kind: [{'parent_id', 'category', 'count'}]}``.
 
-    Rows are sorted by ``(-count, str(parent_id))``, so the sighting-count
+    One row per parent per category: counts from two categories come from two
+    sweeps with their own coverage, so they are never merged. Rows are sorted
+    by ``(-count, str(parent_id), str(category))``, so the sighting-count
     ranking is ``['sighting']``.
     """
-    totals: dict[str, dict[Any, int]] = {}
+    totals: dict[str, dict[tuple[Any, Any], int]] = {}
     for plan in plans:
         for row in plan.get('child_counts') or ():
             kind = row.get('kind')
             by_parent = totals.setdefault(NO_KIND_KEY if kind is None else str(kind), {})
-            by_parent[row['parent_id']] = by_parent.get(row['parent_id'], 0) + int(row['count'])
+            key = (row.get('category'), row['parent_id'])
+            by_parent[key] = by_parent.get(key, 0) + int(row['count'])
     return {
         kind: sorted(
-            ({'parent_id': parent, 'count': count} for parent, count in by_parent.items()),
-            key=lambda r: (-r['count'], str(r['parent_id'])),
+            (
+                {'parent_id': parent, 'category': category, 'count': count}
+                for (category, parent), count in by_parent.items()
+            ),
+            key=lambda r: (-r['count'], str(r['parent_id']), str(r['category'])),
         )
         for kind, by_parent in sorted(totals.items())
     }
@@ -289,7 +296,6 @@ def build_report(
         ],
         'retained_carveout': _summed_retained_carveout(bare_plans),
         'child_rankings': merge_child_counts(bare_plans),
-        'child_counts_known': all('child_counts' in plan for plan in bare_plans),
         'failed_categories': [dict(f) for f in failed_categories],
     }
     return {**inventory, **diff_against_previous(inventory, previous, config=config)}
@@ -544,32 +550,41 @@ def category_comparability(
     return sorted(reason.value for reason in reasons)
 
 
+def _categories_with_known_child_counts(previous: Mapping[str, Any] | None) -> frozenset[str]:
+    """The categories whose children *previous* counted: swept with the flag set."""
+    if previous is None:
+        return frozenset()
+    return frozenset(
+        name for name, entry in previous['categories'].items()
+        if entry.get('child_counts_known') is True
+    )
+
+
 def child_deltas(
     current: Mapping[str, Sequence[Mapping[str, Any]]], previous: Mapping[str, Any] | None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Each ranking row with its previous count and delta.
 
-    Both are ``None`` when there is no previous report or it could not count
-    children (a legacy plan): an unknown count is not a zero.
+    Both are known only for a category the previous report counted (see
+    ``_categories_with_known_child_counts``); a parent absent from such a
+    category's previous ranking had a known zero. For any other category
+    (no previous report, a failed or newly configured category, a legacy
+    plan) both are ``None``: an unknown count is not a zero.
     """
-    known = previous is not None and previous.get('child_counts_known') is True
-    previous_rankings = previous['child_rankings'] if known and previous is not None else {}
+    known = _categories_with_known_child_counts(previous)
     prior = {
-        (kind, row['parent_id']): row['count']
-        for kind, rows in previous_rankings.items()
+        (kind, row.get('category'), row['parent_id']): row['count']
+        for kind, rows in (previous['child_rankings'] if previous is not None else {}).items()
         for row in rows
     }
-    return {
-        kind: [
-            {
-                **row,
-                'previous_count': prior.get((kind, row['parent_id']), 0) if known else None,
-                'delta': row['count'] - prior.get((kind, row['parent_id']), 0) if known else None,
-            }
-            for row in rows
-        ]
-        for kind, rows in current.items()
-    }
+
+    def with_delta(kind: str, row: Mapping[str, Any]) -> dict[str, Any]:
+        if row['category'] not in known:
+            return {**row, 'previous_count': None, 'delta': None}
+        previous_count = prior.get((kind, row['category'], row['parent_id']), 0)
+        return {**row, 'previous_count': previous_count, 'delta': row['count'] - previous_count}
+
+    return {kind: [with_delta(kind, row) for row in rows] for kind, rows in current.items()}
 
 
 def _dissolved(
