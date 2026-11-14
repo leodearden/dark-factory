@@ -18,10 +18,12 @@ import copy
 import importlib.util
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from fused_memory.maintenance._utils import maintenance_service
+from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,7 @@ class SeedReport:
     project_id: str
     memory_ids_by_name: dict[str, list[str]] = field(default_factory=dict)
     stores_written_by_name: dict[str, list[str]] = field(default_factory=dict)
+    stores_queued_by_name: dict[str, list[str]] = field(default_factory=dict)
 
 
 class PartialSeedError(RuntimeError):
@@ -121,6 +124,10 @@ class PartialSeedError(RuntimeError):
     def __init__(self, message: str, partial_report: SeedReport) -> None:
         super().__init__(message)
         self.partial_report = partial_report
+
+
+def _store_names(stores: Iterable[SourceStore]) -> list[str]:
+    return [s.value for s in stores]
 
 
 class SeedManager:
@@ -156,10 +163,8 @@ class SeedManager:
                     partial_report=report,
                 )
             report.memory_ids_by_name[name] = list(response.memory_ids)
-            report.stores_written_by_name[name] = [
-                s.value if hasattr(s, 'value') else str(s)
-                for s in response.stores_written
-            ]
+            report.stores_written_by_name[name] = _store_names(response.stores_written)
+            report.stores_queued_by_name[name] = _store_names(response.stores_queued)
         return report
 
 
