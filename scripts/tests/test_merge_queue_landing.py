@@ -7,6 +7,7 @@ import contextlib
 import errno
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -20,6 +21,7 @@ from _merge_queue_landing import (
     LandingNotConfirmed,
     land_file,
     land_files,
+    reclaim_retained_deploys,
 )
 from config_reload_script_fakes import (
     TOOL_RAISED,
@@ -460,15 +462,18 @@ def test_a_ceiling_passed_during_the_submit_cancels_without_a_poll(repo, scratch
     _assert_untouched(repo, before, scratch)
 
 
+CANCEL_REFUSED_WHILE_LANDING = {
+    "cancelled": False,
+    "state": "finalizing",
+    "reason": "Request is landing (its CAS is in progress)",
+    "code": "finalize_window",
+}
+
+
 def test_a_cancel_refused_while_live_keeps_the_deploy_branch(repo, scratch):
     """The merge worker reads the source from the deploy worktree, so a
     request that may still land must keep it."""
-    queue = FakeMergeQueue(repo, states=["verifying"], cancel_reply={
-        "cancelled": False,
-        "state": "finalizing",
-        "reason": "Request is landing (its CAS is in progress)",
-        "code": "finalize_window",
-    })
+    queue = FakeMergeQueue(repo, states=["verifying"], cancel_reply=CANCEL_REFUSED_WHILE_LANDING)
 
     refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
 
@@ -1042,6 +1047,123 @@ def test_a_teardown_git_refuses_keeps_the_landing(repo, scratch, capsys):
     assert (repo / CONFIG).read_bytes() == EDITED
     err = capsys.readouterr().err
     assert landing.branch in err and "locked" in err, err
+
+
+# ---------------------------------------------------------------------------
+# Reclaiming a deploy an earlier landing retained
+#
+# A caller that lands on a cadence asks first whether an earlier run left a
+# deploy behind that may still land; one that can no longer land is torn down.
+# ---------------------------------------------------------------------------
+
+def _retained_deploy(repo):
+    """The (branch, worktree) land_file kept for a request still live at a
+    passed ceiling whose cancel the queue refused."""
+    queue = FakeMergeQueue(repo, states=["verifying"], cancel_reply=CANCEL_REFUSED_WHILE_LANDING)
+    _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
+    (submitted,) = queue.calls_to("merge_request")
+    return f"task/{submitted['branch']}", pathlib.Path(submitted["worktree"])
+
+
+def _reclaim(repo, answers=None, *, label=LABEL):
+    """reclaim_retained_deploys of *label* in *repo*, through a fresh queue
+    whose merge_status answers each handle with its *answers* sequence.
+    Returns (the deploys kept, the server's tool calls)."""
+    queue = FakeMergeQueue(repo, states=answers or {})
+    with FakeEscalationMcp(tool_handlers=queue.handlers()) as server:
+        kept = reclaim_retained_deploys(str(repo), label, port=str(server.port))
+        calls = server.tool_calls()
+    return kept, calls
+
+
+def _bare(branch):
+    return branch.removeprefix("task/")
+
+
+def _branch_exists(repo, branch):
+    return subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+    ).returncode == 0
+
+
+def test_a_repo_without_a_retained_deploy_reclaims_nothing_and_asks_nothing(repo, scratch):
+    kept, calls = _reclaim(repo)
+
+    assert kept == ()
+    assert calls == []
+
+
+def test_a_retained_deploy_still_live_is_kept_and_reported(repo, scratch):
+    branch, worktree = _retained_deploy(repo)
+
+    kept, calls = _reclaim(repo, {_bare(branch): ["verifying"]})
+
+    assert kept == (branch,)
+    assert calls == [("merge_status", {"branch": _bare(branch)})]
+    assert worktree.is_dir(), "a deploy that may still land lost its worktree"
+    assert _branch_exists(repo, branch)
+
+
+@pytest.mark.parametrize("settled", ["abandoned", "conflict"])
+def test_a_retained_deploy_the_queue_settled_is_torn_down(repo, scratch, settled):
+    before = _main(repo)
+    branch, _ = _retained_deploy(repo)
+
+    kept, calls = _reclaim(repo, {_bare(branch): [settled]})
+
+    assert kept == ()
+    assert calls == [("merge_status", {"branch": _bare(branch)})]
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_retained_deploy_main_already_carries_is_torn_down_without_asking(repo, scratch):
+    branch, _ = _retained_deploy(repo)
+    git(repo, "merge", "--no-ff", "-q", "-m", f"Merge {branch} into main", branch)
+
+    kept, calls = _reclaim(repo, {_bare(branch): ["verifying"]})
+
+    assert kept == ()
+    assert calls == []
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_retained_deploy_whose_poll_is_dropped_is_kept(repo, scratch):
+    """A dropped poll cannot rule out that the request lands."""
+    branch, worktree = _retained_deploy(repo)
+
+    kept, _ = _reclaim(repo, {_bare(branch): [TRANSPORT_FAULT]})
+
+    assert kept == (branch,)
+    assert worktree.is_dir()
+    assert _branch_exists(repo, branch)
+
+
+def test_a_deploy_of_another_label_sharing_the_prefix_is_left_alone(repo, scratch, tmp_path):
+    other = f"task/deploy-{LABEL}-x-20261114T050000Z"
+    worktree = tmp_path / "other-label-worktree"
+    git(repo, "branch", "--no-track", other, "main")
+    git(repo, "worktree", "add", "-q", str(worktree), other)
+
+    kept, calls = _reclaim(repo, {_bare(other): ["abandoned"]})
+
+    assert kept == ()
+    assert calls == []
+    assert worktree.is_dir()
+    assert _branch_exists(repo, other)
+
+
+def test_a_settled_retained_deploy_whose_worktree_vanished_loses_its_branch(repo, scratch):
+    """A reboot that cleared TMPDIR leaves git a worktree record naming a
+    directory that is gone."""
+    branch, worktree = _retained_deploy(repo)
+    shutil.rmtree(worktree.parent)
+
+    kept, _ = _reclaim(repo, {_bare(branch): ["abandoned"]})
+
+    assert kept == ()
+    assert not _branch_exists(repo, branch)
+    assert str(worktree) not in git(repo, "worktree", "list", "--porcelain")
+    _assert_left_nothing_behind(repo, scratch)
 
 
 class _SignalStandIn:
