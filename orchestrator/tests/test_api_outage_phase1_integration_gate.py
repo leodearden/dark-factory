@@ -29,6 +29,7 @@ _API_ERROR_MARKER = 'agent API error: HTTP 529'
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('code_default_config')
 async def test_incident_burst_rows_1_to_5_hold_in_one_harness_run(tmp_path, monkeypatch):
     ledger = await run_incident_burst(tmp_path, monkeypatch)
 
@@ -90,8 +91,8 @@ def _assert_row_1(ledger: BurstLedger) -> None:
             assert record.transient_requeue_count == n, (
                 f'{where}: transient_requeue_count {record.transient_requeue_count}'
             )
-            assert record.genuine_requeue_count == 0, (
-                f'{where}: genuine requeue count {record.genuine_requeue_count}'
+            assert record.non_transient_requeue_count == 0, (
+                f'{where}: non-transient requeue count {record.non_transient_requeue_count}'
             )
             assert len(record.evidence) == 1, f'{where}: evidence files {record.evidence!r}'
             evidence = record.evidence[0]
@@ -133,14 +134,14 @@ def _assert_rows_2_and_3(ledger: BurstLedger) -> None:
         categories = {e.category for e in ledger.escalations_by_task[tid]}
         assert 'infra_issue' in categories, f'{where}: no infra_issue escalation, got {categories}'
 
-    after_b = ledger.after_phase_b
+    after_wedges = ledger.after_wedges
     wedge_ids = {ledger.cast.sigkill_wedge, ledger.cast.reify_wedge}
     blocked = {tid for tid, writes in ledger.status_writes.items() if 'blocked' in writes}
     assert blocked == wedge_ids, f'rows 2/3: blocked writes went to {sorted(blocked)}'
-    assert after_b.parked_live_count == len(wedge_ids), (
-        f'rows 2/3: the park-stop deque holds {after_b.parked_live_count} tasks, expected the two wedges'
+    assert after_wedges.parked_live_count == len(wedge_ids), (
+        f'rows 2/3: the park-stop deque holds {after_wedges.parked_live_count} tasks, expected the two wedges'
     )
-    assert after_b.paused is False, 'rows 2/3: two blocks are under the park-stop threshold yet paused'
+    assert after_wedges.paused is False, 'rows 2/3: two blocks are under the park-stop threshold yet paused'
 
 
 _TRANSIENT_ENVELOPES = (30.0, 60.0, 120.0, 240.0, 480.0)
@@ -178,7 +179,12 @@ def _assert_row_4(ledger: BurstLedger) -> None:
     )
     assert first.cooldown.transient is False, f'{where}: cooldown marked transient'
     assert first.transient_requeue_count == 0, f'{where}: transient count {first.transient_requeue_count}'
-    assert first.genuine_requeue_count == 1, f'{where}: genuine count {first.genuine_requeue_count}'
+    assert first.report.counts_against_requeue_cap is True, (
+        f'{where}: the requeue is history-only, not counted against requeue_cap'
+    )
+    assert first.non_transient_requeue_count == 1, (
+        f'{where}: non-transient count {first.non_transient_requeue_count}'
+    )
 
 
 def _armed_secs(record: DispatchRecord) -> float:
@@ -190,21 +196,21 @@ def _assert_row_5(ledger: BurstLedger) -> None:
     assert ledger.park_stop_trip_wired, (
         'row 5: the scheduler has no on_park_stop_trip callback, so an empty deque proves nothing'
     )
-    phase_a = ledger.phase_a()
-    assert phase_a, 'row 5: no phase-A dispatches recorded'
-    for record in phase_a:
+    burst = ledger.burst_dispatches()
+    assert burst, 'row 5: no burst-phase dispatches recorded'
+    for record in burst:
         where = f'row 5: task {record.task_id} at t={record.at:.0f}s'
         assert record.parked_live_count == 0, f'{where}: parked_live_count {record.parked_live_count}'
         assert record.parked_window_churn_count == 0, (
             f'{where}: parked_window_churn_count {record.parked_window_churn_count}'
         )
         assert record.paused is False, f'{where}: scheduler paused'
-    end = ledger.after_phase_a
-    assert end.pending_escalations == (), f'row 5: escalations pending after phase A: {end.pending_escalations}'
-    assert end.paused is False, 'row 5: scheduler paused after phase A'
-    assert end.parked_live_count == 0, f'row 5: parked_live_count {end.parked_live_count} after phase A'
+    end = ledger.after_burst
+    assert end.pending_escalations == (), f'row 5: escalations pending after the burst: {end.pending_escalations}'
+    assert end.paused is False, 'row 5: scheduler paused after the burst'
+    assert end.parked_live_count == 0, f'row 5: parked_live_count {end.parked_live_count} after the burst'
     assert end.parked_window_churn_count == 0, (
-        f'row 5: parked_window_churn_count {end.parked_window_churn_count} after phase A'
+        f'row 5: parked_window_churn_count {end.parked_window_churn_count} after the burst'
     )
 
 

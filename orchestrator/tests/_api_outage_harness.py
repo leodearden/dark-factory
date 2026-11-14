@@ -8,6 +8,16 @@ Only boundaries owned by other PRDs or other processes are faked: the agent CLI
 (``invoke_with_cap_retry`` returns scripted ``AgentResult``s), the worktree and
 already-merged probes, the briefing, the steward factory, and fused-memory (an
 in-memory task store behind the scheduler's ``mcp_session`` seam).
+
+One departure from production is deliberate: every dispatch gets its own worktree
+base, so its TASK-lifetime ``.task-meta`` root (``TaskArtifacts.task_root_for``) is
+fresh rather than shared across the task's lanes. Phase 1 depends on that only for
+attribution: the zero-output evidence a dispatch reads back is its own, though every
+kill writes the same ``iter1`` file. A gate that needs plan.json, iterations.jsonl
+or review state to follow a task across re-dispatches must share the base instead.
+
+The config is the package defaults: callers request conftest's
+``code_default_config`` fixture, which unpins the operational yaml.
 """
 
 from __future__ import annotations
@@ -16,11 +26,13 @@ import asyncio
 import heapq
 import itertools
 import json
+import os
 import random
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -47,6 +59,7 @@ __all__ = [
     'BurstCast',
     'BurstLedger',
     'DispatchRecord',
+    'Phase',
     'PhaseSnapshot',
     'ZeroOutputEvidence',
     'incident_529_result',
@@ -63,9 +76,14 @@ PROVIDER_529_ERROR = (
     'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
 )
 
-PHASE_A = 'A'
-PHASE_B = 'B'
-PHASE_C = 'C'
+
+class Phase(StrEnum):
+    """The incident hour's three phases, in the order they run."""
+
+    BURST = 'burst'
+    WEDGE = 'wedge'
+    RECOVERY = 'recovery'
+
 
 _EPOCH = datetime(2026, 7, 29, 9, 0, tzinfo=UTC)
 _RUN_ID = 'run-3320-incident-burst'
@@ -152,7 +170,7 @@ class DispatchRecord:
     """One dispatch's report, and what the operator read paths showed right after it."""
 
     task_id: str
-    phase: str
+    phase: Phase
     at: float
     report: TaskReport
     cli_calls: int
@@ -165,8 +183,11 @@ class DispatchRecord:
     paused: bool
 
     @property
-    def genuine_requeue_count(self) -> int:
-        """Requeues counted against ``requeue_cap``; the cast files no non-counting requeue."""
+    def non_transient_requeue_count(self) -> int:
+        """History entries outside the transient bucket: genuine and history-only requeues alike.
+
+        ``report.counts_against_requeue_cap`` tells the two apart for this dispatch's requeue.
+        """
         return len(self.requeue_history) - self.transient_requeue_count
 
 
@@ -202,8 +223,8 @@ class BurstLedger:
     config: OrchestratorConfig
     cast: BurstCast
     dispatches: tuple[DispatchRecord, ...]
-    after_phase_a: PhaseSnapshot
-    after_phase_b: PhaseSnapshot
+    after_burst: PhaseSnapshot
+    after_wedges: PhaseSnapshot
     end_of_run: PhaseSnapshot
     status_writes: Mapping[str, tuple[str, ...]]
     final_status: Mapping[str, str]
@@ -214,19 +235,24 @@ class BurstLedger:
         return tuple(r for r in self.dispatches if r.task_id == task_id)
 
     def kills_of(self, task_id: str) -> tuple[DispatchRecord, ...]:
-        """The task's phase-A dispatches: for a burst task, its incident kills."""
-        return tuple(r for r in self.dispatches_of(task_id) if r.phase == PHASE_A)
+        """The task's burst-phase dispatches: for a burst task, its incident kills."""
+        return tuple(r for r in self.dispatches_of(task_id) if r.phase is Phase.BURST)
 
-    def phase_a(self) -> tuple[DispatchRecord, ...]:
-        return tuple(r for r in self.dispatches if r.phase == PHASE_A)
+    def burst_dispatches(self) -> tuple[DispatchRecord, ...]:
+        return tuple(r for r in self.dispatches if r.phase is Phase.BURST)
 
 
 async def run_incident_burst(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> BurstLedger:
+    """Requires conftest's ``code_default_config`` fixture."""
     simulation = _Simulation(tmp_path, monkeypatch)
-    await simulation.run_phase_a()
-    await simulation.run_phase_b()
-    await simulation.run_phase_c()
-    return simulation.ledger()
+    after_burst, recovery_arrivals = await simulation.run_burst()
+    after_wedges = await simulation.run_wedges()
+    end_of_run = await simulation.run_recovery(recovery_arrivals)
+    return simulation.ledger(after_burst=after_burst, after_wedges=after_wedges, end_of_run=end_of_run)
+
+
+_Arrival = tuple[float, int, str]
+"""A scheduled dispatch: (arrival time, tie-break sequence, task id)."""
 
 
 class _SimClock:
@@ -402,9 +428,12 @@ def _one_step_plan(task_id: str) -> dict:
     }
 
 
-def _code_default_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
+def _package_default_config(tmp_path: Path) -> OrchestratorConfig:
     """Package defaults for every PRD-owned knob; only substrate knobs are overridden."""
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
+    project_layer = Path(os.environ['ORCH_CONFIG_PATH'])
+    assert not project_layer.exists(), (
+        f'request the code_default_config fixture: the config would layer {project_layer}'
+    )
     return OrchestratorConfig(
         project_root=tmp_path,
         transcript_archive=TranscriptArchiveConfig(enabled=False),
@@ -431,6 +460,7 @@ def _build_harness(
         jitter_source=random.Random(SEED).uniform,
     )
     scheduler.finish_startup()
+    scheduler.escalation_queue = queue
     harness.scheduler = scheduler
     harness._escalation_queue = queue
     harness._run_id = _RUN_ID
@@ -454,7 +484,7 @@ class _Simulation:
             self.cast.sigkill_wedge: lambda _n: sigkill_wedge_result(),
             self.cast.reify_wedge: lambda _n: reify_4429_wedge_result(),
         })
-        self.config = _code_default_config(tmp_path, monkeypatch)
+        self.config = _package_default_config(tmp_path)
         self.queue = EscalationQueue(tmp_path / 'escalations')
         self.harness, self.scheduler = _build_harness(self.config, self.store, self.clock, self.queue)
         self.factory = _WorkflowFactory(
@@ -465,39 +495,38 @@ class _Simulation:
         monkeypatch.setattr('orchestrator.workflow.invoke_with_cap_retry', self.cli)
         self._sequence = itertools.count()
         self.dispatches: list[DispatchRecord] = []
-        self._recovery_arrivals: list[tuple[float, int, str]] = []
-        self.after_phase_a: PhaseSnapshot | None = None
-        self.after_phase_b: PhaseSnapshot | None = None
-        self.end_of_run: PhaseSnapshot | None = None
 
-    async def run_phase_a(self) -> None:
-        arrivals: list[tuple[float, int, str]] = []
+    async def run_burst(self) -> tuple[PhaseSnapshot, list[_Arrival]]:
+        """Dispatch until every burst task has taken its kills; return each requeued
+        task's pending re-dispatch for the recovery phase."""
+        arrivals: list[_Arrival] = []
         for i, task_id in enumerate(self.cast.burst):
             first = i * _STAGGER_SECS + self.cli.next_duration_secs(task_id)
             heapq.heappush(arrivals, (first, next(self._sequence), task_id))
         heapq.heappush(arrivals, (_GENUINE_ARRIVAL_SECS, next(self._sequence), self.cast.genuine))
+        recovery_arrivals: list[_Arrival] = []
         while arrivals:
             at, _, task_id = heapq.heappop(arrivals)
-            record = await self._dispatch(task_id, at, PHASE_A)
+            record = await self._dispatch(task_id, at, Phase.BURST)
             if record.report.outcome != WorkflowOutcome.REQUEUED:
                 continue
             arrival = (self._redispatch_at(record), next(self._sequence), task_id)
             if self._kill_pending(record):
                 heapq.heappush(arrivals, arrival)
             else:
-                self._recovery_arrivals.append(arrival)
-        self.after_phase_a = self._snapshot()
+                recovery_arrivals.append(arrival)
+        return self._snapshot(), recovery_arrivals
 
-    async def run_phase_b(self) -> None:
+    async def run_wedges(self) -> PhaseSnapshot:
         for task_id in self.cast.wedges:
-            await self._dispatch(task_id, self.clock.now, PHASE_B)
-        self.after_phase_b = self._snapshot()
+            await self._dispatch(task_id, self.clock.now, Phase.WEDGE)
+        return self._snapshot()
 
-    async def run_phase_c(self) -> None:
+    async def run_recovery(self, arrivals: list[_Arrival]) -> PhaseSnapshot:
         """Each requeued task's healthy re-dispatch; none may run before the wedge controls'."""
-        for at, _, task_id in sorted(self._recovery_arrivals):
-            await self._dispatch(task_id, max(at, self.clock.now), PHASE_C)
-        self.end_of_run = self._snapshot()
+        for at, _, task_id in sorted(arrivals):
+            await self._dispatch(task_id, max(at, self.clock.now), Phase.RECOVERY)
+        return self._snapshot()
 
     def _kill_pending(self, record: DispatchRecord) -> bool:
         return record.task_id in self.cast.burst and self.cli.calls(record.task_id) < KILLS_PER_TASK
@@ -507,7 +536,7 @@ class _Simulation:
             raise AssertionError(f'task {record.task_id} requeued with no cooldown armed')
         return record.at + record.cooldown.armed_secs + self.cli.next_duration_secs(record.task_id)
 
-    async def _dispatch(self, task_id: str, at: float, phase: str) -> DispatchRecord:
+    async def _dispatch(self, task_id: str, at: float, phase: Phase) -> DispatchRecord:
         self.clock.advance_to(at)
         await self.scheduler.set_task_status(task_id, 'in-progress')
         calls_before = self.cli.calls(task_id)
@@ -540,16 +569,16 @@ class _Simulation:
             parked_window_churn_count=self.scheduler.parked_window_churn_count,
         )
 
-    def ledger(self) -> BurstLedger:
-        assert self.after_phase_a is not None and self.after_phase_b is not None
-        assert self.end_of_run is not None
+    def ledger(
+        self, *, after_burst: PhaseSnapshot, after_wedges: PhaseSnapshot, end_of_run: PhaseSnapshot,
+    ) -> BurstLedger:
         return BurstLedger(
             config=self.config,
             cast=self.cast,
             dispatches=tuple(self.dispatches),
-            after_phase_a=self.after_phase_a,
-            after_phase_b=self.after_phase_b,
-            end_of_run=self.end_of_run,
+            after_burst=after_burst,
+            after_wedges=after_wedges,
+            end_of_run=end_of_run,
             status_writes=self.store.writes(),
             final_status=self.store.statuses(),
             escalations_by_task={tid: tuple(self.queue.get_by_task(tid)) for tid in self.cast.all_ids},
