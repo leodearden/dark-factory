@@ -246,8 +246,12 @@ class TestEveryHarnessFilingSiteIsStamped:
         # _file_stale_l0_strand_escalation, a 28th filing site, which this
         # rebase stamps like the other 27.  A filing routed through
         # escalation.file_or_refresh is counted at its call (task 8926).
-        assert len(calls) >= 28, (
-            f'expected >=28 Escalation(...) or file_or_refresh(...) sites, '
+        # Lowered 28 -> 27 by task 7170, which folded the cross-repo,
+        # substrate-flip and external-dep copies onto _file_harness_l1's
+        # single stamped construction; those sites merged, they did not move
+        # out of the module.
+        assert len(calls) >= 27, (
+            f'expected >=27 Escalation(...) or file_or_refresh(...) sites, '
             f'found {len(calls)}'
         )
 
@@ -281,8 +285,10 @@ class TestEveryHarnessEscalationStatesItsLevel:
 
     def test_every_escalation_construction_passes_level(self) -> None:
         calls = _filing_call_sites(_HARNESS_SRC_PATH, frozenset({'Escalation'}))
-        assert len(calls) >= 29, (
-            f'{_HARNESS_SRC_PATH.name}: expected >=29 Escalation(...) constructions, '
+        # Task 7170 folds the dispatch-gate copies onto _file_harness_l1's single
+        # construction; those sites merged, they did not move out of this module.
+        assert len(calls) >= 26, (
+            f'{_HARNESS_SRC_PATH.name}: expected >=26 Escalation(...) constructions, '
             f'found {len(calls)} — if they moved to another module, scan that '
             f'module here too, or this tripwire silently covers less.'
         )

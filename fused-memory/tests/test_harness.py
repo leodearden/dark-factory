@@ -21577,10 +21577,9 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
     `EscalationQueue.has_open_l1` is LEVEL-1-ONLY
     (`escalation/queue.py::EscalationQueue.has_open_l1`, which delegates to
     `get_by_task(task_id, status='pending', level=1)`), and the orchestrator
-    reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at a
-    spread of guards that divert or suppress real work: the external-dep,
-    cross-repo and substrate-flip block-and-escalate paths in
-    `orchestrator/harness.py`, plus TWO sites in `orchestrator/workflow.py`. That population is enumerated authoritatively,
+    reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at
+    guards that divert real work: TWO sites in `orchestrator/workflow.py`.
+    That population is enumerated authoritatively,
     in `path::symbol` form, in the `FINDING_TASK_ESCALATION_LEVEL` comment block
     of `fused_memory/reconciliation/finding_task_escalation.py` — read it there
     rather than restating it here, and do not reintroduce bare line pins
