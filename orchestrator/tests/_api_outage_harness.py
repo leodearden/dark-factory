@@ -50,7 +50,9 @@ __all__ = [
     'PhaseSnapshot',
     'ZeroOutputEvidence',
     'incident_529_result',
+    'reify_4429_wedge_result',
     'run_incident_burst',
+    'sigkill_wedge_result',
 ]
 
 BURST_SIZE = 15
@@ -62,11 +64,14 @@ PROVIDER_529_ERROR = (
 )
 
 PHASE_A = 'A'
+PHASE_B = 'B'
 
 _EPOCH = datetime(2026, 7, 29, 9, 0, tzinfo=UTC)
 _RUN_ID = 'run-3320-incident-burst'
 _BURST_FIRST_ID = 9001
 _GENUINE_ID = '9101'
+_SIGKILL_WEDGE_ID = '9201'
+_REIFY_WEDGE_ID = '9202'
 _STAGGER_SECS = 20.0
 _GENUINE_ARRIVAL_SECS = BURST_SIZE * _STAGGER_SECS / 2
 _KILL_DURATION_MS = 120_000
@@ -83,6 +88,34 @@ def incident_529_result() -> AgentResult:
         duration_ms=_KILL_DURATION_MS,
         transcript_turns=0,
         api_error_status=529,
+    )
+
+
+def sigkill_wedge_result() -> AgentResult:
+    """A SIGKILLed wedge: nothing flushed, so no status is attached."""
+    return AgentResult(
+        success=False,
+        output='',
+        timed_out=True,
+        turns=0,
+        cost_usd=0.0,
+        duration_ms=_KILL_DURATION_MS,
+        transcript_turns=0,
+        api_error_status=None,
+    )
+
+
+def reify_4429_wedge_result() -> AgentResult:
+    """The reify-4429 wedge: a 20-minute zero-output run with no status attached."""
+    return AgentResult(
+        success=False,
+        output='Agent produced no output',
+        timed_out=True,
+        turns=0,
+        cost_usd=0.0,
+        duration_ms=1_200_000,
+        transcript_turns=0,
+        api_error_status=None,
     )
 
 
@@ -132,14 +165,21 @@ class PhaseSnapshot:
 
 @dataclass(frozen=True)
 class BurstCast:
-    """Burst tasks take the 529 kills; the genuine control requeues once for a non-5xx reason."""
+    """Burst tasks take the 529 kills; the genuine control requeues once for a non-5xx
+    reason; the two wedge controls hang with no status attached on every invocation."""
 
     burst: tuple[str, ...]
     genuine: str
+    sigkill_wedge: str
+    reify_wedge: str
+
+    @property
+    def wedges(self) -> tuple[str, ...]:
+        return (self.sigkill_wedge, self.reify_wedge)
 
     @property
     def all_ids(self) -> tuple[str, ...]:
-        return (*self.burst, self.genuine)
+        return (*self.burst, self.genuine, *self.wedges)
 
 
 @dataclass(frozen=True)
@@ -148,6 +188,7 @@ class BurstLedger:
     cast: BurstCast
     dispatches: tuple[DispatchRecord, ...]
     after_phase_a: PhaseSnapshot
+    after_phase_b: PhaseSnapshot
     status_writes: Mapping[str, tuple[str, ...]]
     escalations_by_task: Mapping[str, tuple[Escalation, ...]]
     park_stop_trip_wired: bool
@@ -166,6 +207,7 @@ class BurstLedger:
 async def run_incident_burst(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> BurstLedger:
     simulation = _Simulation(tmp_path, monkeypatch)
     await simulation.run_phase_a()
+    await simulation.run_phase_b()
     return simulation.ledger()
 
 
@@ -362,12 +404,16 @@ class _Simulation:
         self.cast = BurstCast(
             burst=tuple(str(_BURST_FIRST_ID + i) for i in range(BURST_SIZE)),
             genuine=_GENUINE_ID,
+            sigkill_wedge=_SIGKILL_WEDGE_ID,
+            reify_wedge=_REIFY_WEDGE_ID,
         )
         self.clock = _SimClock()
         self.store = _OutageTaskStore(self.cast.all_ids)
         self.cli = _CliScript({
             **dict.fromkeys(self.cast.burst, _burst_script),
             self.cast.genuine: _genuine_script,
+            self.cast.sigkill_wedge: lambda _n: sigkill_wedge_result(),
+            self.cast.reify_wedge: lambda _n: reify_4429_wedge_result(),
         })
         self.config = _code_default_config(tmp_path, monkeypatch)
         self.harness, self.scheduler = _build_harness(
@@ -382,6 +428,7 @@ class _Simulation:
         self._sequence = itertools.count()
         self.dispatches: list[DispatchRecord] = []
         self.after_phase_a: PhaseSnapshot | None = None
+        self.after_phase_b: PhaseSnapshot | None = None
 
     async def run_phase_a(self) -> None:
         arrivals: list[tuple[float, int, str]] = []
@@ -395,6 +442,11 @@ class _Simulation:
             if self._kill_pending(record):
                 heapq.heappush(arrivals, (self._redispatch_at(record), next(self._sequence), task_id))
         self.after_phase_a = self._snapshot()
+
+    async def run_phase_b(self) -> None:
+        for task_id in self.cast.wedges:
+            await self._dispatch(task_id, self.clock.now, PHASE_B)
+        self.after_phase_b = self._snapshot()
 
     def _kill_pending(self, record: DispatchRecord) -> bool:
         return (
@@ -445,12 +497,14 @@ class _Simulation:
 
     def ledger(self) -> BurstLedger:
         queue = self.harness._escalation_queue
-        assert queue is not None and self.after_phase_a is not None
+        assert queue is not None
+        assert self.after_phase_a is not None and self.after_phase_b is not None
         return BurstLedger(
             config=self.config,
             cast=self.cast,
             dispatches=tuple(self.dispatches),
             after_phase_a=self.after_phase_a,
+            after_phase_b=self.after_phase_b,
             status_writes=self.store.writes(),
             escalations_by_task={tid: tuple(queue.get_by_task(tid)) for tid in self.cast.all_ids},
             park_stop_trip_wired=self.scheduler.callbacks.on_park_stop_trip is not None,
