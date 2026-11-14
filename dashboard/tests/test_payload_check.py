@@ -3,18 +3,21 @@
 ``dashboard.payload_check`` is the before_done predicate of the
 ``dashboard-payload-budgets`` recurrence chain, so its exit code IS the
 verdict: 0 within budget, 1 over, 2 the instrument failed. These tests drive
-``check_endpoints`` over ``httpx.MockTransport`` and the launcher over a stub
-command; nothing here reaches a network.
+``check_endpoints`` over ``httpx.MockTransport``, ``main`` over a loopback
+socket that never accepts, and the launcher over a stub command; nothing here
+reaches beyond the host.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 
 import httpx
@@ -30,6 +33,7 @@ from dashboard.payload_budgets import (
 )
 from dashboard.payload_check import (
     DEFAULT_TIMEOUT_SECONDS,
+    RUN_DEADLINE_SECONDS,
     SUMMARY_MAX_CHARS,
     check_endpoints,
     main,
@@ -40,9 +44,17 @@ BASE_URL = 'http://dashboard.invalid:8080'
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / 'scripts' / 'check_dashboard_payload_budgets.sh'
 
+STALL_SECONDS = 30.0
+"""Far longer than any deadline under test, so a stalled request ends only by a deadline."""
 
-def _table(*entries: tuple[str, Mapping[str, str], int, list[list[str]]]) -> BudgetTable:
-    return parse_budget_table(json.dumps({
+BOUNDED_SLACK_SECONDS = 4.0
+"""How far past its bound a deadline-bounded call may return on a loaded host."""
+
+TableEntry = tuple[str, Mapping[str, str], int, list[list[str]]]
+
+
+def _table_document(*entries: TableEntry) -> dict:
+    return {
         'schema_version': 1,
         'endpoints': [
             {
@@ -52,14 +64,20 @@ def _table(*entries: tuple[str, Mapping[str, str], int, list[list[str]]]) -> Bud
             for path, query, budget, keyed in entries
         ],
         'exempt': [],
-    }))
+    }
 
 
-TABLE = _table(
+def _table(*entries: TableEntry) -> BudgetTable:
+    return parse_budget_table(json.dumps(_table_document(*entries)))
+
+
+TABLE_ENTRIES: tuple[TableEntry, ...] = (
     ('/api/v2/dashboard/tasks', {}, 2_000, [['TASKS_SNAPSHOT']]),
     ('/api/v2/dashboard/tasks', {'projection': 'census'}, 1_000, [['TASKS_SNAPSHOT']]),
     ('/api/v2/dashboard/burndown', {'window': '90d'}, 3_000, []),
 )
+TABLE = _table(*TABLE_ENTRIES)
+TASKS, CENSUS, BURNDOWN = (entry.url_suffix() for entry in TABLE.endpoints)
 
 
 def _body(size: int) -> bytes:
@@ -69,10 +87,10 @@ def _body(size: int) -> bytes:
     return head + b'x' * (size - len(head) - len(tail)) + tail
 
 
-Responder = Callable[[httpx.Request], httpx.Response]
+Responder = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
 
 
-def _serving(sizes: Mapping[tuple[str, str], int]) -> Responder:
+def _serving(sizes: Mapping[tuple[str, str], int]) -> Callable[[httpx.Request], httpx.Response]:
     """Answer each (path, query string) with a JSON body of the given size."""
     def respond(request: httpx.Request) -> httpx.Response:
         size = sizes[(request.url.path, request.url.query.decode())]
@@ -87,11 +105,31 @@ WITHIN = {
 }
 
 
-def _check(
-    responder: Responder, table: BudgetTable = TABLE, deadline_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+async def _stall(_request: httpx.Request) -> httpx.Response:
+    """Send no headers for far longer than any deadline under test."""
+    await asyncio.sleep(STALL_SECONDS)
+    raise AssertionError('a stalled request outlived every deadline')
+
+
+async def _check(
+    responder: Responder,
+    table: BudgetTable = TABLE,
+    *,
+    request_deadline_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    run_deadline_seconds: float = RUN_DEADLINE_SECONDS,
 ):
-    with httpx.Client(transport=httpx.MockTransport(responder)) as client:
-        return check_endpoints(client, BASE_URL, table, deadline_seconds=deadline_seconds)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(responder)) as client:
+        return await check_endpoints(
+            client, BASE_URL, table,
+            request_deadline_seconds=request_deadline_seconds,
+            run_deadline_seconds=run_deadline_seconds,
+        )
+
+
+async def _timed_check(responder: Responder, table: BudgetTable = TABLE, **deadlines: float):
+    started = time.monotonic()
+    report = await _check(responder, table, **deadlines)
+    return report, time.monotonic() - started
 
 
 def _summary(report) -> dict:
@@ -101,14 +139,25 @@ def _summary(report) -> dict:
     return json.loads(last)
 
 
-def test_requests_every_entry_once_in_table_order_with_its_query():
+def _accounted(listed: Sequence[str]) -> int:
+    """How many requests a summary list stands for, counting a trailing '+N more'."""
+    if listed and listed[-1].startswith('+'):
+        return len(listed) - 1 + int(listed[-1][1:].split()[0])
+    return len(listed)
+
+
+def _line_for(report, suffix: str) -> str:
+    return next(line for line in report.lines if line.startswith(f'{suffix}: '))
+
+
+async def test_requests_every_entry_once_in_table_order_with_its_query():
     seen: list[tuple[str, str, str]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         seen.append((request.url.host, request.url.path, request.url.query.decode()))
         return _serving(WITHIN)(request)
 
-    _check(respond)
+    await _check(respond)
     assert seen == [
         ('dashboard.invalid', '/api/v2/dashboard/tasks', ''),
         ('dashboard.invalid', '/api/v2/dashboard/tasks', 'projection=census'),
@@ -116,27 +165,28 @@ def test_requests_every_entry_once_in_table_order_with_its_query():
     ]
 
 
-def test_requests_are_sequential():
+async def test_requests_are_sequential():
     in_flight = 0
     peak = 0
 
-    class Counting(httpx.BaseTransport):
-        def handle_request(self, request: httpx.Request) -> httpx.Response:
+    class Counting(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             nonlocal in_flight, peak
             in_flight += 1
             peak = max(peak, in_flight)
             try:
+                await asyncio.sleep(0)
                 return _serving(WITHIN)(request)
             finally:
                 in_flight -= 1
 
-    with httpx.Client(transport=Counting()) as client:
-        check_endpoints(client, BASE_URL, TABLE)
+    async with httpx.AsyncClient(transport=Counting()) as client:
+        await check_endpoints(client, BASE_URL, TABLE)
     assert peak == 1
 
 
-def test_all_within_budget_exits_0_with_one_line_per_request_and_a_compact_summary():
-    report = _check(_serving(WITHIN))
+async def test_all_within_budget_exits_0_with_one_line_per_request_and_a_compact_summary():
+    report = await _check(_serving(WITHIN))
 
     assert report.exit_code == 0
     for entry, measured in zip(TABLE.endpoints, WITHIN.values(), strict=True):
@@ -148,12 +198,12 @@ def test_all_within_budget_exits_0_with_one_line_per_request_and_a_compact_summa
     assert summary['checked'] == 3
     assert summary['over'] == []
     assert summary['failed'] == []
-    assert summary['max_ratio'] == ['/api/v2/dashboard/tasks?projection=census', 0.9]
+    assert summary['max_ratio'] == [CENSUS, 0.9]
 
 
-def test_an_overage_exits_1_and_reports_its_largest_fields():
+async def test_an_overage_exits_1_and_reports_its_largest_fields():
     sizes = {**WITHIN, ('/api/v2/dashboard/tasks', 'projection=census'): 1_250}
-    report = _check(_serving(sizes))
+    report = await _check(_serving(sizes))
 
     assert report.exit_code == 1
     census: EndpointBudget = TABLE.endpoints[1]
@@ -161,28 +211,28 @@ def test_an_overage_exits_1_and_reports_its_largest_fields():
     assert breakdown[0].path == 'TASKS_SNAPSHOT.{}.title', 'the declared data-keyed map was not collapsed'
     assert render_overage(census, 1_250, breakdown) in '\n'.join(report.lines)
     summary = _summary(report)
-    assert summary['over'] == ['/api/v2/dashboard/tasks?projection=census']
-    assert summary['max_ratio'] == ['/api/v2/dashboard/tasks?projection=census', 1.25]
+    assert summary['over'] == [CENSUS]
+    assert summary['max_ratio'] == [CENSUS, 1.25]
 
 
-def test_an_over_budget_body_that_is_not_json_is_still_an_overage():
+async def test_an_over_budget_body_that_is_not_json_is_still_an_overage():
     def respond(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith('/burndown'):
             return httpx.Response(200, content=b'<html>' + b'x' * 4_000)
         return _serving(WITHIN)(request)
 
-    report = _check(respond)
+    report = await _check(respond)
 
     assert report.exit_code == 1
     text = '\n'.join(report.lines)
-    assert '/api/v2/dashboard/burndown?window=90d' in text
+    assert BURNDOWN in text
     assert '4,006' in text and '3,000' in text
     assert 'no breakdown' in text
-    assert _summary(report)['over'] == ['/api/v2/dashboard/burndown?window=90d']
+    assert _summary(report)['over'] == [BURNDOWN]
 
 
-def _failing_on_census(failure: Callable[[httpx.Request], httpx.Response]) -> Responder:
-    def respond(request: httpx.Request) -> httpx.Response:
+def _failing_on_census(failure: Responder) -> Responder:
+    def respond(request: httpx.Request) -> httpx.Response | Awaitable[httpx.Response]:
         if request.url.query == b'projection=census':
             return failure(request)
         return _serving(WITHIN)(request)
@@ -206,26 +256,26 @@ def _server_error(_request: httpx.Request) -> httpx.Response:
     (_timed_out, 'read timed out'),
     (_server_error, '503'),
 ], ids=['connect-error', 'timeout', 'non-200'])
-def test_an_instrument_failure_exits_2_and_is_never_an_overage(failure, cause):
-    report = _check(_failing_on_census(failure))
+async def test_an_instrument_failure_exits_2_and_is_never_an_overage(failure, cause):
+    report = await _check(_failing_on_census(failure))
 
     assert report.exit_code == 2
-    assert any('/api/v2/dashboard/tasks?projection=census' in line and cause in line for line in report.lines)
+    assert any(CENSUS in line and cause in line for line in report.lines)
     text = '\n'.join(report.lines)
     assert 'against a budget of' not in text, 'an instrument failure was reported as an overage'
     summary = _summary(report)
     assert summary['over'] == []
-    assert summary['failed'] == ['/api/v2/dashboard/tasks?projection=census']
+    assert summary['failed'] == [CENSUS]
 
 
-def test_a_response_trickling_past_its_deadline_is_abandoned_unmeasured():
+async def test_a_response_trickling_past_its_deadline_is_abandoned_unmeasured():
     chunks = 30
     sent = 0
 
-    def trickle():
+    async def trickle():
         nonlocal sent
         for _ in range(chunks):
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
             sent += 1
             yield b' '
 
@@ -234,44 +284,101 @@ def test_a_response_trickling_past_its_deadline_is_abandoned_unmeasured():
             return httpx.Response(200, content=trickle())
         return _serving(WITHIN)(request)
 
-    report = _check(respond, deadline_seconds=0.5)
+    report = await _check(respond, request_deadline_seconds=0.5)
 
     assert sent < chunks, 'the trickling body was read to its end instead of abandoned at the deadline'
     assert report.exit_code == 2
-    assert any('/api/v2/dashboard/burndown?window=90d' in line and 'deadline' in line for line in report.lines)
-    assert _summary(report)['failed'] == ['/api/v2/dashboard/burndown?window=90d']
+    assert any(BURNDOWN in line and 'deadline' in line for line in report.lines)
+    assert _summary(report)['failed'] == [BURNDOWN]
 
 
-def test_an_overage_beside_an_instrument_failure_is_still_an_overage():
-    def respond(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith('/burndown'):
-            return httpx.Response(200, content=_body(3_300))
-        return _failing_on_census(_refused)(request)
+async def test_headers_that_never_arrive_are_bounded_by_the_request_deadline():
+    report, elapsed = await _timed_check(_failing_on_census(_stall), request_deadline_seconds=0.3)
 
-    report = _check(respond)
+    assert elapsed < 0.3 + BOUNDED_SLACK_SECONDS, f'a request with no headers held the run for {elapsed:.1f} s'
+    assert report.exit_code == 2
+    stalled = _line_for(report, CENSUS)
+    assert 'NOT MEASURED' in stalled and '0.3 s deadline' in stalled and "run's" not in stalled, stalled
+    for suffix in (TASKS, BURNDOWN):
+        assert 'NOT MEASURED' not in _line_for(report, suffix), 'a stall in one request cost another its measurement'
+    assert _summary(report)['failed'] == [CENSUS]
 
-    assert report.exit_code == 1
+
+async def test_the_run_deadline_bounds_the_run_however_many_requests_stall():
+    stalled_table = _table(*((f'/api/v2/dashboard/stalled-{n}', {}, 1_000, []) for n in range(8)))
+    started: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        started.append(request.url.path)
+        return await _stall(request)
+
+    report, elapsed = await _timed_check(
+        respond, stalled_table, request_deadline_seconds=0.4, run_deadline_seconds=1.0,
+    )
+
+    assert elapsed < 1.0 + BOUNDED_SLACK_SECONDS, f'the run took {elapsed:.1f} s against a 1 s run deadline'
+    assert report.exit_code == 2
+    assert 1 <= len(started) <= 3, f'{len(started)} requests started inside a 1 s run of 0.4 s requests'
+    for entry in stalled_table.endpoints:
+        line = _line_for(report, entry.url_suffix())
+        assert 'NOT MEASURED' in line, line
+        if entry.path in started:
+            assert 'not requested' not in line, line
+            assert '0.4 s deadline' in line or "the run's 1 s deadline" in line, line
+        else:
+            assert "not requested: the run's 1 s deadline had passed" in line, line
+    assert _accounted(_summary(report)['failed']) == 8
+
+
+async def test_a_request_cut_short_by_the_run_deadline_names_the_runs_deadline():
+    report, elapsed = await _timed_check(
+        _stall, _table(TABLE_ENTRIES[0]), request_deadline_seconds=STALL_SECONDS, run_deadline_seconds=0.3,
+    )
+
+    assert elapsed < 0.3 + BOUNDED_SLACK_SECONDS
+    assert report.exit_code == 2
+    line = _line_for(report, TASKS)
+    assert "the run's 0.3 s deadline" in line and 'not requested' not in line, line
+    assert f'{STALL_SECONDS:g} s deadline' not in line, line
+
+
+async def test_an_overage_outlives_the_run_deadline():
+    def respond(request: httpx.Request) -> httpx.Response | Awaitable[httpx.Response]:
+        if (request.url.path, request.url.query) == ('/api/v2/dashboard/tasks', b''):
+            return httpx.Response(200, content=_body(2_500))
+        return _stall(request)
+
+    report, elapsed = await _timed_check(respond, run_deadline_seconds=0.5)
+
+    assert elapsed < 0.5 + BOUNDED_SLACK_SECONDS
+    assert report.exit_code == 1, 'the run deadline cost a measured overage its verdict'
+    tasks: EndpointBudget = TABLE.endpoints[0]
+    breakdown = field_breakdown(json.loads(_body(2_500)), tasks.data_keyed_maps)
+    assert render_overage(tasks, 2_500, breakdown) in '\n'.join(report.lines)
     summary = _summary(report)
-    assert summary['over'] == ['/api/v2/dashboard/burndown?window=90d']
-    assert summary['failed'] == ['/api/v2/dashboard/tasks?projection=census']
+    assert summary['over'] == [TASKS]
+    assert summary['failed'] == [CENSUS, BURNDOWN]
 
 
-def test_the_summary_fits_the_note_cap_however_many_requests_are_over():
-    many = _table(*(
-        (f'/api/v2/dashboard/an-endpoint-with-a-long-name-{n:02d}', {'window': 'all'}, 10, [])
-        for n in range(30)
-    ))
+def test_main_bounds_each_request_and_the_run_over_a_real_stalled_socket(tmp_path, capsys):
+    table = tmp_path / 'payload_budgets.json'
+    table.write_text(json.dumps(_table_document(*TABLE_ENTRIES)))
 
-    def respond(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=_body(500))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        started = time.monotonic()
+        code = main([
+            '--base-url', f'http://127.0.0.1:{port}', '--timeout', '0.3', '--run-deadline', '0.8',
+            '--table', str(table),
+        ])
+        elapsed = time.monotonic() - started
 
-    report = _check(respond, many)
-
-    assert report.exit_code == 1
-    summary = _summary(report)
-    assert summary['checked'] == 30
-    assert summary['over'], 'the summary dropped every overage instead of trimming the list'
-    assert summary['over'][-1].startswith('+'), 'a trimmed list must say how many it left out'
+    out = capsys.readouterr().out
+    assert code == 2, out
+    assert elapsed < 0.8 + BOUNDED_SLACK_SECONDS, f'main took {elapsed:.1f} s against a 0.8 s run deadline'
+    assert any("the run's 0.8 s deadline" in line for line in out.splitlines()), out
 
 
 @pytest.mark.parametrize('content', [None, '{"schema_version": 1, "endpoints": []}'], ids=['missing', 'malformed'])
@@ -289,10 +396,15 @@ def test_cli_defaults():
     args = parse_args([])
     assert args.base_url == 'http://127.0.0.1:8080'
     assert args.timeout == 60.0
+    assert args.run_deadline == RUN_DEADLINE_SECONDS
     assert args.table == TABLE_PATH
 
-    args = parse_args(['--base-url', BASE_URL, '--timeout', '5', '--table', '/tmp/t.json'])
-    assert (args.base_url, args.timeout, args.table) == (BASE_URL, 5.0, Path('/tmp/t.json'))
+    args = parse_args([
+        '--base-url', BASE_URL, '--timeout', '5', '--run-deadline', '30', '--table', '/tmp/t.json',
+    ])
+    assert (args.base_url, args.timeout, args.run_deadline, args.table) == (
+        BASE_URL, 5.0, 30.0, Path('/tmp/t.json'),
+    )
 
 
 def test_the_launcher_is_tracked_executable():
