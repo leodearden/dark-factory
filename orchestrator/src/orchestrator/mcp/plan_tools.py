@@ -2174,16 +2174,18 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
 
 def _markup_escalation_sink(
     artifacts: TaskArtifacts,
+    loss_sink: Callable[[dict[str, Any]], Awaitable[object]],
 ) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
     """Build plan-tools' emitter — the shared channel, this server's spec.
 
     The queue-or-nothing payload floor is ``markup_sink``'s, shared with
-    verdict-tools.
+    verdict-tools. A record the queue cannot take is handed to *loss_sink*.
     """
     return markup_sink.make_escalation_sink(
         worktree=artifacts.worktree,
         spec=MARKUP_SINK_SPEC,
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
+        loss_sink=loss_sink,
         # Resolved through THIS module's globals per call, so a test that
         # substitutes either seam steers an already-built sink.
         resolve_root=lambda worktree: _markup_project_root(worktree),
@@ -2240,6 +2242,7 @@ def _markup_plan_stamp(
 
 def _markup_fact_sink(
     artifacts: TaskArtifacts,
+    journal: Callable[[dict[str, Any]], Awaitable[str | None]],
 ) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
     """Fan one markup fact out to BOTH of this server's fact channels.
 
@@ -2262,10 +2265,11 @@ def _markup_fact_sink(
     composed sink returns THE JOURNAL'S locator — the existing fact-sink return
     contract is unchanged, and the stamp is purely additive.
 
-    Both emitters are built ONCE, here, rather than per record: each memoizes
-    its own resolution state, and rebuilding them per call would discard it.
+    Both emitters are built ONCE rather than per record: each memoizes its own
+    resolution state, and rebuilding them per call would discard it. The
+    journal is built by ``create_server`` and shared with the escalation sink's
+    loss channel; the stamp is built here.
     """
-    journal = _markup_fact_journal(artifacts)
     stamp = _markup_plan_stamp(artifacts)
 
     async def fact_sink(record: dict[str, Any]) -> str | None:
@@ -2403,12 +2407,17 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     # the worst case: an architect whose LAST plan-tools call is a refusal, and
     # which then stops, would have its losses silently dropped — and that is
     # precisely the situation most in need of explanation.
+    #
+    # ONE journal serves the fact sink and the escalation sink's loss records;
+    # why is in the docstring of
+    # orchestrator/src/orchestrator/mcp/markup_sink.py::make_escalation_sink.
+    journal = _markup_fact_journal(artifacts)
     mcp.add_middleware(
         MarkupGuardMiddleware(
             RepairPolicy.REJECT_WITH_REPAIR,
             exempt_tools=frozenset(),
-            escalation_sink=_markup_escalation_sink(artifacts),
-            fact_sink=_markup_fact_sink(artifacts),
+            escalation_sink=_markup_escalation_sink(artifacts, journal),
+            fact_sink=_markup_fact_sink(artifacts, journal),
         )
     )
     mcp.add_middleware(MissingArgumentMiddleware())
