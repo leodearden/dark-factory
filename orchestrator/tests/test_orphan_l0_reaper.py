@@ -21,7 +21,8 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
 from orchestrator.escalation_router import AGGREGATE_ROLE, status_info_sentinel
 from orchestrator.harness import Harness
-from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.review_checkpoint import ReviewCheckpoint, review_escalation_task_id
+from orchestrator.verify import VerifyResult
 
 
 @pytest.fixture
@@ -666,7 +667,7 @@ class TestReviewerEscalationPromotion:
 
     def test_promotes_l0_to_l1(self, checkpoint: ReviewCheckpoint):
         review_id = '20260418T120000'
-        synthetic = f'review-{review_id}'
+        synthetic = review_escalation_task_id(review_id)
         assert checkpoint.escalation_queue is not None
         original = _submit_aged(
             checkpoint.escalation_queue, synthetic, seconds_ago=1.0,
@@ -698,19 +699,47 @@ class TestReviewerEscalationPromotion:
         assert checkpoint.escalation_queue is not None
         _submit_aged(
             checkpoint.escalation_queue,
-            'review-20260418T000000',
+            review_escalation_task_id('20260418T000000'),
             seconds_ago=1.0,
         )
         assert checkpoint._promote_reviewer_escalations('20260418T999999') == 0
 
     def test_does_not_touch_l1(self, checkpoint: ReviewCheckpoint):
         review_id = '20260418T120000'
-        synthetic = f'review-{review_id}'
+        synthetic = review_escalation_task_id(review_id)
         assert checkpoint.escalation_queue is not None
         _submit_aged(
             checkpoint.escalation_queue, synthetic, seconds_ago=1.0, level=1,
         )
         assert checkpoint._promote_reviewer_escalations(review_id) == 0
+
+    def test_prompt_names_the_task_id_promotion_keys_on(
+        self, checkpoint: ReviewCheckpoint,
+    ):
+        review_id = '20260418T120000'
+        tid = review_escalation_task_id(review_id)
+        prompt = checkpoint._build_prompt(
+            mode='focused',
+            phase1=VerifyResult(
+                passed=True, summary='OK', test_output='', lint_output='', type_output='',
+            ),
+            modules=['orchestrator'],
+            briefing_content='',
+            review_id=review_id,
+        )
+
+        # Delimited on purpose: the agent_id `claude-review-<id>` already
+        # contains the bare `review-<id>` substring.
+        assert f'`{tid}`' in prompt
+        assert f'escalate_info(task_id="{tid}"' in prompt
+
+        assert checkpoint.escalation_queue is not None
+        _submit_aged(
+            checkpoint.escalation_queue, tid, seconds_ago=1.0, severity='info',
+        )
+        assert checkpoint._promote_reviewer_escalations(review_id) == 1
+        l1s = [e for e in checkpoint.escalation_queue.get_pending() if e.level == 1]
+        assert [e.task_id for e in l1s] == [tid]
 
 
 # ---------------------------------------------------------------------------
