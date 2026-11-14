@@ -698,7 +698,8 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
-    # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload
+    # Producer: scheduler.py::Scheduler._journal_age_resets, for each reset
+    # age_anchors.py::AgeAnchors.observe returns.  Payload
     # {anchor: int, pending_since: str}: the max_id the task's age now counts
     # from, and the stamp whose change signalled the reset.  Emitted once per
     # applied reset; restoring that anchor at a later process start emits

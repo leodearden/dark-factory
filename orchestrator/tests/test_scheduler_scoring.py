@@ -354,13 +354,13 @@ def _population(first_id: int, *, anchored: int, anchorless: int) -> list[dict]:
 def _gate_tick(scheduler: Scheduler, tasks: list[dict]) -> TickContext:
     """A tick over *tasks* whose legacy ages are non-zero, as acquire_next's preamble leaves them."""
     max_id = max(int(t['id']) for t in tasks)
-    scheduler._update_age_anchors(tasks, max_id)
+    scheduler.age_anchors.observe(tasks, max_id)
     return _tick(tasks, {t['id']: int(t['id']) % 4 for t in tasks}, max_id)
 
 
 def _legacy_scores(scheduler: Scheduler, ctx: TickContext) -> dict[str, float]:
     return {t['id']: scheduler._compute_score_legacy(
-        t['priority'], scheduler._compute_age(t['id'], ctx.max_id), ctx.transitive_counts[t['id']])
+        t['priority'], scheduler.age_anchors.age(t['id'], ctx.max_id), ctx.transitive_counts[t['id']])
         for t in ctx.candidates}
 
 
