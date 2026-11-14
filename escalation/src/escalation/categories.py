@@ -84,7 +84,6 @@ class EscalationCategory(StrEnum):
     RECON_MISSING_INDEX = 'recon_missing_index'
     RECON_REMEDIATION_PHANTOM_CITATION_STORM = 'recon_remediation_phantom_citation_storm'
     RECON_REMEDIATION_PLACEHOLDER_STORM = 'recon_remediation_placeholder_storm'
-    RECON_RESUME_FAILURE_STORM = 'recon_resume_failure_storm'
     RECON_STALE_RUN = 'recon_stale_run'
     RECON_STALE_TASK_COUNT_SNAPSHOT = 'recon_stale_task_count_snapshot'
     RECON_TASK_FINDING = 'recon_task_finding'
