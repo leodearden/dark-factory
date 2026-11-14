@@ -117,6 +117,7 @@ __all__ = [
     'ResolutionOutcome',
     'ResolverUnavailable',
     'ToolClass',
+    'UUID_PREFIX_REPAIR_META_KEY',
     'UUID_PREFIX_STORM_ERROR_TYPE',
     'UnavailableReason',
     'UuidPrefixGuardMiddleware',
@@ -315,6 +316,11 @@ STORM_COUNTED_OUTCOMES: frozenset[str] = frozenset({'forwarded_ambiguous', 'reso
 #: record's type from which callable it arrived on — ``FACT_MARKUP_DETECTED``'s
 #: convention, and the two streams are read side by side.
 FACT_UUID_PREFIX_DETECTED = 'uuid_prefix_detected'
+
+
+#: The ``meta`` key a forwarded call's report rides under. Public so a
+#: consumer that surfaces the report elsewhere names it without retyping it.
+UUID_PREFIX_REPAIR_META_KEY = 'uuid_prefix_repair'
 
 
 #: The C2 port, declared HERE because the guard is the party that depends on
@@ -1103,7 +1109,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         """
         result = await call_next(context)
         meta = dict(result.meta or {})
-        meta['uuid_prefix_repair'] = report
+        meta[UUID_PREFIX_REPAIR_META_KEY] = report
         return ToolResult(
             content=result.content,
             structured_content=result.structured_content,

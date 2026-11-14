@@ -46,6 +46,7 @@ from fused_memory.server.tools import (  # noqa: E402
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
+from fused_memory.services.id_resolver import IdResolver  # noqa: E402
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
@@ -1022,8 +1023,16 @@ async def run_server():
     # Both ToolManager.call_tool wrappings, in the ONE order that works. The
     # ordering rationale lives on the helper, and is pinned by
     # tests/test_markup_guard_fused_memory.py::TestInstallationOrder rather
-    # than by this comment.
-    _install_tool_dispatch_guards(mcp, known_projects=_known_projects_map, prefix_resolver=None)
+    # than by this comment. The prefix resolver is built per use, as
+    # create_mcp_server's own is, so a hot reload of the Mem0 read timeout or
+    # collection prefix applies to the next resolution.
+    _install_tool_dispatch_guards(
+        mcp,
+        known_projects=_known_projects_map,
+        prefix_resolver=lambda project_id, prefix: IdResolver.for_memory_service(
+            memory_service
+        ).resolve_prefix(project_id, prefix),
+    )
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
