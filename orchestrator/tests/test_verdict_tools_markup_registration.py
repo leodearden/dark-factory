@@ -1129,6 +1129,19 @@ class _RefusingQueue:
         raise OSError('No space left on device')
 
 
+class _LossRecorder:
+    """The loss sink every direct sink build here needs: it keeps what it was handed.
+
+    The loss contract itself is ``test_markup_sink_losses.py``'s.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    async def __call__(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
+
+
 class _RecordingQueue:
     """A queue that takes every record and keeps it for the row to read."""
 
@@ -1162,6 +1175,7 @@ async def file_an_unknown_kind(root: Path) -> _RecordingQueue:
         subject_task_id=lambda: '6083',
         resolve_root=lambda worktree: root,
         open_channel=lambda project_root: (Escalation, queue),
+        loss_sink=_LossRecorder(),
     )
     await sink({
         'error_type': UNKNOWN_KIND,
@@ -1267,6 +1281,7 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: tmp_path,
             open_channel=lambda root: (Escalation, queue),
+            loss_sink=_LossRecorder(),
         )
         record = {
             'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
@@ -1360,6 +1375,7 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=resolve_root,
             open_channel=open_channel,
+            loss_sink=_LossRecorder(),
         )
 
         with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
@@ -1392,6 +1408,7 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: None,
             open_channel=lambda root: None,
+            loss_sink=_LossRecorder(),
         )
 
         with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
@@ -1429,6 +1446,7 @@ class TestVerdictToolsResidueChannelIsShared:
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: None,
             open_channel=lambda root: None,
+            loss_sink=_LossRecorder(),
         )
         assert await sink({'error_type': 'mcp_markup_unrepairable'}) is None
 

@@ -1085,8 +1085,8 @@ def build_residue_rig(
 
     real_factory = plan_tools._markup_escalation_sink
 
-    def recording_factory(sink_artifacts: TaskArtifacts):
-        sink = real_factory(sink_artifacts)
+    def recording_factory(sink_artifacts: TaskArtifacts, loss_sink):
+        sink = real_factory(sink_artifacts, loss_sink)
 
         # ASYNC, because the real sink is: it does its blocking work on a
         # worker thread so a git subprocess and two fsync'd queue writes never
@@ -2079,7 +2079,7 @@ class TestAnUnrecognisedRecordKindIsStillFiled:
         monkeypatch.setattr(
             plan_tools, '_escalation_channel', lambda root: (Escalation, queue)
         )
-        sink = plan_tools._markup_escalation_sink(artifacts)
+        sink = plan_tools._markup_escalation_sink(artifacts, _RecordingArm())
 
         esc_id = await sink({
             'error_type': 'mcp_markup_something_new',
@@ -2393,13 +2393,11 @@ class _RecordingArm:
 def _compose(monkeypatch, artifacts, journal: _RecordingArm, stamp: _RecordingArm):
     """Build ``_markup_fact_sink`` over two fake arms.
 
-    Substitutes the module-level SEAMS rather than reaching into the built
-    sink, which is the convention ``_markup_escalation_sink`` and
-    ``_markup_fact_journal`` already keep on this module.
+    The journal is handed in, as ``create_server`` hands in the one it shares
+    with the escalation sink; the stamp is substituted at its module-level seam.
     """
-    monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
     monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
-    return plan_tools._markup_fact_sink(artifacts)
+    return plan_tools._markup_fact_sink(artifacts, journal)
 
 
 class TestTheFactSinkFansOutToBothChannels:
@@ -2504,10 +2502,9 @@ class TestTheTwoArmsAreIsolatedFromEachOther:
             order.append('stamp')
             return 'plan.json'
 
-        monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
         monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
 
-        await plan_tools._markup_fact_sink(artifacts)({'tool': 'add_design_decision'})
+        await plan_tools._markup_fact_sink(artifacts, journal)({'tool': 'add_design_decision'})
 
         assert order == ['journal', 'stamp']
 

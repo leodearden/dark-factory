@@ -101,12 +101,25 @@ def _pending(root: Path) -> list[Escalation]:
     return EscalationQueue(_queue_dir(root)).get_pending()
 
 
-def _sink(tmp_path: Path, worktree: Path, subject: str):
+class _LossRecorder:
+    """A loss sink that keeps every record handed to it."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    async def __call__(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
+
+
+def _sink(
+    tmp_path: Path, worktree: Path, subject: str, losses: _LossRecorder | None = None,
+):
     return markup_sink.make_escalation_sink(
         worktree=worktree,
         spec=SPEC,
         subject_task_id=lambda: subject,
         resolve_root=lambda _wt: tmp_path,
+        loss_sink=_LossRecorder() if losses is None else losses,
     )
 
 
@@ -121,10 +134,13 @@ class TestAnEvalLaneRecordFilesNothing:
         subject: str,
         record: Callable[[], dict[str, Any]],
     ):
-        filed = await _sink(tmp_path, worktree(tmp_path), subject)(record())
+        losses = _LossRecorder()
+
+        filed = await _sink(tmp_path, worktree(tmp_path), subject, losses)(record())
 
         assert filed is None
         assert not _queue_dir(tmp_path).exists()
+        assert losses.records == [], 'an eval-lane record is deliberately unfiled, not lost'
 
 
 class TestAProductionRecordStillFiles:
