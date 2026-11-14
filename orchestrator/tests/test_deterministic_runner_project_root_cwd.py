@@ -5,7 +5,8 @@ config names another project_root. A relative ``before_done.script`` and an
 absent ``cwd`` must resolve against the configured project_root — the root
 fused-memory's submit guard validated the script under — never against the
 process cwd. Every case drives the public ``DeterministicRunner.run()`` with the
-real default script runner.
+real default script runner. The file also pins the schedule-time refusal of a
+self-restart whose resolved script is missing or not executable (task 5312).
 """
 
 from __future__ import annotations
@@ -257,6 +258,65 @@ class TestBeforeDoneRunsUnderConfiguredProjectRoot:
 
         assert outcome == WorkflowOutcome.DONE
         assert marker.read_text().strip() == str(other_dir.resolve())
+
+
+SELF_RESTART_SCRIPT = 'scripts/orchestrator-redeploy-restart.sh'
+
+
+def _plant_missing(project_root: Path, elsewhere: Path) -> None:
+    decoy = elsewhere / SELF_RESTART_SCRIPT
+    decoy.parent.mkdir(parents=True)
+    decoy.write_text('#!/bin/sh\nexit 0\n')
+    decoy.chmod(0o755)
+
+
+def _plant_not_executable(project_root: Path, elsewhere: Path) -> None:
+    script = project_root / SELF_RESTART_SCRIPT
+    script.parent.mkdir(parents=True)
+    script.write_text('#!/bin/sh\nexit 0\n')
+    script.chmod(0o644)
+
+
+@pytest.mark.asyncio
+class TestSelfTargetRefusesUnrunnableScript:
+    @pytest.mark.parametrize(
+        'plant',
+        [
+            pytest.param(_plant_missing, id='missing'),
+            pytest.param(_plant_not_executable, id='not-executable'),
+        ],
+    )
+    async def test_unrunnable_script_blocks_without_registering_a_unit(
+        self, plant, project_root: Path, elsewhere: Path, queue: EscalationQueue,
+    ) -> None:
+        plant(project_root, elsewhere)
+        own_unit = 'orchestrator-reify.service'
+        task = _task('5312', {
+            'script': SELF_RESTART_SCRIPT,
+            'timeout_secs': 10,
+            'target_unit': own_unit,
+        })
+        scheduler = _scheduler(task, project_root)
+        runner = DeterministicRunner(
+            scheduler=scheduler, escalation_queue=queue, own_unit_resolver=lambda: own_unit,
+        )
+        executed_plans: list[RestartPlan] = []
+
+        async def _record_execute(self, *, runner=None, inspector=None):
+            executed_plans.append(self)
+            return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
+
+        with patch.object(RestartPlan, 'execute', _record_execute):
+            outcome = await runner.run(_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert executed_plans == []
+        statuses = [c.args[1] for c in scheduler.set_task_status.await_args_list]
+        assert 'done' not in statuses
+        [esc] = queue.get_by_task('5312', status='pending')
+        assert esc.category == 'infra_issue'
+        assert esc.summary == f'Self-restart scheduling failed: {own_unit}', esc.summary
+        assert str(project_root.resolve() / SELF_RESTART_SCRIPT) in esc.detail, esc.detail
 
 
 @pytest.mark.asyncio
