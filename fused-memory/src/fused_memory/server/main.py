@@ -1028,7 +1028,7 @@ async def run_server():
         topic_cluster_store=topic_cluster_store,
     )
 
-    # Both ToolManager.call_tool wrappers, in the ONE order that works. The
+    # The ToolManager.call_tool wrappers, in the ONE order that works. The
     # ordering rationale lives on the helper, and is pinned by
     # tests/test_markup_guard_fused_memory.py::TestInstallationOrder rather
     # than by this comment.
@@ -2128,22 +2128,26 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 def _install_tool_dispatch_guards(
     mcp: Any, *, known_projects: dict[str, str] | None = None
 ) -> None:
-    """Install the three ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+    """Install the four ``ToolManager.call_tool`` wrappers, in the ONE order that works.
 
-    Three independent concerns share this chokepoint, and the order they are
+    Four independent concerns share this chokepoint, and the order they are
     installed in is not cosmetic — each call wraps whatever ``call_tool`` it
     finds, so the order decides which one ends up OUTSIDE, and therefore what
     the caller sees when more than one fires:
 
-    1. :func:`_install_safe_tool_wrapper` — defence-in-depth, INNERMOST.
+    1. :func:`~fused_memory.server.str_argument_passthrough.install_str_argument_passthrough`
+       — INNERMOST. Keeps a string sent to a ``str | None`` parameter verbatim
+       through FastMCP's argument pre-parse (task 7472). It rejects nothing,
+       so all that matters is that it sits inside the safe wrapper.
+    2. :func:`_install_safe_tool_wrapper` — defence-in-depth.
        Catches BaseException escapes (SystemExit, BaseExceptionGroup, ...) that
        would otherwise poison StreamableHTTPSessionManager's shared task group
        and cascade into uvicorn's main loop. Re-raises CancelledError, which
        asyncio cancellation semantics require.
-    2. :func:`~fused_memory.server.unknown_argument_guard.install_unknown_argument_guard`
+    3. :func:`~fused_memory.server.unknown_argument_guard.install_unknown_argument_guard`
        — refuses a call naming an argument the tool does not declare, which
        the bundled FastMCP would otherwise drop silently (task 4867).
-    3. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
+    4. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
        write-boundary markup guard (task 4458, PRD
        ``plans/toolcall-markup-containment-prd.md``), OUTERMOST. Rejects a call
        whose argument absorbed MCP tool-call envelope markup and hands the
@@ -2175,10 +2179,12 @@ def _install_tool_dispatch_guards(
     REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
     C2), declared HERE at the interception point rather than inferred per tool
     (INV-1). The recon-report server hosts no write tools and gets no markup
-    guard; it gets the other two through :func:`_install_recon_report_guards`.
+    guard; it gets the other three through :func:`_install_recon_report_guards`.
     """
+    from fused_memory.server.str_argument_passthrough import install_str_argument_passthrough
     from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
 
+    install_str_argument_passthrough(mcp)
     _install_safe_tool_wrapper(mcp)
     install_unknown_argument_guard(mcp)
     install_markup_guard(
@@ -2189,14 +2195,16 @@ def _install_tool_dispatch_guards(
 
 
 def _install_recon_report_guards(mcp: Any) -> None:
-    """The recon-report server's wrappers: the safe wrapper inside, the unknown-argument guard outside.
+    """The recon-report server's wrappers: the str passthrough innermost, then the safe wrapper, the unknown-argument guard outside.
 
     Recon LLM agents call its cite_* and report tools over MCP, so a misnamed
     argument there is dropped exactly as on the primary server. Order: see
     :func:`_install_tool_dispatch_guards`.
     """
+    from fused_memory.server.str_argument_passthrough import install_str_argument_passthrough
     from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
 
+    install_str_argument_passthrough(mcp)
     _install_safe_tool_wrapper(mcp)
     install_unknown_argument_guard(mcp)
 
