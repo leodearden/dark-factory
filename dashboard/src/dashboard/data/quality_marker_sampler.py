@@ -33,6 +33,7 @@ from dashboard.data.quality_markers import (
     load_curated_markers,
 )
 from dashboard.data.quality_root_tick import (
+    FACTORY_REPO,
     describe_root_failure,
     git_checkouts,
     run_in_root_threads,
@@ -46,7 +47,6 @@ from dashboard.data.quality_store import (
 from dashboard.data.utils import resolve_now
 
 __all__ = [
-    'FACTORY_REPO',
     'MARKER_GIT_TIMEOUT_SECONDS',
     'MARKER_PER_ROOT_BUDGET_SECONDS',
     'MARKER_ROUTING_BATCH',
@@ -66,10 +66,6 @@ MARKER_GIT_TIMEOUT_SECONDS = 30.0
 
 ROLES_PY = 'orchestrator/src/orchestrator/agents/roles.py'
 """Where every role's prompt lives in the factory repo."""
-
-FACTORY_REPO = Path(__file__).resolve().parents[4]
-"""This module's own checkout: the factory whose roles.py every project's orchestrator runs."""
-
 
 def _counted_since(fold: RoutingFold, curated: CuratedMarkers) -> datetime | None:
     """The newest curated prompt marker in the project's scope, else its first routing decision."""

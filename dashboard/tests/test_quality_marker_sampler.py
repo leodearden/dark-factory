@@ -22,7 +22,6 @@ from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.data.quality_marker_sampler import (
-    FACTORY_REPO,
     MARKER_GIT_TIMEOUT_SECONDS,
     MARKER_PER_ROOT_BUDGET_SECONDS,
     ROLES_PY,
@@ -39,6 +38,7 @@ from dashboard.data.quality_markers import (
     derived_markers,
     fold_routing_decisions,
 )
+from dashboard.data.quality_root_tick import FACTORY_REPO
 from dashboard.data.quality_sampler import (
     QUALITY_PER_ROOT_BUDGET_SECONDS,
     QUALITY_SAMPLE_INTERVAL_SECONDS,
