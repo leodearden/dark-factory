@@ -57,7 +57,6 @@ def _git_ops(
     effect_present,
     effect_probe=None,
     main_branch='main',
-    delivered_checks_enabled=True,
     fork_point=None,
     reported_commit_files=None,
     reported_commit_diff_error=None,
@@ -78,10 +77,11 @@ def _git_ops(
     ``commit_effect_present_in_main`` on a bare MagicMock.
 
     ``config`` is a REAL object, not a MagicMock attribute (amendment pass):
-    the differential now reads ``config.main_branch`` for its third leg and
-    ``config.delivered_checks.enabled`` for the kill switch, and an
-    auto-created MagicMock attribute would sail through both as a truthy
-    non-string.  ``fork_point`` stubs ``merge_base_with_main``; left UNSTUBBED
+    the differential reads ``config.main_branch`` for its third leg, and an
+    auto-created MagicMock attribute would sail through as a truthy
+    non-string.  It carries no kill switch: like a real ``GitOps.config``, the
+    leaf comes from the caller's ``checks_enabled`` (task 6276).
+    ``fork_point`` stubs ``merge_base_with_main``; left UNSTUBBED
     when omitted so the ``^1`` fallback stays exercised on the shape the other
     gate-wiring files construct.
 
@@ -95,10 +95,7 @@ def _git_ops(
     fallback's gate and anchor, so a default ``no_citation`` miss declines cleanly.
     """
     git_ops = MagicMock()
-    git_ops.config = SimpleNamespace(
-        main_branch=main_branch,
-        delivered_checks=SimpleNamespace(enabled=delivered_checks_enabled),
-    )
+    git_ops.config = SimpleNamespace(main_branch=main_branch)
     if fork_point is not None:
         git_ops.merge_base_with_main = AsyncMock(return_value=fork_point)
     else:
@@ -123,6 +120,24 @@ def _git_ops(
     git_ops.find_equivalent_commit = AsyncMock(return_value=equivalent)
     git_ops.project_root = '/repo'
     return git_ops
+
+
+def _survival_rejecting_git_ops(candidate_sha: str) -> MagicMock:
+    """A git_ops whose survival check REJECTS — the only path the
+    delivered-checks differential is ever consulted on.
+    """
+    return _git_ops(
+        citation=None,
+        is_ancestor_map={},
+        effect_present=False,
+        effect_probe=CommitEffectProbe(
+            present=False,
+            diverged_paths=('shared/manifest.py',),
+            anchor_sha=candidate_sha,
+            failure='effect_not_survived',
+            aggregate_survival=0.42,
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -1109,24 +1124,6 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
     branch — not by care.
     """
 
-    @staticmethod
-    def _rejecting_git_ops(candidate_sha: str) -> MagicMock:
-        """A git_ops whose survival check REJECTS — the only path the
-        differential is ever consulted on.
-        """
-        return _git_ops(
-            citation=None,
-            is_ancestor_map={},
-            effect_present=False,
-            effect_probe=CommitEffectProbe(
-                present=False,
-                diverged_paths=('shared/manifest.py',),
-                anchor_sha=candidate_sha,
-                failure='effect_not_survived',
-                aggregate_survival=0.42,
-            ),
-        )
-
     async def test_differential_upgrades_a_survival_rejection(self) -> None:
         """(a) FAIL at the parent, PASS at the citation, PASS at main ->
         a verdict survival REJECTED is ACCEPTED.
@@ -1135,7 +1132,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         merge made the capability true is the entire signal.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1145,7 +1142,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1179,7 +1176,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1233,7 +1230,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         an exception, always an explicit NO SIGNAL in the probe.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         by_ref = {
             f'{sha}^1': outcomes['parent'],
             sha: outcomes['citation'],
@@ -1244,7 +1241,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is False, f'rot ({rot}) must not flip the verdict'
@@ -1258,7 +1255,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         recorded into the probe that gets rendered into the escalation.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
 
         async def _boom(check, *, project_root, ref='main', runner=None):
             raise RuntimeError('delivered-check runner exploded')
@@ -1266,7 +1263,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', _boom):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is False
@@ -1288,7 +1285,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         invert them a second time.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1298,7 +1295,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check('cap-removed', expect='absent')],
+                delivered_checks=[_grep_check('cap-removed', expect='absent')], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1314,7 +1311,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         the precise double-inversion bug this pins against.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, _calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.DELIVERED,
             sha: DeliveredCheckResult.FAILED,
@@ -1324,7 +1321,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check('cap-removed', expect='absent')],
+                delivered_checks=[_grep_check('cap-removed', expect='absent')], checks_enabled=True,
             )
 
         assert verdict.accepted is False
@@ -1337,13 +1334,13 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         that would answer identically each time.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({})
 
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_script_check()],
+                delivered_checks=[_script_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is False
@@ -1359,7 +1356,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         kinds still gets the differential from the greppable one.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1369,7 +1366,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_script_check(), _grep_check()],
+                delivered_checks=[_script_check(), _grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1391,18 +1388,18 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         })
 
         unwired = await validate_landing_evidence(
-            self._rejecting_git_ops(sha), '42', 'task/42',
+            _survival_rejecting_git_ops(sha), '42', 'task/42',
             branch_tip_sha=None, candidate_sha=sha,
         )
         none_declared = await validate_landing_evidence(
-            self._rejecting_git_ops(sha), '42', 'task/42',
-            branch_tip_sha=None, candidate_sha=sha, delivered_checks=[],
+            _survival_rejecting_git_ops(sha), '42', 'task/42',
+            branch_tip_sha=None, candidate_sha=sha, delivered_checks=[], checks_enabled=True,
         )
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             evaluated = await validate_landing_evidence(
-                self._rejecting_git_ops(sha), '42', 'task/42',
+                _survival_rejecting_git_ops(sha), '42', 'task/42',
                 branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert unwired.probe['delivered_checks_state'] == 'unwired'
@@ -1460,7 +1457,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', branch, branch_tip_sha=branch_tip_sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1511,7 +1508,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', branch, branch_tip_sha=branch_tip_sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         git_ops.merge_base_with_main.assert_awaited_once_with(branch_tip_sha)
@@ -1538,7 +1535,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         structurally incapable of ever confirming.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         git_ops.merge_base_with_main = AsyncMock(return_value=sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
@@ -1549,7 +1546,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1568,11 +1565,8 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         silently mis-target.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
-        git_ops.config = SimpleNamespace(
-            main_branch='trunk',
-            delivered_checks=SimpleNamespace(enabled=True),
-        )
+        git_ops = _survival_rejecting_git_ops(sha)
+        git_ops.config = SimpleNamespace(main_branch='trunk')
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1584,47 +1578,11 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert [ref for _name, ref in calls] == [f'{sha}^1', sha, 'trunk']
         assert verdict.accepted is True
-
-    async def test_the_kill_switch_disables_the_second_accept_path(self) -> None:
-        """``delivered_checks.enabled=False`` switches this consumer off too.
-
-        The mark-done delivered-check gate honours that flag
-        (``Harness._delivered_checks_withhold``); a second consumer that
-        ignored it would mean disabling the feature did not actually disable
-        it.  The rejection is left exactly as survival found it, no check is
-        executed, and the state is RECORDED rather than looking like ordinary
-        bad luck — an operator must be able to see in the escalation that the
-        path was switched off, not merely unlucky.
-        """
-        sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
-        git_ops.config = SimpleNamespace(
-            main_branch='main',
-            delivered_checks=SimpleNamespace(enabled=False),
-        )
-        stub, calls = _check_runner({
-            f'{sha}^1': DeliveredCheckResult.FAILED,
-            sha: DeliveredCheckResult.DELIVERED,
-            'main': DeliveredCheckResult.DELIVERED,
-        })
-
-        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
-            verdict = await validate_landing_evidence(
-                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
-            )
-
-        assert calls == [], 'no declared check may run while the feature is off'
-        assert verdict.accepted is False
-        assert verdict.reason == 'effect_absent'
-        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
-        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
-        assert 'delivered_checks.enabled is false' in detail
 
     @pytest.mark.parametrize('checks_enabled', [True, False])
     @pytest.mark.parametrize('mode', ['candidate', 'discovery'])
@@ -1634,12 +1592,12 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         """A real ``GitOps.config`` carries no ``delivered_checks``, so the
         caller holding the project config passes the leaf as ``checks_enabled``.
 
-        The git_ops here says ENABLED, the real-GitOps shape: only the caller's
-        argument can disarm the rescue, in either mode.
+        The git_ops here carries no kill switch, the real-GitOps shape: only
+        the caller's argument can disarm the rescue, in either mode.
         """
         sha = 'c' * 40
         if mode == 'candidate':
-            git_ops = self._rejecting_git_ops(sha)
+            git_ops = _survival_rejecting_git_ops(sha)
             candidate_sha: str | None = sha
         else:
             git_ops = _git_ops(
@@ -1688,7 +1646,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is False
@@ -1710,7 +1668,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
                 '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
             )
             rejected = await validate_landing_evidence(
-                self._rejecting_git_ops(sha), '42', 'task/42',
+                _survival_rejecting_git_ops(sha), '42', 'task/42',
                 branch_tip_sha=None, candidate_sha=sha,
             )
 
@@ -1819,7 +1777,7 @@ class TestRescuedByDeliveredChecks:
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
                 delivered_checks=[
                     {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
-                ],
+                ], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -2062,7 +2020,7 @@ class TestValidateLandingEvidenceBehaviourPreservation:
         verdict = await validate_landing_evidence(
             _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
             '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-            delivered_checks=delivered_checks,
+            delivered_checks=delivered_checks, checks_enabled=True,
         )
         assert verdict.accepted is True, 'seeded on the ACCEPT path too'
         assert verdict.probe['delivered_checks_state'] == expected
@@ -3371,3 +3329,102 @@ class TestContentEquivalenceFallbackRealGit:
         assert verdict.probe['content_fallback'] == 'unanchored'
         assert verdict.probe['evidence_source'] == 'no_equivalent_on_main'
         assert verdict.evidence_sha is None
+
+
+def _build_reverted_capability(repo: _Repo) -> str:
+    """A commit citing task 42 whose added lines a later rewrite removed.
+
+    Returns the cited sha.  Its effect is genuinely ABSENT at main, so the
+    survival check rejects and only the delivered-checks rescue can accept.
+    """
+    cited = repo.commit('feat(42): add the capability', {'pkg/cap.py': _numbered('cap', 30)})
+    repo.commit('refactor: rewrite pkg/cap.py', {'pkg/cap.py': _numbered('gone', 30)})
+    return cited
+
+
+@pytest.mark.asyncio
+class TestDeliveredChecksLeafIsTheCallers:
+    """The rescue's kill switch has ONE source: the caller's
+    ``delivered_checks.enabled`` leaf (task 6276).
+
+    A real ``GitOps.config`` is the ``git`` sub-config, which has no such
+    field, so a caller that supplies checks without the leaf would leave the
+    rescue armed with the feature switched off.  Supplying checks without it
+    is therefore refused outright.
+    """
+
+    @pytest.mark.parametrize('checks_enabled', [True, False])
+    async def test_a_real_gitops_obeys_the_callers_leaf(
+        self, real_git_ops: GitOps, real_git_repo: Path, checks_enabled: bool,
+    ) -> None:
+        assert 'delivered_checks' not in GitConfig.model_fields, (
+            'premise: production GitOps.config cannot carry the kill switch'
+        )
+        cited = _build_reverted_capability(_Repo(real_git_repo))
+        assert await real_git_ops.commit_effect_present_in_main(cited) is False
+        stub, calls = _check_runner({
+            f'{cited}^1': DeliveredCheckResult.FAILED,
+            cited: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                real_git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=cited,
+                delivered_checks=[_grep_check()], checks_enabled=checks_enabled,
+            )
+
+        if checks_enabled:
+            assert verdict.accepted is True
+            assert verdict.rescued_by_delivered_checks is True
+            return
+        assert calls == [], 'no declared check may run while the feature is off'
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+        assert 'delivered_checks.enabled is false' in detail, (
+            'an operator must see the path was switched off, not merely unlucky'
+        )
+
+    @pytest.mark.parametrize('candidate_sha', [
+        pytest.param('c' * 40, id='candidate'),
+        pytest.param(None, id='discovery'),
+    ])
+    @pytest.mark.parametrize('delivered_checks', [
+        pytest.param([], id='none_declared'),
+        pytest.param([_grep_check()], id='declared'),
+    ])
+    async def test_supplying_checks_without_the_leaf_is_refused_before_any_git_call(
+        self, delivered_checks: list[dict[str, object]], candidate_sha: str | None,
+    ) -> None:
+        """``[]`` counts as supplied: a wired site states the leaf even when
+        its task declares nothing.  Each mode's first git probe is pinned
+        unawaited, so the refusal cannot drift behind git work."""
+        git_ops = _survival_rejecting_git_ops('c' * 40)
+
+        with pytest.raises(TypeError, match='require checks_enabled'):
+            await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha='f' * 40,
+                candidate_sha=candidate_sha, delivered_checks=delivered_checks,
+            )
+
+        git_ops.find_task_citation_commit.assert_not_awaited()
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+
+    async def test_a_stand_in_git_ops_config_is_never_consulted(self) -> None:
+        """A stand-in whose config says DISABLED cannot override a caller
+        that says ENABLED: nothing is read off ``git_ops.config``."""
+        sha = 'c' * 40
+        git_ops = _survival_rejecting_git_ops(sha)
+        git_ops.config = SimpleNamespace(
+            main_branch='main', delivered_checks=SimpleNamespace(enabled=False),
+        )
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', differential_confirms):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()], checks_enabled=True,
+            )
+
+        assert verdict.accepted is True
+        assert verdict.rescued_by_delivered_checks is True
