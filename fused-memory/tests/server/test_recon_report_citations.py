@@ -2935,6 +2935,75 @@ class TestCiteTaskFoldReleasedAtRunQuiescence:
         assert cite2 == {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'T-2405'}
 
 
+class _InterleavingTaskInterceptor:
+    """get_task runs *during_await* before answering, standing in for the
+    reaper or another tool call that the event loop runs while cite_task
+    awaits the task lookup."""
+
+    def __init__(self, during_await) -> None:
+        self._during_await = during_await
+
+    async def get_task(self, task_id: str, project_root: str, tag=None) -> dict:
+        self._during_await()
+        return {'id': task_id, 'title': f'T-{task_id}'}
+
+
+class TestCiteTaskActsOnlyOnWhatIsLiveAfterItsAwait:
+    def _state_with_uncited_finding(self, during_await):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=_InterleavingTaskInterceptor(lambda: during_await(state, t)),
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        fid = state.add_finding(
+            run_id='run-1', severity='minor', category='cross_project',
+            description='d', suggested_action='a', task_id=None, flag_type='X',
+        )['finding_id']
+        return state, fid
+
+    @pytest.mark.asyncio
+    async def test_run_quiesced_during_the_lookup_is_reported_unknown(self):
+        def reap(state, t):
+            state.complete('run-1', 'done')
+            t[0] = 301.0
+            assert state.tick() == 1
+
+        state, fid = self._state_with_uncited_finding(reap)
+
+        result = await state.cite_task('run-1', fid, 'dark_factory', '42')
+
+        assert result['error'] == 'run_id_unknown'
+        assert state.run_index('run-1') is None
+        assert state.violations() == []
+
+    @pytest.mark.asyncio
+    async def test_finding_deleted_during_the_lookup_is_reported_unknown(self):
+        def delete(state, _t):
+            assert state.delete_finding('run-1', fid)['status'] == 'deleted'
+
+        state, fid = self._state_with_uncited_finding(delete)
+
+        result = await state.cite_task('run-1', fid, 'dark_factory', '42')
+
+        assert result['error'] == 'finding_unknown'
+        run_index = state.run_index('run-1')
+        assert run_index is not None
+        assert run_index.owner_of(fid) is None
+        assert run_index.by_cited_task('dark_factory:42') is None
+        assert run_index.by_signature(('42', 'X')) is None
+        refiled = state.add_finding(
+            run_id='run-1', severity='minor', category='cross_project',
+            description='d2', suggested_action='a', task_id='42', flag_type='X',
+        )
+        assert 'error' not in refiled, refiled
+        assert state.violations() == []
+
+
 # ---------------------------------------------------------------------------
 # step-7: TestCiteMemory — RED until step-8 adds cite_memory to ReconReportState
 # ---------------------------------------------------------------------------

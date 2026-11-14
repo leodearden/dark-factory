@@ -1990,6 +1990,20 @@ class ReconReportState:
                 return entry, f
         return None
 
+    def _resolve_citation_target(
+        self, run_id: str, finding_id: str
+    ) -> tuple[_ReportEntry, _ReportEntry, _Finding] | dict[str, str]:
+        """``(active entry, the finding's owning entry, the finding)``, or the
+        error naming whichever of the run and the finding is not live."""
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        finding_entry, finding = resolved
+        return entry, finding_entry, finding
+
     def _purge_finding(
         self,
         run_id: str,
@@ -2510,14 +2524,9 @@ class ReconReportState:
         entity-scoped one has no stage carve-out so it can fire from any
         stage.
         """
-        entry = self._resolve_entry(run_id)
-        if entry is None:
-            return _ERR_RUN_UNKNOWN.copy()
-
-        resolved = self._resolve_finding(run_id, finding_id)
-        if resolved is None:
-            return _ERR_FINDING_UNKNOWN.copy()
-        finding_entry, finding = resolved
+        target = self._resolve_citation_target(run_id, finding_id)
+        if isinstance(target, dict):
+            return target
 
         if project_id not in self.known_projects:
             return _ERR_UNKNOWN_PROJECT.copy()
@@ -2527,6 +2536,13 @@ class ReconReportState:
 
         project_root = self.known_projects[project_id]
         result = await self._task_interceptor.get_task(task_id, project_root)
+
+        # The await yields: tick() may have dropped the run, or delete_finding
+        # the finding, before get_task returned.
+        target = self._resolve_citation_target(run_id, finding_id)
+        if isinstance(target, dict):
+            return target
+        entry, finding_entry, finding = target
 
         if not result or 'error' in result:
             return _ERR_TASK_NOT_FOUND.copy()
