@@ -29,11 +29,14 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation import citation_repair
 from fused_memory.reconciliation.flag_identity import (
-    description_digest,
-    normalize_description,
     parse_flag_subject,
     recon_signature_task_id,
     signature_field,
+)
+from fused_memory.server.recon_finding_index import (
+    PersistedSlice,
+    RunFindingIndex,
+    cited_task_key,
 )
 from fused_memory.services.memory_service import MemoryNotFoundError
 from fused_memory.utils.clip_disclosure import clip_text
@@ -76,7 +79,7 @@ def _citation_identities(finding: dict) -> set[str]:
             pid = c.get('project_id')
             tid = c.get('task_id')
             if pid is not None and tid is not None:
-                ids.add(f'{pid}:{tid}')
+                ids.add(cited_task_key(pid, tid))
     for c in finding.get('cited_entities') or []:
         if isinstance(c, dict):
             val = c.get('entity_uuid')
@@ -93,21 +96,6 @@ def _citation_identities(finding: dict) -> set[str]:
             if val is not None:
                 ids.add(str(val))
     return ids
-
-
-def _cited_task_key(project_id: str, task_id: str) -> str:
-    """Build the canonical ``'{project_id}:{task_id}'`` identity string that
-    anchors the in-run primary-cited-task fold (task-2425).
-
-    Single-sourced so :meth:`ReconReportState.cite_task` (fold registration)
-    and :meth:`ReconReportState._purge_finding` (fold-key cleanup) can never
-    drift apart — if the two built this string independently and the formats
-    diverged, a purge would silently fail to clear the anchor it registered,
-    leaking a stale ``_run_cited_task_index`` entry.  Mirrors the
-    ``f'{pid}:{tid}'`` convention :func:`_citation_identities` already uses
-    for ``cited_tasks`` entries.
-    """
-    return f'{project_id}:{task_id}'
 
 
 def _citation_failure_key(marker: Any) -> tuple[Any, Any, Any]:
@@ -310,18 +298,6 @@ class _ReportEntry:
     # Folds whose structured copy the _MAX_PURGED_FINDINGS cap dropped: the
     # operator's cue that the log is the only copy of that many purges.
     purged_findings_overflow: int = 0
-    # in-run dedup: (task_id, flag_type) → finding_id.  Mirrors the entries
-    # this ONE stage contributed to the run-scoped ReconReportState._run_sig_index.
-    # Not consulted for eviction teardown: since task-2088, run-level indices
-    # are released wholesale at run quiescence (see ReconReportState.tick()),
-    # not by walking this per-entry map — do not resurrect a per-entry loop.
-    _signature_to_finding: dict[tuple[str | None, str | None], str] = field(
-        default_factory=dict
-    )
-    # in-run dedup: description_hash → finding_id (null-null findings only).
-    # Mirrors this stage's contribution to _run_desc_index; same
-    # run-quiescence-release caveat as _signature_to_finding above.
-    _deschash_to_finding: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +312,7 @@ class _ReportEntry:
 
 
 def _encode_sig_map(
-    sig_map: dict[tuple[str | None, str | None], str],
+    sig_map: Mapping[tuple[str | None, str | None], str],
 ) -> list[list[str | None]]:
     """Encode a ``(task_id|None, flag_type|None) -> finding_id`` map as a JSON-safe
     list of ``[task_id, flag_type, finding_id]`` triples.
@@ -357,23 +333,13 @@ def _decode_sig_map(
     return {(row[0], row[1]): row[2] for row in rows}  # type: ignore[misc]
 
 
-def _serialize_entry(
-    entry: _ReportEntry,
-    *,
-    sig_anchor_slice: dict[tuple[str | None, str | None], str],
-    cited_task_slice: dict[str, str],
-) -> str:
-    """Serialize *entry* (plus its run-level fold-anchor slices) to a JSON string.
+def _serialize_entry(entry: _ReportEntry, persisted_slice: PersistedSlice) -> str:
+    """Serialize *entry* plus its owned dedup keys to a JSON string.
 
-    *sig_anchor_slice* and *cited_task_slice* are NOT part of ``_ReportEntry`` —
-    they are this entry's OWNED portion of the run-scoped
-    ``ReconReportState._run_sig_index`` / ``_run_cited_task_index``, computed by
-    the caller (``ReconReportState._persist_run``) from the live indices at
-    persist time.  They ride along in the same JSON blob (rather than a second
-    row/table) purely so one row still fully describes one ``(run_id, stage)``
-    entry; :func:`_deserialize_entry` ignores them (they are not part of
-    ``_ReportEntry``'s fields) — use :func:`_deserialize_fold_anchor_slices` to
-    read them back for rebuilding the run-level indices on hydrate.
+    *persisted_slice* is :meth:`RunFindingIndex.owned_slice` of *entry*.  It
+    rides in the same blob so one row fully describes one ``(run_id, stage)``
+    entry; :func:`_deserialize_persisted_slice` reads it back for
+    :meth:`RunFindingIndex.absorb` on hydrate.
 
     ``_Finding`` and the entry's own scalar/collection fields are all built from
     JSON-safe primitives already (str / bool / float / None / list[dict]), so
@@ -400,10 +366,10 @@ def _serialize_entry(
         'created_at': entry.created_at,
         'purged_findings': [dict(r) for r in entry.purged_findings],
         'purged_findings_overflow': entry.purged_findings_overflow,
-        'signature_to_finding': _encode_sig_map(entry._signature_to_finding),
-        'deschash_to_finding': dict(entry._deschash_to_finding),
-        'sig_anchor_slice': _encode_sig_map(sig_anchor_slice),
-        'cited_task_slice': dict(cited_task_slice),
+        'signature_to_finding': _encode_sig_map(persisted_slice.signature_to_finding),
+        'deschash_to_finding': dict(persisted_slice.deschash_to_finding),
+        'sig_anchor_slice': _encode_sig_map(persisted_slice.sig_anchor_slice),
+        'cited_task_slice': dict(persisted_slice.cited_task_slice),
     }
     return json.dumps(payload)
 
@@ -411,9 +377,7 @@ def _serialize_entry(
 def _deserialize_entry(entry_json: str) -> _ReportEntry:
     """Inverse of :func:`_serialize_entry`'s ``_ReportEntry``-shaped fields.
 
-    Does NOT restore the fold-anchor slices — call
-    :func:`_deserialize_fold_anchor_slices` on the same *entry_json* for those;
-    they are run-level, not part of ``_ReportEntry``.
+    The persisted dedup keys are read by :func:`_deserialize_persisted_slice`.
 
     ``_Finding(**fd)`` is what makes a newly-added DEFAULTED field readable on
     an older blob: the key is simply absent and the default supplies it.  A
@@ -436,24 +400,17 @@ def _deserialize_entry(entry_json: str) -> _ReportEntry:
         created_at=data['created_at'],
         purged_findings=[dict(r) for r in data.get('purged_findings', [])],
         purged_findings_overflow=data.get('purged_findings_overflow', 0),
-        _signature_to_finding=_decode_sig_map(data['signature_to_finding']),
-        _deschash_to_finding=dict(data['deschash_to_finding']),
     )
 
 
-def _deserialize_fold_anchor_slices(
-    entry_json: str,
-) -> tuple[dict[tuple[str | None, str | None], str], dict[str, str]]:
-    """Return ``(sig_anchor_slice, cited_task_slice)`` persisted by
-    :func:`_serialize_entry` — this entry's owned slice of the run-scoped
-    ``_run_sig_index`` / ``_run_cited_task_index``.  Used by
-    :meth:`ReconReportState.hydrate_from_store` to rebuild those indices by
-    unioning every entry's slice.
-    """
+def _deserialize_persisted_slice(entry_json: str) -> PersistedSlice:
+    """The dedup keys :func:`_serialize_entry` persisted with an entry."""
     data = json.loads(entry_json)
-    return (
-        _decode_sig_map(data['sig_anchor_slice']),
-        dict(data['cited_task_slice']),
+    return PersistedSlice(
+        signature_to_finding=_decode_sig_map(data['signature_to_finding']),
+        deschash_to_finding=dict(data['deschash_to_finding']),
+        sig_anchor_slice=_decode_sig_map(data['sig_anchor_slice']),
+        cited_task_slice=dict(data['cited_task_slice']),
     )
 
 
@@ -669,26 +626,13 @@ class ReconReportState:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
         self._reaper_interval = reaper_interval
-        # Resident entries.  _state is a READ-ONLY view so that no caller can
-        # add an entry without registering it in _run_entries: entries enter
-        # only through _install_entry, and leave only by tick()'s eviction.
-        self._resident_entries: dict[tuple[str, str], _ReportEntry] = {}
-        self._state: Mapping[tuple[str, str], _ReportEntry] = MappingProxyType(
-            self._resident_entries
-        )
-        self._active: dict[str, str] = {}  # run_id → current stage
-        # Run-level O(1) indices so add_finding / _resolve_finding avoid scanning
-        # all entries across every live run_id.  Populated on the miss path of
-        # add_finding.  RUN-QUIESCENCE-scoped lifetime (task-2088): released by
-        # tick() only once the run's LAST (run_id, *) entry evicts — NOT torn
-        # down per-entry — so cross-stage in-run dedup and duplicate_finding
-        # citation pointers survive an individual stage's TTL eviction for as
-        # long as the run itself is still live.  See tick()'s docstring.
-        # task-4185 (operator ruling 2026-08-12): this index is deliberately
-        # keyed on a PROJECTLESS signature, and stays that way — do NOT
-        # project-namespace the key.  That projectlessness is exactly what
-        # lets a bare top-level task_id (which names no project) fold onto a
-        # foreign citation, and that fold is INTENDED.
+        # One RunFindingIndex per live run: its stage session and its dedup
+        # keys.  An index is dropped when its run quiesces (see tick()).
+        # task-4185 (operator ruling 2026-08-12): the signature keys are
+        # deliberately PROJECTLESS, and stay that way — do NOT
+        # project-namespace them.  That projectlessness is exactly what lets a
+        # bare top-level task_id (which names no project) fold onto a foreign
+        # citation, and that fold is INTENDED.
         #
         # Only the cite_task→cite_task half of the resulting collision is
         # DETECTABLE, and it is guarded: see cite_task's fold-2 bullet.  The
@@ -699,19 +643,7 @@ class ReconReportState:
         # can tell that from a genuine duplicate.  That acceptance is
         # executable, not merely documented, in
         # test_unpinned_anchor_fold_emits_no_near_collision_warning.
-        self._run_sig_index: dict[str, dict[tuple, str]] = {}  # run_id → {sig → finding_id}
-        self._run_finding_index: dict[str, dict[str, _ReportEntry]] = {}  # run_id → {finding_id → entry}
-        self._run_desc_index: dict[str, dict[str, str]] = {}  # run_id → {desc_hash → finding_id}
-        # run_id → {"project_id:task_id" → finding_id} for a null-task_id
-        # finding's PRIMARY (first-ever) cited external task (task-2425).
-        # Same run-quiescence-scoped lifetime as the three indices above —
-        # see tick()'s docstring — released together, never torn down
-        # per-entry.
-        self._run_cited_task_index: dict[str, dict[str, str]] = {}
-        # run_id → {stage → that stage's latest entry, live or evicted}: the
-        # persist reach (see _reachable_run_entries).  Written only by
-        # _install_entry; same run-quiescence lifetime as the indices above.
-        self._run_entries: dict[str, dict[str, _ReportEntry]] = {}
+        self._runs: dict[str, RunFindingIndex[_ReportEntry]] = {}
         self._reaper_task: asyncio.Task | None = None
         # cite_* service injection (task β)
         self._memory_service = memory_service
@@ -733,53 +665,33 @@ class ReconReportState:
             return self._clock_fn()
         return asyncio.get_running_loop().time()
 
+    @property
+    def _state(self) -> Mapping[tuple[str, str], _ReportEntry]:
+        """Read-only view of every resident entry, keyed ``(run_id, stage)``."""
+        return MappingProxyType({
+            (run_id, stage): entry
+            for run_id, idx in self._runs.items()
+            for stage, entry in idx.resident_entries.items()
+        })
+
+    def run_index(self, run_id: str) -> RunFindingIndex[_ReportEntry] | None:
+        """The live run's finding index; None once the run has quiesced."""
+        return self._runs.get(run_id)
+
+    def violations(self) -> list[str]:
+        """Every breach of the run indexes' invariant; empty when it holds."""
+        found: list[str] = []
+        for run_id, idx in self._runs.items():
+            if idx.run_id != run_id:
+                found.append(f'run index of {idx.run_id!r} is held under run {run_id!r}')
+            if idx.quiescent:
+                found.append(f'run {run_id!r}: a quiescent index is still held')
+            found.extend(idx.violations())
+        return found
+
     # ------------------------------------------------------------------
     # Persistence (task 2716)
     # ------------------------------------------------------------------
-
-    def _reachable_run_entries(self, run_id: str) -> list[_ReportEntry]:
-        """Every entry of *run_id* a mutation can still REACH, one per stage.
-
-        ``_run_entries[run_id]``: every entry the run has installed through
-        :meth:`_install_entry`, live or evicted, until the run quiesces.  It
-        is wider than the run's ``_state`` rows because :meth:`tick` evicts a
-        completed entry from ``_state`` at its own TTL but keeps the run's
-        indices until the whole RUN quiesces (see that method's docstring), so
-        an evicted stage's findings stay citable — and supersedable — from a
-        still-live sibling stage.
-
-        The invariant, named once here so the two scopes cannot drift apart:
-        every entry a mutation can reach is in the write reach — an entry
-        :meth:`_resolve_finding` can hand to a mutator is an entry
-        :meth:`_persist_run` must WRITE and :meth:`_purge_finding` must SWEEP.
-        Before task 4653 both walked ``_state`` alone, so every mutation of an
-        evicted-but-indexed finding — the whole ``cite_*`` family as well as
-        the ``supersedes`` stamp — was applied in memory and then silently
-        dropped on the way to the store.
-
-        The registry does not depend on which findings remain, so an evicted
-        entry stays in the reach after its LAST finding is purged.  That is
-        the case :meth:`cite_task`'s cross-stage fold creates (task 6025): it
-        purges the losing finding from its OWNING entry, which can be an
-        earlier, evicted stage, and that stage's row must be rewritten without
-        it or a restart hydrates the purged finding back.
-
-        Keyed by stage, so the store's PRIMARY KEY ``(run_id, stage)`` holds
-        structurally: one entry per stage, never two rows racing for one key
-        in :meth:`_persist_run`'s single upsert.  A same-stage fresh-create
-        overwrites the slot, so the live entry shadows an evicted twin
-        (task 3988, see :meth:`start_report`'s docstring); that twin is still
-        reachable through ``_run_finding_index`` for its old findings, but its
-        later stamps have no row to land in, since the store has no key to
-        hold them under.
-
-        Deliberately NOT for READS.  :meth:`get_assembled_report` stays
-        ``_state``-scoped on purpose: an evicted stage dropping out of the
-        assembled report is that method's intended semantics, and widening it
-        with this helper would change what the report CONTAINS — far beyond
-        aligning write reach with mutation reach.
-        """
-        return list(self._run_entries.get(run_id, {}).values())
 
     def _persist_run(self, run_id: str) -> None:
         """Write every ``(run_id, *)`` entry through to the store.  No-op if
@@ -793,22 +705,18 @@ class ReconReportState:
         whole run is trivially correct where "persist only what changed" would
         need fragile per-method reasoning about which stage's row to write.
 
-        The entries written are :meth:`_reachable_run_entries` — the run's
-        registered entries, live or evicted — NOT just its ``_state`` rows.  A
-        mutation's target is routinely an earlier stage that completed and then
-        aged out of ``_state`` while the run stayed live: task 4653's
+        The entries written are :meth:`RunFindingIndex.reachable_entries` —
+        each stage's latest entry, live or evicted — NOT just its ``_state``
+        rows.  A mutation's target is routinely an earlier stage that completed
+        and then aged out of ``_state`` while the run stayed live: task 4653's
         supersession stamp, every ``cite_*`` citation recorded on an evicted
         entry's finding, and :meth:`cite_task`'s cross-stage fold purge
-        (task 6025).  See that helper for the invariant binding mutation reach
-        and write reach together.
+        (task 6025).  Keyed by stage, so the store's PRIMARY KEY ``(run_id,
+        stage)`` holds structurally.
 
-        For each entry, computes its OWNED slice of the two run-level fold
-        anchors (``_run_cited_task_index`` / the derived-signature entries in
-        ``_run_sig_index``) fresh from the live indices — see
-        :func:`_serialize_entry`'s docstring for why these ride along instead
-        of a companion table. ``is_active`` is set per row from
-        ``self._active.get(run_id) == stage``, so an active-stage transition
-        self-corrects on the very next persist.
+        Each entry is written with :meth:`RunFindingIndex.owned_slice`.
+        ``is_active`` is set per row from the index's active stage, so an
+        active-stage transition self-corrects on the very next persist.
 
         All of the run's serialized rows are written through in ONE
         ``store.upsert_many`` transaction — a single commit / fsync per
@@ -820,12 +728,12 @@ class ReconReportState:
         serialization is likewise resilient: an entry that fails to serialize
         is skipped-and-logged, and the rest of the run still persists.
         """
-        if self._store is None:
+        idx = self._runs.get(run_id)
+        if self._store is None or idx is None:
             return
-        active_stage = self._active.get(run_id)
         updated_at = self._clock()
         rows: list[dict[str, Any]] = []
-        for entry in self._reachable_run_entries(run_id):
+        for entry in idx.reachable_entries():
             rid, stage = entry.run_id, entry.stage
             # Serialize each entry independently so a single un-serializable
             # entry is skipped-and-logged without dropping the rest of the run.
@@ -834,22 +742,7 @@ class ReconReportState:
             # transaction / one fsync for the whole run (review: performance),
             # instead of a commit per entry.
             try:
-                finding_ids = {f.finding_id for f in entry.findings}
-                sig_anchor_slice = {
-                    sig: finding_id
-                    for sig, finding_id in self._run_sig_index.get(run_id, {}).items()
-                    if finding_id in finding_ids and sig not in entry._signature_to_finding
-                }
-                cited_task_slice = {
-                    key: finding_id
-                    for key, finding_id in self._run_cited_task_index.get(run_id, {}).items()
-                    if finding_id in finding_ids
-                }
-                entry_json = _serialize_entry(
-                    entry,
-                    sig_anchor_slice=sig_anchor_slice,
-                    cited_task_slice=cited_task_slice,
-                )
+                entry_json = _serialize_entry(entry, idx.owned_slice(entry))
             except Exception:
                 logger.warning(
                     'recon_report: failed to serialize run_id=%r stage=%r for '
@@ -864,7 +757,7 @@ class ReconReportState:
                     'run_id': rid,
                     'stage': stage,
                     'project_id': entry.project_id,
-                    'is_active': (active_stage == stage),
+                    'is_active': (idx.active_stage == stage),
                     'entry_json': entry_json,
                     'updated_at': updated_at,
                 }
@@ -886,26 +779,10 @@ class ReconReportState:
         """Rebuild in-memory state from the persisted store — run ONCE at boot.
 
         A full no-op when ``self._store is None`` (the byte-identical no-store
-        path) or when the store is empty (a fresh boot).  Otherwise, for every
-        persisted row it restores ``_state[(run_id, stage)]`` and ``_active``
-        (the row flagged ``is_active`` is the run's live stage), then rebuilds
-        all four run-level dedup indices by UNIONING each entry's persisted
-        per-entry mirrors and fold-anchor slices:
-
-        * ``_run_finding_index`` — ``{finding_id -> owning entry}`` for every
-          finding in every entry.
-        * ``_run_sig_index`` — each entry's ``_signature_to_finding`` PLUS its
-          persisted derived-signature slice (the ``cite_task`` entity-scoped
-          fold anchors owned by this entry's findings but absent from its own
-          ``_signature_to_finding``).
-        * ``_run_desc_index`` — each entry's ``_deschash_to_finding``.
-        * ``_run_cited_task_index`` — each entry's persisted cited-task slice
-          (the ``cite_task`` project-scoped fold anchors).
-
-        The union is faithful by construction — each sig / desc-hash /
-        cited-task key maps to exactly one finding_id owned by exactly one
-        entry — so no re-derivation of ``cite_task`` fold-eligibility is
-        needed (see :func:`_serialize_entry`).  This gives σ a correct dedup
+        path) or when the store is empty (a fresh boot).  Otherwise every
+        persisted row is installed in its run's :class:`RunFindingIndex`, which
+        absorbs the row's persisted dedup keys; the row flagged ``is_active``
+        is activated as the run's live stage.  This gives σ a correct dedup
         substrate for continued filing against a run whose earlier stages were
         filed before the restart.
 
@@ -957,9 +834,7 @@ class ReconReportState:
             entry_json = row['entry_json']
             try:
                 entry = _deserialize_entry(entry_json)
-                sig_anchor_slice, cited_task_slice = _deserialize_fold_anchor_slices(
-                    entry_json
-                )
+                persisted_slice = _deserialize_persisted_slice(entry_json)
             except Exception:
                 logger.warning(
                     'recon_report: failed to deserialize persisted row '
@@ -987,23 +862,13 @@ class ReconReportState:
             # diagnostics-only (not used for eviction) and is NOT re-anchored.
             if entry.completed_at is not None:
                 entry.completed_at = self._clock()
-            self._install_entry(entry)
+            idx = self._runs.get(entry.run_id)
+            if idx is None:
+                idx = self._runs[entry.run_id] = RunFindingIndex(entry.run_id)
+            idx.install(entry)
+            idx.absorb(entry, persisted_slice)
             if row['is_active']:
-                self._active[run_id] = stage
-            # Rebuild the four run-level dedup indices by unioning this entry's
-            # persisted per-entry mirrors / fold-anchor slices.  Keys never
-            # collide across a run's entries (each sig/desc/cited-task key is
-            # owned by exactly one entry), so plain dict.update is a safe union.
-            finding_index = self._run_finding_index.setdefault(run_id, {})
-            for f in entry.findings:
-                finding_index[f.finding_id] = entry
-            sig_index = self._run_sig_index.setdefault(run_id, {})
-            sig_index.update(entry._signature_to_finding)
-            sig_index.update(sig_anchor_slice)
-            self._run_desc_index.setdefault(run_id, {}).update(
-                entry._deschash_to_finding
-            )
-            self._run_cited_task_index.setdefault(run_id, {}).update(cited_task_slice)
+                idx.activate(entry.stage)
 
     def start_persistence(self) -> None:
         """Open the shadow store and hydrate in-memory state — call ONCE at boot.
@@ -1074,7 +939,7 @@ class ReconReportState:
         ``known_stages`` vocabulary and *stage* is outside it, the call logs a
         WARNING and returns ``{error: 'unknown_stage', error_type:
         'ReconReportUnknownStage', stage, known_stages}``. It creates no entry,
-        leaves ``self._active`` untouched and writes nothing to the store, so a
+        leaves the run's active stage untouched and writes nothing to the store, so a
         hallucinated stage name can neither open a phantom entry nor re-point
         the run's live stage onto one. Because it precedes the existing-entry
         branch, an out-of-vocabulary entry hydrated from a row persisted before
@@ -1086,13 +951,13 @@ class ReconReportState:
         already_started: False}``. A REPEAT call for an ``(run_id, stage)``
         pair already present in ``self._state`` mutates NOTHING on the
         existing entry — not its findings, stats, summary, created_at, or
-        completed_at, and none of the four run-scoped dedup indices — and
+        completed_at, and none of the run's finding index — and
         returns ``{run_id, stage, already_started: True, project_id,
         finding_count, completed, warning}`` describing the RETAINED entry.
         A structured WARNING is logged whenever a repeat is detected. This
         closes an unconditional-overwrite bug where a second call silently
         destroyed every finding/citation/stat recorded so far, orphaned the
-        run-scoped dedup indices (a ``duplicate_finding`` pointer that could
+        run's dedup keys (a ``duplicate_finding`` pointer that could
         no longer resolve), and reset ``completed_at`` — bypassing the
         post-:meth:`complete` mutation guard.
 
@@ -1105,13 +970,12 @@ class ReconReportState:
         not only the process log. A pure repeat with no divergence stays a
         zero-store-write no-op.
 
-        One deliberate exception to "mutate nothing": if ``self._active``
-        has NO entry for ``run_id`` at all, the repeat call REPAIRS
-        ``self._active[run_id] = stage`` and persists. ``_resolve_entry``
-        (used by ``add_finding``/``set_stat``/``inc_stat``/``complete``)
-        follows ``_active``, so a run whose pointer was dropped — by
-        :meth:`tick` evicting the active stage (see its docstring, "Remove
-        _active pointer only if it still points at this stage"), or by a
+        One deliberate exception to "mutate nothing": if the run has NO
+        active stage at all, the repeat call REPAIRS it by activating
+        *stage* and persists. ``_resolve_entry`` (used by
+        ``add_finding``/``set_stat``/``inc_stat``/``complete``) follows the
+        active stage, so a run whose pointer was dropped — by :meth:`tick`
+        evicting the active stage (:meth:`RunFindingIndex.evict`), or by a
         :meth:`hydrate_from_store` where no persisted row carried
         ``is_active``  — would otherwise answer ``run_id_unknown`` on
         EVERY subsequent call, forever: strictly worse than today's
@@ -1122,7 +986,7 @@ class ReconReportState:
         The pointer is NEVER stolen from a different, currently-active
         stage of the same run BY THIS REPEAT-CALL BRANCH — i.e. for as long
         as the earlier stage's entry is still resident in ``self._state``,
-        the repair only fires when ``self._active.get(run_id) is None``,
+        the repair only fires when the run's active stage is None,
         never when it already names a different stage. Re-pointing at an
         earlier stage would itself be a corruption channel: a confused agent
         naming stage 1 while stage 2 is live would silently redirect stage
@@ -1137,14 +1001,15 @@ class ReconReportState:
         evicts from ``self._state`` (TTL past :meth:`complete`, via
         :meth:`tick`): a call naming that now-absent ``(run_id, stage)`` no
         longer matches ``existing is not None`` below, so it takes the
-        fresh-create path, which unconditionally sets ``self._active[run_id]
-        = stage`` — still capable of stealing the pointer from a different,
+        fresh-create path, which unconditionally activates *stage* — still
+        capable of stealing the pointer from a different,
         live stage of the same run. The unknown-stage guard at the top closes
         that residual for every name outside the configured vocabulary (the
         orphaning a hallucinated stage name used to cause); the residual
         remains in full only when ``known_stages is None``, and for an
         in-vocabulary name it is a genuine stage transition, not a stray call.
         """
+        idx = self._runs.get(run_id)
         if self._known_stages is not None and stage not in self._known_stages:
             logger.warning(
                 'recon_report: start_report rejected unknown stage run_id=%r '
@@ -1153,12 +1018,12 @@ class ReconReportState:
                 run_id,
                 stage,
                 project_id,
-                self._active.get(run_id),
+                idx.active_stage if idx is not None else None,
             )
             return _unknown_stage_error(stage, self._known_stages)
 
-        existing = self._state.get((run_id, stage))
-        if existing is not None:
+        existing = idx.resident_entry(stage) if idx is not None else None
+        if idx is not None and existing is not None:
             warning = (
                 f'start_report called again for an existing report '
                 f'(run_id={run_id!r} stage={stage!r}); preserving the '
@@ -1195,8 +1060,8 @@ class ReconReportState:
             # or the project_id-divergence branch above, so a pure no-op
             # repeat (no divergence, pointer intact) still performs zero
             # store writes.
-            if self._active.get(run_id) is None:
-                self._active[run_id] = stage
+            if idx.active_stage is None:
+                idx.activate(stage)
                 needs_persist = True
             if needs_persist:
                 self._persist_run(run_id)
@@ -1216,8 +1081,10 @@ class ReconReportState:
             project_id=project_id,
             created_at=self._clock(),
         )
-        self._install_entry(entry)
-        self._active[run_id] = stage
+        if idx is None:
+            idx = self._runs[run_id] = RunFindingIndex(run_id)
+        idx.install(entry)
+        idx.activate(stage)
         self._persist_run(run_id)
         return {'run_id': run_id, 'stage': stage, 'already_started': False}
 
@@ -1305,7 +1172,7 @@ class ReconReportState:
         instead, which satisfies that predicate's necessary condition and
         makes the finding newly eligible to be dropped from flagged_items at read time.
         The finding is not deleted or made unreachable: the
-        row remains in ``_state``/``_run_finding_index``, so cross-stage
+        row remains in its entry and the run's finding index, so cross-stage
         ``cite_*`` resolution and :meth:`get_findings_for_run` are
         unaffected — only the ``flagged_items`` projection omits it.
         Suppression is not unconditional either: it is skipped entirely
@@ -1497,15 +1364,16 @@ class ReconReportState:
         if category_truncated:
             warnings.append(f'category truncated to {_MAX_FINDING_TEXT_CHARS} chars')
 
-        # In-run dedup: two separate namespaces.
-        # (1) Signature path: (task_id, flag_type) != (None, None) — O(1) lookup in
-        #     _run_sig_index, scoped to this run_id across ALL stages.  Each field
+        # In-run dedup: two separate namespaces in the run's finding index,
+        # scoped to this run_id across ALL stages.
+        # (1) Signature path: (task_id, flag_type) != (None, None).  Each field
         #     is canonicalized via signature_field so an int task_id (common
         #     in LLM output) and the equivalent str task_id collapse to one key.
         # (2) Null-null path: both are None — dedup by normalized description hash
-        #     in _run_desc_index so identical informational observations collapse.
+        #     so identical informational observations collapse.
         # The two namespaces are kept separate so a null-null finding with description
         # 'd' never collides with a real-signature finding that shares description 'd'.
+        idx = self._runs[run_id]
         c_task_id = recon_signature_task_id(parse_flag_subject(task_id))
         c_flag_type = signature_field(flag_type)
 
@@ -1519,44 +1387,13 @@ class ReconReportState:
         # re-raises); more than one is ambiguous — a bare re-raise gives no
         # basis to pick which condition it restates, so guessing risks
         # merging two genuinely distinct findings, and is deliberately not
-        # done. Scanning _run_sig_index[run_id] (rather than a new index)
-        # reuses its existing cross-stage, run-quiescence-scoped lifetime
+        # done. The run's finding index lives until the run quiesces
         # (task-2088), so inheritance works across stages and survives an
-        # earlier stage's own entry being TTL-evicted, with no tick() change.
-        # Cost: this is an O(signatures-in-run) scan on every add_finding call
-        # that has a non-null task_id and a null flag_type — this sub-path is
-        # expected to be rare (an under-specified re-raise), so the scan is
-        # acceptable and not worth a 4th index today. If profiling ever shows
-        # bare-null re-raises are common on high-finding-count runs, add a
-        # per-run {task_id -> set(flag_type)} auxiliary index maintained
-        # alongside _run_sig_index for an O(1) lookup instead.
+        # earlier stage's own entry being TTL-evicted.
         if c_task_id is not None and c_flag_type is None:
-            established = {
-                ft for (tid, ft) in self._run_sig_index.get(run_id, {}) if tid == c_task_id and ft is not None
-            }
+            established = idx.flag_types_for_task(c_task_id)
             if len(established) == 1:
-                c_flag_type = next(iter(established))
-
-        sig = (c_task_id, c_flag_type)
-        desc_hash = ""
-        if sig != (None, None):
-            existing_id = self._run_sig_index.get(run_id, {}).get(sig)
-            if existing_id is not None:
-                return _duplicate_finding_error(
-                    existing_id, warnings, supersedes_dropped=supersedes is not None
-                )
-        else:
-            # Blank/whitespace-only descriptions normalize to '' — skip dedup so
-            # each blank informational finding allocates independently.  The empty
-            # string is not a meaningful dedup key (two observations with no text
-            # are not the same observation).
-            if normalize_description(description):
-                desc_hash = description_digest(description)
-                existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
-                if existing_id is not None:
-                    return _duplicate_finding_error(
-                        existing_id, warnings, supersedes_dropped=supersedes is not None
-                    )
+                (c_flag_type,) = established
 
         finding_id = str(uuid.uuid4())
         if actionable is None:
@@ -1578,24 +1415,27 @@ class ReconReportState:
                 supersedes_target.finding_id if supersedes_target is not None else None
             ),
         )
+        # A blank description has no desc key, so each blank informational
+        # finding allocates independently: two observations with no text are
+        # not the same observation.
+        keys = idx.keys_for(finding)
+        existing_id = idx.by_signature(keys.signature)
+        if existing_id is None:
+            existing_id = idx.by_desc(keys.desc_hash)
+        if existing_id is not None:
+            return _duplicate_finding_error(
+                existing_id, warnings, supersedes_dropped=supersedes is not None
+            )
         entry.findings.append(finding)
-        if sig != (None, None):
-            entry._signature_to_finding[sig] = finding_id
-            self._run_sig_index.setdefault(run_id, {})[sig] = finding_id
-        else:
-            if desc_hash:  # empty when description normalizes to blank — skip index
-                entry._deschash_to_finding[desc_hash] = finding_id
-                self._run_desc_index.setdefault(run_id, {})[desc_hash] = finding_id
-        self._run_finding_index.setdefault(run_id, {})[finding_id] = entry
+        idx.register(finding, entry)
 
         # task-4653: stamp-late.  The new finding now exists, so the forward
         # pointer we write onto the target resolves.  _resolve_finding is
         # run-scoped and cross-stage, so a later stage can retire an earlier
         # stage's claim — including one whose entry has already aged out of
         # _state, which is the ORDINARY case rather than a corner.  _persist_run
-        # below writes every entry the run can still REACH
-        # (_reachable_run_entries), not just its _state rows, so the stamp on
-        # the earlier stage's row is durable either way.
+        # below writes every entry the run can still REACH, not just its _state
+        # rows, so the stamp on the earlier stage's row is durable either way.
         if supersedes_target is not None:
             if supersedes_target.superseded_by is not None:
                 logger.info(
@@ -1641,14 +1481,11 @@ class ReconReportState:
         the full asymmetry.  Deletion remains the right tool only for
         retracting a finding filed in error by a stage still in progress.
 
-        Removes the finding from ``entry.findings`` and every dedup index
-        it may be registered under — ``_run_finding_index``, whichever of
-        ``_run_sig_index`` / ``_run_desc_index`` it was filed under (and
-        their per-entry mirrors), and ``_run_cited_task_index`` if it is a
-        primary-cited-task fold anchor (task-2425) — via the single-sourced
-        :meth:`_purge_finding` helper shared with the in-run cited-task
-        fold's retract path in :meth:`cite_task`. Indices are recomputed
-        from the finding's own already-canonicalized
+        Removes the finding from ``entry.findings`` and unregisters every
+        dedup key it holds in the run's finding index, via the
+        single-sourced :meth:`_purge_finding` helper shared with the in-run
+        cited-task fold's retract path in :meth:`cite_task`. Keys are
+        re-derived from the finding's own already-canonicalized
         ``task_id``/``flag_type``/``description``/``cited_tasks``, so a
         corrected finding can be re-filed under the same signature,
         description, or primary cited task after retraction instead of
@@ -1911,8 +1748,9 @@ class ReconReportState:
         (self-exclusion so a Stage-1 finding is never suppressed by its own
         citations — closes the aba1ac28 null-null desc-hash bypass).  Any
         finding for which _traces_exclusively_to_stage1 returns True is dropped
-        from flagged_items.  Finding rows remain in _state/_run_finding_index so
-        cross-stage cite_* resolution is unaffected by the read-time filter.
+        from flagged_items.  Finding rows remain in their entries and the run's
+        finding index, so cross-stage cite_* resolution is unaffected by the
+        read-time filter.
 
         Suppression is skipped entirely when ``stage == 'memory_consolidator'``
         to prevent two sibling non-actionable Stage-1 findings that cite the
@@ -1931,30 +1769,29 @@ class ReconReportState:
         ``_Finding.actionable`` is untouched, so reads stay idempotent and
         ``cite_*`` resolution is unaffected.
         """
-        entry = self._state.get((run_id, stage))
-        if entry is None:
+        idx = self._runs.get(run_id)
+        entry = idx.resident_entry(stage) if idx is not None else None
+        if idx is None or entry is None:
             return None
 
         # --- Fix 1: build stage-1 citation identity set for this run ---
-        # Collect _citation_identities from all memory_consolidator findings
-        # across this run (may be spread across multiple start_report calls for
-        # the same stage, though in practice there is one entry per stage).
+        # Collect _citation_identities from the run's resident
+        # memory_consolidator findings.
         #
         # Skipped entirely when stage IS memory_consolidator: applying the
         # filter there would let two sibling non-actionable Stage-1 findings
         # that cite the same target mutually suppress each other.  Fix 1 only
         # targets cross-stage echoes, not intra-Stage-1 duplicates.
         stage1_identities_by_finding: dict[str, set[str]] = {}
-        if stage != 'memory_consolidator':
-            for (r_id, s), other_entry in self._state.items():
-                if r_id == run_id and s == 'memory_consolidator':
-                    for f in other_entry.findings:
-                        stage1_identities_by_finding[f.finding_id] = _citation_identities({
-                            'cited_tasks': list(f.cited_tasks),
-                            'cited_entities': list(f.cited_entities),
-                            'cited_edges': list(f.cited_edges),
-                            'cited_memories': list(f.cited_memories),
-                        })
+        stage1_entry = idx.resident_entry(StageId.memory_consolidator)
+        if stage != StageId.memory_consolidator and stage1_entry is not None:
+            for f in stage1_entry.findings:
+                stage1_identities_by_finding[f.finding_id] = _citation_identities({
+                    'cited_tasks': list(f.cited_tasks),
+                    'cited_entities': list(f.cited_entities),
+                    'cited_edges': list(f.cited_edges),
+                    'cited_memories': list(f.cited_memories),
+                })
 
         # Pre-compute full union of all stage-1 identity sets once; per-candidate
         # we subtract only that finding's own identities — O(F+S) instead of O(F·S).
@@ -2056,9 +1893,9 @@ class ReconReportState:
         Returns ``[]`` for an unknown ``run_id`` (never raises).
         """
         results: list[dict[str, Any]] = []
-        for (r_id, _stage), entry in self._state.items():
-            if r_id != run_id:
-                continue
+        idx = self._runs.get(run_id)
+        resident = idx.resident_entries.values() if idx is not None else ()
+        for entry in resident:
             for f in entry.findings:
                 results.append({
                     'finding_id': f.finding_id,
@@ -2083,25 +1920,24 @@ class ReconReportState:
     def active_run_for_stage(self, stage: str, project_id: str) -> str | None:
         """Resolve the run_id currently in-progress on *stage* for *project_id*.
 
-        Scans ``_active`` (run_id -> its CURRENT stage) rather than
-        ``_state`` directly: a run that has since moved on to a later stage
-        still has its earlier ``(run_id, stage)`` entry sitting in
-        ``_state`` (never retroactively deleted), so ``_active`` is what
+        Reads each run's ACTIVE stage rather than its resident entries: a
+        run that has since moved on to a later stage still has its earlier
+        ``(run_id, stage)`` entry resident, so the active stage is what
         distinguishes "this stage is what the run is doing right now" from
         "this run passed through this stage at some point". Returns
         ``None`` when no run is currently active on that stage for that
         project, or when the ``(run_id, stage)`` entry has since been
         completed (``complete()`` stamps ``completed_at`` but does not
-        clear ``_active``).
+        clear the active stage).
 
         Used by :mod:`server.recon_lifecycle_filer` (task 2624) to resolve
         the live Stage-2 (``task_knowledge_sync``) run a code-detected
         ``task_lifecycle_reset_detected`` finding should land against.
         """
-        for run_id, active_stage in self._active.items():
-            if active_stage != stage:
+        for run_id, idx in self._runs.items():
+            if idx.active_stage != stage:
                 continue
-            entry = self._state.get((run_id, stage))
+            entry = idx.resident_entry(stage)
             if entry is None or entry.completed_at is not None:
                 continue
             if entry.project_id != project_id:
@@ -2113,18 +1949,11 @@ class ReconReportState:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _install_entry(self, entry: _ReportEntry) -> None:
-        """Make *entry* resident and its run's registered entry for its stage —
-        the only way into the read-only ``_state``, so every resident entry is
-        registered."""
-        self._resident_entries[(entry.run_id, entry.stage)] = entry
-        self._run_entries.setdefault(entry.run_id, {})[entry.stage] = entry
-
     def _resolve_entry(self, run_id: str) -> _ReportEntry | None:
-        stage = self._active.get(run_id)
-        if stage is None:
+        idx = self._runs.get(run_id)
+        if idx is None or idx.active_stage is None:
             return None
-        return self._state.get((run_id, stage))
+        return idx.resident_entry(idx.active_stage)
 
     def _resolve_finding(
         self, run_id: str, finding_id: str
@@ -2132,12 +1961,13 @@ class ReconReportState:
         """Return (entry, finding) or None if either run_id or finding_id is unknown.
 
         The lookup covers ALL stage entries that share this ``run_id`` via
-        _run_finding_index, so a finding_id returned via a cross-stage
-        ``duplicate_finding`` response (where the original finding lives in an
-        earlier stage's entry) remains citable from a later stage.  The index
-        is keyed by run_id, preserving cross-run isolation.
+        :meth:`RunFindingIndex.owner_of`, so a finding_id returned via a
+        cross-stage ``duplicate_finding`` response (where the original finding
+        lives in an earlier stage's entry) remains citable from a later stage.
+        The index is per run, preserving cross-run isolation.
         """
-        entry = self._run_finding_index.get(run_id, {}).get(finding_id)
+        idx = self._runs.get(run_id)
+        entry = idx.owner_of(finding_id) if idx is not None else None
         if entry is None:
             return None
         for f in entry.findings:
@@ -2151,22 +1981,18 @@ class ReconReportState:
         owning_entry: _ReportEntry,
         finding: _Finding,
     ) -> None:
-        """Remove *finding* from *owning_entry* and every dedup index it may
-        be registered under: ``_run_finding_index``, whichever of
-        ``_run_sig_index`` / ``_run_desc_index`` it was filed under,
-        ``_run_cited_task_index`` if it is a primary-cited-task fold anchor
-        (task-2425), and the derived projectless ``(cited_task_id,
-        flag_type)`` key in ``_run_sig_index`` if it is an entity-scoped
-        fold anchor (task-2432) — see :meth:`cite_task`'s docstring for both
-        folds.
+        """Remove *finding* from *owning_entry* and unregister it from the
+        run's finding index (:meth:`RunFindingIndex.unregister` pops every
+        key that still names it, fold anchors included — see
+        :meth:`cite_task`'s docstring for both folds).
 
         Also repairs every ``superseded_by`` back-reference AT *finding*
         anywhere in this run (task-4653).  A dangling forward pointer is
         exactly the class of stale pointer this helper exists to prevent:
         left in place it would keep the superseded finding neutered forever,
         pointing at a row that no longer exists.  The sweep covers the run's
-        REACHABLE entries (:meth:`_reachable_run_entries`) — the same
-        registered entries :meth:`_persist_run` writes — because a superseder
+        REACHABLE entries (:meth:`RunFindingIndex.reachable_entries`) — the
+        same entries :meth:`_persist_run` writes — because a superseder
         routinely lives in a later stage's entry than its target, and that
         target's stage has routinely been EVICTED from ``_state`` by then while
         staying resolvable and persisted.  Doing it here covers BOTH removal
@@ -2183,10 +2009,9 @@ class ReconReportState:
         exists to close, reintroduced by the cleanup meant to protect it.
 
         Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
-        cited-task fold's retract path in :meth:`cite_task`, so the
-        run-level dedup indices can never drift out of sync between the two
-        removal paths, and neither path can leave a stale pointer to a
-        finding that no longer exists.
+        cited-task fold's retract path in :meth:`cite_task`, so neither
+        removal path can leave a stale key or pointer to a finding that no
+        longer exists.
 
         Identity-based removal (``is``, not ``==``) — *finding* is the exact
         object reference returned by :meth:`_resolve_finding`; see
@@ -2196,7 +2021,7 @@ class ReconReportState:
         entirely, so any ``cited_entities`` / ``cited_edges`` / ``cited_memories``
         already recorded on it (e.g. via ``cite_entity`` / ``cite_edge`` /
         ``cite_memory`` calls made before this purge) are discarded along with
-        it — not just the four dedup indices. For the cite_task fold this is
+        it — not just its dedup keys. For the cite_task fold this is
         intentional (task-2425): a finding judged a same-run duplicate of an
         earlier one contributes no new information, so citations already
         attached to it are not worth preserving. A caller that records
@@ -2208,39 +2033,8 @@ class ReconReportState:
         :meth:`delete_finding` keeps no such record.
         """
         owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
-        self._run_finding_index.get(run_id, {}).pop(finding.finding_id, None)
-
-        sig = (finding.task_id, finding.flag_type)
-        if sig != (None, None):
-            self._run_sig_index.get(run_id, {}).pop(sig, None)
-            owning_entry._signature_to_finding.pop(sig, None)
-        elif normalize_description(finding.description):
-            desc_hash = description_digest(finding.description)
-            self._run_desc_index.get(run_id, {}).pop(desc_hash, None)
-            owning_entry._deschash_to_finding.pop(desc_hash, None)
-
-        if finding.task_id is None and finding.cited_tasks:
-            primary = finding.cited_tasks[0]
-            primary_key = _cited_task_key(primary['project_id'], primary['task_id'])
-            run_cited_tasks = self._run_cited_task_index.get(run_id, {})
-            if run_cited_tasks.get(primary_key) == finding.finding_id:
-                run_cited_tasks.pop(primary_key, None)
-
-        # task-2432: clear the entity-scoped fold's derived (cited_task_id,
-        # flag_type) anchor. Unlike the project-scoped anchor above, this
-        # is NOT gated on finding.task_id is None — a finding whose top-level
-        # task_id matched its primary citation (single or comma-joined) can
-        # also be a derived-sig anchor (see cite_task's docstring). A finding
-        # purged MID-FOLD in cite_task (the losing side of a collision) has
-        # empty cited_tasks at purge time — its citation is only appended
-        # after the fold-check succeeds — so this guard correctly skips it;
-        # only an established anchor (whose citation is already recorded)
-        # clears its derived sig here.
-        if finding.flag_type is not None and finding.cited_tasks:
-            derived_sig = (signature_field(finding.cited_tasks[0]['task_id']), finding.flag_type)
-            run_sig_index = self._run_sig_index.get(run_id, {})
-            if run_sig_index.get(derived_sig) == finding.finding_id:
-                run_sig_index.pop(derived_sig, None)
+        idx = self._runs[run_id]
+        idx.unregister(finding)
 
         # task-4653: repair every forward pointer AT this finding.  The reach is
         # the run's REACHABLE entries — the same registered entries
@@ -2262,7 +2056,7 @@ class ReconReportState:
         # retired — so the first in reach order is taken.
         remaining = [
             f
-            for other_entry in self._reachable_run_entries(run_id)
+            for other_entry in idx.reachable_entries()
             for f in other_entry.findings
             if f is not finding
         ]
@@ -2282,7 +2076,7 @@ class ReconReportState:
         anchor carries no such pin (task-4185).
 
         The derived signature is deliberately PROJECTLESS (see
-        ``_run_sig_index``'s declaration), so a hit on it does not by itself
+        ``_runs``' declaration), so a hit on it does not by itself
         mean the two findings are about the same task — only about the same
         task NUMBER. This helper answers the narrower question the guard
         needs: did the anchor's own primary citation pin that number to a
@@ -2296,7 +2090,7 @@ class ReconReportState:
             projectless ``(task_id, flag_type)`` key, and a bare top-level
             ``task_id`` names no project — so there is nothing to compare
             against and the fold is the INTENDED one (operator ruling
-            2026-08-12; see ``_run_sig_index``).
+            2026-08-12; see ``_runs``).
 
         (ii) The anchor's primary citation names a DIFFERENT task. Such a
             citation says nothing about which project THIS task id belongs
@@ -2364,7 +2158,7 @@ class ReconReportState:
         ``structural_copy`` field says whether this purge's copy was kept.
 
         *record_entry* is the CITING stage's entry (the one :meth:`cite_task`
-        resolved through ``_active``), not *owning_entry*. The fold is an act
+        resolved through the active stage), not *owning_entry*. The fold is an act
         of the citing stage, so that stage's row is where its folds are
         recorded, and the fold branch's existing :meth:`_persist_run` writes
         it. The record's ``owning_stage`` keeps each record attributable to
@@ -2627,7 +2421,7 @@ class ReconReportState:
         1. Project-scoped null+null fold (task-2425): when *finding* has a
            null top-level task_id and this is its PRIMARY (first-ever)
            citation, the (project_id, task_id) pair doubles as an in-run
-           dedup anchor keyed in ``_run_cited_task_index``. Findings with a
+           dedup anchor, the run finding index's cited-task key. Findings with a
            real top-level task_id, and secondary (non-first) citations, are
            never anchors here. EXEMPTS ``memory_consolidator`` (Stage-1)
            findings, mirroring Fix-1's read-time ``stage !=
@@ -2638,8 +2432,8 @@ class ReconReportState:
            duplicates in a non-Stage-1 stage that Fix-1 cannot reach.
 
         2. Entity-scoped derived-signature fold (task-2432 bullets 1b/2/3):
-           reuses ``_run_sig_index`` — the SAME index add_finding's ordinary
-           (task_id, flag_type) signature lookup consults — with a
+           reuses the run finding index's signature keys — the SAME keys
+           add_finding's ordinary (task_id, flag_type) lookup consults — with a
            PROJECTLESS derived key ``(canonical(task_id), finding.flag_type)``
            built from *this citation's* task_id. Registering it there means a
            LATER add_finding whose top-level task_id equals this cited tid
@@ -2749,40 +2543,14 @@ class ReconReportState:
 
         # In-run cited-task folds (task-2425 project-scoped; task-2432
         # entity-scoped) — see docstring above. Both folds' EXISTENCE CHECKS
-        # run before EITHER registers.
-        project_fold_eligible = (
-            finding.task_id is None
-            and not finding.cited_tasks
-            and finding_entry.stage != 'memory_consolidator'
-        )
-        # Always compute the concrete key (pure, side-effect-free) so its
-        # static type stays non-Optional for the dict lookup/assignment below
-        # — mirrors _purge_finding's primary_key/derived_sig convention.
-        # Its *use* is still gated on project_fold_eligible.
-        cited_task_key = _cited_task_key(project_id, task_id)
-        project_existing_id = (
-            self._run_cited_task_index.get(run_id, {}).get(cited_task_key)
-            if project_fold_eligible
-            else None
-        )
-
+        # run before EITHER registers.  The candidate keys come from the run
+        # index's one key derivation, which owns both folds' eligibility.
+        idx = self._runs[run_id]
+        candidate = idx.citation_keys(finding, project_id=project_id, task_id=task_id)
+        project_existing_id = idx.by_cited_task(candidate.cited_task)
+        entity_existing_id = idx.by_signature(candidate.derived_signature)
+        derived_sig = candidate.derived_signature
         c_cited_task_id = signature_field(task_id)
-        entity_fold_eligible = (
-            not finding.cited_tasks
-            and finding.flag_type is not None
-            and (
-                finding.task_id is None
-                or c_cited_task_id in parse_flag_subject(finding.task_id).components
-            )
-        )
-        # Same rationale as cited_task_key above: compute unconditionally,
-        # gate the use on entity_fold_eligible.
-        derived_sig = (c_cited_task_id, finding.flag_type)
-        entity_existing_id = (
-            self._run_sig_index.get(run_id, {}).get(derived_sig)
-            if entity_fold_eligible
-            else None
-        )
 
         # task-4185: the derived sig is PROJECTLESS, so a hit can mean two
         # projects' findings about same-NUMBERED tasks rather than one task.
@@ -2816,8 +2584,8 @@ class ReconReportState:
                 # which is why it is WARNING and not INFO.  Nothing is
                 # destroyed here (both findings survive), so it needs no
                 # _record_cite_task_fold_purge-style content record; but the
-                # UNGUARDABLE add_finding→derived-sig half (see
-                # ``_run_sig_index``) may have silently folded two projects'
+                # UNGUARDABLE add_finding→derived-sig half (see ``_runs``) may
+                # have silently folded two projects'
                 # findings elsewhere in this same run, and nothing detects
                 # that after the fact.  An operator who sees this knows to
                 # distrust the run's dedup.  Lazy %-args, never an f-string.
@@ -2840,10 +2608,8 @@ class ReconReportState:
 
         # Sequential (not project_hit/entity_hit booleans + a re-derived
         # existing_id) so pyright narrows each *_existing_id to `str` from
-        # its own `is not None` check at the call site — see cited_task_key
-        # comment above for why the naive boolean-flag version doesn't
-        # narrow. Semantics are unchanged: project fold takes priority when
-        # both would hit, purge runs exactly once, either way.
+        # its own `is not None` check at the call site. Project fold takes
+        # priority when both would hit; purge runs exactly once, either way.
         if project_existing_id is not None and project_existing_id != finding.finding_id:
             self._record_cite_task_fold_purge(
                 run_id=run_id,
@@ -2877,38 +2643,28 @@ class ReconReportState:
             self._persist_run(run_id)
             return _duplicate_finding_error(entity_existing_id)
 
-        if project_fold_eligible:
-            self._run_cited_task_index.setdefault(run_id, {})[cited_task_key] = finding.finding_id
         # task-4185: the derived signature has exactly ONE owner per run and
-        # FIRST REGISTRANT WINS.  A finding whose fold was skipped for a
-        # project mismatch keeps its own citation but does NOT take
-        # ownership: otherwise it would overwrite the anchor, and every
-        # later same-project duplicate of that task would compare against
-        # this FOREIGN citation, see a mismatch, and stop folding — trading
-        # a cross-project over-fold for a same-project under-fold.  It also
-        # keeps _purge_finding's ownership check
-        # (`run_sig_index.get(derived_sig) == finding.finding_id`) honest:
-        # deleting a non-owning finding must not clear the anchor another
-        # finding still owns.  The project-scoped registration above is
-        # deliberately NOT gated — its key already carries project_id, so
-        # this finding legitimately anchors 'other_project:42' for its own
-        # project.
+        # FIRST REGISTRANT WINS (RunFindingIndex never overwrites an owner).
+        # A finding whose fold was skipped for a project mismatch keeps its
+        # own citation but does NOT take ownership: otherwise every later
+        # same-project duplicate of that task would compare against this
+        # FOREIGN citation, see a mismatch, and stop folding — trading a
+        # cross-project over-fold for a same-project under-fold.  The
+        # cited-task key carries project_id, so this finding legitimately
+        # anchors 'other_project:42' for its own project.
         #
         # ACCEPTED consequence (task-4185 amend): duplicates WITHIN the
         # foreign project are then not deduped by the derived sig at all —
         # a second other_project:42 citation also finds the original
         # (dark_factory-pinned) anchor, also mismatches, and also survives.
-        # Those fall back to the project-scoped index above when eligible
-        # ('other_project:42' is a real, project-carrying key); when they
-        # are not eligible for fold 1 (e.g. a non-null top-level task_id),
-        # both foreign findings simply survive.  That under-fold is the
-        # price of first-registrant-wins and is preferred to the
-        # alternative — handing the derived-sig anchor to the foreign
-        # finding and under-folding the ORIGINAL project instead.  Pinned
-        # by test_second_foreign_citation_also_survives.
-        if entity_fold_eligible and not entity_project_mismatch:
-            self._run_sig_index.setdefault(run_id, {})[derived_sig] = finding.finding_id
-
+        # Those fall back to the cited-task key when eligible; when they are
+        # not eligible for fold 1 (e.g. a non-null top-level task_id), both
+        # foreign findings simply survive.  That under-fold is the price of
+        # first-registrant-wins and is preferred to the alternative — handing
+        # the derived-sig anchor to the foreign finding and under-folding the
+        # ORIGINAL project instead.  Pinned by
+        # test_second_foreign_citation_also_survives.
+        is_primary_citation = not finding.cited_tasks
         # task-2425 amend: skip the append when an identical {project_id,
         # task_id} citation is already present. Without this, re-citing a
         # finding's own primary task (see
@@ -2930,6 +2686,8 @@ class ReconReportState:
         )
         if not already_cited:
             finding.cited_tasks.append(citation)
+        if is_primary_citation:
+            idx.register_citation(finding, finding_entry)
         self._persist_run(run_id)
         return citation
 
@@ -3220,111 +2978,63 @@ class ReconReportState:
     def tick(self) -> int:
         """Sweep completed entries past TTL.  Returns count evicted.
 
-        Each evicted entry's own ``_state``/``_active`` lookup slots are
-        removed immediately — that part of the contract is unchanged. This is
-        NOT the same as the ``_ReportEntry`` object being garbage-collected
-        immediately: while its run is still live, ``_run_finding_index``
-        keeps a reference to the evicted entry (see below) so its findings
-        stay citable, and ``_run_entries`` keeps it in the run's persist reach
-        (see :meth:`_reachable_run_entries`); the object only becomes
-        unreachable once both are popped at quiescence.
+        Each evicted stage leaves its run's resident set and, if it was the
+        active stage, the active pointer (:meth:`RunFindingIndex.evict`).
+        The entry stays REACHABLE — its findings citable, its row in the
+        persist reach — for as long as its run is live.
 
-        The four shared run-level dedup indices (``_run_sig_index`` /
-        ``_run_desc_index`` / ``_run_finding_index`` / ``_run_cited_task_index``)
-        are RUN-QUIESCENCE scoped, not per-entry (task-2088). They are keyed for the WHOLE run
-        across all of its stages, and reconciliation runs are multi-stage and
-        long-lived: Stage 1 (memory_consolidator) typically files a finding
-        and completes early, while Stage 2/3 + remediation keep the run live
-        for minutes. Releasing a run's indices the moment any ONE completed
-        stage ages out — while a sibling stage of the SAME run is still live
-        — would drop the in-run dedup key mid-run and let a later stage
-        double-file a signature/description already reported by an evicted
-        stage (run 33c324b0 regression), and would dangle any
-        duplicate_finding pointer already handed to another stage by
-        collapsing _run_finding_index out from under it.
+        The run's finding index is RUN-QUIESCENCE scoped, not per-entry
+        (task-2088).  Reconciliation runs are multi-stage and long-lived:
+        Stage 1 (memory_consolidator) typically files a finding and completes
+        early, while Stage 2/3 + remediation keep the run live for minutes.
+        Releasing a run's keys the moment any ONE completed stage ages out
+        would let a later stage double-file a signature/description already
+        reported by an evicted stage (run 33c324b0 regression), and would
+        dangle any duplicate_finding pointer already handed to another stage.
+        So the index is dropped, and the run's rows GC'd from the store, only
+        once its LAST resident stage evicts.  See
+        test_eviction_partial_run_canonical_stage_cleared and the sibling
+        tests in TestReconReportReaper.
 
-        So: while at least one ``(run_id, *)`` entry remains in ``_state``
-        (in-progress, or completed but not yet past its own TTL), all four
-        indices for that run_id are preserved untouched, even for stages that
-        have already been evicted. Only when a run's LAST entry evicts do we
-        release its four indices, together with its ``_run_entries`` registry,
-        wholesale via ``pop(rid, None)`` rather than by walking the evicted
-        entry's own signature/desc-hash/finding maps — this correctly reclaims
-        contributions from every stage of the run in one shot and is robust to
-        several same-run entries evicting within the same tick() call. Do not
-        reintroduce per-entry teardown here; see
-        test_eviction_partial_run_canonical_stage_cleared and the sibling tests
-        in TestReconReportReaper for the regression this guards against.
-
-        Quiescence is computed ONCE per tick() call — the set of run_ids
-        still present in ``_state`` after all of this sweep's deletions —
-        rather than via a per-evicted-entry ``any()`` scan over ``_state``.
-        The latter is O(evicted × remaining _state size) and becomes
-        quadratic when many entries across many runs age out in the same
-        sweep; computing the surviving run_id set once and then doing an O(1)
-        membership check per evicted run_id is O(evicted + remaining).
-
-        Retention caveat: reaching quiescence requires every ``(run_id, *)``
-        entry to individually hit completed_at + TTL. An in-progress entry
-        never expires on its own — it is immortal by design (PRD §9.4; see
-        test_inprogress_not_evicted_by_ttl) — so a stalled or crashed stage
-        that never calls complete() pins that run_id's four indices, and
-        every already-evicted sibling entry object held in ``_run_entries``
-        (bounded by the run's stage count) or kept reachable through
-        ``_run_finding_index``, for as long as the process keeps running.
-        There is currently no separate max-lifetime sweep for in-progress
-        entries to bound this. This is an accepted tradeoff for task-2088
-        (worst case is bounded by process restart, not memory exhaustion
-        under normal operation), not a defect this task fixes.
+        Retention caveat: an in-progress entry never expires on its own — it
+        is immortal by design (PRD §9.4; see test_inprogress_not_evicted_by_ttl)
+        — so a stalled or crashed stage that never calls complete() pins its
+        run's index, and every already-evicted sibling entry it reaches, for
+        as long as the process keeps running.  This is an accepted tradeoff
+        for task-2088 (bounded by process restart), not a defect.
         """
         now = self._clock()
-        to_evict = [
-            (rid, stage)
-            for (rid, stage), entry in self._state.items()
-            if entry.completed_at is not None
-            and now - entry.completed_at > self._ttl_seconds
-        ]
-        evicted_run_ids: set[str] = set()
-        for key in to_evict:
-            rid, stage = key
-            del self._resident_entries[key]
-            evicted_run_ids.add(rid)
-            # Remove _active pointer only if it still points at this stage
-            if self._active.get(rid) == stage:
-                del self._active[rid]
-        if evicted_run_ids:
-            # Run-quiescence gate (task-2088) — see the tick() docstring above.
-            # Compute the set of run_ids with a surviving _state entry ONCE,
-            # after all of this sweep's deletions, instead of rescanning
-            # _state per evicted entry. A run_id that evicted this tick and
-            # has no surviving entry is fully quiescent — release its four
-            # shared indices and its entry registry wholesale.
-            live_run_ids = {r for (r, _s) in self._state}
-            for rid in evicted_run_ids:
-                if rid not in live_run_ids:
-                    self._run_sig_index.pop(rid, None)
-                    self._run_finding_index.pop(rid, None)
-                    self._run_desc_index.pop(rid, None)
-                    self._run_cited_task_index.pop(rid, None)
-                    self._run_entries.pop(rid, None)
-                    # GC the run's persisted rows at quiescence (task 2716) —
-                    # "rows are GC'd with their run".  Best-effort: a shadow-store
-                    # hiccup must not abort the reaper sweep or the in-memory
-                    # eviction just performed (mirrors _persist_run's
-                    # loud-but-non-fatal posture).  No-op when store is None.
-                    if self._store is not None:
-                        try:
-                            self._store.delete_run(rid)
-                        except Exception:
-                            logger.warning(
-                                'recon_report: failed to GC persisted rows for '
-                                'run_id=%r at quiescence',
-                                rid,
-                                exc_info=True,
-                            )
-        if to_evict:
-            logger.debug('recon_report reaper evicted %d entries', len(to_evict))
-        return len(to_evict)
+        evicted = 0
+        for run_id, idx in list(self._runs.items()):
+            expired = [
+                stage
+                for stage, entry in idx.resident_entries.items()
+                if entry.completed_at is not None
+                and now - entry.completed_at > self._ttl_seconds
+            ]
+            for stage in expired:
+                idx.evict(stage)
+            evicted += len(expired)
+            if expired and idx.quiescent:
+                del self._runs[run_id]
+                # GC the run's persisted rows at quiescence (task 2716) —
+                # "rows are GC'd with their run".  Best-effort: a shadow-store
+                # hiccup must not abort the reaper sweep or the in-memory
+                # eviction just performed (mirrors _persist_run's
+                # loud-but-non-fatal posture).  No-op when store is None.
+                if self._store is not None:
+                    try:
+                        self._store.delete_run(run_id)
+                    except Exception:
+                        logger.warning(
+                            'recon_report: failed to GC persisted rows for '
+                            'run_id=%r at quiescence',
+                            run_id,
+                            exc_info=True,
+                        )
+        if evicted:
+            logger.debug('recon_report reaper evicted %d entries', evicted)
+        return evicted
 
     async def _reaper_loop(self) -> None:
         try:
