@@ -201,7 +201,7 @@ class TestAddMemoryIntentBracketing:
             )
 
         assert svc.mem0.add.await_count == 1
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
         assert SourceStore.mem0 in result.stores_written
         mem0_beops = [
             op
@@ -367,7 +367,8 @@ class TestAddMemoryTransientDeferral:
             dual_write=True,
         )
 
-        assert result.stores_written == [SourceStore.graphiti]
+        assert result.stores_written == []
+        assert result.stores_queued == [SourceStore.graphiti]
         assert result.stores_pending_retry == [SourceStore.mem0]
 
     @pytest.mark.asyncio

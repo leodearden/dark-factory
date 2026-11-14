@@ -27,7 +27,10 @@ from fused_memory.middleware.dead_letter_escalator import (
     _REPORTED_TO_CALLER_DEFAULT,
 )
 from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import Mem0WriteState, render_add_memory_message
+from fused_memory.reconciliation.stage_stats import derive_stage_stats
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.queued_writes import QueueOperation
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -112,7 +115,7 @@ class TestIntegrationFlow:
             category='entities_and_relations',
             project_id='test',
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
 
         # Poll until the worker has processed the item, instead of a fixed
         # sleep that can race under full-suite CPU load.
@@ -225,7 +228,7 @@ class TestIntegrationFlow:
             project_id='test',
             dual_write=True,
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
         assert SourceStore.mem0 in result.stores_written
 
         # Poll until the queue has processed both writes, instead of a fixed
@@ -994,6 +997,60 @@ class TestTerminalOutcomeWrittenBack:
         assert row['terminal_error'] is None
 
 
+class TestAddMemoryReportsGraphitiQueued:
+    @pytest.mark.asyncio
+    async def test_a_dual_write_reports_mem0_written_and_graphiti_queued(
+        self, journaled_service
+    ):
+        svc, journal = journaled_service
+
+        response = await svc.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='test',
+            dual_write=True,
+        )
+
+        assert response.stores_written == [SourceStore.mem0]
+        assert response.stores_queued == [SourceStore.graphiti]
+        assert response.stores_pending_retry == []
+        assert response.mem0_write_state is Mem0WriteState.LANDED
+        assert response.message == render_add_memory_message(
+            stores_written=[SourceStore.mem0], stores_queued=[SourceStore.graphiti]
+        )
+        row = await journal.get_write_op(await _sole_queue_write_op_id(svc))
+        assert row is not None
+        result_summary = json.loads(row['result_summary'])
+        assert result_summary['stores_queued'] == ['graphiti']
+        assert result_summary['stores'] == ['mem0']
+
+    @pytest.mark.asyncio
+    async def test_a_real_graphiti_only_add_memory_counts_as_graphiti_writes_queued(
+        self, journaled_service
+    ):
+        svc, journal = journaled_service
+        stage_agent_id = 'recon-stage-memory_consolidator'
+        causation_id = 'run-9147-graphiti-only'
+
+        await svc.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+            agent_id=stage_agent_id,
+            causation_id=causation_id,
+        )
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        async def _completed():
+            row = await journal.get_write_op(write_op_id)
+            return row is not None and row['terminal_status'] == 'completed'
+
+        await poll_until(_completed, timeout=20.0, message='write never stamped completed')
+
+        ops = await journal.get_ops_by_causation(causation_id)
+        assert derive_stage_stats(ops, stage_agent_id)['graphiti_writes_queued'] == 1
+
+
 # ---------------------------------------------------------------------------
 # THE ACCEPTANCE TEST (task 3583).
 #
@@ -1112,25 +1169,18 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
     """The asymmetry the task names, and the regression that anchors it.
 
     `add_memory`'s Mem0 leg is a direct synchronous call, so its failure is
-    visible to the caller immediately. Its Graphiti leg is enqueued and
-    reported as WRITTEN at enqueue time — a true statement about durable
-    acceptance, and a false one about the graph — and until now its eventual
-    death reached nobody.
-
-    The response is deliberately left unchanged: `add_memory` structurally
-    CANNOT wait for the Graphiti write (that is the whole purpose of the
-    queue), and dropping graphiti from `stores_written` would be strictly
-    worse — the caller would lose the true fact that the write was durably
-    accepted and STILL learn nothing when it later died. So the FAILURE becomes
-    push instead.
+    visible to the caller immediately. Its Graphiti leg is reported in
+    `stores_queued` at enqueue time: durably accepted, not yet in the graph.
+    `add_memory` structurally CANNOT wait for the Graphiti write (that is the
+    whole purpose of the queue), so its eventual death is pushed as this
+    escalation.
     """
 
     @pytest.mark.asyncio
-    async def test_the_caller_is_told_graphiti_was_written_at_enqueue_time(
+    async def test_the_caller_is_told_graphiti_was_queued_at_enqueue_time(
         self, journaled_service, tmp_path,
     ):
-        """Today's behaviour, pinned so the regression below is anchored on a
-        measured fact rather than an assumed one."""
+        """The claim the response makes, and the one the alarm says it made."""
         from fused_memory.models.enums import MemoryCategory
 
         svc, _journal = journaled_service
@@ -1142,9 +1192,21 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
             project_id='main',
         )
 
-        assert SourceStore.graphiti in response.stores_written, (
-            "reported at ENQUEUE time, under add_memory's "
-            '"Durably persisted to SQLite — report as written" comment'
+        assert SourceStore.graphiti in response.stores_queued, (
+            'reported at ENQUEUE time as durably queued'
+        )
+        assert SourceStore.graphiti not in response.stores_written, (
+            'an enqueue is not a write to the graph'
+        )
+        lists_holding_graphiti = [
+            f
+            for f in ('stores_written', 'stores_queued', 'stores_pending_retry')
+            if SourceStore.graphiti in getattr(response, f)
+        ]
+        assert lists_holding_graphiti == ['stores_queued']
+        claim = _REPORTED_TO_CALLER[QueueOperation.ADD_MEMORY_GRAPHITI].text
+        assert lists_holding_graphiti[0] in claim, (
+            'the dead-letter alarm must name the claim the response actually made'
         )
 
     @pytest.mark.asyncio
@@ -1164,7 +1226,7 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
             category=MemoryCategory.decisions_and_rationale.value,
             project_id='main',
         )
-        assert SourceStore.graphiti in response.stores_written
+        assert SourceStore.graphiti in response.stores_queued
 
         filed = await _poll_for_escalation(tmp_path)
         detail = filed[0]['detail']
@@ -1177,12 +1239,12 @@ class TestAddMemoryGraphitiLegDeadLetterIsObservable:
         # which is false, and is exactly the lie the alarm exists to surface.
         assert 'reported_to_caller=' in detail, detail
         assert _REPORTED_TO_CALLER['add_memory_graphiti'].text in detail, (
-            'the caller was told graphiti was WRITTEN, not that the write was '
-            'queued; an alarm that misreports what the caller was promised is '
-            'not triageable'
+            'the caller was told graphiti was QUEUED; an alarm that misreports '
+            'what the caller was promised is not triageable'
         )
         assert _REPORTED_TO_CALLER['add_episode'].text not in detail, (
-            'add_memory never returns a queued status — that is add_episode'
+            "add_episode's status='queued' is a distinct claim from add_memory's "
+            'stores_queued, and the alarm must name the one this caller received'
         )
 
     @pytest.mark.asyncio

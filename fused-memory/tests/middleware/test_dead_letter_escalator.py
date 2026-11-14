@@ -552,7 +552,7 @@ class TestWhatTheCallerWasTold:
 
         assert dle_mod._REPORTED_TO_CALLER['add_episode'].text in detail, detail
 
-    def test_the_add_memory_leg_names_the_stores_written_it_returned(self, tmp_path):
+    def test_the_add_memory_leg_names_the_stores_queued_it_returned(self, tmp_path):
         """The claim `add_memory` makes, and the one it does NOT make."""
         _emit(tmp_path, operation='add_memory_graphiti', write_op_id='W-9')
         detail = _filed(tmp_path)[0]['detail']
@@ -564,7 +564,7 @@ class TestWhatTheCallerWasTold:
         """`add_memory_graphiti` has TWO producers and only one faces a caller.
 
         `MemoryService.replay_from_store` enqueues this same operation from a
-        background loop: no `add_memory` call, no synchronous `stores_written`
+        background loop: no `add_memory` call, no synchronous `stores_queued`
         claim, and — the discriminator — no `_write_op_id`, which `add_memory`
         mints for every item it enqueues. Keyed on the operation NAME alone the
         record would tell an operator a caller had been lied to, and send them

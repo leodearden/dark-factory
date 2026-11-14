@@ -6,8 +6,8 @@ Task 3583. The FIRE half of the signal whose seam is
 
 WHAT THIS CLOSES. A durably-queued write is ACCEPTED synchronously and executed
 later: ``add_episode`` returns ``status='queued'``, and ``add_memory``'s
-Graphiti leg appends ``SourceStore.graphiti`` to ``stores_written`` the moment
-the item is enqueued. Both are true statements about durable acceptance. But
+Graphiti leg is reported in ``stores_queued`` the moment the item is enqueued.
+Both are true statements about durable acceptance. But
 when the item later exhausts its attempts, the caller who acted on that success
 is told nothing, ever — the whole premise of the queue is that an accepted
 enqueue eventually lands, and a dead-letter is that premise being broken.
@@ -50,7 +50,7 @@ WHAT THE CALLER WAS TOLD is carried explicitly, via ``_REPORTED_TO_CALLER``,
 keyed on the durable-queue OPERATION name and gated on the evidence that
 operation's claim rests on. The two enqueue sites that report a synchronous
 success make DIFFERENT claims — ``add_episode`` returns ``status='queued'``,
-``add_memory`` returns ``stores_written`` containing graphiti — and an alarm
+``add_memory`` returns ``stores_queued`` containing graphiti — and an alarm
 that misreported which one was made would not be triageable. Neither is the
 operation name alone always evidence that a claim was made at all: see
 ``_Claim.requires_write_op_id`` for the operation with a second, caller-less
@@ -115,7 +115,7 @@ class _Claim:
     ONE producer and only some of them face a caller, so the operation NAME
     alone is not always evidence that anybody was told anything.
     ``add_memory_graphiti`` is the case that forces it: ``add_memory`` mints a
-    ``_write_op_id`` for every item it enqueues and returns ``stores_written``
+    ``_write_op_id`` for every item it enqueues and returns ``stores_queued``
     to a live caller, while ``MemoryService.replay_from_store`` enqueues the
     same operation from a background loop with no caller, no synchronous claim
     and deliberately no ``_write_op_id``. Ungated, a replayed death would name
@@ -143,8 +143,8 @@ _REPORTED_TO_CALLER: Mapping[str, _Claim] = {
         'was told the write had been durably accepted and would land'
     ),
     QueueOperation.ADD_MEMORY_GRAPHITI: _Claim(
-        'add_memory returned stores_written containing graphiti at enqueue '
-        'time — the caller was told this write LANDED, not that it was queued',
+        'add_memory returned stores_queued containing graphiti, so the caller '
+        'was told the write had been durably queued and would land',
         requires_write_op_id=True,
     ),
 }

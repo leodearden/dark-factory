@@ -771,6 +771,95 @@ async def test_derive_stage_stats_graphiti_only_enqueue_stores_written_alias(jou
 
 
 @pytest.mark.asyncio
+async def test_derive_stage_stats_post_beta_graphiti_only_row_counts_queued(journal):
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={
+            'memory_ids': [], 'stores': [], 'stores_pending': [],
+            'stores_queued': ['graphiti'],
+        },
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_beta_dual_write_row_counts_added(journal):
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={
+            'memory_ids': ['m1'], 'stores': ['mem0'], 'stores_pending': [],
+            'stores_queued': ['graphiti'],
+        },
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(memories_added=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_dead_post_beta_graphiti_only_row_is_dead_lettered(journal):
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={
+            'memory_ids': [], 'stores': [], 'stores_pending': [],
+            'stores_queued': ['graphiti'],
+        },
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='backend refused')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_beta_json_string_row_counts_queued(journal):
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary=json.dumps({
+            'memory_ids': [], 'stores': [], 'stores_pending': [],
+            'stores_queued': ['graphiti'],
+        }),
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_beta_row_whose_mem0_leg_is_pending_counts_queued(
+    journal,
+):
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={
+            'memory_ids': [], 'stores': [], 'stores_pending': ['mem0'],
+            'stores_queued': ['graphiti'],
+        },
+        success=False,
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1)
+
+
+@pytest.mark.asyncio
 async def test_derive_stage_stats_update_edge_counts_only_when_verified_true(journal):
     """Two update_edge ops, same stage: one verified, one not. Only the
     verified op counts."""

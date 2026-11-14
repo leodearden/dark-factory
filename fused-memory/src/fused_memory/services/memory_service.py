@@ -81,6 +81,7 @@ from fused_memory.models.memory import (
     EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
+    render_add_memory_message,
 )
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -6604,6 +6605,7 @@ class MemoryService:
 
         memory_ids: list[str] = []
         stores_written: list[SourceStore] = []
+        stores_queued: list[SourceStore] = []
         stores_pending_retry: list[SourceStore] = []
         meta['category'] = resolved_category.value
         _stamp_unverified_claim(meta, unverified_claim)
@@ -6721,8 +6723,7 @@ class MemoryService:
                     ),
                     callback=QueueCallback.REFRESH_ENTITY_SUMMARIES,
                 )
-                # Durably persisted to SQLite — report as written
-                stores_written.append(SourceStore.graphiti)
+                stores_queued.append(SourceStore.graphiti)
             except Exception as e:
                 logger.error(f'Graphiti enqueue failed: {e}')
                 _graphiti_error = f'{type(e).__name__}: {e}'
@@ -6843,6 +6844,7 @@ class MemoryService:
                 result_summary={
                     'memory_ids': memory_ids,
                     'stores': [s.value for s in stores_written],
+                    'stores_queued': [s.value for s in stores_queued],
                     'stores_pending': [s.value for s in stores_pending_retry],
                 },
                 success=not (_graphiti_error or _mem0_error or _mem0_empty_result),
@@ -6863,24 +6865,22 @@ class MemoryService:
             agent_id=agent_id,
         ))
 
-        msg = f'Memory queued for {[s.value for s in stores_written]}'
-        if _graphiti_error:
-            msg += f' [graphiti_error: {_graphiti_error}]'
-        if _mem0_error:
-            msg += f' [mem0_error: {_mem0_error}]'
-        if _mem0_empty_result:
-            msg += f' [{_mem0_empty_result}]'
-        if _mem0_pending:
-            msg += f' [mem0_pending_retry: {_mem0_pending}]'
-        if classification_fallback is not None:
-            msg += f' [classification_fallback: {classification_fallback.value}]'
-
         return AddMemoryResponse(
             memory_ids=memory_ids,
             stores_written=stores_written,
+            stores_queued=stores_queued,
             stores_pending_retry=stores_pending_retry,
             category=resolved_category,
-            message=msg,
+            message=render_add_memory_message(
+                stores_written=stores_written,
+                stores_queued=stores_queued,
+                stores_pending_retry=stores_pending_retry,
+                graphiti_error=_graphiti_error,
+                mem0_error=_mem0_error,
+                mem0_empty_result=_mem0_empty_result,
+                mem0_pending_retry=_mem0_pending,
+                classification_fallback=classification_fallback,
+            ),
             classification_fallback=classification_fallback,
         )
 
@@ -7285,17 +7285,15 @@ class MemoryService:
             agent_id=agent_id,
         ))
 
-        msg = f'Memory queued for {[s.value for s in stores_written]}'
-        if _mem0_error:
-            msg += f' [mem0_error: {_mem0_error}]'
-        elif mem0_outcome.empty_result_error:
-            msg += f' [{mem0_outcome.empty_result_error}]'
-
         return AddMemoryResponse(
             memory_ids=mem0_ids,
             stores_written=stores_written,
             category=resolved_category,
-            message=msg,
+            message=render_add_memory_message(
+                stores_written=stores_written,
+                mem0_error=_mem0_error,
+                mem0_empty_result=mem0_outcome.empty_result_error,
+            ),
         )
 
     # ------------------------------------------------------------------

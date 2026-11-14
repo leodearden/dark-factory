@@ -28,6 +28,7 @@ from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.memory import render_add_memory_message
 from fused_memory.models.scope import Scope, resolve_project_id_for_root
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
@@ -188,7 +189,8 @@ class TestAddMemory:
             category='entities_and_relations',
             project_id='test',
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
+        assert SourceStore.graphiti not in result.stores_written
         assert result.category == MemoryCategory.entities_and_relations
         # Graphiti write goes through durable queue, not directly
         service.durable_queue.enqueue.assert_called_once()
@@ -215,7 +217,8 @@ class TestAddMemory:
             project_id='test',
             dual_write=True,
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
+        assert SourceStore.graphiti not in result.stores_written
         assert SourceStore.mem0 in result.stores_written
         # Graphiti still goes through the durable queue; Mem0 is now a direct call
         assert service.durable_queue.enqueue.call_count == 1
@@ -235,7 +238,8 @@ class TestAddMemory:
         assert result.memory_ids == ['mem0-1'], (
             f'Expected memory_ids=[\'mem0-1\'] for dual_write, got {result.memory_ids!r}'
         )
-        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.graphiti in result.stores_queued
+        assert SourceStore.graphiti not in result.stores_written
         assert SourceStore.mem0 in result.stores_written
 
     @pytest.mark.asyncio
@@ -551,28 +555,28 @@ class TestAddMemory:
         (
             'backend_mock_kwargs',
             'expected_stores',
-            'expected_message_suffix',
+            'expected_message_notes',
             'expected_journal_error',
         ),
         [
             pytest.param(
                 {'return_value': {'results': [{'id': 'mem0-1'}]}},
                 [SourceStore.mem0],
-                '',
+                {},
                 None,
                 id='landed',
             ),
             pytest.param(
                 {'side_effect': RuntimeError('qdrant down')},
                 [],
-                ' [mem0_error: qdrant down]',
+                {'mem0_error': 'qdrant down'},
                 'qdrant down',
                 id='raised',
             ),
             pytest.param(
                 {'return_value': {'results': []}},
                 [],
-                ' [empty_result: mem0 add returned zero memory_ids]',
+                {'mem0_empty_result': 'empty_result: mem0 add returned zero memory_ids'},
                 'empty_result: mem0 add returned zero memory_ids',
                 id='zero_ids',
             ),
@@ -583,7 +587,7 @@ class TestAddMemory:
         service,
         backend_mock_kwargs,
         expected_stores,
-        expected_message_suffix,
+        expected_message_notes,
         expected_journal_error,
     ):
         """add_memory says mem0 was written — in the response, the journal and
@@ -604,9 +608,14 @@ class TestAddMemory:
         assert result.stores_written == expected_stores
         journal_kwargs = mock_journal.log_write_op.call_args[1]
         assert journal_kwargs['result_summary']['stores'] == expected_store_values
+        assert journal_kwargs['result_summary']['stores_queued'] == []
         assert journal_kwargs['success'] is (expected_journal_error is None)
         assert journal_kwargs['error'] == expected_journal_error
-        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
+        assert result.message == render_add_memory_message(
+            stores_written=expected_stores, **expected_message_notes
+        )
+        for error_text in expected_message_notes.values():
+            assert error_text in result.message
 
     @pytest.mark.asyncio
     async def test_dual_write_zero_ids_claims_graphiti_alone_and_names_the_drop(
@@ -628,15 +637,58 @@ class TestAddMemory:
         )
 
         service.durable_queue.enqueue.assert_awaited_once()
-        assert result.stores_written == [SourceStore.graphiti]
+        assert result.stores_written == []
+        assert result.stores_queued == [SourceStore.graphiti]
         journal_kwargs = mock_journal.log_write_op.call_args[1]
-        assert journal_kwargs['result_summary']['stores'] == ['graphiti']
+        assert journal_kwargs['result_summary']['stores'] == []
+        assert journal_kwargs['result_summary']['stores_queued'] == ['graphiti']
         assert journal_kwargs['success'] is False
         assert journal_kwargs['error'] == 'empty_result: mem0 add returned zero memory_ids'
-        assert result.message == (
-            "Memory queued for ['graphiti'] "
-            '[empty_result: mem0 add returned zero memory_ids]'
+        assert result.message == render_add_memory_message(
+            stores_written=[],
+            stores_queued=[SourceStore.graphiti],
+            mem0_empty_result='empty_result: mem0 add returned zero memory_ids',
         )
+        assert 'empty_result: mem0 add returned zero memory_ids' in result.message
+
+    @pytest.mark.asyncio
+    async def test_a_failed_graphiti_enqueue_appears_in_no_store_list(self, service):
+        service.durable_queue.enqueue = AsyncMock(side_effect=RuntimeError('queue down'))
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='dark_factory',
+            causation_id='c1',
+        )
+
+        assert SourceStore.graphiti not in result.stores_written
+        assert SourceStore.graphiti not in result.stores_queued
+        assert SourceStore.graphiti not in result.stores_pending_retry
+        assert '[graphiti_error: RuntimeError: queue down]' in result.message
+        assert mock_journal.log_write_op.call_args[1]['success'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_dual_write_whose_both_legs_fail_keeps_both_error_texts(self, service):
+        service.durable_queue.enqueue = AsyncMock(side_effect=RuntimeError('queue down'))
+        service.mem0.add = AsyncMock(side_effect=RuntimeError('qdrant down'))
+        service.set_write_journal(_mem0_add_journal())
+
+        result = await service.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            dual_write=True,
+            causation_id='c1',
+        )
+
+        assert result.stores_written == []
+        assert result.stores_queued == []
+        assert result.stores_pending_retry == []
+        assert '[graphiti_error: RuntimeError: queue down]' in result.message
+        assert '[mem0_error: qdrant down]' in result.message
 
 
 class TestAddSystemRecord:
@@ -850,30 +902,34 @@ class TestAddSystemRecord:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('backend_mock_kwargs', 'expected_stores', 'expected_message_suffix'),
+        ('backend_mock_kwargs', 'expected_stores', 'expected_message_notes'),
         [
             pytest.param(
                 {'return_value': {'results': [{'id': 'sys-1'}]}},
                 [SourceStore.mem0],
-                '',
+                {},
                 id='landed',
             ),
             pytest.param(
                 {'side_effect': RuntimeError('qdrant down')},
                 [],
-                ' [mem0_error: qdrant down]',
+                {'mem0_error': 'qdrant down'},
                 id='raised',
             ),
             pytest.param(
                 {'return_value': {'results': []}},
                 [],
-                ' [empty_result: mem0 add_system_record returned zero memory_ids]',
+                {
+                    'mem0_empty_result': (
+                        'empty_result: mem0 add_system_record returned zero memory_ids'
+                    ),
+                },
                 id='zero_ids',
             ),
         ],
     )
     async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
-        self, service, backend_mock_kwargs, expected_stores, expected_message_suffix,
+        self, service, backend_mock_kwargs, expected_stores, expected_message_notes,
     ):
         """On the guaranteed-persistence system-write path, the response's
         stores_written and the journal's stores say mem0 only when Mem0
@@ -898,7 +954,11 @@ class TestAddSystemRecord:
         assert result.stores_written == expected_stores
         journal_kwargs = mock_journal.log_write_op.call_args[1]
         assert journal_kwargs['result_summary']['stores'] == expected_store_values
-        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
+        assert result.message == render_add_memory_message(
+            stores_written=expected_stores, **expected_message_notes
+        )
+        for error_text in expected_message_notes.values():
+            assert error_text in result.message
 
     # -- Amendment (task 2620 review): same task_id normalization as add_memory --
 

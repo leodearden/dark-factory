@@ -27,6 +27,8 @@ from _store_mutation_preflight_contract import (
 )
 from mcp.types import CallToolResult, TextContent
 
+from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import render_add_memory_message
 from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'replay_failed_mem0_intents.py'
@@ -39,14 +41,20 @@ _T = datetime(2026, 10, 22, 17, 40, tzinfo=UTC)
 _LANDED_ACK = {
     'memory_ids': ['new-1'],
     'stores_written': ['mem0'],
+    'stores_queued': [],
     'stores_pending_retry': [],
-    'message': "Memory queued for ['mem0']",
+    'message': render_add_memory_message(stores_written=[SourceStore.mem0]),
 }
 _PENDING_ACK = {
     'memory_ids': [],
     'stores_written': [],
+    'stores_queued': [],
     'stores_pending_retry': ['mem0'],
-    'message': 'Memory queued for [] [mem0_pending_retry: rate_limited: RateLimitError: 429]',
+    'message': render_add_memory_message(
+        stores_written=[],
+        stores_pending_retry=[SourceStore.mem0],
+        mem0_pending_retry='rate_limited: RateLimitError: 429',
+    ),
 }
 
 
@@ -257,8 +265,11 @@ class TestReplay:
                 {
                     'memory_ids': [],
                     'stores_written': [],
+                    'stores_queued': [],
                     'stores_pending_retry': [],
-                    'message': 'Memory queued for [] [mem0_error: 429 no credits]',
+                    'message': render_add_memory_message(
+                        stores_written=[], mem0_error='429 no credits'
+                    ),
                 },
                 'NOT_LANDED',
                 'mem0_error',
