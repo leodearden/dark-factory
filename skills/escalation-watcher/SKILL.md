@@ -763,7 +763,11 @@ it, and the gate slug where one corresponds:
   does not qualify: a `milestone_gate` whose detail carries "This human gate files milestone_gate
   rather than review_due because …"
   (`orchestrator/src/orchestrator/review_due.py::ReviewDueWithheld.detail_line`: an invalid chain,
-  or a config without project_id or project_root) is asked like any other milestone gate. The
+  or a config without project_id or project_root) is asked like any other milestone gate.
+  **Third exception:** a milestone gate whose task carries `metadata.x_preauthorised_spawn`
+  (Leo's pre-authorisation of that one gate's session) is handled under "Pre-authorised gate
+  spawn" below, which runs a fixed check and then spawns with no prior ask, attended or AFK. A
+  gate whose check fails is asked like any other milestone gate (task 9712, S16 ruling R15). The
   spawn itself is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost with Leo
   before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
   `--launched-from` go-gate lands, task 9446).
@@ -1256,6 +1260,10 @@ switches on and off. Three behavioural shifts:
      busy-loop on it.
    - Either way, also **file a DecisionRecord via `write-decision`** (see "Filing Parked Decisions
      to the Cockpit Registry" below) for each item left pending — IN ADDITION to the digest entry.
+   - **One exception: a pre-authorised gate.** A milestone gate that passes the check in
+     "Pre-authorised gate spawn" is spawned in AFK posture exactly as when attended. Leo ruled the
+     session before he left, so the "needs a human in the session" premise does not hold for it.
+     Nothing else in this shift is relaxed: a gate that fails the check stays pending + digest.
 
 3. **Batch into a digest, don't ping per-item.** Reminding "every 3-5 cycles" is noise when nobody is
    reading. Maintain a single rolling manifest at `<project_root>/data/escalations/afk-digest.md`
@@ -2143,6 +2151,36 @@ comes from `cd "$DARK_FACTORY_ROOT" && .venv/bin/python scripts/check_run_comple
   escalation id. A withheld gate, whose detail carries "This human gate files milestone_gate
   rather than review_due because …" (an invalid chain or an unusable config), is never spawned: it
   is asked like any other milestone gate, per "Always ask".
+
+### Pre-authorised gate spawn (`metadata.x_preauthorised_spawn`)
+
+A `milestone_gate` (filed by the deterministic runner) whose task Leo pre-authorised to run in its
+own session. The key is task metadata, read with `mcp__fused-memory__get_task`, never the
+escalation's summary or detail: `x_preauthorised_spawn = {ruled_by: 'human', ruled_on: '<date>',
+ruling_ref: '<repo path>::<section>', prompt_from: 'description'}`. A sentence in the gate's prose
+authorises nothing; only the key does (INV-11).
+
+**The check.** Run it as code would; any failure means the gate is asked under "Always ask", and
+the digest names the failing line:
+1. `ruled_by` is exactly `human`, and `ruled_on` and `ruling_ref` are present.
+2. `prompt_from` is exactly `description`.
+3. `ruling_ref` opens: the repo path (relative to `$DARK_FACTORY_ROOT`, or this watcher's
+   `<project_root>`) exists, its `<section>` heading is in the file, and that section quotes the
+   ruling, meaning it records Leo's authorisation of this task's spawn. Read the section; an
+   absent file, absent heading or a section that does not mention the ruling fails.
+4. The task's description is non-empty.
+
+You judge nothing past the check. Whether the work is right, safe or worth doing is the spawned
+session's call.
+
+**On a pass, in attended and AFK posture alike** (the one exception to AFK shift 2):
+- `/spawn` with `prompt=<the task's description, verbatim>`, `terminal_title="gate:<project>#<task_id>
+  <short-slug>"`, `cwd=<project_root>`.
+- Append `<esc-id>` to the exclude-file, so the next scan does not re-fire on the pending gate.
+- Record the spawn in the digest (`afk-digest.md` when AFK, the report otherwise): escalation id,
+  task id, `ruling_ref`. Write no "ask Leo" line and no DecisionRecord for it.
+- **Never resolve the gate.** The spawned session resumes it on success, or leaves it pending for
+  Leo at its own escape row. Never re-spawn for it after.
 
 ### `milestone_check_stalled` (trigger chain, completion gate)
 
