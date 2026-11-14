@@ -504,12 +504,13 @@ what decides whether its row stays `in-progress` or lands in `blocked`:
   that is born-at-L2 (severity `critical`/`urgent`) or a non-info record at
   `level ≥ 2` (the predicate is `escalation/src/escalation/pins.py::needs_human`)
   short-circuits the wait immediately: the orchestrator does not hold a slot
-  waiting on a human. An info L2 never short-circuits it. This now covers **every** phase, MERGE entry included —
+  waiting on a human. This now covers **every** phase, MERGE entry included —
   `_handle_merge_gate_escalations`
   (`orchestrator/src/orchestrator/workflow.py`) replaced the old
   steward-less bail, which returned `ESCALATED` with no steward, no wait and no
   status write, leaving `in-progress` + NULL claimant + an open gating record
-  with nothing running to advance it (task 3536 / PRD γ1 / spec §8-E1).
+  with nothing running to advance it (task 3536 / PRD γ1 / spec §8-E1). An
+  info L2 never short-circuits the wait, in any phase.
 - **(b) Blocked exit.** When the wait concludes without resolution — idle-window
   expiry, steward re-escalation, or a gating record still open on the
   single-shot re-check — `_mark_blocked` parks the row `blocked` and frees the
@@ -730,8 +731,8 @@ and are not restated here.
   `Harness._reap_orphan_l0_escalations` (`harness.py`), takes any L0
   escalation *record* older than `orphan_l0_timeout_secs` whose **filing**
   incarnation is provably dead, judged by the classifier's L0 liveness link:
-  it promotes a blocking record to L1 and routes an info record through the
-  info-L0 router instead (§6 has the full predicate). A newer live workflow
+  it routes a note the info-L0 router owns through that router and promotes
+  any other record to L1 (§6 has the full predicate). A newer live workflow
   on the same task does not keep a prior incarnation's L0 alive. The two are easily conflated — one reaps
   directories, the other reaps queue rows.
 - **Retry caps** bound every retryable failure mode (`requeue_cap=3`,
@@ -971,21 +972,27 @@ flowchart LR
   *Orphan sweep and restart amnesty, as built*
   ([plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md)
   D6/D7). The orphan sweep (`Harness._reap_orphan_l0_escalations`) acts only
-  on L0s older than `orphan_l0_timeout_secs`. It skips a record while a
-  workflow attends the task (`_escalation_events`) or the scheduler holds it
+  on L0s older than `orphan_l0_timeout_secs`, and dismisses an eval-lane
+  record outright. The rest split on whether the info-L0 router owns the
+  record (`orchestrator/src/orchestrator/escalation_router.py::router_owns`:
+  an info L0 outside the eval lane, while `info_l0_router_enabled` is on). A
+  router-owned note already held on a curator ticket is finished first, even
+  with a live workflow. Otherwise the sweep skips a record while a workflow
+  attends the task (`_escalation_events`) or the scheduler holds it
   (`Scheduler.is_actively_held`), unless `classify_pins` proves the filing
-  incarnation gone (§3.7). An info record is routed by the info-L0 router
-  (`orchestrator/src/orchestrator/escalation_router.py::InfoL0Sweep`, exit
-  kind `orphan`); a note the router is already holding on a curator ticket is
-  finished first, even with a live workflow. A blocking record keeps the old
-  path: covered-by-open-L1 dismissal (`EscalationQueue.dismiss_if_covered`),
-  the done-step-commit rebase-superseded dismissal, then verbatim promotion to
-  L1 with `manual_intervention`. The startup amnesty
-  `Harness._dismiss_stale_escalations` first routes info records and finishes
-  their holds (`_route_info_l0s_across_restart`, exit kind `restart`). Its
-  `dismiss_all_pending` then keeps the router-owned notes for the reaper, so
-  with the router enabled only blocking L0s are dismissed and counted as stale
-  strands.
+  incarnation gone (§3.7). A router-owned record is then routed
+  (`escalation_router.py::InfoL0Sweep`, exit kind `orphan`). A record the
+  router does not own (every blocking record, and any info record while
+  `info_l0_router_enabled` is off) keeps the old path: covered-by-open-L1
+  dismissal (`EscalationQueue.dismiss_if_covered`), the done-step-commit
+  rebase-superseded dismissal, then verbatim promotion to L1 with
+  `manual_intervention`. The done-step tripwire files `info`, so that middle
+  arm is reached only with the router off. The startup amnesty
+  `Harness._dismiss_stale_escalations` first routes the router-owned notes
+  and finishes their holds (`_route_info_l0s_across_restart`, exit kind
+  `restart`). Its `dismiss_all_pending` then keeps those notes for the
+  reaper, so only L0s the router does not own are dismissed and counted as
+  stale strands.
 - **L1 auto-watcher.** A repeatedly-spawned Claude CLI rotation (§2.1) that
   only launches when there's an actionable pending L1, running the
   `escalation-watcher-auto` skill.
