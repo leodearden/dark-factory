@@ -1729,6 +1729,31 @@ cross-reference.  The operator docs are under no such constraint and cite
 CLAUDE.md instead."""
 
 
+STEWARD_API_ERROR_GUIDANCE: str = """\
+- **API_ERROR** — an HTTP error from the provider. The summary starts
+  `agent API error: HTTP <status>`. Read the status first: the two status
+  classes need different responses.
+  - **5xx** (500-599, e.g. 529 overloaded) is a server-side provider outage.
+    It is not account-scoped, so switching account or model does NOT help, and
+    the task's code is not at fault, so do not edit code for it. The remedy is
+    to retry later: resolving the escalation re-pends the task, and a block
+    reason carrying a 5xx status routes that requeue to the scheduler's
+    transient lane, which spaces the retries with jittered backoff.
+    Re-escalate via `escalate_blocker(..., level=1)` only if the outage
+    persists across retries.
+  - **4xx** is request-side or account-side. On 401/403 the transport layer
+    already fails over to another configured account automatically, so one
+    that still reaches you means that failover did not fix it: re-escalate via
+    `escalate_blocker(..., level=1)`. Any other 4xx, 429 included, will not
+    clear on a blind retry; find the cause in the diagnostic_detail first.
+"""
+"""STEWARD's entry for ``AgentFailureKind.API_ERROR``.
+
+A named constant so ``test_roles_api_error_guidance.py`` can guard it.
+``shared/src/shared/cli_invoke.py::classify_agent_failure`` files both a 5xx
+and a 4xx under this one kind, so the entry has to split them."""
+
+
 _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
@@ -1884,9 +1909,7 @@ choose your response:
   wrapper/stdio bug) that needs a human. Re-escalate via
   `escalate_blocker(..., level=1)` with the stderr cause rather than retrying
   again.
-- **API_ERROR** — HTTP error from the provider. Usually transient; account
-  failover often helps. Retry is reasonable.
-- **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
+""" + STEWARD_API_ERROR_GUIDANCE + """- **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
   genuinely needs more time; a blind retry rarely succeeds.
 - **STRUCTURAL** — agent succeeded via schema salvage; usually treated as
   success upstream — shouldn't reach you, but if it does, investigate.
