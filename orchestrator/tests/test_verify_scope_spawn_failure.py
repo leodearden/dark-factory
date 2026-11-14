@@ -9,6 +9,7 @@ merge-time verify (see test_verify_scope_cpu_weight.py's docstring).
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import stat
@@ -25,10 +26,18 @@ from orchestrator.merge_lane.worker import (
     _DryRunInvestigationHandles,
     _run_post_merge_verify,
 )
-from orchestrator.verify import CheckRun, LegSlot, VerifyResult, classify_leg, run_verification
+from orchestrator.verify import (
+    CheckRun,
+    LegSlot,
+    ScopeLaunchRefused,
+    VerifyResult,
+    _run_segmented,
+    classify_leg,
+    run_verification,
+)
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES, FailureCategory
 from orchestrator.verify_classify import classify_failure
-from orchestrator.verify_cmd import ToolKind
+from orchestrator.verify_cmd import ChainSegment, ToolKind
 
 # Byte-identical to data/verify-logs/7217/attempt-1.cockpit.{test,lint,type}-20261020T090729_536074Z.log (rc=1, ~0.19s).
 _SCOPE_START_REFUSED = 'Failed to start transient scope unit: Transport endpoint is not connected\n'
@@ -131,6 +140,20 @@ class TestRefusedLaunchIsDecidedByStructure:
         assert f'timed_out={timed_out}' in str(raised.value)
 
 
+def _install_systemd_run(tmp_path: Path, monkeypatch, body: str) -> None:
+    """Put a ``systemd-run`` running the shell *body* first on PATH."""
+    fakebin = tmp_path / 'fakebin'
+    fakebin.mkdir()
+    script = fakebin / 'systemd-run'
+    script.write_text('#!/bin/sh\n' + body)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv('PATH', f'{fakebin}{os.pathsep}' + os.environ['PATH'])
+
+
+def _refusal_body(refusal: str) -> str:
+    return f"printf '%s' {shlex.quote(refusal)} >&2\nexit 1\n"
+
+
 def _install_refusing_systemd_run(tmp_path: Path, monkeypatch, refusal: str) -> None:
     """Put a ``systemd-run`` first on PATH that refuses, as with no user bus.
 
@@ -138,16 +161,7 @@ def _install_refusing_systemd_run(tmp_path: Path, monkeypatch, refusal: str) -> 
     the real ``shutil.which`` + ``create_subprocess_exec`` spawn path produces
     the production leg output.
     """
-    fakebin = tmp_path / 'fakebin'
-    fakebin.mkdir()
-    script = fakebin / 'systemd-run'
-    script.write_text(
-        '#!/bin/sh\n'
-        f"printf '%s' {shlex.quote(refusal)} >&2\n"
-        'exit 1\n'
-    )
-    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    monkeypatch.setenv('PATH', f'{fakebin}{os.pathsep}' + os.environ['PATH'])
+    _install_systemd_run(tmp_path, monkeypatch, _refusal_body(refusal))
 
 
 @pytest.fixture(params=_SAMPLES)
@@ -162,6 +176,24 @@ def refusing_launcher(request, tmp_path, monkeypatch) -> str:
     """A refusing ``systemd-run`` for every reason, observed or not; returns the refusal."""
     _install_refusing_systemd_run(tmp_path, monkeypatch, request.param)
     return request.param
+
+
+@pytest.fixture
+def selective_launcher(tmp_path, monkeypatch) -> None:
+    """A ``systemd-run`` refusing only a payload that names ``refuse-me``.
+
+    Any other payload starts: the fake drops its own options and execs it.
+    """
+    _install_systemd_run(
+        tmp_path, monkeypatch,
+        'case "$*" in *refuse-me*)\n'
+        + _refusal_body(_SCOPE_START_REFUSED)
+        + 'esac\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in -p) shift 2;; -*) shift;; *) break;; esac\n'
+        'done\n'
+        'exec "$@"\n',
+    )
 
 
 @pytest.fixture
@@ -210,7 +242,10 @@ class TestRefusalReasonDoesNotMatter:
         assert result.category == FailureCategory.ENV_TRANSIENT, result.summary
 
 
-async def _verify_in_started_scope(worktree: Path, test_command: str) -> VerifyResult:
+async def _verify_test_leg_only(
+    worktree: Path, test_command: str, **run_kwargs,
+) -> VerifyResult:
+    """A scoped role='task' verify of module ``pkg`` with no lint or type leg."""
     return await run_verification(
         worktree,
         OrchestratorConfig(verify_use_cgroup_scope=True),
@@ -220,6 +255,7 @@ async def _verify_in_started_scope(worktree: Path, test_command: str) -> VerifyR
         ),
         max_retries=0,
         role='task',
+        **run_kwargs,
     )
 
 
@@ -231,7 +267,86 @@ class TestStartedScopeKeepsItsOwnVerdict:
     async def test_red_command_in_a_started_scope_is_not_env_transient(
         self, worktree, test_command,
     ):
-        result = await _verify_in_started_scope(worktree, test_command)
+        result = await _verify_test_leg_only(worktree, test_command)
+        assert result.passed is False
+        assert result.category != FailureCategory.ENV_TRANSIENT, result.summary
+
+
+class TestRunSegmentedRecordsEachRefusal:
+
+    @pytest.mark.asyncio
+    async def test_each_segment_dict_says_whether_its_launch_was_refused(self, tmp_path):
+        outcomes: dict[str, tuple[int, str, bool]] = {
+            'refused': ScopeLaunchRefused(1, 'refused'),
+            'ran-red': (1, 'FAILED tests/x.py::t', False),
+            'ran-green': (0, 'ok', False),
+        }
+        elapsed = [0.0]
+
+        async def run_one(cmd: str, cwd: Path, timeout: float, label: str):
+            elapsed[0] += 1.0
+            return outcomes[label]
+
+        segments = [
+            ChainSegment(cwd_rel='.', command=f'true {label}', label=label)
+            for label in [*outcomes, 'unrun']
+        ]
+        _rc, _output, _timed_out, segment_dicts = await _run_segmented(
+            segments, run_one=run_one, worktree=tmp_path,
+            budget_secs=float(len(outcomes)), now=lambda: elapsed[0],
+        )
+
+        assert {
+            entry['label']: (entry['status'], entry['scope_launch_refused'])
+            for entry in segment_dicts
+        } == {
+            'refused': ('failed', True),
+            'ran-red': ('failed', False),
+            'ran-green': ('passed', False),
+            'unrun': ('not_run', False),
+        }
+
+
+_TWO_SEGMENTS = 'true seg-a && true seg-b'
+
+
+@pytest.mark.usefixtures('code_default_config', 'refusing_launcher')
+class TestSegmentedLegWithEveryLaunchRefused:
+
+    @pytest.mark.asyncio
+    async def test_is_env_transient_for_any_reason(self, worktree):
+        result = await _verify_test_leg_only(worktree, _TWO_SEGMENTS, segment_chained_test=True)
+        assert result.passed is False
+        assert result.category == FailureCategory.ENV_TRANSIENT, result.summary
+
+    @pytest.mark.asyncio
+    async def test_persisted_summary_marks_every_segment_refused(self, worktree):
+        (worktree / '.task').mkdir()
+        await _verify_test_leg_only(
+            worktree, _TWO_SEGMENTS, segment_chained_test=True, attempt_id=1, task_id='7339',
+        )
+        summary_path = worktree / '.task' / 'verify' / 'attempt-1.pkg.summary.json'
+        summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        test_entry = next(c for c in summary['commands'] if c['label'] == 'test')
+        assert [s['scope_launch_refused'] for s in test_entry['segments']] == [True, True]
+
+
+@pytest.mark.usefixtures('code_default_config', 'selective_launcher')
+class TestSegmentedLegWithOneLaunchRefused:
+
+    @pytest.mark.asyncio
+    async def test_refusal_as_the_only_red_is_env_transient(self, worktree):
+        result = await _verify_test_leg_only(
+            worktree, 'true refuse-me && true ok', segment_chained_test=True,
+        )
+        assert result.passed is False
+        assert result.category == FailureCategory.ENV_TRANSIENT, result.summary
+
+    @pytest.mark.asyncio
+    async def test_red_segment_that_ran_keeps_its_verdict(self, worktree):
+        result = await _verify_test_leg_only(
+            worktree, 'true refuse-me && false', segment_chained_test=True,
+        )
         assert result.passed is False
         assert result.category != FailureCategory.ENV_TRANSIENT, result.summary
 
