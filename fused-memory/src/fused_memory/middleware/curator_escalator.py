@@ -196,9 +196,8 @@ def _file_folding_escalation(
             category, fold_key, affected_ids=[f'project:{project_id}'],
         ),
     )
-    response = submit_or_dedupe(  # type: ignore[possibly-unbound]
-        queue, escalation, DedupeConfig.for_content_fingerprint(category),  # type: ignore[possibly-unbound]
-    )
+    config = DedupeConfig.for_content_fingerprint(category)  # type: ignore[possibly-unbound]  # debt: ticket tkt_0RWZE9H0GAK9MW40F76GWJFFJQ
+    response = submit_or_dedupe(queue, escalation, config)  # type: ignore[possibly-unbound]
     return _FoldingOutcome(escalation_id=response['id'], folded=response['status'] == 'dedup_skipped')
 
 
