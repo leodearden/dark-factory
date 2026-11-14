@@ -11328,7 +11328,9 @@ class SpeculativeMergeWorker:
             return None
         return ProbePlacement(depth=d, base=base)
 
-    async def _deep_chain_placement(self, item: RealMergeItem) -> ChainResult | None:
+    async def _deep_chain_placement(
+        self, item: RealMergeItem, *, frontier_depth: int | None = None,
+    ) -> ChainResult | None:
         """Decide whether THIS dispatch should verify a deep CHAIN tip instead
         of the item's own adjacent merge commit (task 3185, PRD γ; task 8527
         extends it to a head alone in the verify frontier).
@@ -11355,9 +11357,10 @@ class SpeculativeMergeWorker:
              chain.  A non-speculative item (the head, merged onto REAL main)
              may chain only when no other entry is in the verify frontier:
              anything landing ahead of a main-based item would leave its chain
-             stale.  The dispatching item has no entry yet, so the depth read
-             here is the same value :meth:`_launch_verify` passes to
-             :meth:`_run_inflight_verify` as ``depth``.
+             stale.  *frontier_depth* is the dispatch-time ``depth``
+             :meth:`_launch_verify` also hands :meth:`_run_inflight_verify`,
+             so this guard and the d=1 floor's reset arm judge one value;
+             ``None`` (a direct caller) never licenses a head.
           2. ``cap = item.request.config.merge_deep.chain_cap; cap <= 0`` ->
              ``None``.  α's shipped kill switch, hoisted ABOVE the queue scan
              for the same reason :meth:`_probe_verify_placement` hoists its
@@ -11412,9 +11415,7 @@ class SpeculativeMergeWorker:
             caller must release it exactly once — see
             :meth:`_run_inflight_verify`'s chain arm), or ``None``.
         """
-        if not may_chain(
-            speculative=item.speculative, frontier_depth=self._verify_frontier_depth(),
-        ):
+        if not may_chain(speculative=item.speculative, frontier_depth=frontier_depth):
             return None
         cap = item.request.config.merge_deep.chain_cap
         if cap <= 0:
@@ -21614,7 +21615,7 @@ class SpeculativeMergeWorker:
             # `except BaseException` arm is what returns it.  The obligation only
             # begins once `chain` is bound, and from that point to the
             # ensure_future there is still nothing that can raise.
-            chain = await self._deep_chain_placement(item)
+            chain = await self._deep_chain_placement(item, frontier_depth=depth)
         except BaseException:
             # See the LEASE/PERMIT LEAK GUARD note above the `try`.  Hand back
             # both resources, then re-raise UNCHANGED -- this arm is a resource

@@ -549,29 +549,30 @@ class TestDeepChainPlacementGate:
             _spy_chain_snapshot(worker, monkeypatch),
         )
 
-    async def test_non_speculative_item_beside_another_frontier_entry_is_not_chained(
-        self, git_repo, monkeypatch,
+    @pytest.mark.parametrize('frontier_depth', [1, None], ids=['beside-an-entry', 'unknown'])
+    async def test_non_speculative_item_not_alone_in_the_frontier_is_not_chained(
+        self, git_repo, monkeypatch, frontier_depth,
     ):
         """A head with another entry in the verify frontier declines before the scan (PRD D5).
 
         The head is merged onto REAL main; anything landing ahead of it would
-        leave a chain built on it stale.
+        leave a chain built on it stale.  An unknown depth (a direct caller)
+        is treated the same way.
         """
         worker, head_item, built, lanes, scans = await self._head_fixture(git_repo, monkeypatch)
-        _seed_frontier(worker, 1)
 
-        assert await worker._deep_chain_placement(head_item) is None
+        assert await worker._deep_chain_placement(head_item, frontier_depth=frontier_depth) is None
         assert built == []
         assert lanes == []
         assert scans == [], 'the guard 1 decline must precede the queue scan too'
 
-    async def test_non_speculative_item_alone_in_the_frontier_chains(
+    async def test_non_speculative_item_alone_in_the_frontier_reaches_the_chain_build(
         self, git_repo, monkeypatch,
     ):
         """A head alone in the verify frontier reaches the build, seeded at its own commit (PRD D5)."""
         worker, head_item, built, _lanes, scans = await self._head_fixture(git_repo, monkeypatch)
 
-        await worker._deep_chain_placement(head_item)
+        await worker._deep_chain_placement(head_item, frontier_depth=0)
 
         assert len(built) == 1, 'a head alone in the frontier must reach build_chain'
         assert built[0]['head_merge_commit'] == head_item.merge_result.merge_commit
@@ -2363,12 +2364,9 @@ class TestDeepDispatchRoundsIntegration:
 
         head_event, *speculative_events = events
         assert head_event['data']['speculative'] is False
-        if frontier == 0:
-            assert head_event['data']['chain_items'] >= 2, (
-                'boundary row 9: a head alone in the frontier verifies a chain'
-            )
-        else:
-            assert head_event['data']['chain_items'] == 1
+        # Boundary row 9: alone in the frontier, the head chains at
+        # min(queue_len, cap) = min(1 + len(_DEEP_QUEUE), 6) = 6.
+        assert head_event['data']['chain_items'] == (6 if frontier == 0 else 1)
         assert [e['data']['chain_items'] for e in speculative_events] == [6, 3, 1]
         deep_events = [e for e in speculative_events if e['data']['chain_items'] >= 2]
         assert len(deep_events) == 2, 'η1 must be able to SEE a deep verify'
