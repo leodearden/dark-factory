@@ -805,13 +805,19 @@ def _fake_proc(returncode: int):
 class TestBlockAndEscalateSubstrateFlip:
     """Unit tests for ``Harness._block_and_escalate_substrate_flip``."""
 
-    @pytest.mark.asyncio
-    async def test_sets_task_blocked(self, tmp_path: Path):
-        """set_task_status('blocked') is called with the task_id."""
+    @staticmethod
+    def _harness_with_queue(tmp_path: Path):
         from escalation.queue import EscalationQueue
 
         h = _make_harness(tmp_path)
-        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+        return h, esc_queue
+
+    @pytest.mark.asyncio
+    async def test_sets_task_blocked(self, tmp_path: Path):
+        """set_task_status('blocked') is called with the task_id."""
+        h, _ = self._harness_with_queue(tmp_path)
 
         verdict = _flip_verdict()
         await h._block_and_escalate_substrate_flip('99', verdict=verdict)
@@ -821,11 +827,7 @@ class TestBlockAndEscalateSubstrateFlip:
     @pytest.mark.asyncio
     async def test_files_l1_escalation_design_concern(self, tmp_path: Path):
         """Files exactly one L1 with category='design_concern' and severity='blocking'."""
-        from escalation.queue import EscalationQueue
-
-        h = _make_harness(tmp_path)
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        h._escalation_queue = esc_queue
+        h, esc_queue = self._harness_with_queue(tmp_path)
 
         verdict = _flip_verdict()
         await h._block_and_escalate_substrate_flip('77', verdict=verdict)
@@ -840,11 +842,7 @@ class TestBlockAndEscalateSubstrateFlip:
     @pytest.mark.asyncio
     async def test_deduped_by_has_open_l1(self, tmp_path: Path):
         """Second call with open L1 is suppressed (no duplicate filed)."""
-        from escalation.queue import EscalationQueue
-
-        h = _make_harness(tmp_path)
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        h._escalation_queue = esc_queue
+        h, esc_queue = self._harness_with_queue(tmp_path)
 
         verdict = _flip_verdict()
         await h._block_and_escalate_substrate_flip('55', verdict=verdict)
@@ -857,11 +855,7 @@ class TestBlockAndEscalateSubstrateFlip:
     @pytest.mark.asyncio
     async def test_open_l1_of_another_category_does_not_suppress(self, tmp_path: Path):
         """An open L1 for an unrelated cause must not hide the flip's root cause."""
-        from escalation.queue import EscalationQueue
-
-        h = _make_harness(tmp_path)
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        h._escalation_queue = esc_queue
+        h, esc_queue = self._harness_with_queue(tmp_path)
         seeded = _seed_open_l1(esc_queue, '45', 'scope_violation')
 
         await h._block_and_escalate_substrate_flip('45', verdict=_flip_verdict())
