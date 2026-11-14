@@ -6,6 +6,8 @@
 no code changed. All file:line cites verified against the working tree this
 session; queue numbers measured 2026-08-10T12:52Z from `data/escalations/`.
 
+> **Implemented:** Addendum B's ratified disposition router is built by plans/info-l0-disposition-router-prd.md — see Addendum D at the end.
+
 ## TL;DR
 
 The pattern is **partially covered**. Severity inflation (the `promote_to_l2`
@@ -576,3 +578,18 @@ ordering; 3424 setup-host all-or-nothing unit gate; 3474 audit CLI prints
 before exit-3 check; 3764 shared 3-strike streak across failure classes; 3786
 isolated-rerun discriminator precedence; 3779 INV-8 narrowing exemption
 breadth; 3811 anti-drift note placement.
+
+---
+
+# Addendum D (2026-11-14): the ratified router is implemented by plans/info-l0-disposition-router-prd.md
+
+Addendum B's ratified disposition router (the reaper/curator primary plus the
+reviewer leg) is implemented by plans/info-l0-disposition-router-prd.md. This
+doc's options map to their owners as follows:
+
+| Option | Owner |
+|---|---|
+| A — inherit severity at the promotion seam | Task 3976. The router PRD's D4 then refuses all-info clusters at `promote_to_l2` (leaf γ, task 5222). |
+| B — stop filing on dead subjects | Leaf δ (task 5223). The exit finalizer and the orphan reaper's info branch disposition info notes instead of promoting them verbatim. |
+| C — a real lifecycle for `escalate_info` | Router PRD D8 (deterministic `status-info` with per-class aggregates) plus D9 (work-shaped notes converted through the curator, with a bounded hold). Both are built in δ. |
+| D — moot-closure sweep | Task 3587, narrowed to non-info records. |
