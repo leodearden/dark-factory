@@ -7,6 +7,7 @@ real child process spawned with a controlled environment, so the production
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -232,3 +233,56 @@ def test_not_running_is_decided_before_unmodelled_inputs(busctl_world: WriteWorl
 
     assert report.verdict is sue.Verdict.NOT_RUNNING
     assert report.restart_value is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file regardless')
+def test_an_unreadable_live_environ_is_reported_not_raised(
+    busctl_world: WriteWorld, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    busctl_world(_world({'Environment': ['PATH=/pinned/bin'], 'MainPID': 4242}))
+    proc_root = tmp_path / 'proc'
+    environ = proc_root / '4242' / 'environ'
+    environ.parent.mkdir(parents=True)
+    environ.write_bytes(b'PATH=/pinned/bin\0')
+    environ.chmod(0o000)
+    request.addfinalizer(lambda: environ.chmod(0o600))
+
+    env = sue.inspect_unit(UNIT, proc_root=proc_root)
+
+    for name in ('PATH', 'LANG'):
+        report = env.variable(name)
+        assert report.verdict is sue.Verdict.UNREADABLE, name
+        assert report.live_value is None, name
+    assert isinstance(env.live, sue.LiveEnvironUnreadable)
+    assert (env.live.pid, env.live.path, env.live.errno) == (4242, environ, errno.EACCES)
+    assert env.variable('PATH').manager_value == MANAGER_PATH_VALUE
+    assert env.variable('PATH').unit_value == '/pinned/bin'
+    assert sue.exit_status(env) == sue.EXIT_LIVE_UNREADABLE
+    assert str(environ) in sue.render(env, ['PATH'])
+
+
+def test_a_main_pid_that_has_exited_is_unreadable_through_the_real_proc(
+    busctl_world: WriteWorld, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exited = subprocess.Popen([sys.executable, '-c', 'pass'])
+    exited.wait()
+    busctl_world(_world({'Environment': ['PATH=/pinned/bin'], 'MainPID': exited.pid}))
+
+    assert sue.main([UNIT]) == sue.EXIT_LIVE_UNREADABLE
+    stdout = capsys.readouterr().out
+    block = _variable_block(stdout, 'PATH')
+    assert MANAGER_PATH_VALUE in block
+    assert '/pinned/bin' in block
+    assert f'/proc/{exited.pid}/environ' in stdout
+
+
+def test_a_complete_report_exits_ok(
+    busctl_world: WriteWorld, live_process: SpawnLive
+) -> None:
+    pid = live_process({'PATH': '/pinned/bin'})
+    busctl_world(_world({'Environment': ['PATH=/pinned/bin'], 'MainPID': pid}))
+
+    env = sue.inspect_unit(UNIT)
+
+    assert env.variable('PATH').verdict is sue.Verdict.MATCHES
+    assert sue.exit_status(env) == sue.EXIT_OK
