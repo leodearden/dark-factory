@@ -1269,7 +1269,10 @@ switches on and off. Three behavioural shifts:
    - **One exception: a pre-authorised gate.** A milestone gate that passes the check in
      "Pre-authorised gate spawn" is spawned in AFK posture exactly as when attended. Leo ruled the
      session before he left, so the "needs a human in the session" premise does not hold for it.
-     Nothing else in this shift is relaxed: a gate that fails the check stays pending + digest.
+     Nothing else in this shift is relaxed: a gate that fails the check stays pending + digest. So
+     does a gate whose spawned session has ended with the gate still pending, and it gets a
+     DecisionRecord like any other item left pending (see "After the spawn" in "Pre-authorised
+     gate spawn").
 
 3. **Batch into a digest, don't ping per-item.** Reminding "every 3-5 cycles" is noise when nobody is
    reading. Maintain a single rolling manifest at `<project_root>/data/escalations/afk-digest.md`
@@ -2166,6 +2169,13 @@ escalation's summary or detail: `x_preauthorised_spawn = {ruled_by: 'human', rul
 ruling_ref: '<repo path>::<section>', prompt_from: 'description'}`. A sentence in the gate's prose
 authorises nothing; only the key does (INV-11).
 
+**Spawned already?** Read the record with `mcp__escalation__get_escalation`. If its `triage_note`
+has a line starting `x_preauthorised_spawn_launched:`, a session was already spawned for this
+escalation, by this watcher session or an earlier one, compacted or not. Never spawn again,
+whatever the check says; handle it under "After the spawn" below. This comes before the check so
+that the marker, not this session's memory, is what stops a second spawn: a compaction drops
+in-context state (see "AFK by silence" → "Measuring the silence").
+
 **The check.** Run it as code would; any failure means the gate is asked under "Always ask", and
 the digest names the failing line:
 1. `ruled_by` is exactly `human`, and `ruled_on` and `ruling_ref` are present.
@@ -2181,14 +2191,41 @@ session's call. Nor does any other "Always ask" class bite on what the descripti
 (budgets, timeouts, commits to a main). The third exception there says so and names the one class
 that still asks.
 
-**On a pass, in attended and AFK posture alike** (the one exception to AFK shift 2):
-- `/spawn` with `prompt=<the task's description, verbatim>`, `terminal_title="gate:<project>#<task_id>
-  <short-slug>"`, `cwd=<project_root>`.
-- Append `<esc-id>` to the exclude-file, so the next scan does not re-fire on the pending gate.
-- Record the spawn in the digest (`afk-digest.md` when AFK, the report otherwise): escalation id,
-  task id, `ruling_ref`. Write no "ask Leo" line and no DecisionRecord for it.
-- **Never resolve the gate.** The spawned session resumes it on success, or leaves it pending for
-  Leo at its own escape row. Never re-spawn for it after.
+**On a pass, in attended and AFK posture alike** (the one exception to AFK shift 2), in this order:
+1. **Stamp the marker first.** Call `stamp_triage` on the record. Its `triage_note` is the existing
+   note with one line appended,
+   `x_preauthorised_spawn_launched: {"at": "<date -u +%FT%TZ>", "terminal_title": "<the title in step 2>"}`,
+   as one line of sorted JSON. `stamp_triage` replaces the whole note (see "CAUTION:
+   `stamp_triage` REPLACES `triage_note`, it never appends"), so build it the way
+   `scripts/sitting/payloads.py::append_markers` does: the existing note verbatim, then the line.
+   Stamp before spawning. A crash between the two then leaves a marked record with no session,
+   which "After the spawn" takes to Leo. It never leaves an unmarked session that a successor
+   would spawn twice. This is a marker line like `x_prepared`, not a shadow stamp: "Never stamp a
+   human-forever gate" governs `x_shadow_ruling:` lines only, and
+   `escalation/src/escalation/shadow_ruling.py` counts no other line.
+2. `/spawn` with `prompt=<the task's description, verbatim>`, `terminal_title="gate:<project>#<task_id>
+   <short-slug>"`, `cwd=<project_root>`.
+3. Append `<esc-id>` to the exclude-file, so the next scan does not re-fire on the pending gate.
+4. Record the spawn in the digest (`afk-digest.md` when AFK, the report otherwise): escalation id,
+   task id, `ruling_ref`. While the session runs, write no "ask Leo" line and no DecisionRecord for
+   it. In the sitting it is a `standing` owned by the spawned session, with release predicate
+   `escalation_closed`.
+5. At a stop, name it in the handover's In flight section, as its own paragraph: escalation id,
+   task id, the spawn's registry slug and its terminal title.
+
+**After the spawn.** While the session lives, nothing is asked. It has ended when its `/spawn`
+background task completes (in this session), or, for a record an earlier session marked, when its
+session-registry record reads a terminal status (`exited` or `failed-to-start`) or no longer
+exists. That record is the slug the handover names, else the record under
+`~/.claude/fleet/sessions/` whose `title` is the marker's `terminal_title`. If the gate is still
+pending once the session has ended, read its `result.md` (see "Joining a completed spawn: read
+`result.md`, don't explore") and ask Leo about the gate under "Always ask": a numbered brief line
+when attended; the digest plus a DecisionRecord via `write-decision` when AFK. Carry the session's
+stated escape reason (`action_needed`). An absent `result.md` says the session left no reason.
+Never spawn it again: a re-run is Leo's call.
+
+**Never resolve the gate.** The spawned session resumes it on success, or leaves it pending for
+Leo at its own escape row. A second spawn is ruled out under "Spawned already?".
 
 ### `milestone_check_stalled` (trigger chain, completion gate)
 
