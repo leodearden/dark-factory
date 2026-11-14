@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, Final, Literal
 
 from shared.project_id import fold_project_token
 from shared.quality_series.git_lines import GitObjectMissing, GitTimeout, git_output
@@ -758,6 +758,44 @@ class StoredDiff:
     previous_id: str | None
     text: str | None
     reason: str | None
+
+
+ABSENT: Final = 'absent'
+"""The diff route's state beside DiffState's: nothing to serve, with a reason naming what was missing."""
+
+_UNSTORED_DIFF_REASONS: Mapping[DiffState, str] = {
+    DiffState.FIRST: "the series' first point has no earlier snapshot to diff against",
+    DiffState.PENDING: "not computed yet: a later snapshot scan runs the instrument's --diff for this pair",
+}
+
+
+@dataclass(frozen=True)
+class ServedDiff:
+    """QUALITY_SNAPSHOT_DIFF: one point's diff as the drill-down serves it, on demand."""
+
+    point_id: str | None
+    previous_id: str | None
+    state: DiffState | Literal['absent']
+    text: str | None
+    reason: str | None
+
+    @classmethod
+    def absent(cls, point_id: str | None, reason: str) -> ServedDiff:
+        return cls(point_id, None, ABSENT, None, reason)
+
+    @classmethod
+    def of(cls, project_id: str, point_id: str, stored: StoredDiff | None) -> ServedDiff:
+        """*point_id*'s stored diff, or ABSENT when *project_id* has no such placed point."""
+        if stored is None:
+            return cls.absent(point_id, f'{project_id} has no placed snapshot point {point_id!r}')
+        reason = stored.reason if stored.reason is not None else _UNSTORED_DIFF_REASONS.get(stored.state)
+        return cls(point_id, stored.previous_id, stored.state, stored.text, reason)
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'point_id': self.point_id, 'previous_id': self.previous_id, 'state': str(self.state),
+            'text': self.text, 'reason': self.reason,
+        }
 
 
 def _no_snapshot_reason(scan: StoredScan) -> str:

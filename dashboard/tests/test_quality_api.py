@@ -494,11 +494,11 @@ def test_a_quality_db_that_is_not_a_database_is_served_unknown_naming_the_error(
         with caplog.at_level(logging.WARNING, logger='dashboard.api.quality'):
             body = _get(seeded, 'project=dark_factory&window=100')
 
-    for key in ('QUALITY', 'QUALITY_MARKERS'):
+    for key in ('QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS'):
         assert (body[key]['state'], body[key]['value']) == ('unknown', None)
         assert body[key]['reason'].startswith('quality.db unreadable: DatabaseError')
     records = [r for r in caplog.records if r.name == 'dashboard.api.quality']
-    assert len(records) == 2, 'one WARNING per datum that read quality.db'
+    assert len(records) == 3, 'one WARNING per datum that read quality.db'
     assert all(record.exc_info is not None for record in records)
 
 
