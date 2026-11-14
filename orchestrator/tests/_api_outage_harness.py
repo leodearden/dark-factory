@@ -33,6 +33,7 @@ from shared.scheduler_state import RequeueCooldown
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
+from orchestrator.git_ops import WarmLaneReseedContaminated
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import RequeueRecord, Scheduler, TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -65,7 +66,9 @@ PHASE_A = 'A'
 _EPOCH = datetime(2026, 7, 29, 9, 0, tzinfo=UTC)
 _RUN_ID = 'run-3320-incident-burst'
 _BURST_FIRST_ID = 9001
+_GENUINE_ID = '9101'
 _STAGGER_SECS = 20.0
+_GENUINE_ARRIVAL_SECS = BURST_SIZE * _STAGGER_SECS / 2
 _KILL_DURATION_MS = 120_000
 
 
@@ -129,11 +132,14 @@ class PhaseSnapshot:
 
 @dataclass(frozen=True)
 class BurstCast:
+    """Burst tasks take the 529 kills; the genuine control requeues once for a non-5xx reason."""
+
     burst: tuple[str, ...]
+    genuine: str
 
     @property
     def all_ids(self) -> tuple[str, ...]:
-        return self.burst
+        return (*self.burst, self.genuine)
 
 
 @dataclass(frozen=True)
@@ -152,6 +158,9 @@ class BurstLedger:
     def kills_of(self, task_id: str) -> tuple[DispatchRecord, ...]:
         """The task's phase-A dispatches: for a burst task, its incident kills."""
         return tuple(r for r in self.dispatches_of(task_id) if r.phase == PHASE_A)
+
+    def phase_a(self) -> tuple[DispatchRecord, ...]:
+        return tuple(r for r in self.dispatches if r.phase == PHASE_A)
 
 
 async def run_incident_burst(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> BurstLedger:
@@ -231,16 +240,31 @@ def _burst_script(n: int) -> AgentResult:
     raise AssertionError(f'burst task invoked a {n}th time; the script ends at kill {KILLS_PER_TASK}')
 
 
+def _genuine_script(n: int) -> AgentResult:
+    raise AssertionError('the genuine control reached the CLI; its first dispatch requeues at lane setup')
+
+
 class _WorkflowFactory:
-    """``build_workflow`` for ``_run_slot``: the real workflow, its peripheral phases stubbed."""
+    """``build_workflow`` for ``_run_slot``: the real workflow, its peripheral phases stubbed.
+
+    A task in *contaminated_first_lane* fails its first lane setup the way a warm
+    lane that fails post-reseed verification does: a counting ``WarmLaneRequeue``.
+    """
 
     def __init__(
-        self, dispatch_root: Path, cli: _CliScript, monkeypatch: pytest.MonkeyPatch,
+        self,
+        dispatch_root: Path,
+        cli: _CliScript,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        contaminated_first_lane: frozenset[str],
     ) -> None:
         self._dispatch_root = dispatch_root
         self._cli = cli
         self._monkeypatch = monkeypatch
+        self._contaminated_first_lane = contaminated_first_lane
         self._sequence = itertools.count(1)
+        self._dispatches: Counter[str] = Counter()
         self._latest: dict[str, TaskWorkflow] = {}
 
     def latest(self, task_id: str) -> TaskWorkflow:
@@ -253,7 +277,11 @@ class _WorkflowFactory:
             **{**kwargs, 'steward_factory': None, 'initial_plan': _one_step_plan(task_id)},
         )
         lane = self._dispatch_root / f'{next(self._sequence):03d}-{task_id}' / 'lane'
-        self._monkeypatch.setattr(wf, '_setup_worktree_and_artifacts', self._setup(wf, lane))
+        self._dispatches[task_id] += 1
+        contaminated = task_id in self._contaminated_first_lane and self._dispatches[task_id] == 1
+        self._monkeypatch.setattr(
+            wf, '_setup_worktree_and_artifacts', self._setup(wf, lane, contaminated=contaminated),
+        )
         for probe in (
             '_recover_if_already_merged',
             '_resume_merge_retry_if_pending',
@@ -263,8 +291,12 @@ class _WorkflowFactory:
         self._latest[task_id] = wf
         return wf
 
-    def _setup(self, wf: TaskWorkflow, lane: Path):
+    def _setup(self, wf: TaskWorkflow, lane: Path, *, contaminated: bool):
         async def setup_worktree_and_artifacts(branch_name: str) -> None:
+            if contaminated:
+                raise WarmLaneReseedContaminated(
+                    f'lane for {branch_name} still carries a prior occupant\'s commits after reseed',
+                )
             lane.mkdir(parents=True)
             artifacts = TaskArtifacts(lane, *wf._artifact_roots(lane))
             artifacts.init(wf.task_id, wf.task.get('title', ''), wf.task.get('description', ''))
@@ -327,15 +359,24 @@ def _build_harness(
 
 class _Simulation:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.cast = BurstCast(burst=tuple(str(_BURST_FIRST_ID + i) for i in range(BURST_SIZE)))
+        self.cast = BurstCast(
+            burst=tuple(str(_BURST_FIRST_ID + i) for i in range(BURST_SIZE)),
+            genuine=_GENUINE_ID,
+        )
         self.clock = _SimClock()
         self.store = _OutageTaskStore(self.cast.all_ids)
-        self.cli = _CliScript(dict.fromkeys(self.cast.burst, _burst_script))
+        self.cli = _CliScript({
+            **dict.fromkeys(self.cast.burst, _burst_script),
+            self.cast.genuine: _genuine_script,
+        })
         self.config = _code_default_config(tmp_path, monkeypatch)
         self.harness, self.scheduler = _build_harness(
             self.config, self.store, self.clock, tmp_path / 'escalations',
         )
-        self.factory = _WorkflowFactory(tmp_path / 'dispatches', self.cli, monkeypatch)
+        self.factory = _WorkflowFactory(
+            tmp_path / 'dispatches', self.cli, monkeypatch,
+            contaminated_first_lane=frozenset({self.cast.genuine}),
+        )
         monkeypatch.setattr('orchestrator.harness.build_workflow', self.factory)
         monkeypatch.setattr('orchestrator.workflow.invoke_with_cap_retry', self.cli)
         self._sequence = itertools.count()
@@ -347,12 +388,20 @@ class _Simulation:
         for i, task_id in enumerate(self.cast.burst):
             first = i * _STAGGER_SECS + self.cli.next_duration_secs(task_id)
             heapq.heappush(arrivals, (first, next(self._sequence), task_id))
+        heapq.heappush(arrivals, (_GENUINE_ARRIVAL_SECS, next(self._sequence), self.cast.genuine))
         while arrivals:
             at, _, task_id = heapq.heappop(arrivals)
             record = await self._dispatch(task_id, at, PHASE_A)
-            if record.report.outcome == WorkflowOutcome.REQUEUED and self.cli.calls(task_id) < KILLS_PER_TASK:
+            if self._kill_pending(record):
                 heapq.heappush(arrivals, (self._redispatch_at(record), next(self._sequence), task_id))
         self.after_phase_a = self._snapshot()
+
+    def _kill_pending(self, record: DispatchRecord) -> bool:
+        return (
+            record.task_id in self.cast.burst
+            and record.report.outcome == WorkflowOutcome.REQUEUED
+            and self.cli.calls(record.task_id) < KILLS_PER_TASK
+        )
 
     def _redispatch_at(self, record: DispatchRecord) -> float:
         if record.cooldown is None:
