@@ -14,11 +14,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import systemd_unit_parity
 from committed_git_repo import committed_repo
+from git_repo_probe import loose_count
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -26,6 +28,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 SCRIPT = Path(__file__).parent.parent / 'install-shared-repo-git-maintenance-timer.sh'
 TEMPLATES_DIR = Path(__file__).parent.parent
 WRAPPER = TEMPLATES_DIR / 'shared-repo-git-maintenance.sh'
+JOB = TEMPLATES_DIR / 'shared_repo_git_maintenance.py'
 CHECKOUT_ROOT = Path(__file__).parents[2]
 
 # The installed unit is a byte copy naming the PRODUCTION checkout, so this is
@@ -223,8 +226,12 @@ def test_service_is_a_journalled_oneshot_around_the_wrapper():
 
 
 def test_service_documents_the_safety_envelope():
-    docs = _values(TEMPLATES_DIR / SERVICE_NAME, 'Unit', 'Documentation')
-    assert any(d.endswith('/docs/shared-repo-git-maintenance.md') for d in docs), docs
+    named, = _values(TEMPLATES_DIR / SERVICE_NAME, 'Unit', 'Documentation')
+    prefix = f'file://{PRODUCTION_ROOT}/'
+    assert named.startswith(prefix), named
+    assert named.endswith('/docs/shared-repo-git-maintenance.md'), named
+    here = CHECKOUT_ROOT / named.removeprefix(prefix)
+    assert here.is_file(), here
 
 
 def test_service_execstart_points_at_a_real_executable_wrapper():
@@ -238,30 +245,15 @@ def test_service_execstart_points_at_a_real_executable_wrapper():
 # ── the wrapper ─────────────────────────────────────────────────────────────
 
 
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ['git', '-C', str(repo), *args], capture_output=True, text=True, timeout=60, check=True
-    ).stdout
-
-
-def _loose_count(repo: Path) -> int:
-    for line in _git(repo, 'count-objects', '-v').splitlines():
-        key, _, value = line.partition(':')
-        if key == 'count':
-            return int(value)
-    raise AssertionError(f'count-objects -v printed no count for {repo}')
+def _hermetic_args(tmp_path: Path, repo: Path) -> list[str]:
+    units = tmp_path / 'no-units'
+    units.mkdir(exist_ok=True)
+    return ['--project-root', str(repo), '--units-dir', str(units), '--lock-file', str(tmp_path / 'l')]
 
 
 def _run_wrapper(tmp_path: Path, repo: Path) -> subprocess.CompletedProcess[str]:
-    units = tmp_path / 'no-units'
-    units.mkdir(exist_ok=True)
     return subprocess.run(
-        [
-            'bash', str(WRAPPER),
-            '--project-root', str(repo),
-            '--units-dir', str(units),
-            '--lock-file', str(tmp_path / 'l'),
-        ],
+        ['bash', str(WRAPPER), *_hermetic_args(tmp_path, repo)],
         env={**os.environ, 'REPO': str(CHECKOUT_ROOT)},
         capture_output=True,
         text=True,
@@ -275,12 +267,12 @@ def test_wrapper_is_executable():
 
 def test_wrapper_maintains_a_real_repo_and_narrates_the_exit_code(tmp_path):
     repo = Path(committed_repo(tmp_path / 'repo', {'README.md': 'seed\n'}))
-    assert _loose_count(repo) > 0
+    assert loose_count(repo) > 0
 
     result = _run_wrapper(tmp_path, repo)
 
     assert result.returncode == 0, result.stderr
-    assert _loose_count(repo) == 0
+    assert loose_count(repo) == 0
     last = result.stdout.splitlines()[-1]
     assert 'maintenance=0' in last, result.stdout
 
@@ -298,3 +290,21 @@ def test_wrapper_exits_zero_even_when_a_repo_fails(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert 'maintenance=1' in result.stdout.splitlines()[-1], result.stdout
+
+
+def test_the_job_runs_on_the_stdlib_alone(tmp_path):
+    """The unit runs the host's bare ``python3`` with no uv, venv or workspace, so a
+    first-party import in the job or its leaves would fail only in production.
+    ``-S -E`` drops site-packages and PYTHONPATH, leaving the stdlib and scripts/."""
+    repo = Path(committed_repo(tmp_path / 'repo', {'README.md': 'seed\n'}))
+
+    result = subprocess.run(
+        [sys.executable, '-S', '-E', str(JOB), *_hermetic_args(tmp_path, repo)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+
+    assert result.returncode == 0, result.stderr
+    [record] = [json.loads(line) for line in result.stdout.splitlines()]
+    assert record['outcome'] == 'maintained', record
