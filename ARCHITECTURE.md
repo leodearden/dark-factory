@@ -727,11 +727,12 @@ and are not restated here.
   quarantines, then reaps, `.worktrees/*` directories left behind by a
   crashed or killed workflow.
 - **Orphaned L0 records.** A *separate* sweep,
-  `Harness._reap_orphan_l0_escalations` (`harness.py`), promotes to L1 any L0
+  `Harness._reap_orphan_l0_escalations` (`harness.py`), takes any L0
   escalation *record* older than `orphan_l0_timeout_secs` whose **filing**
-  incarnation is provably dead, judged by the classifier's L0 liveness link
-  (§6). A newer live workflow on the same task does not keep a prior
-  incarnation's L0 alive. The two are easily conflated — one reaps
+  incarnation is provably dead, judged by the classifier's L0 liveness link:
+  it promotes a blocking record to L1 and routes an info record through the
+  info-L0 router instead (§6 has the full predicate). A newer live workflow
+  on the same task does not keep a prior incarnation's L0 alive. The two are easily conflated — one reaps
   directories, the other reaps queue rows.
 - **Retry caps** bound every retryable failure mode (`requeue_cap=3`,
   `transient_requeue_cap=10`, `max_consecutive_infra_resumes=3`,
@@ -917,7 +918,8 @@ Every escalation is one row in a single model
 by `level`:
 
 ```
-L0  level=0   producer: agent             consumer: steward (per-task, interactive-equivalent review)
+L0  level=0   producer: agent             consumer: blocking → steward (per-task, interactive-equivalent review)
+                                                    info     → reviewer → running steward → info-L0 router
 L1  level=1   producer: steward/workflow  consumer: escalation-watcher-auto (automated triage)
 L2  level=2   producer: auto-watcher      consumer: human (direct — bypasses the auto-watcher)
 ```
@@ -935,8 +937,10 @@ flowchart LR
 
 - **L0.** A per-task `TaskSteward` — a single, persistent Claude session
   across every escalation that task ever raises, with a lifetime budget (§4)
-  — the first responder for any workflow failure.
-- **L0 → L1.** Two routes. Automatically,
+  — the first responder for any workflow failure. An info L0 is consumed by
+  the chain in §3.6, not by the steward ladder.
+- **L0 → L1.** Two routes for a blocking record, and a third for info.
+  Automatically,
   `TaskSteward._auto_escalate_to_human` files a fresh `level=1` escalation and
   dismisses the L0 when the steward exhausts its budget, hits a
   retry/timeout/empty-output cap, or finds its worktree missing at preflight.
@@ -956,8 +960,32 @@ flowchart LR
   filer's liveness — unless it is `info` severity, which never pins at any
   level. `TaskSteward._auto_escalate_to_human`
   (`orchestrator/src/orchestrator/steward.py`) carries the L0's severity onto
-  the L1. A separate orphan sweep (`Harness._reap_orphan_l0_escalations`)
-  promotes to L1 an aged L0 whose filing incarnation is dead (§3.7).
+  the L1. The third route, for info only, is the info-L0 router filing its
+  own L1s. A work-shaped note it cannot convert into a task is dismissed and promoted to
+  one fallback L1 under agent_role `harness-info-l0-router` with
+  suggested_action `convert_to_task`, with the author's text kept in
+  `detail`. The router also files one status-info aggregate L1 per mechanical
+  class per sweep. OPERATIONS.md §5 "Info notes, deliberate holds, and the
+  info-L0 router" says how to read both.
+
+  *Orphan sweep and restart amnesty, as built*
+  ([plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md)
+  D6/D7). The orphan sweep (`Harness._reap_orphan_l0_escalations`) acts only
+  on L0s older than `orphan_l0_timeout_secs`. It skips a record while a
+  workflow attends the task (`_escalation_events`) or the scheduler holds it
+  (`Scheduler.is_actively_held`), unless `classify_pins` proves the filing
+  incarnation gone (§3.7). An info record is routed by the info-L0 router
+  (`orchestrator/src/orchestrator/escalation_router.py::InfoL0Sweep`, exit
+  kind `orphan`); a note the router is already holding on a curator ticket is
+  finished first, even with a live workflow. A blocking record keeps the old
+  path: covered-by-open-L1 dismissal (`EscalationQueue.dismiss_if_covered`),
+  the done-step-commit rebase-superseded dismissal, then verbatim promotion to
+  L1 with `manual_intervention`. The startup amnesty
+  `Harness._dismiss_stale_escalations` first routes info records and finishes
+  their holds (`_route_info_l0s_across_restart`, exit kind `restart`). Its
+  `dismiss_all_pending` then keeps the router-owned notes for the reaper, so
+  with the router enabled only blocking L0s are dismissed and counted as stale
+  strands.
 - **L1 auto-watcher.** A repeatedly-spawned Claude CLI rotation (§2.1) that
   only launches when there's an actionable pending L1, running the
   `escalation-watcher-auto` skill.
@@ -965,7 +993,14 @@ flowchart LR
   updating a root-cause-deduplicated `level=2` escalation whose `members`
   list references the contributing L1 escalation ids (which stay at level
   1). Promotion is gated to the watcher's own identity or an unauthenticated
-  (human) caller.
+  (human) caller. A promote with `severity` omitted over a cluster whose
+  members are all info is refused —
+  `{'status': 'refused', 'code': 'info_only_cluster', …}` — and nothing is
+  minted or folded (`escalation/src/escalation/server.py::promote_to_l2`). The
+  auto-watcher then closes the members at L1, or re-issues with an explicit
+  blocking severity when its RCA judges the cluster collectively blocking
+  (the rung is in `skills/escalation-watcher-auto/SKILL.md`, "Info-only
+  cluster"), so the L2 queue holds no inherited-info records.
 - **Born-at-L2.** `escalate_blocker`/`escalate_info` called with severity
   `critical` or `urgent` are stamped `level=2` immediately — but **only**
   when the filer's `agent_role` is a recognized harness sentinel (e.g.
