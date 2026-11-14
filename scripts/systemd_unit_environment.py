@@ -11,6 +11,7 @@ import argparse
 import enum
 import errno
 import json
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -19,19 +20,49 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Generic, TypeVar
 
+# 0: report printed. 3: nothing was read, the meaning
+# scripts/tasks_db_schema.py::EXIT_UNREADABLE gives it. 4: report printed, but
+# the live layer was unreadable. Never 2: argparse spends it on usage errors.
 EXIT_OK = 0
-# 3: reserved for "nothing was read" (systemd unanswered).
+EXIT_SYSTEMD_UNANSWERED = 3
 EXIT_LIVE_UNREADABLE = 4
 
 _DESTINATION = 'org.freedesktop.systemd1'
 _MANAGER_PATH = '/org/freedesktop/systemd1'
 _MANAGER_INTERFACE = 'org.freedesktop.systemd1.Manager'
+_UNIT_INTERFACE = 'org.freedesktop.systemd1.Unit'
 _SERVICE_INTERFACE = 'org.freedesktop.systemd1.Service'
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _DEFAULT_PROC_ROOT = Path('/proc')
 _DEFAULT_TIMEOUT_SECS = 10.0
 
 _T = TypeVar('_T')
+
+
+class SystemdUnanswered(Exception):
+    """busctl gave no usable reply to *argv*; *detail* says why, verbatim."""
+
+    def __init__(self, argv: Sequence[str], detail: str) -> None:
+        self.argv = tuple(argv)
+        self.detail = detail
+        super().__init__(
+            f'{shlex.join(self.argv)}: no usable reply from the systemd --user '
+            f'manager — {detail}. Every layer of the report comes from systemd, '
+            f'so nothing is printed.'
+        )
+
+
+class UnitNotLoaded(Exception):
+    """The manager reports *unit* with a LoadState other than 'loaded'."""
+
+    def __init__(self, unit: str, load_state: str) -> None:
+        self.unit = unit
+        self.load_state = load_state
+        super().__init__(
+            f"{unit}: LoadState is {load_state!r}, not 'loaded', so the "
+            f'systemd --user manager has no environment for it. Check the name '
+            f'with `systemctl --user list-units --all`.'
+        )
 
 
 @dataclass(frozen=True)
@@ -54,6 +85,12 @@ def _integer(data: object) -> int:
     raise ValueError(f'expected an integer, got {data!r}')
 
 
+def _string(data: object) -> str:
+    if isinstance(data, str):
+        return data
+    raise ValueError(f'expected a string, got {data!r}')
+
+
 def _single_object_path(data: object) -> str:
     if isinstance(data, list) and len(data) == 1 and isinstance(data[0], str):
         return data[0]
@@ -72,6 +109,7 @@ def _path_flag_pairs(data: object) -> tuple[tuple[str, bool], ...]:
     raise ValueError(f'expected a list of [path, flag] pairs, got {data!r}')
 
 
+_STRING = _ReplyType('s', _string)
 _STRINGS = _ReplyType('as', _strings)
 _UINT32 = _ReplyType('u', _integer)
 _UINT64 = _ReplyType('t', _integer)
@@ -79,18 +117,31 @@ _PATH_FLAG_PAIRS = _ReplyType('a(sb)', _path_flag_pairs)
 _LOAD_UNIT_REPLY = _ReplyType('o', _single_object_path)
 
 
-def _busctl(args: Sequence[str], *, expect_type: _ReplyType[_T], timeout_secs: float) -> _T:
-    completed = subprocess.run(
-        ['busctl', '--user', '--json=short', *args],
-        capture_output=True,
-        text=True,
-        timeout=timeout_secs,
-        check=False,
-    )
-    reply = json.loads(completed.stdout)
+def _parse_reply(stdout: str, expect_type: _ReplyType[_T]) -> _T:
+    reply = json.loads(stdout)
+    if not isinstance(reply, dict):
+        raise ValueError('not a JSON object')
     if reply['type'] != expect_type.signature:
-        raise ValueError(f'expected D-Bus type {expect_type.signature!r}, got {reply!r}')
+        raise ValueError(f'expected D-Bus type {expect_type.signature!r}, got {reply["type"]!r}')
     return expect_type.parse(reply['data'])
+
+
+def _busctl(args: Sequence[str], *, expect_type: _ReplyType[_T], timeout_secs: float) -> _T:
+    argv = ('busctl', '--user', '--json=short', *args)
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_secs, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemdUnanswered(argv, str(exc)) from exc
+    if completed.returncode != 0:
+        raise SystemdUnanswered(argv, f'exit {completed.returncode}: {completed.stderr.strip()}')
+    try:
+        return _parse_reply(completed.stdout, expect_type)
+    except (ValueError, KeyError) as exc:
+        raise SystemdUnanswered(
+            argv, f'malformed reply {completed.stdout.strip()!r}: {exc}'
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -282,6 +333,9 @@ def inspect_unit(
     """Read every environment layer of the --user service *unit*."""
     manager = _UserManager(timeout_secs)
     path = manager.load_unit_path(unit)
+    load_state = manager.unit_property(path, _UNIT_INTERFACE, 'LoadState', _STRING)
+    if load_state != 'loaded':
+        raise UnitNotLoaded(unit, load_state)
     environment = manager.unit_property(path, _SERVICE_INTERFACE, 'Environment', _STRINGS)
     return UnitEnvironment(
         unit=unit,
@@ -387,7 +441,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    env = inspect_unit(args.unit)
+    try:
+        env = inspect_unit(args.unit)
+    except (SystemdUnanswered, UnitNotLoaded) as refusal:
+        print(refusal, file=sys.stderr)
+        return EXIT_SYSTEMD_UNANSWERED
     print(render(env, args.names or ['PATH']))
     return exit_status(env)
 
