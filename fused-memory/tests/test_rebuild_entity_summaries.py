@@ -2571,10 +2571,10 @@ class _DualCorpusGraph:
 
 
 def _force_edge_read_structural(monkeypatch, **forced):
-    """Force _paged_ro_query kwargs for the EDGE read only (dispatch on the template)."""
+    """Force paged_ro_query kwargs for the EDGE read only (dispatch on the template)."""
     from fused_memory.backends import graphiti_client
 
-    real = graphiti_client._paged_ro_query
+    real = graphiti_client.paged_ro_query
 
     async def dispatching(*args, **kwargs):
         page_template = args[1] if len(args) > 1 else kwargs.get('page_template', '')
@@ -2582,7 +2582,7 @@ def _force_edge_read_structural(monkeypatch, **forced):
             kwargs = {**kwargs, **forced}
         return await real(*args, **kwargs)
 
-    monkeypatch.setattr(graphiti_client, '_paged_ro_query', dispatching)
+    monkeypatch.setattr(graphiti_client, 'paged_ro_query', dispatching)
 
 
 _STRUCTURAL_CASES = [

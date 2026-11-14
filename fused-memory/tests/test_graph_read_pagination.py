@@ -9,7 +9,7 @@ constants below are this module's local copy, used to size the fixture
 corpora so the tests exercise the real shape rather than a toy; re-measure
 them together.
 
-This module pins the paginated read primitive (``_paged_ro_query``), its four
+This module pins the paginated read primitive (``paged_ro_query``), its four
 fail-closed completeness paths, the two task-4340 methods routed through it,
 and the three task-4869 reads routed through it (the two stale-embedding reads
 and ``query_edges_by_time_range``).
@@ -209,7 +209,7 @@ def total_attributions(grouped: dict[str, list[dict]]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# step-1: the fake really reproduces the defect, and _paged_ro_query cures it
+# step-1: the fake really reproduces the defect, and paged_ro_query cures it
 # ---------------------------------------------------------------------------
 
 _PAGE_TEMPLATE = (
@@ -264,7 +264,7 @@ class TestFakeCappedGraphCensusDispatch:
 
 
 class TestPagedRoQueryHappyPath:
-    """``_paged_ro_query`` recovers a corpus the server cap would truncate."""
+    """``paged_ro_query`` recovers a corpus the server cap would truncate."""
 
     @pytest.mark.asyncio
     async def test_control_unpaginated_read_is_truncated_by_the_cap(self):
@@ -286,11 +286,11 @@ class TestPagedRoQueryHappyPath:
 
     @pytest.mark.asyncio
     async def test_paged_read_recovers_the_whole_corpus(self):
-        """``_paged_ro_query`` returns every row the server holds, and says so."""
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        """``paged_ro_query`` returns every row the server holds, and says so."""
+        from fused_memory.backends.paged_read import paged_ro_query
 
         graph = FakeCappedGraph(make_edge_corpus(_LIVE_EDGE_ROWS))
-        paged = await _paged_ro_query(
+        paged = await paged_ro_query(
             graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=5000
         )
         assert len(paged.rows) == _LIVE_EDGE_ROWS
@@ -333,7 +333,7 @@ class TestPageBoundSubstitution:
     @pytest.mark.asyncio
     async def test_a_template_with_a_map_pattern_pages_normally(self):
         """End to end: the brace-carrying template really does enumerate."""
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        from fused_memory.backends.paged_read import paged_ro_query
 
         template = (
             'MATCH (n:Entity {group: $group})-[e:RELATES_TO]-() '
@@ -341,7 +341,7 @@ class TestPageBoundSubstitution:
             'ORDER BY e.uuid, n.uuid SKIP {skip} LIMIT {limit}'
         )
         graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
-        paged = await _paged_ro_query(
+        paged = await paged_ro_query(
             graph, template, _CENSUS_CYPHER, params={'group': 'g'}, page_size=40
         )
         assert paged.complete is True
@@ -413,12 +413,12 @@ class TestPagedRoQueryStructuralGuards:
         """
         from fused_memory.backends.graphiti_client import (
             INCOMPLETE_STRUCTURAL_REFUSAL,
-            _paged_ro_query,
         )
+        from fused_memory.backends.paged_read import paged_ro_query
 
         graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
         with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
-            paged = await _paged_ro_query(
+            paged = await paged_ro_query(
                 graph,
                 _PAGE_TEMPLATE,
                 _CENSUS_CYPHER,
@@ -450,12 +450,12 @@ class TestPagedRoQueryStructuralGuards:
         """
         from fused_memory.backends.graphiti_client import (
             INCOMPLETE_PAGE_CAP,
-            _paged_ro_query,
         )
+        from fused_memory.backends.paged_read import paged_ro_query
 
         graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
         with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
-            paged = await _paged_ro_query(
+            paged = await paged_ro_query(
                 graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10, max_pages=2
             )
         assert paged.complete is False
@@ -494,8 +494,8 @@ class TestPagedRoQueryCensusGuards:
         """
         from fused_memory.backends.graphiti_client import (
             INCOMPLETE_CENSUS_UNAVAILABLE,
-            _paged_ro_query,
         )
+        from fused_memory.backends.paged_read import paged_ro_query
 
         graph = FakeCappedGraph(
             make_edge_corpus(100),
@@ -504,7 +504,7 @@ class TestPagedRoQueryCensusGuards:
             census_result_set_set=True,
         )
         with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
-            paged = await _paged_ro_query(
+            paged = await paged_ro_query(
                 graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
             )
         assert paged.expected_rows is None
@@ -520,14 +520,14 @@ class TestPagedRoQueryCensusGuards:
         """A SHORTFALL is the truncation signature: report it, naming both numbers."""
         from fused_memory.backends.graphiti_client import (
             INCOMPLETE_SHORT_READ,
-            _paged_ro_query,
         )
+        from fused_memory.backends.paged_read import paged_ro_query
 
         graph = FakeCappedGraph(
             make_edge_corpus(100), resultset_cap=None, census_override=150
         )
         with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
-            paged = await _paged_ro_query(
+            paged = await paged_ro_query(
                 graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
             )
         assert paged.complete is False
@@ -550,13 +550,13 @@ class TestPagedRoQueryCensusGuards:
         task exists to remove, just noisier. Only a SHORTFALL is the
         truncation signature.
         """
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        from fused_memory.backends.paged_read import paged_ro_query
 
         graph = FakeCappedGraph(
             make_edge_corpus(100), resultset_cap=None, census_override=50
         )
         with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
-            paged = await _paged_ro_query(
+            paged = await paged_ro_query(
                 graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
             )
         assert paged.complete is True
@@ -604,12 +604,12 @@ class TestPagedReadReasonInvariant:
     async def test_reason_is_none_exactly_when_complete(
         self, kwargs, graph_kwargs, _kind_name
     ):
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        from fused_memory.backends.paged_read import paged_ro_query
 
         graph = FakeCappedGraph(
             make_edge_corpus(100), resultset_cap=None, **graph_kwargs
         )
-        paged = await _paged_ro_query(
+        paged = await paged_ro_query(
             graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, **kwargs
         )
         if paged.complete:
@@ -643,12 +643,12 @@ class TestIncompleteKindDiscriminator:
         self, kwargs, graph_kwargs, kind_name
     ):
         """Every guard sets the kind that names it — one case per fail-closed path."""
-        from fused_memory.backends import graphiti_client
+        from fused_memory.backends import graphiti_client, paged_read
 
         graph = FakeCappedGraph(
             make_edge_corpus(100), resultset_cap=None, **graph_kwargs
         )
-        paged = await graphiti_client._paged_ro_query(
+        paged = await paged_read.paged_ro_query(
             graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, **kwargs
         )
         expected = None if kind_name is None else getattr(graphiti_client, kind_name)
@@ -667,12 +667,12 @@ class TestIncompleteKindDiscriminator:
         one (making the raise in step-19 silently unreachable — the corrupting
         direction).
         """
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        from fused_memory.backends.paged_read import paged_ro_query
 
         graph = FakeCappedGraph(
             make_edge_corpus(100), resultset_cap=None, **graph_kwargs
         )
-        paged = await _paged_ro_query(
+        paged = await paged_ro_query(
             graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, **kwargs
         )
         if paged.complete:
@@ -1424,7 +1424,7 @@ class TestListEntityNodesEmittedCypher:
 
 
 def _force_paged_kwargs(monkeypatch, **forced):
-    """Re-bind the module-global ``_paged_ro_query`` to force read kwargs.
+    """Re-bind the module-global ``paged_ro_query`` to force read kwargs.
 
     The shims deliberately expose NO ``page_size``/``max_pages`` knob — their
     signatures must stay UNCHANGED, that is the back-compat guarantee the
@@ -1436,12 +1436,12 @@ def _force_paged_kwargs(monkeypatch, **forced):
     """
     from fused_memory.backends import graphiti_client
 
-    real = graphiti_client._paged_ro_query
+    real = graphiti_client.paged_ro_query
 
     async def forced_paged(*args, **kwargs):
         return await real(*args, **{**kwargs, **forced})
 
-    monkeypatch.setattr(graphiti_client, '_paged_ro_query', forced_paged)
+    monkeypatch.setattr(graphiti_client, 'paged_ro_query', forced_paged)
 
 
 def _refusal(monkeypatch):
@@ -2148,10 +2148,10 @@ class DualCorpusGraph:
 
 
 def _force_paged_kwargs_for(monkeypatch, *, edge_read: bool, **forced):
-    """Force ``_paged_ro_query`` kwargs for ONE of the two reads, by page template."""
+    """Force ``paged_ro_query`` kwargs for ONE of the two reads, by page template."""
     from fused_memory.backends import graphiti_client
 
-    real = graphiti_client._paged_ro_query
+    real = graphiti_client.paged_ro_query
 
     async def dispatching(*args, **kwargs):
         page_template = args[1] if len(args) > 1 else kwargs.get('page_template', '')
@@ -2159,11 +2159,11 @@ def _force_paged_kwargs_for(monkeypatch, *, edge_read: bool, **forced):
             kwargs = {**kwargs, **forced}
         return await real(*args, **kwargs)
 
-    monkeypatch.setattr(graphiti_client, '_paged_ro_query', dispatching)
+    monkeypatch.setattr(graphiti_client, 'paged_ro_query', dispatching)
 
 
 def force_edge_read_only(monkeypatch, **forced):
-    """Force ``_paged_ro_query`` kwargs for the EDGE read alone.
+    """Force ``paged_ro_query`` kwargs for the EDGE read alone.
 
     Dispatches on the page template so the node enumeration runs untouched.
     Without this the two reads fail in lockstep on the shared default page
@@ -2173,7 +2173,7 @@ def force_edge_read_only(monkeypatch, **forced):
 
 
 def force_node_read_only(monkeypatch, **forced):
-    """Force ``_paged_ro_query`` kwargs for the NODE read alone; the mirror of the above."""
+    """Force ``paged_ro_query`` kwargs for the NODE read alone; the mirror of the above."""
     _force_paged_kwargs_for(monkeypatch, edge_read=False, **forced)
 
 
@@ -2290,7 +2290,7 @@ class TestDetectStaleWithEdgesReportsBothReads:
     """detect_stale_with_edges returns BOTH read verdicts, each from its own read.
 
     The node read and the edge read truncate independently, so one verdict
-    cannot stand for the other.  Driven through the real ``_paged_ro_query``.
+    cannot stand for the other.  Driven through the real ``paged_ro_query``.
     """
 
     @pytest.mark.asyncio
@@ -2366,7 +2366,7 @@ class TestDetectStaleWithEdgesReportsBothReads:
     async def test_empirical_warnings_go_to_the_given_log(
         self, mock_config, make_backend, caplog
     ):
-        """Both reads' policy warnings; ``_paged_ro_query``'s own diagnostics stay on the backend's."""
+        """Both reads' policy warnings; ``paged_ro_query``'s own diagnostics stay on the backend's."""
         edges = _healthy_edges()
         backend = make_backend(mock_config)
         _wire(backend, DualCorpusGraph(
