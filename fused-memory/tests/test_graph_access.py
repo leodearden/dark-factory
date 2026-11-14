@@ -17,6 +17,7 @@ import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from _graph_access_fake import HangingRawGraph, wait_forever
 from _import_closure import SRC, modules_loaded_by_importing
+from pydantic import ValidationError
 
 from fused_memory.backends import graphiti_client, paged_read
 from fused_memory.backends.graph_access import (
@@ -26,7 +27,12 @@ from fused_memory.backends.graph_access import (
     paged_ro_query,
 )
 from fused_memory.backends.graphiti_client import GraphitiBackend
-from fused_memory.config.schema import FalkorDBProviderConfig, QueueConfig
+from fused_memory.config.schema import (
+    FalkorDBProviderConfig,
+    FusedMemoryConfig,
+    GraphitiBackendConfig,
+    QueueConfig,
+)
 
 _T = TypeVar('_T')
 
@@ -378,11 +384,34 @@ class TestEveryBackendCypherMethodIsBudgeted:
 class TestTheConnectionHasASocketTimeout:
     """The FalkorDB connection itself is bounded, beyond every named budget."""
 
-    def test_the_default_socket_timeout_outlasts_the_default_write_budget(self):
-        assert (
-            FalkorDBProviderConfig().socket_timeout_seconds
-            > QueueConfig().backend_write_timeout_seconds
+    def test_the_default_socket_timeout_outlasts_the_default_budgets(self):
+        FusedMemoryConfig()
+
+    @pytest.mark.parametrize('budget_field', [
+        'backend_read_timeout_seconds', 'backend_write_timeout_seconds',
+    ])
+    def test_a_budget_reaching_the_socket_timeout_is_rejected(self, budget_field):
+        with pytest.raises(ValidationError) as raised:
+            FusedMemoryConfig(
+                graphiti=GraphitiBackendConfig(
+                    falkordb=FalkorDBProviderConfig(socket_timeout_seconds=130.0),
+                ),
+                queue=QueueConfig(**{budget_field: 300.0}),
+            )
+
+        message = str(raised.value)
+        assert 'graphiti.falkordb.socket_timeout_seconds (130.0) must exceed' in message
+        assert f'queue.{budget_field} (300.0)' in message
+
+    def test_a_socket_timeout_raised_with_the_budget_is_accepted(self):
+        config = FusedMemoryConfig(
+            graphiti=GraphitiBackendConfig(
+                falkordb=FalkorDBProviderConfig(socket_timeout_seconds=310.0),
+            ),
+            queue=QueueConfig(backend_write_timeout_seconds=300.0),
         )
+
+        assert config.graphiti.falkordb.socket_timeout_seconds == 310.0
 
     def test_the_driver_connects_with_the_socket_timeout_and_its_clones_share_it(
         self, monkeypatch,

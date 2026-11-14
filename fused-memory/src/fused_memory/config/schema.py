@@ -362,9 +362,10 @@ class FalkorDBProviderConfig(BaseModel):
     socket_timeout_seconds: float = Field(
         default=130.0,
         description=(
-            'Socket timeout of the FalkorDB connection. Kept above '
-            'queue.backend_write_timeout_seconds, so a slow write fails on its '
-            'named budget rather than on a socket error.'
+            'Socket timeout of the FalkorDB connection. FusedMemoryConfig rejects '
+            'a value not above both queue.backend_read_timeout_seconds and '
+            'queue.backend_write_timeout_seconds, so a slow Cypher call fails on '
+            'its named budget rather than on a socket error.'
         ),
     )
 
@@ -3770,6 +3771,24 @@ class FusedMemoryConfig(BaseSettings):
     # Curator's usage-gate pool; independent from ``reconciliation.usage_cap``
     # because each UsageGate instance tracks cap state per-process / per-loop.
     usage_cap: UsageCapConfig | None = Field(default_factory=_default_curator_usage_cap)
+
+    @model_validator(mode='after')
+    def _validate_socket_timeout_outlasts_backend_budgets(self) -> 'FusedMemoryConfig':
+        socket_timeout = self.graphiti.falkordb.socket_timeout_seconds
+        widest_budget = max(
+            self.queue.backend_read_timeout_seconds,
+            self.queue.backend_write_timeout_seconds,
+        )
+        if socket_timeout <= widest_budget:
+            raise ValueError(
+                f'graphiti.falkordb.socket_timeout_seconds ({socket_timeout}) must exceed '
+                f'queue.backend_read_timeout_seconds '
+                f'({self.queue.backend_read_timeout_seconds}) and '
+                f'queue.backend_write_timeout_seconds '
+                f'({self.queue.backend_write_timeout_seconds}): otherwise a slow Cypher '
+                'call fails on a socket error instead of its named budget.'
+            )
+        return self
 
     model_config = SettingsConfigDict(
         env_prefix='',
