@@ -496,6 +496,19 @@ When `status ∈ TERMINAL` and the caller did not explicitly supply `claimant_ru
 written `NULL` in the same UPDATE as the status column. An explicitly supplied claimant is honoured
 (the caller is asserting a deliberate exception and owns it).
 
+*C4-E2 amended 2026-11-14 (task 4897; `docs/prds/claimant-invariant-detection.md` D-5/E-2,
+delivered as its d3 in task 4866) — the honoured exception is ledgered.* When a terminal write
+honours an explicitly supplied non-NULL claimant, `TaskInterceptor._apply_status_transition` stamps
+`metadata.claimant_exception` = `{claimant_run_id, target_status, agent_id, tag, stamped_at}`
+(`fused-memory/src/fused_memory/middleware/task_interceptor.py::_claimant_exception_entry`). The
+stamp is written atomically with the status column, in one transaction, through
+`SqliteTaskBackend.set_status_and_stamp_audit`; once the write has persisted, a structured
+`claimant_exception:` WARNING carries the same fields. An explicit `None` is not an exception — it
+clears exactly like an unsupplied claimant — and non-terminal writes and the same-status no-op stamp
+nothing. The alarm tier is C4-E1 *and* unledgered:
+`violates_terminal_claimant_invariant(task) and not ledger_covers_claimant(task)`
+(`shared/src/shared/task_claimant.py`). The C4-E1 predicate itself is unchanged.
+
 **C4-E3 (non-terminal rule).** For `status ∉ TERMINAL`, the claimant columns are untouched by the
 status write. Clearing on those transitions is caller-side and legal **only** where the caller has
 already established that no live claimant exists.
