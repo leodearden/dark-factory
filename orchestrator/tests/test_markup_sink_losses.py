@@ -23,11 +23,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import _plan_markup_fixtures
 import pytest
 from _git_checkouts import git
 from _markup_corpus import corpus_specimen
 from _markup_sink_rig import QUEUE_LOSS_SHAPES, RecordingQueue, seed_plan
-from _plan_markup_fixtures import isolate_the_refusal_memo  # noqa: F401 — re-export
 from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
@@ -47,6 +47,9 @@ from orchestrator.mcp import (
     verdict_tools,
 )
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT
+
+#: pytest finds a fixture by its name in the requesting module's namespace.
+isolate_the_refusal_memo = _plan_markup_fixtures.isolate_the_refusal_memo
 
 SUBJECT = '7128'
 RAW = 'THE ONLY SURVIVING COPY'
