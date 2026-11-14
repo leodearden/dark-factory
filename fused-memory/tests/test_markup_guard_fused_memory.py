@@ -859,7 +859,7 @@ class TestInstalledOnTheRealServer:
     by review, not by a test. No assertion here reads source text.
     """
 
-    def test_the_installer_helper_declares_the_reject_with_repair_tier(self):
+    def test_the_boundary_chain_declares_the_reject_with_repair_tier(self):
         """INV-1: the tier is declared at the interception point, not inferred.
 
         REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory
@@ -868,52 +868,52 @@ class TestInstalledOnTheRealServer:
         a per-tool tier, because a per-tool tier would be exactly the tool-name
         inference INV-1 forbids.
         """
-        from fused_memory.server import main as main_module
+        from fused_memory.server.boundary_guards import boundary_guard_chain
 
-        recorded: dict[str, Any] = {}
+        markup_member = boundary_guard_chain(
+            known_projects=_KNOWN_PROJECTS, prefix_resolver=None
+        )[0]
 
-        def _record(mcp: Any, **kwargs: Any) -> None:
-            recorded['mcp'] = mcp
-            recorded.update(kwargs)
+        assert markup_member.policy is RepairPolicy.REJECT_WITH_REPAIR
 
-        known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
-        server = create_mcp_server(AsyncMock())
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(main_module, 'install_markup_guard', _record)
-            main_module._install_tool_dispatch_guards(
-                server, known_projects=known_projects
+    @pytest.mark.asyncio
+    async def test_forward_repair_is_consumable_on_the_bundled_server(self):
+        """FORWARD_REPAIR's ``ToolResult`` now reaches the client as ``_meta``.
+
+        The bridge converts a member-authored ``ToolResult`` into the
+        ``CallToolResult`` the bundled low-level handler passes straight
+        through, so the tier installs without error, the repaired write LANDS
+        with the absorbed parameter recovered, and the caller is told so.
+        """
+        from mcp.shared.memory import create_connected_server_and_client_session
+
+        from fused_memory.server.markup_guard import build_markup_guard
+        from fused_memory.server.tool_middleware_bridge import install_tool_middleware
+
+        mock_service = AsyncMock()
+        _pass_through(mock_service, 'add_system_record')
+        server = create_mcp_server(mock_service)
+        _install_safe_tool_wrapper(server)
+        install_tool_middleware(
+            server,
+            (build_markup_guard(policy=RepairPolicy.FORWARD_REPAIR, known_projects=None),),
+            sentinel='_forward_repair_markup_guarded',
+            label='forward-repair markup guard',
+        )
+
+        async with create_connected_server_and_client_session(server._mcp_server) as session:
+            result = await session.call_tool(
+                'add_system_record', _leaked_add_system_record_arguments()
             )
 
-        assert recorded['mcp'] is server
-        assert recorded['policy'] is RepairPolicy.REJECT_WITH_REPAIR
-        assert recorded['known_projects'] is known_projects
-
-    def test_an_undeliverable_policy_is_refused_at_WIRING_time(self):
-        """The declared ValueError, which is a fail-LOUD wiring guard.
-
-        ``MarkupGuardMiddleware._forward`` returns a fastmcp ``ToolResult`` that
-        the bundled dispatcher cannot consume, so FORWARD_REPAIR does not merely
-        behave differently here — it breaks at the FIRST repair, arbitrarily far
-        from the line that declared it. A tier that cannot work has to fail at
-        the wiring, and the tool manager must be left unwrapped so the failure
-        cannot be half-applied.
-        """
-        server = create_mcp_server(AsyncMock())
-        before = server._tool_manager.call_tool
-
-        with pytest.raises(ValueError) as exc_info:
-            install_markup_guard(server, policy=RepairPolicy.FORWARD_REPAIR)
-
-        assert 'FORWARD_REPAIR' in str(exc_info.value) or 'REJECT_WITH_REPAIR' in str(
-            exc_info.value
-        )
-        # ``==`` not ``is``: an UNWRAPPED call_tool is a bound method, and every
-        # attribute access mints a fresh bound-method object, so identity would
-        # fail here even with nothing installed. Equality compares (func, self),
-        # which is exactly the question — and once wrapped the attribute holds a
-        # plain closure, which no bound method equals.
-        assert server._tool_manager.call_tool == before
-        assert getattr(server._tool_manager, '_fused_memory_markup_guarded', False) is False
+        assert result.isError is False
+        mock_service.add_system_record.assert_awaited_once()
+        assert mock_service.add_system_record.await_args.kwargs['content'] == _CLEAN_CONTENT
+        assert mock_service.add_system_record.await_args.kwargs['agent_id'] == _AGENT_ID
+        assert result.meta is not None
+        repair = result.meta['markup_repair']
+        assert repair['field'] == 'content'
+        assert repair['recovered_params'] == ['agent_id']
 
     def test_installing_twice_does_not_double_wrap(self):
         """The ``_fused_memory_markup_guarded`` sentinel's whole job.
