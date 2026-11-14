@@ -21,6 +21,8 @@ INV-11 `no-silent-fail-soft`, INV-4 `storm-escape-required`, INV-9
 
 > **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: the lane no longer files an L0 info at filing; it raises one level-1 `dependency_discovered` escalation per covering task after `git.offline_lane_red_unlanded_hours` (D11).
 
+> **Amended 2026-11-14** (task 5226): scope-divergence is not an info class. `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._escalate_scope_invariant_violation` files `severity='blocking'` by design (plans/task-escalation-state-graph-prd.md D11: the scope gate is real and stays), so this PRD never routes it. The substrate row "Mechanical info filers are enumerable by role" and D8 are corrected to drop it; `escalation/src/escalation/classify.py::INFO_L0_MECHANICAL_ROLES` never carried it.
+
 **Code anchors** verified against main `a24b1fb665` (2026-09-08). Main moves
 fast — cite-by-symbol; re-locate at implementation time.
 
@@ -123,7 +125,7 @@ work items (task 2640).
 | Curator intake from the orchestrator that follows the 307 | `scheduler.py::Scheduler.dispatch_tool` → `mcp_call(f'{memory_url}/mcp', …)` (no trailing slash; used by `harness.py` today); `mcp_lifecycle.py` uses `follow_redirects=True`. The five raw `/mcp/` POSTs in `workflow.py`/`merge_queue.py` are the task-4023 defect and are **not** used here | PASS — no dependency on 4023 |
 | fused-memory `submit_task(planning_mode=False)` passes the curator and is idempotent per escalation | `fused_memory/server/tools.py::submit_task` → `middleware/task_interceptor.py` returns `{'ticket': 'tkt_…'}`; `resolve_ticket` yields the task id; `_check_escalation_idempotency` keys on `(escalation_id, suggestion_hash)`; `spawn_context` is a free string defaulting to `'manual'` | PASS |
 | Event type is a one-site enum edit | `event_store.py::EventType` (StrEnum, name == value); `EventStore.emit(...)` never raises; `event_store` may be `None` | PASS |
-| Mechanical info filers are enumerable by role | Six `severity='info', level=0` filing sites (`orchestrator-starvation-watchdog`, `orchestrator-merge-skew-tripwire`, `orchestrator-no-landings-breaker`, `orchestrator-warm-base-hard-down` notice, `orchestrator-verify-host-monitor` recovery notice, `orchestrator-offline-lane` notice) plus the bare-`orchestrator` done-step tripwire (`suggested_action='verify_wip_reconciliation'`, discriminated by `harness.py::_is_done_step_commit_orphan`) and scope-divergence (`_is_scope_divergence_orphan`); `escalation/classify.py::_REAPER_SWEEP_RESOLVERS` is the existing role registry precedent | PASS |
+| Mechanical info filers are enumerable by role | Six `severity='info', level=0` filing sites (`orchestrator-starvation-watchdog`, `orchestrator-merge-skew-tripwire`, `orchestrator-no-landings-breaker`, `orchestrator-warm-base-hard-down` notice, `orchestrator-verify-host-monitor` recovery notice, `orchestrator-offline-lane` notice) plus the bare-`orchestrator` done-step tripwire (`suggested_action='verify_wip_reconciliation'`, discriminated by `harness.py::_is_done_step_commit_orphan`); `escalation/classify.py::_REAPER_SWEEP_RESOLVERS` is the existing role registry precedent | PASS |
 | Startup amnesty is a single site | `harness.py::Harness._dismiss_stale_escalations` → `EscalationQueue.dismiss_all_pending(resolution, strand_age_secs=)` | PASS |
 
 No novel substrate — every mechanism composes existing, wired capabilities.
@@ -177,8 +179,8 @@ No novel substrate — every mechanism composes existing, wired capabilities.
   (`_escalate_suggestions` is reachable only when `self.mcp is None`).
 - **D8 — STATUS_INFO leg is deterministic per class with one aggregate per
   sweep (Leo).** A registry `escalation/classify.py::INFO_L0_MECHANICAL_ROLES`
-  (frozenset of the six info-filing roles + the done-step and scope-divergence
-  discriminators) → `resolution_class='status-info'`; per sweep and class, one
+  (frozenset of the six info-filing roles + the done-step discriminator)
+  → `resolution_class='status-info'`; per sweep and class, one
   info L1 aggregate (`agent_role='harness-info-l0-router'`, deduped by a
   per-class sentinel through `has_open_l1(sentinel, category=)`), listing the
   dismissed ids. An unknown mechanical role is **not** status-info: it falls to
