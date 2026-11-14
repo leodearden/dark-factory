@@ -25,6 +25,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType
@@ -68,7 +69,7 @@ from shared.task_statuses import TERMINAL, TaskStatus
 import dashboard.app
 from dashboard.config import DashboardConfig
 from dashboard.data import task_lookup
-from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue
+from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue, serve_corpus
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.orchestrator import find_running_orchestrators
 from dashboard.data.quality_store import QualitySample
@@ -884,6 +885,22 @@ def _bindings_of(target: object, name: str, known: frozenset[str]) -> list[Modul
     return found
 
 
+def _land_corpus_walk(client: TestClient, config: DashboardConfig) -> None:
+    """Walk the escalation corpus once in the app's own loop, unbounded, as a running dashboard has.
+
+    ``/prds`` waits
+    ``dashboard/src/dashboard/api/prds.py::REQUEST_READS_WAIT_SECONDS`` on the
+    walk and serves every root UNKNOWN when it misses. The fleet's first walk takes
+    several seconds, so without one landed walk the request's measured size
+    would depend on whether an earlier request had happened to walk it.
+    """
+    assert client.portal is not None, 'the corpus is walked inside a live TestClient'
+    corpus = client.portal.call(partial(
+        serve_corpus, corpus_queues(config), now=datetime.now(UTC), wait_seconds=None,
+    ))
+    assert corpus.value is not None, f'the fleet\'s escalation corpus walk answered no value: {corpus.reason}'
+
+
 def _clear_caches() -> None:
     """Every cache a served payload could come from, so no other test's entry is served here."""
     forget_served_reads()
@@ -926,6 +943,7 @@ def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
             try:
                 with TestClient(app) as client:
                     app.state.config = config
+                    _land_corpus_walk(client, config)
                     yield client
             finally:
                 _clear_caches()
