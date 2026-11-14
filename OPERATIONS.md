@@ -3230,6 +3230,7 @@ missing `LoadState` detector).
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
 | 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`) | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
+| 03:45 | Quality-metrics snapshot of main, one instance per Python project (no LLM, never commits) | `quality-snapshot@.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
 | 04:30 | Legibility trickle health probe | `legibility-trickle-health@.timer` |
@@ -3243,7 +3244,7 @@ caught up on next boot/login rather than silently skipped) and
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
 for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
-02:15 one; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones,
+02:15 one; the sections below for the 02:30, 03:00, 03:15, 03:45, 04:00 and 05:00 ones,
 [Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one, and
 [The owner sweep timer (06:00) and its age](#the-owner-sweep-timer-0600-and-its-age) in §12a
 for the 06:00 one.
@@ -3659,6 +3660,72 @@ verdicts by `(eval_id, metric_id)` and keeps the first, so it would show an
 alarming tripwire as clear whenever its first item passes. Task 3217 re-keys
 that reader. Until it lands, the first scheduled run would publish a verdicts
 file the Memory tab misreads.
+
+### Nightly quality snapshot (03:45)
+
+**What it does.** Measures each Python project's `main` once a night with the
+factory's quality-metrics instrument, through
+`scripts/quality_snapshot_cadence.py` (its module docstring and `--help`). The
+skip of a sha already measured at the same identity, and the pinned tree the
+measurement runs in, are `plans/quality-dashboard-prd.md` decisions 18-19. It
+is pure CPU: no LLM, and it never commits. It is deliberately not coupled to
+the legibility trickle.
+
+| File | Role |
+|---|---|
+| `scripts/quality-snapshot@.timer` | the 03:45 cadence, one instance per project |
+| `scripts/quality-snapshot@.service` | runs the wrapper; `OnFailure=` starts the alarm |
+| `scripts/quality-snapshot-alarm@.service` | runs the alarm in a unit of its own |
+| `scripts/quality_snapshot_alarm.py` | files the failure escalation |
+| `scripts/install-quality-snapshot-timer.sh` | installs one project's instance |
+
+**Instances.** `dark_factory`, `solar_challenge`, `solar_challenge_platform`
+and `scoping_intake`. reify is out of scope until the Rust snapshot variant's
+gaps are owned.
+
+**Where snapshots land.**
+`/home/leo/src/dark-factory/data/quality-metrics/<project_id>/<as_of_sha>.json`,
+which is gitignored. The pinned trees live under
+`~/.local/state/dark-factory/quality-snapshot/<project_id>/` and are removed
+after each run, but a run killed by `TimeoutStartSec` can leave one there:
+remove the directory, then run `git -C <project_root> worktree prune`. Nothing
+is committed by machine. `/review-all` copies its own baseline to
+`plans/quality-metrics/` in its Phase 5, and its Phase 1 reads both homes
+(`skills/review-all/SKILL.md`).
+
+**Deploy.** From the main checkout after landing, once per project:
+`scripts/install-quality-snapshot-timer.sh <project_root>`. The project id
+derives from the root, and the instance's root lives in
+`~/.config/dark-factory/quality-snapshot/<project_id>.env`. An agent cannot
+run it (see "The nightly ladder" above); this landing's deploy is task 9986.
+It is done when `systemctl --user list-timers --all` lists
+`quality-snapshot@<project_id>.timer`.
+
+**When it fails.** The wrapper's `quality_snapshot_cadence:` line is in
+`journalctl --user -u quality-snapshot@<project_id>.service`, and the
+`OnFailure=` handler files one `infra_issue` info escalation, task id
+`quality-snapshot-<project_id>`, on the dark_factory escalation server. A
+handler that could not post shows as a failed
+`quality-snapshot-alarm@<project_id>.service`. The residual is the same as for
+the other §12 jobs: a timer that stops firing pages no one, so check
+`systemctl --user list-timers 'quality-snapshot@*'`.
+
+**Run now.** `systemctl --user start quality-snapshot@<project_id>.service`.
+
+**Backfill.** Measure given shas through the same wrapper, at the unit's
+priority:
+
+```bash
+systemd-run --user --wait --collect -p Nice=19 -p CPUWeight=10 \
+  /home/leo/src/dark-factory/.venv/bin/python \
+  /home/leo/src/dark-factory/scripts/quality_snapshot_cadence.py \
+  --root <project_root> --project-id <project_id> --sha <sha> ...
+```
+
+A point costs about 200 CPU-s for dark_factory. The weekly point for a date is
+main's first-parent sha as of 03:45 that day:
+`git -C <project_root> log -1 --first-parent --before='<date> 03:45' --format=%H main`.
+dark_factory's one-off backfill since 2026-10-08 is task 9986.
 
 ### Legibility trickle health probe (04:30)
 
