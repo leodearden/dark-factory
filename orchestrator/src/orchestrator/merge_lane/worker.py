@@ -18932,16 +18932,16 @@ class SpeculativeMergeWorker:
         #   * `chain_cap > 0` — α's kill switch.  At the shipped default this
         #     arm does not merely have no effect, it is not REACHED: cap=0
         #     dispatch stays byte-identical down to "no method call".
-        #   * `item.speculative` — slot 2 only.  A slot-1 head verify is a
-        #     different tree (merged onto REAL main, never chained by γ), so
-        #     its verdict says nothing about whether chaining is safe.
+        #   * `may_chain(...)` — a round that could have chained: slot 2, or a
+        #     head alone in the frontier at its dispatch (PRD D5); a depth of
+        #     None (a non-production caller) never licenses a head.
         #   * state `is not None` — already reset; nothing to do.
         # `depth=1` is truthful, not a placeholder: at the floor the tree that
         # actually ran IS a one-item chain (that is what makes the floor
         # byte-identical to today's adjacent verify in the first place).
         if (
             out is None
-            and item.speculative
+            and may_chain(speculative=item.speculative, frontier_depth=depth)
             and self._chain_halving_state is not None
             and req.config.merge_deep.chain_cap > 0
         ):
