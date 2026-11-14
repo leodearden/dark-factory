@@ -364,7 +364,7 @@ from fused_memory.reconciliation.flag_record_contract import (
     canonical_flag_types,
     normalize_flag_record_metadata,
 )
-from fused_memory.reconciliation.flag_shape import contains_any_casefolded
+from fused_memory.reconciliation.flag_shape import collect_str_values, contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import (
@@ -855,26 +855,6 @@ def _extract_uuids(text: str) -> set[str]:
     return {m.lower() for m in _UUID_RE.findall(text)}
 
 
-def _collect_str_values(value: Any, out: list[str]) -> None:
-    """Recursively append every ``str`` VALUE reachable in *value* to *out*.
-
-    Descends dicts (values only, not keys), lists, and tuples; every other
-    scalar type (int, float, bool, None, ...) is ignored rather than
-    stringified. Pure, sync, no I/O.
-    """
-    if isinstance(value, str):
-        out.append(value)
-    elif isinstance(value, dict):
-        for v in value.values():
-            _collect_str_values(v, out)
-    elif isinstance(value, (list, tuple)):
-        for v in value:
-            _collect_str_values(v, out)
-    # Any other type (int/float/bool/None/...) is intentionally ignored: only
-    # LLM-authored free text can carry a cited UUID, and stringifying a numeric
-    # or structured value could mint spurious tokens.
-
-
 def _flag_text_blob(flag: dict[str, Any]) -> str:
     """Return every ``str`` value in *flag* (recursively), space-joined.
 
@@ -884,9 +864,7 @@ def _flag_text_blob(flag: dict[str, Any]) -> str:
     the LLM placed it while ignoring structured/numeric noise. Pure, sync, no
     I/O.
     """
-    parts: list[str] = []
-    _collect_str_values(flag, parts)
-    return ' '.join(parts)
+    return ' '.join(collect_str_values(flag))
 
 
 def extract_flag_uuids(flag: dict[str, Any]) -> set[str]:
@@ -5924,9 +5902,7 @@ PREMATURE_WIDENING_CAVEAT_FAMILY = FlagTypeFamily(
 
 def _task_metadata_text(record: dict[str, Any]) -> str:
     """Every ``str`` value under *record*'s ``metadata``, newline-joined (``''`` if none)."""
-    parts: list[str] = []
-    _collect_str_values(record.get('metadata'), parts)
-    return '\n'.join(parts)
+    return '\n'.join(collect_str_values(record.get('metadata')))
 
 
 _ALREADY_RECORDED_CAVEAT_GATE = _TaskTextAccountingGate(

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ['contains_any_casefolded']
+__all__ = ['collect_str_values', 'contains_any_casefolded']
 
 
 def contains_any_casefolded(text: Any, family: tuple[str, ...]) -> bool:
@@ -26,3 +26,22 @@ def contains_any_casefolded(text: Any, family: tuple[str, ...]) -> bool:
         return False
     folded = text.casefold()
     return any(member.casefold() in folded for member in family)
+
+
+def collect_str_values(value: Any) -> list[str]:
+    """Return every ``str`` VALUE reachable in *value*, in traversal order.
+
+    Descends dicts (values only, never keys), lists and tuples.  Every other
+    type (int, float, bool, None, bytes, ...) is ignored rather than
+    stringified: only LLM-authored free text carries what a reader looks for,
+    and a stringified number or structure could mint spurious tokens.
+    """
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        children = value.values()
+    elif isinstance(value, (list, tuple)):
+        children = value
+    else:
+        return []
+    return [text for child in children for text in collect_str_values(child)]
