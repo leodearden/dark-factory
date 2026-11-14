@@ -1,0 +1,316 @@
+# Machine-readable twin of live-task-facts-at-recall-prd.capability-manifest.md
+prd: plans/live-task-facts-at-recall-prd.md
+schema_version: 1
+signal_leaves: ["ω"]
+tasks:
+  - label: "α"
+    task_id: 10079
+    title: "One batched task-facts read (middleware/task_facts.py), replacing the nested status helper"
+    capabilities:
+      - name: "task-store-to-extend"
+        binding: "`grep:fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend`"
+        verdict: PASS
+      - name: "protocol-and-pass-through"
+        binding: "`grep:fused-memory/src/fused_memory/backends/task_backend_protocol.py::TaskBackendProtocol` `grep:fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor`"
+        verdict: PASS
+      - name: "nested-helper-and-callers"
+        binding: "`grep:fused-memory/src/fused_memory/server/tools.py` (_batched_task_statuses, _claim_task_statuses, _verify_mint_referent, nested in the tool registration)"
+        verdict: PASS
+      - name: "read-task-facts"
+        binding: "built here; grep absent on main 60db54fc74"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def read_task_facts"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "store-get-task-facts"
+        binding: "built here; grep absent on main 60db54fc74"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def get_task_facts"
+          paths: ["fused-memory/src/fused_memory/backends/"]
+          expect: present
+      - name: "nested-helper-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_batched_task_statuses"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+  - label: "β"
+    task_id: 10080
+    title: "Search hits name their graph endpoints; entity edges carry their dates"
+    capabilities:
+      - name: "search-conversion"
+        binding: "`grep:fused-memory/src/fused_memory/services/memory_service.py::MemoryService._search_graphiti`"
+        verdict: PASS
+      - name: "edge-normaliser"
+        binding: "`grep:fused-memory/src/fused_memory/services/memory_service.py::_edge_to_dict`"
+        verdict: PASS
+      - name: "result-fields"
+        binding: "`grep:fused-memory/src/fused_memory/models/memory.py::MemoryResult` (entities, temporal)"
+        verdict: PASS
+      - name: "graph-reads"
+        binding: "`grep:fused-memory/src/fused_memory/backends/graphiti_client.py`"
+        verdict: PASS
+      - name: "endpoints-and-dates-delivered"
+        binding: "built here; manual"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The fix's shape is the implementer's (which graph read supplies the names); boundary rows B2 and B9 test it."
+  - label: "γ"
+    task_id: 10082
+    title: "Bind recalled results to tasks (middleware/recall_annotation.py); fix the mention scan"
+    capabilities:
+      - name: "scan-and-parser"
+        binding: "`grep:fused-memory/src/fused_memory/utils/canonical_labels.py::scan_content` `grep:fused-memory/src/fused_memory/utils/canonical_labels.py::parse_node_name`"
+        verdict: PASS
+      - name: "completion-record-registry"
+        binding: "`grep:fused-memory/src/fused_memory/memory_metadata.py::is_orchestrator_completion_record`"
+        verdict: PASS
+      - name: "write-path-scan-consumers"
+        binding: "`grep:fused-memory/src/fused_memory/utils/referent_resolution.py::resolve_referents` `grep:fused-memory/src/fused_memory/server/entities_gate.py::entities_gate`"
+        verdict: PASS
+      - name: "facts-and-endpoints"
+        binding: "producer:α upstream, producer:β upstream"
+        verdict: PASS
+      - name: "bind-tasks"
+        binding: "built here; grep absent on main 60db54fc74"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def bind_tasks"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "render-task-facts"
+        binding: "built here; grep absent on main 60db54fc74"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def render_task_facts"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+  - label: "δ"
+    task_id: 10083
+    title: "Read replies (search, get_entity, get_entity_by_uuid) and reconciliation's stage context carry live task facts"
+    capabilities:
+      - name: "read-tool-bodies"
+        binding: "`grep:fused-memory/src/fused_memory/server/tools.py` (search, get_entity, get_entity_by_uuid, registered inside the tool registration)"
+        verdict: PASS
+      - name: "context-assembler"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/context_assembler.py::ContextAssembler` `grep:fused-memory/src/fused_memory/reconciliation/context_assembler.py::_format_memory_result` (ContextAssembler holds taskmaster)"
+        verdict: PASS
+      - name: "read-and-bind-functions"
+        binding: "producer:α upstream, producer:γ upstream"
+        verdict: PASS
+      - name: "server-and-assembler-bind"
+        binding: "built here; grep absent on main 60db54fc74"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "bind_tasks\\("
+          paths: ["fused-memory/src/fused_memory/server/", "fused-memory/src/fused_memory/reconciliation/context_assembler.py"]
+          expect: present
+  - label: "ε"
+    task_id: 10084
+    title: "Briefings print the live task status block and dated own-task facts"
+    capabilities:
+      - name: "briefing-renderers"
+        binding: "`grep:orchestrator/src/orchestrator/agents/memory_recall.py::render_entity_block` `grep:orchestrator/src/orchestrator/agents/memory_recall.py::parse_search_reply` `grep:orchestrator/src/orchestrator/agents/memory_recall.py::filter_foreign_project_results`"
+        verdict: PASS
+      - name: "reply-field"
+        binding: "producer:δ upstream"
+        verdict: PASS
+      - name: "orchestrator-reads-task-facts"
+        binding: "built here; grep absent on main 60db54fc74"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "task_facts"
+          paths: ["orchestrator/src/orchestrator/agents/"]
+          expect: present
+  - label: "η"
+    task_id: 10085
+    title: "Write replies (add_memory, add_episode, update_memory) echo live task facts; guidance tells writers what to record"
+    capabilities:
+      - name: "write-tool-bodies"
+        binding: "`grep:fused-memory/src/fused_memory/server/tools.py` (add_memory, add_episode, update_memory)"
+        verdict: PASS
+      - name: "guidance-renderer"
+        binding: "`grep:fused-memory/src/fused_memory/utils/referent_resolution.py::render_referent_declaration_guidance`"
+        verdict: PASS
+      - name: "docs"
+        binding: "`grep:.claude/commands/memory.md` `grep:CLAUDE.md` (memory section)"
+        verdict: PASS
+      - name: "binding-and-facts"
+        binding: "producer:α upstream, producer:γ upstream, producer:δ upstream"
+        verdict: PASS
+      - name: "write-echo-delivered"
+        binding: "built here; manual"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "δ's bind_tasks grep cannot tell the write arm from the read arm in the same file; boundary row B12 tests it."
+  - label: "θ"
+    task_id: 10086
+    title: "Code writers carry the task as structure and write no status value (per-writer tests, census test)"
+    capabilities:
+      - name: "decision-notes-writer"
+        binding: "`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._write_decisions_to_memory`"
+        verdict: PASS
+      - name: "completion-marker"
+        binding: "`grep:orchestrator/src/orchestrator/completion_record.py::completion_record_metadata`"
+        verdict: PASS
+      - name: "reconciliation-writers"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler` `grep:fused-memory/src/fused_memory/reconciliation/scope_freshness.py` `grep:fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._reconcile_status_correction`"
+        verdict: PASS
+      - name: "status-vocabulary"
+        binding: "`grep:shared/src/shared/task_statuses.py`"
+        verdict: PASS
+      - name: "registry"
+        binding: "producer:γ upstream"
+        verdict: PASS
+      - name: "writer-tests-and-census"
+        binding: "built here; manual"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Test module names are the implementer's; boundary row B14 tests the census."
+  - label: "ι"
+    task_id: 10081
+    title: "Stop writing the task-count snapshot, for every project"
+    capabilities:
+      - name: "writer-switch-alarm"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_write_task_count_snapshot` `grep:fused-memory/src/fused_memory/reconciliation/policies/__init__.py::SNAPSHOT_WRITE_BLOCKED_PROJECTS` `grep:fused-memory/src/fused_memory/reconciliation/task_count_snapshot_cadence.py`"
+        verdict: PASS
+      - name: "stage-consumers"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/prompts/stage3.py` `grep:fused-memory/src/fused_memory/reconciliation/prompts/judge.py` `grep:fused-memory/src/fused_memory/reconciliation/recon_self_model.py` `grep:fused-memory/src/fused_memory/reconciliation/standing_decision_constants.py`"
+        verdict: PASS
+      - name: "writer-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _write_task_count_snapshot"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+      - name: "switch-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SNAPSHOT_WRITE_BLOCKED_PROJECTS *[:=]"
+          paths: ["fused-memory/src/fused_memory/reconciliation/policies/"]
+          expect: absent
+      - name: "cadence-module-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "import.*task_count_snapshot_cadence|task_count_snapshot_cadence import"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+      - name: "deletion-script"
+        binding: "built here; manual"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The script's name is the implementer's; ω runs it once per registered project."
+  - label: "κ"
+    task_id: 10087
+    title: "Retire the status-sentence detector, the stale-status sweep and four status write gates"
+    capabilities:
+      - name: "sweep-and-callers"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/stale_status_snapshot_edge_sweep.py::sweep_stale_status_snapshot_edges_for_task` `grep:fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py` `grep:fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler._retire_stale_status_snapshots`"
+        verdict: PASS
+      - name: "status-grammar-and-importers"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/status_snapshot_extraction.py` `grep:fused-memory/src/fused_memory/reconciliation/citation_verifier.py` `grep:fused-memory/src/fused_memory/reconciliation/stale_priority_override_edge_sweep.py`"
+        verdict: PASS
+      - name: "count-grammar-and-filters"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/task_filter.py::is_count_snapshot` `grep:fused-memory/src/fused_memory/reconciliation/flag_dedup.py` `grep:fused-memory/src/fused_memory/reconciliation/policies/know_live.py`"
+        verdict: PASS
+      - name: "four-gates"
+        binding: "`grep:fused-memory/src/fused_memory/server/tools.py` (ReconLiveTaskStatusWriteRejected, ReconConflictingTaskStatusWriteRejected, ReconSnapshotWriteRejected, _premature_completion_block)"
+        verdict: PASS
+      - name: "stage1-prompt"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/prompts/stage1.py`"
+        verdict: PASS
+      - name: "kept"
+        binding: "`grep:fused-memory/src/fused_memory/services/completion_claim_gate.py` (the completion-claim check; the mixed-framing gate ReconMixedFramingWriteRejected in server/tools.py)"
+        verdict: PASS
+      - name: "join-live-and-echo"
+        binding: "producer:η upstream, producer:δ upstream, producer:ε upstream, producer:θ upstream, producer:ι upstream"
+        verdict: PASS
+      - name: "sweep-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "sweep_stale_status_snapshot_edges"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+      - name: "live-status-gate-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ReconLiveTaskStatusWriteRejected"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+      - name: "conflicting-status-gate-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ReconConflictingTaskStatusWriteRejected"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+      - name: "snapshot-gate-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "error_type.: .ReconSnapshotWriteRejected"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: absent
+      - name: "count-grammar-removed"
+        binding: "built here; present on main 60db54fc74, must become absent"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_count_snapshot"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+      - name: "stage1-status-flip-two-step-gone"
+        binding: "built here; present on main 60db54fc74, must become absent (inherited from task 9739 at decompose)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "status flips"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
+          expect: absent
+      - name: "stage1-task-count-example-gone"
+        binding: "built here; present on main 60db54fc74, must become absent (inherited from task 9739 at decompose)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "3 blocked, 18 done"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
+          expect: absent
+  - label: "ω"
+    task_id: 10088
+    title: "Integration gate: the boundary suite (B1–B17) and a live check"
+    capabilities:
+      - name: "everything-it-runs"
+        binding: "producer:κ upstream (and through it every leaf)"
+        verdict: PASS
+      - name: "suite-and-live-check"
+        binding: "built here; manual"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A live run: the boundary suite on the merged tree, a live search and a fresh briefing, and the snapshot deletion script once per registered project."
