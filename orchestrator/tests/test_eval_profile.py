@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import cast
 
 import pytest
+from shared.transcript_archive import resolve_archive_root
 
 from orchestrator import config
 from orchestrator.config import OrchestratorConfig
@@ -34,6 +35,7 @@ from orchestrator.evals.profile import (
     resolve_eval_profile_update,
 )
 from orchestrator.evals.runner import build_eval_orch_config
+from orchestrator.evals.snapshots import eval_worktree_root
 from orchestrator.fm_retry import FM_NULL_SENTINEL_URL, is_fm_null_sentinel
 
 
@@ -199,3 +201,48 @@ def test_build_eval_orch_config_applies_profile_and_inherits_base(tmp_path):
     # Per-run overrides still applied on top of the profile-resolved base.
     assert result.models.implementer == 'sonnet'
     assert result.sandbox.enabled is False
+
+
+def _archive_root(cfg: OrchestratorConfig):
+    """Where the producer hook archives this config's transcripts, by production's own composition."""
+    return resolve_archive_root(cfg.project_root, cfg.transcript_archive.root)
+
+
+@pytest.mark.usefixtures('code_default_config')
+def test_transcript_archive_root_resolves_under_the_eval_worktree_root(tmp_path):
+    """An eval cell archives its transcripts under the eval root, never the project's archive.
+
+    S1 λ1 / C11: production archives every session under
+    ``project_root/data/orchestrator/agent-transcripts``; the profiled config
+    moves only the root, and keeps every sibling leaf of *base*'s
+    ``transcript_archive`` (a submodel copy, not a fresh default).
+    """
+    project_root = tmp_path / 'proj'
+    base = OrchestratorConfig(project_root=project_root)
+
+    resolved = apply_eval_profile(base)
+
+    archive_root = _archive_root(resolved)
+    assert archive_root == eval_worktree_root(project_root) / 'agent-transcripts'
+    assert not archive_root.is_relative_to(project_root)
+    assert resolved.transcript_archive.enabled == base.transcript_archive.enabled
+    assert resolved.transcript_archive.retention == base.transcript_archive.retention
+    assert resolved.transcript_archive.storm_threshold == base.transcript_archive.storm_threshold
+
+
+def test_build_eval_orch_config_roots_transcripts_under_the_fixture_project(tmp_path):
+    """The transcript root follows the fixture's project, not the campaign's base.
+
+    Campaigns load one base (dark-factory's) for fixtures of several projects
+    (reify's among them); the cell's transcripts belong beside its worktree,
+    under the fixture project's eval root.
+    """
+    base = OrchestratorConfig(project_root=tmp_path / 'a')
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path / 'b')}
+
+    result = build_eval_orch_config(cfg, task, base)
+
+    archive_root = _archive_root(result)
+    assert archive_root.is_relative_to(eval_worktree_root(tmp_path / 'b'))
+    assert not archive_root.is_relative_to(eval_worktree_root(tmp_path / 'a'))
