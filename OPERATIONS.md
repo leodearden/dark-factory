@@ -172,6 +172,77 @@ the task tree directly. For status of a *running* orchestrator's live
 state, prefer the fused-memory/escalation MCP reads in [§4](#4-watching-a-run)
 or the dashboard.
 
+### Inspecting a unit's live environment
+
+Do not read `/proc/<pid>/environ` of the `systemd --user` manager, the pid
+`systemctl show -p MainPID --value user@$(id -u).service` names. It is the
+wrong place to look, twice over:
+
+- Whether the read is permitted at all depends on the manager's capability
+  state. Measured: `Permission denied` on 2026-09-27, while the manager's
+  `CapPrm` held `CAP_WAKE_ALARM`, which a normal shell lacks; readable on
+  2026-11-14, after a re-exec had dropped it.
+- When it is readable, it holds the manager's own exec-time environment, not
+  the block the manager hands units. On 2026-11-14 its `PATH` lacked
+  `~/.local/bin`, while the unit block's `PATH` began with it.
+
+Inside an agent sandbox any `/proc/<pid>/environ` read may also be denied: on
+2026-11-14 a dispatched agent got `EACCES` on the orchestrator unit's own
+MainPID.
+
+A unit's environment has three layers. `Environment=` overrides the manager
+block, and an `EnvironmentFile=` overrides `Environment=`. To eyeball them:
+
+- the manager's block now, which a restart inherits:
+  `systemctl --user show-environment`;
+- the unit's overlay:
+  `systemctl --user show <unit> -p Environment -p EnvironmentFiles`. It
+  space-joins the assignments, so a value containing a space cannot be split
+  back out;
+- the running process:
+  `tr '\0' '\n' < /proc/$(systemctl --user show <unit> -p MainPID --value)/environ`.
+  It is readable at the same uid for a service holding no capabilities.
+
+One command reads all three and compares them:
+
+<!-- unit-environment-recipe:begin
+     EXECUTED verbatim by tests/scripts/test_systemd_unit_environment.py against a fake busctl; edit the command and that guard runs the new one. -->
+- **Unit environment, layer by layer**: `cd "$(git rev-parse --show-toplevel)" && python3 scripts/systemd_unit_environment.py orchestrator-dark-factory.service`
+<!-- unit-environment-recipe:end -->
+
+Substitute any `--user` service unit, and add `--var NAME` (repeatable;
+default `PATH`). It asks systemd over `busctl --user --json=short`, so no value
+is split back out of space-joined text, and it needs only the system
+`python3`. Per variable it prints the manager value, the unit's value, the
+value a restart would give, the live value, and a verdict:
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| `MATCHES` | The running process has the value a restart would give | None; the environment is not the problem |
+| `DRIFTED` | The running process predates the current value | Restart the unit |
+| `NOT_RUNNING` | `MainPID` is 0: stopped, or an idle oneshot | None; the next start gets the restart value |
+| `UNREADABLE` | The process's environ could not be read; the report names the path and errno | `EACCES`: re-run outside the sandbox, as the unit's uid. `ENOENT`: the process exited mid-read, so re-run |
+| `INDETERMINATE` | The unit has `EnvironmentFile=`, `PassEnvironment=` or `UnsetEnvironment=`, whose effect is not visible over D-Bus; the report names them | Read the named inputs by hand; the live value is still reported |
+
+Exit codes: `0`, report printed; `3`, nothing read (busctl missing, failing,
+timed out or malformed, or the unit not loaded), with the reason on stderr and
+nothing on stdout; `4`, report printed but the live layer unreadable.
+
+A later `show-environment`, or an interactive `which`, cannot refute a unit's
+`ENOENT`: a running unit keeps its exec-time environment until it restarts.
+That is how `fused-memory.service` stayed degraded from 08:59 to 18:22 on
+2026-08-18. `DRIFTED` is that condition, and restarting the unit is the fix.
+
+The live layer is an exec-time snapshot. A change a process makes to its own
+environment afterwards, such as a `load_dotenv()`, never appears in
+`/proc/<pid>/environ`.
+
+The orchestrator units are immune to the manager's `PATH`: they pin
+`Environment=PATH=` (`scripts/orchestrator-dark-factory.service`). The
+host-side fix for every other unit is the untracked
+`~/.config/environment.d/995-user-path.conf`, whose own header gives the
+`995-` ordering rationale.
+
 ### Reading the flake ledger
 
 ```bash
@@ -3101,6 +3172,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | All work across the fleet stalls; every account shows capped | The multi-account usage gate is **all-or-nothing per scope**: capacity in a scope only frees up once at least one account is uncapped for it | Check account-level cap/reset times; this self-heals once any single account resets — it is not a per-request failure to retry individually |
 | A burst of zero-output invocations across many tasks at once | Usually a transient upstream 5xx (529 overloaded), not a real failure. Since task 3316 an execute-phase zero-output result carrying a 5xx requeues through the scheduler's transient lane instead of blocking | Read the task's `zero_output_evidence-iter<N>.json` under its TASK root, `<worktree base>/.task-meta/task-<id>/` (for this repo `.worktrees/.task-meta/task-<id>/`; path owner `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.zero_output_evidence_path`). A `ZERO_OUTPUT_HANG_REASON` block's detail names the exact glob. `api_error_status` in 500-599, with the provider's error in `output_tail`, is a provider outage: wait it out, and do not switch accounts or treat it as a code regression. `api_error_status: null` with `transcript_turns: 0` is a local wedge: read `proc_tree` and `stderr_tail`. Check host health via PSI (`full` pressure), not load average |
 | Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |
+| `Permission denied` reading `/proc/<pid>/environ` while diagnosing a systemd --user unit's `PATH` or environment, or a unit failing `ENOENT` on a binary that `which` finds | That pid is the user manager, whose environ is readable or not depending on its capabilities, and is the wrong layer anyway. Or the unit is `DRIFTED`: it still has the environment of its last start | [§3 Inspecting a unit's live environment](#inspecting-a-units-live-environment) |
 | `escalation-watcher-auto` rotations respawn continuously while the L1 queue shows only `esc-task-path-guard*` records, and each rotation resolves nothing | The path-scope guard files its rejection / advisory audit records at `level=1` under a **synthetic anchor** `task_id` — no such task exists. Until the record reaches a terminal state it stays `pending`, and the supervisor's pre-boot precheck (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts any pending un-promoted L1 as actionable, so it keeps spawning rotations. A `stamp_triage` does **not** clear it: that precheck reads `status`/`level` only, never `triaged_at` | Expected, and clears on the first rotation that actually reaches the record — the watcher's `scope_violation` recipe has an audit-only branch that closes these `close_only`/`benign` (see `skills/escalation-watcher-auto/SKILL.md`). **Do not `stamp_triage` these records**: a stamp reaches no terminal state, so it cannot clear the precheck, but its fresh `triaged_at` makes the next rotation drop the record at the drain filter before the auto-close branch is consulted — the loop then persists for as long as the stamp stays fresh (~6h). The recipe carves these out of that skip; a rotation running an older copy will not. If they persist beyond that, check the drain-filter carve-out is present, then compare the branch's tokens against `_ANCHOR_TASK_ID` / `_AGENT_ROLE` in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` for producer drift. Do **not** "fix" this by re-gating the producer — the guard is the census, and the one deliberate bypass (`routing_override_reason`) already returns before any verdict or escalation fires (`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._path_guard_or_skip`), so there is nothing left to gate |
 | Two branches that each moved `orchestrator/tests/merge_lane_ratchet_baseline.json` conflict on it (a probe bounce or a stopped merge), although they moved different code | The structured merge driver `.gitattributes` names (`merge=ratchet-baseline`) is not installed in this host's `.git/config`, so git falls back to its line merge, which conflicts whenever two branches touch one baseline row; or the driver REFUSED this pair (it says why on stderr: two different changes to one scalar, a row deleted on one side and changed on the other, two insertions at one place in a path list) and wrote git's own text merge with markers. The probe (`git merge-tree` at `project_root`) reads attributes from `project_root`'s working tree, so it composes only once `.gitattributes` is on main and `project_root` has re-synced | `git config --get merge.ratchet-baseline.driver` on the host: empty means run `python3 scripts/merge_lane_ratchet_merge.py install` from the main checkout (it writes the shared `.git/config`, so it covers every linked worktree; `scripts/setup-host.sh` step 9 does the same on a new host). A merge or probe that instead DIES with `fatal: custom merge driver ratchet-baseline lacks command line` (exit 128) means a `merge.ratchet-baseline` section without its `driver` key: `git config --remove-section merge.ratchet-baseline`, then install. A refusal is an ordinary conflict: resolve the code, then regenerate the baseline with `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json`. While a driver merge runs under the probe, git leaves transient `.merge_file_*` files in `project_root`; they are untracked and gone when the probe returns. A raise is never authorized in the baseline file itself: it is one new file under `orchestrator/tests/merge_lane_ratchet_raises/`, which never conflicts |
 | `git commit` finishing a merge (one stopped on another file) is refused by the ratchet commit gate for a baseline raise over its 3-way bound, and `--write-baseline --authorize-raise` then prints `no measure rose; nothing recorded` | The staged baseline holds more than merging both parents can (`scripts/merge_lane_metrics.py::_both_moved_bound`; two raises of one measure compose, so the ratchet-baseline merge driver's own `ours + theirs - base` passes), and the excess is the merge's own raise; but the file on disk already holds that value, so the write gate sees nothing rising | `git checkout HEAD -- orchestrator/tests/merge_lane_ratchet_baseline.json` (ours; `--ours` does nothing once the driver resolved the file), then `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason "<why>"`: it measures from ours, records the merge's own entry file, and the commit passes. The gate's refusal prints the same recipe |
