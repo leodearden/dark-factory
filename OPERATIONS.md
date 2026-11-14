@@ -3540,8 +3540,12 @@ check.
 ### Transcript secret sweep (02:30)
 
 Agent subprocesses inherit no secret-bearing variable except their own
-`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`), and transcripts
-are redacted as they are archived (task 6820). This sweep is the backstop for
+`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`). Verify and
+offline-lane children, a target project's build and test runs, inherit every
+credential except the `CLAUDE_OAUTH_TOKEN_*` account pool
+(`shared/src/shared/secret_env.py::without_account_pool`, task 6828); that
+governs what they inherit, not what a test later loads into its own process.
+Transcripts are redacted as they are archived (task 6820). This sweep is the backstop for
 everything already on disk.
 
 - **What it scans.** Every regular `*.jsonl` file under each orchestrator
