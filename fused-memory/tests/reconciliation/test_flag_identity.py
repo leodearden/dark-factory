@@ -491,3 +491,106 @@ class TestExtractFlagUuids:
 
     def test_a_flag_whose_values_are_not_str_names_no_uuid(self):
         assert extract_flag_uuids({'a': 1, 'b': None, 'c': [2, 3]}) == set()
+
+
+_RECON_ROWS = [
+    pytest.param(row[1]['task_id'], row[1]['flag_type'], row[6], id=row[0])
+    for row in _GOLDEN
+    if isinstance(row[1]['flag_type'], str)
+    and (row[1]['task_id'] is None or type(row[1]['task_id']) in (str, int))
+]
+
+
+class _AnyTaskInterceptor:
+    async def get_task(self, task_id: Any, project_root: str, tag: Any = None) -> dict[str, Any]:
+        return {'id': task_id, 'title': f'T-{task_id}'}
+
+
+class TestReconReportStoresTheGoldenForms:
+    """recon_report's stored forms, read only through ReconReportState's public seams."""
+
+    @staticmethod
+    def _state() -> Any:
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300, clock=lambda: 0.0, task_interceptor=_AnyTaskInterceptor(),
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        return state
+
+    @staticmethod
+    def _add(state: Any, *, task_id: Any, flag_type: Any, description: str = 'd') -> dict[str, Any]:
+        return state.add_finding(
+            run_id='r1', severity='moderate', category='memory_stale',
+            description=description, suggested_action='a', actionable=True,
+            task_id=task_id, flag_type=flag_type,
+        )
+
+    @pytest.mark.parametrize(('task_id', 'flag_type', 'recon_task_id'), _RECON_ROWS)
+    def test_a_finding_stores_the_golden_recon_task_id(self, task_id, flag_type, recon_task_id):
+        state = self._state()
+
+        result = self._add(state, task_id=task_id, flag_type=flag_type)
+
+        assert 'finding_id' in result, result
+        [stored] = state.get_findings_for_run('r1')
+        assert stored['task_id'] == recon_task_id
+
+    @pytest.mark.parametrize('respelled', ['4223, 3105', ' 3105 ,4223,', '4223,3105,3105'])
+    def test_a_respelled_composite_is_the_same_finding(self, respelled):
+        state = self._state()
+        first = self._add(state, task_id='3105,4223', flag_type=_FT)
+
+        second = self._add(state, task_id=respelled, flag_type=_FT, description='other text')
+
+        assert second.get('error') == 'duplicate_finding', second
+        assert second.get('existing_finding_id') == first['finding_id']
+
+    def test_null_null_findings_dedup_on_the_normalized_description(self):
+        state = self._state()
+        first = self._add(state, task_id=None, flag_type=None, description='Stale Edge  d592ca46')
+
+        second = self._add(state, task_id=None, flag_type=None, description=' stale edge\td592CA46 ')
+
+        assert second.get('error') == 'duplicate_finding', second
+        assert second.get('existing_finding_id') == first['finding_id']
+
+    def test_a_blank_null_null_description_never_dedups(self):
+        state = self._state()
+
+        first = self._add(state, task_id=None, flag_type=None, description='   ')
+        second = self._add(state, task_id=None, flag_type=None, description='   ')
+
+        assert 'finding_id' in first, first
+        assert 'finding_id' in second, second
+        assert first['finding_id'] != second['finding_id']
+
+    @pytest.mark.asyncio
+    async def test_an_int_citation_of_a_composite_member_anchors_the_entity_fold(self):
+        state = self._state()
+        composite = self._add(state, task_id='5040,5149', flag_type='X')
+        cited = await state.cite_task('r1', composite['finding_id'], 'dark_factory', 5149)
+        assert 'error' not in cited, cited
+
+        later = self._add(state, task_id=None, flag_type='X', description='worded differently')
+        folded = await state.cite_task('r1', later['finding_id'], 'dark_factory', '5149')
+
+        assert folded.get('error') == 'duplicate_finding', folded
+        assert folded.get('existing_finding_id') == composite['finding_id']
+        assert [f['finding_id'] for f in state.get_findings_for_run('r1')] == [
+            composite['finding_id'],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_later_finding_on_the_cited_member_collapses_onto_the_composite(self):
+        state = self._state()
+        composite = self._add(state, task_id='5040,5149', flag_type='X')
+        cited = await state.cite_task('r1', composite['finding_id'], 'dark_factory', '5149')
+        assert 'error' not in cited, cited
+
+        later = self._add(state, task_id=5149, flag_type='X', description='worded differently')
+
+        assert later.get('error') == 'duplicate_finding', later
+        assert later.get('existing_finding_id') == composite['finding_id']
