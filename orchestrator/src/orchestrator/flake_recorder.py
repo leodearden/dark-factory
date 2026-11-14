@@ -30,9 +30,10 @@ files the owner afterwards (PRD §5.9) and raises any ``regressed_after_resoluti
 escalation, so no network call is left on the observation path.
 
 Since ε1 (task 6864) :func:`record_call_site_observations` is the one body every call
-site records through, and :data:`_CALL_SITES_WITH_LIVE_SIGNALS` names the call sites
-whose observations do more than write the rows and the due items.  The merge-gate entry
-unwraps its ``VerifyResult`` and delegates.
+site records through, and :data:`_LIVE_SIGNAL_CALL_SITE_STORM_WORDING` names the call
+sites whose observations do more than write the rows and the due items, and words how
+the storm escalation names each of them.  The merge-gate entry unwraps its
+``VerifyResult`` and delegates.
 
 Import discipline: this module imports ``flake_ledger`` (which depends on ``shared``
 alone) at runtime and NOTHING else from ``orchestrator``.
@@ -73,13 +74,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _StormWording:
+    """How the storm L2 names one call site that feeds it."""
+
+    reds: str
+    observer: str
+    head_label: str
+
+
 #: The call sites whose suppressions emit ``merge_flake_suppressed`` and bump the INV-4
 #: storm streak: the merge gate's, and the main-health classifier's task-mu fork, whose
 #: suppression also masks a red a merge depends on (task 3788).  The offline lane gates no
-#: merge, so a lane clear masks nothing (offline-lane PRD D6, call 1).
-_CALL_SITES_WITH_LIVE_SIGNALS: Final = frozenset(
-    {FlakeCallSite.merge_gate, FlakeCallSite.main_probe},
-)
+#: merge, so a lane clear masks nothing (offline-lane PRD D6, call 1).  Each entry is how
+#: the storm L2 names that call site (task 7249).
+_LIVE_SIGNAL_CALL_SITE_STORM_WORDING: Final[Mapping[FlakeCallSite, _StormWording]] = {
+    FlakeCallSite.merge_gate: _StormWording(
+        reds='merge-verify reds',
+        observer=(
+            'the role=merge isolated-rerun-confirm gate (verify.confirm_isolated_rerun_verdict, '
+            'recorded by flake_recorder.record_merge_flake_suppression) re-ran merge-verify '
+            'reds on the merge candidate, a task branch merged onto main; look at the merges '
+            'that landed on those reds and at host CPU load'
+        ),
+        head_label='merge SHA',
+    ),
+    FlakeCallSite.main_probe: _StormWording(
+        reds="reds in main's own baseline, so look at main",
+        observer=(
+            "the main-health probe's task-mu fork (verify._wholly_preexisting_after_flake_gate, "
+            'recorded by flake_recorder.record_flake_observation) re-ran tests that were red '
+            "in main's baseline in a worktree pinned at main, and they passed, so it "
+            'downgraded a main-red verdict to task-own; the probed tree is MAIN, not a task '
+            'branch, so look at main for a flaky or order-dependent test'
+        ),
+        head_label='probed main SHA',
+    ),
+}
 
 
 def _emit_merge_flake_suppressed(
@@ -118,6 +149,11 @@ def _emit_merge_flake_suppressed(
 #: detector; time-windowing is a sanctioned PRD §9 follow-up.
 _merge_flake_suppression_streak = 0
 
+#: The call sites that fed the current window, for the storm escalation to name.
+#: Replaced, never mutated, on each bump, and opened afresh by a window's first bump, so
+#: the counter above stays the one authority on whether a window is open.
+_merge_flake_suppression_window_call_sites: frozenset[FlakeCallSite] = frozenset()
+
 #: Suppressions per window before the born-at-L2 storm escalation fires. A
 #: tunable (PRD §9): chronic suppression means α is repeatedly masking reds —
 #: a fleet-health "someone must look now" condition.
@@ -128,24 +164,21 @@ _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD = 5
 _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL = 'merge-flake-suppression-storm'
 
 def _bump_suppression_streak_and_maybe_escalate(
-    escalation_queue: Any, task_id: str | None, merge_sha: str,
+    escalation_queue: Any, task_id: str | None, merge_sha: str, *, call_site: FlakeCallSite,
 ) -> None:
     """Advance the suppression streak; file a born-at-L2 storm escalation at
     the threshold, then reset the counter (INV-4).
 
-    Modeled on ``merge_queue._alarm_verify_worktree_contention``: a born-at-L2
-    escalation (``severity='critical'``, ``level=2``,
-    ``agent_role='orchestrator-merge-flake-monitor'`` — the ``orchestrator-``
-    prefix marks it a harness sentinel so the escalation server never downgrades
-    the critical severity) that routes straight to a human, bypassing the
-    auto-watcher. Deduped on a fixed open-L2 sentinel task_id so a persistent
-    storm files at most one open critical per window.
+    *call_site* is the call site whose suppression this is, one of
+    :data:`_LIVE_SIGNAL_CALL_SITE_STORM_WORDING`; any other is refused before the window
+    moves.  The window records the call sites that fed it and the storm escalation
+    names them, so a storm the main-health probe fed points its reader at main.
 
-    The window resets to 0 whenever the threshold is reached — on submit, on a
-    dedup-skip, AND on a ``None`` queue — so the counter can never grow
-    unbounded and each fresh window makes an independent escalation decision.
-    None-safe: with no queue there is nothing to file into, so it resets and
-    returns.  After task ε the remote worktree host no longer reaches this
+    The window (its count and its call sites) resets whenever the threshold is
+    reached — on submit, on a dedup-skip, AND on a ``None`` queue — so the counter
+    can never grow unbounded and each fresh window makes an independent escalation
+    decision.  None-safe: with no queue there is nothing to file into, so it resets
+    and returns.  After task ε the remote worktree host no longer reaches this
     function at all — recording happens on the dispatcher, which HAS a queue —
     so a ``None`` queue now means only a CLI or test caller, not the
     CPU-starvation target this gate addresses (the α scope fence).
@@ -171,42 +204,118 @@ def _bump_suppression_streak_and_maybe_escalate(
     reading this counter as "merges since reset" is misreading it — read the
     ``flake_occurrence`` rows, which carry ``merge_sha`` and can be grouped.
     """
-    global _merge_flake_suppression_streak
+    global _merge_flake_suppression_streak, _merge_flake_suppression_window_call_sites
+    site = FlakeCallSite(call_site)
+    if site not in _LIVE_SIGNAL_CALL_SITE_STORM_WORDING:
+        raise ValueError(
+            f'call_site={site} has no live signals, so it cannot feed the storm streak; '
+            f'only {", ".join(_LIVE_SIGNAL_CALL_SITE_STORM_WORDING)} do',
+        )
+    prior = (
+        _merge_flake_suppression_window_call_sites
+        if _merge_flake_suppression_streak
+        else frozenset()
+    )
+    _merge_flake_suppression_window_call_sites = prior | {site}
     _merge_flake_suppression_streak += 1
     if _merge_flake_suppression_streak < _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD:
         return
 
     # Window reached: make the escalation decision once, then reset regardless.
+    sites = _merge_flake_suppression_window_call_sites
     _merge_flake_suppression_streak = 0
+    _merge_flake_suppression_window_call_sites = frozenset()
     if escalation_queue is None:
         return
+    _file_storm_escalation(
+        escalation_queue, sites, latest=site, merge_sha=merge_sha, task_id=task_id,
+    )
 
+
+def _in_table_order(sites: frozenset[FlakeCallSite]) -> list[FlakeCallSite]:
+    return [s for s in _LIVE_SIGNAL_CALL_SITE_STORM_WORDING if s in sites]
+
+
+def _storm_wording(site: FlakeCallSite) -> _StormWording:
+    return _LIVE_SIGNAL_CALL_SITE_STORM_WORDING[site]
+
+
+def _storm_summary(sites: frozenset[FlakeCallSite]) -> str:
+    parts = '; '.join(f'{s}: {_storm_wording(s).reds}' for s in _in_table_order(sites))
+    return (
+        'Flake-suppression storm: isolated re-runs have suppressed '
+        f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} reds since the last reset ({parts})'
+    )
+
+
+def _most_recent_suppression(
+    latest: FlakeCallSite, *, head_sha: str, task_id: str | None,
+) -> str:
+    return (
+        f'call_site={latest}, {_storm_wording(latest).head_label} {head_sha}, '
+        f'observing task_id: {task_id}'
+    )
+
+
+def _storm_detail(
+    sites: frozenset[FlakeCallSite],
+    *,
+    latest: FlakeCallSite,
+    head_sha: str,
+    task_id: str | None,
+) -> str:
+    ordered = _in_table_order(sites)
+    observers = ' '.join(f'{s}: {_storm_wording(s).observer}.' for s in ordered)
+    return (
+        f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} suppressions since the counter was '
+        f'last reset, from call site(s) {", ".join(ordered)}: a CUMULATIVE count, NOT '
+        'necessarily back-to-back merges (a clean verify does not reset the counter). '
+        f'{observers} '
+        'Most recent suppression: '
+        f'{_most_recent_suppression(latest, head_sha=head_sha, task_id=task_id)}. '
+        'Each suppression means a red passed on isolated re-run; a sustained rate '
+        'indicates either chronic host CPU starvation or a genuinely flaky test being '
+        "repeatedly masked. Each flake_occurrence row carries its suppression's call_site. "
+        'Investigate before the gate hides a real regression.'
+    )
+
+
+def _file_storm_escalation(
+    escalation_queue: Any,
+    sites: frozenset[FlakeCallSite],
+    *,
+    latest: FlakeCallSite,
+    merge_sha: str,
+    task_id: str | None,
+) -> None:
+    """File the storm escalation naming the window's *sites*, unless one is open.
+
+    Modeled on
+    ``orchestrator/src/orchestrator/merge_lane/worker.py::_alarm_verify_worktree_contention``:
+    a born-at-L2 escalation (``severity='critical'``, ``level=2``,
+    ``agent_role='orchestrator-merge-flake-monitor'`` — the ``orchestrator-``
+    prefix marks it a harness sentinel so the escalation server never downgrades
+    the critical severity) that routes straight to a human, bypassing the
+    auto-watcher. Deduped on a fixed open-L2 sentinel task_id so a persistent
+    storm files at most one open critical per window, whichever call sites fed it;
+    a deduped window's call sites reach only the log, since the open L2 names the
+    window that filed it.
+    """
     from escalation.models import Escalation  # noqa: PLC0415 — local, escalation optional dep
 
     sentinel = _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
     # Dedup: don't re-alarm while an open L2 already exists for the storm
     # sentinel (has_open_l1 is hardcoded to level=1, so get_by_task is used).
     if escalation_queue.get_by_task(sentinel, status='pending', level=2):
+        logger.warning(
+            'flake-suppression storm deduped: an L2 for %s is already open, so it does '
+            'not name this window from call site(s) %s; most recent suppression: %s',
+            sentinel,
+            ', '.join(_in_table_order(sites)),
+            _most_recent_suppression(latest, head_sha=merge_sha, task_id=task_id),
+        )
         return
 
-    summary = (
-        'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate '
-        f'has suppressed {_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify '
-        'reds since the last reset'
-    )
-    detail = (
-        f'The role=merge isolated-rerun-confirm gate (observed by '
-        f'verify.confirm_isolated_rerun_verdict, recorded by '
-        f'flake_recorder.record_merge_flake_suppression) has suppressed '
-        f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify failures as '
-        f'CPU-starvation flakes since the counter was last reset — a CUMULATIVE '
-        f'count, NOT necessarily back-to-back merges (a clean merge-verify does '
-        f'not reset the counter). Most recent merge SHA: {merge_sha}, task_id: '
-        f'{task_id}. Each suppression means a merge-verify red passed on isolated '
-        're-run — but a sustained rate of suppressions indicates either chronic '
-        'host CPU starvation or a genuinely flaky test that is being repeatedly '
-        'masked. Investigate before the gate hides a real regression.'
-    )
     esc = Escalation(
         id=escalation_queue.make_id(sentinel),
         task_id=sentinel,
@@ -214,8 +323,8 @@ def _bump_suppression_streak_and_maybe_escalate(
         severity='critical',
         level=2,
         category=EscalationCategory.MERGE_FLAKE_SUPPRESSION_STORM,
-        summary=summary,
-        detail=detail,
+        summary=_storm_summary(sites),
+        detail=_storm_detail(sites, latest=latest, head_sha=merge_sha, task_id=task_id),
         suggested_action=(
             'Inspect merge-flake-suppressed events (EventType.merge_flake_suppressed) '
             'and host CPU load. Confirm the suppressed tests are load flakes, not a '
@@ -385,6 +494,7 @@ def _is_suppression(s: FlakeSuppression, guard: _Guard) -> bool:
 def _fire_live_signals(
     suppressions: Sequence[FlakeSuppression],
     *,
+    call_site: FlakeCallSite,
     head_sha: str,
     observing_task_id: str | None,
     event_store: EventStore | None,
@@ -406,7 +516,7 @@ def _fire_live_signals(
         guard(
             'streak',
             lambda: _bump_suppression_streak_and_maybe_escalate(
-                escalation_queue, observing_task_id, head_sha,
+                escalation_queue, observing_task_id, head_sha, call_site=call_site,
             ),
         )
 
@@ -431,7 +541,7 @@ async def record_call_site_observations(
     on the ledger's due list carrying its context, in the same transaction as the rows
     of the suppression that names it; which tests are eligible is the caller's call,
     never derived from a verdict here.  Then, for a call site in
-    :data:`_CALL_SITES_WITH_LIVE_SIGNALS`, each ``passes_in_isolation`` suppression
+    :data:`_LIVE_SIGNAL_CALL_SITE_STORM_WORDING`, each ``passes_in_isolation`` suppression
     emits its fact and bumps the storm streak.
 
     ORDER IS THE CONTRACT: the durable rows and items first, the in-process signals
@@ -460,10 +570,10 @@ async def record_call_site_observations(
         ledger_db_path(project_root), project_id, suppressions, due,
         head=head, observing_task_id=observing_task_id, guard=guard,
     )
-    if call_site in _CALL_SITES_WITH_LIVE_SIGNALS:
+    if call_site in _LIVE_SIGNAL_CALL_SITE_STORM_WORDING:
         _fire_live_signals(
             suppressions,
-            head_sha=head_sha, observing_task_id=observing_task_id,
+            call_site=call_site, head_sha=head_sha, observing_task_id=observing_task_id,
             event_store=event_store, escalation_queue=escalation_queue, guard=guard,
         )
 
