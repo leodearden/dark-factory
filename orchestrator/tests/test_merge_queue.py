@@ -9675,6 +9675,7 @@ class TestEnsureVerifyDiskSpace:
             )
         assert reason is not None
         assert reason.startswith(TRANSIENT_INFRA_REASON_PREFIX)
+        assert '(disk pressure)' in reason.partition(':')[0]
         gops.prune_stale_merge_worktrees.assert_awaited_once()
 
     async def test_oserror_on_first_stat_fails_open(self, tmp_path: Path):
@@ -13387,6 +13388,7 @@ class TestRunPostMergeVerify:
         assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
             f'expected transient-infra reason, got: {result.reason!r}'
         )
+        assert '(disk pressure)' in result.reason.partition(':')[0]
         git_ops.prune_stale_merge_worktrees.assert_awaited_once()
         assert enospc_retries.get(req.task_id, 0) == 1, (
             f'expected enospc_retries[task_id]=1, got: {enospc_retries}'
@@ -13482,6 +13484,40 @@ class TestRunPostMergeVerify:
             f'empty (byte-identical to the persistent-ENOSPC branch), so the TRAIN verify '
             f'gate never mis-tags it as a cross-member interaction candidate; '
             f'got: {result.failure_category!r}'
+        )
+
+    @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
+    async def test_persistent_infra_hold_reason_names_its_category(self, category) -> None:
+        """(task 3177) The persistent classified-infra hold's reason header names
+        the category the gate measured, never a disk-pressure cause it did not
+        measure, and still starts with the prefix workflow routes on."""
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        verifier = _ScriptedVerifier(
+            answers=[VerifyScript(result=_infra_category_verify_result(category=category))],
+        )
+        result = await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            verifier=verifier,
+        )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra reason, got: {result.reason!r}'
+        )
+        header = result.reason.partition(':')[0]
+        assert f'category={category}' in header, (
+            f'expected the header to name category={category}, got: {header!r}'
+        )
+        assert 'disk pressure' not in header, (
+            f'a {category} hold must not claim disk pressure, got: {header!r}'
         )
 
     async def test_env_transient_outer_retry_stacks_with_internal_env_serial_retry(self) -> None:
