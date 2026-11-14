@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Predicate: is the nightly memory-metadata coverage census producing
+readings? Exit 0 = yes; non-zero = escalate.
+
+Usage: check_memory_metadata_census_reporting.py <hours>
+(with REPO unset, so it reads the main checkout the nightly run writes)
+
+It reads both the census service's systemd state and the newest row of the
+history artifact, because the census wrapper always exits 0 and a
+healthy-looking unit can still be recording nothing. OPERATIONS.md §12
+"Nightly canonical/topic coverage census (05:00)" carries the full argument.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+UNIT = "memory-metadata-coverage-census.service"
+TIMER = "memory-metadata-coverage-census.timer"
+INSTALLER = "scripts/install-memory-metadata-coverage-census-timer.sh"
+ARMING_CHECK = (
+    f"confirm {TIMER} is armed with `systemctl --user list-timers {TIMER}` "
+    f"and run {INSTALLER} if it is not listed"
+)
+UNIT_FIELDS = ("LoadState", "Result", "ExecMainStatus", "ExecMainExitTimestamp")
+NOT_INSTALLED_LOAD_STATES = frozenset({"", "not-found"})
+SYSTEMD_UTC_TIMESTAMP = "%a %Y-%m-%d %H:%M:%S UTC"
+NEVER_RAN_TIMESTAMPS = frozenset({"", "n/a"})
+DEFAULT_REPO = "/home/leo/src/dark-factory"
+HISTORY_RELPATH = Path("plans") / "memory-metadata-coverage-history.json"
+USAGE = (
+    "usage: check_memory_metadata_census_reporting.py <hours>\n"
+    "  <hours>: the freshness window, a finite positive number"
+)
+
+
+class NotReporting(Exception):
+    """A named reason the census is not producing readings."""
+
+
+def read_unit_state() -> dict[str, str]:
+    # systemctl renders timestamps in the caller's local zone; pin it so the
+    # format parsed below is the only one that can arrive.
+    try:
+        completed = subprocess.run(
+            ["systemctl", "--user", "show", "-p", ",".join(UNIT_FIELDS), UNIT],
+            env={**os.environ, "TZ": "UTC"},
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NotReporting(
+            f"UNREADABLE UNIT STATE: could not read unit state of {UNIT} ({exc})"
+        ) from None
+    if completed.returncode != 0:
+        raise NotReporting(
+            f"UNREADABLE UNIT STATE: could not read unit state of {UNIT}: "
+            f"systemctl exited {completed.returncode} ({completed.stderr.strip()!r})"
+        )
+    return dict(
+        line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
+    )
+
+
+def require_loaded(state: dict[str, str]) -> None:
+    load_state = state.get("LoadState", "")
+    if load_state == "loaded":
+        return
+    if load_state in NOT_INSTALLED_LOAD_STATES:
+        verdict = (
+            f"NOT INSTALLED: {UNIT} has LoadState={load_state!r}; "
+            f"arm the 05:00 timer with {INSTALLER}"
+        )
+    elif load_state == "masked":
+        verdict = (
+            f"MASKED: {UNIT} has LoadState='masked', so the timer cannot start "
+            f"it; if the mask is not deliberate, remove it with "
+            f"`systemctl --user unmask {UNIT}` and then run {INSTALLER}"
+        )
+    else:
+        verdict = (
+            f"NOT LOADED: {UNIT} has LoadState={load_state!r}; "
+            f"`systemctl --user status {UNIT}` names why systemd rejected the "
+            f"installed unit file, and {INSTALLER} recopies the committed one"
+        )
+    raise NotReporting(verdict)
+
+
+def last_run_time(state: dict[str, str]) -> datetime:
+    raw = state.get("ExecMainExitTimestamp", "")
+    if raw in NEVER_RAN_TIMESTAMPS:
+        raise NotReporting(
+            f"NEVER RAN: {UNIT} is installed but has never run "
+            f"(ExecMainExitTimestamp={raw!r}); the first reading lands at the next "
+            f"05:00 only if the timer is armed: {ARMING_CHECK}"
+        )
+    try:
+        return datetime.strptime(raw, SYSTEMD_UTC_TIMESTAMP).replace(tzinfo=UTC)
+    except ValueError:
+        raise NotReporting(
+            f"UNREADABLE LAST RUN: {UNIT} reported ExecMainExitTimestamp={raw!r}, "
+            f"not a systemd UTC timestamp"
+        ) from None
+
+
+def require_succeeded(state: dict[str, str], run_age: float) -> None:
+    result = state.get("Result", "")
+    status = state.get("ExecMainStatus", "")
+    if result != "success" or status != "0":
+        raise NotReporting(
+            f"FAILED LAST RUN: {UNIT} last run, {run_age:.1f}h ago, ended "
+            f"Result={result!r} ExecMainStatus={status!r}; "
+            f"read journalctl --user -u {UNIT} -n 100"
+        )
+
+
+def require_recent_run(run_age: float, window_hours: float) -> None:
+    if run_age > window_hours:
+        raise NotReporting(
+            f"STALE LAST RUN: {UNIT} last ran {run_age:.1f}h ago, "
+            f"outside the {window_hours:g}h window; {ARMING_CHECK}"
+        )
+
+
+def history_path() -> Path:
+    return Path(os.environ.get("REPO") or DEFAULT_REPO) / HISTORY_RELPATH
+
+
+def load_history(path: Path) -> object:
+    try:
+        with path.open() as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise NotReporting(f"NO HISTORY: {path} does not exist") from None
+    except ValueError as exc:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: {path} is not valid JSON ({exc})"
+        ) from None
+    except OSError as exc:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: {path} could not be read ({exc})"
+        ) from None
+
+
+def newest_stamp(path: Path) -> datetime:
+    history = load_history(path)
+    runs = history.get("runs") if isinstance(history, dict) else None
+    if not isinstance(runs, list):
+        raise NotReporting(f"UNREADABLE HISTORY: {path} has no 'runs' list")
+    if not runs:
+        raise NotReporting(f"NO READINGS: 'runs' is empty in {path}")
+    newest = runs[-1]
+    stamp = newest.get("stamp") if isinstance(newest, dict) else None
+    if stamp is None:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: the newest row in {path} has no 'stamp'"
+        )
+    return parse_row_stamp(stamp, path)
+
+
+def parse_row_stamp(stamp: object, path: Path) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(stamp) if isinstance(stamp, str) else None
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: the newest row in {path} has stamp={stamp!r}, "
+            f"not an ISO-8601 timestamp"
+        )
+    if parsed.tzinfo is None:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: the newest row in {path} has stamp={stamp!r} "
+            f"with no UTC offset"
+        )
+    return parsed
+
+
+def require_fresh_history_row(
+    window_hours: float, successful_run_age: float
+) -> float:
+    path = history_path()
+    age = age_hours(newest_stamp(path))
+    if age > window_hours:
+        raise NotReporting(
+            f"STALE HISTORY ROW: the newest reading in {path} is {age:.1f}h old, "
+            f"outside the {window_hours:g}h window, although {UNIT} last ran "
+            f"successfully {successful_run_age:.1f}h ago, so the census is "
+            f"aborting before it appends; "
+            f"look for ABORT in journalctl --user -u {UNIT} -n 100"
+        )
+    return age
+
+
+def age_hours(then: datetime) -> float:
+    return (datetime.now(UTC) - then).total_seconds() / 3600
+
+
+def assess(window_hours: float) -> str:
+    state = read_unit_state()
+    require_loaded(state)
+    run_age = age_hours(last_run_time(state))
+    require_succeeded(state, run_age)
+    require_recent_run(run_age, window_hours)
+    row_age = require_fresh_history_row(window_hours, successful_run_age=run_age)
+    return (
+        f"OK: {UNIT} last ran {run_age:.1f}h ago; "
+        f"newest history row {row_age:.1f}h ago (window {window_hours:g}h)"
+    )
+
+
+def parse_window(args: list[str]) -> float | None:
+    if len(args) != 1:
+        return None
+    try:
+        hours = float(args[0])
+    except ValueError:
+        return None
+    return hours if math.isfinite(hours) and hours > 0 else None
+
+
+def main(argv: list[str]) -> int:
+    window_hours = parse_window(argv[1:])
+    if window_hours is None:
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        verdict = assess(window_hours)
+    except NotReporting as reason:
+        print(reason, file=sys.stderr)
+        return 1
+    print(verdict)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

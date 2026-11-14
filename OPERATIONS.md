@@ -4082,7 +4082,8 @@ recurring probe here.
 the `topic` / `canonical` metadata the vocabulary contract specifies, trends
 that against the previous runs, and then **rehearses** the sweep that would
 close the gap — one job, in that order, so an operator reads the shortfall
-and the proposed stamping in the same journal entry.
+and the proposed stamping in the same journal entry. None of it runs until
+the timer is armed on the host — see **First run: arm the timer.** below.
 
 The measurement is a deterministic paginated Qdrant `count` + `scroll`, not
 a semantic search: a coverage number derived from ranked retrieval could not
@@ -4182,7 +4183,7 @@ than a failure. For an ad-hoc run that must leave the checkout alone, set
 carrying all three steps' exit codes:
 
 ```
-memory-metadata-coverage-census: done (census=0 stamp=0 commit=0)
+memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 commit-step=committed)
 ```
 
 ```bash
@@ -4197,9 +4198,55 @@ artifacts are written anyway and carry the evidence of exactly which cell
 fell short. The wrapper always exits 0 for the reason the whole §12 family
 shares: a recurring `oneshot` that can fail enters systemd `failed` state
 and stays there, silently ending the trend. A red run is found by reading
-the summary line, not the unit state — and a `commit=` other than 0 is the
-one worth acting on, since it means the regenerated artifacts are sitting
-uncommitted in a checkout other processes operate on.
+the summary line, not the unit state — and a `commit=` other than 0, narrated
+as `commit-step=refused:*` or `commit-step=failed`, is the one worth acting
+on, since it means the regenerated artifacts are sitting uncommitted in a
+checkout other processes operate on. `scripts/memory-metadata-coverage-census.sh`
+is the source of the full `commit-step=` token vocabulary.
+
+**Is it producing readings?** One command answers it, and it is the runbook
+predicate of verify gate task **5864**:
+
+```bash
+scripts/check_memory_metadata_census_reporting.py 72
+```
+
+Exit 0 means the service's last run succeeded inside the window *and* the
+newest history row is inside it too. Non-zero means escalate, with one named
+verdict on stderr: `NOT INSTALLED` (LoadState `not-found`; run the
+installer), `MASKED` (the timer cannot start a masked service; unmask it if
+the mask is not deliberate, then run the installer), `NOT LOADED` (any other
+LoadState; `systemctl --user status` names why systemd rejected the unit
+file), `NEVER RAN` or `STALE LAST RUN` (both carry the `list-timers`
+check for whether the timer is armed), `FAILED LAST RUN` or
+`UNREADABLE LAST RUN` (read the journal; a run that failed is reported as
+failed even when it is also stale), `STALE HISTORY ROW` or an unreadable
+history artifact, and `UNREADABLE UNIT STATE` (`systemctl` itself failed).
+The probe reads only the service's state, so a timer that is not armed
+surfaces as `NEVER RAN` or `STALE LAST RUN` rather than as a verdict of its
+own.
+
+It reads `$REPO/plans/memory-metadata-coverage-history.json` with the
+wrapper's own `REPO` default, so **run it with `REPO` unset**. The service
+sets no `REPO`, so every nightly run writes the main checkout's file; pointed
+at a task worktree, the probe reads that worktree's older committed copy and
+reports a false `STALE HISTORY ROW`.
+
+**Why it reads the history row, not just the unit state.** The wrapper
+always exits 0, so systemd reports `Result=success` for every night that
+ran, whatever the census did — and `census=1` is ambiguous: it is the
+routine incomplete-coverage exit above, where the row *is* appended, and
+also the exit of a census that aborted before appending anything
+(`CensusScanIncomplete`, an unreadable history file, a backend fault). Only
+the newest row's age tells those apart, so a stale row behind a healthy unit
+means the census is aborting; look for `ABORT` in the journal. What the probe
+does **not** see is commit health: the row is appended to the working-tree
+file before the commit step, and the merge worker's advance
+(`orchestrator/src/orchestrator/git_ops.py::GitOps.advance_main`) re-applies
+uncommitted `project_root` edits rather than resetting them, so a refused or
+failed commit still leaves a fresh row on disk. Commit health is read from
+`commit-step=` on the summary line. This paragraph is the single home of the
+argument; the probe's docstring points here.
 
 **The rehearsal is never `--apply`.** Committing bulk `canonical: true`
 stamps stays an operator decision, run by hand after reading the rehearsal:
@@ -4214,13 +4261,21 @@ per-(project, topic) uniqueness check censuses a violation and lets the
 write through, so an unattended bulk stamp could manufacture exactly the
 violations this census counts.
 
-**First run: arm the timer.** The installer kicks no immediate run — that
-would put an unreviewed, off-cadence row into the trend the nightly job
-owns.
+**First run: arm the timer.** On this host the timer is armed by
+deterministic deploy task **5863**, not from an agent session: an agent
+cannot write `~/.config/systemd/user/`, which is outside the sandbox
+write-set (`orchestrator/src/orchestrator/agents/write_set.py`). An operator
+can still run the installer by hand; it is idempotent and exits non-zero if
+the timer is missing from `list-timers --all` afterwards:
 
 ```bash
 scripts/install-memory-metadata-coverage-census-timer.sh
 ```
+
+The installer kicks no immediate run — that would put an unreviewed,
+off-cadence row into the trend the nightly job owns — so the first reading
+lands at the next 05:00, and until then the reporting probe above says
+`NEVER RAN`.
 
 **Reading the uniqueness-violation count.** A non-zero
 `topics_with_multiple_canonical` is **partly backlog, not purely a live
