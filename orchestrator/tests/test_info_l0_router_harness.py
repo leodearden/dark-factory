@@ -288,8 +288,16 @@ async def _file_no_landings_breaker(harness: Harness) -> None:
     ids=['warm-base-hard-down', 'no-landings-breaker'],
 )
 class TestHarnessSentinelNoticesAreRoutedNotLeftPending:
-    """The orphan reaper never leaves the harness's level-0 sentinel notices
-    pending; the harness filer docstrings' Routing notes point here."""
+    """How the orphan reaper routes the harness's level-0 sentinel notices,
+    from ``Harness._file_warm_base_hard_down_notice`` and
+    ``Harness._file_no_landings_info_escalation``.  No steward serves their
+    sentinel tasks, so the reaper takes them once older than
+    ``orphan_l0_timeout_secs``.  Their roles are in
+    ``escalation.classify.INFO_L0_MECHANICAL_ROLES``, so the info-L0 router
+    closes them as status-info on their class's aggregate L1.  With
+    ``info_l0_router_enabled`` off, the reaper promotes them to L1.  Either
+    way none is left pending.  The filers' Routing notes point here.
+    """
 
     async def test_the_router_closes_it_status_info_on_its_class_aggregate(
         self, tmp_path: Path, mock_orch_config, file_notice,

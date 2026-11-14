@@ -8836,15 +8836,11 @@ class Harness:
         no-op.  Best-effort: any submit failure is swallowed and logged.
 
         **Routing note:** ``severity='info', level=0``, against a sentinel
-        task no steward serves.  Once older than ``orphan_l0_timeout_secs``
-        the orphan L0 reaper hands it to the info-L0 router, which closes it
-        as status-info and lists it on that class's aggregate L1, because
-        ``_WARM_BASE_HARD_DOWN_ROLE`` is in
-        ``escalation.classify.INFO_L0_MECHANICAL_ROLES``.  With
-        ``info_l0_router_enabled`` off the reaper promotes it to L1 instead.
-        Filing it never halts the scheduler; the watchdog's own latch already
-        halted dispatch.
-        See orchestrator/tests/test_info_l0_router_harness.py::TestHarnessSentinelNoticesAreRoutedNotLeftPending.
+        task no steward serves; ``_WARM_BASE_HARD_DOWN_ROLE`` is listed in
+        ``escalation.classify.INFO_L0_MECHANICAL_ROLES``.  Filing it never
+        halts the scheduler; the watchdog's own latch already halted dispatch.
+        How the orphan reaper routes it:
+        orchestrator/tests/test_info_l0_router_harness.py::TestHarnessSentinelNoticesAreRoutedNotLeftPending.
         """
         if not self._escalation_queue:
             return
@@ -8984,17 +8980,13 @@ class Harness:
         Best-effort: any submit failure is swallowed and logged.
 
         **Routing note:** ``severity='info', level=0``, against a sentinel
-        task no steward serves.  Once older than ``orphan_l0_timeout_secs``
-        the orphan L0 reaper hands it to the info-L0 router, which closes it
-        as status-info and lists it on that class's aggregate L1, because
-        ``orchestrator-no-landings-breaker`` is in
-        ``escalation.classify.INFO_L0_MECHANICAL_ROLES``.  With
-        ``info_l0_router_enabled`` off the reaper promotes it to L1 instead.
-        Filing it never halts the scheduler (``force_halt_scheduler`` already
-        handles the halt; ``file_escalation=False`` was passed there to avoid
-        the auto-watcher resolving the scheduler-pause L1 and silently undoing
-        the halt).
-        See orchestrator/tests/test_info_l0_router_harness.py::TestHarnessSentinelNoticesAreRoutedNotLeftPending.
+        task no steward serves; ``orchestrator-no-landings-breaker`` is listed
+        in ``escalation.classify.INFO_L0_MECHANICAL_ROLES``.  Filing it never
+        halts the scheduler (``force_halt_scheduler`` already handles the
+        halt; ``file_escalation=False`` was passed there to avoid the
+        auto-watcher resolving the scheduler-pause L1 and silently undoing
+        the halt).  How the orphan reaper routes it:
+        orchestrator/tests/test_info_l0_router_harness.py::TestHarnessSentinelNoticesAreRoutedNotLeftPending.
         """
         if not self._escalation_queue:
             return
