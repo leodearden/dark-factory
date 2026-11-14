@@ -2695,10 +2695,12 @@ So:
    ```
 
 2. **On production, ad-hoc access is reads through
-   `docker exec docker-falkordb-1 redis-cli`, and nothing else.** There are
-   two exceptions: this section's own remedy and recovery procedures, and
-   committed tooling that reads through
-   `fused-memory/src/fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader`.
+   `docker exec docker-falkordb-1 redis-cli`, and nothing else.** This rule
+   covers hand-run access. It does not cover this section's own remedy and
+   recovery procedures, or committed tooling, whose access to production is
+   settled when it is reviewed. The eval harness and
+   `seed_scratch_reference_graph.py` in "The scratch FalkorDB" below are
+   committed tooling of that kind.
 3. **Never clone a graph on production.** That means no `RESTORE` onto it and
    no `EVAL`. The one sanctioned `DUMP` is
    `fused-memory/scripts/seed_scratch_reference_graph.py`, and its `RESTORE`

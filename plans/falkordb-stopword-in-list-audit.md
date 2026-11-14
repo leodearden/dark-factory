@@ -1,6 +1,6 @@
 # FalkorDB stopword IN-list crash: measurements and code-site audit
 
-This is the one place where the measurements and the per-site verdicts for the FalkorDB#3348 crash are written down: where the stopword indices sit, which query shapes crash and which survive, and every Cypher site that fused-memory runs or reaches. The rule that follows from them is in `OPERATIONS.md` §"FalkorDB settings and the recreate gate", which points here and does not restate them. That way a re-measurement is a one-file edit.
+This is the one place where the measurements and the per-site verdicts for the FalkorDB#3348 crash are written down: where the stopword indices sit, which query shapes crash and which survive, and every Cypher site that fused-memory runs or reaches. The rule that follows from them is in `OPERATIONS.md` §"FalkorDB settings and the recreate gate" → "Experiments never touch production FalkorDB", which points here and does not restate them. That way a re-measurement is a one-file edit.
 
 Every figure below is dated. Each verdict gives its reason, so that it can be checked and proved wrong rather than taken on trust. Written by task 7794 (2026-11-14). The architect took the measurements. The implementer added the `GRAPH.RO_QUERY` row of the matrix.
 
@@ -19,7 +19,7 @@ Read-only `docker exec docker-falkordb-1 redis-cli GRAPH.RO_QUERY dark_factory '
 | label | indexed properties |
 |---|---|
 | Entity | uuid RANGE, created_at RANGE, group_id RANGE+FULLTEXT, name RANGE+FULLTEXT, summary FULLTEXT |
-| Episodic | created_at, group_id RANGE+FULLTEXT, uuid, valid_at, content, source, source_description |
+| Episodic | created_at RANGE, group_id RANGE+FULLTEXT, uuid RANGE, valid_at RANGE, content FULLTEXT, source FULLTEXT, source_description FULLTEXT |
 | Community | uuid RANGE, name FULLTEXT, group_id FULLTEXT |
 
 RELATES_TO (even with FULLTEXT on name, fact and group_id), MENTIONS, HAS_EPISODE, NEXT_EPISODE, HAS_MEMBER and Saga report stopwords `[]`.

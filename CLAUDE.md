@@ -87,7 +87,8 @@ Full fresh-machine walkthrough: `SETUP.md`.
 Production FalkorDB (`docker-falkordb-1`, `:6379`) takes no experiments,
 clones or index work, and ad-hoc access to it is `redis-cli` reads only. The
 rule, and the stopword IN-list crash it guards against, are in `OPERATIONS.md`
-§"FalkorDB settings and the recreate gate".
+§"FalkorDB settings and the recreate gate" → "Experiments never touch
+production FalkorDB".
 
 ### Locating installed code
 
