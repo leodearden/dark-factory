@@ -34,7 +34,7 @@ from collections.abc import Mapping
 # ``scripts/memory-metadata-coverage-census.sh`` carries a bash copy for the
 # same reason. This copy is pinned against drift by
 # ``scripts/tests/test_git_env.py::test_scrubbed_git_env_matches_shared_redirect_classifier``.
-_GIT_REDIRECT_ENV = (
+GIT_REDIRECT_ENV = (
     'GIT_DIR',
     'GIT_WORK_TREE',
     'GIT_INDEX_FILE',
@@ -51,7 +51,7 @@ _GIT_REDIRECT_ENV = (
 # ``GIT_CONFIG_COUNT``'s pairs are an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0,
 # ...), so they cannot be enumerated by name. (``git -c`` itself propagates
 # through ``GIT_CONFIG_PARAMETERS`` above, not through this family.)
-_GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 
 
 def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
@@ -59,8 +59,8 @@ def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
     removed, ``LC_ALL=C``.
 
     Pure: *environ* (in production ``os.environ``) is never mutated. Drops every
-    name in :data:`_GIT_REDIRECT_ENV` and every name carrying a
-    :data:`_GIT_REDIRECT_ENV_PREFIXES` prefix; keeps everything else verbatim
+    name in :data:`GIT_REDIRECT_ENV` and every name carrying a
+    :data:`GIT_REDIRECT_ENV_PREFIXES` prefix; keeps everything else verbatim
     (the unit's ``PATH``/``HOME``, the ceiling, the identity vars) and forces
     ``LC_ALL=C`` so porcelain output stays locale-stable.
 
@@ -70,8 +70,8 @@ def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
     scrubbed = {
         key: value
         for key, value in environ.items()
-        if key not in _GIT_REDIRECT_ENV
-        and not key.startswith(_GIT_REDIRECT_ENV_PREFIXES)
+        if key not in GIT_REDIRECT_ENV
+        and not key.startswith(GIT_REDIRECT_ENV_PREFIXES)
     }
     scrubbed['LC_ALL'] = 'C'
     return scrubbed

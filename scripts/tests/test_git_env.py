@@ -79,8 +79,8 @@ def test_scrubbed_git_env_matches_shared_redirect_classifier():
     the shared definition in BOTH directions: a name added to
     df_pytest_isolation's list that git_env does not scrub, or a name git_env
     scrubs that the shared classifier does not consider redirecting, fails here."""
-    assert git_env._GIT_REDIRECT_ENV == _GIT_REDIRECT_ENV
-    assert git_env._GIT_REDIRECT_ENV_PREFIXES == _GIT_REDIRECT_ENV_PREFIXES
+    assert git_env.GIT_REDIRECT_ENV == _GIT_REDIRECT_ENV
+    assert git_env.GIT_REDIRECT_ENV_PREFIXES == _GIT_REDIRECT_ENV_PREFIXES
 
     redirecting = git_redirect_env(POISONED_GIT_ENV)
     assert redirecting, "the shared classifier must classify the derived mapping"
