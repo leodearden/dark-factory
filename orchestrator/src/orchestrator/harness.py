@@ -9419,46 +9419,11 @@ class Harness:
     ) -> None:
         """Block a task and file an L1 escalation for a PASS→FAIL substrate flip.
 
-        Mirrors ``_block_and_escalate_external_dep``:
-        - Sets the task to ``blocked`` via ``scheduler.set_task_status`` (unconditional;
-          wrapped in try/except so a transient write failure does not prevent the L1
-          from being filed).
-        - Submits a level-1 ``Escalation`` with category='design_concern' to the queue.
-        - Deduped by ``has_open_l1`` so repeated dispatch attempts (after the requeue
-          cooldown expires) do not stack duplicate escalations.
-        - No-ops gracefully when ``_escalation_queue`` is None (bare-Harness unit tests).
-
         A PASS→FAIL flip means the task's probe-set premise no longer holds on
         current main; the design_concern class routes it to human/curator judgment
-        (same class as report_false_premise).
+        (same class as report_false_premise).  Blocking, filing and the
+        category-scoped dedupe live in ``_block_and_file_dispatch_gate_l1``.
         """
-        try:
-            await self.scheduler.set_task_status(task_id, 'blocked')
-        except Exception:
-            logger.warning(
-                'Substrate flip block for task %s — set_task_status raised; '
-                'will still attempt to file escalation',
-                task_id,
-                exc_info=True,
-            )
-
-        if not self._escalation_queue:
-            logger.warning(
-                'Substrate flip block for task %s — no escalation queue, skipping L1 file',
-                task_id,
-            )
-            return
-
-        if self._escalation_queue.has_open_l1(task_id):
-            logger.warning(
-                'Substrate flip block for task %s — open L1 already exists, suppressing '
-                'duplicate; pre-existing L1 may be for an unrelated cause',
-                task_id,
-            )
-            return
-
-        from escalation.models import Escalation  # noqa: PLC0415
-
         summary = f'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task {task_id})'
         detail = (
             f'Dispatch-time substrate re-check detected a PASS→FAIL flip.\n'
@@ -9468,23 +9433,8 @@ class Harness:
             f'The task premise (probe set authored at investigation time) no longer holds '
             f'on current main — re-spec required before dispatch.'
         )
-        esc = Escalation(
-            id=self._escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='orchestrator-scheduler',
-            severity='blocking',
-            category='design_concern',
-            summary=summary[:200],
-            detail=detail,
-            suggested_action='manual_intervention',
-            level=1,
-            filing_claimant_run_id=self._filing_claimant_run_id,
-        )
-        self._escalation_queue.submit(esc)
-        logger.warning(
-            'Filed L1 substrate-flip escalation %s for task %s',
-            esc.id,
-            task_id,
+        await self._block_and_file_dispatch_gate_l1(
+            task_id, category='design_concern', summary=summary, detail=detail,
         )
 
     async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:

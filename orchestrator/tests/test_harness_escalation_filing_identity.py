@@ -283,8 +283,8 @@ class TestEveryHarnessEscalationStatesItsLevel:
         calls = _filing_call_sites(_HARNESS_SRC_PATH, frozenset({'Escalation'}))
         # Task 7170 folds the dispatch-gate copies onto _file_harness_l1's single
         # construction; those sites merged, they did not move out of this module.
-        assert len(calls) >= 28, (
-            f'{_HARNESS_SRC_PATH.name}: expected >=28 Escalation(...) constructions, '
+        assert len(calls) >= 27, (
+            f'{_HARNESS_SRC_PATH.name}: expected >=27 Escalation(...) constructions, '
             f'found {len(calls)} — if they moved to another module, scan that '
             f'module here too, or this tripwire silently covers less.'
         )
