@@ -28,6 +28,7 @@ from dashboard.payload_budgets import (
     EndpointBudget,
     field_breakdown,
     load_budget_table,
+    nodes_at,
     render_overage,
     slack_violation,
 )
@@ -42,24 +43,6 @@ _SWEPT: tuple[EndpointBudget, ...] = load_budget_table().endpoints
 def fleet_client() -> Iterator[TestClient]:
     with open_fleet_client() as client:
         yield client
-
-
-def _targets(node: object, key_path: tuple[str, ...]) -> Iterator[object]:
-    """Every node *key_path* reaches; ``[]`` descends a list, ``{}`` every map value."""
-    if not key_path:
-        yield node
-        return
-    segment, rest = key_path[0], key_path[1:]
-    if segment == '[]' and isinstance(node, list):
-        children = node
-    elif segment == '{}' and isinstance(node, dict):
-        children = list(node.values())
-    elif isinstance(node, dict) and segment in node:
-        children = [node[segment]]
-    else:
-        children = []
-    for child in children:
-        yield from _targets(child, rest)
 
 
 @pytest.mark.parametrize('entry', _SWEPT, ids=[entry.url_suffix() for entry in _SWEPT])
@@ -86,7 +69,7 @@ def test_request_is_within_its_budget(
     )
 
     for key_path in entry.data_keyed_maps:
-        reached = [node for node in _targets(payload, key_path) if isinstance(node, dict)]
+        reached = [node for node in nodes_at(payload, key_path) if isinstance(node, dict)]
         assert any(reached), (
             f'{entry.url_suffix()} declares the data-keyed map {list(key_path)}, but it '
             'resolves to no non-empty dict in the served payload. The declaration has '

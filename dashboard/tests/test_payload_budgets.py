@@ -46,6 +46,7 @@ from dashboard.payload_budgets import (
     PayloadBudgetTableError,
     field_breakdown,
     load_budget_table,
+    nodes_at,
     parse_budget_table,
     render_overage,
     slack_violation,
@@ -312,7 +313,28 @@ class TestFieldBreakdown:
             'TASKS_SNAPSHOT.{}.rows.value[].title': (
                 _leaf('title', 'one') + _leaf('title', 'two') + _leaf('title', 'three')
             ),
+            'TASKS_SNAPSHOT.{}(keys)': _compact('dark-factory') + 1 + _compact('reify') + 1,
         }
+
+    def test_a_collapsed_maps_keys_are_charged_once_beside_its_container_values(self) -> None:
+        """A map grown by its keys (longer ids, more of them) shows in the breakdown."""
+        payload = {'SCHEDULER': {'events_by_task': {
+            '4866': [{'kind': 'claimed'}, {'kind': 'done'}],
+            '12345': {'kind': 'claimed'},
+        }}}
+        collapsed = _as_dict(field_breakdown(payload, (('SCHEDULER', 'events_by_task'),)))
+        assert collapsed == {
+            'SCHEDULER.events_by_task.{}[].kind': _leaf('kind', 'claimed') + _leaf('kind', 'done'),
+            'SCHEDULER.events_by_task.{}.kind': _leaf('kind', 'claimed'),
+            'SCHEDULER.events_by_task.{}(keys)': _compact('4866') + 1 + _compact('12345') + 1,
+        }
+
+    def test_no_keys_leaf_unless_a_collapsed_map_holds_containers(self) -> None:
+        payload = {'WINDOW': {'days': 90}}
+        assert _as_dict(field_breakdown(payload, (('WINDOW',),))) == {
+            'WINDOW.{}': _leaf('days', 90),
+        }
+        assert _as_dict(field_breakdown(payload)) == {'WINDOW.days': _leaf('days', 90)}
 
     def test_an_undeclared_data_keyed_map_stays_split(self) -> None:
         payload = {
@@ -366,6 +388,26 @@ class TestFieldBreakdown:
         breakdown = field_breakdown({'a': 1})
         assert isinstance(breakdown, tuple)
         assert breakdown == (FieldBytes(path='a', bytes=_leaf('a', 1)),)
+
+
+class TestNodesAt:
+    """A declared key path resolves in the grammar the breakdown collapses by."""
+
+    def test_named_segments_descend_by_key(self) -> None:
+        payload = {'A': {'b': {'c': 1}}}
+        assert list(nodes_at(payload, ('A', 'b'))) == [{'c': 1}]
+
+    def test_list_descent_reaches_every_item(self) -> None:
+        payload = {'A': {'per_project': [{'daily': {'x': 1}}, {'daily': {'y': 2}}]}}
+        assert list(nodes_at(payload, ('A', 'per_project', '[]', 'daily'))) == [{'x': 1}, {'y': 2}]
+
+    def test_a_collapsed_map_reaches_every_value(self) -> None:
+        payload = {'B': {'reify': {'labels': {'d1': 1}}, 'dark-factory': {'labels': {'d2': 2}}}}
+        assert list(nodes_at(payload, ('B', '{}', 'labels'))) == [{'d1': 1}, {'d2': 2}]
+
+    @pytest.mark.parametrize('key_path', [('missing',), ('A', '[]'), ('A', 'b', 'c', 'd')])
+    def test_a_path_that_misses_reaches_nothing(self, key_path: tuple[str, ...]) -> None:
+        assert list(nodes_at({'A': {'b': {'c': 1}}}, key_path)) == []
 
 
 def _entry_for_overage() -> EndpointBudget:

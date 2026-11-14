@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -34,6 +34,7 @@ SLACK_FLOOR_BYTES = 32_768
 
 _LIST_DESCENT = '[]'
 _COLLAPSED_KEY = '{}'
+_COLLAPSED_KEYS = '{}(keys)'
 
 _TABLE_KEYS = frozenset({'_README', 'schema_version', 'endpoints', 'exempt'})
 _ENDPOINT_KEYS = frozenset({'path', 'query', 'data_keyed_maps', 'history'})
@@ -288,8 +289,11 @@ def field_breakdown(
     holding no dict. It is charged its JSON-encoded key, the colon, and its
     compact value. List descent renders as ``[]``. A dict whose key path is in
     *data_keyed_maps* has its keys collapsed to ``{}``, so a field spread
-    across project labels or dates sums into one leaf. Nothing is inferred:
-    two NAMED fields that happen to share a shape stay apart.
+    across project labels or dates sums into one leaf. Where such a map's
+    values are containers, its keys and their colons are charged to one
+    ``{}(keys)`` leaf beside them, so a map grown by its keys still shows.
+    Nothing is inferred: two NAMED fields that happen to share a shape stay
+    apart.
     """
     totals: Counter[tuple[str, ...]] = Counter()
     keyed = frozenset(tuple(key_path) for key_path in data_keyed_maps)
@@ -302,6 +306,24 @@ def field_breakdown(
         key=lambda item: (-item[1], item[0]),
     )
     return tuple(FieldBytes(path=path, bytes=size) for path, size in ranked)
+
+
+def nodes_at(payload: object, key_path: Sequence[str]) -> Iterator[object]:
+    """Every node *key_path* reaches in *payload*: ``[]`` descends a list, ``{}`` every map value."""
+    if not key_path:
+        yield payload
+        return
+    segment, rest = key_path[0], key_path[1:]
+    if segment == _LIST_DESCENT and isinstance(payload, list):
+        children = payload
+    elif segment == _COLLAPSED_KEY and isinstance(payload, dict):
+        children = list(payload.values())
+    elif isinstance(payload, dict) and segment in payload:
+        children = [payload[segment]]
+    else:
+        children = []
+    for child in children:
+        yield from nodes_at(child, rest)
 
 
 def render_overage(
@@ -370,12 +392,16 @@ def _account_dict(
     collapse = path in keyed
     for key, value in node.items():
         member = (*path, _COLLAPSED_KEY if collapse else key)
+        key_bytes = len(_encoded(key)) + 1
         if isinstance(value, dict) and value:
             _account_dict(value, member, keyed, totals)
         elif _holds_a_dict(value):
             _account_list(value, (*member, _LIST_DESCENT), keyed, totals)
         else:
-            totals[member] += len(_encoded(key)) + 1 + len(_encoded(value))
+            totals[member] += key_bytes + len(_encoded(value))
+            continue
+        if collapse:
+            totals[(*path, _COLLAPSED_KEYS)] += key_bytes
 
 
 def _rendered(path: tuple[str, ...]) -> str:
