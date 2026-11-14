@@ -63,9 +63,7 @@ def _assert_burst_premises(ledger: BurstLedger) -> None:
     assert _API_ERROR_MARKER in classified.summary, f'premise: marker missing from {classified.summary!r}'
 
     kill_times = [r.at for tid in ledger.cast.burst for r in ledger.kills_of(tid)]
-    assert len(kill_times) == BURST_SIZE * KILLS_PER_TASK, (
-        f'premise: expected {BURST_SIZE * KILLS_PER_TASK} burst kills, got {len(kill_times)}'
-    )
+    assert kill_times, 'premise: no burst kills recorded'
     window_secs = config.park_stop_parked_window_hours * 3600
     assert max(kill_times) - min(kill_times) < window_secs, (
         f'premise: the burst must sit inside one park-stop window ({window_secs}s); '
@@ -76,7 +74,6 @@ def _assert_burst_premises(ledger: BurstLedger) -> None:
 def _assert_row_1(ledger: BurstLedger) -> None:
     for tid in ledger.cast.burst:
         kills = ledger.kills_of(tid)
-        assert len(kills) == KILLS_PER_TASK, f'row 1: task {tid} had {len(kills)} kills'
         for n, record in enumerate(kills, start=1):
             report = record.report
             where = f'row 1: task {tid} kill {n}'
@@ -101,6 +98,7 @@ def _assert_row_1(ledger: BurstLedger) -> None:
             assert evidence.api_error_status == 529, f'{where}: evidence {evidence!r}'
             assert 'overloaded_error' in evidence.output_tail, f'{where}: evidence {evidence!r}'
             assert evidence.output_tail.endswith(PROVIDER_529_ERROR), f'{where}: evidence {evidence!r}'
+        assert len(kills) == KILLS_PER_TASK, f'row 1: task {tid} had {len(kills)} kills'
         writes = ledger.status_writes[tid]
         assert 'blocked' not in writes, f'row 1: task {tid} was written blocked: {writes}'
         assert ledger.escalations_by_task[tid] == (), (

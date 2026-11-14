@@ -31,12 +31,12 @@ from escalation.queue import EscalationQueue
 from shared.scheduler_state import RequeueCooldown
 
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.git_ops import WarmLaneReseedContaminated
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import RequeueRecord, Scheduler, TaskAssignment
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 from orchestrator.workflow import build_workflow as real_build_workflow
 
 __all__ = [
@@ -65,6 +65,7 @@ PROVIDER_529_ERROR = (
 
 PHASE_A = 'A'
 PHASE_B = 'B'
+PHASE_C = 'C'
 
 _EPOCH = datetime(2026, 7, 29, 9, 0, tzinfo=UTC)
 _RUN_ID = 'run-3320-incident-burst'
@@ -75,6 +76,7 @@ _REIFY_WEDGE_ID = '9202'
 _STAGGER_SECS = 20.0
 _GENUINE_ARRIVAL_SECS = BURST_SIZE * _STAGGER_SECS / 2
 _KILL_DURATION_MS = 120_000
+_MERGE_SHA = '3320' * 10
 
 
 def incident_529_result() -> AgentResult:
@@ -116,6 +118,19 @@ def reify_4429_wedge_result() -> AgentResult:
         duration_ms=1_200_000,
         transcript_turns=0,
         api_error_status=None,
+    )
+
+
+def _healthy_result() -> AgentResult:
+    """A productive implementer session once the provider has recovered."""
+    return AgentResult(
+        success=True,
+        output='step-1 implemented',
+        timed_out=False,
+        turns=12,
+        cost_usd=0.42,
+        duration_ms=90_000,
+        transcript_turns=12,
     )
 
 
@@ -189,7 +204,9 @@ class BurstLedger:
     dispatches: tuple[DispatchRecord, ...]
     after_phase_a: PhaseSnapshot
     after_phase_b: PhaseSnapshot
+    end_of_run: PhaseSnapshot
     status_writes: Mapping[str, tuple[str, ...]]
+    final_status: Mapping[str, str]
     escalations_by_task: Mapping[str, tuple[Escalation, ...]]
     park_stop_trip_wired: bool
 
@@ -208,6 +225,7 @@ async def run_incident_burst(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     simulation = _Simulation(tmp_path, monkeypatch)
     await simulation.run_phase_a()
     await simulation.run_phase_b()
+    await simulation.run_phase_c()
     return simulation.ledger()
 
 
@@ -249,20 +267,25 @@ class _OutageTaskStore(HermeticMcpSession):
     def writes(self) -> dict[str, tuple[str, ...]]:
         return {tid: tuple(log) for tid, log in self._writes.items()}
 
+    def statuses(self) -> dict[str, str]:
+        return dict(self._status)
+
 
 class _CliScript:
     """``invoke_with_cap_retry`` for the cast: each task's n-th call returns ``script(n)``.
 
     Calls are attributed to a task by the ``cwd`` its dispatch's worktree registered.
+    A successful session marks its plan step done, as the implementer does through
+    plan-tools.
     """
 
     def __init__(self, scripts: Mapping[str, Callable[[int], AgentResult]]) -> None:
         self._scripts = scripts
-        self._task_by_cwd: dict[Path, str] = {}
+        self._dispatch_by_cwd: dict[Path, tuple[str, TaskArtifacts]] = {}
         self._calls: Counter[str] = Counter()
 
-    def register_worktree(self, worktree: Path, task_id: str) -> None:
-        self._task_by_cwd[worktree] = task_id
+    def register_worktree(self, worktree: Path, task_id: str, artifacts: TaskArtifacts) -> None:
+        self._dispatch_by_cwd[worktree] = (task_id, artifacts)
 
     def calls(self, task_id: str) -> int:
         return self._calls[task_id]
@@ -271,19 +294,16 @@ class _CliScript:
         return self._scripts[task_id](self._calls[task_id] + 1).duration_ms / 1000
 
     async def __call__(self, **kwargs: object) -> AgentResult:
-        task_id = self._task_by_cwd[Path(str(kwargs['cwd']))]
+        task_id, artifacts = self._dispatch_by_cwd[Path(str(kwargs['cwd']))]
         self._calls[task_id] += 1
-        return self._scripts[task_id](self._calls[task_id])
+        result = self._scripts[task_id](self._calls[task_id])
+        if result.success:
+            artifacts.update_step_status('step-1', 'done')
+        return result
 
 
 def _burst_script(n: int) -> AgentResult:
-    if n <= KILLS_PER_TASK:
-        return incident_529_result()
-    raise AssertionError(f'burst task invoked a {n}th time; the script ends at kill {KILLS_PER_TASK}')
-
-
-def _genuine_script(n: int) -> AgentResult:
-    raise AssertionError('the genuine control reached the CLI; its first dispatch requeues at lane setup')
+    return incident_529_result() if n <= KILLS_PER_TASK else _healthy_result()
 
 
 class _WorkflowFactory:
@@ -330,6 +350,13 @@ class _WorkflowFactory:
             '_recover_before_execute',
         ):
             self._monkeypatch.setattr(wf, probe, AsyncMock(return_value=None))
+        self._monkeypatch.setattr(
+            wf, '_verify_debugfix_loop', AsyncMock(return_value=WorkflowOutcome.DONE),
+        )
+        self._monkeypatch.setattr(wf, '_review', AsyncMock(return_value=ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={},
+        )))
+        self._monkeypatch.setattr(wf, '_merge_and_finalise', _merged_done(wf))
         self._latest[task_id] = wf
         return wf
 
@@ -344,9 +371,21 @@ class _WorkflowFactory:
             artifacts.init(wf.task_id, wf.task.get('title', ''), wf.task.get('description', ''))
             wf.worktree = lane
             wf.artifacts = artifacts
-            self._cli.register_worktree(lane, wf.task_id)
+            self._cli.register_worktree(lane, wf.task_id, artifacts)
 
         return setup_worktree_and_artifacts
+
+
+def _merged_done(wf: TaskWorkflow):
+    """The merge phase landing: the done write, then the DONE phase, as the real tail orders them."""
+
+    async def merge_and_finalise(branch_name: str) -> WorkflowOutcome:
+        wf._enter_phase(WorkflowState.MERGE)
+        await wf.scheduler.mark_done(wf.task_id, kind='merged', sha=_MERGE_SHA)
+        wf._enter_phase(WorkflowState.DONE)
+        return WorkflowOutcome.DONE
+
+    return merge_and_finalise
 
 
 def _one_step_plan(task_id: str) -> dict:
@@ -411,7 +450,7 @@ class _Simulation:
         self.store = _OutageTaskStore(self.cast.all_ids)
         self.cli = _CliScript({
             **dict.fromkeys(self.cast.burst, _burst_script),
-            self.cast.genuine: _genuine_script,
+            self.cast.genuine: lambda _n: _healthy_result(),
             self.cast.sigkill_wedge: lambda _n: sigkill_wedge_result(),
             self.cast.reify_wedge: lambda _n: reify_4429_wedge_result(),
         })
@@ -427,8 +466,10 @@ class _Simulation:
         monkeypatch.setattr('orchestrator.workflow.invoke_with_cap_retry', self.cli)
         self._sequence = itertools.count()
         self.dispatches: list[DispatchRecord] = []
+        self._recovery_arrivals: list[tuple[float, int, str]] = []
         self.after_phase_a: PhaseSnapshot | None = None
         self.after_phase_b: PhaseSnapshot | None = None
+        self.end_of_run: PhaseSnapshot | None = None
 
     async def run_phase_a(self) -> None:
         arrivals: list[tuple[float, int, str]] = []
@@ -439,8 +480,13 @@ class _Simulation:
         while arrivals:
             at, _, task_id = heapq.heappop(arrivals)
             record = await self._dispatch(task_id, at, PHASE_A)
+            if record.report.outcome != WorkflowOutcome.REQUEUED:
+                continue
+            arrival = (self._redispatch_at(record), next(self._sequence), task_id)
             if self._kill_pending(record):
-                heapq.heappush(arrivals, (self._redispatch_at(record), next(self._sequence), task_id))
+                heapq.heappush(arrivals, arrival)
+            else:
+                self._recovery_arrivals.append(arrival)
         self.after_phase_a = self._snapshot()
 
     async def run_phase_b(self) -> None:
@@ -448,12 +494,14 @@ class _Simulation:
             await self._dispatch(task_id, self.clock.now, PHASE_B)
         self.after_phase_b = self._snapshot()
 
+    async def run_phase_c(self) -> None:
+        """Each requeued task's healthy re-dispatch; none may run before the wedge controls'."""
+        for at, _, task_id in sorted(self._recovery_arrivals):
+            await self._dispatch(task_id, max(at, self.clock.now), PHASE_C)
+        self.end_of_run = self._snapshot()
+
     def _kill_pending(self, record: DispatchRecord) -> bool:
-        return (
-            record.task_id in self.cast.burst
-            and record.report.outcome == WorkflowOutcome.REQUEUED
-            and self.cli.calls(record.task_id) < KILLS_PER_TASK
-        )
+        return record.task_id in self.cast.burst and self.cli.calls(record.task_id) < KILLS_PER_TASK
 
     def _redispatch_at(self, record: DispatchRecord) -> float:
         if record.cooldown is None:
@@ -499,13 +547,16 @@ class _Simulation:
         queue = self.harness._escalation_queue
         assert queue is not None
         assert self.after_phase_a is not None and self.after_phase_b is not None
+        assert self.end_of_run is not None
         return BurstLedger(
             config=self.config,
             cast=self.cast,
             dispatches=tuple(self.dispatches),
             after_phase_a=self.after_phase_a,
             after_phase_b=self.after_phase_b,
+            end_of_run=self.end_of_run,
             status_writes=self.store.writes(),
+            final_status=self.store.statuses(),
             escalations_by_task={tid: tuple(queue.get_by_task(tid)) for tid in self.cast.all_ids},
             park_stop_trip_wired=self.scheduler.callbacks.on_park_stop_trip is not None,
         )
