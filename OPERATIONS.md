@@ -3766,7 +3766,7 @@ Once the timer below is installed for a project, the "nothing runs the
 probes" claim becomes historical **for that project only** — a second project
 without the timer is back to the pre-4514 state.
 
-**Four artefacts, four different questions.** Do not merge them again:
+**Five artefacts, five different questions.** Do not merge them again:
 
 | Artefact | Answers |
 |---|---|
@@ -3774,8 +3774,9 @@ without the timer is back to the pre-4514 state.
 | `scripts/legibility/check_trickle_progress.py` | Did SIGNAL flow? (reads the recorded run state) |
 | `scripts/legibility/check_census_progress.py` | Did a FIRED census advance census-state? (reads the recorded census-fire streak plus the project's `docs/legibility/census-state.json`) |
 | `scripts/legibility/check_trickle_health.py` | Runs the three on a timer and escalates |
+| `scripts/legibility/check_trickle_health_liveness.sh` | Did the HEALTH unit run and reach a verdict? (reads `legibility-trickle-health@<project>.service`'s `Result` and `ExecMainStatus`) |
 
-`check_trickle_health.py` **executes** the other three as subprocesses rather
+`check_trickle_health.py` **executes** the first three as subprocesses rather
 than re-deriving any verdict, so there is no lockstep duplication to keep
 in sync and `check_trickle_liveness.sh` stays byte-identical as its own
 header comment requires.
@@ -3810,6 +3811,24 @@ dark_factory's is task 6205; reify's is task 6312. A project's deploy is
 done when `systemctl --user list-timers --all` lists
 `legibility-trickle-health@<project_id>.timer`, not when the installer lands
 on main.
+
+**Liveness.** `check_trickle_health.py` exits 0 when healthy, 3
+(`scripts/legibility/check_trickle_health.py::EXIT_DEGRADED`) when every probe
+ran and at least one failed, and 1 when it reached no verdict: an unresolved
+project id, or any uncaught exception including an `ImportError`, since 1 is
+Python's own crash status. So a DEGRADED night leaves the unit `failed` with
+status 3. That is the alarm, not a broken unit.
+`check_trickle_health_liveness.sh <project_id> <hours>` counts
+`Result=success`/`ExecMainStatus=0` and `Result=exit-code`/`ExecMainStatus=3`
+as ALIVE. Never-ran, staleness, an abnormal `Result`, or any other status (1,
+2 = a usage error or uv, 203 = exec failure) all FAIL. DEGRADED is not exit 1
+because a crash would then read as a finding. The probe does not accept 0
+alone because it would then fail a health unit that is correctly reporting a
+broken trickle, as happened nightly from 2026-09-29 (task 6205). Binding: once
+this probe is on main, task 10045 files one delayed-milestone predicate per
+project (`check_trickle_health_liveness.sh <project_id> 72`,
+`after_secs=604800`, depending on deploys 6205 and 6312) and records their ids
+here. These milestones are one-shot: a `done` predicate never runs again.
 
 **Reading the verdict.** Each door has its own remedy, and conflating them
 is how an operator ends up tuning the sampler for a crashed coder:
