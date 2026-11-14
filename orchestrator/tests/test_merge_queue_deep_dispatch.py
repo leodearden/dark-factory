@@ -175,6 +175,43 @@ class TestSelectChainDepth:
         assert select_chain_depth(1, 2, 1) is None
 
 
+class TestMayChain:
+    """``may_chain(speculative=, frontier_depth=)``: the D5 eligibility rule.
+
+    ``plans/merge-lane-policy-prd.md`` D5: a dispatch may chain when its item
+    is speculative, or when nothing else is in the verify frontier.  Reached
+    as a module attribute so a missing symbol fails this class alone.
+    """
+
+    @pytest.mark.parametrize(
+        ('speculative', 'frontier_depth', 'expected'),
+        [
+            (True, 0, True),
+            (True, 3, True),
+            (True, None, True),
+            (False, 0, True),
+            (False, 1, False),
+            (False, 2, False),
+            (False, None, False),
+        ],
+        ids=[
+            'speculative-alone',
+            'speculative-beside-three',
+            'speculative-unknown-depth',
+            'head-alone-in-the-frontier',
+            'head-beside-one',
+            'head-beside-two',
+            'head-unknown-depth-never-licensed',
+        ],
+    )
+    def test_the_d5_rule(
+        self, speculative: bool, frontier_depth: int | None, expected: bool,
+    ) -> None:
+        assert merge_queue.may_chain(
+            speculative=speculative, frontier_depth=frontier_depth,
+        ) is expected
+
+
 class TestNextHalvingState:
     """``next_halving_state(passed, dispatched_depth) -> int | None`` (PRD dec. 5).
 
@@ -368,10 +405,10 @@ class TestChainHalvingWorkerState:
 # ═══════════════════════════════════════════════════════════════════════════
 # step-11: RED — the deep GATE, and the kill-switch byte-identity guarding it
 #
-# `_deep_chain_placement(item)` is the slot-2 policy hook: the deep twin of
+# `_deep_chain_placement(item)` is the deep policy hook: the deep twin of
 # `_probe_verify_placement` (merge_queue.py:11988), structured identically —
-# a slot-1 guard, then a HOISTED zero-cost kill-switch guard, then the pure
-# policy, then (step-14) the bounded git work.
+# an eligibility guard (PRD D5's `may_chain`), then a HOISTED zero-cost
+# kill-switch guard, then the pure policy, then (step-14) the bounded git work.
 #
 # Everything below asserts a NEGATIVE — the gate declines — so each test also
 # proves the decline COSTS NOTHING: no `build_chain`, no `_spec-` lane, and,
@@ -491,30 +528,56 @@ class TestDeepChainPlacementGate:
         assert lanes == []
         assert scans == [], 'cap=0 must short-circuit BEFORE the O(n) queue scan'
 
-    async def test_non_speculative_item_is_never_chained(self, git_repo, monkeypatch):
-        """Slot 1 — the head trust anchor — is unchanged by contract, at ANY cap.
-
-        Its tree is merged onto REAL main; chaining onto it would make the one
-        verify the pipeline trusts for landing a cumulative tree instead.
-        """
+    async def _head_fixture(
+        self, git_repo: Path, monkeypatch,
+    ) -> tuple[SpeculativeMergeWorker, RealMergeItem, list[dict], list[str], list[int]]:
+        """A chain_cap=6 worker, five buffered requests and a NON-speculative head, all spied."""
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo, chain_cap=6)
         worker = _make_worker(git_ops)
         worker._intake.replace_lane('normal', [
             _make_req(str(300 + i), str(300 + i), config, git_repo) for i in range(5)
         ])
-        built = _spy_build_chain(monkeypatch)
-        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
-        scans = _spy_chain_snapshot(worker, monkeypatch)
         head_item = _make_item(
             _make_req('101', '101', config, git_repo), 'beef' * 10, git_repo,
             speculative=False,
         )
+        return (
+            worker, head_item,
+            _spy_build_chain(monkeypatch),
+            _count_spec_lane_acquires(git_ops, monkeypatch),
+            _spy_chain_snapshot(worker, monkeypatch),
+        )
 
-        assert await worker._deep_chain_placement(head_item) is None
+    @pytest.mark.parametrize('frontier_depth', [1, None], ids=['beside-an-entry', 'unknown'])
+    async def test_non_speculative_item_not_alone_in_the_frontier_is_not_chained(
+        self, git_repo, monkeypatch, frontier_depth,
+    ):
+        """A head with another entry in the verify frontier declines before the scan (PRD D5).
+
+        The head is merged onto REAL main; anything landing ahead of it would
+        leave a chain built on it stale.  An unknown depth (a direct caller)
+        is treated the same way.
+        """
+        worker, head_item, built, lanes, scans = await self._head_fixture(git_repo, monkeypatch)
+
+        assert await worker._deep_chain_placement(head_item, frontier_depth=frontier_depth) is None
         assert built == []
         assert lanes == []
-        assert scans == [], 'the slot-1 guard must precede the queue scan too'
+        assert scans == [], 'the guard 1 decline must precede the queue scan too'
+
+    async def test_non_speculative_item_alone_in_the_frontier_reaches_the_chain_build(
+        self, git_repo, monkeypatch,
+    ):
+        """A head alone in the verify frontier reaches the build, seeded at its own commit (PRD D5)."""
+        worker, head_item, built, _lanes, scans = await self._head_fixture(git_repo, monkeypatch)
+
+        await worker._deep_chain_placement(head_item, frontier_depth=0)
+
+        assert len(built) == 1, 'a head alone in the frontier must reach build_chain'
+        assert built[0]['head_merge_commit'] == head_item.merge_result.merge_commit
+        assert (built[0]['cap'], built[0]['target_depth']) == (5, 5)
+        assert scans == [5]
 
     async def test_queue_shorter_than_two_declines(self, git_repo, monkeypatch):
         """An empty unfrozen suffix means ``queue_len == 1`` — nothing to chain ONTO.
@@ -1456,29 +1519,36 @@ class TestRunInflightVerifyChainRedirect:
         )
 
     @pytest.mark.parametrize(
-        'slot1,cap,expected',
+        'slot1,cap,depth,expected',
         [
-            (False, 6, None),   # positive control: slot 2, cap on -> resets
-            (True, 6, 3),       # slot 1 is a DIFFERENT tree -> no reset
-            (False, 0, 3),      # kill switch: the arm is not even reached
+            (False, 6, None, None),  # positive control: slot 2, cap on -> resets
+            (True, 6, 0, None),      # a head alone in the frontier could have chained
+            (True, 6, 1, 3),         # a head beside another entry could not -> no reset
+            (True, 6, None, 3),      # no dispatch-time depth never licenses a head
+            (False, 0, 0, 3),        # kill switch: the arm is not even reached
         ],
-        ids=['slot2-cap-on-resets', 'slot1-does-not-reset', 'cap-zero-does-not-reset'],
+        ids=[
+            'slot2-cap-on-resets', 'slot1-alone-resets', 'slot1-beside-one-does-not-reset',
+            'slot1-unknown-depth-does-not-reset', 'cap-zero-does-not-reset',
+        ],
     )
     async def test_the_floor_reset_arms_two_guards_are_each_load_bearing(
-        self, git_repo: Path, monkeypatch, slot1: bool, cap: int, expected,
+        self, git_repo: Path, monkeypatch, slot1: bool, cap: int, depth: int | None, expected,
     ):
-        """The d=1 floor's reset arm: ``item.speculative`` and ``chain_cap > 0``.
+        """The d=1 floor's reset arm: :func:`may_chain` and ``chain_cap > 0``.
 
         Both guards previously had no test in which they were the DECIDING
         branch — every scenario that could have exercised them started from
         ``_chain_halving_state is None``, so either guard could have been
         deleted with the suite still green.  Here the state starts at 3 and
-        each row differs in exactly one guard, so a deletion flips a row.
+        each row differs in exactly one guard input, so a deletion flips a row.
 
-        Why each guard matters.  A slot-1 head verify is merged onto REAL main
-        and is never chained by γ, so its green says nothing about whether
-        chaining is safe — letting it reset would climb the bisector back out
-        on evidence about a different tree.  And under the shipped
+        Why each guard matters.  Only a round that could have chained says
+        anything about whether chaining is safe: a slot-2 round, or a head
+        alone in the verify frontier at its dispatch (``depth == 0``, PRD D5).
+        A head beside another entry, or with no dispatch-time depth, verifies
+        a tree no chain could have been built on, and letting it reset would
+        climb the bisector back out on evidence about it.  And under the shipped
         ``chain_cap=0`` kill switch this arm must not merely have no effect: it
         must not be REACHED, so a cap-0 dispatch stays byte-identical down to
         "no method call".
@@ -1503,7 +1573,7 @@ class TestRunInflightVerifyChainRedirect:
         worker._chain_halving_state = 3
         posted = _spy_post_merge_verify(monkeypatch, outcome=None)   # a PASS
 
-        res = await worker._run_inflight_verify(item, _local_lease())
+        res = await worker._run_inflight_verify(item, _local_lease(), depth=depth)
 
         assert len(posted) == 1 and posted[0]['chain_items'] == 1
         assert res.outcome is None, 'the fixture must actually be a PASS'
@@ -1983,19 +2053,14 @@ class _DeepScene:
         """Drive ONE full dispatch round through ``_dispatch_item``.
 
         Returns the recorded ``_run_inflight_verify`` kwargs for the round
-        (plus ``'result'``).  Releases the host lease, any worktree the
-        ordinary (non-chain) arm hands back, and the chain reservation a
-        passing tip hands to finalize (task 7720), so the next round starts
-        from the same resource state — which is what makes the ROUND SEQUENCE,
-        and not a slowly-leaking fixture, the thing under test.
+        (plus ``'result'``), after :meth:`release_round`.
         """
         self._round_no += 1
-        worker = self.worker
         item = _make_item(
             _make_req('101', '101', self.config, self.repo), self.head,
             _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}'),
         )
-        entry = await worker._dispatch_item(item)
+        entry = await self.worker._dispatch_item(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
         assert entry.verify_task is not None
         await entry.verify_task
@@ -2003,16 +2068,26 @@ class _DeepScene:
         rec = self.calls[-1]
         rec['item'] = item
         rec['round'] = self._round_no
+        await self.release_round(entry)
+        return rec
+
+    async def release_round(self, entry) -> None:
+        """Hand back what the round that just verified *entry* holds.
+
+        The host lease, the chain reservation a passing tip keeps for finalize
+        (task 7720), and any worktree the ordinary (non-chain) arm hands to
+        ``_finalize_inflight``.  The scene stops short of finalize (γ lands
+        nothing), so the next round starts from the same resource state —
+        which is what makes the ROUND SEQUENCE, and not a slowly-leaking
+        fixture, the thing under test.
+        """
+        worker = self.worker
         if entry.lease is not None:
             await worker._host_allocator.release(entry.lease)
-        worker._chain_reservations.release(item.request.request_id)
-        vr = rec['result']
+        worker._chain_reservations.release(entry.item.request.request_id)
+        vr = self.calls[-1]['result']
         if vr.merge_wt is not None:
-            # The ordinary arm hands its verified worktree to _finalize_inflight;
-            # this scene stops short of finalize (γ lands nothing), so return it
-            # here or the pool starves the next round.
             await worker._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
-        return rec
 
 
 async def _make_deep_scene(
@@ -2235,12 +2310,12 @@ class TestDeepDispatchRoundsIntegration:
         verify, a deep tip verify, a halved tip verify and a floor verify —
         and requires the field present, integral and truthful on all of them.
 
-        Parameterised over the verify frontier, and the expected list is the
-        SAME at both: ``chain_items`` is in CHAIN-ITEM units and is
-        deliberately frontier-INDEPENDENT.  At ``frontier=0`` the list was
-        already this, so the parameterisation is what converts a vacuous pass
-        into a real pin — a frontier-derived emitter would produce
-        ``[1, 8, 5, 3]`` at ``frontier=2`` and fail here.
+        Parameterised over the verify frontier.  The three speculative rounds
+        expect the SAME list at both: ``chain_items`` is in CHAIN-ITEM units
+        and is deliberately frontier-INDEPENDENT, so a frontier-derived emitter
+        would produce ``[8, 5, 3]`` at ``frontier=2`` and fail here.  The head
+        round is where the frontier DOES matter, by policy: PRD D5 chains a
+        head only when it is alone in the frontier (boundary row 9).
         """
         from orchestrator.verify_runner import HostLease
 
@@ -2253,7 +2328,8 @@ class TestDeepDispatchRoundsIntegration:
             allocator=_StubRemoteAllocator(lease), frontier=frontier,
         )
 
-        # slot 1 (the trust anchor) — never chained, so a flat 1.
+        # slot 1 (the head): PRD D5 chains it only when it is alone in the verify
+        # frontier, so it is deep at frontier-0 and a flat 1 at frontier-2.
         #
         # base_sha is REAL MAIN, deliberately: a slot-1 item is merged onto
         # main, and a stale base would fire _dispatch_item's Mechanism-2
@@ -2269,12 +2345,8 @@ class TestDeepDispatchRoundsIntegration:
         entry = await scene.worker._dispatch_item(head_item)
         assert entry is not None and entry.verify_task is not None
         await entry.verify_task
-        await scene.worker._host_allocator.release(entry.lease)
-        _vr = scene.calls[-1]['result']
-        if _vr.merge_wt is not None:
-            await scene.worker._release_or_cleanup(
-                _vr.merge_wt, spec_warm=_vr.spec_warm,
-            )
+        # A chained head's links go back too, or the speculative rounds find none.
+        await scene.release_round(entry)
 
         # slot 2: deep (6) → halved (3) → floor (no chain).  The fake runner
         # always passes, so drive the halving by hand rather than by verdict —
@@ -2290,8 +2362,13 @@ class TestDeepDispatchRoundsIntegration:
             assert not isinstance(ev['data']['chain_items'], bool)
             assert ev['data']['chain_items'] >= 1
 
-        assert [e['data']['chain_items'] for e in events] == [1, 6, 3, 1]
-        deep_events = [e for e in events if e['data']['chain_items'] >= 2]
+        head_event, *speculative_events = events
+        assert head_event['data']['speculative'] is False
+        # Boundary row 9: alone in the frontier, the head chains at
+        # min(queue_len, cap) = min(1 + len(_DEEP_QUEUE), 6) = 6.
+        assert head_event['data']['chain_items'] == (6 if frontier == 0 else 1)
+        assert [e['data']['chain_items'] for e in speculative_events] == [6, 3, 1]
+        deep_events = [e for e in speculative_events if e['data']['chain_items'] >= 2]
         assert len(deep_events) == 2, 'η1 must be able to SEE a deep verify'
 
     async def test_non_chain_speculative_dispatch_emits_one_at_any_frontier(

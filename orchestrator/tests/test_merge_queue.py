@@ -2513,6 +2513,10 @@ class TestSpeculativeMergeWorker:
         With fix: except clause resolves N+1's Future as 'blocked' with
         'Verifier error'; finally clause always sets _speculation_slot.
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the _remerge this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(
             git_ops, 'vre-n', 'file_vre_n.py', 'n = 1\n',
         )
@@ -21517,6 +21521,10 @@ class TestSpeculationPermitLeakOnMergerError:
         """(a) WorktreeMissing raised during N+1's merger step must release
         the speculation permit (currently leaks → deadlock at next look-ahead).
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the merger step this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'leak-wm-n', 'leak_wm_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'leak-wm-n1', 'leak_wm_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'leak-wm-n2', 'leak_wm_n2.py', 'n2 = 3\n')
@@ -21581,6 +21589,10 @@ class TestSpeculationPermitLeakOnMergerError:
         """(b) Generic Exception raised during N+1's merger step must release
         the speculation permit (currently leaks → deadlock at next look-ahead).
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the merger step this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'leak-ex-n', 'leak_ex_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'leak-ex-n1', 'leak_ex_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'leak-ex-n2', 'leak_ex_n2.py', 'n2 = 3\n')

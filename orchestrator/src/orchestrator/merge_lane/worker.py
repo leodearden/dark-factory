@@ -7588,6 +7588,15 @@ def select_probe_depth(
 # _deep_chain_placement passes `cap - 1` / `d - 1` (see its docstring).
 
 
+def may_chain(*, speculative: bool, frontier_depth: int | None) -> bool:
+    """Whether a dispatch may build a deep chain (``plans/merge-lane-policy-prd.md`` D5).
+
+    Its item is speculative, or no other entry is in the verify frontier; a
+    *frontier_depth* of ``None`` is unknown and never licenses a non-speculative chain.
+    """
+    return speculative or frontier_depth == 0
+
+
 def select_chain_depth(
     chain_cap: int,
     queue_len: int,
@@ -11319,13 +11328,16 @@ class SpeculativeMergeWorker:
             return None
         return ProbePlacement(depth=d, base=base)
 
-    async def _deep_chain_placement(self, item: RealMergeItem) -> ChainResult | None:
-        """Decide whether THIS second-slot dispatch should verify a deep CHAIN
-        tip instead of the item's own adjacent merge commit (task 3185, PRD γ).
+    async def _deep_chain_placement(
+        self, item: RealMergeItem, *, frontier_depth: int | None = None,
+    ) -> ChainResult | None:
+        """Decide whether THIS dispatch should verify a deep CHAIN tip instead
+        of the item's own adjacent merge commit (task 3185, PRD γ; task 8527
+        extends it to a head alone in the verify frontier).
 
         The deep twin of :meth:`_probe_verify_placement`, and deliberately the
-        same shape: a slot-1 guard, a hoisted zero-cost kill-switch guard, then
-        the pure policy.  The one structural difference is what a firing
+        same shape: an eligibility guard, a hoisted zero-cost kill-switch guard,
+        then the pure policy.  The one structural difference is what a firing
         placement MEANS.  A :class:`ProbePlacement` only RELABELS the dispatch's
         depth/base attribution — the verify still exercises *item*'s own tree
         (its "KNOWN PHASE-1 LIMITATION").  A :class:`ChainResult` genuinely
@@ -11340,11 +11352,15 @@ class SpeculativeMergeWorker:
 
         The guards, in order, and why that order:
 
-          1. ``not item.speculative`` -> ``None``.  **Slot 1 is never chained.**
-             The head item is merged onto REAL main and is the pipeline's trust
-             anchor: its verdict is the one :meth:`_finalize_inflight` lands a
-             CAS advance on.  Chaining it would make that anchor a verdict about
-             a cumulative tree instead of about the item being landed.
+          1. not :func:`may_chain` -> ``None``
+             (``plans/merge-lane-policy-prd.md`` D5).  A speculative item may
+             chain.  A non-speculative item (the head, merged onto REAL main)
+             may chain only when no other entry is in the verify frontier:
+             anything landing ahead of a main-based item would leave its chain
+             stale.  *frontier_depth* is the dispatch-time ``depth``
+             :meth:`_launch_verify` also hands :meth:`_run_inflight_verify`,
+             so this guard and the d=1 floor's reset arm judge one value;
+             ``None`` (a direct caller) never licenses a head.
           2. ``cap = item.request.config.merge_deep.chain_cap; cap <= 0`` ->
              ``None``.  α's shipped kill switch, hoisted ABOVE the queue scan
              for the same reason :meth:`_probe_verify_placement` hoists its
@@ -11399,7 +11415,7 @@ class SpeculativeMergeWorker:
             caller must release it exactly once — see
             :meth:`_run_inflight_verify`'s chain arm), or ``None``.
         """
-        if not item.speculative:
+        if not may_chain(speculative=item.speculative, frontier_depth=frontier_depth):
             return None
         cap = item.request.config.merge_deep.chain_cap
         if cap <= 0:
@@ -15599,13 +15615,14 @@ class SpeculativeMergeWorker:
 
     def _holds_lookahead(self, item: RealMergeItem) -> bool:
         """Whether the merger waits for *item*'s dispatch before its look-ahead
-        pop (task 7720): only a speculative item can chain, only while
-        ``merge_deep.chain_cap`` (read live) is on, and only a live verifier
-        loop can decide."""
+        pop (task 7720): any item may chain at its own dispatch (a
+        non-speculative one when it is then alone in the verify frontier,
+        which the merger cannot know yet; PRD D5), so the look-ahead waits for
+        every dispatch's decision while ``merge_deep.chain_cap`` (read live)
+        is on and a live verifier loop can decide."""
         verifier = self._verifier_task
         return (
-            item.speculative
-            and item.request.config.merge_deep.chain_cap > 0
+            item.request.config.merge_deep.chain_cap > 0
             and verifier is not None
             and not verifier.done()
         )
@@ -18866,9 +18883,7 @@ class SpeculativeMergeWorker:
                 # the tip just made redundant.  See `_adopt_head_on_tip_authority` for which
                 # entry counts as the head, why the tip's verdict covers it,
                 # and the two lease axes the teardown must leave idle.
-                await self._adopt_head_on_tip_authority(
-                    req.request_id, req.task_id,
-                )
+                await self._adopt_head_on_tip_authority(item)
                 return InflightVerifyResult(
                     outcome=None,
                     merge_wt=item.merge_wt,
@@ -18916,16 +18931,16 @@ class SpeculativeMergeWorker:
         #   * `chain_cap > 0` — α's kill switch.  At the shipped default this
         #     arm does not merely have no effect, it is not REACHED: cap=0
         #     dispatch stays byte-identical down to "no method call".
-        #   * `item.speculative` — slot 2 only.  A slot-1 head verify is a
-        #     different tree (merged onto REAL main, never chained by γ), so
-        #     its verdict says nothing about whether chaining is safe.
+        #   * `may_chain(...)` — a round that could have chained: slot 2, or a
+        #     head alone in the frontier at its dispatch (PRD D5); a depth of
+        #     None (a non-production caller) never licenses a head.
         #   * state `is not None` — already reset; nothing to do.
         # `depth=1` is truthful, not a placeholder: at the floor the tree that
         # actually ran IS a one-item chain (that is what makes the floor
         # byte-identical to today's adjacent verify in the first place).
         if (
             out is None
-            and item.speculative
+            and may_chain(speculative=item.speculative, frontier_depth=depth)
             and self._chain_halving_state is not None
             and req.config.merge_deep.chain_cap > 0
         ):
@@ -19026,18 +19041,32 @@ class SpeculativeMergeWorker:
         self._intake.request_redispatch(_remerged, front=True)
         return False
 
-    async def _adopt_head_on_tip_authority(
-        self, tip_req_id: str, tip_task_id: str,
-    ) -> InflightEntry | None:
+    def _head_inside_tip(self, tip: RealMergeItem) -> InflightEntry | None:
+        """The entry ahead of *tip* that *tip*'s tree contains, or None.
+
+        A non-speculative tip is built on main, so it is the head itself and
+        contains no entry ahead of it (``plans/merge-lane-policy-prd.md`` D5).
+        """
+        if not tip.speculative:
+            return None
+        head = self._finalizing_head_entry()
+        if head is None and self._inflight:
+            head = self._inflight[0]
+        if head is None or head.item.request.request_id == tip.request.request_id:
+            return None
+        return head
+
+    async def _adopt_head_on_tip_authority(self, tip: RealMergeItem) -> InflightEntry | None:
         """Claim the HEAD I0 for a green chain tip and tear its verify down
         (task 3186, PRD δ; decision #3).
 
-        WHY THE HEAD IS DELTA'S BUSINESS AT ALL.  ``_deep_chain_placement`` is
-        gated on ``item.speculative``, so slot 1's head is never chained — but
-        the speculative slot-2 item that IS chained was merged onto the head's
-        merge commit (the frozen-prefix tip), and the links were merged onto
-        that.  The tip tree the verify just passed therefore strictly CONTAINS
-        the head's tree.  Two consequences, and both are decision #3:
+        WHY THE HEAD IS DELTA'S BUSINESS AT ALL.  A speculative tip was merged
+        onto the head's merge commit (the frozen-prefix tip), and its links
+        onto that, so the tree the verify just passed strictly CONTAINS the
+        head's tree.  A non-speculative tip IS the head (PRD D5): it lands on
+        its own tip authority through the unchanged CAS walk, and there is
+        nothing ahead of it to cancel (:meth:`_head_inside_tip`).  For a
+        speculative tip, two consequences, and both are decision #3:
 
           * The head's own verdict is about a SUBSET the tip has better
             evidence for.  Waiting for it buys nothing; OBEYING it when it is
@@ -19063,9 +19092,9 @@ class SpeculativeMergeWorker:
              would silently skip the cancel there, leaving the finalize parked
              on a verdict it no longer needs.
 
-        Either way the TIP'S OWN entry is excluded explicitly: in production it
-        sits on ``_inflight`` behind the head, and reading it as "the head"
-        would have this coroutine cancel itself.
+        Either way :meth:`_head_inside_tip` excludes the TIP'S OWN entry: in
+        production it sits on ``_inflight`` behind the head, and reading it as
+        "the head" would have this coroutine cancel itself.
 
         THE TEARDOWN IS THE SANCTIONED PAIR, in the head-failure cascade's
         order: :meth:`_teardown_verify_task` (which owns the load-bearing
@@ -19100,12 +19129,8 @@ class SpeculativeMergeWorker:
         Returns the adopted entry, or ``None`` when there is no head to adopt
         (single-slot round, head already finalized, passthrough head).
         """
-        head = self._finalizing_head_entry()
-        if head is None and self._inflight:
-            candidate = self._inflight[0]
-            if candidate.item.request.request_id != tip_req_id:
-                head = candidate
-        if head is None or head.item.request.request_id == tip_req_id:
+        head = self._head_inside_tip(tip)
+        if head is None:
             return None
         if head.verify_task is None:
             # A passthrough / pre-established-PASS entry has no verify to
@@ -19113,6 +19138,7 @@ class SpeculativeMergeWorker:
             # decision #3 says nothing about it.
             return None
 
+        tip_task_id = tip.request.task_id
         head_task_id = head.item.request.task_id
         if head.verify_task.done() and head.item.request.result.done():
             # ── task 3186 (PRD δ), review fix #4: DELIVERED ≠ UNDECIDED ─────
@@ -19832,10 +19858,9 @@ class SpeculativeMergeWorker:
                 #     True, so those verifies are cancelled and their requests
                 #     manually requeued (NOT re-merged onto the stale tip) --
                 #     again correct, for the same base-is-gone reason.
-                # "Head path unaffected" DOES hold literally: the deep gate
-                # returns None for a non-speculative item, and the head
-                # finalizes ahead of the deep item in submission order, so slot
-                # 1 never reaches this branch on account of a chain.
+                # A chained head (alone in the frontier, PRD D5) reaches this
+                # branch on a red tip as a slot-2 tip does, and its successors,
+                # stacked on its dead chain tip, die in the cascade.
                 _n_failed_val = True
                 if vr.status == InflightStatus.DROPPED:
                     self._retire_item(req.request_id)
@@ -21590,7 +21615,7 @@ class SpeculativeMergeWorker:
             # `except BaseException` arm is what returns it.  The obligation only
             # begins once `chain` is bound, and from that point to the
             # ensure_future there is still nothing that can raise.
-            chain = await self._deep_chain_placement(item)
+            chain = await self._deep_chain_placement(item, frontier_depth=depth)
         except BaseException:
             # See the LEASE/PERMIT LEAK GUARD note above the `try`.  Hand back
             # both resources, then re-raise UNCHANGED -- this arm is a resource
