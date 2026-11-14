@@ -50,6 +50,7 @@ from dashboard.data.quality_markers import (
     derive,
     derived_markers,
     fold_routing_decisions,
+    instrument_markers,
     load_curated_markers,
     marker_datum,
     marker_stream,
@@ -1057,6 +1058,75 @@ class TestOtherDerivedSources:
 
         assert derived.skipped == 2
         assert derived.markers == ()
+
+
+_SCHEMA_2_PARAMS = {'complexipy_version': '6.2.0', 'h14_soft_ceiling_lines': 1500, 'h14_alarm_lines': 2000}
+_SCHEMA_3_PARAMS = {
+    **_SCHEMA_2_PARAMS,
+    'python_version': '3.13.9',
+    'instrument': {'quality_metrics_snapshot': 'f' * 40, 'source_measures': 'e' * 40},
+}
+_SCHEMA_2_UNKNOWN = frozenset({'instrument', 'python_version'})
+
+
+def _identity(sha: str, minutes: float, params: dict[str, object], unknown: frozenset[str] = frozenset()) -> SnapshotIdentity:
+    return SnapshotIdentity(as_of_sha=sha, committed_at=_t(minutes), params=params, unknown_params=unknown)
+
+
+class TestInstrumentMarkerPolarity:
+    """Unknown never equals unknown: a marker sits wherever the instrument's --diff says 'params differ'."""
+
+    def test_schema_2_then_schema_3_marks_the_unknown_keys(self) -> None:
+        sha3 = 'c' * 40
+        snapshots = [
+            _identity(SHA_A, 10, _SCHEMA_2_PARAMS, _SCHEMA_2_UNKNOWN),
+            _identity(sha3, 20, _SCHEMA_3_PARAMS),
+        ]
+
+        (marker,) = instrument_markers('dark_factory', snapshots)
+
+        assert (marker.marker_id, marker.at, marker.kind, marker.ref) == (
+            f'instrument:{sha3}', _t(20), MarkerKind.INSTRUMENT, sha3,
+        )
+        assert marker.label == 'instrument params changed: instrument (unknown), python_version (unknown)'
+
+    def test_two_schema_2_snapshots_with_equal_params_still_differ(self) -> None:
+        snapshots = [
+            _identity(SHA_A, 10, _SCHEMA_2_PARAMS, _SCHEMA_2_UNKNOWN),
+            _identity(SHA_B, 20, dict(_SCHEMA_2_PARAMS), _SCHEMA_2_UNKNOWN),
+        ]
+
+        (marker,) = instrument_markers('dark_factory', snapshots)
+
+        assert (marker.marker_id, marker.at) == (f'instrument:{SHA_B}', _t(20))
+        assert marker.label == 'instrument params changed: instrument (unknown), python_version (unknown)'
+
+    def test_two_schema_3_snapshots_with_equal_params_are_the_same_instrument(self) -> None:
+        snapshots = [_identity(SHA_A, 10, _SCHEMA_3_PARAMS), _identity(SHA_B, 20, dict(_SCHEMA_3_PARAMS))]
+
+        assert instrument_markers('dark_factory', snapshots) == []
+
+    def test_a_schema_3_params_change_names_only_that_key(self) -> None:
+        snapshots = [
+            _identity(SHA_A, 10, _SCHEMA_3_PARAMS),
+            _identity(SHA_B, 20, {**_SCHEMA_3_PARAMS, 'complexipy_version': '6.3.0'}),
+        ]
+
+        (marker,) = instrument_markers('dark_factory', snapshots)
+
+        assert marker.label == 'instrument params changed: complexipy_version'
+
+    def test_input_order_does_not_matter(self) -> None:
+        snapshots = [
+            _identity(SHA_A, 10, _SCHEMA_2_PARAMS, _SCHEMA_2_UNKNOWN),
+            _identity('c' * 40, 20, _SCHEMA_3_PARAMS),
+            _identity(SHA_B, 30, {**_SCHEMA_3_PARAMS, 'complexipy_version': '6.3.0'}),
+        ]
+
+        assert instrument_markers('dark_factory', list(reversed(snapshots))) == instrument_markers(
+            'dark_factory', snapshots
+        )
+        assert [marker.at for marker in instrument_markers('dark_factory', snapshots)] == [_t(20), _t(30)]
 
 
 def _every_source(tmp_path: Path) -> Path:
