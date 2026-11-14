@@ -1,8 +1,9 @@
-"""Tests for scripts/systemd_unit_environment.py (task 5978).
+"""Tests for scripts/systemd_unit_environment.py and its OPERATIONS.md recipe (task 5978).
 
 systemd is played by tests/scripts/fake_busctl.py on PATH; the live layer is a
 real child process spawned with a controlled environment, so the production
-/proc/<pid>/environ read runs.
+/proc/<pid>/environ read runs. The recipe in OPERATIONS.md §3 is extracted and
+executed verbatim against the same fake.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
@@ -18,6 +20,12 @@ from pathlib import Path
 import fake_busctl
 import pytest
 import systemd_unit_environment as sue
+import verify_command_invariants as vci
+
+REPO_ROOT = Path(__file__).parents[2]
+RECIPE_MARKER = 'unit-environment-recipe'
+RECIPE_LABEL = 'Unit environment, layer by layer'
+RECIPE_UNIT = 'orchestrator-dark-factory.service'
 
 UNIT = 'example.service'
 UNIT_PATH = '/fake/unit/0'
@@ -355,3 +363,51 @@ def test_a_malformed_reply_is_systemd_unanswered(
     with pytest.raises(sue.SystemdUnanswered) as excinfo:
         sue.inspect_unit(UNIT)
     assert garbage_stdout in excinfo.value.detail
+
+
+def _recipe_command() -> str:
+    return vci.marked_span(
+        (REPO_ROOT / 'OPERATIONS.md').read_text(),
+        begin=f'{RECIPE_MARKER}:begin',
+        end=f'{RECIPE_MARKER}:end',
+        pattern=re.compile(r'- \*\*' + re.escape(RECIPE_LABEL) + r'\*\*: `([^`]+)`'),
+        what=f'`- **{RECIPE_LABEL}**: <command>` bullet',
+        source='OPERATIONS.md',
+        label=f'the {RECIPE_LABEL!r} command',
+        task='5978',
+    ).strip()
+
+
+def test_the_operations_recipe_runs_verbatim_and_reports_the_unit(
+    busctl_world: WriteWorld, live_process: SpawnLive
+) -> None:
+    command = _recipe_command()
+    pid = live_process({'PATH': '/pinned/bin'})
+    busctl_world(
+        {
+            'manager_environment': [f'PATH={MANAGER_PATH_VALUE}'],
+            'units': {
+                RECIPE_UNIT: {
+                    'path': '/fake/unit/recipe',
+                    'Environment': ['PATH=/pinned/bin'],
+                    'MainPID': pid,
+                }
+            },
+        }
+    )
+
+    try:
+        completed = subprocess.run(
+            ['bash', '-c', command],
+            cwd=REPO_ROOT / 'scripts',
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f'the OPERATIONS.md recipe {command!r} did not finish within 60s')
+
+    detail = f'command: {command}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}'
+    assert completed.returncode == 0, detail
+    assert 'MATCHES' in _variable_block(completed.stdout, 'PATH'), detail
