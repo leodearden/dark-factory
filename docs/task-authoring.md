@@ -2487,6 +2487,41 @@ event carrying the advisory plus `writer_source` (`update_task` or
 rewriting a planned task's text, which no caller is told about. Contract:
 `plans/task-amendment-delivery-prd.md` §9 C7.
 
+### Superseding another task's plan
+
+A frozen `plan.json` is not inert:
+`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._plan` picks its
+branch from the plan file. A plan with steps and a `_session_id` is
+revalidated. A description or details amendment declines the Lever-B skip
+(previous subsection), but the revalidating architect is still handed the
+old plan to confirm, update or recreate. A metadata-only correction changes
+no fingerprint. So with `revalidation_skip_enabled`, no overlap with main's
+changes and `TaskWorkflow._can_skip_revalidation` passing, the orchestrator
+stamps `_revalidated_at` and proceeds without invoking the architect at all.
+Only an absent `plan.json` selects fresh planning.
+
+No task lane can remove or rewrite another task's plan. The OS sandbox
+grants only `orchestrator/src/orchestrator/agents/write_set.py::WriteSet.writable_paths`,
+whose only `.task-meta` entries are the dispatch's own lane and task dirs.
+A resolution's `granted_files` folds into plan files and locks, never into
+the sandbox. A plan step that writes another task's `.task-meta/` is
+therefore unimplementable (task 4822's step 5d; task 4825).
+
+plan-tools flags such a step when it is authored. The `add_plan_step`,
+`add_prerequisite`, `replace_plan_step` and `confirm_plan` responses carry
+`foreign_task_meta` (`{paths: {<step id>: [<path>]}, note}`) for any
+absolute path inside another lane's or task's `.task-meta` dir
+(`WriteSet.is_foreign_task_meta`). The flag is advisory: prose cannot tell a
+read from a write, and reads are fine.
+
+The route: to make another task plan fresh, resolve an escalation for THAT
+task with `resolve_issue(action='restart', recut=True)` (task 5516;
+`escalation/src/escalation/server.py::resolve_issue`). Its next dispatch
+parks the branch, quarantines the worktree and moves `.task-meta` aside,
+deleting nothing, then cuts fresh from main and plans fresh. A task that
+needs this files `escalate_blocker` for it instead of scheduling the write
+as a step.
+
 ## 10. Rotating a long-running audit-trail task
 
 A task that stays open across many reconciliation cycles accretes. Each
