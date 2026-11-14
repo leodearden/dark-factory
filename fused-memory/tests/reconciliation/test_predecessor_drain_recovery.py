@@ -8,12 +8,15 @@ hard-killed instance: it drains and then simply closes.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -33,7 +36,12 @@ from fused_memory.reconciliation.predecessor_drain_recovery import (
     RecoveredDrain,
     recover_predecessor_drains,
 )
-from reconciliation.harness_fixtures import open_event_buffer, open_journal
+from reconciliation.harness_fixtures import (
+    make_harness,
+    make_harness_config,
+    open_event_buffer,
+    open_journal,
+)
 
 PROJECT_P = 'project-p'
 PROJECT_Q = 'project-q'
@@ -86,6 +94,21 @@ async def _dead_predecessor_drains_two_events(stores: _Stores, *, holding_its_lo
         assert await stores.dead.mark_run_active(PROJECT_P)
     e1, e2 = await _push_events(stores.live, PROJECT_P, 2)
     assert await stores.dead.drain_by_ids(PROJECT_P, [e1, e2], run_id=KILLED_RUN_ID) == 2
+
+
+def _block_first_call(monkeypatch: pytest.MonkeyPatch, obj: object, name: str) -> asyncio.Event:
+    """Make the first call of ``obj.<name>`` set the returned event and never return."""
+    original = getattr(obj, name)
+    entered = asyncio.Event()
+
+    async def blocking_first_call(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            await asyncio.Event().wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(obj, name, blocking_first_call)
+    return entered
 
 
 @pytest.mark.asyncio
@@ -192,3 +215,39 @@ async def test_recover_predecessor_drains_never_touches_the_callers_own_drain(st
     assert await recover_predecessor_drains(stores.journal, stores.live) == []
     assert await stores.live.count_buffered(PROJECT_P) == 0
     assert await stores.live.get_lock_holder_instance_id(PROJECT_P) == stores.live.instance_id
+
+
+@pytest.mark.asyncio
+async def test_run_loop_recovers_a_dead_predecessors_runless_drain_before_its_first_reaper_tick(
+    stores, monkeypatch,
+):
+    await _dead_predecessor_drains_two_events(stores, holding_its_lock=True)
+    await stores.live.defer_write(
+        PROJECT_P, 'deferred-during-dead-tenure', 'observations_and_summaries', {},
+    )
+    harness = make_harness(
+        journal=stores.journal,
+        event_buffer=stores.live,
+        taskmaster=AsyncMock(),
+        config=make_harness_config(judge_enabled=False),
+        known_projects={PROJECT_P: '/tmp/test-project'},
+    )
+    harness.drain()
+    monkeypatch.setattr(harness, '_start_escalation_server', AsyncMock())
+    monkeypatch.setattr(harness, '_stop_escalation_server', AsyncMock())
+    first_reaper_tick = _block_first_call(monkeypatch, harness.journal, 'get_stale_runs')
+
+    loop_task = asyncio.create_task(harness.run_loop())
+    tick_wait = asyncio.ensure_future(first_reaper_tick.wait())
+    try:
+        await asyncio.wait({tick_wait, loop_task}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+        assert first_reaper_tick.is_set(), f'run_loop never reached its reaper; task: {loop_task!r}'
+
+        assert await stores.live.count_buffered(PROJECT_P) == 2
+        assert await stores.live.get_lock_holder_instance_id(PROJECT_P) is None
+        harness.memory.add_memory.assert_awaited()
+    finally:
+        tick_wait.cancel()
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
