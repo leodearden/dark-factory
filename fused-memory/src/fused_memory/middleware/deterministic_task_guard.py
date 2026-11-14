@@ -126,12 +126,6 @@ _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 # boundary.
 _VALID_BEFORE_DONE_KINDS: frozenset[str] = frozenset({'deploy', 'predicate'})
 
-# How the diagnostics name each before_done.script_root's base directory.
-_SCRIPT_BASE_NAMES: dict[str, str] = {
-    'project': 'project_root',
-    'factory': 'the dark-factory root',
-}
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -667,9 +661,8 @@ def _validate_before_done(
                 "dark-factory checkout, or use script_root='project'."
             ),
         )
-    where = _SCRIPT_BASE_NAMES[before_done.get('script_root', 'project')]
     script_base = paths.script_base.resolve()
-    err = _validate_script_under(script, paths.script, script_base, where)
+    err = _validate_script_under(script, paths.script, script_base, paths.script_root.base_name)
     if err is not None:
         return err
 

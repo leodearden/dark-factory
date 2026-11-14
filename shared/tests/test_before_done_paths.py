@@ -1,10 +1,13 @@
-"""Where a deterministic task's before_done script runs (tasks 6464, 6386, 9116).
+"""Where a deterministic task's before_done script runs (tasks 6464, 6386, 6557, 9116).
 
 Pure-function tests for ``resolve_before_done_paths``, the single entry point
 both the run-time executor and the fused-memory submit guard call: a relative
 script and a relative cwd resolve against the configured project_root, and
 ``before_done.script_root`` picks the script's base. Every refusal it raises
-is a ``BeforeDonePathsRefused``.
+is a ``BeforeDonePathsRefused``. A stored record can reach the executor through
+``update_task``, whose ``BeforeDone`` write boundary only warns, so the
+resolver refuses a malformed record itself rather than failing in the path
+join.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from shared.before_done_paths import (
     BeforeDonePathsRefused,
     CwdRefused,
     FactoryRootUnresolved,
+    ScriptRoot,
     ScriptRootRefused,
     resolve_before_done_paths,
 )
@@ -37,7 +41,10 @@ class TestResolveBeforeDonePaths:
         paths = resolve_before_done_paths({'script': RELATIVE_SCRIPT}, ROOT, _never_consulted)
 
         assert paths == BeforeDonePaths(
-            script=ROOT / RELATIVE_SCRIPT, script_base=ROOT, cwd=ROOT,
+            script=ROOT / RELATIVE_SCRIPT,
+            script_root=ScriptRoot.PROJECT,
+            script_base=ROOT,
+            cwd=ROOT,
         )
 
     @pytest.mark.parametrize('empty_cwd', ['', None])
@@ -63,7 +70,10 @@ class TestResolveBeforeDonePaths:
         )
 
         assert paths == BeforeDonePaths(
-            script=ROOT / RELATIVE_SCRIPT, script_base=ROOT, cwd=Path('/srv/elsewhere'),
+            script=ROOT / RELATIVE_SCRIPT,
+            script_root=ScriptRoot.PROJECT,
+            script_base=ROOT,
+            cwd=Path('/srv/elsewhere'),
         )
 
     def test_relative_cwd_resolves_under_project_root(self) -> None:
@@ -83,7 +93,10 @@ class TestResolveBeforeDonePaths:
         paths = resolve_before_done_paths(FACTORY_PREDICATE, ROOT, lambda: FACTORY)
 
         assert paths == BeforeDonePaths(
-            script=FACTORY / RELATIVE_SCRIPT, script_base=FACTORY, cwd=ROOT,
+            script=FACTORY / RELATIVE_SCRIPT,
+            script_root=ScriptRoot.FACTORY,
+            script_base=FACTORY,
+            cwd=ROOT,
         )
 
     def test_factory_root_does_not_move_a_relative_cwd(self) -> None:
@@ -92,7 +105,10 @@ class TestResolveBeforeDonePaths:
         )
 
         assert paths == BeforeDonePaths(
-            script=FACTORY / RELATIVE_SCRIPT, script_base=FACTORY, cwd=ROOT / 'sub/dir',
+            script=FACTORY / RELATIVE_SCRIPT,
+            script_root=ScriptRoot.FACTORY,
+            script_base=FACTORY,
+            cwd=ROOT / 'sub/dir',
         )
 
     def test_relative_script_base_is_rejected(self) -> None:
@@ -112,7 +128,13 @@ class TestScriptBaseSelection:
 
         paths = resolve_before_done_paths(before_done, ROOT, _never_consulted)
 
+        assert paths.script_root is ScriptRoot.PROJECT
         assert paths.script_base == ROOT
+
+    @pytest.mark.parametrize('script_root', list(ScriptRoot))
+    def test_every_script_root_names_its_base(self, script_root: ScriptRoot) -> None:
+        assert isinstance(script_root.base_name, str)
+        assert script_root.base_name
 
     @pytest.mark.parametrize(
         'kind_fields', [{'kind': 'deploy'}, {}], ids=['explicit-deploy', 'default-deploy'],
@@ -167,6 +189,20 @@ class TestRefusalFamily:
         assert isinstance(excinfo.value, refusal)
         assert isinstance(excinfo.value, ValueError)
 
+    @pytest.mark.parametrize(
+        'cwd',
+        [5, True, ['scripts'], {'dir': 'x'}, 0, False, []],
+        ids=['int', 'true', 'list', 'dict', 'zero', 'false', 'empty-list'],
+    )
+    def test_non_string_cwd_refused_naming_field_and_type(self, cwd: object) -> None:
+        with pytest.raises(CwdRefused) as excinfo:
+            resolve_before_done_paths(
+                {'script': RELATIVE_SCRIPT, 'cwd': cwd}, ROOT, _never_consulted,
+            )
+
+        assert 'before_done.cwd' in str(excinfo.value)
+        assert repr(type(cwd).__name__) in str(excinfo.value)
+
     def test_cwd_is_refused_before_script_root(self) -> None:
         before_done = {'script': RELATIVE_SCRIPT, 'cwd': 5, 'script_root': 'elsewhere'}
 
@@ -189,7 +225,12 @@ class TestBeforeDonePathsInvariant:
         offending = {'script': script, 'script_base': script_base, 'cwd': cwd}[field]
 
         with pytest.raises(ValueError) as excinfo:
-            BeforeDonePaths(script=script, script_base=script_base, cwd=cwd)
+            BeforeDonePaths(
+                script=script,
+                script_root=ScriptRoot.PROJECT,
+                script_base=script_base,
+                cwd=cwd,
+            )
 
         assert f'BeforeDonePaths.{field} ' in str(excinfo.value)
         assert str(offending) in str(excinfo.value)

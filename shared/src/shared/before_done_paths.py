@@ -13,15 +13,33 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from shared.task_metadata import script_root_kind_conflict
 
 
+class ScriptRoot(StrEnum):
+    """``before_done.script_root``: which directory the script joins."""
+
+    PROJECT = 'project'
+    FACTORY = 'factory'
+
+    @property
+    def base_name(self) -> str:
+        """How a diagnostic names this root's directory."""
+        match self:
+            case ScriptRoot.PROJECT:
+                return 'project_root'
+            case ScriptRoot.FACTORY:
+                return 'the dark-factory root'
+
+
 @dataclass(frozen=True)
 class BeforeDonePaths:
     script: Path
+    script_root: ScriptRoot
     script_base: Path
     cwd: Path
 
@@ -35,7 +53,7 @@ class BeforeDonePaths:
 
 
 class BeforeDonePathsRefused(ValueError):
-    """before_done names no script location this process can resolve."""
+    """before_done names a script or cwd this process cannot resolve."""
 
 
 class ScriptRootRefused(BeforeDonePathsRefused):
@@ -53,25 +71,31 @@ class FactoryRootUnresolved(BeforeDonePathsRefused):
     remedy."""
 
     def __init__(self, script: str) -> None:
-        self.script = script
         super().__init__(
             "before_done.script_root='factory' but the dark-factory root could not "
             f'be resolved, so script {script!r} cannot be located.',
         )
 
 
+def _script_root(before_done: Mapping[str, Any]) -> ScriptRoot:
+    script_root = before_done.get('script_root', ScriptRoot.PROJECT)
+    try:
+        return ScriptRoot(script_root)
+    except ValueError:
+        raise ScriptRootRefused(
+            f'before_done.script_root={script_root!r} is neither '
+            f'{ScriptRoot.PROJECT.value!r} nor {ScriptRoot.FACTORY.value!r}.',
+        ) from None
+
+
 def _script_base(
     before_done: Mapping[str, Any],
+    script_root: ScriptRoot,
     project_root: Path,
     factory_root_resolver: Callable[[], Path | None],
 ) -> Path:
-    script_root = before_done.get('script_root', 'project')
-    if script_root == 'project':
+    if script_root is ScriptRoot.PROJECT:
         return project_root
-    if script_root != 'factory':
-        raise ScriptRootRefused(
-            f"before_done.script_root={script_root!r} is neither 'project' nor 'factory'.",
-        )
     conflict = script_root_kind_conflict(script_root, before_done.get('kind') or 'deploy')
     if conflict is not None:
         raise ScriptRootRefused(f'before_done.{conflict}')
@@ -109,9 +133,11 @@ def resolve_before_done_paths(
     dark-factory root.
     """
     cwd = _before_done_cwd(before_done)
-    base = _script_base(before_done, project_root, factory_root_resolver)
+    script_root = _script_root(before_done)
+    base = _script_base(before_done, script_root, project_root, factory_root_resolver)
     return BeforeDonePaths(
         script=base / before_done['script'],
+        script_root=script_root,
         script_base=base,
         cwd=project_root / cwd if cwd else project_root,
     )
